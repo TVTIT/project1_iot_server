@@ -8,8 +8,10 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+    environment:
+      - API_DOMAIN=${API_DOMAIN:-localhost}
     volumes:
-      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
     depends_on:
       - backend
     networks:
@@ -100,6 +102,7 @@ services:
     networks:
       - iot_net
 
+  # 5. Cloudflare Tunnel
   cloudflared:
     image: cloudflare/cloudflared:1920-fe70e951a3c5
     container_name: cloudflared-prototype
@@ -107,6 +110,8 @@ services:
     command: tunnel run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - iot_net
 
 volumes:
   postgres_data:

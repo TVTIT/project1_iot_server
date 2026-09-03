@@ -9,22 +9,23 @@ http {
     keepalive_timeout  65;
     client_max_body_size 50M;
 
-    # Upstreams
+    # Upstream Go Backend
     upstream backend_api {
         server backend:8080;
     }
 
+    # Upstream Supabase API Gateway (Kong)
     upstream supabase_kong {
         server kong:8000;
     }
 
     server {
         listen 80;
-        server_name localhost;
+        server_name ${API_DOMAIN};
 
-        # Go Backend REST API
-        location /api/ {
-            proxy_pass http://backend_api;
+        # 1. Supabase Auth Routing (/auth/v1/*)
+        location /auth/v1/ {
+            proxy_pass http://supabase_kong;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -33,8 +34,19 @@ http {
             proxy_pass_header Authorization;
         }
 
-        # Go Backend WebSocket for Realtime Telemetry
-        location /ws/ {
+        # 2. Supabase Storage Routing (/storage/v1/*)
+        location /storage/v1/ {
+            proxy_pass http://supabase_kong;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Authorization $http_authorization;
+            proxy_pass_header Authorization;
+        }
+
+        # 3. Go Backend WebSocket for Realtime Telemetry (/v1/ws hoặc /v1/telemetry/ws)
+        location ~ ^/v1/(ws|telemetry/ws) {
             proxy_pass http://backend_api;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
@@ -46,9 +58,9 @@ http {
             proxy_read_timeout 86400;
         }
 
-        # Supabase API Gateway (Kong) routing for Auth & Storage
-        location ~ ^/(auth|storage|rest)/v1/ {
-            proxy_pass http://supabase_kong;
+        # 4. Go Backend Business REST API (/v1/*)
+        location /v1/ {
+            proxy_pass http://backend_api;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -57,7 +69,7 @@ http {
             proxy_pass_header Authorization;
         }
 
-        # Health check
+        # 5. Health check
         location /healthz {
             return 200 'OK';
             add_header Content-Type text/plain;
