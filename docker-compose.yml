@@ -105,7 +105,7 @@ services:
   # 5. Cloudflare Tunnel
   cloudflared:
     image: cloudflare/cloudflared:1920-fe70e951a3c5
-    container_name: cloudflared-prototype
+    container_name: cloudflared
     restart: unless-stopped
     command: tunnel run
     environment:
