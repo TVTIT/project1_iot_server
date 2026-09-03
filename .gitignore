@@ -1,0 +1,66 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.crt
+*.csr
+*.priv
+*.ovpn
+
+# Docker volumes
+postgres_data/
+mosquitto_data/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage.out
+coverage.html
+
+# Temporary files
+tmp/
+temp/
+
+# Supabase
+supabase/.temp
+supabase/.env
+
+# Node (if any)
+node_modules/
+
+# Flutter (future)
+.pub-cache/
+build/
+*.lock
+
+# Keep example env
+!.env.example
