@@ -20,7 +20,7 @@ go.work.sum
 *.swo
 *~
 
-# Environment
+# Environment & Certificates
 .env
 .env.local
 .env.*.local
@@ -29,7 +29,10 @@ go.work.sum
 *.crt
 *.csr
 *.priv
+*.srl
 *.ovpn
+certs/
+config/mosquitto/certs/
 
 # Docker volumes
 postgres_data/
