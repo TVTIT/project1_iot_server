@@ -5,6 +5,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+
+	"github.com/gin-gonic/gin"
+	_ "github.com/golang-jwt/jwt/v5"
+	_ "github.com/google/uuid"
+	_ "github.com/gorilla/websocket"
+	_ "github.com/jackc/pgx/v5"
 )
 
 func main() {
@@ -13,43 +19,53 @@ func main() {
 		port = "8080"
 	}
 
-	mux := http.NewServeMux()
+	env := os.Getenv("SERVER_ENV")
+	if env == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	} else {
+		gin.SetMode(gin.DebugMode)
+	}
 
-	// Health checks
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+	router := gin.Default()
+
+	// Health check endpoints
+	router.GET("/healthz", func(c *gin.Context) {
+		c.String(http.StatusOK, "OK")
 	})
 
-	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"running","service":"iot-backend","version":"v1"}`))
-	})
+	// V1 API Group
+	v1 := router.Group("/v1")
+	{
+		v1.GET("/health", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"status":  "running",
+				"service": "iot-backend",
+				"version": "v1",
+			})
+		})
 
-	// Telemetry REST API
-	mux.HandleFunc("GET /v1/telemetry/history", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":"telemetry history endpoint placeholder"}`))
-	})
+		// Placeholder route groups
+		v1.GET("/telemetry/history", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "telemetry history endpoint placeholder",
+			})
+		})
 
-	// Realtime WebSocket Endpoint
-	mux.HandleFunc("GET /v1/ws", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":"websocket endpoint placeholder"}`))
-	})
+		v1.GET("/ws", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "websocket endpoint placeholder",
+			})
+		})
 
-	// Federated Learning Endpoints (as per AGENTS.md Section 14)
-	mux.HandleFunc("GET /v1/fl/rounds/current", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":"fl current round endpoint placeholder"}`))
-	})
+		v1.GET("/fl/rounds/current", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "fl current round endpoint placeholder",
+			})
+		})
+	}
 
-	log.Printf("Server starting on port %s...", port)
-	if err := http.ListenAndServe(fmt.Sprintf(":%s", port), mux); err != nil {
+	log.Printf("Gin Server starting on port %s...", port)
+	if err := router.Run(fmt.Sprintf(":%s", port)); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
