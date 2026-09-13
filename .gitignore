@@ -34,9 +34,11 @@ go.work.sum
 certs/
 config/mosquitto/certs/
 
-# Docker volumes
+# Docker volumes & Backups
 postgres_data/
 mosquitto_data/
+storage_data/
+backups/
 
 # Logs
 *.log
