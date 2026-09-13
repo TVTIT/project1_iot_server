@@ -14,6 +14,7 @@ services:
       - ./config/nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
     depends_on:
       - backend
+      - supabase-envoy
     networks:
       - iot_net
 
@@ -23,7 +24,7 @@ services:
     container_name: iot_mosquitto
     restart: unless-stopped
     ports:
-      - "1883:1883"
+      - "18830:1883"
       - "8883:8883"
     volumes:
       - ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
@@ -69,7 +70,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
     ports:
-      - "127.0.0.1:5432:5432" # Bound locally for management/debug
+      - "127.0.0.1:5432:5432"
     networks:
       - iot_net
     healthcheck:
@@ -78,7 +79,100 @@ services:
       timeout: 5s
       retries: 5
 
-  # 4. Go Backend Server (Modular Monolith)
+  # 4. Supabase API Gateway (Envoy - aliased as kong for backwards compatibility)
+  supabase-envoy:
+    image: envoyproxy/envoy:v1.39.1
+    container_name: supabase_envoy
+    restart: unless-stopped
+    depends_on:
+      - supabase-auth
+      - supabase-storage
+    volumes:
+      - ./config/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./config/envoy/cds.yaml:/etc/envoy/cds.yaml:ro
+      - ./config/envoy/lds.template.yaml:/etc/envoy/lds.template.yaml:ro
+      - ./config/envoy/docker-entrypoint.sh:/docker-entrypoint.sh:ro
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-admin}
+    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
+    networks:
+      iot_net:
+        aliases:
+          - envoy
+          - kong
+
+  # 5. Supabase Auth (GoTrue)
+  supabase-auth:
+    image: supabase/gotrue:v2.196.0
+    container_name: supabase_auth
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      timeout: 5s
+      interval: 10s
+      retries: 3
+    environment:
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost}
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-iot_platform}
+      GOTRUE_SITE_URL: ${GOTRUE_SITE_URL:-http://localhost}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true" # Tắt xác nhận email theo yêu cầu
+    networks:
+      iot_net:
+        aliases:
+          - auth
+
+  # 6. Supabase Storage API
+  supabase-storage:
+    image: supabase/storage-api:v1.74.0
+    container_name: supabase_storage
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      timeout: 5s
+      interval: 10s
+      retries: 3
+    volumes:
+      - storage_data:/var/lib/storage
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-iot_platform}
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-iot-storage}
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost}
+      TENANT_ID: default
+      REGION: local
+      POSTGREST_URL: http://rest:3000
+    networks:
+      iot_net:
+        aliases:
+          - storage
+
+  # 7. Go Backend Server (Modular Monolith)
   backend:
     build:
       context: ./src
@@ -93,7 +187,9 @@ services:
       MQTT_CLIENT_ID: "backend_monolith"
       MQTT_USERNAME: "backend_service"
       MQTT_PASSWORD: "backend_secret"
-      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-secret}
+      SUPABASE_JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_URL: "http://supabase-envoy:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,7 +198,7 @@ services:
     networks:
       - iot_net
 
-  # 5. Cloudflare Tunnel
+  # 8. Cloudflare Tunnel
   cloudflared:
     image: cloudflare/cloudflared:1920-fe70e951a3c5
     container_name: cloudflared
@@ -116,6 +212,7 @@ services:
 volumes:
   postgres_data:
   mosquitto_data:
+  storage_data:
 
 networks:
   iot_net:
