@@ -56,6 +56,9 @@ services:
     restart: unless-stopped
     depends_on:
       - mosquitto
+    profiles:
+      - production
+      - tcp_tunnel
 
   # 3. Database: PostgreSQL with TimescaleDB
   postgres:
@@ -208,6 +211,9 @@ services:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
     networks:
       - iot_net
+    profiles:
+      - production
+      - http_tunnel
 
 volumes:
   postgres_data:
