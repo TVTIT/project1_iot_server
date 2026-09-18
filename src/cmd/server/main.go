@@ -44,22 +44,24 @@ func main() {
 			})
 		})
 
-		// Placeholder route groups
+		// Telemetry REST API
 		v1.GET("/telemetry/history", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"message": "telemetry history endpoint placeholder",
 			})
 		})
 
+		// Realtime WebSocket Endpoint
 		v1.GET("/ws", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"message": "websocket endpoint placeholder",
 			})
 		})
 
-		v1.GET("/fl/rounds/current", func(c *gin.Context) {
+		// Digital Twin Endpoints (Section 10.8 of AGENTS.md)
+		v1.GET("/digital-twins", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
-				"message": "fl current round endpoint placeholder",
+				"message": "digital twins list endpoint placeholder",
 			})
 		})
 	}
