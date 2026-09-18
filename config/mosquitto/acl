@@ -3,13 +3,13 @@ user backend_service
 topic read gateways/+/telemetry/#
 topic readwrite gateways/+/acks/#
 topic read gateways/+/status
-topic write gateways/+/fl/cmd
-topic read gateways/+/fl/status
+topic write gateways/+/commands/#
+topic read gateways/+/responses/#
 
 # Dynamic user pattern for Gateways
 # Each gateway authenticates with its gateway_id and accesses only its own topic namespace
 pattern readwrite gateways/%u/telemetry/#
 pattern readwrite gateways/%u/acks/#
 pattern readwrite gateways/%u/status
-pattern read gateways/%u/fl/cmd
-pattern write gateways/%u/fl/status
+pattern read gateways/%u/commands/#
+pattern write gateways/%u/responses/#

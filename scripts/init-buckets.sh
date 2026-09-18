@@ -32,7 +32,5 @@ create_private_bucket() {
 
 echo "=== Initializing Supabase Storage Private Buckets ==="
 create_private_bucket "media-images"
-create_private_bucket "fl-models"
-create_private_bucket "fl-weights"
 
 echo "=== Buckets initialization finished! ==="
