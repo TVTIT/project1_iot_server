@@ -6,21 +6,16 @@ This repository contains the main implementation of a university IoT
 Gateway–Server project (`Đồ án 1`). The system receives sensor data from
 heterogeneous Gateways, stores time-series measurements, provides historical
 queries and near-real-time streaming to users, authenticates users, and allows
-authorized Gateways to upload stored media.
+authorized Gateways to upload stored media. The backend also owns a Digital
+Twin module that represents Gateways, sensors, and controllable devices; keeps
+their current reported and desired states; stores temporal property history;
+and coordinates authorized MQTT commands and execution feedback.
 
 The project is implemented by one student. This is the student's first large
 university project, and the student has limited experience with Go, Mosquitto,
 and MQTT. Prefer the smallest complete and explainable solution over
 microservices, premature optimization, or infrastructure that is not required
 by the MVP.
-
-**FL Module Decision (as of 2026-08-31):** Federated Learning will be
-implemented using a **Go unified codebase** — both server-side aggregation
-and client-side training are written in Go. The FastAPI/Python aggregator from
-the initial plan is **removed**. Gateway training uses `gonum` for numerical
-operations with manual backprop for a small autoencoder. This decision was
-made after evaluating Gorgonia (unmaintained ~3 years) vs gonum (actively
-maintained).
 
 Schedule:
 
@@ -29,8 +24,21 @@ Schedule:
 - The student has more implementation time during September and October, so
   tasks in those months may be scheduled more aggressively.
 - Build and verify a local proof of concept before expanding to the main MVP.
-- **FL spike on AM5728 must happen in September** to validate training on
-  real hardware.
+
+Current progress snapshot supplied by the user on 2026-09-16:
+
+- A local proof of concept has demonstrated
+  `Gateway -> MQTT -> Go -> PostgreSQL`.
+- Mosquitto, Portmap/TCP, MQTT TLS/CA, per-Gateway credentials, and ACLs have
+  been implemented at prototype level.
+- Supabase Auth and Supabase Storage have been completed at prototype level.
+- Digital Twin, TimescaleDB temporal history, the complete business API,
+  realtime client delivery, and end-to-end command reconciliation remain to be
+  implemented and verified.
+
+Treat this snapshot as planning context, not proof that a repository feature is
+correct. Inspect the code, migrations, configuration, and tests before claiming
+that a feature is complete.
 
 Unless the user requests otherwise, explain decisions and write report-ready
 text in Vietnamese. Keep code, identifiers, protocol fields, and technical
@@ -50,30 +58,31 @@ The main project must provide these end-to-end capabilities:
 8. WebSocket sends newly committed telemetry to authorized clients.
 9. An authenticated Gateway obtains a signed upload URL from Go and uploads an
    image directly to private Supabase Storage.
-10. A simple Flutter client demonstrates Auth, Gateway lists, historical charts,
-    realtime charts, and stored-image access.
-
-**FL MVP scope (added):**
-
-1. Server can create FL rounds, invite gateways, collect weight updates.
-2. Gateway (Go binary) trains a small autoencoder locally and uploads weight
-   updates.
-3. Server aggregates updates (FedAvg) and stores global models.
-4. Multiple gateways (at least 2) participate in a round.
-5. Gateway giả lập (Docker) and AM5728 board share the same Go training code.
+10. Go maintains a Digital Twin entity for every managed Gateway and sensor,
+    including relationships, current `reported_state`, and current
+    `desired_state`.
+11. Telemetry and AI inference values update Digital Twin reported properties
+    and append temporal history to TimescaleDB.
+12. An authorized client changes desired state through the Go API; Go records a
+    command, publishes it through MQTT, receives Gateway feedback, and updates
+    command and reported-state status.
+13. A simple Flutter client demonstrates Auth, Gateway lists, current Digital
+    Twin state, historical charts, realtime charts, stored-image access, and a
+    small set of safe device configuration commands.
 
 The following features are deferred unless the user explicitly restores them:
 
 - gRPC and gRPC-Web.
-- A command-and-control subsystem.
 - A full alert engine.
+- LLM-generated commands or autonomous control policies.
+- A complete third-party NGSI-LD Context Broker deployment such as Scorpio or
+  Orion-LD.
+- Full ETSI NGSI-LD API conformance beyond the endpoints and entity mappings
+  explicitly implemented and tested by this project.
 - Live-video streaming or a dedicated media server.
 - Large-video upload, resumable upload, and transcoding.
 - A custom administration application.
 - Advanced observability, orchestration, or multi-node high availability.
-- Advanced FL algorithms (trimmed mean, norm clipping) — start with FedAvg
-  only.
-- Automatic FL scheduler — use admin-triggered rounds first.
 
 Do not let deferred features complicate the MVP interfaces or schedule.
 
@@ -93,10 +102,14 @@ Treat these as selected decisions, not alternatives to compare again:
 - Portmap/TCP forwarding for public MQTT TCP reachability when required.
 - Docker Compose for development and server deployment.
 - Basic CI for format, lint, unit tests, migration checks, and image builds.
-- **Go unified for FL**: server aggregation and client training both in Go.
-- **gonum** for training numerical operations (manual backprop).
-- **Flat float32 tensor serialization** for weight exchange between server
-  and gateways.
+- A Digital Twin module inside the Go modular monolith; do not split it into a
+  separate microservice for the MVP.
+- NGSI-LD-compatible entity identifiers and JSON-LD representations at the API
+  boundary, while PostgreSQL remains the authoritative store.
+- PostgreSQL JSONB plus relational constraints for current Digital Twin state;
+  TimescaleDB hypertables for temporal property values.
+- A transactional outbox for reliable MQTT command publication and a
+  reconciliation worker for desired-versus-reported state convergence.
 
 Do not replace these choices without an explicit user request. In particular:
 
@@ -108,11 +121,15 @@ Do not replace these choices without an explicit user request. In particular:
 - Do not expose PostgREST as the public business API. The Go backend owns all
   application APIs. PostgREST may remain internal if the self-hosted Supabase
   stack requires it.
-- Do not reintroduce gRPC merely for performance. REST and WebSocket were
-  chosen to reduce Protobuf, code-generation, gRPC-Web, and proxy complexity.
-- Do not send large images or video through MQTT (execpt weight file from Federated Learning function).
-- **Do not reintroduce Python/FastAPI for FL** — the Go unified decision is
-  final.
+- Do not reintroduce gRPC merely for performance. REST and WebSocket were chosen
+  to reduce Protobuf, code-generation, gRPC-Web, and proxy complexity.
+- Do not send large images or video through MQTT.
+- Do not add Scorpio, Orion-LD, Kafka, Redis, or another database merely to
+  implement the first Digital Twin vertical slice. Add such infrastructure only
+  when the user explicitly requests it and the repository contains a measured
+  need.
+- Do not persist Digital Twin state in JSON files or an in-memory Go map. A Go
+  map may be a bounded cache only; PostgreSQL is the source of truth.
 
 ## 4. Network topology and traffic flows
 
@@ -128,8 +145,8 @@ Flutter/Web
 ```
 
 REST is used for Gateway lists, sensor metadata, historical queries, media
-metadata, and signed-read-URL requests. WebSocket is used only for new
-realtime telemetry events.
+metadata, and signed-read-URL requests. WebSocket is used only for new realtime
+telemetry events.
 
 ### 4.2 Client and Supabase services
 
@@ -148,9 +165,9 @@ Nginx and the Supabase API Gateway have different responsibilities:
 
 - Nginx is the external reverse proxy. It manages public hostnames/routes,
   request-size limits, timeouts, proxy headers, and WebSocket upgrade headers.
-- The Supabase API Gateway is an internal component of the self-hosted stack.
-  It routes `/auth/v1/*`, `/storage/v1/*`, and other required Supabase paths
-  and applies Supabase-specific CORS, API-key, and header behavior.
+- The Supabase API Gateway is an internal component of the self-hosted stack. It
+  routes `/auth/v1/*`, `/storage/v1/*`, and other required Supabase paths and
+  applies Supabase-specific CORS, API-key, and header behavior.
 - Depending on the pinned self-hosted Supabase version, the API Gateway may be
   Envoy or Kong. Follow the selected upstream Compose version instead of mixing
   configurations from different releases.
@@ -200,21 +217,54 @@ Gateway
 
 The Gateway must never receive or store the Supabase `service_role` key.
 
-### 4.5 FL control and data planes (ADDED)
+### 4.5 Digital Twin uplink synchronization
 
 ```text
-CONTROL-PLANE (MQTT, lightweight):
-Server --(round cmd)--> Gateway (gateways/%u/fl/cmd)
-Gateway --(status/ACK)--> Server (gateways/%u/fl/status)
-
-DATA-PLANE (HTTPS -> Supabase Storage):
-Server --(signed READ URL)--> Gateway (download global model)
-Gateway --(signed WRITE URL)--> Supabase Storage (upload local update)
+Gateway
+    -> MQTT telemetry/status/response
+    -> Mosquitto
+    -> Go Digital Twin ingress
+    -> validate identity, schema, time, and idempotency
+    -> update reported state in PostgreSQL
+    -> append temporal properties to TimescaleDB
+    -> publish an authorized realtime event after commit
 ```
 
-- MQTT carries only control messages (round_id, model_id, deadline_at).
-- Weight updates are uploaded as files via HTTPS signed URLs.
-- This matches the media upload pattern already in place.
+The incoming MQTT topic and authenticated MQTT username identify the Gateway.
+Do not trust a conflicting `gateway_id` inside the payload. Telemetry updates
+only `reported_state`; it must never overwrite `desired_state`.
+
+### 4.6 Digital Twin downlink control
+
+```text
+Flutter/Web
+    -> HTTPS + Supabase JWT
+    -> Go authorization and command validation
+    -> transaction: desired state + command + MQTT outbox
+    -> outbox publisher
+    -> Mosquitto
+    -> Gateway executes command
+    -> MQTT acknowledgement/result/reported state
+    -> Go updates command and Digital Twin
+    -> authorized client receives the committed result
+```
+
+All application-level Gateway configuration and control commands must pass
+through the Go Digital Twin module. Clients must not publish directly to MQTT.
+An accepted API request means that the command was recorded; it does not mean
+that the physical Gateway has executed it successfully.
+
+### 4.7 Digital Twin read flows
+
+```text
+Current state: Client -> Go REST API -> PostgreSQL
+History:       Client -> Go REST API -> TimescaleDB
+Realtime:      committed state/event -> Go WebSocket -> authorized client
+```
+
+Do not rebuild current state by scanning the full temporal history for every
+request. PostgreSQL keeps the latest state, while TimescaleDB keeps append-only
+historical observations and state changes.
 
 ## 5. Service responsibilities
 
@@ -237,9 +287,6 @@ Gateway --(signed WRITE URL)--> Supabase Storage (upload local update)
 - Isolate every Gateway to its own MQTT topic namespace.
 - Do not perform application validation or database persistence; those belong
   to Go.
-- **FL control topics**: add `gateways/%u/fl/cmd` (Gateway subscribe,
-  Server publish) and `gateways/%u/fl/status` (Gateway publish,
-  Server subscribe).
 
 ### 5.3 Go backend
 
@@ -256,11 +303,12 @@ Keep the implementation as a modular monolith. Logical modules include:
 - Historical queries and adaptive `time_bucket` aggregation.
 - Authenticated WebSocket connections and realtime fan-out.
 - Media upload authorization, signed URLs, metadata, and validation status.
-- **FL module**: round lifecycle, aggregation (FedAvg), signed URL management
-  for weights, validation (NaN, checksum), metrics.
-- **FL training kernel**: dense autoencoder training with gonum (forward +
-  backward manual backprop).
-- **FL serialization**: flat float32 tensor + model_config.json manifest.
+- Digital Twin entity and relationship management.
+- NGSI-LD mapping at the API boundary.
+- Reported-state ingestion and desired-state updates.
+- Command validation, persistence, transactional outbox publication, execution
+  acknowledgement, timeout, retry, and reconciliation.
+- Temporal Digital Twin property persistence and history queries.
 
 MQTT callbacks must do only cheap parsing/copying and enqueue bounded work. Do
 not create an unbounded goroutine per MQTT message.
@@ -269,8 +317,12 @@ not create an unbounded goroutine per MQTT message.
 
 - PostgreSQL stores application profiles, Gateway ownership/permissions,
   sensors, media metadata, Gateway credential metadata, and deduplication
-  records.
+  records. It also stores Digital Twin entities, relationships, current state,
+  commands, and MQTT outbox rows.
 - TimescaleDB hypertables store raw time-series samples.
+- TimescaleDB also stores temporal Digital Twin property observations, including
+  telemetry values and AI inference values such as `reconstruction_loss` or
+  `anomaly_score` when those fields are present in the selected model.
 - SQL joins determine whether a user may access a Gateway and therefore its
   sensors, telemetry, realtime stream, and media.
 - Use migrations for schemas, constraints, indexes, hypertables, and policies.
@@ -279,66 +331,6 @@ not create an unbounded goroutine per MQTT message.
   contains the required TimescaleDB extension.
 - Prefer one documented PostgreSQL topology. Do not silently introduce a second
   application database merely to avoid configuration work.
-
-**FL tables (add via migration):**
-
-```sql
-fl_models(
-  model_id          UUID PRIMARY KEY,
-  name              TEXT,
-  architecture_json JSONB,
-  input_window      INT,
-  param_count       BIGINT,
-  created_at        TIMESTAMPTZ DEFAULT now()
-);
-
-fl_global_models(
-  model_id     UUID REFERENCES fl_models,
-  round_number INT,
-  storage_path TEXT,
-  checksum     TEXT,
-  metrics_json JSONB,
-  created_at   TIMESTAMPTZ DEFAULT now(),
-  PRIMARY KEY (model_id, round_number)
-);
-
-fl_rounds(
-  round_id             UUID PRIMARY KEY,
-  model_id             UUID REFERENCES fl_models,
-  round_number         INT,
-  state                TEXT,
-  target_client_count  INT,
-  min_updates_required INT,
-  deadline_at          TIMESTAMPTZ,
-  created_at           TIMESTAMPTZ DEFAULT now()
-);
-
-fl_round_participants(
-  round_id      UUID REFERENCES fl_rounds,
-  gateway_id    TEXT,
-  state         TEXT,
-  invited_at    TIMESTAMPTZ,
-  downloaded_at TIMESTAMPTZ,
-  submitted_at  TIMESTAMPTZ,
-  PRIMARY KEY (round_id, gateway_id)
-);
-
-fl_client_updates(
-  update_id         UUID PRIMARY KEY,
-  round_id          UUID REFERENCES fl_rounds,
-  gateway_id        TEXT,
-  message_id        UUID,
-  storage_path      TEXT,
-  num_samples       INT,
-  checksum          TEXT,
-  size_bytes        BIGINT,
-  train_loss        DOUBLE PRECISION,
-  validation_status TEXT,
-  received_at       TIMESTAMPTZ DEFAULT now(),
-  UNIQUE (round_id, gateway_id),
-  UNIQUE (gateway_id, message_id)
-);
-```
 
 ### 5.5 Supabase Auth
 
@@ -365,8 +357,6 @@ fl_client_updates(
 - Storage RLS remains defense in depth and must match the Gateway permission
   model where direct SDK access is allowed.
 - Supabase Storage is for stored files, not live-video streaming.
-- **FL weight storage**: weights are stored as binary float32 arrays in
-  Supabase Storage, using the same signed URL mechanism as media uploads.
 
 ## 6. Identity and authorization model
 
@@ -376,8 +366,7 @@ Human-user and Gateway identities are separate.
 
 - Supabase Auth owns human accounts and sessions.
 - `profiles.id` references `auth.users.id`.
-- `user_gateways` records which users may access which Gateways and their
-  role.
+- `user_gateways` records which users may access which Gateways and their role.
 - Go must check `user_gateways`; never authorize solely because a JWT is valid
   or because the client supplied a `gateway_id`.
 
@@ -394,8 +383,8 @@ Each Gateway has:
 
 If a Gateway calls the signed-upload REST endpoint, use a separate
 Gateway-specific HTTP credential or short-lived Gateway JWT issued by Go. Do
-not reuse a human Supabase account, a Supabase `service_role` key, or assume
-the MQTT password is automatically an HTTP bearer token.
+not reuse a human Supabase account, a Supabase `service_role` key, or assume the
+MQTT password is automatically an HTTP bearer token.
 
 Provision, rotate, and revoke MQTT and HTTP credentials independently. Never
 log plaintext credentials or tokens.
@@ -409,8 +398,12 @@ log plaintext credentials or tokens.
 - `telemetry`
 - `processed_messages`
 - `media_objects`
-- `fl_models`, `fl_global_models`, `fl_rounds`,
-  `fl_round_participants`, `fl_client_updates`
+- `twin_entities`
+- `twin_relationships`
+- `twin_states`
+- `twin_commands`
+- `twin_outbox`
+- `twin_temporal_values`
 - Gateway HTTP credential/token metadata where required
 
 Typical authorization chain:
@@ -420,6 +413,7 @@ auth.users / profiles
     -> user_gateways
     -> gateways
     -> sensors / telemetry / realtime / media_objects
+    -> twin_entities / twin_states / twin_commands / twin_temporal_values
 ```
 
 Use parameterized SQL, least-privilege database roles, and transactions for
@@ -443,13 +437,16 @@ Minimum topic namespace:
 gateways/<gateway_id>/telemetry/#   Gateway may publish
 gateways/<gateway_id>/acks/#        Gateway may publish when app ACK is used
 gateways/<gateway_id>/status        Gateway may publish when status is in scope
-gateways/<gateway_id>/fl/cmd        Gateway: subscribe, Server: publish
-gateways/<gateway_id>/fl/status     Gateway: publish, Server: subscribe
+gateways/<gateway_id>/responses/#   Gateway may publish command results
+gateways/<gateway_id>/commands/#    Gateway may subscribe; Go may publish
 ```
 
 Prefer `%u` ACL patterns so the authenticated MQTT username can access only its
-own namespace. A leaked credential must be revocable for one Gateway without
-rotating every Gateway.
+own namespace. A Gateway must not publish to `commands/#` or subscribe to
+another Gateway's namespace. The backend MQTT principal has only the cross-
+Gateway publish/subscribe permissions required by its ingress and command
+roles. A leaked credential must be revocable for one Gateway without rotating
+every Gateway.
 
 Provision new credentials through an authenticated admin operation. Generate
 secrets server-side using a cryptographically secure random generator and
@@ -501,8 +498,8 @@ Illustrative payload:
 
 Rules:
 
-- Generate `message_id` once using UUIDv4/UUIDv7 and a cryptographically
-  secure source.
+- Generate `message_id` once using UUIDv4/UUIDv7 and a cryptographically secure
+  source.
 - Store the serialized message in a durable Gateway outbox before publishing.
 - A retry reuses the same `message_id`, topic, payload, sequence range, and
   measurement timestamps.
@@ -517,27 +514,342 @@ Rules:
 If one logical batch must be split, use separate `message_id` values plus a
 shared `batch_id`, `part_index`, and `part_count`.
 
-## 10. Deduplication, ordering, queues, and backpressure
+## 10. Digital Twin module
+
+### 10.1 Scope and ownership
+
+The Digital Twin is a logical module inside the Go modular monolith. It owns:
+
+- NGSI-LD-compatible representations of Gateways, sensors, and controllable
+  devices.
+- Relationships such as `hasSensor`, `connectedTo`, `controls`, and
+  `managedBy`.
+- Current `reported_state` received from the physical system.
+- Current `desired_state` requested by an authorized user.
+- Temporal history of telemetry, AI inference values, and selected state
+  changes.
+- Command creation, MQTT publication, acknowledgement, result handling,
+  timeout, retry policy, and desired-versus-reported reconciliation.
+
+PostgreSQL is authoritative. Do not treat an exported NGSI-LD JSON document, a
+JSON file on disk, a process-local Go map, WebSocket state, or retained MQTT
+messages as the source of truth.
+
+Implement the project-specific subset first. Do not claim complete NGSI-LD
+conformance unless the implemented endpoints, JSON-LD processing, contexts,
+content types, and error behavior have been tested against the relevant ETSI
+requirements.
+
+### 10.2 Entity identity and NGSI-LD mapping
+
+Use stable URN identifiers:
+
+```text
+urn:ngsi-ld:Gateway:<gateway_id>
+urn:ngsi-ld:Sensor:<sensor_id>
+urn:ngsi-ld:Device:<device_id>
+```
+
+The database may use internal UUID primary keys, but the public `entity_id`
+must remain stable. An illustrative API representation is:
+
+```json
+{
+  "id": "urn:ngsi-ld:Gateway:gateway_001",
+  "type": "Gateway",
+  "name": {
+    "type": "Property",
+    "value": "AM5728 Gateway 001"
+  },
+  "connectionStatus": {
+    "type": "Property",
+    "value": "online",
+    "observedAt": "2026-09-16T08:30:00Z"
+  },
+  "hasSensor": {
+    "type": "Relationship",
+    "object": "urn:ngsi-ld:Sensor:sensor_001"
+  },
+  "@context": [
+    "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context.jsonld"
+  ]
+}
+```
+
+Keep protocol fields and database columns in `snake_case`. Use NGSI-LD-style
+property names at the JSON-LD boundary only through an explicit mapper; do not
+scatter naming conversions throughout handlers and repositories. Pin or serve
+the selected project context when custom terms are introduced. Do not fetch an
+untrusted remote JSON-LD context during each API request.
+
+### 10.3 Reported state and desired state
+
+- `reported_state` describes what the Gateway last confirmed or measured.
+- `desired_state` describes the persistent target configuration requested by an
+  authorized user.
+- Only trusted Gateway telemetry, status, or command-result messages may update
+  `reported_state`.
+- Only an authorized API operation may update `desired_state`.
+- Updating `desired_state` creates a command only when an actionable difference
+  from `reported_state` exists.
+- A published command must not be treated as a successful state change.
+- A command succeeds only after a correlated Gateway result and/or reported
+  state confirms the intended effect.
+- Keep `reported_version` and `desired_version` counters. Use optimistic
+  concurrency for desired-state writes so two client requests do not silently
+  overwrite each other.
+- Store `last_reported_at`, `last_desired_at`, and the actor responsible for a
+  desired-state change.
+
+Use desired state for durable targets such as sampling interval, operating
+mode, or enabled/disabled configuration. Use an explicit one-shot command for
+actions such as reboot or capture-image, because those actions are not durable
+target states.
+
+### 10.4 Current and temporal storage
+
+Minimum relational tables:
+
+```text
+twin_entities
+    id UUID primary key
+    entity_id TEXT unique not null
+    entity_type TEXT not null
+    name TEXT
+    attributes JSONB not null default '{}'
+    created_at TIMESTAMPTZ not null
+    updated_at TIMESTAMPTZ not null
+
+twin_relationships
+    source_entity_id UUID not null
+    relationship_type TEXT not null
+    target_entity_id UUID not null
+    created_at TIMESTAMPTZ not null
+    primary key (source_entity_id, relationship_type, target_entity_id)
+
+twin_states
+    entity_id UUID primary key
+    reported_state JSONB not null default '{}'
+    desired_state JSONB not null default '{}'
+    reported_version BIGINT not null default 0
+    desired_version BIGINT not null default 0
+    last_reported_at TIMESTAMPTZ
+    last_desired_at TIMESTAMPTZ
+    updated_at TIMESTAMPTZ not null
+
+twin_commands
+    id UUID primary key
+    command_id UUID unique not null
+    entity_id UUID not null
+    action TEXT not null
+    parameters JSONB not null default '{}'
+    status TEXT not null
+    desired_version BIGINT
+    idempotency_key TEXT
+    issued_by UUID
+    issued_at TIMESTAMPTZ not null
+    expires_at TIMESTAMPTZ not null
+    acknowledged_at TIMESTAMPTZ
+    completed_at TIMESTAMPTZ
+    attempt_count INTEGER not null default 0
+    error_code TEXT
+    error_message TEXT
+
+twin_outbox
+    id UUID primary key
+    command_id UUID not null
+    topic TEXT not null
+    payload JSONB not null
+    status TEXT not null
+    attempt_count INTEGER not null default 0
+    next_attempt_at TIMESTAMPTZ not null
+    created_at TIMESTAMPTZ not null
+    published_at TIMESTAMPTZ
+```
+
+Use a TimescaleDB hypertable for temporal values:
+
+```text
+twin_temporal_values
+    observed_at TIMESTAMPTZ not null
+    entity_id UUID not null
+    property_name TEXT not null
+    value_number DOUBLE PRECISION
+    value_text TEXT
+    value_boolean BOOLEAN
+    metadata JSONB not null default '{}'
+    message_id UUID
+```
+
+Choose exactly one typed value column for each row. Preserve units and source
+metadata. Add constraints and indexes through migrations. Do not duplicate the
+same high-frequency sample in both `telemetry` and `twin_temporal_values`
+without a documented reason; prefer one physical time-series table with clear
+views or mappings where practical.
+
+### 10.5 Uplink ingress behavior
+
+For every MQTT telemetry or status message:
+
+1. Derive the Gateway identity from the authenticated MQTT connection/topic.
+2. Validate the topic, protocol version, payload size, schema, timestamps, and
+   allowed property names.
+3. Apply existing `(gateway_id, message_id)` idempotency rules.
+4. Resolve the Gateway, sensor, or device entity.
+5. In one database transaction, insert the deduplication record, append temporal
+   values, and update current reported state/version.
+6. Commit before sending the application-level ACK or realtime event.
+7. Publish WebSocket updates only to users authorized for the related Gateway.
+
+Reject unknown entities by default. If automatic sensor discovery is later
+enabled, place discovered entities in a pending state until an authorized user
+accepts them.
+
+### 10.6 Downlink command behavior
+
+All client-originated control and configuration operations follow this path:
+
+1. Validate the Supabase JWT.
+2. Check `user_gateways` and the user's role for the target entity's Gateway.
+3. Validate the action and parameters against a server-owned command schema.
+4. Start a database transaction.
+5. Update desired state when the command represents a durable target.
+6. Insert `twin_commands` with status `pending`.
+7. Insert the corresponding `twin_outbox` row.
+8. Commit the transaction.
+9. Let a bounded outbox worker publish to MQTT.
+10. Correlate Gateway acknowledgement/result by `command_id`.
+11. Update command status and reported state in a transaction.
+12. Notify authorized clients after commit.
+
+Never update PostgreSQL and publish MQTT as two unrelated handler operations.
+The transactional outbox exists to close that failure gap. MQTT delivery is
+at-least-once, so the Gateway must remember recently processed `command_id`
+values and return the previous result for a duplicate command instead of
+executing it twice.
+
+Illustrative command payload:
+
+```json
+{
+  "protocol_version": 1,
+  "message_type": "command",
+  "command_id": "0195e18c-9fc1-7a42-9064-69ea49e63bf3",
+  "entity_id": "urn:ngsi-ld:Gateway:gateway_001",
+  "action": "update_configuration",
+  "parameters": {
+    "sampling_interval_seconds": 5
+  },
+  "desired_version": 12,
+  "issued_at": "2026-09-16T08:31:00Z",
+  "expires_at": "2026-09-16T08:32:00Z"
+}
+```
+
+Illustrative result payload:
+
+```json
+{
+  "protocol_version": 1,
+  "message_type": "command_result",
+  "command_id": "0195e18c-9fc1-7a42-9064-69ea49e63bf3",
+  "gateway_id": "gateway_001",
+  "status": "succeeded",
+  "reported_state": {
+    "sampling_interval_seconds": 5
+  },
+  "completed_at": "2026-09-16T08:31:03Z"
+}
+```
+
+### 10.7 Command lifecycle and reconciliation
+
+Use this minimum lifecycle:
+
+```text
+pending -> published -> acknowledged -> succeeded
+                         |              -> failed
+                         -> timeout
+pending/published -> cancelled when cancellation is still safe
+```
+
+- `pending` means committed to the database and waiting for publication.
+- `published` means sent to the broker; it does not prove Gateway receipt.
+- `acknowledged` means the Gateway accepted the command for processing.
+- `succeeded` means the Gateway confirmed the requested effect.
+- `failed` contains a stable error code and a safe diagnostic message.
+- `timeout` means no valid completion arrived before the deadline.
+
+The reconciliation worker compares desired and reported versions/state. Retry
+only operations declared idempotent, respect `expires_at`, use exponential
+backoff with jitter, and cap attempts. Do not blindly retry one-shot actions
+such as reboot or capture-image. A late result must be recorded and handled by
+an explicit policy instead of silently changing a previously final status.
+
+### 10.8 HTTP API boundary
+
+Minimum project API:
+
+```text
+POST   /v1/digital-twins
+GET    /v1/digital-twins
+GET    /v1/digital-twins/{entity_id}
+PATCH  /v1/digital-twins/{entity_id}
+GET    /v1/digital-twins/{entity_id}/state
+PATCH  /v1/digital-twins/{entity_id}/desired-state
+GET    /v1/digital-twins/{entity_id}/history
+POST   /v1/digital-twins/{entity_id}/commands
+GET    /v1/digital-twins/{entity_id}/commands
+GET    /v1/commands/{command_id}
+```
+
+URL-encode URN entity identifiers in path parameters or use an unambiguous
+surrogate route identifier. Desired-state and command requests support an
+idempotency key. A successful create response returns `202 Accepted`, the
+`command_id`, and current command status; it must not report physical execution
+success prematurely.
+
+### 10.9 Go package boundaries
+
+Prefer this logical structure, adapting names to existing repository
+conventions rather than duplicating packages:
+
+```text
+internal/digitaltwin/
+    domain/          entity, relationship, state, command
+    service/         entity, state, command, reconciliation, temporal
+    repository/      PostgreSQL and TimescaleDB access
+    mqtt/            ingress, response handler, command publisher
+    mapper/          telemetry and NGSI-LD mappings
+    transport/http/  REST handlers and DTOs
+    worker/          outbox, timeout, retry, offline detection
+```
+
+Domain and service packages must not depend directly on HTTP, MQTT client, or
+database-driver types. Repositories and publishers are injected through small
+interfaces. Keep transactions at the service/use-case boundary where one
+operation spans state, command, and outbox writes.
+
+## 11. Deduplication, ordering, queues, and backpressure
 
 - Identify retries by `(gateway_id, message_id)`.
 - Use a regular `processed_messages` table with primary key
   `(gateway_id, message_id)`.
-- Store `payload_hash`. Same ID and hash means a retry; same ID with a
-  different hash is a protocol/security error.
-- Insert the deduplication marker and telemetry samples in the same
-  transaction.
+- Store `payload_hash`. Same ID and hash means a retry; same ID with a different
+  hash is a protocol/security error.
+- Insert the deduplication marker and telemetry samples in the same transaction.
 - Use an atomic conflict pattern such as `INSERT ... ON CONFLICT DO NOTHING`.
 - Order data by measurement timestamp and sequence, never MQTT arrival order.
 - Use a bounded Go queue, fixed worker pool, and bounded PostgreSQL connection
   pool.
-- Apply exponential backoff with jitter and propagate sustained pressure to
-  the Gateway's durable outbox.
+- Apply exponential backoff with jitter and propagate sustained pressure to the
+  Gateway's durable outbox.
 - Never use an unbounded queue or unbounded goroutine creation.
 
 For Linux Gateways, prefer a small SQLite outbox. On constrained
 microcontrollers, use a bounded flash/NVS outbox designed to limit flash wear.
 
-## 11. High-frequency telemetry and historical charts
+## 12. High-frequency telemetry and historical charts
 
 For a 100 Hz sensor, group the 100 samples measured during one second into one
 MQTT message. Batching reduces transport and insert overhead; it does not mean
@@ -558,13 +870,13 @@ Default MVP policy:
 If threshold alerts are later restored, evaluate raw samples or features
 computed from every raw sample, not only chart-downsampled data.
 
-## 12. Media rules
+## 13. Media rules
 
 - MQTT is binary-capable, but the MVP uses MQTT only for telemetry/control
   metadata, not media bytes.
 - Support stored images first.
-- Go authenticates the Gateway and validates intended object path, content
-  type, expected size, and quota before issuing a signed URL.
+- Go authenticates the Gateway and validates intended object path, content type,
+  expected size, and quota before issuing a signed URL.
 - The signed URL must be short-lived and limited to the intended operation and
   object path.
 - The Gateway uploads directly to private Storage over HTTPS through Nginx and
@@ -574,7 +886,7 @@ computed from every raw sample, not only chart-downsampled data.
 - Never expose a public bucket merely to simplify the Flutter demo.
 - Large video, resumable/TUS upload, and live streaming remain out of scope.
 
-## 13. Target Gateway platforms
+## 14. Target Gateway platforms
 
 ### ESP32
 
@@ -582,7 +894,6 @@ computed from every raw sample, not only chart-downsampled data.
 - Store credentials in encrypted NVS when supported.
 - Use a bounded flash outbox and account for flash wear.
 - Target telemetry and small control messages, not video workflows.
-- **FL on ESP32**: Not in scope for MVP. Use Go gateways only.
 
 ### Luckfox Pico Plus
 
@@ -592,7 +903,6 @@ computed from every raw sample, not only chart-downsampled data.
 - Cross-compile or add dependencies to Buildroot rather than assuming desktop
   packages exist.
 - Upload captured images through HTTPS signed URLs.
-- **FL on Luckfox**: Not in scope for MVP. Use Go gateways only.
 
 ### TI AM5728 with TI SDK/Arago Linux
 
@@ -601,82 +911,6 @@ computed from every raw sample, not only chart-downsampled data.
 - Configure time synchronization, filesystem permissions, log rotation, and a
   SQLite/file durable outbox.
 - Benchmark CPU, memory, disk, and network use on the real board.
-- **FL on AM5728**: Primary target. Go binary cross-compiled with
-  `GOOS=linux GOARCH=arm GOARM=7`. Training kernel uses gonum.
-
-## 14. FL specific design decisions
-
-### 14.1 Model architecture
-
-- Autoencoder/forecaster with dense layers, 7–30k parameters.
-- `input_window` = `sample_count` from telemetry batch.
-- For MVP, use fixed `input_window` per model (e.g., 100). Multiple models
-  can exist for different frequencies.
-- Output shape = 2 × `input_window` (prediction + reconstruction).
-
-### 14.2 Training on Gateway
-
-- Use **gonum** (`gonum.org/v1/gonum/mat`) for matrix operations.
-- Manual backprop for dense layers (ReLU activation, MSE loss).
-- Optimizer: SGD with momentum or simple Adam (implement manually, ~50
-  lines).
-- Train on each telemetry batch as it arrives or collect a small buffer.
-- Loss value reported with weight update.
-
-### 14.3 Weight serialization
-
-- Flat `[]float32` array, little-endian binary via `encoding/binary`.
-- `model_config.json` describes architecture, param_count, layer sizes,
-  weight order.
-- All gateways (giả lập and AM5728) use the same serialization code.
-
-### 14.4 Aggregation (Server)
-
-- FedAvg: weighted average by `num_samples`.
-- Bounded memory: accumulate one buffer, O(param_count), not
-  O(K × param_count).
-- Validate: NaN/Inf rejection, checksum, param_count match.
-- Store global model in Supabase Storage as flat float32 array.
-
-### 14.5 Round lifecycle
-
-```text
-created -> open -> collecting -> aggregating -> completed
-                            -> aborted (deadline, insufficient updates)
-```
-
-- Go controls state transitions.
-- Admin triggers round creation (no auto-scheduler for MVP).
-- Go calls aggregation function directly (no separate FastAPI service).
-
-### 14.6 API endpoints (Gateway-facing)
-
-```text
-GET  /api/v1/fl/rounds/current?model_id=...
-     -> round metadata + signed READ URL for global weights
-
-POST /api/v1/fl/rounds/{round_id}/updates
-     -> signed WRITE URL for weight upload
-
-POST /api/v1/fl/rounds/{round_id}/updates/{update_id}/complete
-     -> confirm upload complete
-```
-
-### 14.7 API endpoints (User-facing)
-
-```text
-GET /api/v1/fl/models
-GET /api/v1/fl/rounds?model_id=...
-GET /api/v1/fl/rounds/{round_id}
-```
-
-### 14.8 FL security
-
-- Gateway JWT for authentication.
-- `num_samples` cross-checked against TimescaleDB telemetry counts (unique
-  advantage of this system).
-- Norm clipping as defense against poisoning (start with FedAvg only).
-- Checksum validation, NaN/Inf rejection before accepting updates.
 
 ## 15. Development and deployment rules
 
@@ -688,8 +922,8 @@ GET /api/v1/fl/rounds/{round_id}
   final deployment.
 - Use Dockerfiles and Docker Compose with health checks, named volumes, restart
   policies, explicit networks, and persistent data paths.
-- Do not expose PostgreSQL, Supabase Studio, Auth, Storage, internal API
-  Gateway ports, or Go debug endpoints publicly.
+- Do not expose PostgreSQL, Supabase Studio, Auth, Storage, internal API Gateway
+  ports, or Go debug endpoints publicly.
 - Protect Studio using Cloudflare Access, VPN, or a trusted management network.
 - Use migrations instead of manual production schema edits.
 - Add structured logs without passwords, JWTs, private keys, or signed URLs.
@@ -707,8 +941,7 @@ At minimum, test:
 - One 100 Hz sensor sending one 100-sample message per second.
 - Invalid payloads, duplicate delivery, reconnect, retry, lost application ACK,
   and out-of-order messages.
-- Queue saturation and temporary database slowdown without unbounded memory
-  use.
+- Queue saturation and temporary database slowdown without unbounded memory use.
 - Gateway offline outbox and resend behavior.
 - Per-Gateway MQTT ACL isolation and credential revocation.
 - Invalid/expired TLS certificates, hostname mismatch, and incorrect time.
@@ -718,15 +951,24 @@ At minimum, test:
   behavior.
 - Signed upload/read URL expiry, object-path restriction, size/type rejection,
   and private-bucket denial.
+- Telemetry updates the correct Digital Twin reported state and temporal rows in
+  the same successful processing path.
+- A client cannot write `reported_state` and a Gateway cannot write
+  `desired_state`.
+- User A cannot read or control User B's Digital Twin.
+- A desired-state update creates one command and one outbox item in the same
+  transaction.
+- Database commit succeeds while MQTT is unavailable; the outbox later
+  publishes without losing the command.
+- Duplicate command publication does not execute the physical action twice.
+- Command acknowledgement, success, failure, expiry, timeout, retry, and late
+  result behavior.
+- Desired-versus-reported reconciliation after Gateway reconnect.
+- Optimistic concurrency rejects a stale desired-state version.
+- NGSI-LD entity serialization preserves identifiers, property types,
+  relationships, observed timestamps, and the selected context.
 - Service restart, persistent data, clean-environment Compose deployment,
   backup, and restore.
-- **FL-specific**:
-  - Gateway training loop produces expected weight updates.
-  - Weight serialization roundtrip (serialize -> deserialize -> same values).
-  - Server aggregation produces correct FedAvg result.
-  - Cross-compiled ARM7 binary runs on AM5728.
-  - Multiple gateways (giả lập + AM5728) can participate in one round.
-  - NaN/Inf rejection works.
 
 Run focused tests while implementing each module. The final integration period
 is for acceptance and regression testing, not the first time components are
@@ -738,16 +980,19 @@ For planning, September and October may use short task durations because the
 student has more available time. November and December need integration buffer,
 especially around Supabase, WebSocket, Storage, Flutter, and final deployment.
 
-**FL-specific milestones:**
+Preferred Digital Twin implementation order:
 
-| Mốc | Việc | Rủi ro |
-|---|---|---|
-| 01–15/09 | FL training kernel spike on AM5728 (gonum + cross-compile) | Cao nhất |
-| 16–30/09 | FL server: migrations, round lifecycle, API, signed URLs | Trung bình |
-| 01–15/10 | FL gateway: training integration, weight upload | Trung bình |
-| 16–31/10 | Multi-gateway test (giả lập + real board) | Trung bình |
-| 11 | Integration with main system, metrics, charts | Thấp |
-| 12 | Final freeze, report | Thấp |
+1. Add entity, relationship, current-state, command, outbox, and temporal
+   migrations.
+2. Map one Gateway and one sensor into stable NGSI-LD-compatible entities.
+3. Complete the uplink vertical slice from telemetry to reported state and
+   temporal history.
+4. Complete one downlink configuration slice from desired-state API to MQTT
+   result and reported-state convergence.
+5. Add command query, timeout/retry policy, WebSocket events, and authorization
+   tests.
+6. Expand supported properties and commands only after the first vertical slice
+   passes end-to-end tests on the real AM5728 Gateway.
 
 If schedule slips, reduce scope in this order:
 
@@ -755,19 +1000,19 @@ If schedule slips, reduce scope in this order:
 2. Target one Flutter platform, preferably Android.
 3. Provide one historical chart and one realtime chart.
 4. Use Supabase Studio for administration instead of building an admin UI.
-5. Temporarily use short polling if WebSocket cannot be stabilized, while
+5. Limit Digital Twin entity types to `Gateway` and `Sensor`, relationships to
+   `hasSensor`, and commands to one safe configuration operation.
+6. Export NGSI-LD-compatible entity JSON from project APIs without deploying a
+   full external Context Broker.
+7. Temporarily use short polling if WebSocket cannot be stabilized, while
    preserving the historical REST API.
-6. **FL fallback**: All clients are giả lập (Docker); AM5728 only demo
-   inference, not training. Bỏ trimmed mean / robust aggregation. Bỏ MQTT
-   control plane — gateway polls `GET /fl/rounds/current`.
 
 Do not cut MQTT TLS, per-Gateway credentials/ACLs, human-user Auth,
 User–Gateway authorization, telemetry persistence, deduplication, bounded
 queues, durable Gateway retry behavior, historical queries, or private media
-access.
-
-**FL cannot cut:** Private Storage for weights, Gateway JWT auth,
-dedup/idempotency, bounded-memory aggregation, validation NaN/finite.
+access. Do not cut the Digital Twin core path of reported state, desired state,
+authorized command creation, transactional outbox, MQTT result correlation,
+and command status query once device control is presented as an MVP feature.
 
 ## 18. Instructions for coding agents
 
@@ -783,27 +1028,32 @@ dedup/idempotency, bounded-memory aggregation, validation NaN/finite.
   application-level idempotency.
 - Do not authorize from request parameters or JWT validity alone; verify the
   resource relationship in PostgreSQL.
-- Route Supabase Auth and Storage through the Supabase API Gateway. Nginx is
-  the external reverse proxy, not a substitute for that internal gateway.
+- Route Supabase Auth and Storage through the Supabase API Gateway. Nginx is the
+  external reverse proxy, not a substitute for that internal gateway.
 - Do not give a Gateway a Supabase human account or `service_role` key.
-- Prefer static Mosquitto `password_file` and `acl_file` for the first MVP;
-  add dynamic administration only if it is required and scheduled.
+- Prefer static Mosquitto `password_file` and `acl_file` for the first MVP; add
+  dynamic administration only if it is required and scheduled.
 - Treat retention periods, queue sizes, worker counts, packet limits, upload
   limits, token lifetimes, and timeouts as configurable values.
+- Keep all application-level device commands inside the Digital Twin module.
+  The client calls Go APIs and never publishes MQTT commands directly.
+- Keep PostgreSQL as the authoritative Digital Twin store. Do not create JSON
+  configuration files or global Go maps as durable state.
+- Keep `reported_state` and `desired_state` separate. Never mark desired state
+  as reported until a correlated Gateway message confirms it.
+- Persist desired-state changes, commands, and outbox records atomically.
+- Use `command_id` for end-to-end correlation and idempotency. Do not claim
+  exactly-once command execution.
+- Implement one vertical slice first:
+  `PATCH desired state -> transaction -> outbox -> MQTT -> Gateway result ->
+  reported state -> command query/realtime event`.
+- Keep NGSI-LD mapping in one package. Do not leak JSON-LD library types into
+  domain services or database repositories.
+- Do not add an external Context Broker unless explicitly requested. If added
+  later, define which component is authoritative before writing code; never
+  allow Go and the broker to become two unsynchronized sources of truth.
 - Benchmark before choosing production defaults.
 - When the repository does not yet contain a convention, present the simplest
   viable option and its trade-off rather than inventing a permanent decision.
 - Explain important implementation choices in plain Vietnamese when handing
   work back to the user.
-
-**FL-specific coding rules:**
-
-- Use `gonum` for matrix ops in training; no Gorgonia.
-- Weight serialization: `encoding/binary` little-endian.
-- Aggregation: bounded memory, O(param_count), not O(K × param_count).
-- Cross-compile flags: `GOOS=linux GOARCH=arm GOARM=7`.
-- Test training on laptop before ARM7 spike.
-- Log losses and weight norms for debugging.
-- Do not store training data on server; only weight updates.
-- Use `num_samples` from gateway, but cross-check with TimescaleDB when
-  possible.
