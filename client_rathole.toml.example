@@ -1,0 +1,12 @@
+# Rathole Client Configuration Template
+# Copy this file to client_rathole.toml and replace with your VPS credentials
+[client]
+# Public IP or domain of your remote Rathole server and control port
+remote_addr = "vps-ip-or-domain:4712"
+
+[client.services.mqtts_development]
+# Service token matching server.toml on the Rathole server
+token = "your_secret_rathole_service_token_here"
+# Local address of Mosquitto broker inside docker network (port 8883 for MQTTS TLS)
+local_addr = "mosquitto:8883"
+nodelay = true

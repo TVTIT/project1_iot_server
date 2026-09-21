@@ -31,6 +31,7 @@ go.work.sum
 *.priv
 *.srl
 *.ovpn
+client_rathole.toml
 certs/
 config/mosquitto/certs/
 
