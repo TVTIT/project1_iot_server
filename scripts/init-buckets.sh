@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load configuration from .env if present
+if [ -f "${PROJECT_ROOT}/.env" ]; then
+    set -a
+    source "${PROJECT_ROOT}/.env"
+    set +a
+fi
+
 # Endpoint through Nginx or internal Envoy
 STORAGE_URL="${STORAGE_URL:-http://localhost/storage/v1}"
 SERVICE_ROLE_KEY="${SERVICE_ROLE_KEY:-}"
+BUCKET_NAME="${MEDIA_STORAGE_BUCKET:-media-images}"
 
 if [ -z "$SERVICE_ROLE_KEY" ]; then
-    echo "ERROR: SERVICE_ROLE_KEY environment variable is required."
+    echo "ERROR: SERVICE_ROLE_KEY environment variable is required (check .env)."
     exit 1
 fi
 
@@ -14,7 +24,6 @@ create_private_bucket() {
     local bucket_id="$1"
     echo "Creating private bucket: ${bucket_id}..."
     
-    # Try to create bucket
     local status_code
     status_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${STORAGE_URL}/bucket" \
         -H "Authorization: Bearer ${SERVICE_ROLE_KEY}" \
@@ -31,6 +40,6 @@ create_private_bucket() {
 }
 
 echo "=== Initializing Supabase Storage Private Buckets ==="
-create_private_bucket "media-images"
+create_private_bucket "${BUCKET_NAME}"
 
 echo "=== Buckets initialization finished! ==="
