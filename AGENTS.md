@@ -29,8 +29,8 @@ Current progress snapshot supplied by the user on 2026-09-16:
 
 - A local proof of concept has demonstrated
   `Gateway -> MQTT -> Go -> PostgreSQL`.
-- Mosquitto, Portmap/TCP, MQTT TLS/CA, per-Gateway credentials, and ACLs have
-  been implemented at prototype level.
+- Mosquitto, a Rathole reverse TCP tunnel, MQTT TLS/CA, per-Gateway
+  credentials, and ACLs have been implemented at prototype level.
 - Supabase Auth and Supabase Storage have been completed at prototype level.
 - Digital Twin, TimescaleDB temporal history, the complete business API,
   realtime client delivery, and end-to-end command reconciliation remain to be
@@ -99,7 +99,8 @@ Treat these as selected decisions, not alternatives to compare again:
 - Flutter for a simple MVP client; prefer one platform, normally Android.
 - Nginx as the public HTTP reverse proxy.
 - Cloudflare Tunnel for public HTTP/HTTPS access.
-- Portmap/TCP forwarding for public MQTT TCP reachability when required.
+- Rathole reverse TCP tunneling for public MQTT TCP reachability when direct
+  inbound connectivity is unavailable.
 - Docker Compose for development and server deployment.
 - Basic CI for format, lint, unit tests, migration checks, and image builds.
 - A Digital Twin module inside the Go modular monolith; do not split it into a
@@ -191,7 +192,8 @@ not be exposed directly to the Internet.
 ```text
 Gateway
     -> MQTT over TLS
-    -> Portmap/TCP forwarding when required
+    -> Rathole client
+    -> Rathole server on the public host
     -> Mosquitto
     -> Go MQTT subscriber
     -> bounded in-memory queue
@@ -200,8 +202,12 @@ Gateway
     -> authorized WebSocket clients
 ```
 
-Portmap provides TCP reachability only. It does not provide encryption,
-authentication, authorization, deduplication, or reliable persistence.
+Rathole provides TCP reachability only. It does not replace MQTT TLS,
+Mosquitto authentication/ACLs, application-level authorization,
+deduplication, or reliable persistence. The Rathole client must forward to the
+Mosquitto service address reachable from its Docker network, such as
+`mosquitto:8883`, not to container-local loopback. Keep the Rathole control and
+service tokens distinct from MQTT credentials.
 
 ### 4.4 Gateway media upload
 
@@ -917,7 +923,38 @@ computed from every raw sample, not only chart-downsampled data.
 - Inspect existing code, Compose files, migrations, documentation, and current
   Git status before making changes.
 - Preserve user edits and unrelated dirty-worktree changes.
-- Keep secrets out of Git. Commit `.env.example`, never a populated `.env`.
+- Keep secrets and deployment-specific values out of Git. Commit
+  `.env.example`, never a populated `.env`.
+- Centralize environment-dependent configuration in the repository-root
+  `.env`. This includes real domains, public IP addresses, external hostnames,
+  tunnel endpoints, certificate SANs, ports that vary by deployment, database
+  names and users, bucket names, email addresses used for local provisioning,
+  Gateway identifiers used only by one deployment, API keys, passwords,
+  tokens, and credential paths.
+- Do not hard-code personal or deployment-specific values in Go source, shell
+  scripts, SQL migrations, Docker Compose files, checked-in service configs,
+  tests, examples, or documentation. Read them from environment variables or
+  inject them through a configuration layer.
+- If a component cannot expand environment variables in its native format,
+  use a separate runtime configuration file that is ignored by Git, such as
+  `client_rathole.toml`. Commit only a corresponding `.example` or template
+  containing safe placeholders. Generate the runtime file from `.env` when
+  practical; otherwise document the one-time local creation step.
+- `.env.example` and checked-in config templates must contain descriptive,
+  non-sensitive placeholders or safe local defaults only. They must not expose
+  real Rathole tokens, Cloudflare tokens, JWTs, MQTT passwords, private keys,
+  public deployment domains, personal emails, or machine-specific paths.
+- Validate required configuration at process or script startup and fail with a
+  clear error when a required value is absent. Do not silently fall back to a
+  production-looking domain, shared credential, or known default secret.
+- Stable protocol constants and product-level decisions may remain in code,
+  including MQTT topic shapes, JSON field names, supported command statuses,
+  NGSI-LD prefixes, and local Docker service names. Do not move these to
+  `.env` merely because they are strings.
+- Never log or print plaintext secrets. Avoid passing secrets as command-line
+  arguments when an environment variable, protected file, or standard input is
+  available, because command arguments may be visible in process listings or
+  shell history.
 - Pin image and dependency versions; do not use floating `latest` tags for the
   final deployment.
 - Use Dockerfiles and Docker Compose with health checks, named volumes, restart
@@ -1031,6 +1068,11 @@ and command status query once device control is presented as an MVP feature.
 - Route Supabase Auth and Storage through the Supabase API Gateway. Nginx is the
   external reverse proxy, not a substitute for that internal gateway.
 - Do not give a Gateway a Supabase human account or `service_role` key.
+- Treat `.env` as the default source for environment-dependent values. When a
+  service requires a native config file, keep the real file ignored and commit
+  only a sanitized `.example` or template. Never introduce a real domain,
+  personal email, public IP, machine path, Gateway-specific deployment ID, or
+  secret directly into source code, migrations, Compose, tests, or docs.
 - Prefer static Mosquitto `password_file` and `acl_file` for the first MVP; add
   dynamic administration only if it is required and scheduled.
 - Treat retention periods, queue sizes, worker counts, packet limits, upload
