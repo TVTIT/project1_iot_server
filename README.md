@@ -51,10 +51,13 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
    - **Digital Twin Subsystem**: Quản lý thực thể Gateway/Sensor/Device chuẩn NGSI-LD, đồng bộ `reported_state` từ uplink, tiếp nhận `desired_state` từ người dùng, quản lý lệnh điều khiển qua Transactional Outbox và đối soát trạng thái (reconciliation).
 4. **PostgreSQL 16 + TimescaleDB**:
    - Dữ liệu quan hệ & bảo mật: `profiles`, `gateways`, `user_gateways`, `sensors`, `media_objects`, `processed_messages`.
-   - Dữ liệu Digital Twin: `twin_entities`, `twin_relationships`, `twin_states`, `twin_commands`, `twin_outbox`.
+   - Dữ liệu Digital Twin: `twin_entities`, `twin_relationships`, `twin_states`, `twin_commands`, `twin_outbox`. Mỗi entity có `gateway_id` bắt buộc để phân quyền qua `user_gateways`.
    - Hypertables:
-     - `telemetry`: Phân vùng 1 ngày (`chunk_time_interval => '1 day'`), tự động nén columnar sau 7 ngày, retention sau 30 ngày.
+     - `telemetry`: Phân vùng 1 ngày (`chunk_time_interval => '1 day'`) và tự động nén columnar sau 7 ngày.
      - `twin_temporal_values`: Lưu chuỗi biến thiên giá trị thuộc tính số, chữ, boolean và AI inference metrics (reconstruction loss, anomaly score).
+   - Chưa bật retention tự động cho dữ liệu chuỗi thời gian. Thời hạn lưu sẽ được cấu hình sau khi đo dung lượng thực tế.
+   - Các khóa ngoại dùng `ON DELETE RESTRICT`: phải archive hoặc dọn dữ liệu phụ thuộc có chủ đích trước khi xóa Gateway/Sensor.
+   - FK từ `telemetry` tới `sensors` bảo vệ tính toàn vẹn trên đường ghi nóng; cần benchmark batch insert 100 Hz trước khi chốt cấu hình production.
    - Row Level Security (RLS) bảo vệ dữ liệu theo User–Gateway mapping (`migrations/000004_supabase_compat.up.sql`).
 5. **Self-hosted Supabase Services**:
    - **Envoy Gateway (`supabase-envoy`)**: Đóng vai trò API Gateway nội bộ điều phối `/auth/v1` và `/storage/v1` (tương thích Kong alias).
@@ -72,10 +75,14 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 ├── docker-compose.yml               # Cấu hình toàn bộ stack dịch vụ (8 container)
 ├── AGENTS.md                        # Đặc tả hệ thống, MVP scope và quyết định kiến trúc
 ├── migrations/                      # SQL migrations cho Database
-│   ├── 000001_init_schema.up.sql    # Relational entities, TimescaleDB hypertable, compression, retention
-│   ├── 000002_fl_tables.up.sql      # (Legacy FL schema - được thay thế bằng Digital Twin migrations)
+│   ├── 000001_init_schema.up.sql    # Relational entities và telemetry hypertable
+│   ├── 000002_digital_twin_tables.up.sql # Digital Twin, command, outbox và temporal hypertable
 │   ├── 000003_supabase_roles.up.sql # Khởi tạo role cho GoTrue Auth và Storage
-│   └── 000004_supabase_compat.up.sql# Khóa ngoại profiles-auth.users, trigger user mới và RLS policies
+│   ├── 000004_supabase_compat.up.sql# Khóa ngoại profiles-auth.users, trigger user mới và RLS policies
+│   ├── 000005_seed_dev_data.up.sql  # Gateway, sensor và Digital Twin mẫu cho development
+│   ├── 000006_add_gateway_ownership_columns.up.sql # Cột ownership và desired-state actor
+│   ├── 000007_backfill_twin_gateway_ownership.up.sql # Backfill ownership cho entity hiện hữu
+│   └── 000008_schema_hardening.up.sql # FK, CHECK, UNIQUE và gỡ retention mặc định
 ├── config/
 │   ├── nginx/
 │   │   └── nginx.conf.template      # Cấu hình Nginx reverse proxy mẫu
@@ -92,7 +99,8 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 │   ├── gen-certs.sh                 # Tạo Root CA và Server Certificate cho Mosquitto TLS
 │   ├── gen-keys.py                  # Sinh ANON_KEY và SERVICE_ROLE_KEY từ JWT_SECRET
 │   ├── init-buckets.sh              # Khởi tạo private storage bucket (media-images)
-│   └── backup-db.sh                 # Sao lưu dữ liệu PostgreSQL + TimescaleDB ra file nén .sql.gz
+│   ├── backup-db.sh                 # Sao lưu dữ liệu PostgreSQL + TimescaleDB ra file nén .sql.gz
+│   └── sql/                         # Preflight, verification và rollback schema hardening
 └── src/
     ├── cmd/
     │   ├── server/                  # Điểm khởi chạy Go Backend Server
@@ -155,6 +163,36 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
    ./scripts/backup-db.sh
    # File backup sẽ được lưu tại thư mục ./backups/
    ```
+
+### 3.3 Áp dụng migration schema hardening
+
+Các file trong `migrations/` được mount vào `/docker-entrypoint-initdb.d` và chỉ tự chạy khi PostgreSQL khởi tạo một data volume mới. Restart container không áp dụng migration mới lên database hiện hữu.
+
+Repository hiện chưa có migration version table. Vì vậy, trên database hiện hữu chỉ áp dụng `000006`–`000008` đúng một lần và chạy script verification để xác nhận; không chạy lại `000008` khi các constraint đã tồn tại.
+
+Trước khi nâng cấp database hiện hữu, tạo backup và chạy preflight:
+
+```bash
+set -a && source .env && set +a
+bash scripts/backup-db.sh
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < scripts/sql/preflight-schema-hardening.sql
+```
+
+Sau khi preflight thành công, áp dụng lần lượt:
+
+```bash
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < migrations/000006_add_gateway_ownership_columns.up.sql
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < migrations/000007_backfill_twin_gateway_ownership.up.sql
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < migrations/000008_schema_hardening.up.sql
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < scripts/sql/verify-schema-hardening.sql
+```
+
+Các lệnh trên giả định `POSTGRES_USER` và `POSTGRES_DB` đã được export từ `.env`. Không chạy `docker compose down -v` trên database có dữ liệu cần giữ.
 
 ---
 
