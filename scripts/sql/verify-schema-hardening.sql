@@ -13,7 +13,28 @@ DECLARE
     gateway_entity UUID;
     test_gateway_id TEXT;
     test_command UUID;
+    max_wait_seconds INTEGER := 60;
+    waited_seconds INTEGER := 0;
+    gateway_column_ready BOOLEAN := FALSE;
 BEGIN
+    LOOP
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'twin_entities'
+              AND column_name = 'gateway_id'
+              AND data_type = 'text'
+              AND is_nullable = 'NO'
+        )
+        INTO gateway_column_ready;
+
+        EXIT WHEN gateway_column_ready OR waited_seconds >= max_wait_seconds;
+
+        PERFORM pg_sleep(1);
+        waited_seconds := waited_seconds + 1;
+    END LOOP;
+
     IF NOT EXISTS (
         SELECT 1
         FROM information_schema.columns
