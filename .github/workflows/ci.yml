@@ -74,13 +74,27 @@ jobs:
             -e STORAGE_DB_PASSWORD=test_storage_password \
             -v "$PWD/migrations:/docker-entrypoint-initdb.d:ro" \
             -d timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
-          for i in $(seq 1 60); do
-            if docker exec migration-check pg_isready -U ci_admin -d ci_custom_db; then
+          migration_ready=false
+          for i in $(seq 1 90); do
+            if docker exec migration-check \
+              psql -U ci_admin -d ci_custom_db -Atc \
+              "SELECT count(*) FROM schema_migrations WHERE version = 9 AND name = 'migration_tracking_and_sensor_urn';" \
+              2>/dev/null | grep -qx 1; then
+              migration_ready=true
               break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' migration-check | grep -qx true; then
+              echo "Migration container stopped before initialization completed."
+              docker logs migration-check
+              exit 1
             fi
             sleep 1
           done
-          docker exec migration-check pg_isready -U ci_admin -d ci_custom_db
+          if [ "$migration_ready" != true ]; then
+            echo "Timed out waiting for migration version 9 to commit."
+            docker logs migration-check
+            exit 1
+          fi
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
             < scripts/sql/verify-schema-hardening.sql
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
