@@ -1,51 +1,58 @@
+version: "2"
+
 run:
   timeout: 5m
   modules-download-mode: readonly
+  go: "1.27"
 
 linters:
+  default: none
   enable:
-    - gofmt
-    - goimports
-    - govet
     - errcheck
+    - govet
     - staticcheck
     - unused
     - ineffassign
     - revive
     - misspell
+  settings:
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+          disabled: false
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
 
-linters-settings:
-  gofmt:
-    simplify: true
-  goimports:
-    local-prefixes: iot-platform
-  revive:
-    rules:
-      - name: exported
-        severity: warning
-        disabled: false
-      - name: blank-imports
-      - name: context-as-argument
-      - name: error-return
-      - name: error-strings
-      - name: error-naming
-      - name: if-return
-      - name: increment-decrement
-      - name: var-naming
-      - name: var-declaration
-      - name: package-comments
-      - name: range
-      - name: receiver-naming
-      - name: time-naming
-      - name: unexported-return
-      - name: indent-error-flow
-      - name: errorf
-      - name: empty-block
-      - name: superfluous-else
-      - name: unused-parameter
-      - name: unreachable-code
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - iot-platform
 
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0

@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main, develop ]
@@ -14,8 +17,8 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
           cache-dependency-path: src/go.sum
@@ -26,9 +29,9 @@ jobs:
       - name: Lint (go vet)
         run: go vet ./...
       - name: Lint (golangci-lint)
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.60
+          version: v2.14.0
           working-directory: ./src
           args: --timeout=5m
       - name: Unit tests
@@ -42,8 +45,8 @@ jobs:
   cross-compile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
           cache-dependency-path: src/go.sum
@@ -52,10 +55,71 @@ jobs:
       - name: Build gateway (linux/armv7 for AM5728)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -o /dev/null ./cmd/gateway
 
+  migration-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - name: Initialize and verify schema
+        run: |
+          cleanup() { docker rm -f migration-check >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run --name migration-check \
+            -e POSTGRES_USER=ci_admin \
+            -e POSTGRES_PASSWORD=test_admin_password \
+            -e POSTGRES_DB=ci_custom_db \
+            -e AUTH_DB_PASSWORD=test_auth_password \
+            -e STORAGE_DB_PASSWORD=test_storage_password \
+            -v "$PWD/migrations:/docker-entrypoint-initdb.d:ro" \
+            -d timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          for i in $(seq 1 60); do
+            if docker exec migration-check pg_isready -U ci_admin -d ci_custom_db; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec migration-check pg_isready -U ci_admin -d ci_custom_db
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
+            < scripts/sql/verify-schema-hardening.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
+            < scripts/sql/verify-migration-000009.sql
+          docker exec migration-check psql -U ci_admin -d ci_custom_db -c \
+            "CREATE TABLE auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}');"
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
+            < migrations/000004_supabase_compat.up.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
+            < migrations/000004_supabase_compat.up.sql
+          docker exec migration-check psql -U ci_admin -d ci_custom_db -Atc \
+            "SELECT count(*) FROM schema_migrations WHERE version = 4 AND name = 'supabase_compat';" \
+            | grep -qx 1
+          docker exec migration-check psql -U ci_admin -d ci_custom_db -Atc \
+            "SELECT count(*) FROM pg_policies WHERE schemaname = 'public';" \
+            | grep -qx 6
+          docker exec migration-check psql -U ci_admin -d ci_custom_db -Atc \
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'on_auth_user_created';" \
+            | grep -qx 1
+          docker exec migration-check psql -U ci_admin -d ci_custom_db -Atc \
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey';" \
+            | grep -qx 1
+          docker run --rm --network container:migration-check \
+            -e PGPASSWORD=test_auth_password \
+            timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a \
+            psql -h 127.0.0.1 -U supabase_auth_admin -d ci_custom_db -Atc "SELECT current_user" \
+            | grep -qx supabase_auth_admin
+          docker run --rm --network container:migration-check \
+            -e PGPASSWORD=test_storage_password \
+            timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a \
+            psql -h 127.0.0.1 -U supabase_storage_admin -d ci_custom_db -Atc "SELECT current_user" \
+            | grep -qx supabase_storage_admin
+          cleanup
+          trap - EXIT
+
   docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build Docker image (backend)
@@ -68,7 +132,32 @@ jobs:
           tags: iot-backend:ci
       - name: Smoke test container
         run: |
-          docker run -d --name test-backend -p 8080:8080 iot-backend:ci
-          sleep 2
+          cleanup() {
+            docker rm -f test-backend smoke-postgres >/dev/null 2>&1 || true
+            docker network rm backend-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker network create backend-smoke
+          docker run -d --name smoke-postgres --network backend-smoke \
+            -e POSTGRES_PASSWORD=test_password \
+            -e POSTGRES_DB=iot_platform \
+            timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          for i in $(seq 1 60); do
+            if docker exec smoke-postgres pg_isready -U postgres -d iot_platform; then
+              break
+            fi
+            sleep 1
+          done
+          docker run -d --name test-backend --network backend-smoke -p 8080:8080 \
+            -e DATABASE_URL=postgres://postgres:test_password@smoke-postgres:5432/iot_platform?sslmode=disable \
+            iot-backend:ci
+          for i in $(seq 1 30); do
+            if curl -f http://localhost:8080/readyz; then
+              break
+            fi
+            sleep 1
+          done
+          curl -f http://localhost:8080/readyz
           curl -f http://localhost:8080/healthz || exit 1
-          docker rm -f test-backend
+          cleanup
+          trap - EXIT
