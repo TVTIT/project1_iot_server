@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # 1. Reverse Proxy (Nginx)
   nginx:
@@ -24,7 +22,7 @@ services:
     container_name: iot_mosquitto
     restart: unless-stopped
     ports:
-      - "1883:1883"
+      - "127.0.0.1:1883:1883"
       - "8883:8883"
     volumes:
       - ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
@@ -76,13 +74,15 @@ services:
 
   # 3. Database: PostgreSQL with TimescaleDB
   postgres:
-    image: timescale/timescaledb:latest-pg16
+    image: timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
     container_name: iot_postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-iot_platform}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?AUTH_DB_PASSWORD is required}
+      STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -95,6 +95,26 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Provision or rotate Supabase database roles on both new and existing volumes.
+  supabase-role-provisioner:
+    image: timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-iot_platform}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?AUTH_DB_PASSWORD is required}
+      STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required}
+    volumes:
+      - ./migrations/000000_configure_supabase_roles.sh:/migrations/000000_configure_supabase_roles.sh:ro
+    command: ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"]
+    networks:
+      - iot_net
 
   # 4. Supabase API Gateway (Envoy - aliased as kong for backwards compatibility)
   supabase-envoy:
@@ -128,8 +148,8 @@ services:
     container_name: supabase_auth
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      supabase-role-provisioner:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
       timeout: 5s
@@ -140,7 +160,7 @@ services:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
       GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-iot_platform}
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${AUTH_DB_PASSWORD:?AUTH_DB_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-iot_platform}
       GOTRUE_SITE_URL: ${GOTRUE_SITE_URL:-http://localhost}
       GOTRUE_URI_ALLOW_LIST: "*"
       GOTRUE_DISABLE_SIGNUP: "false"
@@ -156,14 +176,34 @@ services:
         aliases:
           - auth
 
+  # Apply application constraints that depend on GoTrue's auth.users table.
+  supabase-compat-migration:
+    image: timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      supabase-auth:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - ./migrations/000004_supabase_compat.up.sql:/migrations/000004_supabase_compat.up.sql:ro
+    command:
+      - /bin/sh
+      - -ec
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql
+    networks:
+      - iot_net
+
   # 6. Supabase Storage API
   supabase-storage:
     image: supabase/storage-api:v1.74.0
     container_name: supabase_storage
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      supabase-role-provisioner:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
       timeout: 5s
@@ -175,7 +215,7 @@ services:
       ANON_KEY: ${ANON_KEY}
       SERVICE_KEY: ${SERVICE_ROLE_KEY}
       AUTH_JWT_SECRET: ${JWT_SECRET}
-      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-iot_platform}
+      DATABASE_URL: postgres://supabase_storage_admin:${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-iot_platform}
       STORAGE_BACKEND: file
       FILE_STORAGE_BACKEND_PATH: /var/lib/storage
       GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-iot-storage}
@@ -199,11 +239,23 @@ services:
     environment:
       SERVER_PORT: "8080"
       SERVER_ENV: ${SERVER_ENV:-development}
-      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/iot_platform?sslmode=disable}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      DATABASE_MAX_CONNS: ${DATABASE_MAX_CONNS:-10}
+      DATABASE_MIN_CONNS: ${DATABASE_MIN_CONNS:-1}
+      DATABASE_CONNECT_TIMEOUT: ${DATABASE_CONNECT_TIMEOUT:-10s}
+      READINESS_TIMEOUT: ${READINESS_TIMEOUT:-2s}
+      HTTP_READ_HEADER_TIMEOUT: ${HTTP_READ_HEADER_TIMEOUT:-5s}
+      HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-15s}
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-30s}
+      HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-60s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
       MQTT_BROKER_URL: ${MQTT_BROKER_URL:-tcp://mosquitto:1883}
-      MQTT_CLIENT_ID: "backend_monolith"
-      MQTT_USERNAME: "backend_service"
-      MQTT_PASSWORD: "backend_secret"
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-backend_monolith}
+      MQTT_USERNAME: ${MQTT_USERNAME:?MQTT_USERNAME is required}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD is required}
+      MQTT_QUEUE_CAPACITY: ${MQTT_QUEUE_CAPACITY:-256}
+      MQTT_WORKER_COUNT: ${MQTT_WORKER_COUNT:-4}
+      MQTT_MAX_PAYLOAD_BYTES: ${MQTT_MAX_PAYLOAD_BYTES:-1048576}
       SUPABASE_JWT_SECRET: ${JWT_SECRET}
       SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
       SUPABASE_URL: "http://supabase-envoy:8000"
@@ -212,6 +264,14 @@ services:
         condition: service_healthy
       mosquitto:
         condition: service_started
+      supabase-compat-migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     networks:
       - iot_net
 

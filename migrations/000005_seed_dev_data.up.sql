@@ -1,6 +1,17 @@
 -- Seed Development Data for Local Testing
 -- Includes sample Gateway, Sensors, User-Gateway mapping, and initial Digital Twin entities
 
+\set ON_ERROR_STOP on
+SELECT to_regclass('auth.users') IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'twin_entities'
+             AND column_name = 'gateway_id'
+       ) AS seed_ready \gset
+\if :seed_ready
+
 DO $$
 DECLARE
     v_user_id UUID;
@@ -45,7 +56,8 @@ BEGIN
         entity_id,
         entity_type,
         name,
-        attributes
+        attributes,
+        gateway_id
     ) VALUES (
         v_gw_entity_uuid,
         'urn:ngsi-ld:Gateway:gateway_001',
@@ -55,7 +67,8 @@ BEGIN
             'connectionStatus', 'online',
             'model', 'AM5728',
             'ip', '192.168.1.100'
-        )
+        ),
+        'gateway_001'
     )
     ON CONFLICT (id) DO UPDATE
     SET entity_id = EXCLUDED.entity_id,
@@ -69,16 +82,18 @@ BEGIN
         entity_id,
         entity_type,
         name,
-        attributes
+        attributes,
+        gateway_id
     ) VALUES (
         v_sensor_entity_uuid,
-        'urn:ngsi-ld:Sensor:sensor_001',
+        'urn:ngsi-ld:Sensor:gateway_001:sensor_001',
         'Sensor',
         'Vibration / Accelerometer 100Hz',
         jsonb_build_object(
             'unit', 'm/s2',
             'sampling_frequency_hz', 100
-        )
+        ),
+        'gateway_001'
     )
     ON CONFLICT (id) DO UPDATE
     SET entity_id = EXCLUDED.entity_id,
@@ -125,3 +140,6 @@ BEGIN
         last_desired_at = EXCLUDED.last_desired_at;
 
 END $$;
+\else
+\echo 'Skipping 000005_seed_dev_data: Auth or the application schema is not ready.'
+\endif
