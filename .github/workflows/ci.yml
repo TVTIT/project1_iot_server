@@ -156,22 +156,78 @@ jobs:
             -e POSTGRES_PASSWORD=test_password \
             -e POSTGRES_DB=iot_platform \
             timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
-          for i in $(seq 1 60); do
-            if docker exec smoke-postgres pg_isready -U postgres -d iot_platform; then
+
+          postgres_initialized=false
+          for i in $(seq 1 90); do
+            if docker logs smoke-postgres 2>&1 \
+              | grep -F "PostgreSQL init process complete; ready for start up" >/dev/null; then
+              postgres_initialized=true
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' smoke-postgres | grep -qx true; then
+              echo "PostgreSQL container stopped during initialization."
+              docker logs smoke-postgres
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$postgres_initialized" != true ]; then
+            echo "Timed out waiting for PostgreSQL initialization."
+            docker logs smoke-postgres
+            exit 1
+          fi
+
+          postgres_ready=false
+          for i in $(seq 1 30); do
+            if docker exec smoke-postgres \
+              pg_isready -U postgres -d iot_platform >/dev/null 2>&1; then
+              postgres_ready=true
               break
             fi
             sleep 1
           done
+          if [ "$postgres_ready" != true ]; then
+            echo "PostgreSQL did not become ready after initialization."
+            docker logs smoke-postgres
+            exit 1
+          fi
+
           docker run -d --name test-backend --network backend-smoke -p 8080:8080 \
             -e DATABASE_URL=postgres://postgres:test_password@smoke-postgres:5432/iot_platform?sslmode=disable \
             iot-backend:ci
+
+          backend_ready=false
           for i in $(seq 1 30); do
-            if curl -f http://localhost:8080/readyz; then
+            if curl --fail --silent --connect-timeout 1 --max-time 2 \
+              http://127.0.0.1:8080/readyz >/dev/null; then
+              backend_ready=true
               break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' test-backend | grep -qx true; then
+              echo "Backend container stopped before becoming ready."
+              docker logs test-backend
+              exit 1
             fi
             sleep 1
           done
-          curl -f http://localhost:8080/readyz
-          curl -f http://localhost:8080/healthz || exit 1
+          if [ "$backend_ready" != true ]; then
+            echo "Timed out waiting for backend readiness."
+            docker logs test-backend
+            docker logs smoke-postgres
+            exit 1
+          fi
+
+          if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+            http://127.0.0.1:8080/readyz; then
+            docker logs test-backend
+            docker logs smoke-postgres
+            exit 1
+          fi
+          if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+            http://127.0.0.1:8080/healthz; then
+            docker logs test-backend
+            docker logs smoke-postgres
+            exit 1
+          fi
           cleanup
           trap - EXIT
