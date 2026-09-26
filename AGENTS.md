@@ -441,7 +441,7 @@ Minimum topic namespace:
 
 ```text
 gateways/<gateway_id>/telemetry/#   Gateway may publish
-gateways/<gateway_id>/acks/#        Gateway may publish when app ACK is used
+gateways/<gateway_id>/acks/#        Gateway may subscribe; Go publishes DB-commit ACKs
 gateways/<gateway_id>/status        Gateway may publish when status is in scope
 gateways/<gateway_id>/responses/#   Gateway may publish command results
 gateways/<gateway_id>/commands/#    Gateway may subscribe; Go may publish
@@ -552,7 +552,7 @@ Use stable URN identifiers:
 
 ```text
 urn:ngsi-ld:Gateway:<gateway_id>
-urn:ngsi-ld:Sensor:<sensor_id>
+urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>
 urn:ngsi-ld:Device:<device_id>
 ```
 
@@ -574,7 +574,7 @@ must remain stable. An illustrative API representation is:
   },
   "hasSensor": {
     "type": "Relationship",
-    "object": "urn:ngsi-ld:Sensor:sensor_001"
+    "object": "urn:ngsi-ld:Sensor:gateway_001:sensor_001"
   },
   "@context": [
     "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context.jsonld"

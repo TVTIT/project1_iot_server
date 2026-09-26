@@ -82,7 +82,8 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 │   ├── 000005_seed_dev_data.up.sql  # Gateway, sensor và Digital Twin mẫu cho development
 │   ├── 000006_add_gateway_ownership_columns.up.sql # Cột ownership và desired-state actor
 │   ├── 000007_backfill_twin_gateway_ownership.up.sql # Backfill ownership cho entity hiện hữu
-│   └── 000008_schema_hardening.up.sql # FK, CHECK, UNIQUE và gỡ retention mặc định
+│   ├── 000008_schema_hardening.up.sql # FK, CHECK, UNIQUE và gỡ retention mặc định
+│   └── 000009_migration_tracking_and_sensor_urn.up.sql # Theo dõi version và URN Sensor theo Gateway
 ├── config/
 │   ├── nginx/
 │   │   └── nginx.conf.template      # Cấu hình Nginx reverse proxy mẫu
@@ -164,11 +165,38 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
    # File backup sẽ được lưu tại thư mục ./backups/
    ```
 
+### 3.2.1 Chạy và kiểm tra Go Backend
+
+Backend yêu cầu `DATABASE_URL` hợp lệ và sẽ dừng ngay nếu không kết nối được
+PostgreSQL. Giới hạn pool, HTTP timeout và các giới hạn MQTT dự kiến đều được
+cấu hình qua `.env`; xem `.env.example` để biết tên biến.
+
+```bash
+docker compose up -d backend
+docker compose exec backend wget -qO- http://127.0.0.1:8080/healthz
+docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
+```
+
+- `/healthz` chỉ xác nhận tiến trình HTTP còn hoạt động.
+- `/readyz` xác nhận backend hiện truy cập được dependency bắt buộc.
+- `docker compose stop backend` gửi `SIGTERM` để backend hoàn tất request đang
+  xử lý và đóng PostgreSQL pool.
+
 ### 3.3 Áp dụng migration schema hardening
 
 Các file trong `migrations/` được mount vào `/docker-entrypoint-initdb.d` và chỉ tự chạy khi PostgreSQL khởi tạo một data volume mới. Restart container không áp dụng migration mới lên database hiện hữu.
 
-Repository hiện chưa có migration version table. Vì vậy, trên database hiện hữu chỉ áp dụng `000006`–`000008` đúng một lần và chạy script verification để xác nhận; không chạy lại `000008` khi các constraint đã tồn tại.
+Migration `000009` tạo bảng `schema_migrations` sau khi schema hiện hữu đã được đối chiếu. Trên database hiện hữu, chỉ áp dụng migration này sau khi `000006`–`000008` đã được xác minh; không chạy lại các migration hardening khi constraint đã tồn tại.
+
+`AUTH_DB_PASSWORD` và `STORAGE_DB_PASSWORD` là hai mật khẩu riêng. Service
+one-shot `supabase-role-provisioner` tạo hoặc xoay vòng hai role database trước
+khi GoTrue và Storage khởi động; không dùng lại mật khẩu PostgreSQL superuser
+cho hai dịch vụ này. Vì upstream nhận PostgreSQL URI, hai mật khẩu chỉ dùng ký
+tự URL-safe: chữ cái, chữ số, dấu `.`, `_`, `~` và `-`.
+
+`000005_seed_dev_data.up.sql` là dữ liệu development tùy chọn. Trên database
+mới file này được bỏ qua trong init vì GoTrue chưa tạo `auth.users`; nếu cần dữ
+liệu demo, chạy file một lần sau khi `supabase-compat-migration` hoàn tất.
 
 Trước khi nâng cấp database hiện hữu, tạo backup và chạy preflight:
 
@@ -190,6 +218,12 @@ docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   < migrations/000008_schema_hardening.up.sql
 docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   < scripts/sql/verify-schema-hardening.sql
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < scripts/sql/preflight-migration-000009.sql
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < migrations/000009_migration_tracking_and_sensor_urn.up.sql
+docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  < scripts/sql/verify-migration-000009.sql
 ```
 
 Các lệnh trên giả định `POSTGRES_USER` và `POSTGRES_DB` đã được export từ `.env`. Không chạy `docker compose down -v` trên database có dữ liệu cần giữ.
@@ -233,6 +267,9 @@ Các lệnh trên giả định `POSTGRES_USER` và `POSTGRES_DB` đã được 
 | `/storage/v1/object/*` | Supabase Storage API | Upload/Download tệp tin trực tiếp qua Signed URL |
 
 ### 4.3 MQTT Topic Contract
+
+Đặc tả đầy đủ về payload, retry, sequence, application ACK và định danh Sensor
+nằm tại `docs/protocols/mqtt-v1.md`.
 
 - **Port TLS**: `8883`
 - **Topic Namespace theo chuẩn ACL (`%u` isolation)**:
@@ -300,7 +337,7 @@ Thay vì tích hợp Federated Learning (đã được loại bỏ để tập t
 ### 5.1 Chuẩn định danh & Thực thể NGSI-LD
 - Mỗi thực thể vật lý (Gateway, Sensor, Device/Actuator) có định danh URN bền vững:
   - `urn:ngsi-ld:Gateway:<gateway_id>`
-  - `urn:ngsi-ld:Sensor:<sensor_id>`
+  - `urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>`
   - `urn:ngsi-ld:Device:<device_id>`
 - Lưu trữ quan hệ thực thể trong `twin_relationships` (`hasSensor`, `connectedTo`, `controls`, `managedBy`).
 - Cung cấp biểu diễn JSON-LD tại API boundary với `@context: ["https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context.jsonld"]`.

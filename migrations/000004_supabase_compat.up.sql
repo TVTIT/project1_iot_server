@@ -1,6 +1,18 @@
 -- Supabase Compatibility & Row Level Security (RLS)
 -- NOTE: This migration is applied AFTER Supabase Auth (GoTrue) initializes the auth schema.
 
+\set ON_ERROR_STOP on
+SELECT to_regclass('auth.users') IS NOT NULL AS auth_ready \gset
+\if :auth_ready
+
+CREATE OR REPLACE FUNCTION auth.uid()
+RETURNS uuid
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid
+$$;
+
 -- 1. Add Foreign Key reference from profiles.id to auth.users.id
 DO $$
 BEGIN
@@ -90,3 +102,26 @@ CREATE POLICY "media_objects_select_policy" ON media_objects
               AND ug.user_id = auth.uid()
         )
     );
+
+SELECT to_regclass('public.schema_migrations') IS NOT NULL AS migration_tracking_ready \gset
+\if :migration_tracking_ready
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM schema_migrations
+        WHERE version = 4
+          AND name <> 'supabase_compat'
+    ) THEN
+        RAISE EXCEPTION 'Migration version 4 has an unexpected name';
+    END IF;
+END
+$$;
+
+INSERT INTO schema_migrations (version, name)
+VALUES (4, 'supabase_compat')
+ON CONFLICT (version) DO NOTHING;
+\endif
+\else
+\echo 'Skipping 000004_supabase_compat: auth.users is not initialized yet.'
+\endif

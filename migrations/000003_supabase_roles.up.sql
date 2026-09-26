@@ -18,20 +18,15 @@ BEGIN
 
     -- 2. Create authenticator role (used by PostgREST/APIs to switch to anon/authenticated)
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticator') THEN
-        CREATE ROLE authenticator NOINHERIT LOGIN PASSWORD 'your_secure_postgres_password';
+        CREATE ROLE authenticator NOLOGIN NOINHERIT;
     END IF;
 
-    -- 3. Create admin roles for services
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supabase_auth_admin') THEN
-        CREATE ROLE supabase_auth_admin LOGIN PASSWORD 'your_secure_postgres_password';
-    END IF;
-
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supabase_storage_admin') THEN
-        CREATE ROLE supabase_storage_admin LOGIN PASSWORD 'your_secure_postgres_password';
-    END IF;
-
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supabase_admin') THEN
-        CREATE ROLE supabase_admin LOGIN PASSWORD 'your_secure_postgres_password' BYPASSRLS;
+    -- Service roles and deployment-specific passwords are provisioned by
+    -- 000000_configure_supabase_roles.sh before this migration.
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supabase_auth_admin')
+       OR NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supabase_storage_admin')
+       OR NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'supabase_admin') THEN
+        RAISE EXCEPTION 'Supabase service roles have not been provisioned';
     END IF;
 END
 $$;
@@ -40,17 +35,17 @@ $$;
 GRANT anon, authenticated, service_role TO authenticator;
 GRANT anon, authenticated, service_role TO supabase_storage_admin;
 GRANT anon, authenticated, service_role TO supabase_auth_admin;
-GRANT supabase_auth_admin TO postgres;
-GRANT supabase_storage_admin TO postgres;
-GRANT supabase_admin TO postgres;
+SELECT format('GRANT supabase_auth_admin TO %I', current_user) \gexec
+SELECT format('GRANT supabase_storage_admin TO %I', current_user) \gexec
+SELECT format('GRANT supabase_admin TO %I', current_user) \gexec
 
 -- Schema for Supabase Auth
 CREATE SCHEMA IF NOT EXISTS auth AUTHORIZATION supabase_auth_admin;
 GRANT ALL ON SCHEMA auth TO supabase_auth_admin;
 
 -- Permissions on database & schemas
-GRANT CREATE ON DATABASE iot_platform TO supabase_auth_admin;
-GRANT CREATE ON DATABASE iot_platform TO supabase_storage_admin;
+SELECT format('GRANT CREATE ON DATABASE %I TO supabase_auth_admin', current_database()) \gexec
+SELECT format('GRANT CREATE ON DATABASE %I TO supabase_storage_admin', current_database()) \gexec
 GRANT ALL ON SCHEMA public TO supabase_auth_admin;
 GRANT ALL ON SCHEMA public TO supabase_storage_admin;
 ALTER USER supabase_auth_admin CREATEROLE;
