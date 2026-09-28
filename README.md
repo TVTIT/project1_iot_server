@@ -72,9 +72,17 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 ```text
 .
 ├── .env.example                     # Mẫu biến môi trường cho Docker Compose & Backend
+├── client_rathole.toml.example      # Mẫu cấu hình client Rathole chuyển tiếp cổng MQTT TCP
 ├── docker-compose.yml               # Cấu hình toàn bộ stack dịch vụ (8 container)
 ├── AGENTS.md                        # Đặc tả hệ thống, MVP scope và quyết định kiến trúc
+├── .github/
+│   └── workflows/
+│       └── ci.yml                   # CI pipeline: lint, test, cross-compile, migration, docker smoke
+├── docs/
+│   └── protocols/
+│       └── mqtt-v1.md               # Đặc tả giao thức MQTT v1, payload batch, retry, command và URN
 ├── migrations/                      # SQL migrations cho Database
+│   ├── 000000_configure_supabase_roles.sh # Provision và xoay vòng role database cho Supabase Auth/Storage
 │   ├── 000001_init_schema.up.sql    # Relational entities và telemetry hypertable
 │   ├── 000002_digital_twin_tables.up.sql # Digital Twin, command, outbox và temporal hypertable
 │   ├── 000003_supabase_roles.up.sql # Khởi tạo role cho GoTrue Auth và Storage
@@ -171,16 +179,23 @@ Backend yêu cầu `DATABASE_URL` hợp lệ và sẽ dừng ngay nếu không k
 PostgreSQL. Giới hạn pool, HTTP timeout và các giới hạn MQTT dự kiến đều được
 cấu hình qua `.env`; xem `.env.example` để biết tên biến.
 
+- **Cấu hình tiến trình & kết nối CSDL**:
+  - `SERVER_PORT` (mặc định: `8080`), `SERVER_ENV` (`development` / `production`).
+  - `DATABASE_URL`: URI kết nối PostgreSQL bắt buộc có scheme `postgres://` hoặc `postgresql://`.
+  - `DATABASE_MAX_CONNS` (10), `DATABASE_MIN_CONNS` (1), `DATABASE_CONNECT_TIMEOUT` (10s).
+  - Timeouts HTTP: `READINESS_TIMEOUT` (2s), `HTTP_READ_HEADER_TIMEOUT` (5s), `HTTP_READ_TIMEOUT` (15s), `HTTP_WRITE_TIMEOUT` (30s), `HTTP_IDLE_TIMEOUT` (60s), `SHUTDOWN_TIMEOUT` (10s).
+  - Giới hạn MQTT: `MQTT_QUEUE_CAPACITY` (256), `MQTT_WORKER_COUNT` (4), `MQTT_MAX_PAYLOAD_BYTES` (1MB).
+
 ```bash
 docker compose up -d backend
 docker compose exec backend wget -qO- http://127.0.0.1:8080/healthz
 docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 ```
 
-- `/healthz` chỉ xác nhận tiến trình HTTP còn hoạt động.
-- `/readyz` xác nhận backend hiện truy cập được dependency bắt buộc.
-- `docker compose stop backend` gửi `SIGTERM` để backend hoàn tất request đang
-  xử lý và đóng PostgreSQL pool.
+- `/healthz`: Liveness probe chỉ xác nhận tiến trình HTTP còn hoạt động (trả về `OK`).
+- `/readyz`: Readiness probe xác nhận backend hiện truy cập được CSDL PostgreSQL (`{"status":"ready"}` HTTP 200 hoặc `{"status":"not_ready"}` HTTP 503).
+- Toàn bộ HTTP request/response được gán hoặc chuyển tiếp header `X-Request-ID` (tự động tạo UUIDv4 nếu chưa có) phục vụ distributed tracing.
+- `docker compose stop backend` gửi tín hiệu `SIGTERM` để backend dừng tiếp nhận kết nối mới, hoàn tất request đang xử lý trong thời gian `SHUTDOWN_TIMEOUT` và đóng connection pool PostgreSQL an toàn.
 
 ### 3.3 Áp dụng migration schema hardening
 
@@ -228,20 +243,49 @@ docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 
 Các lệnh trên giả định `POSTGRES_USER` và `POSTGRES_DB` đã được export từ `.env`. Không chạy `docker compose down -v` trên database có dữ liệu cần giữ.
 
+### 3.4 Kiểm thử tự động & CI (Continuous Integration)
+
+Repository tích hợp quy trình kiểm thử tự động toàn diện qua GitHub Actions (`.github/workflows/ci.yml`), bao gồm 4 luồng kiểm tra song song:
+
+1. **`lint-and-test`**:
+   - Kiểm tra định dạng code Go với `gofmt`.
+   - Phân tích tĩnh code bằng `go vet` và `golangci-lint` (v2.14.0).
+   - Chạy toàn bộ Unit Tests với bộ phát hiện tương tranh (`-race`) và xuất báo cáo độ bao phủ (`coverage.out`):
+     ```bash
+     cd src && go test -v -race -coverprofile=coverage.out ./...
+     ```
+2. **`cross-compile`**:
+   - Biên dịch độc lập Go Backend cho `linux/amd64`.
+   - Biên dịch chéo Gateway Simulator (`linux/armv7` với `GOARM=7`) dành cho mục tiêu phần cứng bo TI AM5728.
+3. **`migration-check`**:
+   - Khởi động container TimescaleDB độc lập với cấu hình phân quyền ngẫu nhiên (`ci_admin`, `ci_custom_db`).
+   - Tự động kiểm tra chuỗi migration `000001` đến `000009` và bảng theo dõi `schema_migrations`.
+   - Chạy xác minh preflight, verification script cho schema hardening và URN format.
+   - Giả lập bảng `auth.users`, kiểm tra migration tương thích Supabase (`000004_supabase_compat.up.sql`), xác minh 6 policies RLS, trigger tự động tạo profile và khóa ngoại liên kết.
+   - Kiểm tra khả năng kết nối độc lập của 2 role CSDL `supabase_auth_admin` và `supabase_storage_admin`.
+4. **`docker-build`**:
+   - Đóng gói container image `iot-backend:ci` qua Docker Buildx.
+   - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`).
+
 ---
 
 ## 4. Đặc tả API & Giao thức (API & Protocol Specs)
 
 ### 4.1 REST API (Go Backend)
 
+Mọi HTTP request/response của Go Backend đều được gán hoặc bảo toàn header truy vết `X-Request-ID`.
+
 #### Endpoint hệ thống & Telemetry:
-| Phương thức | Đường dẫn | Xác thực | Mô tả |
-|---|---|---|---|
-| `GET` | `/healthz` | Không | Healthcheck cấp Nginx/container (trả về `OK`) |
-| `GET` | `/v1/health` | Không | Healthcheck Go Backend (`{"status":"running",...}`) |
-| `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) |
-| `GET` | `/v1/ws` | Bearer JWT / Query token | Nâng cấp kết nối WebSocket để streaming telemetry theo thời gian thực |
-| `POST` | `/v1/media/upload-url` | Bearer Gateway JWT | Gateway yêu cầu signed upload URL cho ảnh chụp |
+| Phương thức | Đường dẫn | Xác thực | Mô tả | Trạng thái hiện tại |
+|---|---|---|---|---|
+| `GET` | `/healthz` | Không | Liveness probe cấp Nginx/container (trả về text `OK`) | Hoạt động (HTTP 200) |
+| `GET` | `/readyz` | Không | Readiness probe kiểm tra kết nối PostgreSQL (`{"status":"ready"}`) | Hoạt động (HTTP 200/503) |
+| `GET` | `/v1/health` | Không | Healthcheck Go Backend (`{"status":"running","service":"iot-backend","version":"v1"}`) | Hoạt động (HTTP 200) |
+| `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) | 501 Not Implemented |
+| `GET` | `/v1/ws` | Bearer JWT / Query token | Nâng cấp kết nối WebSocket để streaming telemetry theo thời gian thực | 501 Not Implemented |
+| `POST` | `/v1/media/upload-url` | Bearer Gateway JWT | Gateway yêu cầu signed upload URL cho ảnh chụp | Đang phát triển |
+
+*Ghi chú: Các endpoint trả về `501 Not Implemented` được giữ nguyên cấu trúc routing nhằm bảo toàn hợp đồng API trong quá trình hoàn thiện các service handler theo từng giai đoạn.*
 
 #### Digital Twin & Device Control API (`/v1/*`):
 | Phương thức | Đường dẫn | Xác thực | Mô tả |
