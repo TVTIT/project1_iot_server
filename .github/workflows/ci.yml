@@ -70,15 +70,16 @@ jobs:
             -e POSTGRES_USER=ci_admin \
             -e POSTGRES_PASSWORD=test_admin_password \
             -e POSTGRES_DB=ci_custom_db \
-            -e AUTH_DB_PASSWORD=test_auth_password \
-            -e STORAGE_DB_PASSWORD=test_storage_password \
+            -e AUTH_DB_PASSWORD=test_auth_password_1234 \
+            -e STORAGE_DB_PASSWORD=test_storage_password_1234 \
+            -e BACKEND_DB_PASSWORD=test_backend_password_1234 \
             -v "$PWD/migrations:/docker-entrypoint-initdb.d:ro" \
             -d timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
           migration_ready=false
           for i in $(seq 1 90); do
             if docker exec migration-check \
               psql -U ci_admin -d ci_custom_db -Atc \
-              "SELECT count(*) FROM schema_migrations WHERE version = 9 AND name = 'migration_tracking_and_sensor_urn';" \
+              "SELECT count(*) FROM schema_migrations WHERE version = 10 AND name = 'stage2_auth_and_provisioning';" \
               2>/dev/null | grep -qx 1; then
               migration_ready=true
               break
@@ -91,7 +92,7 @@ jobs:
             sleep 1
           done
           if [ "$migration_ready" != true ]; then
-            echo "Timed out waiting for migration version 9 to commit."
+            echo "Timed out waiting for migration version 10 to commit."
             docker logs migration-check
             exit 1
           fi
@@ -99,6 +100,8 @@ jobs:
             < scripts/sql/verify-schema-hardening.sql
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
             < scripts/sql/verify-migration-000009.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
+            < scripts/sql/verify-migration-000010.sql
           docker exec migration-check psql -U ci_admin -d ci_custom_db -c \
             "CREATE TABLE auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}');"
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
@@ -118,17 +121,19 @@ jobs:
             "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey';" \
             | grep -qx 1
           docker run --rm --network container:migration-check \
-            -e PGPASSWORD=test_auth_password \
+            -e PGPASSWORD=test_auth_password_1234 \
             timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a \
             psql -h 127.0.0.1 -U supabase_auth_admin -d ci_custom_db -Atc "SELECT current_user" \
             | grep -qx supabase_auth_admin
           docker run --rm --network container:migration-check \
-            -e PGPASSWORD=test_storage_password \
+            -e PGPASSWORD=test_storage_password_1234 \
             timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a \
             psql -h 127.0.0.1 -U supabase_storage_admin -d ci_custom_db -Atc "SELECT current_user" \
             | grep -qx supabase_storage_admin
           cleanup
           trap - EXIT
+      - name: Verify Stage 2 migration upgrades
+        run: sh scripts/test-stage2-migrations.sh
 
   docker-build:
     runs-on: ubuntu-latest

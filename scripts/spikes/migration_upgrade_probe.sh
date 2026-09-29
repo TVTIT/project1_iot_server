@@ -16,15 +16,16 @@ docker run --name "$CONTAINER" \
     -e POSTGRES_USER=spike_admin \
     -e POSTGRES_PASSWORD="$PASSWORD" \
     -e POSTGRES_DB="$DATABASE" \
-    -e AUTH_DB_PASSWORD=stage2_auth_password \
-    -e STORAGE_DB_PASSWORD=stage2_storage_password \
+    -e AUTH_DB_PASSWORD=stage2_auth_password_1234 \
+    -e STORAGE_DB_PASSWORD=stage2_storage_password_1234 \
+    -e BACKEND_DB_PASSWORD=stage2_backend_password_1234 \
     -v "$PROJECT_ROOT/migrations:/docker-entrypoint-initdb.d:ro" \
     -d "$IMAGE" >/dev/null
 
 ready=false
 for _ in $(seq 1 90); do
     if docker exec "$CONTAINER" psql -U spike_admin -d "$DATABASE" -Atc \
-        "SELECT count(*) FROM schema_migrations WHERE version = 9" 2>/dev/null |
+        "SELECT count(*) FROM schema_migrations WHERE version = 10 AND name = 'stage2_auth_and_provisioning'" 2>/dev/null |
         grep -qx 1; then
         ready=true
         break
@@ -43,14 +44,14 @@ BEGIN;
 SELECT pg_advisory_xact_lock(3290, 2);
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 10) THEN
+    IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 900010) THEN
         CREATE TABLE stage2_migration_probe (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
             applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         INSERT INTO stage2_migration_probe DEFAULT VALUES;
         INSERT INTO schema_migrations (version, name)
-        VALUES (10, 'stage2_upgrade_probe');
+        VALUES (900010, 'stage2_upgrade_probe');
     END IF;
 END
 $$;
@@ -67,7 +68,7 @@ wait "$second_pid"
 run_probe_migration >/dev/null
 
 docker exec "$CONTAINER" psql -U spike_admin -d "$DATABASE" -Atc \
-    "SELECT count(*) FROM schema_migrations WHERE version = 10 AND name = 'stage2_upgrade_probe'" |
+    "SELECT count(*) FROM schema_migrations WHERE version = 900010 AND name = 'stage2_upgrade_probe'" |
     grep -qx 1
 docker exec "$CONTAINER" psql -U spike_admin -d "$DATABASE" -Atc \
     "SELECT count(*) FROM stage2_migration_probe" |

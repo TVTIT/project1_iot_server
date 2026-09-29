@@ -197,17 +197,20 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 - Toàn bộ HTTP request/response được gán hoặc chuyển tiếp header `X-Request-ID` (tự động tạo UUIDv4 nếu chưa có) phục vụ distributed tracing.
 - `docker compose stop backend` gửi tín hiệu `SIGTERM` để backend dừng tiếp nhận kết nối mới, hoàn tất request đang xử lý trong thời gian `SHUTDOWN_TIMEOUT` và đóng connection pool PostgreSQL an toàn.
 
-### 3.3 Áp dụng migration schema hardening
+### 3.3 Áp dụng migration
 
-Các file trong `migrations/` được mount vào `/docker-entrypoint-initdb.d` và chỉ tự chạy khi PostgreSQL khởi tạo một data volume mới. Restart container không áp dụng migration mới lên database hiện hữu.
+Các migration `000001` đến `000009` trong `/docker-entrypoint-initdb.d` chỉ tự
+chạy khi PostgreSQL khởi tạo data volume mới. Từ version 10, service one-shot
+`application-migrations` dùng `schema_migrations` và PostgreSQL advisory lock để
+áp dụng migration chưa chạy trên cả volume mới và volume hiện hữu đã baseline.
 
 Migration `000009` tạo bảng `schema_migrations` sau khi schema hiện hữu đã được đối chiếu. Trên database hiện hữu, chỉ áp dụng migration này sau khi `000006`–`000008` đã được xác minh; không chạy lại các migration hardening khi constraint đã tồn tại.
 
-`AUTH_DB_PASSWORD` và `STORAGE_DB_PASSWORD` là hai mật khẩu riêng. Service
-one-shot `supabase-role-provisioner` tạo hoặc xoay vòng hai role database trước
+`AUTH_DB_PASSWORD`, `STORAGE_DB_PASSWORD` và `BACKEND_DB_PASSWORD` là ba mật
+khẩu riêng. Service one-shot `supabase-role-provisioner` tạo hoặc xoay vòng các role database trước
 khi GoTrue và Storage khởi động; không dùng lại mật khẩu PostgreSQL superuser
-cho hai dịch vụ này. Vì upstream nhận PostgreSQL URI, hai mật khẩu chỉ dùng ký
-tự URL-safe: chữ cái, chữ số, dấu `.`, `_`, `~` và `-`.
+cho các dịch vụ này. Password phải có ít nhất 22 ký tự URL-safe. Backend kết
+nối bằng `iot_backend_app`, không dùng PostgreSQL superuser.
 
 `000005_seed_dev_data.up.sql` là dữ liệu development tùy chọn. Trên database
 mới file này được bỏ qua trong init vì GoTrue chưa tạo `auth.users`; nếu cần dữ
@@ -243,6 +246,10 @@ docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 
 Các lệnh trên giả định `POSTGRES_USER` và `POSTGRES_DB` đã được export từ `.env`. Không chạy `docker compose down -v` trên database có dữ liệu cần giữ.
 
+Sau khi database đã có baseline version 9, các migration mới được áp dụng tự
+động khi chạy Compose. Xem quy trình Task 2.1, backend role và bootstrap
+platform admin tại `docs/backend/stage-2-task-2.1-migrations.md`.
+
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
 Repository tích hợp quy trình kiểm thử tự động toàn diện qua GitHub Actions (`.github/workflows/ci.yml`), bao gồm 4 luồng kiểm tra song song:
@@ -259,10 +266,11 @@ Repository tích hợp quy trình kiểm thử tự động toàn diện qua Git
    - Biên dịch chéo Gateway Simulator (`linux/armv7` với `GOARM=7`) dành cho mục tiêu phần cứng bo TI AM5728.
 3. **`migration-check`**:
    - Khởi động container TimescaleDB độc lập với cấu hình phân quyền ngẫu nhiên (`ci_admin`, `ci_custom_db`).
-   - Tự động kiểm tra chuỗi migration `000001` đến `000009` và bảng theo dõi `schema_migrations`.
-   - Chạy xác minh preflight, verification script cho schema hardening và URN format.
+    - Tự động kiểm tra chuỗi migration đến `000010` và bảng theo dõi `schema_migrations`.
+    - Kiểm tra clean install, upgrade từ version 9, hai runner đồng thời và chạy lặp.
+    - Chạy verification cho schema hardening, URN, platform admin, credential metadata và backend database role.
    - Giả lập bảng `auth.users`, kiểm tra migration tương thích Supabase (`000004_supabase_compat.up.sql`), xác minh 6 policies RLS, trigger tự động tạo profile và khóa ngoại liên kết.
-   - Kiểm tra khả năng kết nối độc lập của 2 role CSDL `supabase_auth_admin` và `supabase_storage_admin`.
+    - Kiểm tra khả năng kết nối độc lập của các role CSDL Supabase và quyền tối thiểu của `iot_backend_app`.
 4. **`docker-build`**:
    - Đóng gói container image `iot-backend:ci` qua Docker Buildx.
    - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`).

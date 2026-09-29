@@ -83,6 +83,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-iot_platform}
       AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?AUTH_DB_PASSWORD is required}
       STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required}
+      BACKEND_DB_PASSWORD: ${BACKEND_DB_PASSWORD:?BACKEND_DB_PASSWORD is required}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -110,9 +111,31 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-iot_platform}
       AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?AUTH_DB_PASSWORD is required}
       STORAGE_DB_PASSWORD: ${STORAGE_DB_PASSWORD:?STORAGE_DB_PASSWORD is required}
+      BACKEND_DB_PASSWORD: ${BACKEND_DB_PASSWORD:?BACKEND_DB_PASSWORD is required}
     volumes:
       - ./migrations/000000_configure_supabase_roles.sh:/migrations/000000_configure_supabase_roles.sh:ro
     command: ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"]
+    networks:
+      - iot_net
+
+  # Apply tracked application migrations to both new and existing volumes.
+  application-migrations:
+    image: timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      supabase-role-provisioner:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      PGDATABASE: ${POSTGRES_DB:-iot_platform}
+    volumes:
+      - ./migrations:/migrations:ro
+      - ./scripts/run-migrations.sh:/run-migrations.sh:ro
+    command: ["/bin/sh", "/run-migrations.sh"]
     networks:
       - iot_net
 
@@ -185,6 +208,8 @@ services:
         condition: service_healthy
       supabase-auth:
         condition: service_healthy
+      application-migrations:
+        condition: service_completed_successfully
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
@@ -265,6 +290,8 @@ services:
       mosquitto:
         condition: service_started
       supabase-compat-migration:
+        condition: service_completed_successfully
+      application-migrations:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/readyz"]
