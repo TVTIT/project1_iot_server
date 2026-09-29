@@ -101,7 +101,7 @@ BEGIN
     END IF;
 
     gateway_entity := gen_random_uuid();
-    test_gateway_id := '__schema_hardening_test_' || replace(gen_random_uuid()::text, '-', '');
+    test_gateway_id := 'schema_hardening_test_' || replace(gen_random_uuid()::text, '-', '');
 
     INSERT INTO gateways (gateway_id, name)
     VALUES (test_gateway_id, 'Schema hardening verification Gateway');
