@@ -199,6 +199,10 @@ jobs:
 
           docker run -d --name test-backend --network backend-smoke -p 8080:8080 \
             -e DATABASE_URL=postgres://postgres:test_password@smoke-postgres:5432/iot_platform?sslmode=disable \
+            -e SUPABASE_JWT_SECRET=ci-only-jwt-secret-at-least-32-characters \
+            -e SUPABASE_JWT_ISSUER=http://auth.test.local/auth/v1 \
+            -e SUPABASE_JWT_AUDIENCE=authenticated \
+            -e SUPABASE_JWT_CLOCK_SKEW=30s \
             iot-backend:ci
 
           backend_ready=false

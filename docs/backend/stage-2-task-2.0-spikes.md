@@ -69,6 +69,22 @@ trúc response và in `jwks_key_count`; số lượng key là observation, khôn
 Phương án 1 được ưu tiên. Không được âm thầm thêm `SUPABASE_JWT_ISSUER` rồi bỏ
 qua kiểm tra khi claim vắng mặt.
 
+### Kiểm chứng bổ sung cho Task 2.2.0 (2026-09-30)
+
+Kết quả ở trên là quan sát lịch sử trước khi cấu hình issuer, không bị thay thế.
+Với `supabase/gotrue:v2.196.0`, đặt `GOTRUE_JWT_ISSUER` trong Compose (local:
+`http://localhost/auth/v1`) đã làm access token mới từ login **và** refresh
+có claim `iss` khớp chính xác cấu hình. Spike hiện yêu cầu issuer và audience
+qua environment, xác minh chữ ký HS256 và fail nếu thiếu hoặc sai `iss` ở một
+trong hai token; output chỉ ghi `issuer_matches_expected=true`, không in token
+hay secret. Lần chạy local qua Nginx/API Gateway đạt: audience `authenticated`,
+role `authenticated`, subject UUID, refresh contract stable và JWKS key count 0.
+
+Sau khi đổi issuer, token cũ không có `iss` phải login/refresh lại trước khi
+backend bắt buộc kiểm tra issuer ở các bước tiếp theo của Task 2.2. Trên mỗi
+deployment, issuer phải là public Auth URL tương ứng, không sao chép giá trị
+`localhost` vào production.
+
 ## Spike S2 - Mosquitto static password reload
 
 Script: `scripts/spikes/mosquitto_password_reload.sh`

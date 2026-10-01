@@ -29,7 +29,9 @@ def decode_segment(value: str) -> dict[str, object]:
     return json.loads(base64.urlsafe_b64decode(value + padding))
 
 
-def verify_token(token: str, secret: str) -> tuple[dict[str, object], dict[str, object]]:
+def verify_token(
+    token: str, secret: str, expected_issuer: str, expected_audience: str
+) -> tuple[dict[str, object], dict[str, object]]:
     parts = token.split(".")
     if len(parts) != 3:
         raise RuntimeError("access token is not a three-part JWT")
@@ -47,14 +49,17 @@ def verify_token(token: str, secret: str) -> tuple[dict[str, object], dict[str, 
         raise RuntimeError("JWT signature verification failed")
 
     now = int(time.time())
-    for claim in ("aud", "sub", "role", "iat", "exp"):
+    for claim in ("iss", "aud", "sub", "role", "iat", "exp"):
         if claim not in claims:
             raise RuntimeError(f"JWT is missing required claim {claim!r}")
+    if claims["iss"] != expected_issuer:
+        raise RuntimeError("JWT issuer does not match GOTRUE_JWT_ISSUER")
     if not isinstance(claims["exp"], int) or claims["exp"] <= now:
         raise RuntimeError("JWT is expired or has a non-integer exp claim")
+    if not isinstance(claims["iat"], int):
+        raise RuntimeError("JWT has a non-integer iat claim")
     if claims.get("role") != "authenticated":
         raise RuntimeError(f"unexpected human-user role: {claims.get('role')!r}")
-    expected_audience = os.environ.get("JWT_SPIKE_EXPECTED_AUDIENCE", "authenticated")
     audience = claims.get("aud")
     if audience != expected_audience and not (
         isinstance(audience, list) and expected_audience in audience
@@ -97,6 +102,8 @@ def main() -> int:
     anon_key = required("ANON_KEY")
     service_key = required("SERVICE_ROLE_KEY")
     jwt_secret = required("JWT_SECRET")
+    expected_issuer = required("GOTRUE_JWT_ISSUER")
+    expected_audience = required("SUPABASE_JWT_AUDIENCE")
     email = f"stage2-jwt-spike-{secrets.token_hex(8)}@example.invalid"
     password = secrets.token_urlsafe(24)
     user_id = ""
@@ -131,7 +138,9 @@ def main() -> int:
         refresh_token = login.get("refresh_token")
         if not isinstance(access_token, str) or not isinstance(refresh_token, str):
             raise RuntimeError("password login did not return access and refresh tokens")
-        header, claims = verify_token(access_token, jwt_secret)
+        header, claims = verify_token(
+            access_token, jwt_secret, expected_issuer, expected_audience
+        )
 
         refreshed = request_json(
             f"{base_url}/auth/v1/token?grant_type=refresh_token",
@@ -141,11 +150,11 @@ def main() -> int:
         refreshed_token = refreshed.get("access_token")
         if not isinstance(refreshed_token, str):
             raise RuntimeError("refresh flow did not return an access token")
-        refreshed_header, refreshed_claims = verify_token(refreshed_token, jwt_secret)
+        refreshed_header, refreshed_claims = verify_token(
+            refreshed_token, jwt_secret, expected_issuer, expected_audience
+        )
 
-        stable_claims = ("aud", "sub", "role")
-        if "iss" in claims or "iss" in refreshed_claims:
-            stable_claims += ("iss",)
+        stable_claims = ("iss", "aud", "sub", "role")
         for claim in stable_claims:
             if claims.get(claim) != refreshed_claims.get(claim):
                 raise RuntimeError(f"claim {claim!r} changed during token refresh")
@@ -153,8 +162,7 @@ def main() -> int:
         summary = {
             "algorithm": header["alg"],
             "refresh_algorithm": refreshed_header["alg"],
-            "issuer": claims.get("iss"),
-            "issuer_present": "iss" in claims,
+            "issuer_matches_expected": True,
             "jwks_key_count": len(keys),
             "audience": claims["aud"],
             "role": claims["role"],
