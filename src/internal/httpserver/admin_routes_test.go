@@ -3,12 +3,13 @@ package httpserver
 import (
 	"context"
 	"errors"
-	"iot-platform/internal/auth"
-	"iot-platform/internal/httpapi"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"iot-platform/internal/auth"
+	"iot-platform/internal/httpapi"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
