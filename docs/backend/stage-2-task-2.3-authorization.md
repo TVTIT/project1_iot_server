@@ -5,9 +5,10 @@
 **Task 2.3.0 hoàn thành:** kiểm tra baseline và chốt contract dưới đây.
 **Task 2.3.1–2.3.2 đã triển khai và kiểm chứng local isolated**;
 **Task 2.3.3–2.3.4 đã triển khai và kiểm chứng local**;
-**Task 2.3.5–2.3.7 chưa triển khai**. Router đã đăng ký `GET /v1/gateways`
-dưới authenticated group; Sensor list route chưa đăng ký, vẫn nhận `404`
-từ NoRoute. Contract Sensor dưới đây chưa phải bằng chứng API hoạt động.
+**Task 2.3.5 đã triển khai và kiểm chứng local**;
+**Task 2.3.6–2.3.7 chưa triển khai**. Router đã đăng ký cả Gateway list và
+Sensor list dưới authenticated group. Chưa áp dụng deployment hoặc kiểm chứng
+hai API bằng token GoTrue thật qua Nginx/Envoy; bằng chứng local ở mục 8.
 
 Chỉ triển khai:
 
@@ -309,3 +310,64 @@ methods và listGateways handler đạt 100%. Coverage
 gateway khi chạy harness unit + DB integration 97,6%. Coverage httpserver của
 harness chỉ chạy subset tests, không đại diện coverage toàn package.
 Chưa commit/push, chưa xác nhận CI GitHub cho thay đổi này và chưa áp dụng deployment.
+
+## 8. Kết quả Task 2.3.5 — Sensor list API
+
+Thêm `GET /v1/gateways/{gateway_id}/sensors` qua authenticated group. Reader
+lấy UUID từ Principal; validate Gateway ID trước gọi service; không parse GET
+body thành identity. Query user_id (rỗng/lặp) bị 400. SensorReader là dependency
+nhỏ bắt buộc của router, nil/typed-nil chặn startup wiring; main inject cùng
+gateway.Service hiện có, không tạo pool hoặc query authorization thứ hai.
+
+Response thành công giữ `gateway_id`, `items` luôn là array; mỗi sensor có
+sensor_id/name/unit/created_at, nullable metadata giữ NULL, timestamp UTC và
+no-store. Thứ tự từ SQL sensor_id ASC, không sort theo arrival/created_at.
+
+Error mapping đã kiểm chứng:
+
+| Trường hợp | Status / code |
+|---|---|
+| Missing/invalid JWT | 401 / unauthorized |
+| Invalid matched Gateway ID/query user_id | 400 / invalid_request |
+| Unknown/inaccessible Gateway | 404 / not_found, cùng message resource not found |
+| Deadline/cancellation | 503 / service_unavailable |
+| Internal DB errors | 500 / internal_error |
+
+URL không match route vẫn dùng NoRoute. Không kiểm tra existence không scoped
+để phân biệt Gateway của người khác với Gateway không tồn tại. Expected denial
+không log chi tiết tài nguyên; unexpected failures chỉ log request ID, operation,
+safe error category. Không log raw DB error, connection string hoặc token.
+
+### TDD và verification
+
+RED: `go test ./internal/httpserver` compile fail do SensorReader/listSensors
+và RouterDependencies.SensorReader chưa tồn tại. Sau implement cùng unit suite
+GREEN, không tạo checkpoint commit tự động.
+
+| Guarantee | Test |
+|---|---|
+| JWT trước reader, matched invalid ID không gọi reader, query/body chống giả danh | TestSensorListBoundary |
+| DTO 4 fields, NULL, UTC, no-store và thứ tự | TestSensorListBoundary |
+| Empty Gateway 200, safe 404/500/503, request ID và log secrecy | TestSensorListErrorsAndEmpty |
+| Missing principal không chạm reader | TestSensorHandlerMissingPrincipal |
+| Nil/typed-nil SensorReader fail closed | TestRouterRejectsMissingSensorReader |
+| A/B isolation, ba role, admin/no-member denial, cùng sensor ID ở hai Gateway | TestGatewayHTTPAuthorizationIntegration |
+| Real PostgreSQL empty parent trước sensor provisioning; revoke và user B không ảnh hưởng | Cùng HTTP integration |
+| Khóa bảng sensors -> timeout 503, unlock -> 200 | Cùng HTTP integration |
+
+`sh scripts/test-stage2-authorization.sh` mở rộng chạy Sensor unit/HTTP tests
+và PostgreSQL integration dưới `iot_backend_app`; setup fixture bằng admin
+connection isolated. JWT test HS256 theo contract hiện có, không dùng secret
+deployment. Harness resources đã cleanup, không sửa `.env` hoặc stack thật.
+
+Verification local đã chạy: Go race tests `-count=1`, vet/build, golangci-lint
+v2.14.0 **0 issues**, 11 Python harness tests, Auth/admin/migration/smoke
+regression và authorization harness đều PASS. Unit coverage tổng **84,0%**;
+httpserver **99,2%**, listSensors handler **100%**. Authorization harness
+coverage gateway **97,6%**, httpserver **85,4%** (chỉ subset tests, không thay
+thế coverage toàn package).
+
+Chưa triển khai Task 2.3.6: Auth harness cũ vẫn pass nhưng chưa gọi hai API mới
+với GoTrue thật qua proxy. Chưa commit/push và chưa xác nhận CI cho thay đổi
+Task 2.3.5; mốc M3 còn chờ người dùng yêu cầu. Task 2.3.7 nghiệm thu toàn bộ
+không được đánh dấu xong chỉ vì Sensor HTTP test xanh.
