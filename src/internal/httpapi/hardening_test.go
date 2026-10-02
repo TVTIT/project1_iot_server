@@ -1,13 +1,14 @@
 package httpapi
 
 import (
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 func TestRequestIDRejectsDuplicateAndControlCharacters(t *testing.T) {

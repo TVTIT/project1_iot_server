@@ -3,15 +3,16 @@ package httpserver
 import (
 	"context"
 	"errors"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"iot-platform/internal/auth"
 	"iot-platform/internal/httpapi"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 func TestAdminGroupWithRealVerifier(t *testing.T) {
