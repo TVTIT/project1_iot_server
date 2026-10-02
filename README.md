@@ -2,6 +2,12 @@
 
 Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biến thời gian thực từ các Gateway không đồng nhất (heterogeneous Gateways: ESP32, Luckfox Pico Plus, TI AM5728), lưu trữ chuỗi thời gian (time-series) trên TimescaleDB, hỗ trợ truy vấn lịch sử, streaming dữ liệu thời gian thực qua WebSocket, xác thực và phân quyền người dùng thông qua Supabase Auth/RLS, quản lý tải lên media (hình ảnh) qua private storage, và tích hợp phân hệ **Digital Twin** (quản lý thực thể theo chuẩn NGSI-LD, đồng bộ trạng thái `reported_state` / `desired_state`, điều khiển Gateway qua MQTT Transactional Outbox và lưu trữ lịch sử thuộc tính biến thiên theo thời gian).
 
+Đây là kiến trúc/mục tiêu MVP, không phải toàn bộ tính năng đã hoàn thành.
+Task 2.2 đã có JWT authentication và PostgreSQL platform-admin guard; các
+business route hiện còn stub hoặc chưa đăng ký. Xem
+[contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md)
+để phân biệt phần đã triển khai với User–Gateway permissions/WebSocket tương lai.
+
 ---
 
 ## 1. Kiến trúc tổng thể (System Architecture)
@@ -136,14 +142,25 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
    ```
 
 2. **Khởi tạo JWT Secret & Supabase API Keys**:
-   Chạy script để sinh `ANON_KEY` và `SERVICE_ROLE_KEY` tương ứng với `JWT_SECRET` của bạn (độ dài tối thiểu 32 ký tự):
-   ```bash
-   python3 scripts/gen-keys.py "super-secret-jwt-token-with-at-least-32-characters-long"
-   ```
-   Cập nhật các giá trị in ra vào file `.env`:
-   - `JWT_SECRET`
-   - `ANON_KEY`
-   - `SERVICE_ROLE_KEY`
+    Sinh signing secret ngẫu nhiên, lưu kín vào `JWT_SECRET` trong `.env`:
+    ```bash
+    openssl rand -hex 32
+    ```
+    Không dùng sample secret/placeholder; không commit hoặc chia sẻ output.
+    `ANON_KEY` và `SERVICE_ROLE_KEY` phải ký bằng cùng secret. Script hiện có
+    `scripts/gen-keys.py` hỗ trợ `JWT_SECRET` đã export, nhưng cũng có **public
+    fallback** nếu không cấu hình và in keys ra stdout. Không truyền secret qua
+    argv (lộ process listing/history), không bật `set -x`; bảo vệ output và
+    kiểm tra biến không rỗng nếu dùng cho local. Script chưa phải workflow
+    production an toàn cho tới khi được sửa/kiểm tra riêng. Không có xác nhận
+    secret đã rotate; đổi secret không mặc nhiên thu hồi refresh sessions.
+
+    Cấu hình `GOTRUE_JWT_ISSUER=http://localhost/auth/v1` cho local;
+    production dùng public HTTPS issuer đã chọn. Compose mapping biến này vào
+    `SUPABASE_JWT_ISSUER` của Go, audience/role phải là `authenticated`.
+    Token cũ thiếu issuer phải refresh/login lại. `service_role` không phải
+    human platform admin và không được cấp cho Gateway/Flutter. Xem
+    [hướng dẫn Task 2.2](docs/backend/stage-2-task-2.2-authentication.md).
 
 3. **Khởi tạo chứng chỉ TLS cho Mosquitto Broker**:
    ```bash
@@ -179,6 +196,12 @@ Backend yêu cầu `DATABASE_URL` hợp lệ và sẽ dừng ngay nếu không k
 PostgreSQL. Giới hạn pool, HTTP timeout và các giới hạn MQTT dự kiến đều được
 cấu hình qua `.env`; xem `.env.example` để biết tên biến.
 
+Compose yêu cầu `JWT_SECRET`, `GOTRUE_JWT_ISSUER` và
+`SUPABASE_JWT_AUDIENCE=authenticated`; backend nhận các biến
+`SUPABASE_JWT_SECRET`/`SUPABASE_JWT_ISSUER` qua mapping Compose.
+`SUPABASE_JWT_CLOCK_SKEW` mặc định `30s` (0–5m),
+`AUTHORIZATION_TIMEOUT` mặc định `2s` cho lookup platform admin.
+
 - **Cấu hình tiến trình & kết nối CSDL**:
   - `SERVER_PORT` (mặc định: `8080`), `SERVER_ENV` (`development` / `production`).
   - `DATABASE_URL`: URI kết nối PostgreSQL bắt buộc có scheme `postgres://` hoặc `postgresql://`.
@@ -193,7 +216,7 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 ```
 
 - `/healthz`: Liveness probe chỉ xác nhận tiến trình HTTP còn hoạt động (trả về `OK`).
-- `/readyz`: Readiness probe xác nhận backend hiện truy cập được CSDL PostgreSQL (`{"status":"ready"}` HTTP 200 hoặc `{"status":"not_ready"}` HTTP 503).
+- `/readyz`: Readiness probe xác nhận backend hiện truy cập được CSDL PostgreSQL (`{"status":"ready"}` HTTP 200 hoặc safe error envelope `service_unavailable` HTTP 503).
 - Toàn bộ HTTP request/response được gán hoặc chuyển tiếp header `X-Request-ID` (tự động tạo UUIDv4 nếu chưa có) phục vụ distributed tracing.
 - `docker compose stop backend` gửi tín hiệu `SIGTERM` để backend dừng tiếp nhận kết nối mới, hoàn tất request đang xử lý trong thời gian `SHUTDOWN_TIMEOUT` và đóng connection pool PostgreSQL an toàn.
 
@@ -252,7 +275,7 @@ platform admin tại `docs/backend/stage-2-task-2.1-migrations.md`.
 
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
-Repository tích hợp quy trình kiểm thử tự động toàn diện qua GitHub Actions (`.github/workflows/ci.yml`), bao gồm 4 luồng kiểm tra song song:
+Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.1**, bao gồm 5 luồng kiểm tra song song:
 
 1. **`lint-and-test`**:
    - Kiểm tra định dạng code Go với `gofmt`.
@@ -273,7 +296,11 @@ Repository tích hợp quy trình kiểm thử tự động toàn diện qua Git
     - Kiểm tra khả năng kết nối độc lập của các role CSDL Supabase và quyền tối thiểu của `iot_backend_app`.
 4. **`docker-build`**:
    - Đóng gói container image `iot-backend:ci` qua Docker Buildx.
-   - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`).
+    - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`).
+5. **`auth-integration`**:
+    - Python harness regression, GoTrue login/refresh qua Nginx/Envoy và PostgreSQL admin guard.
+    - Từ repo root: `sh scripts/test-stage2-auth.sh` và `sh scripts/test-stage2-admin.sh`.
+    - Các harness auth/smoke/admin/migration dùng tài nguyên isolated, không đọc/sửa `.env` deployment; lệnh đầy đủ và prerequisites tại [Task 2.2](docs/backend/stage-2-task-2.2-authentication.md#7-lệnh-verification-có-thể-chạy).
 
 ---
 
@@ -290,12 +317,22 @@ Mọi HTTP request/response của Go Backend đều được gán hoặc bảo t
 | `GET` | `/readyz` | Không | Readiness probe kiểm tra kết nối PostgreSQL (`{"status":"ready"}`) | Hoạt động (HTTP 200/503) |
 | `GET` | `/v1/health` | Không | Healthcheck Go Backend (`{"status":"running","service":"iot-backend","version":"v1"}`) | Hoạt động (HTTP 200) |
 | `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) | 501 Not Implemented |
-| `GET` | `/v1/ws` | Bearer JWT / Query token | Nâng cấp kết nối WebSocket để streaming telemetry theo thời gian thực | 501 Not Implemented |
-| `POST` | `/v1/media/upload-url` | Bearer Gateway JWT | Gateway yêu cầu signed upload URL cho ảnh chụp | Đang phát triển |
+| `GET` | `/v1/ws` | Human Bearer JWT (chỉ header) | Stub; chưa nâng cấp WebSocket hoặc streaming | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
+| `GET` | `/v1/digital-twins` | Human Bearer JWT (Supabase) | Stub danh sách Digital Twin | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
+| `POST` | `/v1/media/upload-url` | Gateway credential riêng (dự kiến) | Gateway yêu cầu signed upload URL cho ảnh chụp | Chưa đăng ký route (404) |
 
-*Ghi chú: Các endpoint trả về `501 Not Implemented` được giữ nguyên cấu trúc routing nhằm bảo toàn hợp đồng API trong quá trình hoàn thiện các service handler theo từng giai đoạn.*
+*Ghi chú: Ba business GET stub đều yêu cầu JWT hợp lệ trước khi trả `501`;
+thiếu/sai JWT trả `401`. Không nhận token qua query/body. `501` không chứng
+minh User–Gateway permission hay nghiệp vụ hoàn thành. Chưa có production
+admin handler; admin guard được kiểm thử qua test-only route. Xem
+[route matrix và safe error contract](docs/backend/stage-2-task-2.2-authentication.md).*
 
 #### Digital Twin & Device Control API (`/v1/*`):
+Danh sách dưới là **thiết kế MVP**: hiện chỉ `GET /v1/digital-twins` được
+đăng ký dưới dạng authenticated stub `501`; các route còn lại chưa đăng ký
+(`404`, hoặc `405` nếu path đã có method khác), chưa thực hiện thao tác vật lý
+hay giao dịch command/outbox.
+
 | Phương thức | Đường dẫn | Xác thực | Mô tả |
 |---|---|---|---|
 | `POST` | `/v1/digital-twins` | Bearer JWT (Supabase) | Tạo mới thực thể Digital Twin (Gateway / Sensor / Device) |
@@ -384,7 +421,7 @@ nằm tại `docs/protocols/mqtt-v1.md`.
 
 ## 5. Phân hệ Digital Twin & Quản lý điều khiển (Digital Twin Subsystem)
 
-Thay vì tích hợp Federated Learning (đã được loại bỏ để tập trung vào mục tiêu trọng tâm của đồ án), hệ thống sở hữu phân hệ **Digital Twin** hoàn chỉnh được thiết kế theo kiến trúc Modular Monolith bên trong Go Backend:
+Thay vì tích hợp Federated Learning (đã được loại bỏ để tập trung vào mục tiêu trọng tâm của đồ án), hệ thống thiết kế phân hệ **Digital Twin** theo kiến trúc Modular Monolith bên trong Go Backend. Các mục dưới mô tả hành vi mục tiêu; schema đã có nhưng business handlers/đường điều khiển chưa hoàn thành:
 
 ### 5.1 Chuẩn định danh & Thực thể NGSI-LD
 - Mỗi thực thể vật lý (Gateway, Sensor, Device/Actuator) có định danh URN bền vững:

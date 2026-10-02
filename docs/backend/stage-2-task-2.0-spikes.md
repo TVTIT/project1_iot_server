@@ -187,3 +187,5 @@ probe table rows=1
 
 Task 2.0 không triển khai schema, middleware, API hoặc credential manager thật.
 Các phần đó lần lượt thuộc Task 2.1 đến Task 2.6.
+
+Issuer blocker được giải quyết trong Task 2.2 bằng GOTRUE_JWT_ISSUER.
