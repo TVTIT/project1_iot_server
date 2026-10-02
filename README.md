@@ -308,6 +308,12 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
       GoTrue login/refresh qua Nginx/Envoy và PostgreSQL admin guard.
     - Từ repo root: `sh scripts/test-stage2-auth.sh` và `sh scripts/test-stage2-admin.sh`.
     - Các harness auth/smoke/admin/migration dùng tài nguyên isolated, không đọc/sửa `.env` deployment; lệnh đầy đủ và prerequisites tại [Task 2.2](docs/backend/stage-2-task-2.2-authentication.md#7-lệnh-verification-có-thể-chạy).
+6. **`authorization-integration`**:
+    - Kiểm chứng repository Gateway/Sensor bằng PostgreSQL thật dưới `iot_backend_app`:
+      user isolation, role matrix, nullable metadata, membership revocation và deadline.
+    - Từ repo root: `sh scripts/test-stage2-authorization.sh`; dùng DB isolated,
+      không đọc/sửa `.env`. Đây mới là repository, chưa triển khai HTTP API.
+    - Contract và kết quả tại [Task 2.3](docs/backend/stage-2-task-2.3-authorization.md).
 
 ---
 
