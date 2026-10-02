@@ -59,6 +59,26 @@ def assert_startup_failure(code: int, output: str, field: str, sensitive: list[s
         raise RuntimeError("startup log exposed test credentials")
 
 
+def assert_signup_denied(status: int, body: object) -> None:
+    # GoTrue v2.196.0: distinguish policy rejection from bad input/proxy failure.
+    if status != 422 or not isinstance(body, dict) or body.get("error_code") != "signup_disabled":
+        raise RuntimeError(
+            f"public signup was not rejected by GoTrue signup policy (HTTP {status})"
+        )
+
+
+def admin_created_user_id(status: int, body: object) -> str:
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"Admin API user creation failed (HTTP {status}); response suppressed")
+    try:
+        user_id = uuid.UUID(body["id"])
+    except (KeyError, ValueError, TypeError, AttributeError) as error:
+        raise RuntimeError("Admin API response is missing a valid user UUID") from error
+    if user_id.int == 0:
+        raise RuntimeError("Admin API returned a zero user UUID")
+    return str(user_id)
+
+
 def http_request(
     base: str,
     path: str,
@@ -361,6 +381,38 @@ class Stack:
             assert_response(*http_request(base, "/v1/ws", token), 401)
         print("PASS: invalid signature/algorithm/claims rejected through HTTP")
 
+    def check_account_rows(self, email: str, present: bool) -> None:
+        # psql variables prevent interpolating even fixture identifiers into SQL.
+        counts = self.command(
+            [
+                "docker",
+                "exec",
+                "-i",
+                "-e",
+                "AUTH_TEST_EMAIL",
+                self.postgres,
+                "psql",
+                "-U",
+                "stage2_admin",
+                "-d",
+                "stage2_auth_test",
+                "-At",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ],
+            env={"AUTH_TEST_EMAIL": email},
+            stdin=r"""\getenv fixture_email AUTH_TEST_EMAIL
+SELECT count(u.id), count(p.id), count(ug.user_id), count(pa.user_id)
+FROM auth.users u
+LEFT JOIN public.profiles p ON p.id = u.id
+LEFT JOIN public.user_gateways ug ON ug.user_id = u.id
+LEFT JOIN public.platform_admins pa ON pa.user_id = u.id
+WHERE u.email = :'fixture_email';
+""",
+        )
+        if counts != ("1|1|0|0" if present else "0|0|0|0"):
+            raise RuntimeError("unexpected account/profile/membership/admin rows in isolated DB")
+
     def real_auth(self) -> None:
         spec = importlib.util.spec_from_file_location(
             "jwt_spike", ROOT / "scripts/spikes/jwt_contract.py"
@@ -411,6 +463,7 @@ class Stack:
                 "GOTRUE_JWT_SECRET": self.secret,
                 "GOTRUE_EXTERNAL_EMAIL_ENABLED": "true",
                 "GOTRUE_MAILER_AUTOCONFIRM": "true",
+                "GOTRUE_DISABLE_SIGNUP": "true",
             },
             ["--network-alias", "auth", "-p", "127.0.0.1::9999"],
         )
@@ -480,24 +533,36 @@ class Stack:
             nginx,
         )
         self.command(["docker", "exec", nginx, "nginx", "-t"])
+        denied_email = "stage2-signup-denied-" + secrets.token_hex(8) + "@example.invalid"
+        denied_password = secrets.token_urlsafe(24)
+        self.sensitive.append(denied_password)
+        status, body, _ = http_request(
+            base,
+            "/auth/v1/signup",
+            key=self.anon,
+            body={"email": denied_email, "password": denied_password},
+            method="POST",
+        )
+        assert_signup_denied(status, body)
+        self.check_account_rows(denied_email, present=False)
+        print("PASS: public signup denied by GoTrue; no user/profile/membership created")
         users = []
         try:
             for _ in range(2):
                 password = secrets.token_urlsafe(24)
                 self.sensitive.append(password)
                 email = "stage2-auth-" + secrets.token_hex(8) + "@example.invalid"
-                status, signup, _ = http_request(
+                status, created, _ = http_request(
                     base,
-                    "/auth/v1/signup",
-                    key=self.anon,
-                    body={"email": email, "password": password},
+                    "/auth/v1/admin/users",
+                    token=self.service,
+                    key=self.service,
+                    body={"email": email, "password": password, "email_confirm": True},
                     method="POST",
                 )
-                if status != 200 or not isinstance(signup, dict) or "user" not in signup:
-                    raise RuntimeError(f"signup failed (HTTP {status}); response suppressed")
-                user_id = str(uuid.UUID(signup["user"]["id"]))
+                user_id = admin_created_user_id(status, created)
                 users.append(user_id)
-                self.sensitive.extend([signup["access_token"], signup["refresh_token"]])
+                self.check_account_rows(email, present=True)
                 status, login, _ = http_request(
                     base,
                     "/auth/v1/token?grant_type=password",
@@ -514,6 +579,24 @@ class Stack:
                     raise RuntimeError("GoTrue token subject does not match test user")
                 self.check_routes(base, token)
                 self.check_bad_tokens(base, claims)
+                # Human identity (even later bootstrapped admin) is not a service key.
+                status, _, _ = http_request(
+                    base,
+                    "/auth/v1/admin/users",
+                    token=token,
+                    key=self.anon,
+                    body={
+                        "email": denied_email,
+                        "password": denied_password,
+                        "email_confirm": True,
+                    },
+                    method="POST",
+                )
+                if status != 403:
+                    raise RuntimeError(
+                        f"human token could not demonstrate Admin API denial (HTTP {status})"
+                    )
+                self.check_account_rows(denied_email, present=False)
                 status, refreshed, _ = http_request(
                     base,
                     "/auth/v1/token?grant_type=refresh_token",
@@ -581,7 +664,10 @@ class Stack:
                 raise RuntimeError(
                     "GoTrue-token/real-DB admin guard integration failed; output suppressed"
                 )
-            print("PASS: GoTrue login/refresh + real PostgreSQL admin 204 / normal user 403")
+            print("PASS: Admin-created users have profiles but no automatic Gateway/admin grants")
+            print(
+                "PASS: human token cannot create Auth users; GoTrue login/refresh + admin guard 204/403"
+            )
         finally:
             for user_id in users:
                 status, _, _ = http_request(

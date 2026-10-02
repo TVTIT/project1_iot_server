@@ -9,6 +9,35 @@ import stage2_auth
 
 
 class AuthHarnessTests(unittest.TestCase):
+    def test_centralized_signup_config_is_closed_by_default(self):
+        compose = (stage2_auth.ROOT / "docker-compose.yml").read_text()
+        example = (stage2_auth.ROOT / ".env.example").read_text()
+        self.assertIn("GOTRUE_DISABLE_SIGNUP: ${GOTRUE_DISABLE_SIGNUP:-true}", compose)
+        self.assertIn("\nGOTRUE_DISABLE_SIGNUP=true\n", example)
+
+    def test_signup_denial_requires_gotrue_error_not_proxy_failure(self):
+        stage2_auth.assert_signup_denied(422, {"error_code": "signup_disabled"})
+        for status, body in [
+            (200, {}),
+            (403, {}),
+            (502, None),
+            (422, {"error_code": "invalid_email"}),
+        ]:
+            with self.assertRaises(RuntimeError):
+                stage2_auth.assert_signup_denied(status, body)
+
+    def test_admin_creation_uses_user_response_not_signup_session(self):
+        user_id = "11111111-1111-4111-8111-111111111111"
+        self.assertEqual(stage2_auth.admin_created_user_id(200, {"id": user_id}), user_id)
+        for status, body in [
+            (403, {"id": user_id}),
+            (200, {"user": {"id": user_id}}),
+            (200, {"id": "invalid"}),
+            (200, {"id": str(stage2_auth.uuid.UUID(int=0))}),
+        ]:
+            with self.assertRaises(RuntimeError):
+                stage2_auth.admin_created_user_id(status, body)
+
     def test_synthetic_token_preserves_claims_and_algorithm(self):
         claims = {"iss": "http://localhost/auth/v1", "role": "authenticated"}
         token = stage2_auth.make_token("test-only-secret", claims)
@@ -79,6 +108,25 @@ class AuthHarnessTests(unittest.TestCase):
         stack.command = mock.Mock(return_value="false")
         with self.assertRaises(RuntimeError):
             stack.wait(lambda: True, "fixture readiness", "owned-container")
+
+    def test_account_probe_uses_sql_parameter_and_requires_profile_without_grants(self):
+        stack = stage2_auth.Stack()
+        stack.postgres = "owned-postgres"
+        stack.command = mock.Mock(return_value="1|1|0|0")
+        email = "fixture@example.invalid"
+        stack.check_account_rows(email, present=True)
+        self.assertNotIn(email, stack.command.call_args.kwargs["stdin"])
+        self.assertIn(":'fixture_email'", stack.command.call_args.kwargs["stdin"])
+        self.assertEqual(stack.command.call_args.kwargs["env"], {"AUTH_TEST_EMAIL": email})
+        for unexpected in ("1|0|0|0", "1|1|1|0", "1|1|0|1", "0|0|0|0"):
+            stack.command.return_value = unexpected
+            with self.assertRaises(RuntimeError):
+                stack.check_account_rows(email, present=True)
+        stack.command.return_value = "0|0|0|0"
+        stack.check_account_rows(email, present=False)
+        stack.command.return_value = "1|1|0|0"
+        with self.assertRaises(RuntimeError):
+            stack.check_account_rows(email, present=False)
 
 
 if __name__ == "__main__":
