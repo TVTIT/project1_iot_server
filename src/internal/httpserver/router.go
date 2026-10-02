@@ -27,6 +27,7 @@ type RouterDependencies struct {
 	TokenVerifier        auth.Verifier
 	PlatformAdminChecker auth.PlatformAdminChecker
 	GatewayReader        GatewayReader
+	SensorReader         SensorReader
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -50,6 +51,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 
 	if auth.IsNilDependency(deps.GatewayReader) {
 		return nil, fmt.Errorf("gateway reader is required")
+	}
+	if auth.IsNilDependency(deps.SensorReader) {
+		return nil, fmt.Errorf("sensor reader is required")
 	}
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
@@ -90,6 +94,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	groups := newRouteGroups(router, deps)
 	authenticated := groups.authenticated
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
+	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
 	authenticated.GET("/telemetry/history", notImplemented)
 	authenticated.GET("/ws", notImplemented)
 	authenticated.GET("/digital-twins", notImplemented)

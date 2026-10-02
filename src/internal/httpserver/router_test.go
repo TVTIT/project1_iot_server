@@ -192,6 +192,7 @@ func mustRouter(t *testing.T, readiness ReadinessChecker) http.Handler {
 
 func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
 	return RouterDependencies{
+		SensorReader:         sensorReaderFunc(func(context.Context, uuid.UUID, string) ([]gateway.Sensor, error) { return nil, nil }),
 		GatewayReader:        gatewayReaderFunc(func(context.Context, uuid.UUID) ([]gateway.Gateway, error) { return nil, nil }),
 		ReadinessChecker:     readiness,
 		ReadinessTimeout:     time.Second,

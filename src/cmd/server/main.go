@@ -75,6 +75,7 @@ func run() error {
 	}
 	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
 		GatewayReader:        gatewayService,
+		SensorReader:         gatewayService,
 		ReadinessChecker:     pool,
 		ReadinessTimeout:     cfg.ReadinessTimeout,
 		AuthorizationTimeout: cfg.AuthorizationTimeout,
