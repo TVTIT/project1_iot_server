@@ -76,6 +76,7 @@ Compose lấy cấu hình từ repository-root `.env` (không commit), mapping:
 | `AUTHORIZATION_TIMEOUT` | Backend, timeout lookup admin, mặc định `2s`, phải dương |
 | `JWT_EXPIRY` | GoTrue `GOTRUE_JWT_EXP`, mặc định `3600` giây |
 | `SUPABASE_PUBLIC_URL` | Public URL cho Supabase; **không thay thế** issuer explicit |
+| `GOTRUE_DISABLE_SIGNUP` | GoTrue; mặc định `true`, giữ `true` theo mô hình quản lý tập trung |
 | `DATABASE_URL` | Backend kết nối bằng `iot_backend_app`, không dùng superuser |
 
 Local theo `.env.example`: `SUPABASE_PUBLIC_URL=http://localhost`,
@@ -177,8 +178,9 @@ hoặc `cancelled`; không log raw database error. Không log credential để d
 
 ## 6. Bootstrap platform admin hiện có
 
-Đăng ký human user qua Supabase trước, để trigger tạo `profiles`. Áp dụng
-migration 000010 và Supabase compatibility migration. Bootstrap là thao tác
+Operator tạo/mời human user qua công cụ quản trị Supabase Auth trước, để
+trigger tạo `profiles`; không dùng public signup. Xem [Task 2.2A](stage-2-task-2.2A-centralized-accounts.md).
+Áp dụng migration 000010 và Supabase compatibility migration. Bootstrap là thao tác
 operator bằng PostgreSQL administrator credential, **không** bằng backend role
 hay Supabase `service_role` key; không có public API tự cấp quyền.
 
@@ -228,7 +230,9 @@ sh scripts/test-stage2-admin.sh
 sh scripts/test-stage2-migrations.sh
 ```
 
-- Auth: isolated GoTrue/PostgreSQL/backend/Nginx/Envoy; login, refresh, issuer,
+- Auth: isolated GoTrue/PostgreSQL/backend/Nginx/Envoy; public signup denial
+  `422/signup_disabled` không tạo DB rows, Admin API tạo users không tự cấp
+  Gateway/admin, human token không tạo user qua Admin API; login, refresh, issuer,
   invalid token matrix, public `200`, missing token `401`, valid stub `501`,
   bootstrap và test-only admin guard (admin `204`, normal user `403`), kiểm tra
   log không chứa test credentials/tokens.

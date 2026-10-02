@@ -162,6 +162,12 @@ business route hiện còn stub hoặc chưa đăng ký. Xem
     human platform admin và không được cấp cho Gateway/Flutter. Xem
     [hướng dẫn Task 2.2](docs/backend/stage-2-task-2.2-authentication.md).
 
+    MVP dùng quản lý tập trung: giữ `GOTRUE_DISABLE_SIGNUP=true` trong `.env`
+    (Compose mặc định `true`), tạo/mời user qua công cụ quản trị Supabase Auth
+    được bảo vệ, không public signup. Tạo account không tự cấp Gateway/admin.
+    Quy trình bootstrap, áp dụng vào stack cũ và giới hạn kiểm chứng tại
+    [Task 2.2A](docs/backend/stage-2-task-2.2A-centralized-accounts.md).
+
 3. **Khởi tạo chứng chỉ TLS cho Mosquitto Broker**:
    ```bash
    chmod +x scripts/gen-certs.sh
@@ -298,7 +304,8 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
    - Đóng gói container image `iot-backend:ci` qua Docker Buildx.
     - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`).
 5. **`auth-integration`**:
-    - Python harness regression, GoTrue login/refresh qua Nginx/Envoy và PostgreSQL admin guard.
+    - Python harness regression, public signup denial, Admin API tạo fixture user,
+      GoTrue login/refresh qua Nginx/Envoy và PostgreSQL admin guard.
     - Từ repo root: `sh scripts/test-stage2-auth.sh` và `sh scripts/test-stage2-admin.sh`.
     - Các harness auth/smoke/admin/migration dùng tài nguyên isolated, không đọc/sửa `.env` deployment; lệnh đầy đủ và prerequisites tại [Task 2.2](docs/backend/stage-2-task-2.2-authentication.md#7-lệnh-verification-có-thể-chạy).
 
