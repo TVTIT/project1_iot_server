@@ -21,9 +21,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POSTGRES_IMAGE = (
-    "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a"
-)
+POSTGRES_IMAGE = "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a"
 ISSUER = "http://auth.test.local/auth/v1"
 
 
@@ -31,7 +29,9 @@ def make_token(secret: str, claims: dict, algorithm: str = "HS256") -> str:
     """Test tokens only; production verification remains in Go's JWT library."""
 
     def encode(value: dict) -> str:
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        return (
+            base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        )
 
     message = encode({"alg": algorithm, "typ": "JWT"}) + "." + encode(claims)
     signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
@@ -52,16 +52,24 @@ def assert_response(status: int, body: object, headers: dict, expected: int) -> 
         raise RuntimeError("401 response is missing Bearer challenge")
 
 
-def assert_startup_failure(code: int, output: str, field: str, sensitive: list[str]) -> None:
+def assert_startup_failure(
+    code: int, output: str, field: str, sensitive: list[str]
+) -> None:
     if code != 1 or field not in output:
-        raise RuntimeError(f"startup did not fail at configuration validation for {field}")
+        raise RuntimeError(
+            f"startup did not fail at configuration validation for {field}"
+        )
     if any(value and value in output for value in sensitive):
         raise RuntimeError("startup log exposed test credentials")
 
 
 def assert_signup_denied(status: int, body: object) -> None:
     # GoTrue v2.196.0: distinguish policy rejection from bad input/proxy failure.
-    if status != 422 or not isinstance(body, dict) or body.get("error_code") != "signup_disabled":
+    if (
+        status != 422
+        or not isinstance(body, dict)
+        or body.get("error_code") != "signup_disabled"
+    ):
         raise RuntimeError(
             f"public signup was not rejected by GoTrue signup policy (HTTP {status})"
         )
@@ -69,7 +77,9 @@ def assert_signup_denied(status: int, body: object) -> None:
 
 def admin_created_user_id(status: int, body: object) -> str:
     if status != 200 or not isinstance(body, dict):
-        raise RuntimeError(f"Admin API user creation failed (HTTP {status}); response suppressed")
+        raise RuntimeError(
+            f"Admin API user creation failed (HTTP {status}); response suppressed"
+        )
     try:
         user_id = uuid.UUID(body["id"])
     except (KeyError, ValueError, TypeError, AttributeError) as error:
@@ -77,6 +87,57 @@ def admin_created_user_id(status: int, body: object) -> str:
     if user_id.int == 0:
         raise RuntimeError("Admin API returned a zero user UUID")
     return str(user_id)
+
+
+def assert_gateway_list(
+    status: int, body: object, expected_ids: list[str], expected_roles: list[str]
+) -> None:
+    if status != 200 or not isinstance(body, dict) or set(body) != {"items"}:
+        raise RuntimeError(
+            f"Gateway list contract failed (HTTP {status}); response suppressed"
+        )
+    items = body["items"]
+    if not isinstance(items, list) or len(items) != len(expected_ids):
+        raise RuntimeError("Gateway list did not match authorized resources")
+    ids, roles = [], []
+    required = {"gateway_id", "name", "description", "role", "created_at"}
+    for item in items:
+        if not isinstance(item, dict) or set(item) != required:
+            raise RuntimeError("Gateway list item has an unexpected response shape")
+        ids.append(item["gateway_id"])
+        roles.append(item["role"])
+    if ids != expected_ids or roles != expected_roles:
+        raise RuntimeError("Gateway list did not match authorized resources")
+
+
+def assert_sensor_list(
+    status: int, body: object, expected_gateway: str, expected_ids: list[str]
+) -> None:
+    if (
+        status != 200
+        or not isinstance(body, dict)
+        or set(body) != {"gateway_id", "items"}
+    ):
+        raise RuntimeError(
+            f"Sensor list contract failed (HTTP {status}); response suppressed"
+        )
+    if body["gateway_id"] != expected_gateway or not isinstance(body["items"], list):
+        raise RuntimeError("Sensor list parent or items are invalid")
+    ids = []
+    required = {"sensor_id", "name", "unit", "created_at"}
+    for item in body["items"]:
+        if not isinstance(item, dict) or set(item) != required:
+            raise RuntimeError("Sensor list item has an unexpected response shape")
+        ids.append(item["sensor_id"])
+    if ids != expected_ids:
+        raise RuntimeError("Sensor list did not match authorized resources")
+
+
+def assert_resource_not_found(status: int, body: object, headers: dict) -> None:
+    assert_response(status, body, headers, 404)
+    error = body["error"]
+    if error.get("code") != "not_found" or error.get("message") != "resource not found":
+        raise RuntimeError("resource denial exposed distinguishable information")
 
 
 def http_request(
@@ -201,7 +262,12 @@ class Stack:
     def wait(self, predicate, label: str, container: str) -> None:
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            if self.command(["docker", "inspect", "-f", "{{.State.Running}}", container]) != "true":
+            if (
+                self.command(
+                    ["docker", "inspect", "-f", "{{.State.Running}}", container]
+                )
+                != "true"
+            ):
                 raise RuntimeError(f"container stopped while waiting for {label}")
             try:
                 if predicate():
@@ -216,7 +282,9 @@ class Stack:
 
     def prepare(self) -> dict:
         if not os.environ.get("STAGE2_BACKEND_IMAGE"):
-            self.command(["docker", "build", "-t", self.image, str(ROOT / "src")], timeout=300)
+            self.command(
+                ["docker", "build", "-t", self.image, str(ROOT / "src")], timeout=300
+            )
             self.owned_image = True
         self.command(["docker", "network", "create", self.network])
         self.network_created = True
@@ -299,7 +367,9 @@ class Stack:
         self.host_db_url = self.db_url(host, "iot_backend_app", "BACKEND_DB_PASSWORD")
         return {
             "SERVER_ENV": "production",
-            "DATABASE_URL": self.db_url("postgres:5432", "iot_backend_app", "BACKEND_DB_PASSWORD"),
+            "DATABASE_URL": self.db_url(
+                "postgres:5432", "iot_backend_app", "BACKEND_DB_PASSWORD"
+            ),
             "SUPABASE_JWT_SECRET": self.secret,
             "SUPABASE_JWT_ISSUER": ISSUER,
             "SUPABASE_JWT_AUDIENCE": "authenticated",
@@ -323,27 +393,47 @@ class Stack:
                 env[key] = value
             container = self.create(name, self.image, env)
             subprocess.run(
-                ["docker", "start", "-a", container], text=True, capture_output=True, timeout=20
+                ["docker", "start", "-a", container],
+                text=True,
+                capture_output=True,
+                timeout=20,
             )
-            code = int(self.command(["docker", "inspect", "-f", "{{.State.ExitCode}}", container]))
+            code = int(
+                self.command(
+                    ["docker", "inspect", "-f", "{{.State.ExitCode}}", container]
+                )
+            )
             result = subprocess.run(
-                ["docker", "logs", container], text=True, capture_output=True, timeout=10
+                ["docker", "logs", container],
+                text=True,
+                capture_output=True,
+                timeout=10,
             )
             if result.returncode:
                 raise RuntimeError("cannot read negative startup logs")
             assert_startup_failure(
-                code, result.stdout + result.stderr, key, self.sensitive + ["short-test-key"]
+                code,
+                result.stdout + result.stderr,
+                key,
+                self.sensitive + ["short-test-key"],
             )
-        print("PASS: six negative startup cases (exit 1, config error, no credential leak)")
+        print(
+            "PASS: six negative startup cases (exit 1, config error, no credential leak)"
+        )
 
     def start_backend(self, config: dict) -> str:
         self.backend = self.create(
-            "backend", self.image, config, ["--network-alias", "backend", "-p", "127.0.0.1::8080"]
+            "backend",
+            self.image,
+            config,
+            ["--network-alias", "backend", "-p", "127.0.0.1::8080"],
         )
         self.start(self.backend)
         base = f"http://127.0.0.1:{self.port(self.backend, 8080)}"
         self.wait(
-            lambda: http_request(base, "/readyz")[0] == 200, "backend readiness", self.backend
+            lambda: http_request(base, "/readyz")[0] == 200,
+            "backend readiness",
+            self.backend,
         )
         return base
 
@@ -411,7 +501,162 @@ WHERE u.email = :'fixture_email';
 """,
         )
         if counts != ("1|1|0|0" if present else "0|0|0|0"):
-            raise RuntimeError("unexpected account/profile/membership/admin rows in isolated DB")
+            raise RuntimeError(
+                "unexpected account/profile/membership/admin rows in isolated DB"
+            )
+
+    def seed_authorization_resources(self, users: list[str]) -> tuple[str, str, str]:
+        gateway_a = "auth_a_" + secrets.token_hex(6)
+        gateway_b = "auth_b_" + secrets.token_hex(6)
+        gateway_empty = "auth_empty_" + secrets.token_hex(6)
+        fixture = {
+            "users": users,
+            "gateway_a": gateway_a,
+            "gateway_b": gateway_b,
+            "gateway_empty": gateway_empty,
+        }
+        self.command(
+            [
+                "docker",
+                "exec",
+                "-i",
+                "-e",
+                "AUTHORIZATION_FIXTURE",
+                self.postgres,
+                "psql",
+                "-U",
+                "stage2_admin",
+                "-d",
+                "stage2_auth_test",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ],
+            env={"AUTHORIZATION_FIXTURE": json.dumps(fixture)},
+            stdin=r"""\getenv fixture_json AUTHORIZATION_FIXTURE
+WITH fixture AS (SELECT :'fixture_json'::jsonb AS value)
+INSERT INTO gateways (gateway_id, name, description, created_at)
+SELECT gateway_id, name, description, created_at
+FROM fixture,
+LATERAL (VALUES
+    (value->>'gateway_a', 'Gateway A', NULL::text, NULL::timestamptz),
+    (value->>'gateway_b', 'Gateway B', 'private B', now()),
+    (value->>'gateway_empty', 'Gateway Empty', NULL::text, now())
+) AS rows(gateway_id, name, description, created_at);
+
+WITH fixture AS (SELECT :'fixture_json'::jsonb AS value)
+INSERT INTO user_gateways (user_id, gateway_id, role)
+SELECT (value->'users'->>1)::uuid, value->>'gateway_b', 'operator'
+FROM fixture;
+
+WITH fixture AS (SELECT :'fixture_json'::jsonb AS value)
+INSERT INTO sensors (gateway_id, sensor_id, name, unit, created_at)
+SELECT gateway_id, sensor_id, name, unit, created_at
+FROM fixture,
+LATERAL (VALUES
+    (value->>'gateway_a', 'z', 'last', 'unit', now()),
+    (value->>'gateway_a', 'a', 'first', NULL::text, NULL::timestamptz),
+    (value->>'gateway_b', 'a', 'other', 'different', now())
+) AS rows(gateway_id, sensor_id, name, unit, created_at);
+""",
+        )
+        return gateway_a, gateway_b, gateway_empty
+
+    def update_gateway_membership(
+        self, user_id: str, gateway_id: str, role: str | None
+    ) -> None:
+        fixture = {"user_id": user_id, "gateway_id": gateway_id, "role": role}
+        statement = (
+            "DELETE FROM user_gateways AS ug USING fixture "
+            "WHERE ug.user_id = (value->>'user_id')::uuid "
+            "AND ug.gateway_id = value->>'gateway_id';"
+            if role is None
+            else "INSERT INTO user_gateways (user_id, gateway_id, role) "
+            "SELECT (value->>'user_id')::uuid, value->>'gateway_id', value->>'role' "
+            "FROM fixture "
+            "ON CONFLICT (user_id, gateway_id) DO UPDATE SET role = EXCLUDED.role;"
+        )
+        self.command(
+            [
+                "docker",
+                "exec",
+                "-i",
+                "-e",
+                "AUTHORIZATION_FIXTURE",
+                self.postgres,
+                "psql",
+                "-U",
+                "stage2_admin",
+                "-d",
+                "stage2_auth_test",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ],
+            env={"AUTHORIZATION_FIXTURE": json.dumps(fixture)},
+            stdin=(
+                r"\getenv fixture_json AUTHORIZATION_FIXTURE"
+                "\nWITH fixture AS (SELECT :'fixture_json'::jsonb AS value)\n"
+                + statement
+                + "\n"
+            ),
+        )
+
+    def check_real_authorization_api(
+        self, base: str, users: list[str], admin_token: str, normal_token: str
+    ) -> None:
+        gateway_a, gateway_b, gateway_empty = self.seed_authorization_resources(users)
+
+        assert_gateway_list(
+            *http_request(base, "/v1/gateways", admin_token)[:2], [], []
+        )
+        assert_sensor_list(
+            *http_request(base, f"/v1/gateways/{gateway_b}/sensors", normal_token)[:2],
+            gateway_b,
+            ["a"],
+        )
+        assert_resource_not_found(
+            *http_request(base, f"/v1/gateways/{gateway_a}/sensors", normal_token)
+        )
+
+        self.update_gateway_membership(users[0], gateway_a, "owner")
+        self.update_gateway_membership(users[0], gateway_empty, "viewer")
+        assert_gateway_list(
+            *http_request(base, "/v1/gateways", admin_token)[:2],
+            [gateway_a, gateway_empty],
+            ["owner", "viewer"],
+        )
+        assert_sensor_list(
+            *http_request(base, f"/v1/gateways/{gateway_a}/sensors", admin_token)[:2],
+            gateway_a,
+            ["a", "z"],
+        )
+        assert_sensor_list(
+            *http_request(base, f"/v1/gateways/{gateway_empty}/sensors", admin_token)[
+                :2
+            ],
+            gateway_empty,
+            [],
+        )
+        assert_resource_not_found(
+            *http_request(base, f"/v1/gateways/{gateway_b}/sensors", admin_token)
+        )
+
+        self.update_gateway_membership(users[0], gateway_a, None)
+        assert_gateway_list(
+            *http_request(base, "/v1/gateways", admin_token)[:2],
+            [gateway_empty],
+            ["viewer"],
+        )
+        assert_resource_not_found(
+            *http_request(base, f"/v1/gateways/{gateway_a}/sensors", admin_token)
+        )
+        assert_gateway_list(
+            *http_request(base, "/v1/gateways", normal_token)[:2],
+            [gateway_b],
+            ["operator"],
+        )
+        print(
+            "PASS: real GoTrue tokens through Nginx enforce Gateway/Sensor membership and revocation"
+        )
 
     def real_auth(self) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -439,7 +684,9 @@ WHERE u.email = :'fixture_email';
             stdin="CREATE ROLE postgres NOLOGIN;\n",
         )
         now = int(time.time())
-        self.anon = make_token(self.secret, {"role": "anon", "iat": now, "exp": now + 3600})
+        self.anon = make_token(
+            self.secret, {"role": "anon", "iat": now, "exp": now + 3600}
+        )
         self.service = make_token(
             self.secret, {"role": "service_role", "iat": now, "exp": now + 3600}
         )
@@ -469,7 +716,11 @@ WHERE u.email = :'fixture_email';
         )
         self.start(gotrue)
         auth_base = f"http://127.0.0.1:{self.port(gotrue, 9999)}"
-        self.wait(lambda: http_request(auth_base, "/health")[0] == 200, "GoTrue health", gotrue)
+        self.wait(
+            lambda: http_request(auth_base, "/health")[0] == 200,
+            "GoTrue health",
+            gotrue,
+        )
         self.command(
             [
                 "docker",
@@ -506,7 +757,10 @@ WHERE u.email = :'fixture_email';
                 *[
                     part
                     for name in ("envoy.yaml", "cds.yaml", "lds.template.yaml")
-                    for part in ("-v", f"{ROOT / 'config/envoy' / name}:/etc/envoy/{name}:ro")
+                    for part in (
+                        "-v",
+                        f"{ROOT / 'config/envoy' / name}:/etc/envoy/{name}:ro",
+                    )
                 ],
                 "-v",
                 f"{ROOT / 'config/envoy/docker-entrypoint.sh'}:/docker-entrypoint.sh:ro",
@@ -533,7 +787,9 @@ WHERE u.email = :'fixture_email';
             nginx,
         )
         self.command(["docker", "exec", nginx, "nginx", "-t"])
-        denied_email = "stage2-signup-denied-" + secrets.token_hex(8) + "@example.invalid"
+        denied_email = (
+            "stage2-signup-denied-" + secrets.token_hex(8) + "@example.invalid"
+        )
         denied_password = secrets.token_urlsafe(24)
         self.sensitive.append(denied_password)
         status, body, _ = http_request(
@@ -545,7 +801,9 @@ WHERE u.email = :'fixture_email';
         )
         assert_signup_denied(status, body)
         self.check_account_rows(denied_email, present=False)
-        print("PASS: public signup denied by GoTrue; no user/profile/membership created")
+        print(
+            "PASS: public signup denied by GoTrue; no user/profile/membership created"
+        )
         users = []
         try:
             for _ in range(2):
@@ -574,7 +832,9 @@ WHERE u.email = :'fixture_email';
                     raise RuntimeError("GoTrue login failed; response suppressed")
                 token, refresh = login["access_token"], login["refresh_token"]
                 self.sensitive.extend([token, refresh])
-                _, claims = spike.verify_token(token, self.secret, ISSUER, "authenticated")
+                _, claims = spike.verify_token(
+                    token, self.secret, ISSUER, "authenticated"
+                )
                 if claims["sub"] != user_id:
                     raise RuntimeError("GoTrue token subject does not match test user")
                 self.check_routes(base, token)
@@ -606,15 +866,20 @@ WHERE u.email = :'fixture_email';
                 )
                 if status != 200:
                     raise RuntimeError("GoTrue refresh failed; response suppressed")
-                self.sensitive.extend([refreshed["access_token"], refreshed["refresh_token"]])
+                self.sensitive.extend(
+                    [refreshed["access_token"], refreshed["refresh_token"]]
+                )
                 _, refreshed_claims = spike.verify_token(
                     refreshed["access_token"], self.secret, ISSUER, "authenticated"
                 )
                 if any(
-                    claims[key] != refreshed_claims[key] for key in ("iss", "sub", "aud", "role")
+                    claims[key] != refreshed_claims[key]
+                    for key in ("iss", "sub", "aud", "role")
                 ):
                     raise RuntimeError("refresh changed stable identity claims")
-                assert_response(*http_request(base, "/v1/ws", refreshed["access_token"]), 501)
+                assert_response(
+                    *http_request(base, "/v1/ws", refreshed["access_token"]), 501
+                )
                 if len(users) == 1:
                     admin_token = token
                 else:
@@ -664,7 +929,10 @@ WHERE u.email = :'fixture_email';
                 raise RuntimeError(
                     "GoTrue-token/real-DB admin guard integration failed; output suppressed"
                 )
-            print("PASS: Admin-created users have profiles but no automatic Gateway/admin grants")
+            self.check_real_authorization_api(base, users, admin_token, normal_token)
+            print(
+                "PASS: Admin-created users have profiles but no automatic Gateway/admin grants"
+            )
             print(
                 "PASS: human token cannot create Auth users; GoTrue login/refresh + admin guard 204/403"
             )
@@ -688,15 +956,22 @@ WHERE u.email = :'fixture_email';
             if result.returncode:
                 raise RuntimeError("cannot verify container log redaction")
             if any(value in result.stdout + result.stderr for value in self.sensitive):
-                raise RuntimeError("container logs exposed test credentials; output suppressed")
+                raise RuntimeError(
+                    "container logs exposed test credentials; output suppressed"
+                )
         print("PASS: container logs contain no test credentials or tokens")
 
     def diagnostics(self) -> None:
         for name in self.containers:
-            if not name.endswith(("-postgres", "-backend", "-gotrue", "-envoy", "-nginx")):
+            if not name.endswith(
+                ("-postgres", "-backend", "-gotrue", "-envoy", "-nginx")
+            ):
                 continue
             result = subprocess.run(
-                ["docker", "logs", "--tail", "12", name], text=True, capture_output=True, timeout=10
+                ["docker", "logs", "--tail", "12", name],
+                text=True,
+                capture_output=True,
+                timeout=10,
             )
             output = result.stdout + result.stderr
             for value in self.sensitive:
