@@ -6,9 +6,11 @@
 **Task 2.3.1–2.3.2 đã triển khai và kiểm chứng local isolated**;
 **Task 2.3.3–2.3.4 đã triển khai và kiểm chứng local**;
 **Task 2.3.5 đã triển khai và kiểm chứng local**;
-**Task 2.3.6–2.3.7 chưa triển khai**. Router đã đăng ký cả Gateway list và
-Sensor list dưới authenticated group. Chưa áp dụng deployment hoặc kiểm chứng
-hai API bằng token GoTrue thật qua Nginx/Envoy; bằng chứng local ở mục 8.
+**Task 2.3.6 đã triển khai và kiểm chứng local isolated**;
+**Task 2.3.7 chưa triển khai**. Router đã đăng ký cả Gateway list và Sensor
+list dưới authenticated group. Hai API đã được kiểm chứng bằng access token
+GoTrue thật qua Nginx/Envoy trên stack test; chưa áp dụng hoặc xác nhận trên
+deployment thật. Bằng chứng Task 2.3.6 ở mục 9.
 
 Chỉ triển khai:
 
@@ -367,7 +369,64 @@ httpserver **99,2%**, listSensors handler **100%**. Authorization harness
 coverage gateway **97,6%**, httpserver **85,4%** (chỉ subset tests, không thay
 thế coverage toàn package).
 
-Chưa triển khai Task 2.3.6: Auth harness cũ vẫn pass nhưng chưa gọi hai API mới
-với GoTrue thật qua proxy. Chưa commit/push và chưa xác nhận CI cho thay đổi
-Task 2.3.5; mốc M3 còn chờ người dùng yêu cầu. Task 2.3.7 nghiệm thu toàn bộ
-không được đánh dấu xong chỉ vì Sensor HTTP test xanh.
+Tại thời điểm kết thúc Task 2.3.5, Auth harness cũ chưa gọi hai API mới với
+GoTrue thật qua proxy. Kết quả bổ sung Task 2.3.6 được ghi riêng bên dưới để
+không viết lại lịch sử bằng chứng M3. Task 2.3.7 nghiệm thu toàn bộ không được
+đánh dấu xong chỉ vì Sensor HTTP test xanh.
+
+## 9. Kết quả Task 2.3.6 — GoTrue và proxy authorization regression
+
+Mở rộng `scripts/tests/stage2_auth.py`, không tạo Auth stack thứ hai. Harness
+vẫn tạo user qua GoTrue Admin API với public signup disabled, login và refresh
+qua `Nginx -> Envoy -> GoTrue`; sau đó dùng access token thật gọi:
+
+```text
+Client fixture -> Nginx -> Go backend -> iot_backend_app -> PostgreSQL
+```
+
+Không thêm test-only HTTP endpoint vào backend. Administrator DB connection
+chỉ seed Gateway/Sensor/membership trong database isolated; business requests
+vẫn đi qua backend database role và SQL scoped theo membership.
+
+### Kịch bản đã kiểm chứng
+
+1. Tạo hai human users bằng Auth Admin API; account mới có profile nhưng chưa
+   có Gateway membership hoặc platform-admin grant.
+2. Bootstrap user đầu thành platform admin. Trước khi cấp Gateway membership,
+   `GET /v1/gateways` bằng token admin thật trả `items: []`: global admin không
+   bypass API người dùng.
+3. User thứ hai có role `operator` trên Gateway B, chỉ thấy Gateway B và Sensor
+   B. User này không đọc được Sensor Gateway A (`404`).
+4. Operator fixture cấp user admin role owner trên Gateway A và viewer trên
+   Gateway Empty. Gateway list trả đúng thứ tự/role, không lộ Gateway B.
+5. Sensor A trả `a,z` theo stable ordering, giữ nullable metadata; Gateway
+   Empty trả `200 / items: []`. Gateway B vẫn `404` đối với admin chưa được cấp.
+6. Thu hồi membership Gateway A. Cùng access token admin vẫn hợp lệ nhưng list
+   chỉ còn Gateway Empty và Sensor A trả `404`; User B vẫn thấy Gateway B.
+7. Login/refresh stable claims, public signup denial, human-token Admin API
+   denial, platform-admin guard 204/403, JWT negative cases, existing stubs và
+   container log secrecy tiếp tục PASS.
+
+Fixture IDs ngẫu nhiên, truyền vào psql bằng JSON qua environment và psql
+variable `:'fixture_json'`; không nội suy UUID/ID vào SQL text và không đưa DB
+password/token vào argv. Containers/network/image do harness sở hữu được
+cleanup; không source/sửa `.env`, database hay stack deployment.
+
+### TDD và kiểm chứng
+
+RED: thêm ba unit tests cho response assertions làm Python suite lỗi vì
+`assert_gateway_list`, `assert_sensor_list`, `assert_resource_not_found` chưa
+tồn tại. GREEN: 16 Python tests pass sau khi thêm strict shape/order/404 checks.
+Thêm unit tests riêng xác nhận fixture/membership SQL dùng parameterized JSON
+và secrets đi qua environment thay vì command arguments.
+
+`sh scripts/test-stage2-auth.sh` PASS với dòng bằng chứng:
+
+```text
+PASS: real GoTrue tokens through Nginx enforce Gateway/Sensor membership and revocation
+```
+
+CI `auth-integration` hiện đã gọi script này nên không cần thêm job hoặc workflow
+khác. Tuy nhiên thay đổi chưa push, vì vậy chưa có GitHub Actions run chứng minh
+commit Task 2.3.6 xanh. Đây là local isolated evidence, không chứng nhận public
+deployment đã cập nhật image/config hoặc JWT secret mẫu đã được rotate.
