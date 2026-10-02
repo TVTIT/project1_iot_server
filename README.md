@@ -307,8 +307,10 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
     - Python harness regression, public signup denial, Admin API tạo fixture user,
       GoTrue login/refresh qua Nginx/Envoy và PostgreSQL admin guard.
     - Dùng access token GoTrue thật qua Nginx tới Go backend để kiểm chứng
-      Gateway/Sensor isolation, admin không bypass membership và revoke quyền
-      có hiệu lực ở request tiếp theo.
+       Gateway/Sensor isolation, admin không bypass membership và revoke quyền
+       có hiệu lực ở request tiếp theo.
+    - So sánh Sensor metadata/NULL/UTC với fixture và kiểm tra missing/forbidden
+      Gateway cùng `404` qua proxy.
     - Từ repo root: `sh scripts/test-stage2-auth.sh` và `sh scripts/test-stage2-admin.sh`.
     - Các harness auth/smoke/admin/migration dùng tài nguyên isolated, không đọc/sửa `.env` deployment; lệnh đầy đủ và prerequisites tại [Task 2.2](docs/backend/stage-2-task-2.2-authentication.md#7-lệnh-verification-có-thể-chạy).
 6. **`authorization-integration`**:
@@ -317,7 +319,9 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
     - Từ repo root: `sh scripts/test-stage2-authorization.sh`; dùng DB isolated,
       không đọc/sửa `.env`. Harness cũng test GET Gateways bằng router thật,
       PostgreSQL và JWT test ký đúng contract; cũng kiểm chứng Sensor API,
-      phân biệt Gateway rỗng với denial và timeout khi database bị khóa.
+       phân biệt Gateway rỗng với denial và timeout khi database bị khóa.
+    - Cleanup xóa anonymous volumes thuộc container test; lỗi cleanup làm
+      harness trả nonzero, không dùng global volume prune.
     - Contract và kết quả tại [Task 2.3](docs/backend/stage-2-task-2.3-authorization.md).
 
 ---

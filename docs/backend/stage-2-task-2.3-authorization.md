@@ -7,10 +7,11 @@
 **Task 2.3.3–2.3.4 đã triển khai và kiểm chứng local**;
 **Task 2.3.5 đã triển khai và kiểm chứng local**;
 **Task 2.3.6 đã triển khai và kiểm chứng local isolated**;
-**Task 2.3.7 chưa triển khai**. Router đã đăng ký cả Gateway list và Sensor
+**Task 2.3.7 đã bổ sung nghiệm thu local và xử lý findings; M5 còn chờ commit/push
+và CI cho thay đổi mới**. Router đã đăng ký cả Gateway list và Sensor
 list dưới authenticated group. Hai API đã được kiểm chứng bằng access token
 GoTrue thật qua Nginx/Envoy trên stack test; chưa áp dụng hoặc xác nhận trên
-deployment thật. Bằng chứng Task 2.3.6 ở mục 9.
+deployment thật. Bằng chứng Task 2.3.6 ở mục 9; nghiệm thu và CI ở mục 10.
 
 Chỉ triển khai:
 
@@ -427,6 +428,69 @@ PASS: real GoTrue tokens through Nginx enforce Gateway/Sensor membership and rev
 ```
 
 CI `auth-integration` hiện đã gọi script này nên không cần thêm job hoặc workflow
-khác. Tuy nhiên thay đổi chưa push, vì vậy chưa có GitHub Actions run chứng minh
-commit Task 2.3.6 xanh. Đây là local isolated evidence, không chứng nhận public
+khác. Khi kết thúc implementation local Task 2.3.6 chưa có CI cho thay đổi này;
+sau push đã xác minh đúng SHA như mục 10. Kết quả không chứng nhận public
 deployment đã cập nhật image/config hoặc JWT secret mẫu đã được rotate.
+
+## 10. Task 2.3.7 — Nghiệm thu sau review (2026-10-03)
+
+### Findings và xử lý
+
+- Authorization harness xóa container kèm anonymous volumes bằng
+  `docker rm -f -v` chỉ với tên ngẫu nhiên do chính harness tạo. Cleanup lỗi
+  có thông báo an toàn và trả nonzero; nếu tests đã lỗi thì giữ exit code đó.
+  Không dùng global prune, không xóa volume deployment hay dọn các volume cũ
+  không xác minh được ownership. Các resources cũ còn sót không tự biến mất.
+- Bổ sung regression bằng Docker/Go giả lập cho bốn tổ hợp test/cleanup thành
+  công hoặc thất bại, kiểm tra đúng tên container và `-v`.
+- GoTrue/proxy harness so sánh Sensor metadata với fixture cụ thể, gồm
+  `name`, `unit`, `created_at`; Sensor A giữ NULL, Sensor B cùng ID có metadata
+  khác. Timestamp fixture có offset `+01:00` phải trả chính xác UTC `Z`.
+- Missing-Gateway và forbidden-Gateway qua proxy cùng trả `404`, code
+  `not_found`, message `resource not found`; không so sánh request ID vì mỗi
+  request có ID riêng.
+- Negative tests từ chối metadata sai, timestamp không hợp lệ/non-UTC và NULL
+  sai so với fixture. Không thay đổi business API, migrations hoặc quyền write.
+
+### Bằng chứng local sau sửa
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Python harness regression | 18 tests PASS, gồm cleanup và metadata negatives |
+| `sh scripts/test-stage2-authorization.sh` | PostgreSQL/HTTP integration chạy thật PASS, cleanup thành công |
+| `sh scripts/test-stage2-auth.sh` | GoTrue/proxy/metadata/404/revoke/signup/JWT/admin/log secrecy PASS |
+| `go test -race -count=1 -coverprofile=… ./...` trong `src` | PASS |
+| Coverage unit tổng / gateway / httpserver | 84,0% / 86,6% / 99,2% |
+| Coverage authorization subset gateway / httpserver | 97,6% / 85,4% |
+
+Integration mặc định skip khi chạy Go suite không có environment isolated;
+hai harness ở trên là bằng chứng DB và GoTrue thật, không dựa vào skip để
+tuyên bố PASS. Coverage HTTP subset không phải coverage toàn repository.
+
+### CI đã xác minh và giới hạn
+
+Đã truy vấn lại `gh run view 37039033227 --json headSha,status,conclusion,jobs,url`:
+
+- SHA: `452a41d9784d26c049d04c0f86c802ea4218efc6` (Task 2.3.6).
+- [Run 37039033227](https://github.com/TVTIT/project1_iot_server/actions/runs/37039033227):
+  `completed/success`, sáu jobs thành công: lint/test, authorization integration,
+  Auth integration, migrations, cross-compile và Docker build/smoke.
+- Bằng chứng remote là run/job/step metadata; hai reviewer không tải được logs
+  do `403`. Không khẳng định đã đọc stdout CI.
+- Run này **không bao phủ các sửa sau review chưa commit**. M5/CI-3 chỉ đóng
+  sau commit/push được người dùng duyệt và CI xanh đúng SHA mới.
+
+### Checklist nghiệm thu
+
+- [x] Hai API đọc, DTO/NULL/UTC/order, role matrix và timeout được tài liệu hóa.
+- [x] SQL membership-scoped, admin không bypass, parent-empty/404, revoke có tests.
+- [x] PostgreSQL và access token GoTrue thật chứng minh isolation; coverage ≥80%.
+- [x] Findings cleanup và metadata regression đã xử lý local.
+- [x] Không thêm sensor writes, provisioning/membership API hoặc operator/viewer writes.
+- [x] History, WebSocket và Digital Twin routes vẫn authenticated `501`; chưa triển khai control.
+- [ ] Commit/push M5 và xác minh CI đúng SHA mới.
+- [ ] Deployment thật: signup denial, signing-secret rotation và origin/edge security
+  vẫn là scope vận hành riêng; không được suy ra từ nghiệm thu isolated.
+
+Phần implementation/tài liệu Task 2.3.0–2.3.7 đã có bằng chứng local; chưa
+đánh dấu mốc giao GitHub hoàn tất trước CI mới và không chứng nhận production.
