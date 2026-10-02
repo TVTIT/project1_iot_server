@@ -111,7 +111,11 @@ def assert_gateway_list(
 
 
 def assert_sensor_list(
-    status: int, body: object, expected_gateway: str, expected_ids: list[str]
+    status: int,
+    body: object,
+    expected_gateway: str,
+    expected_ids: list[str],
+    expected_items: list[dict] | None = None,
 ) -> None:
     if (
         status != 200
@@ -131,6 +135,10 @@ def assert_sensor_list(
         ids.append(item["sensor_id"])
     if ids != expected_ids:
         raise RuntimeError("Sensor list did not match authorized resources")
+    if expected_items is not None and body["items"] != expected_items:
+        raise RuntimeError(
+            "Sensor metadata did not match fixture values, NULL or UTC timestamps"
+        )
 
 
 def assert_resource_not_found(status: int, body: object, headers: dict) -> None:
@@ -553,9 +561,9 @@ INSERT INTO sensors (gateway_id, sensor_id, name, unit, created_at)
 SELECT gateway_id, sensor_id, name, unit, created_at
 FROM fixture,
 LATERAL (VALUES
-    (value->>'gateway_a', 'z', 'last', 'unit', now()),
+    (value->>'gateway_a', 'z', 'last', 'unit', '2026-01-01T01:00:00+01:00'::timestamptz),
     (value->>'gateway_a', 'a', 'first', NULL::text, NULL::timestamptz),
-    (value->>'gateway_b', 'a', 'other', 'different', now())
+    (value->>'gateway_b', 'a', 'other', 'different', '2026-01-01T01:00:00+01:00'::timestamptz)
 ) AS rows(gateway_id, sensor_id, name, unit, created_at);
 """,
         )
@@ -612,10 +620,29 @@ LATERAL (VALUES
             *http_request(base, f"/v1/gateways/{gateway_b}/sensors", normal_token)[:2],
             gateway_b,
             ["a"],
+            [
+                {
+                    "sensor_id": "a",
+                    "name": "other",
+                    "unit": "different",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ],
         )
-        assert_resource_not_found(
-            *http_request(base, f"/v1/gateways/{gateway_a}/sensors", normal_token)
+        forbidden = http_request(
+            base, f"/v1/gateways/{gateway_a}/sensors", normal_token
         )
+        missing = http_request(
+            base,
+            f"/v1/gateways/auth_missing_{secrets.token_hex(6)}/sensors",
+            normal_token,
+        )
+        assert_resource_not_found(*forbidden)
+        assert_resource_not_found(*missing)
+        # Request IDs intentionally differ; the public status/code/message must not.
+        for field in ("code", "message"):
+            if forbidden[1]["error"][field] != missing[1]["error"][field]:
+                raise RuntimeError("missing and forbidden resource errors differ")
 
         self.update_gateway_membership(users[0], gateway_a, "owner")
         self.update_gateway_membership(users[0], gateway_empty, "viewer")
@@ -628,12 +655,22 @@ LATERAL (VALUES
             *http_request(base, f"/v1/gateways/{gateway_a}/sensors", admin_token)[:2],
             gateway_a,
             ["a", "z"],
+            [
+                {"sensor_id": "a", "name": "first", "unit": None, "created_at": None},
+                {
+                    "sensor_id": "z",
+                    "name": "last",
+                    "unit": "unit",
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
+            ],
         )
         assert_sensor_list(
             *http_request(base, f"/v1/gateways/{gateway_empty}/sensors", admin_token)[
                 :2
             ],
             gateway_empty,
+            [],
             [],
         )
         assert_resource_not_found(

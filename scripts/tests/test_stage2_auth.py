@@ -2,13 +2,101 @@
 
 import base64
 import json
+import os
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import stage2_auth
 
 
 class AuthHarnessTests(unittest.TestCase):
+    def test_authorization_cleanup_removes_owned_volumes_and_propagates_failure(self):
+        for test_exit, cleanup_exit, expected_exit in [
+            (0, 0, 0),
+            (0, 1, 1),
+            (7, 0, 7),
+            (7, 1, 7),
+        ]:
+            with self.subTest(test_exit=test_exit, cleanup_exit=cleanup_exit):
+                with tempfile.TemporaryDirectory(prefix="auth-cleanup-") as directory:
+                    path = Path(directory)
+                    docker = path / "docker"
+                    docker.write_text("""#!/bin/sh
+case "$1" in
+  logs) echo 'PostgreSQL init process complete; ready for start up' ;;
+  port) echo '127.0.0.1:12345' ;;
+  rm) printf '%s\\n' "$*" > "$CLEANUP_RECORD"; exit "$CLEANUP_EXIT" ;;
+esac
+""")
+                    go = path / "go"
+                    go.write_text('#!/bin/sh\nexit "$TEST_EXIT"\n')
+                    docker.chmod(0o700)
+                    go.chmod(0o700)
+                    result = subprocess.run(
+                        [
+                            "sh",
+                            str(
+                                stage2_auth.ROOT
+                                / "scripts/test-stage2-authorization.sh"
+                            ),
+                        ],
+                        env={
+                            **os.environ,
+                            "PATH": f"{path}:{os.environ['PATH']}",
+                            "CLEANUP_RECORD": str(path / "record"),
+                            "CLEANUP_EXIT": str(cleanup_exit),
+                            "TEST_EXIT": str(test_exit),
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, expected_exit)
+                    self.assertRegex(
+                        (path / "record").read_text(),
+                        r"^rm -f -v stage2-authorization-[0-9a-f]{16}\n$",
+                    )
+                    self.assertEqual(
+                        "Failed to clean up" in result.stderr, cleanup_exit != 0
+                    )
+
+    def test_sensor_metadata_rejects_wrong_values(self):
+        expected = [
+            {
+                "sensor_id": "a",
+                "name": "first",
+                "unit": None,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        for field, wrong in [
+            ("name", "other Gateway"),
+            ("unit", "wrong"),
+            ("created_at", 123),
+            ("created_at", "not-a-timestamp"),
+            ("created_at", "2026-01-01T01:00:00+01:00"),
+            ("created_at", None),
+        ]:
+            with self.subTest(field=field, wrong=wrong):
+                body = {
+                    "gateway_id": "gateway_a",
+                    "items": [dict(expected[0], **{field: wrong})],
+                }
+                with self.assertRaises(RuntimeError):
+                    stage2_auth.assert_sensor_list(
+                        200, body, "gateway_a", ["a"], expected
+                    )
+        stage2_auth.assert_sensor_list(
+            200,
+            {"gateway_id": "gateway_a", "items": expected},
+            "gateway_a",
+            ["a"],
+            expected,
+        )
+
     def test_gateway_list_assertion_requires_exact_authorized_items(self):
         stage2_auth.assert_gateway_list(
             200,

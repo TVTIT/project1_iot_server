@@ -7,9 +7,15 @@ SUFFIX="$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
 CONTAINER="stage2-authorization-$SUFFIX"
 created=false
 cleanup() {
+    status=$?
+    trap - EXIT
     if [ "$created" = true ]; then
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        if ! docker rm -f -v "$CONTAINER" >/dev/null 2>&1; then
+            echo 'Failed to clean up isolated authorization container and volumes.' >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
     fi
+    exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
