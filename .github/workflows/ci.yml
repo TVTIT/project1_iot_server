@@ -137,6 +137,7 @@ jobs:
 
   docker-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
@@ -150,93 +151,26 @@ jobs:
           load: true
           tags: iot-backend:ci
       - name: Smoke test container
-        run: |
-          cleanup() {
-            docker rm -f test-backend smoke-postgres >/dev/null 2>&1 || true
-            docker network rm backend-smoke >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          docker network create backend-smoke
-          docker run -d --name smoke-postgres --network backend-smoke \
-            -e POSTGRES_PASSWORD=test_password \
-            -e POSTGRES_DB=iot_platform \
-            timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+        working-directory: .
+        env:
+          STAGE2_BACKEND_IMAGE: iot-backend:ci
+        run: sh scripts/test-backend-smoke.sh
 
-          postgres_initialized=false
-          for i in $(seq 1 90); do
-            if docker logs smoke-postgres 2>&1 \
-              | grep -F "PostgreSQL init process complete; ready for start up" >/dev/null; then
-              postgres_initialized=true
-              break
-            fi
-            if ! docker inspect -f '{{.State.Running}}' smoke-postgres | grep -qx true; then
-              echo "PostgreSQL container stopped during initialization."
-              docker logs smoke-postgres
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ "$postgres_initialized" != true ]; then
-            echo "Timed out waiting for PostgreSQL initialization."
-            docker logs smoke-postgres
-            exit 1
-          fi
-
-          postgres_ready=false
-          for i in $(seq 1 30); do
-            if docker exec smoke-postgres \
-              pg_isready -U postgres -d iot_platform >/dev/null 2>&1; then
-              postgres_ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [ "$postgres_ready" != true ]; then
-            echo "PostgreSQL did not become ready after initialization."
-            docker logs smoke-postgres
-            exit 1
-          fi
-
-          docker run -d --name test-backend --network backend-smoke -p 8080:8080 \
-            -e DATABASE_URL=postgres://postgres:test_password@smoke-postgres:5432/iot_platform?sslmode=disable \
-            -e SUPABASE_JWT_SECRET=ci-only-jwt-secret-at-least-32-characters \
-            -e SUPABASE_JWT_ISSUER=http://auth.test.local/auth/v1 \
-            -e SUPABASE_JWT_AUDIENCE=authenticated \
-            -e SUPABASE_JWT_CLOCK_SKEW=30s \
-            iot-backend:ci
-
-          backend_ready=false
-          for i in $(seq 1 30); do
-            if curl --fail --silent --connect-timeout 1 --max-time 2 \
-              http://127.0.0.1:8080/readyz >/dev/null; then
-              backend_ready=true
-              break
-            fi
-            if ! docker inspect -f '{{.State.Running}}' test-backend | grep -qx true; then
-              echo "Backend container stopped before becoming ready."
-              docker logs test-backend
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ "$backend_ready" != true ]; then
-            echo "Timed out waiting for backend readiness."
-            docker logs test-backend
-            docker logs smoke-postgres
-            exit 1
-          fi
-
-          if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
-            http://127.0.0.1:8080/readyz; then
-            docker logs test-backend
-            docker logs smoke-postgres
-            exit 1
-          fi
-          if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
-            http://127.0.0.1:8080/healthz; then
-            docker logs test-backend
-            docker logs smoke-postgres
-            exit 1
-          fi
-          cleanup
-          trap - EXIT
+  auth-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Auth harness regression tests
+        working-directory: .
+        run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_auth.py'
+      - name: GoTrue, PostgreSQL and Nginx/Envoy integration
+        working-directory: .
+        run: sh scripts/test-stage2-auth.sh
+      - name: Admin checker database regressions
+        working-directory: .
+        run: sh scripts/test-stage2-admin.sh
