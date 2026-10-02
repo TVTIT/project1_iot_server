@@ -312,7 +312,8 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
     - Kiểm chứng repository Gateway/Sensor bằng PostgreSQL thật dưới `iot_backend_app`:
       user isolation, role matrix, nullable metadata, membership revocation và deadline.
     - Từ repo root: `sh scripts/test-stage2-authorization.sh`; dùng DB isolated,
-      không đọc/sửa `.env`. Đây mới là repository, chưa triển khai HTTP API.
+      không đọc/sửa `.env`. Harness cũng test GET Gateways bằng router thật,
+      PostgreSQL và JWT test ký đúng contract; Sensor HTTP API chưa triển khai.
     - Contract và kết quả tại [Task 2.3](docs/backend/stage-2-task-2.3-authorization.md).
 
 ---
@@ -329,6 +330,8 @@ Mọi HTTP request/response của Go Backend đều được gán hoặc bảo t
 | `GET` | `/healthz` | Không | Liveness probe cấp Nginx/container (trả về text `OK`) | Hoạt động (HTTP 200) |
 | `GET` | `/readyz` | Không | Readiness probe kiểm tra kết nối PostgreSQL (`{"status":"ready"}`) | Hoạt động (HTTP 200/503) |
 | `GET` | `/v1/health` | Không | Healthcheck Go Backend (`{"status":"running","service":"iot-backend","version":"v1"}`) | Hoạt động (HTTP 200) |
+| `GET` | `/v1/gateways` | Human Bearer JWT | Gateway được cấp qua user_gateways; admin không bypass | Đã triển khai; 200 items, 401 nếu thiếu/sai JWT |
+| `GET` | `/v1/gateways/{gateway_id}/sensors` | Dự kiến Human Bearer JWT | Sensor kế thừa quyền Gateway | Chưa đăng ký route (Task 2.3.5) |
 | `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) | 501 Not Implemented |
 | `GET` | `/v1/ws` | Human Bearer JWT (chỉ header) | Stub; chưa nâng cấp WebSocket hoặc streaming | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
 | `GET` | `/v1/digital-twins` | Human Bearer JWT (Supabase) | Stub danh sách Digital Twin | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |

@@ -4,9 +4,10 @@
 
 **Task 2.3.0 hoàn thành:** kiểm tra baseline và chốt contract dưới đây.
 **Task 2.3.1–2.3.2 đã triển khai và kiểm chứng local isolated**;
-**Task 2.3.3–2.3.7 chưa triển khai**. Tài liệu này không chứng minh hai API đã
-hoạt động. Router hiện chưa đăng ký hai route đọc Gateway/Sensor, nên nhận
-`404` từ NoRoute, không phải authenticated stub `501`.
+**Task 2.3.3–2.3.4 đã triển khai và kiểm chứng local**;
+**Task 2.3.5–2.3.7 chưa triển khai**. Router đã đăng ký `GET /v1/gateways`
+dưới authenticated group; Sensor list route chưa đăng ký, vẫn nhận `404`
+từ NoRoute. Contract Sensor dưới đây chưa phải bằng chứng API hoạt động.
 
 Chỉ triển khai:
 
@@ -254,7 +255,57 @@ Auth/admin/migration/smoke hiện có. Golangci-lint v2.14.0 kết quả **0 iss
 Actionlint v1.7.7 kiểm tra workflow (tắt shellcheck) PASS. Không coi package
 coverage 98,0% là coverage tổng repository hoặc bằng chứng HTTP authorization.
 
-Task 2.3.3 sẽ kiểm tra service inputs (bao gồm zero user UUID), timeout use-case
-và wiring ở các task tiếp. Repository hiện không cấp quyền cho UUID zero khi
-không có membership; không tuyên bố service validation đã hoàn thành. Không
-claim JWT thật đã dùng với repository mới hoặc hai HTTP API đã tồn tại.
+Tại thời điểm kết thúc Task 2.3.2, chưa có service/wiring/API. Kết quả bổ sung
+Task 2.3.3–2.3.4 được ghi riêng bên dưới; giữ phân biệt với bằng chứng repository.
+
+## 7. Kết quả Task 2.3.3–2.3.4
+
+- Service validate UUID khác zero; Sensor read use-case validate Gateway ID
+  trước query, nhưng chưa expose Sensor handler. Không nhận bearer token trong
+  service. Constructor từ chối nil/typed-nil repository và timeout <= 0.
+- Deadline lấy từ `AUTHORIZATION_TIMEOUT`, bao phủ cả operation. Context từ
+  caller được propagate; dependency trả success sau deadline vẫn bị từ chối.
+- `GET /v1/gateways` đăng ký qua authenticated group. Danh tính chỉ từ Principal,
+  query key user_id (rỗng/lặp) bị 400; GET body không chọn danh tính.
+- DTO đúng 5 fields đã chốt, nullable metadata, UTC timestamp, `items: []`,
+  no-store. Lỗi DB 500 và timeout/cancellation 503 dùng safe error envelope;
+  logs chỉ có request ID/operation/category, không raw DB errors.
+- Main wire repository -> service -> router bằng pool hiện có. Thiếu reader
+  (kể cả typed-nil) chặn router initialization. Health/stubs giữ nguyên.
+- Adapter bỏ dependency Auth, dùng helper nil nội bộ để service không phụ
+  thuộc package Auth/Gin. Không thêm migration, config hoặc dependencies.
+
+### Bằng chứng TDD và integration
+
+RED: `go test ./internal/gateway ./internal/httpserver` lỗi compile vì
+NewService/ErrInvalidUser/GatewayReader chưa có. GREEN: unit suite pass sau
+implement. Test DTO ban đầu đếm nhầm 6 fields, đã sửa thành 5 đúng contract;
+không mở rộng response để làm test sai pass.
+
+| Guarantee | Tests |
+|---|---|
+| Validation, no repository call khi input sai, deadline/cancellation/errors | TestReadService |
+| JWT 401, user_id 400, body không giả danh, đúng DTO/UTC/no-store | TestGatewayListBoundary |
+| Empty array, safe 500/503, request ID, log secrecy | TestGatewayListEmptyAndErrors |
+| Handler fail closed khi thiếu principal | TestGatewayHandlerRejectsAbsentPrincipal |
+| Nil/typed-nil reader chặn router initialization | TestRouterRejectsMissingGatewayReader |
+| PostgreSQL thật + JWT test ký strict HS256, role matrix, isolation và revoke | TestGatewayHTTPAuthorizationIntegration |
+
+Harness authorization giờ chạy cả package gateway và httpserver. Setup DB bằng
+administrator; router/service/repository dùng `iot_backend_app`. Human JWT test
+có issuer/audience/role/iat/exp/sub hợp lệ, secret CSPRNG riêng. Admin có
+platform_admins nhưng không mapping nhận items rỗng; thêm một mapping chỉ thấy
+đúng Gateway đó, không thấy Gateway user khác. Membership thu hồi phản ánh ở
+request tiếp theo, user B không bị ảnh hưởng.
+
+Đây là httptest router với PostgreSQL thật, **không phải GoTrue token thật qua
+Nginx/Envoy** cho endpoint mới. Auth harness cũ vẫn pass nhưng không test GET
+Gateways; mở rộng luồng đó thuộc Task 2.3.6. Chưa triển khai Task 2.3.5.
+
+Local verification: Go race tests, vet/build, golangci-lint v2.14.0 (0 issues),
+authorization harness và Auth/admin/migration/smoke regression PASS. Coverage
+unit tổng repository 82,6%, package gateway 86,6%, httpserver 98,8%; service
+methods và listGateways handler đạt 100%. Coverage
+gateway khi chạy harness unit + DB integration 97,6%. Coverage httpserver của
+harness chỉ chạy subset tests, không đại diện coverage toàn package.
+Chưa commit/push, chưa xác nhận CI GitHub cho thay đổi này và chưa áp dụng deployment.
