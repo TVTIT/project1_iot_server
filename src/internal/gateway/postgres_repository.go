@@ -7,8 +7,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-
-	"iot-platform/internal/auth"
 )
 
 // Database is the pgxpool subset required by the PostgreSQL adapter.
@@ -21,7 +19,7 @@ type postgresRepository struct{ database Database }
 
 // NewPostgresRepository rejects missing dependencies, including typed nils.
 func NewPostgresRepository(database Database) (Repository, error) {
-	if auth.IsNilDependency(database) {
+	if isNilDependency(database) {
 		return nil, fmt.Errorf("gateway database is required")
 	}
 	return &postgresRepository{database: database}, nil

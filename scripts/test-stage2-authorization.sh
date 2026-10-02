@@ -53,5 +53,5 @@ set -- -v -race -count=1 -cover
 if [ -n "${AUTHORIZATION_TEST_COVERAGE_FILE:-}" ]; then
     set -- "$@" "-coverprofile=$AUTHORIZATION_TEST_COVERAGE_FILE"
 fi
-go test "$@" ./internal/gateway -run 'Test(ValidateGatewayID|Repository|Role|PostgresAuthorizationIntegration)'
+go test "$@" ./internal/gateway ./internal/httpserver -run 'Test(ValidateGatewayID|Repository|Role|ReadService|GatewayList|RouterRejectsMissingGatewayReader|PostgresAuthorizationIntegration|GatewayHTTPAuthorizationIntegration)'
 echo 'Isolated Gateway authorization integration tests passed.'

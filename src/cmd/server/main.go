@@ -16,6 +16,7 @@ import (
 	"iot-platform/internal/auth"
 	"iot-platform/internal/config"
 	"iot-platform/internal/database"
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpserver"
 )
 
@@ -64,7 +65,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create platform admin checker: %w", err)
 	}
+	gatewayRepository, err := gateway.NewPostgresRepository(pool)
+	if err != nil {
+		return fmt.Errorf("create gateway repository: %w", err)
+	}
+	gatewayService, err := gateway.NewService(gatewayRepository, cfg.AuthorizationTimeout)
+	if err != nil {
+		return fmt.Errorf("create gateway service: %w", err)
+	}
 	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
+		GatewayReader:        gatewayService,
 		ReadinessChecker:     pool,
 		ReadinessTimeout:     cfg.ReadinessTimeout,
 		AuthorizationTimeout: cfg.AuthorizationTimeout,

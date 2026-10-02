@@ -26,6 +26,7 @@ type RouterDependencies struct {
 	AuthorizationTimeout time.Duration
 	TokenVerifier        auth.Verifier
 	PlatformAdminChecker auth.PlatformAdminChecker
+	GatewayReader        GatewayReader
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -47,6 +48,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		return nil, fmt.Errorf("authorization timeout must be positive")
 	}
 
+	if auth.IsNilDependency(deps.GatewayReader) {
+		return nil, fmt.Errorf("gateway reader is required")
+	}
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
 	router.Use(httpapi.RequestIDMiddleware(), httpapi.RecoveryMiddleware(slog.Default()))
@@ -85,6 +89,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	groups := newRouteGroups(router, deps)
 	authenticated := groups.authenticated
+	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/telemetry/history", notImplemented)
 	authenticated.GET("/ws", notImplemented)
 	authenticated.GET("/digital-twins", notImplemented)

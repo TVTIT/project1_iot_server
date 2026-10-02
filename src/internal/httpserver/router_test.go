@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"iot-platform/internal/auth"
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpapi"
 )
 
@@ -191,6 +192,7 @@ func mustRouter(t *testing.T, readiness ReadinessChecker) http.Handler {
 
 func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
 	return RouterDependencies{
+		GatewayReader:        gatewayReaderFunc(func(context.Context, uuid.UUID) ([]gateway.Gateway, error) { return nil, nil }),
 		ReadinessChecker:     readiness,
 		ReadinessTimeout:     time.Second,
 		AuthorizationTimeout: time.Second,
