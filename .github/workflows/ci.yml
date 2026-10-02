@@ -156,6 +156,21 @@ jobs:
           STAGE2_BACKEND_IMAGE: iot-backend:ci
         run: sh scripts/test-backend-smoke.sh
 
+  authorization-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: PostgreSQL membership-scoped repository tests
+        working-directory: .
+        env:
+          AUTHORIZATION_TEST_COVERAGE_FILE: ${{ runner.temp }}/authorization-coverage.out
+        run: sh scripts/test-stage2-authorization.sh
+
   auth-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15
