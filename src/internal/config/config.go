@@ -22,6 +22,7 @@ type Config struct {
 	DatabaseMinConns       int32
 	DatabaseConnectTimeout time.Duration
 	ReadinessTimeout       time.Duration
+	AuthorizationTimeout   time.Duration
 	HTTPReadHeaderTimeout  time.Duration
 	HTTPReadTimeout        time.Duration
 	HTTPWriteTimeout       time.Duration
@@ -107,6 +108,9 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.ReadinessTimeout, err = duration(lookup, "READINESS_TIMEOUT", 2*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.AuthorizationTimeout, err = duration(lookup, "AUTHORIZATION_TIMEOUT", 2*time.Second); err != nil {
 		return Config{}, err
 	}
 	if cfg.HTTPReadHeaderTimeout, err = duration(lookup, "HTTP_READ_HEADER_TIMEOUT", 5*time.Second); err != nil {

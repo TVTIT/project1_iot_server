@@ -3,12 +3,15 @@ package httpserver
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
+
+	"iot-platform/internal/auth"
+	"iot-platform/internal/httpapi"
 )
 
 // ReadinessChecker verifies whether a required dependency is available.
@@ -16,20 +19,53 @@ type ReadinessChecker interface {
 	Ping(context.Context) error
 }
 
-// NewRouter creates the backend HTTP routes.
-func NewRouter(database ReadinessChecker, readinessTimeout time.Duration) http.Handler {
+// RouterDependencies contains the mandatory HTTP boundary dependencies.
+type RouterDependencies struct {
+	ReadinessChecker     ReadinessChecker
+	ReadinessTimeout     time.Duration
+	AuthorizationTimeout time.Duration
+	TokenVerifier        auth.Verifier
+	PlatformAdminChecker auth.PlatformAdminChecker
+}
+
+// NewRouter creates the backend HTTP routes and fails closed when an
+// authentication dependency is absent.
+func NewRouter(deps RouterDependencies) (http.Handler, error) {
+	if auth.IsNilDependency(deps.ReadinessChecker) {
+		return nil, fmt.Errorf("readiness checker is required")
+	}
+	if deps.ReadinessTimeout <= 0 {
+		return nil, fmt.Errorf("readiness timeout must be positive")
+	}
+	if auth.IsNilDependency(deps.TokenVerifier) {
+		return nil, fmt.Errorf("token verifier is required")
+	}
+	if auth.IsNilDependency(deps.PlatformAdminChecker) {
+		return nil, fmt.Errorf("platform admin checker is required")
+	}
+	if deps.AuthorizationTimeout <= 0 {
+		return nil, fmt.Errorf("authorization timeout must be positive")
+	}
+
 	router := gin.New()
-	router.Use(gin.Recovery(), requestIDMiddleware())
+	router.HandleMethodNotAllowed = true
+	router.Use(httpapi.RequestIDMiddleware(), httpapi.RecoveryMiddleware(slog.Default()))
+	router.NoRoute(func(c *gin.Context) {
+		httpapi.WriteError(c, http.StatusNotFound, "not_found", "resource not found")
+	})
+	router.NoMethod(func(c *gin.Context) {
+		httpapi.WriteError(c, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+	})
 
 	router.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "OK")
 	})
 	router.GET("/readyz", func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), readinessTimeout)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), deps.ReadinessTimeout)
 		defer cancel()
-		if err := database.Ping(ctx); err != nil {
+		if err := deps.ReadinessChecker.Ping(ctx); err != nil {
 			slog.WarnContext(c.Request.Context(), "readiness check failed", "error", err)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+			httpapi.WriteError(c, http.StatusServiceUnavailable, "service_unavailable", "service unavailable")
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
@@ -45,23 +81,26 @@ func NewRouter(database ReadinessChecker, readinessTimeout time.Duration) http.H
 
 	// Preserve the documented API surface until each business handler is added.
 	notImplemented := func(c *gin.Context) {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "not_implemented"})
+		httpapi.WriteError(c, http.StatusNotImplemented, "not_implemented", "endpoint not implemented")
 	}
-	router.GET("/v1/telemetry/history", notImplemented)
-	router.GET("/v1/ws", notImplemented)
-	router.GET("/v1/digital-twins", notImplemented)
+	groups := newRouteGroups(router, deps)
+	authenticated := groups.authenticated
+	authenticated.GET("/telemetry/history", notImplemented)
+	authenticated.GET("/ws", notImplemented)
+	authenticated.GET("/digital-twins", notImplemented)
 
-	return router
+	return router, nil
 }
 
-func requestIDMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		requestID := c.GetHeader("X-Request-ID")
-		if requestID == "" {
-			requestID = uuid.NewString()
-		}
-		c.Set("request_id", requestID)
-		c.Header("X-Request-ID", requestID)
-		c.Next()
-	}
+// Register all future admin handlers through groups.admin, never by rebuilding
+// a group with the same URL prefix: Gin does not inherit prefix policies.
+type routeGroups struct {
+	authenticated *gin.RouterGroup
+	admin         *gin.RouterGroup
+}
+
+func newRouteGroups(router *gin.Engine, deps RouterDependencies) routeGroups {
+	authenticated := router.Group("/v1", auth.AuthenticationMiddleware(deps.TokenVerifier))
+	admin := authenticated.Group("/admin", auth.PlatformAdminMiddleware(deps.PlatformAdminChecker, deps.AuthorizationTimeout, slog.Default()))
+	return routeGroups{authenticated: authenticated, admin: admin}
 }

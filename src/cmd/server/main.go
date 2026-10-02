@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"iot-platform/internal/auth"
 	"iot-platform/internal/config"
 	"iot-platform/internal/database"
 	"iot-platform/internal/httpserver"
@@ -49,9 +50,34 @@ func run() error {
 	}
 	defer pool.Close()
 
+	tokenVerifier, err := auth.NewHS256Verifier(auth.VerifierConfig{
+		Secret:    cfg.SupabaseJWTSecret,
+		Issuer:    cfg.SupabaseJWTIssuer,
+		Audience:  cfg.SupabaseJWTAudience,
+		ClockSkew: cfg.SupabaseJWTClockSkew,
+	})
+	if err != nil {
+		return fmt.Errorf("create JWT verifier: %w", err)
+	}
+
+	adminChecker, err := auth.NewPostgresPlatformAdminChecker(pool)
+	if err != nil {
+		return fmt.Errorf("create platform admin checker: %w", err)
+	}
+	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
+		ReadinessChecker:     pool,
+		ReadinessTimeout:     cfg.ReadinessTimeout,
+		AuthorizationTimeout: cfg.AuthorizationTimeout,
+		TokenVerifier:        tokenVerifier,
+		PlatformAdminChecker: adminChecker,
+	})
+	if err != nil {
+		return fmt.Errorf("create HTTP router: %w", err)
+	}
+
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.ServerPort),
-		Handler:           httpserver.NewRouter(pool, cfg.ReadinessTimeout),
+		Handler:           router,
 		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,

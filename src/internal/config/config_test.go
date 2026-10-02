@@ -193,6 +193,20 @@ func validConfigValues() map[string]string {
 	}
 }
 
+func TestAuthorizationTimeout(t *testing.T) {
+	for _, value := range []string{"0s", "-1s", "invalid"} {
+		values := validConfigValues()
+		values["AUTHORIZATION_TIMEOUT"] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatalf("accepted timeout %q", value)
+		}
+	}
+	cfg, err := Load(mapLookup(validConfigValues()))
+	if err != nil || cfg.AuthorizationTimeout != 2*time.Second {
+		t.Fatal("invalid default authorization timeout")
+	}
+}
+
 func mapLookup(values map[string]string) LookupFunc {
 	return func(key string) (string, bool) {
 		value, ok := values[key]
