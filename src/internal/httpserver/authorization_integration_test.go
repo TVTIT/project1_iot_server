@@ -83,7 +83,15 @@ func TestGatewayHTTPAuthorizationIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := NewRouter(RouterDependencies{ReadinessChecker: pool, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: service, SensorReader: service})
+	provisionRepo, err := gateway.NewPostgresProvisioningRepository(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisionService, err := gateway.NewProvisioningService(provisionRepo, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRouter(RouterDependencies{SensorProvisioner: provisionService, GatewayProvisioner: provisionService, AdminMaxBodyBytes: 16384, ReadinessChecker: pool, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: service, SensorReader: service})
 	if err != nil {
 		t.Fatal(err)
 	}
