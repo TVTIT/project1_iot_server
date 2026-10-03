@@ -72,3 +72,7 @@ build/
 
 # Keep example env
 !.env.example
+# Optional local runtime directories only. The tracked prototype passwd is
+# deliberately preserved; Compose uses a named volume, not that file.
+/config/mosquitto/auth-runtime/
+/config/mosquitto/control-runtime/
