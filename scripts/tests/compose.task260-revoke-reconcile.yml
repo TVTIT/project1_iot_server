@@ -1,0 +1,44 @@
+# Disposable negative/control fixture ONLY: broker has NO startup gate.
+# Never use this topology for the accepted restart path.
+services:
+  db:
+    image: postgres@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/fixture-password
+    volumes:
+      - ${DYNSEC_FIXTURE:?fixture required}/db-password:/run/fixture-password:ro
+      - database:/var/lib/postgresql/data
+    networks: [management]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+  broker:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    user: "1883:1883"
+    entrypoint: ["mosquitto", "-c", "/fixture/broker.conf"]
+    ports: ["127.0.0.1::8883"]
+    networks: [management]
+    volumes:
+      - ${DYNSEC_FIXTURE:?fixture required}/broker:/fixture:ro
+      - security:/security
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    restart: "no"
+  setup:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    entrypoint: ["/bin/sh"]
+    network_mode: none
+    volumes:
+      - security:/security
+      - ${DYNSEC_FIXTURE:?fixture required}/broker:/fixture
+      - ${DYNSEC_FIXTURE:?fixture required}/snapshot:/snapshot:ro
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+networks:
+  management: {}
+volumes:
+  database:
+  security:

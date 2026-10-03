@@ -1,0 +1,42 @@
+# OWNED HOST HARNESS ONLY. No public broker mapping; host loopback TLS.
+# Not a deployment replacement. No autonomous child restart.
+services:
+  db:
+    image: postgres@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/fixture-password
+    volumes:
+      - ${DYNSEC_FIXTURE:?required}/db-password:/run/fixture-password:ro
+      - database:/var/lib/postgresql/data
+    networks: [management]
+    restart: "no"
+  broker:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    user: "1883:1883"
+    network_mode: host
+    entrypoint: ["mosquitto", "-c", "/fixture/broker.conf"]
+    volumes:
+      - ${DYNSEC_FIXTURE:?required}/broker:/fixture:ro
+      - security:/security
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    restart: "no"
+  setup:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    entrypoint: ["/bin/sh"]
+    network_mode: none
+    volumes:
+      - security:/security
+      - ${DYNSEC_FIXTURE:?required}/broker:/fixture
+      - ${DYNSEC_FIXTURE:?required}/snapshot:/snapshot:ro
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+networks:
+  management: {}
+volumes:
+  database:
+  security:
