@@ -10,7 +10,7 @@ import hmac
 import importlib.util
 import json
 import os
-from pathlib import Path
+import re
 import secrets
 import signal
 import subprocess
@@ -18,7 +18,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-
+from datetime import datetime
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 POSTGRES_IMAGE = "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a"
@@ -148,6 +149,24 @@ def assert_resource_not_found(status: int, body: object, headers: dict) -> None:
         raise RuntimeError("resource denial exposed distinguishable information")
 
 
+def assert_provision_response(status, body, headers, expected_status, expected):
+    assert_response(status, body, headers, expected_status)
+    if not isinstance(body, dict) or set(body) != set(expected) | {"created_at"}:
+        raise RuntimeError("provisioning response shape mismatch; response suppressed")
+    if any(body[key] != value for key, value in expected.items()):
+        raise RuntimeError("provisioning metadata/identity mismatch; response suppressed")
+    timestamp = body["created_at"]
+    if timestamp is not None:
+        try:
+            if not isinstance(timestamp, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z", timestamp
+            ):
+                raise ValueError()
+            datetime.fromisoformat(timestamp[:-1] + "+00:00")
+        except ValueError as error:
+            raise RuntimeError("provisioning timestamp is not UTC RFC3339 or NULL") from error
+
+
 def http_request(
     base: str,
     path: str,
@@ -216,6 +235,121 @@ class Stack:
             self.secret,
             *[value for key, value in self.credentials.items() if "PASSWORD" in key],
         ]
+        self.provisioned_gateways: list[str] = []
+
+    def fixture_sql(self, fixture: dict, sql: str) -> str:
+        return self.command(
+            ["docker", "exec", "-i", "-e", "AUTHORIZATION_FIXTURE", self.postgres,
+             "psql", "-U", "stage2_admin", "-d", "stage2_auth_test", "-At",
+             "-v", "ON_ERROR_STOP=1"],
+            env={"AUTHORIZATION_FIXTURE": json.dumps(fixture)},
+            stdin=r"\getenv fixture_json AUTHORIZATION_FIXTURE" + "\n" + sql,
+        )
+
+    def cleanup_provisioned_resources(self) -> None:
+        # Restrictive Twin FKs require explicit graph removal before Gateways/users.
+        self.fixture_sql({"gateways": self.provisioned_gateways}, """
+BEGIN;
+CREATE TEMP TABLE owned_gateways AS
+SELECT jsonb_array_elements_text(:'fixture_json'::jsonb->'gateways') AS gateway_id;
+DELETE FROM twin_relationships WHERE source_entity_id IN
+ (SELECT id FROM twin_entities JOIN owned_gateways USING (gateway_id))
+ OR target_entity_id IN (SELECT id FROM twin_entities JOIN owned_gateways USING (gateway_id));
+DELETE FROM twin_states WHERE entity_id IN
+ (SELECT id FROM twin_entities JOIN owned_gateways USING (gateway_id));
+DELETE FROM twin_entities USING owned_gateways WHERE twin_entities.gateway_id = owned_gateways.gateway_id;
+DELETE FROM sensors USING owned_gateways WHERE sensors.gateway_id = owned_gateways.gateway_id;
+DELETE FROM user_gateways USING owned_gateways WHERE user_gateways.gateway_id = owned_gateways.gateway_id;
+DELETE FROM gateways USING owned_gateways WHERE gateways.gateway_id = owned_gateways.gateway_id;
+COMMIT;
+""")
+
+    def check_real_provisioning_api(self, base, users, tokens) -> None:
+        admin, owner, nonmember = tokens
+        gateway_ids = sorted("provision_" + secrets.token_hex(6) for _ in range(2))
+        self.provisioned_gateways.extend(gateway_ids)  # Track before first PUT, including failures.
+        expected_gateways = []
+        for index, gateway_id in enumerate(gateway_ids):
+            path = f"/v1/admin/gateways/{gateway_id}"
+            payload = {"name": " Gateway ", "description": None if index == 0 else "",
+                       "owner_user_id": users[1]}
+            expected = {"gateway_id": gateway_id, **payload,
+                        "entity_id": f"urn:ngsi-ld:Gateway:{gateway_id}"}
+            response = http_request(base, path, admin, body=payload, method="PUT")
+            assert_provision_response(*response, 201, expected)
+            if response[1]["created_at"] is None:
+                raise RuntimeError("new Gateway timestamp unexpectedly NULL")
+            expected_gateways.append({key: response[1][key] for key in
+                                      ("gateway_id", "name", "description", "created_at")})
+            retry = http_request(base, path, admin, body=payload, method="PUT")
+            assert_provision_response(*retry, 200, expected)
+            if retry[1] != response[1]:
+                raise RuntimeError("Gateway retry changed persisted representation")
+            assert_response(*http_request(base, path, admin,
+                body={**payload, "description": "conflict"}, method="PUT"), 409)
+            for token in (owner, nonmember):
+                assert_response(*http_request(base, path, token, body=payload, method="PUT"), 403)
+            sensor_path = path + "/sensors/shared"
+            sensor_payload = {"name": " Sensor ", "unit": None if index == 0 else ""}
+            sensor_expected = {"gateway_id": gateway_id, "sensor_id": "shared", **sensor_payload,
+                               "entity_id": f"urn:ngsi-ld:Sensor:{gateway_id}:shared"}
+            sensor = http_request(base, sensor_path, admin, body=sensor_payload, method="PUT")
+            assert_provision_response(*sensor, 201, sensor_expected)
+            if sensor[1]["created_at"] is None:
+                raise RuntimeError("new Sensor timestamp unexpectedly NULL")
+            sensor_retry = http_request(base, sensor_path, admin, body=sensor_payload, method="PUT")
+            assert_provision_response(*sensor_retry, 200, sensor_expected)
+            if sensor_retry[1] != sensor[1]:
+                raise RuntimeError("Sensor retry changed persisted representation")
+            assert_response(*http_request(base, sensor_path, admin,
+                body={**sensor_payload, "unit": "conflict"}, method="PUT"), 409)
+            for token in (owner, nonmember):
+                assert_response(*http_request(base, sensor_path, token,
+                    body=sensor_payload, method="PUT"), 403)
+            read_path = f"/v1/gateways/{gateway_id}/sensors"
+            assert_sensor_list(*http_request(base, read_path, owner)[:2], gateway_id, ["shared"],
+                [{key: sensor[1][key] for key in ("sensor_id", "name", "unit", "created_at")}])
+            for token in (admin, nonmember):
+                assert_resource_not_found(*http_request(base, read_path, token))
+            self.assert_provisioned_graph(gateway_id, users[1], payload, sensor_payload)
+        owner_list = http_request(base, "/v1/gateways", owner)
+        assert_gateway_list(*owner_list[:2], gateway_ids, ["owner", "owner"])
+        if owner_list[1]["items"] != [{**item, "role": "owner"} for item in expected_gateways]:
+            raise RuntimeError("owner Gateway read metadata differs from provisioned metadata")
+        for token in (admin, nonmember):
+            assert_gateway_list(*http_request(base, "/v1/gateways", token)[:2], [], [])
+        print("PASS: real human JWT -> Nginx admin PUT Gateway/Sensor -> Twin graph; retries/conflicts and membership isolation")
+
+    def assert_provisioned_graph(self, gateway_id, owner, gateway, sensor):
+        result = self.fixture_sql({"gateway_id": gateway_id, "owner": owner,
+                                   "gateway": gateway, "sensor": sensor}, """
+WITH f AS (SELECT :'fixture_json'::jsonb AS v),
+e AS (SELECT t.* FROM twin_entities t, f WHERE t.gateway_id = v->>'gateway_id'),
+s AS (SELECT ts.* FROM twin_states ts JOIN e ON e.id = ts.entity_id)
+SELECT
+ (SELECT count(*) FROM gateways g, f WHERE g.gateway_id = v->>'gateway_id'
+  AND g.name = v->'gateway'->>'name' AND g.description IS NOT DISTINCT FROM v->'gateway'->>'description'),
+ (SELECT count(*) FROM user_gateways ug, f WHERE ug.gateway_id = v->>'gateway_id'
+  AND ug.user_id = (v->>'owner')::uuid AND ug.role = 'owner'),
+ (SELECT count(*) FROM sensors sn, f WHERE sn.gateway_id = v->>'gateway_id'
+  AND sn.sensor_id = 'shared' AND sn.name = v->'sensor'->>'name'
+  AND sn.unit IS NOT DISTINCT FROM v->'sensor'->>'unit'),
+ (SELECT count(*) FROM e, f WHERE entity_type = 'Gateway'
+  AND entity_id = 'urn:ngsi-ld:Gateway:' || (v->>'gateway_id')
+  AND name = v->'gateway'->>'name' AND attributes = '{}'::jsonb),
+ (SELECT count(*) FROM e, f WHERE entity_type = 'Sensor'
+  AND entity_id = 'urn:ngsi-ld:Sensor:' || (v->>'gateway_id') || ':shared'
+  AND name = v->'sensor'->>'name' AND attributes = '{}'::jsonb),
+ (SELECT count(*) FROM e),
+ (SELECT count(*) FROM s WHERE reported_state = '{}'::jsonb AND desired_state = '{}'::jsonb
+  AND reported_version = 0 AND desired_version = 0 AND last_reported_at IS NULL
+  AND last_desired_at IS NULL AND last_desired_by IS NULL),
+ (SELECT count(*) FROM twin_relationships r JOIN e src ON src.id = r.source_entity_id
+  JOIN e dst ON dst.id = r.target_entity_id WHERE relationship_type = 'hasSensor'
+  AND src.entity_type = 'Gateway' AND dst.entity_type = 'Sensor');
+""")
+        if result != "1|1|1|1|1|2|2|1":
+            raise RuntimeError("provisioned database/Twin/state/hasSensor invariant failed")
 
     def command(
         self,
@@ -842,8 +976,10 @@ LATERAL (VALUES
             "PASS: public signup denied by GoTrue; no user/profile/membership created"
         )
         users = []
+        emails = []
         try:
-            for _ in range(2):
+            tokens = []
+            for _ in range(3):
                 password = secrets.token_urlsafe(24)
                 self.sensitive.append(password)
                 email = "stage2-auth-" + secrets.token_hex(8) + "@example.invalid"
@@ -857,6 +993,7 @@ LATERAL (VALUES
                 )
                 user_id = admin_created_user_id(status, created)
                 users.append(user_id)
+                emails.append(email)
                 self.check_account_rows(email, present=True)
                 status, login, _ = http_request(
                     base,
@@ -868,6 +1005,7 @@ LATERAL (VALUES
                 if status != 200:
                     raise RuntimeError("GoTrue login failed; response suppressed")
                 token, refresh = login["access_token"], login["refresh_token"]
+                tokens.append(token)
                 self.sensitive.extend([token, refresh])
                 _, claims = spike.verify_token(
                     token, self.secret, ISSUER, "authenticated"
@@ -919,7 +1057,7 @@ LATERAL (VALUES
                 )
                 if len(users) == 1:
                     admin_token = token
-                else:
+                elif len(users) == 2:
                     normal_token = token
             # Bootstrap uses the existing script, administrator DB credential stays in the container.
             self.command(
@@ -966,6 +1104,8 @@ LATERAL (VALUES
                 raise RuntimeError(
                     "GoTrue-token/real-DB admin guard integration failed; output suppressed"
                 )
+            self.check_real_provisioning_api(base, users, tokens)
+            self.cleanup_provisioned_resources()
             self.check_real_authorization_api(base, users, admin_token, normal_token)
             print(
                 "PASS: Admin-created users have profiles but no automatic Gateway/admin grants"
@@ -974,16 +1114,25 @@ LATERAL (VALUES
                 "PASS: human token cannot create Auth users; GoTrue login/refresh + admin guard 204/403"
             )
         finally:
-            for user_id in users:
-                status, _, _ = http_request(
-                    base,
-                    "/auth/v1/admin/users/" + user_id,
-                    token=self.service,
-                    key=self.service,
-                    method="DELETE",
-                )
-                if status not in (200, 204):
-                    raise RuntimeError("test user cleanup failed")
+            self.cleanup_provisioned_resources()
+            cleanup_errors = []
+            for user_id, email in zip(users, emails):
+                try:
+                    status, _, _ = http_request(
+                        base,
+                        "/auth/v1/admin/users/" + user_id,
+                        token=self.service,
+                        key=self.service,
+                        method="DELETE",
+                    )
+                    if status not in (200, 204):
+                        raise RuntimeError("test user cleanup failed")
+                    self.check_account_rows(email, present=False)
+                except Exception:
+                    # Attempt every owned account; never silently accept an orphan.
+                    cleanup_errors.append("account")
+            if cleanup_errors:
+                raise RuntimeError("test user cleanup failed; response suppressed")
 
     def check_logs(self) -> None:
         for name in self.containers:

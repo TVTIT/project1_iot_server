@@ -13,6 +13,102 @@ import stage2_auth
 
 
 class AuthHarnessTests(unittest.TestCase):
+    def test_provision_response_strict_schema_metadata_and_utc(self):
+        expected = {"gateway_id": "fixture", "name": " Name ", "description": None,
+                    "owner_user_id": "11111111-1111-4111-8111-111111111111",
+                    "entity_id": "urn:ngsi-ld:Gateway:fixture"}
+        valid = {**expected, "created_at": "2026-01-01T00:00:00.123Z"}
+        stage2_auth.assert_provision_response(201, valid, {}, 201, expected)
+        stage2_auth.assert_provision_response(200, {**expected, "created_at": None}, {}, 200, expected)
+        for changed in [{**valid, "extra": True}, {**valid, "name": "Name"},
+                        {**valid, "description": ""}, {**valid, "created_at": 1},
+                        {**valid, "created_at": "2026-01-01T01:00:00+01:00"},
+                        {**valid, "created_at": "invalidZ"},
+                        {**valid, "created_at": "2026-01-01Z"}]:
+            with self.assertRaises(RuntimeError):
+                stage2_auth.assert_provision_response(201, changed, {}, 201, expected)
+        with self.assertRaises(RuntimeError):
+            stage2_auth.assert_provision_response(200, valid, {}, 201, expected)
+
+    def test_sensor_provision_response_requires_scoped_urn_and_nullable_unit(self):
+        expected = {"gateway_id": "fixture", "sensor_id": "shared", "name": " Sensor ",
+                    "unit": None, "entity_id": "urn:ngsi-ld:Sensor:fixture:shared"}
+        valid = {**expected, "created_at": "2026-01-01T00:00:00Z"}
+        stage2_auth.assert_provision_response(201, valid, {}, 201, expected)
+        for changed in [{**valid, "unit": ""}, {**valid, "entity_id": "urn:ngsi-ld:Sensor:shared"},
+                        {**valid, "gateway_id": "other"}, {**valid, "internal_id": "private"}]:
+            with self.assertRaises(RuntimeError):
+                stage2_auth.assert_provision_response(201, changed, {}, 201, expected)
+
+    def test_provision_graph_probe_rejects_partial_or_duplicate_graph(self):
+        stack = stage2_auth.Stack()
+        stack.postgres = "owned-postgres"
+        stack.command = mock.Mock(return_value="1|1|1|1|1|2|2|1")
+        stack.assert_provisioned_graph("fixture", "owner", {}, {})
+        call = stack.command.call_args.kwargs
+        self.assertNotIn("\"owner\"", call["stdin"])
+        self.assertIn("v->>'owner'", call["stdin"])
+        self.assertIn("last_desired_by IS NULL", call["stdin"])
+        for result in ("1|0|1|1|1|2|2|1", "1|1|1|1|1|2|1|1", "1|1|1|1|1|3|2|2"):
+            stack.command.return_value = result
+            with self.assertRaises(RuntimeError):
+                stack.assert_provisioned_graph("fixture", "owner", {}, {})
+
+    def test_provision_cleanup_orders_restrictive_fks_and_propagates_errors(self):
+        stack = stage2_auth.Stack()
+        stack.postgres = "owned-postgres"
+        stack.provisioned_gateways = ["scenario_owned"]
+        stack.command = mock.Mock(return_value="")
+        stack.cleanup_provisioned_resources()
+        call = stack.command.call_args.kwargs
+        sql = call["stdin"]
+        self.assertNotIn("scenario_owned", sql)
+        self.assertEqual(json.loads(call["env"]["AUTHORIZATION_FIXTURE"]),
+                         {"gateways": ["scenario_owned"]})
+        tables = ["twin_relationships", "twin_states", "twin_entities", "sensors", "user_gateways", "gateways"]
+        positions = [sql.index("DELETE FROM " + table + " ") for table in tables]
+        self.assertEqual(positions, sorted(positions))
+        stack.command.side_effect = RuntimeError("cleanup failed")
+        with self.assertRaises(RuntimeError):
+            stack.cleanup_provisioned_resources()
+
+    def test_provisioning_cleanup_ownership_and_exit_codes(self):
+        for test_exit, cleanup_exit, run_exit, expected in [
+            (0, 0, 0, 0), (7, 0, 0, 7), (0, 1, 0, 1),
+            (7, 1, 0, 7), (0, 0, 9, 9),
+        ]:
+            with (
+                self.subTest(test_exit=test_exit, cleanup_exit=cleanup_exit, run_exit=run_exit),
+                tempfile.TemporaryDirectory(prefix="provisioning-cleanup-") as directory,
+            ):
+                path = Path(directory)
+                docker = path / "docker"
+                docker.write_text("""#!/bin/sh
+case "$1" in
+  run) exit "$RUN_EXIT" ;;
+  logs) echo 'PostgreSQL init process complete; ready for start up' ;;
+  port) echo '127.0.0.1:12345' ;;
+  rm) printf '%s\\n' "$*" > "$CLEANUP_RECORD"; exit "$CLEANUP_EXIT" ;;
+esac
+""")
+                go = path / "go"
+                go.write_text('#!/bin/sh\nexit "$TEST_EXIT"\n')
+                docker.chmod(0o700)
+                go.chmod(0o700)
+                result = subprocess.run(
+                    ["sh", str(stage2_auth.ROOT / "scripts/test-stage2-provisioning.sh")],
+                    env={**os.environ, "PATH": f"{path}:{os.environ['PATH']}",
+                         "CLEANUP_RECORD": str(path / "record"), "CLEANUP_EXIT": str(cleanup_exit),
+                         "TEST_EXIT": str(test_exit), "RUN_EXIT": str(run_exit)},
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                self.assertEqual(result.returncode, expected)
+                if run_exit:
+                    self.assertFalse((path / "record").exists(), "must not remove an unowned container")
+                else:
+                    self.assertRegex((path / "record").read_text(), r"^rm -f -v stage2-provisioning-[0-9]+\n$")
+                self.assertEqual("Failed to remove" in result.stderr, cleanup_exit != 0)
+
     def test_authorization_cleanup_removes_owned_volumes_and_propagates_failure(self):
         for test_exit, cleanup_exit, expected_exit in [
             (0, 0, 0),
