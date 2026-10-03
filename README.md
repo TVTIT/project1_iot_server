@@ -3,10 +3,13 @@
 Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biến thời gian thực từ các Gateway không đồng nhất (heterogeneous Gateways: ESP32, Luckfox Pico Plus, TI AM5728), lưu trữ chuỗi thời gian (time-series) trên TimescaleDB, hỗ trợ truy vấn lịch sử, streaming dữ liệu thời gian thực qua WebSocket, xác thực và phân quyền người dùng thông qua Supabase Auth/RLS, quản lý tải lên media (hình ảnh) qua private storage, và tích hợp phân hệ **Digital Twin** (quản lý thực thể theo chuẩn NGSI-LD, đồng bộ trạng thái `reported_state` / `desired_state`, điều khiển Gateway qua MQTT Transactional Outbox và lưu trữ lịch sử thuộc tính biến thiên theo thời gian).
 
 Đây là kiến trúc/mục tiêu MVP, không phải toàn bộ tính năng đã hoàn thành.
-Task 2.2 đã có JWT authentication và PostgreSQL platform-admin guard; các
-business route hiện còn stub hoặc chưa đăng ký. Xem
+Task 2.2 đã có JWT authentication và PostgreSQL platform-admin guard; Task 2.3
+đã có Gateway/Sensor read API theo membership. Task 2.4 đã triển khai hai Admin
+PUT provision Gateway/Sensor và graph Twin atomically trong worktree; independent
+local verification đã PASS, còn chờ commit/push và CI trên SHA mới. Xem
 [contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md)
-để phân biệt phần đã triển khai với User–Gateway permissions/WebSocket tương lai.
+và [contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md)
+để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
 
 ---
 
@@ -281,7 +284,7 @@ platform admin tại `docs/backend/stage-2-task-2.1-migrations.md`.
 
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
-Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.1**, bao gồm 5 luồng kiểm tra song song:
+Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.1**, gồm các jobs sau (cấu hình mới chưa có CI xanh trên SHA cuối):
 
 1. **`lint-and-test`**:
    - Kiểm tra định dạng code Go với `gofmt`.
@@ -322,7 +325,13 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
        phân biệt Gateway rỗng với denial và timeout khi database bị khóa.
     - Cleanup xóa anonymous volumes thuộc container test; lỗi cleanup làm
       harness trả nonzero, không dùng global volume prune.
-    - Contract và kết quả tại [Task 2.3](docs/backend/stage-2-task-2.3-authorization.md).
+     - Contract và kết quả tại [Task 2.3](docs/backend/stage-2-task-2.3-authorization.md).
+7. **`provisioning-integration`**:
+     - PostgreSQL isolated dưới `iot_backend_app`, router thật: Gateway/Sensor/Twin
+       atomic, retry, rollback, concurrency, timeout và admin revocation.
+     - Từ repo root: `sh scripts/test-stage2-provisioning.sh`; không đọc/sửa `.env`.
+     - `auth-integration` cũng kiểm tra hai PUT bằng JWT GoTrue thật qua Nginx/Envoy.
+       Contract, lệnh và giới hạn bằng chứng tại [Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md).
 
 ---
 
@@ -340,6 +349,8 @@ Mọi HTTP request/response của Go Backend đều được gán hoặc bảo t
 | `GET` | `/v1/health` | Không | Healthcheck Go Backend (`{"status":"running","service":"iot-backend","version":"v1"}`) | Hoạt động (HTTP 200) |
 | `GET` | `/v1/gateways` | Human Bearer JWT | Gateway được cấp qua user_gateways; admin không bypass | Đã triển khai; 200 items, 401 nếu thiếu/sai JWT |
 | `GET` | `/v1/gateways/{gateway_id}/sensors` | Human Bearer JWT | Sensor kế thừa quyền Gateway | Đã triển khai; 200 items, 404 nếu không tồn tại/không có quyền |
+| `PUT` | `/v1/admin/gateways/{gateway_id}` | Human JWT + DB platform admin | Gateway + owner ban đầu + Twin/state trong một transaction | Worktree: 201 tạo, 200 retry no-op, 409 conflict |
+| `PUT` | `/v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` | Human JWT + DB platform admin | Sensor + Twin/state + hasSensor trong một transaction | Worktree: 201 tạo, 200 retry no-op, 409 conflict |
 | `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) | 501 Not Implemented |
 | `GET` | `/v1/ws` | Human Bearer JWT (chỉ header) | Stub; chưa nâng cấp WebSocket hoặc streaming | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
 | `GET` | `/v1/digital-twins` | Human Bearer JWT (Supabase) | Stub danh sách Digital Twin | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
@@ -347,9 +358,11 @@ Mọi HTTP request/response của Go Backend đều được gán hoặc bảo t
 
 *Ghi chú: Ba business GET stub đều yêu cầu JWT hợp lệ trước khi trả `501`;
 thiếu/sai JWT trả `401`. Không nhận token qua query/body. `501` không chứng
-minh User–Gateway permission hay nghiệp vụ hoàn thành. Chưa có production
-admin handler; admin guard được kiểm thử qua test-only route. Xem
-[route matrix và safe error contract](docs/backend/stage-2-task-2.2-authentication.md).*
+minh User–Gateway permission hay nghiệp vụ hoàn thành. Hai Admin PUT đã được
+đăng ký trong router; không cấp MQTT credentials, không có membership API hay
+device control. Platform admin không bypass membership trên user read API. Xem
+[safe error contract](docs/backend/stage-2-task-2.2-authentication.md) và
+[provisioning contract](docs/backend/stage-2-task-2.4-provisioning.md).*
 
 #### Digital Twin & Device Control API (`/v1/*`):
 Danh sách dưới là **thiết kế MVP**: hiện chỉ `GET /v1/digital-twins` được
