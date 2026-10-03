@@ -6,6 +6,58 @@ import stage2_mosquitto_runtime as runtime
 
 
 class Contracts(unittest.TestCase):
+    def assert_ca_only(self, config, backend, private_services):
+        service = config['services'][backend]
+        target = service['environment']['MQTT_TLS_CA_FILE']
+        mounts = service['volumes']
+        ca = [m for m in mounts if m['target'] == target]
+        self.assertEqual(len(ca), 1, 'CA must be an individual file mount')
+        self.assertTrue(ca[0].get('read_only'), 'CA must be read-only')
+        self.assertTrue(ca[0]['source'].endswith('/ca.crt'))
+        self.assertEqual(ca[0]['type'], 'bind')
+        self.assertFalse(ca[0]['bind']['create_host_path'])
+        for mount in mounts:
+            self.assertFalse(mount['source'].endswith('.key'))
+            self.assertFalse(mount['source'].endswith('/certs'))
+            self.assertFalse(mount['target'].endswith('.key'))
+            self.assertFalse(target.startswith(mount['target'].rstrip('/') + '/'),
+                             'broad certificate/config mount forbidden')
+        for name in private_services:
+            for mount in config['services'][name].get('volumes', []):
+                self.assertFalse(mount['target'].startswith('/mosquitto/config'))
+                self.assertFalse(mount['source'].endswith(('.key', '/certs')))
+
+    def test_actual_production_compose_ca_only(self):
+        import json
+        # No inherited deployment environment, implicit .env, or printed config.
+        env = dict(runtime.ENV, COMPOSE_DISABLE_ENV_FILE='1')
+        for key in ('MQTT_PASSWORD', 'POSTGRES_PASSWORD', 'AUTH_DB_PASSWORD',
+                    'STORAGE_DB_PASSWORD', 'BACKEND_DB_PASSWORD', 'JWT_SECRET',
+                    'DATABASE_URL', 'GOTRUE_JWT_ISSUER', 'SUPABASE_JWT_AUDIENCE'):
+            env[key] = 'isolated-test-placeholder'
+        env['MQTT_TLS_CA_SOURCE'] = '/tmp/opencode/public-fixture/ca.crt'
+        env['MQTT_TLS_CA_FILE'] = '/mqtt-public/ca.crt'
+        config = json.loads(runtime.run(['docker', 'compose', '--env-file', '/dev/null',
+                                        '-f', str(runtime.ROOT / 'docker-compose.yml'),
+                                        'config', '--format', 'json'], env=env, capture=True))
+        self.assert_ca_only(config, 'backend', ('mosquitto-auth-init', 'mosquitto-reloader'))
+        ca = next(m for m in config['services']['backend']['volumes']
+                  if m['target'] == '/mqtt-public/ca.crt')
+        self.assertEqual(ca['source'], env['MQTT_TLS_CA_SOURCE'])
+        del env['MQTT_TLS_CA_SOURCE'], env['MQTT_TLS_CA_FILE']
+        defaults = json.loads(runtime.run(['docker', 'compose', '--env-file', '/dev/null',
+                                          '-f', str(runtime.ROOT / 'docker-compose.yml'),
+                                          'config', '--format', 'json'], env=env, capture=True))
+        self.assert_ca_only(defaults, 'backend', ('mosquitto-auth-init', 'mosquitto-reloader'))
+        self.assertEqual(defaults['services']['backend']['environment']['MQTT_TLS_CA_FILE'],
+                         '/mosquitto/config/certs/ca.crt')
+
+    def test_fixture_compose_ca_only(self):
+        import json
+        poc = runtime.PoC('/tmp/opencode/public-fixture')
+        config = json.loads(poc.command('config', '--format', 'json', capture=True))
+        self.assert_ca_only(config, 'backend', ('initializer', 'reloader'))
+
     def test_cleanup_owned_scope_partial_build_and_recreated_resources(self):
         poc = runtime.PoC('/tmp/opencode')
         commands = []

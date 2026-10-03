@@ -318,7 +318,13 @@ services:
     volumes:
       - mosquitto_auth:/mosquitto/auth
       - mosquitto_control:/mosquitto/control:ro
-      - ./config/mosquitto/certs:/mosquitto/config/certs:ro
+      # Backend verifies the broker with a public CA; never mount broker keys.
+      - type: bind
+        source: ${MQTT_TLS_CA_SOURCE:-./config/mosquitto/certs/ca.crt}
+        target: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}
+        read_only: true
+        bind:
+          create_host_path: false
     container_name: iot_backend
     restart: unless-stopped
     environment:

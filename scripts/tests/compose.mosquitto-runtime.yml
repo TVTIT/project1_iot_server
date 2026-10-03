@@ -45,7 +45,12 @@ services:
     volumes:
       - auth:/mosquitto/auth
       - control:/mosquitto/control:ro
-      - config:/mosquitto/config:ro
+      - type: bind
+        source: ${POC_HELPER_DIR:?required}/public/ca.crt
+        target: /mosquitto/config/ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
   initializer:
     <<: *runtime
     image: ${POC_INIT_IMAGE:?required}

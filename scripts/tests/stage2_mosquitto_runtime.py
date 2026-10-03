@@ -190,6 +190,28 @@ class PoC:
             raise RuntimeError('auth mount permissions failed')
         if service in ('writer', 'backend') and (len(control) != 1 or control[0]['RW']):
             raise RuntimeError('backend control mount must be read-only')
+        if service == 'backend':
+            ca = [m for m in mounts if m['Destination'] == '/mosquitto/config/ca.crt']
+            if (len(ca) != 1 or ca[0]['RW'] or ca[0]['Type'] != 'bind'
+                    or not ca[0]['Source'].endswith('/public/ca.crt')
+                    or any(m['Destination'] == '/mosquitto/config'
+                           or m['Source'].endswith('.key')
+                           or m['Destination'].endswith('.key') for m in mounts)):
+                raise RuntimeError('backend public CA isolation failed')
+            self.exec(service, '/bin/sh', '-ec',
+                      'test "$(id -u)" = 1883; test -r /mosquitto/config/ca.crt; '
+                      'test ! -w /mosquitto/config/ca.crt; '
+                      'test -z "$(find /mosquitto/config -name \'*.key\')"; '
+                      'test ! -e /mosquitto/config/server.key; '
+                      'test ! -r /mosquitto/config/server.key; '
+                      'test ! -e /mosquitto/config/ca.key; '
+                      'test ! -r /mosquitto/config/ca.key; test ! -e /poc')
+        if service == 'reloader':
+            if any(m['Destination'].startswith('/mosquitto/config')
+                   or m['Source'].endswith('.key') for m in mounts):
+                raise RuntimeError('reloader mounted private certificates')
+            self.exec(service, '/bin/sh', '-ec', 'test ! -e /mosquitto/config/server.key; '
+                      'test ! -e /mosquitto/config/ca.key')
 
     def adapter_phase(self, fixture, phase):
         fixture = dict(fixture, Phase=phase)
@@ -312,6 +334,12 @@ class PoC:
         for path in d.iterdir():
             if path.name not in ('helper', 'runtime.test'):
                 path.chmod(0o600)
+        # Only this public file is mounted by the backend. Test keys remain in
+        # the isolated helper directory / broker config, never backend mounts.
+        public = d / 'public'
+        public.mkdir(mode=0o755)
+        (public / 'ca.crt').write_bytes((d / 'ca.crt').read_bytes())
+        (public / 'ca.crt').chmod(0o644)
         print('stage=build-production-targets', flush=True)
         self.command('build', 'writer', 'initializer', 'reloader', timeout=300)
         # Prove rejection at the initializer, not merely at backend startup.
@@ -351,6 +379,9 @@ class PoC:
         print('initializer_unsafe_password=denied,no-store,broker-blocked', flush=True)
         self.command('run', '--rm', 'initializer')
         self.command('run', '--rm', 'initializer')
+        self.command('run', '--rm', '--entrypoint', '/bin/sh', 'initializer', '-ec',
+                     'test ! -e /mosquitto/config/server.key; test ! -e /mosquitto/config/ca.key; '
+                     'test ! -e /poc')
         print('stage=start-writer', flush=True)
         self.command('up', '-d', 'writer')
         self.exec('writer', '/bin/sh', '-c',
@@ -482,7 +513,13 @@ log_dest stdout
         identity = self.exec('broker', 'cat', '/proc/1/stat', capture=True).split()[21]
         self.probe('backend_service', backend)
         self.probe(gateway, 'wrong_' + secrets.token_hex(8), False)
-        # Invalid hostname must fail TLS, not be classified as auth rejection.
+        # Wrong CA and hostname must fail TLS, not count as auth rejection.
+        try:
+            mqtt_connection(self.port, d / 'wrong-ca.crt', gateway, old, False).close()
+        except ssl.SSLCertVerificationError:
+            pass
+        else:
+            raise RuntimeError('wrong CA verification did not fail')
         context = ssl.create_default_context(cafile=str(d / 'ca.crt'))
         try:
             with socket.create_connection(('127.0.0.1', self.port), 2) as raw:
@@ -564,6 +601,9 @@ log_dest stdout
                     raise RuntimeError('enabled backend startup did not become ready') from None
                 time.sleep(.2)
         self.check_security('backend')
+        print('backend_CA_isolation=PASS UID1883 public-file-RO readable; '
+              'broker-key/CA-key=absent,unreadable; init/reloader=no-private-certs; '
+              'fresh-startup=ready; wrong-CA/hostname=TLS-rejected', flush=True)
         self.command('stop', 'backend')
         for settings in (
                 ['-e', 'MQTT_PASSWORD=wrong_' + secrets.token_hex(8)],
