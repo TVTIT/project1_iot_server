@@ -5,11 +5,16 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 Đây là kiến trúc/mục tiêu MVP, không phải toàn bộ tính năng đã hoàn thành.
 Task 2.2 đã có JWT authentication và PostgreSQL platform-admin guard; Task 2.3
 đã có Gateway/Sensor read API theo membership. Task 2.4 đã triển khai hai Admin
-PUT provision Gateway/Sensor và graph Twin atomically trong worktree; independent
-local verification đã PASS, còn chờ commit/push và CI trên SHA mới. Xem
-[contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md)
-và [contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md)
-để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
+PUT provision Gateway/Sensor và graph Twin atomically trong worktree; Task 2.5 đã
+hoàn thành hạ tầng runtime credential cho Mosquitto (quản lý `password_file` trong
+named volume, atomic replace có lock/fsync, reload qua Unix socket sidecar không
+dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS). Independent local
+verification đã PASS, còn chờ commit/push và CI trên SHA mới. Xem
+[contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md),
+[contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md) và
+[hạ tầng runtime Mosquitto Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md)
+để phân biệt phần đã triển khai với credential REST API của Task 2.6 cũng như
+telemetry/WebSocket/device control tương lai.
 
 ---
 
@@ -332,6 +337,15 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
      - Từ repo root: `sh scripts/test-stage2-provisioning.sh`; không đọc/sửa `.env`.
      - `auth-integration` cũng kiểm tra hai PUT bằng JWT GoTrue thật qua Nginx/Envoy.
        Contract, lệnh và giới hạn bằng chứng tại [Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md).
+8. **`mosquitto-runtime-integration`**:
+     - Kiểm chứng hạ tầng runtime credential Mosquitto: khởi tạo volume auth, atomic replace
+       file mật khẩu có lock/fsync, gửi tín hiệu reload qua Unix domain socket sidecar (không dùng
+       Docker socket, không host PID).
+     - Kiểm chứng kết nối MQTT TLS thật, cách ly phân quyền ACL `%u`, probe xác thực fresh
+       connection, và cơ chế tự động rollback/recovery khi có sự cố.
+     - Chạy 14 tests contract trong Python harness và tích hợp native Go adapter.
+     - Từ repo root: `sh scripts/test-stage2-mosquitto-runtime.sh` và `python3 -m unittest discover -s scripts/tests -p 'test_stage2_mosquitto_runtime.py'`.
+       Contract, kiến trúc và ranh giới tại [Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md).
 
 ---
 
