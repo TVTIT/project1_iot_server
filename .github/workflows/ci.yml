@@ -171,6 +171,19 @@ jobs:
           AUTHORIZATION_TEST_COVERAGE_FILE: ${{ runner.temp }}/authorization-coverage.out
         run: sh scripts/test-stage2-authorization.sh
 
+  provisioning-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Atomic Gateway/Sensor provisioning, HTTP and failure database tests
+        working-directory: .
+        run: sh scripts/test-stage2-provisioning.sh
+
   auth-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -183,7 +196,7 @@ jobs:
       - name: Auth harness regression tests
         working-directory: .
         run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_auth.py'
-      - name: Centralized Auth, signup denial and Nginx/Envoy integration
+      - name: Centralized Auth, provisioning and membership through Nginx/Envoy
         working-directory: .
         run: sh scripts/test-stage2-auth.sh
       - name: Admin checker database regressions
