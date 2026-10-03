@@ -22,6 +22,15 @@ func cleanPath(s string) bool {
 	return filepath.IsAbs(s) && filepath.Clean(s) == s && s != "/" && !strings.ContainsAny(s, "\x00\r\n")
 }
 
+// ValidateBackendPassword rejects unsafe backend credentials before any store
+// or volume mutation. Valid passwords are checked verbatim, never normalized.
+func ValidateBackendPassword(password string) error {
+	if !validPassword(password) || strings.TrimSpace(password) == "" || strings.Contains(strings.ToLower(password), "replace_with") || strings.Contains(strings.ToLower(password), "change_me") {
+		return ErrInvalidInput
+	}
+	return nil
+}
+
 // LoadConfig parses and validates the opt-in credential runtime configuration.
 func LoadConfig(get func(string) (string, bool)) (StartupConfig, error) {
 	var c StartupConfig
@@ -44,7 +53,7 @@ func LoadConfig(get func(string) (string, bool)) (StartupConfig, error) {
 	if e != nil || u.Scheme != "ssl" || u.Hostname() == "" || u.Port() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		return c, fmt.Errorf("MQTT_BROKER_URL requires ssl host and port")
 	}
-	if c.Username != BackendUsername || !validPassword(c.Password) || strings.TrimSpace(c.Password) == "" || strings.Contains(strings.ToLower(c.Password), "replace_with") || strings.Contains(strings.ToLower(c.Password), "change_me") {
+	if c.Username != BackendUsername || ValidateBackendPassword(c.Password) != nil {
 		return c, fmt.Errorf("invalid MQTT backend credentials")
 	}
 	c.CAFile = read("MQTT_TLS_CA_FILE")

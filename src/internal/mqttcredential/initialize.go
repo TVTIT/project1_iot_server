@@ -15,7 +15,7 @@ import (
 // Initialize never repairs or rotates an existing store. An interrupted first
 // initialization leaves explicit recovery evidence for an operator.
 func Initialize(ctx context.Context, dir, password string, tool NativeTool) error {
-	if !validPassword(password) || !filepath.IsAbs(tool.Path) || tool.Timeout <= 0 {
+	if ValidateBackendPassword(password) != nil || !filepath.IsAbs(tool.Path) || tool.Timeout <= 0 {
 		return ErrInvalidInput
 	}
 	if err := secureDir(dir); err != nil {

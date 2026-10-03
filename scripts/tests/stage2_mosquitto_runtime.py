@@ -314,6 +314,41 @@ class PoC:
                 path.chmod(0o600)
         print('stage=build-production-targets', flush=True)
         self.command('build', 'writer', 'initializer', 'reloader', timeout=300)
+        # Prove rejection at the initializer, not merely at backend startup.
+        # This isolated override models the production completed-init dependency.
+        override = d / 'initializer-dependency.yml'
+        override.write_text('services:\n  broker:\n    depends_on:\n      initializer:\n        condition: service_completed_successfully\n')
+        original_password = self.env['POC_BACKEND_PASSWORD']
+        self.compose.extend(['-f', str(override)])
+        try:
+            for password in ('replace_with_backend_mqtt_password', ' \t '):
+                self.env['POC_BACKEND_PASSWORD'] = password
+                try:
+                    self.command('up', '-d', 'broker')
+                except RuntimeError:
+                    pass
+                else:
+                    raise RuntimeError('unsafe initializer password allowed broker startup')
+                cid = self.command('ps', '-aq', 'initializer', capture=True).decode().strip()
+                state = json.loads(run(['docker', 'inspect', cid], capture=True))[0]['State']
+                if state['Running'] or state['ExitCode'] != 1:
+                    raise RuntimeError('initializer did not reject unsafe password')
+                logs = subprocess.run(['docker', 'logs', cid], env=ENV,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      timeout=30, check=True)
+                log = logs.stdout + logs.stderr
+                if b'auth initialization failed' not in log or password.encode() in log:
+                    raise RuntimeError('initializer rejection missing or exposed credential')
+                broker = self.command('ps', '-aq', 'broker', capture=True).decode().strip()
+                if broker and json.loads(run(['docker', 'inspect', broker], capture=True))[0]['State']['Running']:
+                    raise RuntimeError('broker started after initializer rejection')
+                self.command('run', '--rm', '--entrypoint', '/bin/sh', 'initializer',
+                             '-c', 'test ! -e /mosquitto/auth/passwd; test ! -e /mosquitto/auth/passwd.last-good')
+                self.command('rm', '-f', 'initializer', 'broker')
+        finally:
+            self.env['POC_BACKEND_PASSWORD'] = original_password
+            del self.compose[-2:]
+        print('initializer_unsafe_password=denied,no-store,broker-blocked', flush=True)
         self.command('run', '--rm', 'initializer')
         self.command('run', '--rm', 'initializer')
         print('stage=start-writer', flush=True)

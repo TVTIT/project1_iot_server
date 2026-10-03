@@ -15,6 +15,24 @@ func startupEnv() map[string]string {
 func loadMap(m map[string]string) (StartupConfig, error) {
 	return LoadConfig(func(k string) (string, bool) { v, ok := m[k]; return v, ok })
 }
+
+func TestBackendPasswordValidation(t *testing.T) {
+	for _, password := range []string{"", " \t ", "\u2003", "replace_with_backend_mqtt_password", "REPLACE_WITH_password", "CHANGE_ME", "a\nb", "a\rb", "a\x00b", strings.Repeat("x", 4097)} {
+		if ValidateBackendPassword(password) == nil {
+			t.Fatal("unsafe backend password accepted")
+		}
+		m := startupEnv()
+		m["MQTT_PASSWORD"] = password
+		if _, err := loadMap(m); err == nil {
+			t.Fatal("runtime config accepted unsafe backend password")
+		}
+	}
+	for _, password := range []string{" literal password ", "secret with spaces", strings.Repeat("x", 4096)} {
+		if err := ValidateBackendPassword(password); err != nil {
+			t.Fatal("valid verbatim password rejected")
+		}
+	}
+}
 func TestStartupConfig(t *testing.T) {
 	c, e := loadMap(startupEnv())
 	if e != nil || c.Password != " literal password " || c.Runtime.MaxPending != 8 || c.Runtime.OperationTimeout != 10*time.Second {

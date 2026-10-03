@@ -47,7 +47,8 @@ func bootstrap() error {
 }
 
 func run(get func(string) string) error {
-	if get("MQTT_USERNAME") != mqttcredential.BackendUsername || get("MQTT_PASSWORD") == "" {
+	password := get("MQTT_PASSWORD")
+	if get("MQTT_USERNAME") != mqttcredential.BackendUsername || mqttcredential.ValidateBackendPassword(password) != nil {
 		return errors.New("invalid initializer configuration")
 	}
 	if os.Geteuid() == 0 {
@@ -57,7 +58,7 @@ func run(get func(string) string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return mqttcredential.Initialize(ctx, "/mosquitto/auth", get("MQTT_PASSWORD"), mqttcredential.NativeTool{Path: "/usr/bin/mosquitto_passwd", Timeout: 3 * time.Second})
+	return mqttcredential.Initialize(ctx, "/mosquitto/auth", password, mqttcredential.NativeTool{Path: "/usr/bin/mosquitto_passwd", Timeout: 3 * time.Second})
 }
 
 func main() {
