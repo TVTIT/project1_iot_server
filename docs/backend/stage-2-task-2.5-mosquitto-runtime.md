@@ -179,11 +179,19 @@ Spike đã chứng minh thuật toán băm `sha512-pbkdf2` của Mosquitto có f
   - Khôi phục file gốc từ bản sao dự phòng: `rename(snapshot, passwd)` và `fsync` thư mục auth.
   - Gửi lại tín hiệu reload qua Unix socket.
   - Chạy `RecoveryProbe` để xác nhận broker đã khôi phục trạng thái credential trước đó.
-- **Trường hợp Rollback cũng thất bại**:
-  - Giữ nguyên thư mục staging chứa chứng cứ lỗi (`retain = true`).
-  - Ghi marker `.credential.pending` với nội dung `recovery-required\n` và `fsync` thư mục.
-  - Đánh dấu runtime bị nhiễm độc (`poisoned = true`), trả về lỗi kết hợp `errors.Join(cause, ErrRecoveryRequired)`.
-  - Toàn bộ các mutation tiếp theo sẽ bị từ chối (fail-closed) cho đến khi người quản trị kiểm tra và xử lý thủ công.
+- **Phân định rõ ranh giới giữa hai trạng thái sau sự cố**:
+  1. **Trạng thái đã rollback có kiểm chứng (Verified Rollback)**:
+     - Xảy ra khi quy trình khôi phục snapshot thành công và `RecoveryProbe` xác nhận broker đã quay về trạng thái credential hợp lệ trước đó.
+     - Trong trạng thái này, file `passwd` và bộ nhớ broker đã được đưa về trạng thái nhất quán cũ.
+  2. **Trạng thái bất định (Uncertain State) khi gặp `ErrRecoveryRequired`**:
+     - Xảy ra khi bước rollback thất bại, `RecoveryProbe` thất bại, hoặc quá trình fsync/rename/promote `passwd.last-good` gặp lỗi sau khi file hoặc broker đã bị biến đổi.
+     - Runtime **KHÔNG BẢO ĐẢM** được việc rollback đã hoàn tất: file `passwd` và trạng thái trong broker có thể không còn khớp với snapshot cũ, hoặc broker đã nạp credential mới nhưng `passwd.last-good` chưa được promote.
+     - Hành vi an toàn của runtime:
+       * Giữ nguyên thư mục staging chứa chứng cứ lỗi (`retain = true`).
+       * Ghi marker `.credential.pending` với nội dung `recovery-required\n` và `fsync` thư mục.
+       * Đánh dấu runtime bị nhiễm độc (`poisoned = true`), trả về lỗi kết hợp `errors.Join(cause, ErrRecoveryRequired)`.
+       * Toàn bộ các mutation tiếp theo sẽ bị từ chối (fail-closed) cho đến khi người quản trị kiểm tra và xử lý thủ công.
+     - **Ràng buộc đối với tầng gọi/CSDL**: Database **TUYỆT ĐỐI KHÔNG ĐƯỢC** tự ý coi đây là một thất bại thông thường và đánh dấu event là "failed" như thể rollback đã xong, mà bắt buộc phải giữ intent dở dang hoặc chuyển sang trạng thái cần khắc phục (`recovery_needed`) để tiến trình đối soát (reconciler) can thiệp có chủ đích.
 
 ---
 
@@ -252,10 +260,11 @@ Module `mqttcredential.Probe` sử dụng thư viện `paho.mqtt.golang` để t
    - Nếu nhận bất kỳ mã lỗi nào hoặc lỗi mạng/timeout: Coi là probe thất bại (`ErrVerificationFailed`).
 
 2. **Negative Probe (`Rejected`)**:
-   - Sử dụng sau khi thu hồi mật khẩu Gateway (Revoke).
+   - Sử dụng sau khi thu hồi mật khẩu Gateway (Revoke) trong các kịch bản kiểm thử có mật khẩu cũ đã biết.
    - Yêu cầu broker phải trả về mã từ chối xác thực rõ ràng:
      * `packets.ErrRefusedBadUsernameOrPassword` (Mã phản hồi MQTT 4).
      * Hoặc `packets.ErrRefusedNotAuthorised` (Mã phản hồi MQTT 5).
+   - **Bản chất xác thực**: Negative probe chỉ hợp lệ khi probe bằng **mật khẩu cũ đã biết** của Gateway. Việc thử một mật khẩu ngẫu nhiên không chứng minh được tài khoản đã bị thu hồi vì mật khẩu ngẫu nhiên luôn bị từ chối dù credential cũ còn hiệu lực hay không.
    - **Nguyên tắc cốt tử**: Lỗi mạng (timeout, connection reset, TLS handshake fail, DNS/routing error) **tuyệt đối không được coi là xác thực bị từ chối**. Nếu gặp lỗi mạng trong negative probe, hệ thống coi là probe thất bại (`ErrVerificationFailed`) để kích hoạt rollback, ngăn ngừa việc broker chưa kịp revoke nhưng hệ thống ngỡ là đã revoke do rớt mạng.
 
 ---
@@ -290,15 +299,29 @@ Task 2.6 phải phối hợp hai pha (two-phase coordination):
 2. **Pha 2 (Runtime Execution)**: Gọi `mqttcredential.Runtime` để cập nhật file `passwd`, gửi reload và probe broker.
 3. **Pha 3 (PostgreSQL Finalize)**: Cập nhật trạng thái thành công trong PostgreSQL.
 
-Nếu bước 2 thất bại, runtime đã tự động rollback file và broker về trạng thái cũ; Task 2.6 chỉ cần đánh dấu event thất bại trong CSDL. Nếu xảy ra sự cố sập nguồn giữa các bước, Task 2.6 cần có cơ chế đối soát (reconciliation worker) dựa trên `passwd.last-good` và bảng dữ liệu CSDL.
+**Xử lý lỗi và phân định trạng thái phục hồi (Recovery Contract)**:
+- **Trường hợp Rollback có kiểm chứng (Verified Rollback)**:
+  * Nếu bước 2 thất bại với các lỗi runtime thông thường (không kèm theo `ErrRecoveryRequired`), runtime đã tự động kích hoạt rollback snapshot thành công và `RecoveryProbe` xác nhận broker đã khôi phục trạng thái credential trước đó.
+  * Trong trường hợp này, trạng thái file và broker được đảm bảo giữ nguyên vẹn như trước khi mutation xảy ra; Task 2.6 có thể đánh dấu event trong CSDL là `failed`.
+- **Trường hợp Trạng thái bất định (Uncertain State) khi gặp `ErrRecoveryRequired`**:
+  * Khi bước 2 trả về lỗi kết hợp `ErrRecoveryRequired` (hoặc xảy ra sự cố sập nguồn/crash giữa các bước fsync/rename/promote), runtime **KHÔNG BẢO ĐẢM** được việc rollback đã hoàn tất.
+  * Ví dụ: Broker có thể đã nạp credential mới qua SIGHUP nhưng promotion `passwd.last-good` bị lỗi I/O, hoặc rollback snapshot gặp lỗi phân quyền/đĩa đầy.
+  * **Ràng buộc đối với Task 2.6**: CSDL **TUYỆT ĐỐI KHÔNG ĐƯỢC** tự ý đánh dấu event là "failed" như thể rollback đã hoàn tất. CSDL bắt buộc phải duy trì trạng thái intent dở dang hoặc chuyển sang trạng thái `recovery_needed` / `pending_reconciliation` để tiến trình đối soát (reconciliation worker) hoặc quản trị viên can thiệp xử lý có chủ đích.
 
-### 8.2 Thách thức Negative Probe khi Revoke
+### 8.2 Thách thức kiểm chứng Revoke và Contract cho Task 2.6
 
-- Để bảo vệ mật khẩu, PostgreSQL **không bao giờ lưu mật khẩu plaintext** của Gateway (chỉ lưu hash PBKDF2/bcrypt).
+- Để bảo vệ mật khẩu, PostgreSQL **không bao giờ lưu mật khẩu plaintext** của Gateway (chỉ lưu chuỗi hash an toàn).
 - Khi người quản trị gọi API Revoke một Gateway, Backend **không có mật khẩu cũ** để thực hiện negative probe (gửi mật khẩu cũ lên broker xem có bị từ chối kết nối hay không).
-- **Giải pháp chuyển tiếp cho Task 2.6**:
-  * Xác nhận offline: Đảm bảo username của Gateway đã bị xóa hoàn toàn khỏi file `passwd` sau khi parse candidate và `fsync`.
-  * Xác nhận online thay thế: Thử kết nối với username vừa bị thu hồi kèm theo một mật khẩu ngẫu nhiên để xác nhận broker trả về mã từ chối xác thực (user không tồn tại trong hệ thống).
+- **Phân tích bản chất kỹ thuật của Negative Probe**:
+  * Auth rejection (`CONNACK` return code 4 hoặc 5) chỉ chứng minh cặp `(username, password)` cụ thể được gửi đi bị từ chối xác thực.
+  * Thử một **mật khẩu ngẫu nhiên** và nhận phản hồi từ chối **hoàn toàn KHÔNG chứng minh** được username đã bị xóa khỏi broker hay credential cũ đã hết hiệu lực. Nếu broker chưa nạp lại cấu hình và credential cũ vẫn còn hiệu lực, một mật khẩu ngẫu nhiên gửi lên vẫn chắc chắn bị từ chối như thường — gây ra hiện tượng **false-green (kết luận thành công giả)** cực kỳ nguy hiểm.
+  * Integration test của Task 2.5 sở dĩ kiểm chứng được revoke an toàn là vì test case kiểm thử trực tiếp nắm giữ plaintext password cũ đã biết để probe và nhận đúng `CONNACK` rejection sau reload.
+- **Contract chuyển tiếp bắt buộc cho Task 2.6**:
+  * Task 2.6 **TUYỆT ĐỐI KHÔNG ĐƯỢC** tự ý sinh mật khẩu ngẫu nhiên để probe rồi báo revoke thành công.
+  * Task 2.6 **TUYỆT ĐỐI KHÔNG ĐƯỢC** giải quyết bằng cách lưu trữ mật khẩu plaintext lâu dài trong CSDL hay bộ nhớ backend.
+  * Task 2.6 **KHÔNG ĐƯỢC** tin tưởng mù quáng vào tín hiệu ACK `signalled\n` từ sidecar reloader (bởi tín hiệu này chỉ xác nhận SIGHUP đã phát tới kernel, không chứng minh broker đã nạp xong file mới).
+  * Về mặt offline: Runtime Task 2.5 đảm bảo username đã bị loại bỏ hoàn toàn khỏi file `candidate`, `fsync` file và thư mục, atomic rename đè lên `passwd`, và ghi nhận `passwd.last-good`.
+  * Về mặt online: Nếu không có bằng chứng generation-specific hoặc operation-specific đáng tin cậy để probe revoke mà không cần plaintext cũ, Task 2.6 phải thiết kế trạng thái revoke rõ ràng: đánh dấu trạng thái CSDL theo mô hình two-phase/pending-reconciliation, hoặc giữ trạng thái chưa xác nhận đầy đủ (unconfirmed revocation) theo đúng thiết kế, thay vì ngụy tạo bằng chứng giả.
 
 ---
 
@@ -318,23 +341,41 @@ Và `mosquitto.conf` đã trỏ đường dẫn:
 password_file /mosquitto/auth/passwd
 ```
 
-### 9.2 Kế hoạch chuyển đổi trên môi trường thực tế
+**Lưu ý quan trọng về dữ liệu khởi tạo:** Named volume `mosquitto_auth` khi được container `mosquitto-auth-init` khởi tạo lần đầu chỉ tự động seed duy nhất một tài khoản hệ thống nội bộ là `backend_service`. Initializer **hoàn toàn không tự động import** các tài khoản Gateway từ file prototype tracked trong git (`config/mosquitto/passwd`).
 
-1. **Chưa thực hiện trên production/staging**: Không tự ý xóa file `config/mosquitto/passwd` trong commit hiện tại để tránh làm gián đoạn các workflow local chưa chuyển đổi.
-2. **Khi triển khai**:
-   - Thiết lập các biến môi trường bắt buộc trong `.env` của máy chủ: `MQTT_USERNAME=backend_service`, `MQTT_PASSWORD=<mật khẩu sinh ngẫu nhiên mạnh>`.
-   - Khởi động stack bằng Docker Compose: `mosquitto-auth-init` sẽ tự động khởi tạo volume `mosquitto_auth` và tài khoản `backend_service`.
-   - Thực hiện commit riêng biệt ngừng track file prototype khi có sự phê duyệt chính thức từ người quản trị:
-     ```bash
-     git rm --cached config/mosquitto/passwd
-     git commit -m "chore(security): ngừng tracking password file Mosquitto prototype"
-     ```
+### 9.2 Runbook chuyển đổi trên môi trường thực tế (Migration Runbook)
+
+Việc chuyển dịch từ file prototype sang store runtime trên môi trường thực tế/production bắt buộc phải tuân thủ quy trình phê duyệt vận hành chặt chẽ theo 5 bước:
+
+1. **Bước 1 — Inventory và backup an toàn**:
+   - Rà soát danh sách toàn bộ các Gateway và tài khoản hiện hữu cần duy trì kết nối.
+   - Sao lưu dự phòng an toàn dữ liệu, chứng chỉ TLS và các file cấu hình hiện có vào vùng lưu trữ bảo mật (phân quyền `0600`).
+   - Tuyệt đối không xuất, in hay ghi các chuỗi băm (hashes) hoặc mật khẩu ra `stdout`, console log, hay hệ thống giám sát tập trung.
+
+2. **Bước 2 — Duyệt maintenance window và chọn phương án migration**:
+   - Quản trị viên phê duyệt khung thời gian bảo trì (maintenance window) phù hợp để tránh ảnh hưởng tới luồng thu thập dữ liệu cảm biến.
+   - Chọn rõ ràng một trong hai phương án chuyển đổi:
+     * **Phương án A (Chuyển tiếp credential hiện hữu)**: Thực hiện copy có kiểm soát các dòng credential Gateway hiện tại vào store mới, chạy kiểm tra tính tương thích cú pháp của parser, quyền hạn file (`0600`, UID `1883`), đồng thời bảo đảm tài khoản `backend_service` sử dụng mật khẩu mạnh được sinh mới cho môi trường production.
+     * **Phương án B (Provisioning lại có kiểm soát ở Task 2.6)**: Chấp nhận gián đoạn kết nối Gateway trong khung bảo trì, khởi tạo volume sạch chỉ với `backend_service`, sau đó sử dụng Admin API của Task 2.6 để provision lại credential mới cho từng Gateway và nạp lại vào thiết bị vật lý.
+
+3. **Bước 3 — Xác minh sau khi nạp store mới**:
+   - Khởi động stack dịch vụ và kiểm tra logs khởi tạo của `mosquitto-auth-init` (đảm bảo thoát mã 0, quyền file/thư mục đạt chuẩn `0700`/`0600`).
+   - Kiểm tra kết nối MQTT qua TLS (port 8883) của tài khoản `backend_service`.
+   - Với các Gateway hiện hữu, kiểm tra xác thực bằng credential mới/chuyển tiếp và xác minh quy tắc phân quyền ACL `%u` đảm bảo topic isolation hoạt động chính xác.
+
+4. **Bước 4 — Quy trình Rollback có kiểm soát**:
+   - Nếu quá trình chuyển đổi gặp sự cố không thể khắc phục trong maintenance window, kích hoạt rollback về bản backup đã tạo ở Bước 1.
+   - **Tuyệt đối KHÔNG tự động quay về** sử dụng file tracked prototype trong git chứa credential cũ hay các secret mặc định/công khai của prototype.
+
+5. **Bước 5 — Ngừng tracking và xoá/rotate secret prototype**:
+   - Sau khi môi trường thực tế đã chạy ổn định trên named volume mới và toàn bộ Gateway được xác minh thành công:
+   - Việc ngừng tracking file prototype (`git rm --cached config/mosquitto/passwd` hoặc cập nhật `.gitignore`) và xoá/rotate các prototype credentials công khai phải được thực hiện thông qua một commit riêng biệt kèm biên bản phê duyệt vận hành rõ ràng, không gộp chung với các commit tính năng thông thường.
 
 ---
 
 ## 10. Bằng chứng kiểm chứng Local & CI (Verification Evidence)
 
-Toàn bộ các yêu cầu của Task 2.5 đã được kiểm chứng độc lập trên môi trường local với kết quả 100% PASS.
+Toàn bộ các yêu cầu của Task 2.5 đã được kiểm chứng độc lập trên môi trường local với kết quả 100% PASS, và CI pipeline trên GitHub Actions đã xác nhận thành công.
 
 ### 10.1 Tổng hợp các lệnh kiểm chứng
 
@@ -364,8 +405,15 @@ git diff --check
 |---|---|---|
 | **Python Contract Tests** | 37 tests (14 tests runtime trong `test_stage2_mosquitto_runtime.py` + 23 tests auth/provisioning) | **37/37 PASS** |
 | **Go Unit & Race Tests** | `src/...` với `-race -count=1` trên Go 1.27.1 | **PASS** (không phát hiện race condition) |
-| **Mosquitto Integration** | Docker compose isolated với Mosquitto 2.0.18 thật, TLS 1.2, CA trust bundle, ACL pattern `%u` | **PASS** (kiểm chứng thành công provision, rotate, revoke, reload và recovery) |
-| **Code Coverage mới** | `src/internal/mqttcredential`<br>`src/internal/mosquittoreload`<br>`src/cmd/mosquitto-reloader` | **84.5%**<br>**90.1%**<br>**84.6%** (Đạt yêu cầu >80%) |
-| **CI Workflow** | File `.github/workflows/ci.yml` được mở rộng với job thứ 8: `mosquitto-runtime-integration` | Cấu hình đúng chuẩn, sẵn sàng kiểm thử trên GitHub Actions |
+| **Mosquitto Integration** | Docker compose isolated với Mosquitto 2.0.18 thật, TLS 1.2, CA trust bundle, ACL pattern `%u` | **PASS** (kiểm chứng thành công provision, rotate, revoke với mật khẩu cũ đã biết, reload và recovery) |
+| **Code Coverage mới** | `src/internal/mqttcredential`<br>`src/internal/mosquittoreload`<br>`src/cmd/mosquitto-reloader` | **84.5%**<br>**90.1%**<br>**84.6%** (Đạt yêu cầu >80% cho feature mới) |
+| **CLI Initializer Coverage** | `src/cmd/mosquitto-auth-init` | **~6.5% – 9.4%** instrumented unit coverage (Phần lớn logic cốt lõi về phân quyền root volume, drop UID 1883 và filesystem bootstrap được kiểm chứng toàn diện qua container integration harness) |
+| **GitHub Actions CI** | Cả 8 jobs CI trên GitHub Actions đã **PASS** tại commit `674e8db` (bao gồm job `mosquitto-runtime-integration`) | **8/8 JOBS PASS** |
+
+### 10.3 Lưu ý ranh giới thực tế và bảo mật
+
+- **Baseline CI `674e8db`**: Mốc CI PASS 8/8 tại commit `674e8db` là mốc trước khi áp dụng các commit sửa lỗi theo review (chưa bao phủ các commit kế tiếp về chặn password placeholder/whitespace tại initializer `fafc565` và thu hẹp mount chứng chỉ backend chỉ đọc CA công khai `d5375ce`). Các commit này đã được kiểm chứng local đầy đủ.
+- **Ranh giới Coverage**: Phân định rõ giữa Unit coverage và Feature union coverage: các package nghiệp vụ cốt lõi đều đạt >80%, còn CLI entrypoint initializer có instrumented coverage thấp do phụ thuộc vào đặc quyền Linux container được kiểm chứng bằng integration harness.
+- **Ranh giới Bảo mật Thực tế**: Tuyệt đối **không tuyên bố hệ thống production đã hoàn toàn secure** hay **đã hoàn tất rotate secret production** khi chưa có thao tác vận hành thực tế theo runbook chuyển đổi trên môi trường triển khai thật.
 
 Tài liệu này xác nhận hạ tầng runtime credential của Task 2.5 đã hoàn thành đầy đủ, đáp ứng toàn bộ các tiêu chí thiết kế, bảo mật và sẵn sàng làm nền tảng vững chắc cho Task 2.6.

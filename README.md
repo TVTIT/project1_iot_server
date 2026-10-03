@@ -8,8 +8,12 @@ Task 2.2 đã có JWT authentication và PostgreSQL platform-admin guard; Task 2
 PUT provision Gateway/Sensor và graph Twin atomically trong worktree; Task 2.5 đã
 hoàn thành hạ tầng runtime credential cho Mosquitto (quản lý `password_file` trong
 named volume, atomic replace có lock/fsync, reload qua Unix socket sidecar không
-dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS). Independent local
-verification đã PASS, còn chờ commit/push và CI trên SHA mới. Xem
+dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS). Cả 8 jobs CI trên
+GitHub Actions đã PASS tại commit `674e8db` (lưu ý run này là mốc trước khi áp
+dụng các commit sửa review findings về placeholder và cert mount). Named volume
+`mosquitto_auth` mới chỉ seed tài khoản nội bộ `backend_service`, không tự động
+import các tài khoản Gateway từ file prototype tracked trong git; hệ thống chưa hoàn
+tất rotate secret production khi chưa thực hiện runbook chuyển đổi thực tế. Xem
 [contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md),
 [contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md) và
 [hạ tầng runtime Mosquitto Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md)
@@ -55,7 +59,7 @@ telemetry/WebSocket/device control tương lai.
    - `/storage/v1/*`: Định tuyến tới Supabase Storage API (qua Envoy gateway).
 2. **Mosquitto MQTT Broker (`config/mosquitto/`)**:
    - Chạy MQTTS (port `8883` công khai qua TLS, `18830` cục bộ).
-   - Xác thực Gateway độc lập bằng username/password (`config/mosquitto/passwd`).
+   - Xác thực Gateway độc lập bằng username/password: runtime broker đọc từ named volume `mosquitto_auth` (`/mosquitto/auth/passwd`) được quản lý an toàn bởi Go backend (file `config/mosquitto/passwd` hiện là template prototype tracked trong git và không tự động import vào volume mới).
    - Phân quyền theo topic (`config/mosquitto/acl`) với pattern `%u` cách ly từng Gateway: telemetry, status, responses (Gateway publish), commands (Gateway subscribe).
 3. **Go Backend Modular Monolith (`src/cmd/server`)**:
    - Xử lý xác thực JWT Supabase, phân quyền quan hệ User–Gateway (`user_gateways`).
@@ -342,10 +346,12 @@ Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.ym
        file mật khẩu có lock/fsync, gửi tín hiệu reload qua Unix domain socket sidecar (không dùng
        Docker socket, không host PID).
      - Kiểm chứng kết nối MQTT TLS thật, cách ly phân quyền ACL `%u`, probe xác thực fresh
-       connection, và cơ chế tự động rollback/recovery khi có sự cố.
-     - Chạy 14 tests contract trong Python harness và tích hợp native Go adapter.
+       connection (phân biệt rõ negative probe chỉ kiểm chứng bằng password cũ đã biết, không dùng password ngẫu nhiên),
+       và cơ chế tự động rollback/recovery khi có sự cố (phân biệt verified rollback với trạng thái uncertain khi gặp `ErrRecoveryRequired`).
+     - Chạy 14 tests contract trong Python harness và tích hợp native Go adapter; feature union coverage đạt >80% (CLI initializer đạt ~6.5%–9.4% unit coverage có container integration bù đắp).
+     - Cả 8 jobs CI trên GitHub Actions đã PASS tại commit `674e8db` (lưu ý run này là mốc trước khi áp dụng các commit sửa review findings về placeholder và cert mount).
      - Từ repo root: `sh scripts/test-stage2-mosquitto-runtime.sh` và `python3 -m unittest discover -s scripts/tests -p 'test_stage2_mosquitto_runtime.py'`.
-       Contract, kiến trúc và ranh giới tại [Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md).
+       Contract, runbook migration và ranh giới tại [Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md).
 
 ---
 
