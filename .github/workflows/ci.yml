@@ -54,6 +54,13 @@ jobs:
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/server
       - name: Build gateway (linux/armv7 for AM5728)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -o /dev/null ./cmd/gateway
+      - name: Build runtime commands (linux/amd64 and linux/armv7)
+        run: |
+          for arch in amd64 arm; do
+            for command in mosquitto-auth-init mosquitto-reloader; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOARM=7 go build -o /dev/null "./cmd/$command"
+            done
+          done
 
   migration-check:
     runs-on: ubuntu-latest
@@ -147,9 +154,24 @@ jobs:
         with:
           context: ./src
           file: ./src/Dockerfile
+          target: backend
           push: false
           load: true
           tags: iot-backend:ci
+      - name: Build Docker image (auth initializer)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          target: auth-init
+          push: false
+      - name: Build Docker image (reloader)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          target: reloader
+          push: false
       - name: Smoke test container
         working-directory: .
         env:
@@ -202,3 +224,29 @@ jobs:
       - name: Admin checker database regressions
         working-directory: .
         run: sh scripts/test-stage2-admin.sh
+
+  mosquitto-runtime-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Prepare isolated harness artifact directory
+        run: mkdir -p /tmp/opencode
+      - name: Runtime harness regression tests (13 contracts plus workflow guard)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_mosquitto_runtime.py'
+      - name: Native Go adapter, TLS, ACL, initializer, reloader and fault regressions
+        run: sh scripts/test-stage2-mosquitto-runtime.sh
+      - name: Upload actual adapter integration coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosquitto-runtime-coverage
+          path: /tmp/opencode/mqtt_poc_*-adapter-*.cover
+          if-no-files-found: error
