@@ -28,6 +28,9 @@ type RouterDependencies struct {
 	PlatformAdminChecker auth.PlatformAdminChecker
 	GatewayReader        GatewayReader
 	SensorReader         SensorReader
+	GatewayProvisioner   GatewayProvisioner
+	SensorProvisioner    SensorProvisioner
+	AdminMaxBodyBytes    int64
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -54,6 +57,15 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	if auth.IsNilDependency(deps.SensorReader) {
 		return nil, fmt.Errorf("sensor reader is required")
+	}
+	if auth.IsNilDependency(deps.GatewayProvisioner) {
+		return nil, fmt.Errorf("gateway provisioner is required")
+	}
+	if auth.IsNilDependency(deps.SensorProvisioner) {
+		return nil, fmt.Errorf("sensor provisioner is required")
+	}
+	if deps.AdminMaxBodyBytes < 1 || deps.AdminMaxBodyBytes > 1048576 {
+		return nil, fmt.Errorf("admin body limit must be between 1 and 1048576")
 	}
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
@@ -92,6 +104,8 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		httpapi.WriteError(c, http.StatusNotImplemented, "not_implemented", "endpoint not implemented")
 	}
 	groups := newRouteGroups(router, deps)
+	groups.admin.PUT("/gateways/:gateway_id", provisionGateway(deps.GatewayProvisioner, deps.AdminMaxBodyBytes))
+	groups.admin.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensor(deps.SensorProvisioner, deps.AdminMaxBodyBytes))
 	authenticated := groups.authenticated
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))

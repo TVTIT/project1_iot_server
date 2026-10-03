@@ -73,7 +73,18 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create gateway service: %w", err)
 	}
+	provisioningRepository, err := gateway.NewPostgresProvisioningRepository(pool)
+	if err != nil {
+		return fmt.Errorf("create provisioning repository: %w", err)
+	}
+	provisioningService, err := gateway.NewProvisioningService(provisioningRepository, cfg.AuthorizationTimeout)
+	if err != nil {
+		return fmt.Errorf("create provisioning service: %w", err)
+	}
 	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
+		GatewayProvisioner:   provisioningService,
+		SensorProvisioner:    provisioningService,
+		AdminMaxBodyBytes:    int64(cfg.AdminMaxBodyBytes),
 		GatewayReader:        gatewayService,
 		SensorReader:         gatewayService,
 		ReadinessChecker:     pool,

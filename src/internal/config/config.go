@@ -23,6 +23,7 @@ type Config struct {
 	DatabaseConnectTimeout time.Duration
 	ReadinessTimeout       time.Duration
 	AuthorizationTimeout   time.Duration
+	AdminMaxBodyBytes      int
 	HTTPReadHeaderTimeout  time.Duration
 	HTTPReadTimeout        time.Duration
 	HTTPWriteTimeout       time.Duration
@@ -111,6 +112,9 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.AuthorizationTimeout, err = duration(lookup, "AUTHORIZATION_TIMEOUT", 2*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.AdminMaxBodyBytes, err = integer(lookup, "ADMIN_MAX_BODY_BYTES", 16384, 1, 1048576); err != nil {
 		return Config{}, err
 	}
 	if cfg.HTTPReadHeaderTimeout, err = duration(lookup, "HTTP_READ_HEADER_TIMEOUT", 5*time.Second); err != nil {

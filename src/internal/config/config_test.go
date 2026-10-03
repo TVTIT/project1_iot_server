@@ -17,6 +17,29 @@ func TestLoadRequiresDatabaseURL(t *testing.T) {
 	}
 }
 
+func TestAdminMaxBodyBytes(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		want    int
+		invalid bool
+	}{
+		{"", 16384, false}, {"1", 1, false}, {"1048576", 1048576, false}, {"0", 0, true}, {"1048577", 0, true}, {"-1", 0, true}, {"1.5", 0, true},
+	} {
+		values := validConfigValues()
+		if tc.raw != "" {
+			values["ADMIN_MAX_BODY_BYTES"] = tc.raw
+		}
+		cfg, err := Load(mapLookup(values))
+		if tc.invalid {
+			if err == nil {
+				t.Fatalf("accepted %q", tc.raw)
+			}
+		} else if err != nil || cfg.AdminMaxBodyBytes != tc.want {
+			t.Fatalf("raw=%q value=%d err=%v", tc.raw, cfg.AdminMaxBodyBytes, err)
+		}
+	}
+}
+
 func TestLoadUsesSafeOperationalDefaults(t *testing.T) {
 	values := validConfigValues()
 

@@ -192,6 +192,13 @@ func mustRouter(t *testing.T, readiness ReadinessChecker) http.Handler {
 
 func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
 	return RouterDependencies{
+		SensorProvisioner: sensorProvisionerFunc(func(context.Context, uuid.UUID, gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error) {
+			return gateway.ProvisionSensorResult{}, gateway.ErrProvisioningInconsistent
+		}),
+		GatewayProvisioner: gatewayProvisionerFunc(func(context.Context, uuid.UUID, gateway.ProvisionGatewayInput) (gateway.ProvisionGatewayResult, error) {
+			return gateway.ProvisionGatewayResult{}, gateway.ErrProvisioningInconsistent
+		}),
+		AdminMaxBodyBytes:    16384,
 		SensorReader:         sensorReaderFunc(func(context.Context, uuid.UUID, string) ([]gateway.Sensor, error) { return nil, nil }),
 		GatewayReader:        gatewayReaderFunc(func(context.Context, uuid.UUID) ([]gateway.Gateway, error) { return nil, nil }),
 		ReadinessChecker:     readiness,
