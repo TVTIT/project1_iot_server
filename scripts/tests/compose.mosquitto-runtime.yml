@@ -1,0 +1,105 @@
+# Disposable actual image targets: cold volume ownership and production pidfd.
+x-runtime: &runtime
+  image: ${POC_BACKEND_IMAGE:?required}
+  build:
+    context: ../../src
+    target: backend
+  user: "1883:1883"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=1m,mode=0700,uid=1883,gid=1883"]
+  environment: []
+  entrypoint: [/bin/sh]
+services:
+  database:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POC_DATABASE_PASSWORD:?required}
+    networks: [probe]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  backend:
+    <<: *runtime
+    entrypoint: [/app/server]
+    environment:
+      DATABASE_URL: postgres://postgres:${POC_DATABASE_PASSWORD:?required}@database:5432/postgres?sslmode=disable
+      SUPABASE_JWT_SECRET: ${POC_JWT_SECRET:?required}
+      SUPABASE_JWT_ISSUER: http://auth.invalid/auth/v1
+      SUPABASE_JWT_AUDIENCE: authenticated
+      MQTT_CREDENTIAL_RUNTIME_ENABLED: "true"
+      MQTT_BROKER_URL: ssl://broker:8883
+      MQTT_USERNAME: backend_service
+      MQTT_PASSWORD: ${POC_BACKEND_PASSWORD:?required}
+      MQTT_TLS_CA_FILE: /mosquitto/config/ca.crt
+      MQTT_AUTH_DIR: /mosquitto/auth
+      MQTT_RELOAD_SOCKET: /mosquitto/control/reload.sock
+      MOSQUITTO_PASSWD_PATH: /usr/bin/mosquitto_passwd
+    networks: [probe]
+    depends_on:
+      database:
+        condition: service_healthy
+    volumes:
+      - auth:/mosquitto/auth
+      - control:/mosquitto/control:ro
+      - config:/mosquitto/config:ro
+  initializer:
+    <<: *runtime
+    image: ${POC_INIT_IMAGE:?required}
+    build:
+      context: ../../src
+      target: auth-init
+    user: "0:0"
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
+    entrypoint: [/app/mosquitto-auth-init]
+    network_mode: none
+    environment:
+      MQTT_USERNAME: backend_service
+      MQTT_PASSWORD: ${POC_BACKEND_PASSWORD:?required}
+    volumes:
+      - auth:/mosquitto/auth
+      - control:/mosquitto/control
+  writer:
+    <<: *runtime
+    command: [-c, "exec sleep 600"]
+    networks: [probe]
+    volumes:
+      - auth:/mosquitto/auth
+      - control:/mosquitto/control:ro
+      - config:/mosquitto/config
+      - ${POC_HELPER_DIR:?required}:/poc:ro
+  broker:
+    <<: *runtime
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    build: !reset null
+    entrypoint: [/usr/sbin/mosquitto]
+    command: [-c, /mosquitto/config/mosquitto.conf]
+    networks: [probe]
+    ports: ["127.0.0.1::8883"]
+    volumes:
+      - auth:/mosquitto/auth:ro
+      - config:/mosquitto/config:ro
+  reloader:
+    <<: *runtime
+    image: ${POC_RELOADER_IMAGE:?required}
+    build:
+      context: ../../src
+      target: reloader
+    entrypoint: [/app/mosquitto-reloader]
+    environment:
+      MQTT_RELOAD_SOCKET: /mosquitto/control/reload.sock
+    pid: service:broker
+    network_mode: none
+    depends_on: [broker]
+    volumes:
+      - control:/mosquitto/control
+volumes:
+  auth:
+  control:
+  config:
+networks:
+  probe:
+    driver: bridge
