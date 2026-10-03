@@ -51,6 +51,10 @@ func run() error {
 	}
 	defer pool.Close()
 
+	if _, err := cfg.MQTTCredentialRuntime.Start(rootCtx); err != nil {
+		return fmt.Errorf("check MQTT credential runtime: %w", err)
+	}
+
 	tokenVerifier, err := auth.NewHS256Verifier(auth.VerifierConfig{
 		Secret:    cfg.SupabaseJWTSecret,
 		Issuer:    cfg.SupabaseJWTIssuer,

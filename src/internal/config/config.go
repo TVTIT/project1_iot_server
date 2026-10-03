@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"iot-platform/internal/mqttcredential"
 )
 
 // LookupFunc returns an environment value and whether it is set.
@@ -15,6 +17,7 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
+	MQTTCredentialRuntime  mqttcredential.StartupConfig
 	ServerPort             int
 	ServerEnv              string
 	DatabaseURL            string
@@ -143,6 +146,9 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 
+	if cfg.MQTTCredentialRuntime, err = mqttcredential.LoadConfig(lookup); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 

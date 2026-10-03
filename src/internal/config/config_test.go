@@ -8,6 +8,23 @@ import (
 
 const testJWTSecret = "test-only-jwt-secret-at-least-32-characters"
 
+func TestMQTTRuntimeOptIn(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MQTTCredentialRuntime.Enabled {
+		t.Fatalf("old HTTP fixture: %v", err)
+	}
+	values["MQTT_CREDENTIAL_RUNTIME_ENABLED"] = "true"
+	if _, err = Load(mapLookup(values)); err == nil {
+		t.Fatal("enabled runtime accepted missing MQTT settings")
+	}
+	values["MQTT_CREDENTIAL_RUNTIME_ENABLED"] = "false"
+	values["MQTT_PASSWORD"] = "bad\nsecret"
+	if _, err = Load(mapLookup(values)); err != nil {
+		t.Fatal("disabled runtime validated unused MQTT password")
+	}
+}
+
 func TestLoadRequiresDatabaseURL(t *testing.T) {
 	_, err := Load(func(_ string) (string, bool) {
 		return "", false
