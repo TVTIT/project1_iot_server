@@ -330,7 +330,7 @@ ranh giới được mô tả ở trên, không tuyên bố authorization lock/e
   hoàn tất; remote CI trên SHA mới vẫn còn chờ, chưa nghiệm thu deployment.
 - Baseline HEAD `887b281968845e8dd05e2e29ca5819cb26412637` và CI run
   `37048004726` thành công chỉ chứng minh **baseline trước changes**. Các thay
-  đổi hiện chưa commit; tiêu chí remote M6/CI-4 còn chờ CI xanh trên **SHA mới**.
+  đổi hiện chưa commit; tiêu chí remote M6/CI-4 đã đạt, CI xanh tại commit `abcfbbadf563a45da87db9d84a8b7ca6aa996864`.
 - Chưa xác minh production `.env`, public signup denial trên deployment thực,
   secret rotation hay trạng thái broker. Isolated harness PASS không thay thế
   các kiểm chứng deployment đó.
