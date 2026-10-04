@@ -48,7 +48,7 @@ func TestPostgresAdmissionIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(ctx)
+		defer rollbackTestTransaction(t, tx)
 		if _, err = tx.Exec(ctx, eventSQL, operationID); err != nil {
 			t.Fatal(err)
 		}

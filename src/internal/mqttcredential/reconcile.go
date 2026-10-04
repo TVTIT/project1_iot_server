@@ -15,6 +15,7 @@ type StartupInventoryRepository interface {
 	ListStartupInventory(context.Context, string, int) ([]Metadata, error)
 }
 
+// StartupRuntime defines lifecycle and dynamic security adapter operations during startup.
 type StartupRuntime interface {
 	BeginStartup(context.Context) (VerificationReceipt, error)
 	DisableStartup(context.Context, VerificationReceipt, string) (RecoveryDisableEvidence, error)
@@ -23,6 +24,7 @@ type StartupRuntime interface {
 	CloseDrain(context.Context) error
 }
 
+// StartupOptions configures timeouts, paging, and backend verification for startup reconciliation.
 type StartupOptions struct {
 	Timeout            time.Duration
 	PageSize, MaxPages int
@@ -31,6 +33,7 @@ type StartupOptions struct {
 	VerifyBackend func(context.Context, VerificationReceipt) error
 }
 
+// StartupReconciler reconciles broker state with database inventory before opening traffic.
 type StartupReconciler struct {
 	repo        Repository
 	maintenance MaintenanceRepository
@@ -43,6 +46,7 @@ type StartupReconciler struct {
 	readiness   StartupReadiness
 }
 
+// NewStartupReconciler validates dependencies and returns a new StartupReconciler.
 func NewStartupReconciler(r Repository, m MaintenanceRepository, recovery RecoveryRepository, runtime StartupRuntime, c StartupOptions) (*StartupReconciler, error) {
 	i, ok := r.(StartupInventoryRepository)
 	if !ok || dynSecNil(r) || dynSecNil(m) || dynSecNil(recovery) || dynSecNil(runtime) || c.Timeout <= 0 || c.Timeout > 10*time.Minute || c.PageSize < 1 || c.PageSize > 1024 || c.MaxPages < 1 || c.MaxPages > 1024 || c.VerifyBackend == nil {
@@ -51,6 +55,7 @@ func NewStartupReconciler(r Repository, m MaintenanceRepository, recovery Recove
 	return &StartupReconciler{repo: r, maintenance: m, recovery: recovery, inventory: i, runtime: runtime, cfg: c}, nil
 }
 
+// Ready returns true if the startup reconciler has completed successfully.
 func (s *StartupReconciler) Ready() bool { return s.readiness.Ready() }
 
 // Run is a single synchronous bounded worker, before exposing any mutation

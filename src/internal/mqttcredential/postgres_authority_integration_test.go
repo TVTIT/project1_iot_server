@@ -53,7 +53,7 @@ func TestPostgresAuthorityGuards(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			defer tx.Rollback(ctx)
+			defer rollbackTestTransaction(t, tx)
 			if _, e = tx.Exec(ctx, `UPDATE gateway_mqtt_credential_events SET `+mutation+` WHERE operation_id=$1`, b.Operation.OperationID); e != nil {
 				t.Fatalf("syntactically valid transition rejected before commit: %v", e)
 			}
@@ -98,7 +98,13 @@ func TestPostgresAuthorityGuards(t *testing.T) {
 		CREATE TRIGGER `+functionName+` BEFORE UPDATE ON gateway_mqtt_credentials FOR EACH ROW EXECUTE FUNCTION `+functionName+`()`); err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Exec(ctx, `DROP TRIGGER IF EXISTS `+functionName+` ON gateway_mqtt_credentials; DROP FUNCTION IF EXISTS `+functionName+`()`) // cleanup even on assertion failure
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanup, `DROP TRIGGER IF EXISTS `+functionName+` ON gateway_mqtt_credentials; DROP FUNCTION IF EXISTS `+functionName+`() `); err != nil {
+			t.Error("fault trigger cleanup failed")
+		}
+	}()
 	if _, err = admin.Exec(ctx, `DELETE FROM profiles WHERE id=$1`, actor); err == nil {
 		t.Fatal("nested actor nulling blessed combined authority mutation")
 	}

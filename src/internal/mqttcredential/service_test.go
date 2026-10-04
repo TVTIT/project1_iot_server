@@ -63,7 +63,7 @@ func (r *provisionRepo) ResolveCommitAmbiguity(context.Context, uuid.UUID) (Oper
 func (r *provisionRepo) ResolveMaintenance(context.Context, uuid.UUID) (MaintenanceCheckpoint, error) {
 	return r.cp, nil
 }
-func (r *provisionRepo) BindMaintenanceEpoch(_ context.Context, g MaintenanceGuard, e string) (MaintenanceCheckpoint, error) {
+func (r *provisionRepo) BindMaintenanceEpoch(_ context.Context, _ MaintenanceGuard, e string) (MaintenanceCheckpoint, error) {
 	r.calls = append(r.calls, "bind")
 	r.cp.BrokerEpoch = &e
 	return r.cp, nil
@@ -94,7 +94,7 @@ func (r *provisionRepo) FailKnown(_ context.Context, u OperationUpdate) (Metadat
 	r.meta.OperationStatus = r.op.Status
 	return r.meta, nil
 }
-func (r *provisionRepo) RequireMaintenanceRecovery(_ context.Context, g MaintenanceGuard, e ErrorCode) (MaintenanceCheckpoint, error) {
+func (r *provisionRepo) RequireMaintenanceRecovery(_ context.Context, _ MaintenanceGuard, _ ErrorCode) (MaintenanceCheckpoint, error) {
 	r.calls = append(r.calls, "recovery")
 	if r.cp.Status == MaintenanceCompleted {
 		return MaintenanceCheckpoint{}, errors.New("immutable")
@@ -102,7 +102,7 @@ func (r *provisionRepo) RequireMaintenanceRecovery(_ context.Context, g Maintena
 	r.cp.Status = MaintenanceRecoveryNeeded
 	return r.cp, nil
 }
-func (r *provisionRepo) CompleteMaintenance(_ context.Context, g MaintenanceGuard) (MaintenanceCheckpoint, error) {
+func (r *provisionRepo) CompleteMaintenance(_ context.Context, _ MaintenanceGuard) (MaintenanceCheckpoint, error) {
 	r.calls = append(r.calls, "complete")
 	if r.op.Status != OperationSucceeded {
 		return MaintenanceCheckpoint{}, errors.New("not finalized")
@@ -195,7 +195,7 @@ func TestRevokeServiceContracts(t *testing.T) {
 				return
 			}
 			if good {
-				if v.Metadata.Status != CredentialRevoked || v.Metadata.CredentialVersion != 1 || !a.open || r.cp.Status != MaintenanceCompleted {
+				if v.Status != CredentialRevoked || v.CredentialVersion != 1 || !a.open || r.cp.Status != MaintenanceCompleted {
 					t.Fatal("revoke finalization/OPEN")
 				}
 			} else if a.open || !a.closed {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"iot-platform/internal/gateway"
 )
 
@@ -21,7 +22,7 @@ type ProvisionRuntime interface {
 	ReleaseClosed(context.Context, uuid.UUID) error
 }
 
-// Function seams are for trusted composition/tests only. Production entropy
+// ProvisionServiceOptions configures credential provisioning service parameters and hooks. Function seams are for trusted composition/tests only. Production entropy
 // sources must be secure and bounded; the service never starts a reader goroutine.
 type ProvisionServiceOptions struct {
 	RecoveryTimeout    time.Duration
@@ -32,10 +33,14 @@ type ProvisionServiceOptions struct {
 	// This never resets a poisoned service or substitutes for admin authorization.
 	StartupReady func() bool
 }
+
+// ProvisionResponse holds the mutation result and optional plaintext secret.
 type ProvisionResponse struct {
 	MutationResult
 	Secret *SecretResult
 }
+
+// ProvisionService executes credential management operations and coordinates broker runtime.
 type ProvisionService struct {
 	repo           Repository
 	maintenance    MaintenanceRepository
@@ -45,6 +50,7 @@ type ProvisionService struct {
 	busy, poisoned bool
 }
 
+// NewProvisionService constructs a ProvisionService after validating dependencies and options.
 func NewProvisionService(r Repository, m MaintenanceRepository, a ProvisionRuntime, c ProvisionServiceOptions) (*ProvisionService, error) {
 	if dynSecNil(r) || dynSecNil(m) || dynSecNil(a) || c.RecoveryTimeout <= 0 || c.RecoveryTimeout > time.Minute || c.PageSize < 1 || c.PageSize > 1024 || c.MaxPages < 1 || c.MaxPages > 1024 {
 		return nil, &DomainError{Code: CodeInvalidRequest}
@@ -64,6 +70,8 @@ func serviceError(e error) error {
 	}
 	return &DomainError{Code: CodeServiceUnavailable}
 }
+
+// Metadata retrieves credential metadata for a gateway if the actor is a platform admin.
 func (s *ProvisionService) Metadata(ctx context.Context, actor uuid.UUID, g string) (Metadata, error) {
 	if actor == uuid.Nil || gateway.ValidateGatewayID(g) != nil {
 		return Metadata{}, &DomainError{Code: CodeInvalidRequest}

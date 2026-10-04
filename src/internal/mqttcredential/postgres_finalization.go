@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"iot-platform/internal/gateway"
 )
 
@@ -42,14 +43,17 @@ func sameCompletion(a, b Completion) bool {
 	return reflect.DeepEqual(canonical(a), canonical(b))
 }
 
+// ConditionalFinalize commits verified successful operation completion to Postgres.
 func (r *PostgresRepository) ConditionalFinalize(ctx context.Context, u OperationUpdate) (Metadata, error) {
 	return r.complete(ctx, u, ExecutionVerifiedSuccess)
 }
 
+// FailKnown records an unchanged failure completion for a known operation.
 func (r *PostgresRepository) FailKnown(ctx context.Context, u OperationUpdate) (Metadata, error) {
 	return r.complete(ctx, u, ExecutionUnchangedFailure)
 }
 
+// RequireRecovery flags an operation update as requiring recovery.
 func (r *PostgresRepository) RequireRecovery(ctx context.Context, u OperationUpdate) (Metadata, error) {
 	return r.complete(ctx, u, ExecutionRecoveryRequired)
 }
@@ -190,6 +194,7 @@ func (r *PostgresRepository) complete(ctx context.Context, u OperationUpdate, ou
 // Bound may be reduced by the caller; it can never be disabled by a large limit.
 const maxRepositoryScanLimit = 1000
 
+// ListUnresolved lists unresolved pending or recovery-needed operations.
 func (r *PostgresRepository) ListUnresolved(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
 	if limit <= 0 || limit > r.scanLimit {
 		return nil, &DomainError{Code: CodeInvalidRequest}
@@ -217,6 +222,7 @@ func (r *PostgresRepository) ListUnresolved(ctx context.Context, cursor uuid.UUI
 	return result, nil
 }
 
+// ListDurableRevocations lists authoritative durable revocation decisions.
 func (r *PostgresRepository) ListDurableRevocations(ctx context.Context, cursor string, limit int) ([]RevocationDecision, error) {
 	if limit <= 0 || limit > r.scanLimit || (cursor != "" && gateway.ValidateGatewayID(cursor) != nil) {
 		return nil, &DomainError{Code: CodeInvalidRequest}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"iot-platform/internal/gateway"
 )
 
@@ -27,6 +28,7 @@ func scanRecovery(row pgx.Row) (RecoveryRecord, error) {
 	return r, nil
 }
 
+// ResolveRecovery loads a recovery record by recovery ID.
 func (r *PostgresRepository) ResolveRecovery(ctx context.Context, id uuid.UUID) (RecoveryRecord, error) {
 	if id == uuid.Nil {
 		return RecoveryRecord{}, &DomainError{Code: CodeInvalidRequest}
@@ -45,6 +47,7 @@ func (r *PostgresRepository) ResolveRecovery(ctx context.Context, id uuid.UUID) 
 	return record, nil
 }
 
+// ListPendingRecovery lists pending recovery records ordered by recovery ID.
 func (r *PostgresRepository) ListPendingRecovery(ctx context.Context, cursor uuid.UUID, limit int) ([]RecoveryRecord, error) {
 	if limit <= 0 || limit > r.scanLimit {
 		return nil, &DomainError{Code: CodeInvalidRequest}
@@ -113,6 +116,7 @@ func (r *PostgresRepository) checkRecoveryGuard(ctx context.Context, tx pgx.Tx, 
 	return p.Operation, m, nil
 }
 
+// BeginRecovery inserts or verifies an in-progress recovery record for an operation.
 func (r *PostgresRepository) BeginRecovery(ctx context.Context, q RecoveryRequest) (RecoveryRecord, error) {
 	if !validRecoveryRequest(q) {
 		return RecoveryRecord{}, &DomainError{Code: CodeInvalidRequest}
@@ -158,6 +162,7 @@ func (r *PostgresRepository) BeginRecovery(ctx context.Context, q RecoveryReques
 	return record, nil
 }
 
+// BindRecoveryEpoch rebinds a pending recovery record to a new broker epoch.
 func (r *PostgresRepository) BindRecoveryEpoch(ctx context.Context, id uuid.UUID, expected, epoch string) (RecoveryRecord, error) {
 	if id == uuid.Nil || !validEpoch(expected) || !validEpoch(epoch) {
 		return RecoveryRecord{}, &DomainError{Code: CodeInvalidRequest}
@@ -191,6 +196,7 @@ func recoveryConflict(err error) error {
 	return err
 }
 
+// CompleteRecovery finalizes a recovery record with disable evidence and updates credential metadata.
 func (r *PostgresRepository) CompleteRecovery(ctx context.Context, q RecoveryRequest, evidence RecoveryDisableEvidence) (Metadata, error) {
 	if !validRecoveryRequest(q) || evidence.Validate(q.BrokerEpoch) != nil {
 		return Metadata{}, &DomainError{Code: CodeInvalidRequest}

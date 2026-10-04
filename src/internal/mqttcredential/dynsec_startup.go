@@ -3,10 +3,11 @@ package mqttcredential
 import (
 	"context"
 	"errors"
+
 	"iot-platform/internal/gateway"
 )
 
-// Startup owns a fresh adapter before exposing the service. busy is held until
+// BeginStartup initializes adapter startup mode before exposing the service. busy is held until
 // OPEN; failed passes can retry only via the startup capability, never Execute.
 func (a *DynSecAdapter) BeginStartup(ctx context.Context) (VerificationReceipt, error) {
 	a.mu.Lock()
@@ -46,6 +47,7 @@ func (a *DynSecAdapter) snapshotProvesAbsence(ctx context.Context, u string) boo
 	return errors.Is(err, errDynSecSnapshotAbsent)
 }
 
+// DisableStartup disables a client during broker startup and collects recovery disable evidence.
 func (a *DynSecAdapter) DisableStartup(ctx context.Context, r VerificationReceipt, u string) (RecoveryDisableEvidence, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -93,6 +95,7 @@ func (a *DynSecAdapter) DisableStartup(ctx context.Context, r VerificationReceip
 	return RecoveryDisableEvidence{RAMDisabled: true, SnapshotObserved: true, BrokerEpoch: r.Epoch}, nil
 }
 
+// VerifyStartupInventory verifies that active and revoked credentials match broker state at startup.
 func (a *DynSecAdapter) VerifyStartupInventory(ctx context.Context, r VerificationReceipt, rows []Metadata) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -127,6 +130,7 @@ func (a *DynSecAdapter) VerifyStartupInventory(ctx context.Context, r Verificati
 	return a.startupEpoch(ctx, r)
 }
 
+// OpenStartup transitions the broker to open state following successful startup verification.
 func (a *DynSecAdapter) OpenStartup(ctx context.Context, r VerificationReceipt) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -13,6 +13,7 @@ import (
 	"time"
 )
 
+// ErrLifecycleUnavailable indicates that broker lifecycle control cannot be performed.
 var ErrLifecycleUnavailable = errors.New("broker lifecycle unavailable")
 
 // LifecycleConfig is trusted startup configuration, NEVER IPC request data.
@@ -29,10 +30,13 @@ type LifecycleConfig struct {
 	StopTimeout     time.Duration
 }
 
+// VerificationReceipt proves completion of verification across broker lifecycle epoch and challenge nonce.
 type VerificationReceipt struct {
 	Epoch string `json:"epoch"`
 	Nonce string `json:"nonce"`
 }
+
+// LifecycleDescription describes current broker child process and ingress gate state.
 type LifecycleDescription struct {
 	Epoch     string   `json:"epoch"`
 	Nonce     string   `json:"nonce"`
@@ -69,6 +73,8 @@ func loopbackEndpoint(a string) bool {
 	ip := net.ParseIP(h)
 	return ip != nil && ip.IsLoopback()
 }
+
+// NewBrokerLifecycle validates configuration and creates a broker child and gate lifecycle manager.
 func NewBrokerLifecycle(c LifecycleConfig) (*BrokerLifecycle, error) {
 	if !filepath.IsAbs(c.Executable) || filepath.Clean(c.Executable) != c.Executable || !loopbackEndpoint(c.BrokerAddress) || len(c.PublicAddresses) < 1 || len(c.PublicAddresses) > 8 || c.MaxConnections < 1 || c.MaxConnections > 4096 || c.DialTimeout <= 0 || c.DialTimeout > time.Minute || c.StopTimeout <= 0 || c.StopTimeout > time.Minute {
 		return nil, ErrLifecycleUnavailable
@@ -80,7 +86,7 @@ func NewBrokerLifecycle(c LifecycleConfig) (*BrokerLifecycle, error) {
 	}
 	for _, v := range c.ChildEnv {
 		k, _, ok := strings.Cut(v, "=")
-		if !ok || !(k == "PATH" || k == "LANG" || k == "LC_ALL" || k == "LC_CTYPE" || k == "TASK265B_CHILD") {
+		if !ok || (k != "PATH" && k != "LANG" && k != "LC_ALL" && k != "LC_CTYPE" && k != "TASK265B_CHILD") {
 			return nil, ErrLifecycleUnavailable
 		}
 	}
@@ -96,6 +102,8 @@ func freshIdentity() (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
+
+// StartClosed starts the broker child process with ingress gate closed.
 func (l *BrokerLifecycle) StartClosed() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -159,7 +167,11 @@ func (l *BrokerLifecycle) failLocked() {
 	l.terminal = true
 	l.failOnce.Do(func() { close(l.failed) })
 }
+
+// Failed returns a channel closed when the broker lifecycle enters terminal failure.
 func (l *BrokerLifecycle) Failed() <-chan struct{} { return l.failed }
+
+// Describe returns a point-in-time snapshot of broker child and ingress status.
 func (l *BrokerLifecycle) Describe() LifecycleDescription {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -170,6 +182,8 @@ func (l *BrokerLifecycle) Describe() LifecycleDescription {
 	}
 	return d
 }
+
+// OpenVerified validates receipt epoch and nonce before opening ingress gate listeners.
 func (l *BrokerLifecycle) OpenVerified(r VerificationReceipt) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -204,6 +218,8 @@ func (l *BrokerLifecycle) closeLocked() error {
 	}
 	return e
 }
+
+// CloseDrain closes ingress gate listeners and generates a fresh challenge nonce.
 func (l *BrokerLifecycle) CloseDrain() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -238,6 +254,8 @@ func (l *BrokerLifecycle) stopLocked() error {
 	l.child = nil
 	return nil
 }
+
+// RestartClosed closes ingress, stops the broker child process, and restarts it closed.
 func (l *BrokerLifecycle) RestartClosed() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -253,6 +271,8 @@ func (l *BrokerLifecycle) RestartClosed() error {
 	}
 	return l.spawnLocked()
 }
+
+// Shutdown closes ingress gate listeners and stops child process execution permanently.
 func (l *BrokerLifecycle) Shutdown() {
 	l.mu.Lock()
 	defer l.mu.Unlock()

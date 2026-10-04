@@ -39,7 +39,7 @@ func assertSecretEncoding(t *testing.T, password string) {
 		t.Fatal("incorrect raw Base64URL length or padding")
 	}
 	for _, c := range password {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 			t.Fatal("unexpected password alphabet")
 		}
 	}

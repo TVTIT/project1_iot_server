@@ -2,6 +2,8 @@
 // root, not wired into production images/Compose. Run as the broker UID (1883)
 // and container PID1. Startup JSON on stdin contains paths/limits only, never
 // manager passwords, PostgreSQL/JWT secrets or commands from an API request.
+//
+//nolint:misspell // Mosquitto is the official product name.
 package main
 
 import (
@@ -34,6 +36,7 @@ func run(ctx context.Context, input io.Reader) error {
 		return mqttcredential.ErrLifecycleUnavailable
 	}
 	// Child command identity is fixed; IPC cannot select exec/config targets.
+	//nolint:misspell // Mosquitto is the official product name.
 	if cfg.Lifecycle.Executable != "/usr/sbin/mosquitto" || len(cfg.Lifecycle.Args) != 2 || cfg.Lifecycle.Args[0] != "-c" || cfg.Controller.UID != 1883 || os.Geteuid() != 1883 {
 		return mqttcredential.ErrLifecycleUnavailable
 	}

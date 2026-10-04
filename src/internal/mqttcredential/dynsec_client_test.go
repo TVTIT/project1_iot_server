@@ -6,13 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
 type dynsecFake struct {
-	mu         sync.Mutex
 	receive    func(string, []byte, bool)
 	lost       func()
 	publish    func([]byte)
@@ -215,7 +213,7 @@ func TestDynSecValidationAndStrictJSON(t *testing.T) {
 			t.Fatal("invalid projection")
 		}
 	}
-	for _, bad := range []DynSecConfig{DynSecConfig{}, cfg} {
+	for _, bad := range []DynSecConfig{{}, cfg} {
 		if _, e := NewDynSecClient(context.Background(), bad); e == nil {
 			t.Fatal("invalid endpoint")
 		}

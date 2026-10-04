@@ -64,14 +64,14 @@ func (r *revokeLookupRepository) ResolveMaintenance(ctx context.Context, id uuid
 	return r.MaintenanceRepository.ResolveMaintenance(ctx, id)
 }
 
-func (r revokeKillMaintenance) CompleteMaintenance(ctx context.Context, g MaintenanceGuard) (MaintenanceCheckpoint, error) {
+func (r revokeKillMaintenance) CompleteMaintenance(_ context.Context, _ MaintenanceGuard) (MaintenanceCheckpoint, error) {
 	if waitProvisionFixture("revoke-kill-open") != nil {
 		return MaintenanceCheckpoint{}, ErrLifecycleUnavailable
 	}
 	return MaintenanceCheckpoint{}, &DomainError{Code: CodeServiceUnavailable}
 }
 
-func revokePinnedCases(t *testing.T, ctx context.Context, repo *PostgresRepository, actor uuid.UUID, sql func(string, ...any), cfg DynSecAdapterConfig, ctrl ControllerClient, create func(string) (*ProvisionService, *provisionFaultRuntime)) {
+func revokePinnedCases(ctx context.Context, t *testing.T, repo *PostgresRepository, actor uuid.UUID, sql func(string, ...any), cfg DynSecAdapterConfig, ctrl ControllerClient, create func(string) (*ProvisionService, *provisionFaultRuntime)) {
 	t.Helper()
 	provision := func() (string, string) {
 		g := "fixture_" + uuid.NewString()
@@ -125,8 +125,10 @@ func revokePinnedCases(t *testing.T, ctx context.Context, repo *PostgresReposito
 	if e != nil {
 		t.Fatal("session dial")
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	defer func() { _ = conn.Close() }() // Revoke intentionally disconnects this peer.
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal("session deadline failed")
+	}
 	p := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
 	p.ProtocolName, p.ProtocolVersion, p.CleanSession = "MQTT", 4, true
 	p.ClientIdentifier, p.UsernameFlag, p.PasswordFlag, p.Username, p.Password = uuid.NewString(), true, true, g, []byte(password)
@@ -140,10 +142,12 @@ func revokePinnedCases(t *testing.T, ctx context.Context, repo *PostgresReposito
 	}
 	in := MutationInput{g, uuid.New(), ActionRevoke}
 	v, e := s.Revoke(ctx, actor, in)
-	if e != nil || v.Metadata.Status != CredentialRevoked || v.Metadata.CredentialVersion != 1 || v.SecretReturned {
+	if e != nil || v.Status != CredentialRevoked || v.CredentialVersion != 1 || v.SecretReturned {
 		t.Fatal("revoke result", e)
 	}
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal("disconnect probe deadline failed")
+	}
 	b := make([]byte, 1)
 	if _, e = conn.Read(b); e == nil {
 		t.Fatal("session not disconnected")
@@ -293,10 +297,12 @@ func revokePinnedCases(t *testing.T, ctx context.Context, repo *PostgresReposito
 			for _, addr := range []string{"broker:8883", "broker:8884"} {
 				conn, e := net.DialTimeout("tcp", addr, time.Second)
 				if e == nil {
-					conn.SetDeadline(time.Now().Add(time.Second))
+					if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+						t.Fatal("gate probe deadline failed")
+					}
 					b := []byte{0}
 					_, e = conn.Read(b)
-					conn.Close()
+					_ = conn.Close() // Preserve the CLOSED gate read outcome.
 					if timeout, ok := e.(net.Error); ok && timeout.Timeout() {
 						t.Fatal("CLOSED gate hung instead of EOF")
 					}

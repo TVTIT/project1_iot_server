@@ -2,7 +2,7 @@ package mqttcredential
 
 import "context"
 
-// Scan the current projection, not historical winners. A legacy/null authority
+// ListStartupInventory scans credential metadata inventory for startup reconciliation. Scan the current projection, not historical winners. A legacy/null authority
 // is diagnostic failure. Deleted actors on modern historical rows remain valid.
 func (r *PostgresRepository) ListStartupInventory(ctx context.Context, cursor string, limit int) ([]Metadata, error) {
 	if limit < 1 || limit > r.scanLimit {

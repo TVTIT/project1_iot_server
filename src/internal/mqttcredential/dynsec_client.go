@@ -52,7 +52,9 @@ type DynSecConfig struct {
 	ManagementDial func(context.Context) (net.Conn, error)
 }
 
-func (DynSecConfig) String() string     { return "mqttcredential.DynSecConfig{redacted}" }
+func (DynSecConfig) String() string { return "mqttcredential.DynSecConfig{redacted}" }
+
+// GoString returns a redacted string representation of DynSecConfig.
 func (c DynSecConfig) GoString() string { return c.String() }
 
 // DynSecClientMetadata is an explicit safe projection. No native password,
@@ -98,7 +100,9 @@ type DynSecClient struct {
 	closeOnce  sync.Once
 }
 
-func (*DynSecClient) String() string     { return "mqttcredential.DynSecClient{redacted}" }
+func (*DynSecClient) String() string { return "mqttcredential.DynSecClient{redacted}" }
+
+// GoString returns a redacted string representation of DynSecClient.
 func (c *DynSecClient) GoString() string { return c.String() }
 
 func validDynSecConfig(c DynSecConfig) bool {
@@ -162,7 +166,7 @@ func dynSecNil(v any) bool {
 	}
 	r := reflect.ValueOf(v)
 	switch r.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return r.IsNil()
 	default:
 		return false
@@ -200,6 +204,8 @@ func (c *DynSecClient) invalidate(code string) {
 		delete(c.pending, key)
 	}
 }
+
+// Close terminates the dynamic security client and background worker.
 func (c *DynSecClient) Close() {
 	c.closeOnce.Do(func() { c.invalidate("closed"); c.transport.Close(); <-c.workerDone })
 }
@@ -343,22 +349,32 @@ func (c *DynSecClient) CreateClient(ctx context.Context, u string) error {
 	_, e := c.request(ctx, "createClient", u, "", "")
 	return e
 }
+
+// DisableClient sends a disableClient command to dynamic security for the target username.
 func (c *DynSecClient) DisableClient(ctx context.Context, u string) error {
 	_, e := c.request(ctx, "disableClient", u, "", "")
 	return e
 }
+
+// EnableClient sends an enableClient command to dynamic security for the target username.
 func (c *DynSecClient) EnableClient(ctx context.Context, u string) error {
 	_, e := c.request(ctx, "enableClient", u, "", "")
 	return e
 }
+
+// SetClientPassword updates the dynamic security password for the target username.
 func (c *DynSecClient) SetClientPassword(ctx context.Context, u, password string) error {
 	_, e := c.request(ctx, "setClientPassword", u, password, "")
 	return e
 }
+
+// AddClientRole assigns an existing dynamic security role to the target username.
 func (c *DynSecClient) AddClientRole(ctx context.Context, u, role string) error {
 	_, e := c.request(ctx, "addClientRole", u, "", role)
 	return e
 }
+
+// GetClient retrieves projected client metadata for the target username.
 func (c *DynSecClient) GetClient(ctx context.Context, u string) (DynSecClientMetadata, error) {
 	b, e := c.request(ctx, "getClient", u, "", "")
 	if e != nil {

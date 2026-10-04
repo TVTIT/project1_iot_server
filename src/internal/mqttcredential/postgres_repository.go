@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"iot-platform/internal/gateway"
 )
 
@@ -18,7 +19,7 @@ type PostgresRepository struct {
 	scanLimit int
 }
 
-// Optional scanLimit bounds reconciliation pages without changing existing callers.
+// NewPostgresRepository initializes a PostgresRepository. Optional scanLimit bounds reconciliation pages without changing existing callers.
 func NewPostgresRepository(pool *pgxpool.Pool, timeout time.Duration, scanLimit ...int) (*PostgresRepository, error) {
 	limit := maxRepositoryScanLimit
 	if len(scanLimit) == 1 {
@@ -37,6 +38,7 @@ func safeReadError(err error) error {
 	return &DomainError{Code: CodeServiceUnavailable}
 }
 
+// IsPlatformAdmin checks whether the given actor user ID has platform admin privileges.
 func (r *PostgresRepository) IsPlatformAdmin(ctx context.Context, actor uuid.UUID) (bool, error) {
 	if actor == uuid.Nil {
 		return false, &DomainError{Code: CodeInvalidRequest}

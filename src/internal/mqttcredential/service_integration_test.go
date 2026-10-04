@@ -141,8 +141,10 @@ func servicePinnedBrokerPostgres(t *testing.T, rotate bool, revoke ...bool) {
 		if e != nil {
 			return ErrVerificationFailed
 		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		defer func() { _ = conn.Close() }() // Preserve login result on teardown.
+		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			return ErrVerificationFailed
+		}
 		packet := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
 		packet.ProtocolName, packet.ProtocolVersion, packet.CleanSession = "MQTT", 4, true
 		packet.ClientIdentifier, packet.UsernameFlag, packet.PasswordFlag, packet.Username, packet.Password = uuid.NewString(), true, true, u, []byte(p)
@@ -216,7 +218,7 @@ func servicePinnedBrokerPostgres(t *testing.T, rotate bool, revoke ...bool) {
 		return s, runtime
 	}
 	if len(revoke) == 1 && revoke[0] {
-		revokePinnedCases(t, ctx, repo, actor, sql, cfg, ctrl, create)
+		revokePinnedCases(ctx, t, repo, actor, sql, cfg, ctrl, create)
 		return
 	}
 	// Every case uses an independent process-owned service/adapter and a new

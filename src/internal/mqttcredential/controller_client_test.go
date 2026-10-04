@@ -37,9 +37,14 @@ func TestControllerPinnedBroker(t *testing.T) {
 			t.Fatal("unauthorized UID accepted")
 		}
 		if c, e := client.ManagementDial(ctx); e == nil {
-			defer c.Close()
-			c.SetDeadline(time.Now().Add(time.Second))
-			c.Write([]byte("x"))
+			defer func() { _ = c.Close() }() // Teardown may race the controller's drain.
+			if err := c.SetDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal("unauthorized probe deadline failed")
+			}
+			// Rejection may close the peer before this write; that is a valid denial.
+			if _, err := c.Write([]byte("x")); err != nil {
+				t.Log("unauthorized probe write rejected")
+			}
 			var b [1]byte
 			if _, e = c.Read(b[:]); e == nil {
 				t.Fatal("unauthorized tunnel accepted")
@@ -63,7 +68,7 @@ func TestControllerPinnedBroker(t *testing.T) {
 		t.Fatal("wrapper restart reused lifetime")
 	}
 	if conn, err := net.DialTimeout("tcp", "broker:18884", 100*time.Millisecond); err == nil {
-		conn.Close()
+		_ = conn.Close() // Preserve the unexpected-connect assertion below.
 		t.Fatal("loopback management reachable from backend network")
 	}
 	ca, e := os.ReadFile(input.CAPath)
@@ -85,7 +90,7 @@ func TestControllerPinnedBroker(t *testing.T) {
 	for _, addr := range input.Public {
 		c, e := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if e == nil {
-			c.Close()
+			_ = c.Close() // Preserve the unexpected-connect assertion below.
 			t.Fatal("public path reachable while CLOSED")
 		}
 	}
@@ -151,7 +156,7 @@ func TestControllerPinnedBroker(t *testing.T) {
 	wrongRoots.AppendCertsFromPEM(wrong)
 	for _, bad := range []*tls.Config{{RootCAs: wrongRoots, ServerName: "localhost", MinVersion: tls.VersionTLS12}, {RootCAs: roots, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12}} {
 		if conn, e := client.DialManagementTLS(ctx, bad); e == nil {
-			conn.Close()
+			_ = conn.Close() // Preserve the TLS-bypass assertion below.
 			t.Fatal("private TLS verification bypass")
 		}
 	}
@@ -174,7 +179,7 @@ func TestControllerPinnedBroker(t *testing.T) {
 	var sessions []net.Conn
 	defer func() {
 		for _, c := range sessions {
-			c.Close()
+			_ = c.Close() // Best-effort cleanup after controller drain.
 		}
 	}()
 	for _, addr := range input.Public {
@@ -188,7 +193,9 @@ func TestControllerPinnedBroker(t *testing.T) {
 		t.Fatal(e)
 	}
 	for _, c := range sessions {
-		c.SetReadDeadline(time.Now().Add(time.Second))
+		if err := c.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal("drain probe deadline failed")
+		}
 		var b [1]byte
 		if _, e = io.ReadFull(c, b[:]); e == nil {
 			t.Fatal("maintenance kept session")

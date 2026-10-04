@@ -81,8 +81,10 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 		if e != nil {
 			return ErrVerificationFailed
 		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		defer func() { _ = conn.Close() }() // Preserve login result on teardown.
+		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			return ErrVerificationFailed
+		}
 		packet := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
 		packet.ProtocolName = "MQTT"
 		packet.ProtocolVersion = 4
@@ -180,7 +182,9 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 		if err != nil {
 			t.Fatal("ACL oracle TLS")
 		}
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal("ACL oracle deadline failed")
+		}
 		p := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
 		p.ProtocolName, p.ProtocolVersion, p.CleanSession = "MQTT", 4, true
 		p.ClientIdentifier, p.UsernameFlag, p.PasswordFlag, p.Username, p.Password = uuid.NewString(), true, true, u, []byte(password)
@@ -195,11 +199,13 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 		return conn
 	}
 	admin := connect("admin", input.Password)
-	defer admin.Close()
+	defer func() { _ = admin.Close() }() // Close the latest oracle after reconnects.
 	gateway := connect("C", input.NewPassword)
-	defer gateway.Close()
+	defer func() { _ = gateway.Close() }() // Close the latest oracle after reconnects.
 	subscribe := func(conn net.Conn, topic string, allowed bool) {
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal("subscribe deadline failed")
+		}
 		p := packets.NewControlPacket(packets.Subscribe).(*packets.SubscribePacket)
 		p.MessageID, p.Topics, p.Qoss = 1, []string{topic}, []byte{0}
 		if p.Write(conn) != nil {
@@ -212,7 +218,9 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 		}
 	}
 	delivery := func(sender, receiver net.Conn, topic string, allowed bool) {
-		sender.SetDeadline(time.Now().Add(3 * time.Second))
+		if err := sender.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal("publish deadline failed")
+		}
 		p := packets.NewControlPacket(packets.Publish).(*packets.PublishPacket)
 		p.TopicName, p.Payload = topic, []byte("nonsecret-acl-oracle")
 		if p.Write(sender) != nil {
@@ -222,7 +230,9 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 		if allowed {
 			wait = 3 * time.Second
 		}
-		receiver.SetDeadline(time.Now().Add(wait))
+		if err := receiver.SetDeadline(time.Now().Add(wait)); err != nil {
+			t.Fatal("delivery deadline failed")
+		}
 		v, err := packets.ReadPacket(receiver)
 		if allowed {
 			got, ok := v.(*packets.PublishPacket)
@@ -240,7 +250,7 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 	for _, topic := range []string{"gateways/A/telemetry/sample", "gateways/C/commands/action", "gateways/C/acks/result"} {
 		delivery(gateway, admin, topic, false)
 		// A TLS read timeout poisons that connection; never reuse the oracle.
-		admin.Close()
+		_ = admin.Close() // Discard the timeout-poisoned TLS oracle.
 		admin = connect("admin", input.Password)
 		subscribe(admin, "gateways/#", true)
 	}
@@ -252,18 +262,20 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 		delivery(admin, gateway, "gateways/C/"+suffix+"/result", true)
 		delivery(admin, gateway, "gateways/A/"+suffix+"/result", false)
 		// Drain the admin's own echo from its broad test subscription.
-		admin.SetReadDeadline(time.Now().Add(time.Second))
-		if _, err := packets.ReadPacket(admin); err != nil {
-			t.Fatal("admin oracle echo")
+		if err := admin.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal("echo deadline failed")
 		}
 		if _, err := packets.ReadPacket(admin); err != nil {
 			t.Fatal("admin oracle echo")
 		}
-		gateway.Close()
+		if _, err := packets.ReadPacket(admin); err != nil {
+			t.Fatal("admin oracle echo")
+		}
+		_ = gateway.Close() // Discard the timeout-poisoned TLS oracle.
 		gateway = connect("C", input.NewPassword)
 	}
-	admin.Close()
-	gateway.Close()
+	_ = admin.Close() // Best-effort teardown; ACL assertions are complete.
+	_ = gateway.Close()
 	t.Log("PASS actual adapter role send/receive/subscribe own namespace; cross-Gateway and broad subscribe denied")
 	op.Previous = &CredentialSnapshot{Status: CredentialActive, CredentialVersion: 1}
 	op.CredentialVersion = 2

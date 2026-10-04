@@ -31,7 +31,8 @@ func (c ControllerClient) call(ctx context.Context, op string, r VerificationRec
 	if e != nil {
 		return LifecycleDescription{}, ErrLifecycleUnavailable
 	}
-	defer conn.Close()
+	// The response/read error is authoritative; transport teardown is best-effort.
+	defer func() { _ = conn.Close() }()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	deadline, _ := ctx.Deadline()
@@ -49,16 +50,24 @@ func (c ControllerClient) call(ctx context.Context, op string, r VerificationRec
 	}
 	return response.Description, nil
 }
+
+// Describe queries current lifecycle status from the broker lifecycle controller.
 func (c ControllerClient) Describe(ctx context.Context) (LifecycleDescription, error) {
 	return c.call(ctx, "Describe", VerificationReceipt{})
 }
+
+// CloseDrain commands the controller to drain and close external broker access.
 func (c ControllerClient) CloseDrain(ctx context.Context) error {
 	_, e := c.call(ctx, "CloseDrain", VerificationReceipt{})
 	return e
 }
+
+// RestartClosed requests restarting the broker in a closed maintenance state.
 func (c ControllerClient) RestartClosed(ctx context.Context) (LifecycleDescription, error) {
 	return c.call(ctx, "RestartClosed", VerificationReceipt{})
 }
+
+// OpenVerified unblocks normal broker traffic after verification receipt presentation.
 func (c ControllerClient) OpenVerified(ctx context.Context, r VerificationReceipt) error {
 	_, e := c.call(ctx, "OpenVerified", r)
 	return e

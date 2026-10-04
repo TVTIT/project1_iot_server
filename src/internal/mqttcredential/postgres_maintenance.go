@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"iot-platform/internal/gateway"
 )
 
@@ -21,6 +22,7 @@ func scanMaintenance(row pgx.Row) (MaintenanceCheckpoint, error) {
 	return c, nil
 }
 
+// ResolveMaintenance queries a maintenance checkpoint by operation ID.
 func (r *PostgresRepository) ResolveMaintenance(ctx context.Context, id uuid.UUID) (MaintenanceCheckpoint, error) {
 	if id == uuid.Nil {
 		return MaintenanceCheckpoint{}, &DomainError{Code: CodeInvalidRequest}
@@ -39,6 +41,7 @@ func (r *PostgresRepository) ResolveMaintenance(ctx context.Context, id uuid.UUI
 	return c, nil
 }
 
+// ListPendingMaintenance lists incomplete maintenance checkpoints ordered by operation ID.
 func (r *PostgresRepository) ListPendingMaintenance(ctx context.Context, cursor uuid.UUID, limit int) ([]MaintenanceCheckpoint, error) {
 	if limit <= 0 || limit > r.scanLimit {
 		return nil, &DomainError{Code: CodeInvalidRequest}
@@ -69,12 +72,15 @@ func validEpoch(s string) bool {
 	return e == nil && len(b) == 32 && hex.EncodeToString(b) == s
 }
 
+// BindMaintenanceEpoch binds a broker lifetime epoch to an in-progress maintenance checkpoint.
 func (r *PostgresRepository) BindMaintenanceEpoch(ctx context.Context, g MaintenanceGuard, epoch string) (MaintenanceCheckpoint, error) {
 	if !validEpoch(epoch) {
 		return MaintenanceCheckpoint{}, &DomainError{Code: CodeInvalidRequest}
 	}
 	return r.updateMaintenance(ctx, g, "bind", &epoch, nil)
 }
+
+// RequireMaintenanceRecovery marks a maintenance checkpoint as requiring recovery with an error code.
 func (r *PostgresRepository) RequireMaintenanceRecovery(ctx context.Context, g MaintenanceGuard, code ErrorCode) (MaintenanceCheckpoint, error) {
 	switch code {
 	case CodeRecoveryRequired, CodeServiceUnavailable, CodeFinalizationPending, CodeVerificationUnavailable, CodeInternalError, CodeRuntimeBusy, CodeRuntimeDisabled:
@@ -83,6 +89,8 @@ func (r *PostgresRepository) RequireMaintenanceRecovery(ctx context.Context, g M
 	}
 	return r.updateMaintenance(ctx, g, "recovery", nil, &code)
 }
+
+// CompleteMaintenance marks a maintenance checkpoint as completed after verified commit.
 func (r *PostgresRepository) CompleteMaintenance(ctx context.Context, g MaintenanceGuard) (MaintenanceCheckpoint, error) {
 	if g.ExpectedEpoch == nil {
 		return MaintenanceCheckpoint{}, &DomainError{Code: CodeInvalidRequest}
@@ -110,9 +118,10 @@ func (r *PostgresRepository) updateMaintenance(ctx context.Context, g Maintenanc
 		return MaintenanceCheckpoint{}, safeReadError(err)
 	}
 	status := g.ExpectedStatus
-	if action == "complete" {
+	switch action {
+	case "complete":
 		status = MaintenanceCompleted
-	} else if action == "recovery" {
+	case "recovery":
 		status = MaintenanceRecoveryNeeded
 	}
 	c, err := scanMaintenance(tx.QueryRow(ctx, `UPDATE public.mqtt_credential_maintenance p SET status=$8, broker_epoch=CASE WHEN $9='bind' THEN $10::text ELSE p.broker_epoch END,error_code=$11,updated_at=now(),completed_at=CASE WHEN $9='complete' THEN now() ELSE NULL END

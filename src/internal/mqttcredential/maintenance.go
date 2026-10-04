@@ -7,8 +7,10 @@ import (
 	"github.com/google/uuid"
 )
 
+// MaintenanceStatus represents the state of a credential maintenance checkpoint.
 type MaintenanceStatus string
 
+// MaintenanceStatus constants define valid checkpoint progression states.
 const (
 	MaintenanceInProgress     MaintenanceStatus = "in_progress"
 	MaintenanceCompleted      MaintenanceStatus = "completed"
@@ -30,7 +32,7 @@ type MaintenanceCheckpoint struct {
 	RecoveryID           *uuid.UUID
 }
 
-// Epoch is a nonsecret broker lifetime identity from the controller challenge, never
+// MaintenanceGuard guards maintenance transitions with expected status and broker epoch. Epoch is a nonsecret broker lifetime identity from the controller challenge, never
 // created_at. CAS rebinding invalidates previous lifetime ACKs. The service must
 // serialize global runtime execution; per-Gateway queued intents are permitted.
 type MaintenanceGuard struct {
@@ -39,7 +41,7 @@ type MaintenanceGuard struct {
 	ExpectedEpoch  *string
 }
 
-// Separate capability preserves the existing Repository and its test doubles.
+// MaintenanceRepository manages database persistence for maintenance checkpoints. Separate capability preserves the existing Repository and its test doubles.
 // CompleteMaintenance is called only AFTER reconcile + epoch-correlated OPEN
 // ACK; secret return requires its confirmed commit. Unknown commit or absent
 // lookup never authorizes runtime replay or secret return.

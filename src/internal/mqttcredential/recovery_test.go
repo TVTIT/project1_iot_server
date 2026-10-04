@@ -1,8 +1,9 @@
 package mqttcredential
 
 import (
-	"github.com/google/uuid"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestRecoveryDisableEvidence(t *testing.T) {

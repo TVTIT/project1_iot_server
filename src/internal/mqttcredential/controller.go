@@ -29,6 +29,8 @@ type ControllerConfig struct {
 	MaxInflight       int
 	ManagementAddress string
 }
+
+// LifecycleController serves unix-domain socket control commands for broker lifecycle.
 type LifecycleController struct {
 	lifecycle *BrokerLifecycle
 	cfg       ControllerConfig
@@ -42,6 +44,7 @@ type controllerResponse struct {
 	Description LifecycleDescription `json:"description"`
 }
 
+// NewLifecycleController validates configuration and creates a broker lifecycle controller.
 func NewLifecycleController(l *BrokerLifecycle, c ControllerConfig) (*LifecycleController, error) {
 	if l == nil || !filepath.IsAbs(c.ControlDir) || filepath.Clean(c.ControlDir) != c.ControlDir || len(c.ControlDir) > 75 || c.Timeout <= 0 || c.Timeout > time.Minute || c.MaxFrameBytes < 256 || c.MaxFrameBytes > 65536 || c.MaxInflight < 1 || c.MaxInflight > 128 || !loopbackEndpoint(c.ManagementAddress) {
 		return nil, ErrLifecycleUnavailable
@@ -154,7 +157,8 @@ func (s *LifecycleController) Serve(ctx context.Context) error {
 		return ErrLifecycleUnavailable
 	}
 	lock := os.NewFile(uintptr(fd), "lifecycle lock")
-	defer lock.Close()
+	// Release the lock on every exit; cleanup must not replace the serving error.
+	defer func() { _ = lock.Close() }()
 	i, e := lock.Stat()
 	if e != nil || !controllerOwned(i, s.cfg.UID, 0600) || unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB) != nil {
 		return ErrLifecycleUnavailable

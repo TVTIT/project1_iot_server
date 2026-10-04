@@ -18,30 +18,42 @@ func TestControllerFilesystemAndUID(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	os.Chmod(dir, 0755)
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	if s.Serve(context.Background()) == nil {
 		t.Fatal("unsafe directory accepted")
 	}
-	os.Chmod(dir, 0700)
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(dir, "control.sock")
-	os.WriteFile(path, []byte("keep"), 0600)
+	if err := os.WriteFile(path, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if s.Serve(context.Background()) == nil {
 		t.Fatal("non socket removed")
 	}
 	if b, _ := os.ReadFile(path); string(b) != "keep" {
 		t.Fatal("file changed")
 	}
-	os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
 	live, e := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if e != nil {
 		t.Fatal(e)
 	}
 	live.SetUnlinkOnClose(false)
-	os.Chmod(path, 0600)
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
 	if s.Serve(context.Background()) == nil {
 		t.Fatal("live socket replaced")
 	}
-	live.Close()
+	if err := live.Close(); err != nil {
+		t.Fatal(err) // The next assertion requires a refused, not live, socket.
+	}
 	// Owned refused socket is safely replaced, but lock prevents a second owner.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -65,13 +77,17 @@ func TestControllerFilesystemAndUID(t *testing.T) {
 	}
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], 1025)
-	conn.Write(n[:])
-	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Write(n[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	var b [1]byte
 	if _, e = conn.Read(b[:]); e == nil {
 		t.Fatal("oversize frame accepted")
 	}
-	conn.Close()
+	_ = conn.Close() // Best-effort cleanup after peer rejection.
 	// Fill both admission slots with incomplete headers. Excess connections
 	// are immediately rejected; cancellation must close pending readers.
 	var pending []net.Conn
@@ -87,20 +103,22 @@ func TestControllerFilesystemAndUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	excess.SetReadDeadline(time.Now().Add(time.Second))
+	if err := excess.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = excess.Read(b[:]); err == nil {
 		t.Fatal("unbounded IPC admission")
 	}
-	excess.Close()
+	_ = excess.Close() // Best-effort cleanup after peer rejection.
 	for _, c := range pending {
-		defer c.Close()
+		defer func() { _ = c.Close() }() // May already be drained by cancellation.
 	}
 	// Real SO_PEERCRED observed, mismatch closes before processing payload.
 	peerListener, e := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "peer.sock"), Net: "unix"})
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer peerListener.Close()
+	defer func() { _ = peerListener.Close() }() // Best-effort fixture teardown.
 	peer, e := net.Dial("unix", peerListener.Addr().String())
 	if e != nil {
 		t.Fatal(e)
@@ -112,8 +130,8 @@ func TestControllerFilesystemAndUID(t *testing.T) {
 	if controllerPeerUID(accepted) != uint32(os.Geteuid()) {
 		t.Fatal("peer UID mismatch")
 	}
-	peer.Close()
-	accepted.Close()
+	_ = peer.Close() // Best-effort fixture teardown; UID assertion is complete.
+	_ = accepted.Close()
 	cancel()
 	if e = <-done; e != nil {
 		t.Fatal(e)

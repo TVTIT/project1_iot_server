@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"iot-platform/internal/gateway"
 	"reflect"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
+	"iot-platform/internal/gateway"
 )
 
 // DynSecController is a trusted local capability, not a public API. A single
@@ -21,7 +22,7 @@ type DynSecController interface {
 	OpenVerified(context.Context, VerificationReceipt) error
 }
 
-// All callbacks are server-owned, bounded and must use the private TLS tunnel.
+// DynSecAdapterConfig configures dynamic security adapter operations. All callbacks are server-owned, bounded and must use the private TLS tunnel.
 // NewClient MUST allocate a new lifetime, never return a cached manager client.
 // Login MUST perform a fresh authenticated TLS CONNECT (not network liveness).
 type DynSecAdapterConfig struct {
@@ -33,6 +34,7 @@ type DynSecAdapterConfig struct {
 	Timeout, RecoveryTimeout time.Duration
 }
 
+// DynSecAdapter orchestrates broker dynamic security updates and verification.
 type DynSecAdapter struct {
 	cfg     DynSecAdapterConfig
 	mu      sync.Mutex
@@ -41,7 +43,7 @@ type DynSecAdapter struct {
 	opened  DynSecAdapterResult
 }
 
-// Runtime evidence is not DB finalization or power-loss durability. No secret
+// DynSecAdapterResult captures adapter execution outcome and verification evidence. Runtime evidence is not DB finalization or power-loss durability. No secret
 // is stored or returned. The service owns its transient generation callback.
 type DynSecAdapterResult struct {
 	OperationID uuid.UUID
@@ -50,6 +52,7 @@ type DynSecAdapterResult struct {
 	receipt     VerificationReceipt
 }
 
+// NewDynSecAdapter validates configuration and constructs a DynSecAdapter.
 func NewDynSecAdapter(c DynSecAdapterConfig) (*DynSecAdapter, error) {
 	if dynSecNil(c.Controller) || c.NewClient == nil || c.Observe == nil || c.Login == nil || len(c.ProtectedUsernames) < 2 || c.Timeout <= 0 || c.Timeout > time.Minute || c.RecoveryTimeout <= 0 || c.RecoveryTimeout > time.Minute {
 		return nil, ErrInvalidInput

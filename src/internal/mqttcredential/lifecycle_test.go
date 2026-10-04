@@ -27,7 +27,7 @@ func fixtureLifecycle(t *testing.T) *BrokerLifecycle {
 	return l
 }
 
-func TestLifecycleChild(t *testing.T) {
+func TestLifecycleChild(_ *testing.T) {
 	if os.Getenv("TASK265B_CHILD") != "1" {
 		return
 	}
@@ -98,7 +98,7 @@ func TestLifecycleEpochReceiptAndDeath(t *testing.T) {
 	for _, addr := range opened.Addresses {
 		c, e := net.DialTimeout("tcp", addr, time.Second)
 		if e == nil {
-			c.Close()
+			_ = c.Close() // Preserve the dead-child gate assertion below.
 			t.Fatal("dead child left gate reachable")
 		}
 	}

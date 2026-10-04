@@ -76,8 +76,10 @@ func TestStartupServicePinnedBrokerPostgres(t *testing.T) {
 		if e != nil {
 			return ErrVerificationFailed
 		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		defer func() { _ = conn.Close() }() // Preserve login result on teardown.
+		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			return ErrVerificationFailed
+		}
 		packet := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
 		packet.ProtocolName, packet.ProtocolVersion, packet.CleanSession = "MQTT", 4, true
 		packet.ClientIdentifier, packet.UsernameFlag, packet.PasswordFlag, packet.Username, packet.Password = uuid.NewString(), true, true, u, []byte(p)
@@ -187,7 +189,7 @@ func TestStartupServicePinnedBrokerPostgres(t *testing.T) {
 	backendChecks := 0
 	faultRuntime := &startupNativeFaultRuntime{DynSecAdapter: a, t: t, target: rotating, mode: "unreadable"}
 	ambiguous := &startupRecoveryCommitSeam{RecoveryRepository: r}
-	s, e := NewStartupReconciler(r, r, ambiguous, faultRuntime, StartupOptions{Timeout: time.Minute, PageSize: 2, MaxPages: 16, VerifyBackend: func(ctx context.Context, receipt VerificationReceipt) error {
+	s, e := NewStartupReconciler(r, r, ambiguous, faultRuntime, StartupOptions{Timeout: time.Minute, PageSize: 2, MaxPages: 16, VerifyBackend: func(ctx context.Context, _ VerificationReceipt) error {
 		// Real correlated manager traffic, not public TCP liveness. Fixture manager
 		// backend role bootstrap is established by the shared fixture.
 		backendChecks++
@@ -316,7 +318,7 @@ func TestStartupServicePinnedBrokerPostgres(t *testing.T) {
 		outcome := "dial-rejected"
 		if dialErr == nil {
 			outcome = "tcp-accepted"
-			conn.Close()
+			_ = conn.Close() // Best-effort probe teardown, not authentication evidence.
 		}
 		t.Logf("CLOSED gate sample route=%s outcome=%s elapsed_ms=%d (not authentication evidence)", route, outcome, time.Since(start).Milliseconds())
 	}

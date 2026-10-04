@@ -21,8 +21,11 @@ type DynSecSnapshotConfig struct {
 	MaxBytes       int64
 	ValidateTarget func(string) bool
 }
+
+// DynSecSnapshotReader reads filesystem snapshots of dynamic security state.
 type DynSecSnapshotReader struct{ cfg DynSecSnapshotConfig }
 
+// NewDynSecSnapshotReader validates configuration and returns a DynSecSnapshotReader.
 func NewDynSecSnapshotReader(cfg DynSecSnapshotConfig) (*DynSecSnapshotReader, error) {
 	if !filepath.IsAbs(cfg.Path) || filepath.Clean(cfg.Path) != cfg.Path || cfg.MaxBytes <= 0 || cfg.MaxBytes > 64<<20 || cfg.ValidateTarget == nil {
 		return nil, dynSecError("snapshot_configuration")
@@ -44,7 +47,8 @@ func (r *DynSecSnapshotReader) Observe(ctx context.Context, target string) (DynS
 	if e != nil {
 		return bad()
 	}
-	defer syscall.Close(dir)
+	// Read-only descriptor cleanup cannot change the validated observation.
+	defer func() { _ = syscall.Close(dir) }()
 	var ds syscall.Stat_t
 	if syscall.Fstat(dir, &ds) != nil || ds.Mode&0077 != 0 || ds.Uid != r.cfg.WriterUID {
 		return bad()
@@ -55,7 +59,7 @@ func (r *DynSecSnapshotReader) Observe(ctx context.Context, target string) (DynS
 		return bad()
 	}
 	f := os.NewFile(uintptr(fd), "dynsec-snapshot")
-	defer f.Close()
+	defer func() { _ = f.Close() }() // Read-only cleanup; preserve the observation error.
 	before, e := f.Stat()
 	if e != nil || !before.Mode().IsRegular() || before.Size() > r.cfg.MaxBytes || before.Mode().Perm()&0077 != 0 || before.Mode().Perm()&0400 == 0 {
 		return bad()
@@ -79,7 +83,7 @@ func (r *DynSecSnapshotReader) Observe(ctx context.Context, target string) (DynS
 		return bad()
 	}
 	other := os.NewFile(uintptr(current), "dynsec-snapshot-check")
-	defer other.Close()
+	defer func() { _ = other.Close() }() // Read-only identity-check descriptor.
 	now, e := other.Stat()
 	if e != nil || !os.SameFile(before, now) || before.Size() != now.Size() || !before.ModTime().Equal(now.ModTime()) {
 		return bad()
@@ -107,7 +111,7 @@ func openDynSecDirectory(path string) (int, error) {
 	}
 	for i := len(parts) - 1; i >= 0; i-- {
 		next, e := syscall.Openat(fd, parts[i], syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-		syscall.Close(fd)
+		_ = syscall.Close(fd) // Release the previous read-only directory, preserving Openat's error.
 		if e != nil {
 			return -1, e
 		}

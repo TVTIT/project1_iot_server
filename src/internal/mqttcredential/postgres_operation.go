@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// BeginOperation starts a credential mutation operation transaction in Postgres.
 func (r *PostgresRepository) BeginOperation(ctx context.Context, req BeginRequest) (BeginResult, error) {
 	if err := ValidateMutationInput(req.ActorUserID, req.Input); err != nil {
 		return BeginResult{}, err
