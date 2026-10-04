@@ -1,7 +1,8 @@
 # Task 2.6 — Harness hợp nhất và bằng chứng giới hạn
 
 Đây là hồ sơ kiểm chứng **fixture**, không phải production runbook hay nghiệm
-thu toàn bộ G1. Kiến trúc được chọn nằm trong
+thu toàn bộ G1. Báo cáo nghiệm thu triển khai và kết quả rà soát Task 2.6 được ghi tại
+[stage-2-task-2.6-acceptance.md](stage-2-task-2.6-acceptance.md). Kiến trúc được chọn nằm trong
 [task26-g1-architecture.md](task26-g1-architecture.md); kế hoạch authoritative nằm
 ngoài repo tại `../../../docs/backend_plan/task_2.6_detail_plan.md`.
 

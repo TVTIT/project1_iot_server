@@ -60,7 +60,7 @@ Kiến trúc thay thế phương án quản lý file tĩnh ban đầu (vốn g�
 | **Cổng khởi động (Restart Ingress Gate)** | **PASS** | Đạt trong fixture Go wrapper (PID1); kiểm chứng nguyên lý fail-closed khi khởi động. |
 | **Thu hồi xác thực (Revoke Flow)** | **PASS** | Đạt yêu cầu đối chiếu lệnh tương quan và snapshot; lưu ý file snapshot native **không có bảo đảm fsync chống mất nguồn đột ngột**. |
 | **Xoay vòng mật khẩu (Rotate Flow)** | **PASS** | Đạt chu trình drain, sinh CSPRNG trong RAM, cold load verify và nạp giả lập; **DB active không tương đương biên nhận thiết bị (handoff receipt)** sau khi sập. |
-| **Quy trình tạo role/client (Provisioning Choreography)** | *Chưa thử nghiệm* | Chuỗi khởi tạo role và cấp quyền ban đầu (từ trạng thái rỗng) chưa được kiểm chứng đầy đủ trong fixture. |
+| **Quy trình tạo role/client (Provisioning Choreography)** | **PASS** | Đã triển khai và kiểm chứng đầy đủ trong Go service/adapter (`TestDynSec.*`, `TestStartup.*`) và HTTP integration; khởi tạo role `gateway_<id>` kèm client tự động. |
 | **Mất kết nối DB sau khi MỞ (DB loss post-OPEN)** | *Chưa đạt / Chưa chốt* | Chưa có cơ chế giám sát rớt kết nối DB (lease-loss fencing) để tự động ngắt kết nối nếu DB sập sau khi đã OPEN. |
 | **Rathole thực tế & Tối thiểu đặc quyền** | *Giả lập* | Mới mô phỏng chuyển tiếp TCP qua cổng; chưa kiểm thử binary Rathole thật, chưa phân quyền triệt để UID tiến trình. |
 | **Lưu trữ mã hóa trên USB & Phần cứng thật** | *Giả lập* | Mới kiểm chứng qua file local mode 0600; chưa kiểm thử nạp USB vật lý và mã hóa flash/NVS trên bo mạch thật. |
@@ -76,10 +76,10 @@ Kiến trúc thay thế phương án quản lý file tĩnh ban đầu (vốn g�
 - Cấp phát mật khẩu động qua môi trường mạng (hệ thống trung thành với mô hình nạp offline qua USB).
 
 ### 3.2. Rào cản tối thiểu chặn triển khai Production (Minimum Production Rollout Blockers)
-- **Tích hợp quy trình cấp phát (Provisioning Choreography):** Cần hoàn thiện và kiểm chứng chuỗi lệnh tạo role/client hoàn chỉnh từ trạng thái ban đầu, kết hợp nguyên tắc đặc quyền tối thiểu (least privilege) cho các thông tin xác thực nội bộ.
+- **Tích hợp quy trình cấp phát (Provisioning Choreography):** *Đã hoàn thành trong mã nguồn Task 2.6:* Chuỗi tạo role/client tự động, kiểm tra quyền tối thiểu của tài khoản quản lý nội bộ và Ingress Gate đã hoàn tất kiểm chứng cục bộ; rào cản còn lại là remote CI trên GitHub Actions và bật tính năng có kiểm soát trên môi trường triển khai thực tế.
 - **Xác định chính sách mất DB sau khi MỞ (Post-OPEN Policy):** Cần định nghĩa rõ ràng phương án xử lý và quản lý tranh chấp đồng thời (concurrency policy) ở mức vừa đủ cho MVP khi mất kết nối DB sau khi đã OPEN (không bắt buộc giải pháp HA/fencing hoàn hảo cho G1).
 - **Rủi ro bypass mạng:** Cần cấu hình hạ tầng mạng/Docker để đảm bảo mọi luồng từ Internet hoặc Rathole bắt buộc phải đi qua Ingress Gate trước khi tới Mosquitto.
-- *Ghi chú kiến trúc:* Hệ thống không bắt buộc phải trang bị thêm một bộ giám sát ngoài chuyên biệt (external independent supervisor) làm hạ tầng thường trực; việc triển khai production có thể kế thừa mô hình wrapper tối giản đã chứng minh trong fixture.
+- *Ghi chú kiến trúc:* Hệ thống không bắt buộc phải trang bị thêm một bộ giám sát ngoài chuyên biệt (external independent supervisor) làm hạ tầng thường trực; việc triển khai production có thể kế thừa mô hình wrapper tối giản đã chứng minh trong fixture. Xem [Sổ tay vận hành Task 2.6](stage-2-task-2.6-mqtt-credentials.md) và [Báo cáo nghiệm thu Stage 2 Task 2.6](stage-2-task-2.6-acceptance.md) để biết chi tiết.
 
 ### 3.3. Giới hạn nghiệm thu phía thiết bị (Device Rollout / Hardware Acceptance Limit)
 - Thẩm định vật lý quy trình nạp USB an toàn và khả năng lưu trữ mã hóa phần cứng (flash/NVS) trên các bo mạch mục tiêu (ESP32, Luckfox Pico Plus, TI AM5728) thuộc phạm vi nghiệm thu thiết bị Gateway thực tế, tách biệt với việc triển khai backend G1.

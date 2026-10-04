@@ -8,17 +8,21 @@ Task 2.2 đã có JWT authentication và PostgreSQL platform-admin guard; Task 2
 PUT provision Gateway/Sensor và graph Twin atomically trong worktree; Task 2.5 đã
 hoàn thành hạ tầng runtime credential cho Mosquitto (quản lý `password_file` trong
 named volume, atomic replace có lock/fsync, reload qua Unix socket sidecar không
-dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS). Cả 8 jobs CI trên
+dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS). Task 2.6 đã hoàn thành
+triển khai 4 endpoint Admin MQTT Credential (`/v1/admin/gateways/{gateway_id}/mqtt-credential*`:
+GET metadata, POST provision, POST rotate, DELETE revoke), Dynamic Security adapter,
+hàng rào Ingress Gate fail-closed, recovery checkpoints và regression tests trong worktree
+(mặc định vô hiệu hóa trên deployment `MQTT_CREDENTIAL_API_ENABLED=false`). Cả 8 jobs CI trên
 GitHub Actions đã PASS tại commit `674e8db` (lưu ý run này là mốc trước khi áp
-dụng các commit sửa review findings về placeholder và cert mount). Named volume
+dụng các commit sửa review findings về placeholder và cert mount; chưa có remote CI cho Task 2.6). Named volume
 `mosquitto_auth` mới chỉ seed tài khoản nội bộ `backend_service`, không tự động
 import các tài khoản Gateway từ file prototype tracked trong git; hệ thống chưa hoàn
 tất rotate secret production khi chưa thực hiện runbook chuyển đổi thực tế. Xem
 [contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md),
-[contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md) và
-[hạ tầng runtime Mosquitto Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md)
-để phân biệt phần đã triển khai với credential REST API của Task 2.6 cũng như
-telemetry/WebSocket/device control tương lai.
+[contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md),
+[hạ tầng runtime Mosquitto Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md) và
+[sổ tay vận hành MQTT Credential Task 2.6](docs/backend/stage-2-task-2.6-mqtt-credentials.md)
+để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
 
 ---
 
@@ -371,6 +375,10 @@ Mọi HTTP request/response của Go Backend đều được gán hoặc bảo t
 | `GET` | `/v1/gateways/{gateway_id}/sensors` | Human Bearer JWT | Sensor kế thừa quyền Gateway | Đã triển khai; 200 items, 404 nếu không tồn tại/không có quyền |
 | `PUT` | `/v1/admin/gateways/{gateway_id}` | Human JWT + DB platform admin | Gateway + owner ban đầu + Twin/state trong một transaction | Worktree: 201 tạo, 200 retry no-op, 409 conflict |
 | `PUT` | `/v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` | Human JWT + DB platform admin | Sensor + Twin/state + hasSensor trong một transaction | Worktree: 201 tạo, 200 retry no-op, 409 conflict |
+| `GET` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Human JWT + DB platform admin | Metadata credential Gateway; no-body, no-store | Worktree: 200 metadata (deployment tắt: 503) |
+| `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Human JWT + DB platform admin | Provision credential + CSPRNG secret 1 lần; Idempotency-Key | Worktree: 201 secret (deployment tắt: 503) |
+| `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/rotate` | Human JWT + DB platform admin | Rotate credential trong maintenance window; Idempotency-Key | Worktree: 200 secret (deployment tắt: 503) |
+| `DELETE` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Human JWT + DB platform admin | Thu hồi vĩnh viễn (revoke) quyền MQTT; Idempotency-Key | Worktree: 200 revoked (deployment tắt: 503) |
 | `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) | 501 Not Implemented |
 | `GET` | `/v1/ws` | Human Bearer JWT (chỉ header) | Stub; chưa nâng cấp WebSocket hoặc streaming | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
 | `GET` | `/v1/digital-twins` | Human Bearer JWT (Supabase) | Stub danh sách Digital Twin | 401 nếu thiếu/sai JWT; 501 nếu hợp lệ |
@@ -378,11 +386,13 @@ Mọi HTTP request/response của Go Backend đều được gán hoặc bảo t
 
 *Ghi chú: Ba business GET stub đều yêu cầu JWT hợp lệ trước khi trả `501`;
 thiếu/sai JWT trả `401`. Không nhận token qua query/body. `501` không chứng
-minh User–Gateway permission hay nghiệp vụ hoàn thành. Hai Admin PUT đã được
-đăng ký trong router; không cấp MQTT credentials, không có membership API hay
-device control. Platform admin không bypass membership trên user read API. Xem
-[safe error contract](docs/backend/stage-2-task-2.2-authentication.md) và
-[provisioning contract](docs/backend/stage-2-task-2.4-provisioning.md).*
+minh User–Gateway permission hay nghiệp vụ hoàn thành. Hai Admin PUT provisioning đã được
+đăng ký trong router; không có membership API hay
+device control. Bốn Admin MQTT credential route đã được triển khai đầy đủ nhưng mặc định bị
+vô hiệu hóa trên deployment (`503 credential_runtime_disabled`). Platform admin không bypass
+membership trên user read API. Xem [safe error contract](docs/backend/stage-2-task-2.2-authentication.md),
+[provisioning contract](docs/backend/stage-2-task-2.4-provisioning.md) và
+[vận hành MQTT credential](docs/backend/stage-2-task-2.6-mqtt-credentials.md).*
 
 #### Digital Twin & Device Control API (`/v1/*`):
 Danh sách dưới là **thiết kế MVP**: hiện chỉ `GET /v1/digital-twins` được
