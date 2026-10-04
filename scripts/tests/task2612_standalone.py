@@ -5,16 +5,89 @@ import hashlib
 import hmac
 import http.client
 import json
+import re
 import secrets
 import socket
 import ssl
 import subprocess
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from stage2_mosquitto_runtime import ENV, ROOT, run
 from task265b_lifecycle import IMAGE
 from task26_harness_helpers import require
+
+
+def readiness_status(port, tls, timeout):
+    """Status only; do not parse/log bodies or inherit credential call timeouts."""
+    deadline = time.monotonic() + timeout
+    connection = http.client.HTTPSConnection('localhost', port, context=tls, timeout=timeout)
+    try:
+        connection.connect()
+        connection.sock.settimeout(max(.001, deadline - time.monotonic()))
+        connection.request('GET', '/readyz')
+        connection.sock.settimeout(max(.001, deadline - time.monotonic()))
+        return connection.getresponse().status
+    finally:
+        connection.close()
+
+
+def wait_ready(probe, startup_timeout=40):
+    deadline = time.monotonic() + startup_timeout
+    last = 'not-probed'
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            status = probe(min(2, remaining))
+            last = f'http:{status}'
+            if status == 200:
+                return True, last
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            # Exception messages can contain URLs or response data.
+            last = 'network:' + type(error).__name__
+        time.sleep(min(.2, max(0, deadline - time.monotonic())))
+    return False, last
+
+
+def startup_diagnosis(backend, proxy, network, last, secrets_to_redact):
+    def collect(args):
+        try:
+            return subprocess.run(['docker', *args], env=ENV, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return subprocess.CompletedProcess(args, -1, ('diagnostic:' + type(error).__name__).encode())
+
+    # BusyBox wget from the already pinned broker fixture; no public backend port,
+    # credential env, volume, or response body. Docker execution itself is bounded.
+    direct = collect(['run', '--rm', '--name', backend + '-readiness', '--network', network,
+                      '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true',
+                      '--entrypoint', 'wget', IMAGE, '-S', '-O', '/dev/null', '-T', '2',
+                      'http://' + backend + ':8080/readyz'])
+    statuses = re.findall(rb'HTTP/\S+\s+(\d{3})', direct.stdout)
+    direct_status = 'http:' + statuses[-1].decode() if statuses else 'network-or-tool-error'
+    # Even a timed-out docker CLI can leave its container behind. Cleanup must
+    # succeed; the outer fixture also owns this name in its final cleanup.
+    cleanup = collect(['rm', '-f', backend + '-readiness'])
+    require(cleanup.returncode == 0, 'direct readiness probe cleanup failed')
+    sections = [f'standalone startup timeout: proxy={last}; direct={direct_status}']
+    for name in (backend, proxy):
+        state = collect(['inspect', '-f', '{{json .State}}', name])
+        # Whitelist state fields; never print inspect's Config/Env or raw errors.
+        try:
+            parsed = json.loads(state.stdout)
+            safe = {key: parsed.get(key) for key in ('Status', 'Running', 'ExitCode', 'OOMKilled')}
+        except (ValueError, AttributeError):
+            safe = {'diagnostic': 'state-unavailable'}
+        sections.append(name + ' state=' + json.dumps(safe))
+        logs = collect(['logs', '--tail', '80', name]).stdout.decode(errors='replace')
+        for value in sorted(filter(None, secrets_to_redact), key=len, reverse=True):
+            logs = logs.replace(value, '[REDACTED]')
+        logs = re.sub(r'(?i)(?:postgres(?:ql)?://|https?://)\S+|Bearer\s+\S+', '[REDACTED]', logs)
+        logs = re.sub(r'(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----',
+                      '[REDACTED]', logs)
+        logs = re.sub(r'(?i)((?:password|token|secret|dsn)\s*[=:]\s*)\S+', r'\1[REDACTED]', logs)
+        sections.append(name + ' logs (redacted, bounded tail):\n' + logs[:32768])
+    return '\n'.join(sections)
 
 
 def acceptance(directory, spike, database, backend, proxy, network, mounts, payload):
@@ -61,21 +134,15 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
                      '--mount', 'type=volume,src=' + mounts['/control'] + ',dst=/control',
                      '--mount', 'type=volume,src=' + mounts['/security'] + ',dst=/security,readonly']
         run(args + ['--entrypoint', '/server', IMAGE], capture=True)
-        deadline = time.monotonic() + 40
-        while time.monotonic() < deadline:
-            try:
-                status, _, _ = request('GET', '/readyz', '', '')
-                if status == 200:
-                    print('PASS standalone startup ' + ('enabled' if enabled else 'disabled without credential mounts/config'), flush=True)
-                    return
-            except (OSError, ValueError):
-                pass
-            time.sleep(.2)
-        logs = subprocess.run(['docker', 'logs', backend], env=ENV, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, check=True, timeout=10).stdout
-        for value in [jwt_secret, payload['AppDSN'], payload['AdminDSN'], *spike.passwords.values(), *observed_secrets]:
-            logs = logs.replace(value.encode(), b'[REDACTED]')
-        print(logs.decode(), flush=True)
+        ready, last = wait_ready(lambda timeout: readiness_status(port, tls, timeout))
+        if ready:
+            print('PASS standalone startup ' + ('enabled' if enabled else 'disabled without credential mounts/config'), flush=True)
+            return
+        print(startup_diagnosis(backend, proxy, network, last,
+                               [jwt_secret, payload['AppDSN'], payload['AdminDSN'],
+                                urlsplit(payload['AppDSN']).password, urlsplit(payload['AdminDSN']).password,
+                                *spike.passwords.values(), *observed_secrets,
+                                *[v for k, v in values.items() if 'PASSWORD' in k]]), flush=True)
         raise RuntimeError('standalone startup failed')
 
     def exists():

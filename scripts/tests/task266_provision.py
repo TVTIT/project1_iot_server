@@ -196,7 +196,7 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
         if coverage_out:
             shutil.copyfile(artifacts / 'service.cover', coverage_out)
     finally:
-        for owned in (test_container, database, proxy):
+        for owned in (test_container + '-readiness', test_container, database, proxy):
             subprocess.run(['docker', 'rm', '-f', '-v', owned], env=ENV,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
             check = subprocess.run(['docker', 'inspect', owned], env=ENV,

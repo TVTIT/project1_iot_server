@@ -252,7 +252,9 @@ jobs:
       - name: Prepare redacted coverage directory
         run: mkdir -p /tmp/opencode
       - name: Credential harness guards
-        run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_mqtt_credentials.py'
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_mqtt_credentials.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_task2612_standalone.py'
       - name: HTTPS Nginx, PostgreSQL, native DynSec and lifecycle fault acceptance
         env:
           TASK2612_COVERAGE_OUT: /tmp/opencode/task2612-http.cover

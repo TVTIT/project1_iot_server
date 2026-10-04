@@ -51,7 +51,7 @@ class CredentialHarnessTests(unittest.TestCase):
         self.assertNotIn('composeCredentials', source)
         self.assertNotIn('client-tests', source)
         self.assertNotIn('InsecureSkipVerify', source)
-        self.assertIn("request('GET', '/readyz'", source)
+        self.assertIn("connection.request('GET', '/readyz')", source)
         self.assertIn('stderr=subprocess.STDOUT', source)
         self.assertIn('standalone graceful exit status', source)
         self.assertIn('standalone database secret exclusion', source)
