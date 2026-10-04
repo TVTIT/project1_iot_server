@@ -14,21 +14,29 @@ import (
 
 // PostgresRepository persists safe business intent, observations and completion.
 type PostgresRepository struct {
-	pool      *pgxpool.Pool
-	timeout   time.Duration
-	scanLimit int
+	pool            *pgxpool.Pool
+	timeout         time.Duration
+	finalizeTimeout time.Duration
+	scanLimit       int
 }
 
 // NewPostgresRepository initializes a PostgresRepository. Optional scanLimit bounds reconciliation pages without changing existing callers.
 func NewPostgresRepository(pool *pgxpool.Pool, timeout time.Duration, scanLimit ...int) (*PostgresRepository, error) {
+	return NewPostgresRepositoryWithFinalizationTimeout(pool, timeout, timeout, scanLimit...)
+}
+
+// NewPostgresRepositoryWithFinalizationTimeout separates the completion transaction
+// budget from short queries/admission. Caller deadlines still bound both. Rollback
+// cleanup and ambiguity lookups retain the ordinary query budget.
+func NewPostgresRepositoryWithFinalizationTimeout(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*PostgresRepository, error) {
 	limit := maxRepositoryScanLimit
 	if len(scanLimit) == 1 {
 		limit = scanLimit[0]
 	}
-	if pool == nil || timeout <= 0 || len(scanLimit) > 1 || limit <= 0 || limit > maxRepositoryScanLimit {
+	if pool == nil || timeout <= 0 || finalizeTimeout <= 0 || len(scanLimit) > 1 || limit <= 0 || limit > maxRepositoryScanLimit {
 		return nil, &DomainError{Code: CodeInvalidRequest}
 	}
-	return &PostgresRepository{pool: pool, timeout: timeout, scanLimit: limit}, nil
+	return &PostgresRepository{pool: pool, timeout: timeout, finalizeTimeout: finalizeTimeout, scanLimit: limit}, nil
 }
 
 func safeReadError(err error) error {

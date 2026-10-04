@@ -86,6 +86,71 @@ WHERE c.gateway_id=$1 AND p.operation_id=c.last_operation_id AND e.status IN ('s
 		return OperationUpdate{OperationGuard{b.Metadata.GatewayID, b.Operation.OperationID, b.Operation.Status, b.Metadata.Status, b.Metadata.CredentialVersion}, c}
 	}
 	proof := VerificationEvidence{true, true, true}
+	t.Run("separate finalization budget and short admission reads", func(t *testing.T) {
+		shortDB, e := NewPostgresRepositoryWithFinalizationTimeout(app, 100*time.Millisecond, 2*time.Second)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, outcome := range []ExecutionOutcome{ExecutionVerifiedSuccess, ExecutionUnchangedFailure, ExecutionRecoveryRequired} {
+			g := newGateway()
+			_, b := begin(g, ActionProvision)
+			evidence := VerificationEvidence{}
+			if outcome == ExecutionVerifiedSuccess {
+				evidence = proof
+			}
+			u := update(b, outcome, evidence)
+			exec(`CREATE FUNCTION task2613_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.gateway_id=TG_ARGV[0] THEN PERFORM pg_sleep(0.3); END IF; RETURN NEW; END $$`)
+			exec(`CREATE TRIGGER task2613_delay BEFORE UPDATE ON gateway_mqtt_credential_events FOR EACH ROW EXECUTE FUNCTION task2613_delay('` + g + `')`)
+			m, err := shortDB.complete(ctx, u, outcome)
+			exec(`DROP TRIGGER task2613_delay ON gateway_mqtt_credential_events; DROP FUNCTION task2613_delay()`)
+			if err != nil || m.GatewayID != g {
+				t.Fatal("finalization incorrectly used short query budget", err)
+			}
+		}
+		g := newGateway()
+		_, b := begin(g, ActionProvision)
+		lock, e := admin.Begin(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer func() { _ = lock.Rollback(ctx) }()
+		if _, e = lock.Exec(ctx, `LOCK TABLE gateway_mqtt_credentials IN ACCESS EXCLUSIVE MODE`); e != nil {
+			t.Fatal(e)
+		}
+		started := time.Now()
+		_, e = shortDB.GetMetadata(ctx, g)
+		requireCode(t, e, CodeServiceUnavailable)
+		if time.Since(started) > time.Second {
+			t.Fatal("read used finalization budget")
+		}
+		started = time.Now()
+		_, e = shortDB.BeginOperation(ctx, BeginRequest{actor, uuid.New(), MutationInput{g, uuid.New(), ActionRotate}})
+		requireCode(t, e, CodeServiceUnavailable)
+		if time.Since(started) > time.Second {
+			t.Fatal("admission used finalization budget")
+		}
+		_ = lock.Rollback(ctx)
+		// A separate short finalization budget must interrupt a real delayed COMMIT.
+		shortFinalize, e := NewPostgresRepositoryWithFinalizationTimeout(app, 2*time.Second, 100*time.Millisecond)
+		if e != nil {
+			t.Fatal(e)
+		}
+		exec(`CREATE FUNCTION task2613_commit_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.gateway_id=TG_ARGV[0] THEN PERFORM pg_sleep(0.3); END IF; RETURN NEW; END $$`)
+		exec(`CREATE CONSTRAINT TRIGGER task2613_commit_delay AFTER UPDATE ON gateway_mqtt_credential_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION task2613_commit_delay('` + g + `')`)
+		m, e := shortFinalize.ConditionalFinalize(ctx, update(b, ExecutionVerifiedSuccess, proof))
+		var unknown *CommitOutcomeUnknown
+		if !errors.As(e, &unknown) || unknown.OperationID != b.Operation.OperationID || m.GatewayID != "" {
+			t.Fatal("expired commit must remain unknown and return no metadata", e)
+		}
+		exec(`DROP TRIGGER task2613_commit_delay ON gateway_mqtt_credential_events; DROP FUNCTION task2613_commit_delay()`)
+		o, e := r.ResolveCommitAmbiguity(ctx, b.Operation.OperationID)
+		if e != nil || (o.Status != OperationPending && o.Status != OperationSucceeded) {
+			t.Fatal("exact detached lookup unavailable", e)
+		}
+		if _, e = r.ConditionalFinalize(ctx, update(b, ExecutionVerifiedSuccess, proof)); e != nil {
+			t.Fatal("database-only completion retry failed", e)
+		}
+	})
 	success := func(b BeginResult) Metadata {
 		t.Helper()
 		m, e := r.ConditionalFinalize(ctx, update(b, ExecutionVerifiedSuccess, proof))

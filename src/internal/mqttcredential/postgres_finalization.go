@@ -77,7 +77,7 @@ func (r *PostgresRepository) complete(ctx context.Context, u OperationUpdate, ou
 	if gateway.ValidateGatewayID(g.GatewayID) != nil || g.ExpectedOperationID == uuid.Nil || g.ExpectedOperationStatus.Validate() != nil || g.ExpectedCredentialStatus.Validate() != nil || g.ExpectedCredentialVersion <= 0 || !safeCompletionCode(proposed.Operation.ErrorCode) {
 		return invalid()
 	}
-	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	ctx, cancel := context.WithTimeout(ctx, r.finalizeTimeout)
 	defer cancel()
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
