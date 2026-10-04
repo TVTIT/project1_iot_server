@@ -350,6 +350,9 @@ services:
       MQTT_WORKER_COUNT: ${MQTT_WORKER_COUNT:-4}
       MQTT_MAX_PAYLOAD_BYTES: ${MQTT_MAX_PAYLOAD_BYTES:-1048576}
       MQTT_CREDENTIAL_RUNTIME_ENABLED: ${MQTT_CREDENTIAL_RUNTIME_ENABLED:-true}
+      # Legacy broker cannot safely enable the DynSec API. Use the reviewed
+      # lifecycle composition template; never opt in on this ungated service.
+      MQTT_CREDENTIAL_API_ENABLED: "false"
       MQTT_AUTH_DIR: /mosquitto/auth
       MQTT_RELOAD_SOCKET: /mosquitto/control/reload.sock
       MOSQUITTO_PASSWD_PATH: /usr/bin/mosquitto_passwd

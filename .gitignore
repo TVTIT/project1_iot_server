@@ -76,3 +76,7 @@ build/
 # deliberately preserved; Compose uses a named volume, not that file.
 /config/mosquitto/auth-runtime/
 /config/mosquitto/control-runtime/
+/config/mosquitto/lifecycle.conf
+/config/mosquitto/lifecycle-startup.json
+/config/mosquitto/dynsec-runtime/
+/config/mosquitto/controller-runtime/

@@ -17,6 +17,7 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
+	Credential             CredentialConfig
 	MQTTCredentialRuntime  mqttcredential.StartupConfig
 	ServerPort             int
 	ServerEnv              string
@@ -147,6 +148,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 
 	if cfg.MQTTCredentialRuntime, err = mqttcredential.LoadConfig(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.Credential, err = loadCredential(lookup, cfg); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

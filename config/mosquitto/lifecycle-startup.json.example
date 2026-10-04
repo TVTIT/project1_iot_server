@@ -1,0 +1,20 @@
+{
+  "Lifecycle": {
+    "Executable": "/usr/sbin/mosquitto",
+    "Args": ["-c", "/mosquitto/config/lifecycle.conf"],
+    "ChildEnv": ["PATH=/usr/sbin:/usr/bin:/bin"],
+    "PublicAddresses": ["0.0.0.0:8883"],
+    "BrokerAddress": "127.0.0.1:18884",
+    "MaxConnections": 64,
+    "DialTimeout": 2000000000,
+    "StopTimeout": 5000000000
+  },
+  "Controller": {
+    "ControlDir": "/mosquitto/controller",
+    "UID": 1883,
+    "Timeout": 5000000000,
+    "MaxFrameBytes": 4096,
+    "MaxInflight": 8,
+    "ManagementAddress": "127.0.0.1:18884"
+  }
+}
