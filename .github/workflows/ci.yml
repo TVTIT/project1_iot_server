@@ -237,6 +237,48 @@ jobs:
         working-directory: .
         run: sh scripts/test-stage2-admin.sh
 
+  mosquitto-credential-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Prepare redacted coverage directory
+        run: mkdir -p /tmp/opencode
+      - name: Credential harness guards
+        run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_mqtt_credentials.py'
+      - name: HTTPS Nginx, PostgreSQL, native DynSec and lifecycle fault acceptance
+        env:
+          TASK2612_COVERAGE_OUT: /tmp/opencode/task2612-http.cover
+          TASK266_COVERAGE_OUT: /tmp/opencode/task2612-provision.cover
+          TASK267_COVERAGE_OUT: /tmp/opencode/task2612-rotate.cover
+          TASK268_COVERAGE_OUT: /tmp/opencode/task2612-revoke.cover
+          TASK269_COVERAGE_OUT: /tmp/opencode/task2612-startup.cover
+          TASK2611_COVERAGE_OUT: /tmp/opencode/task2612-composition.cover
+        run: sh scripts/test-stage2-mqtt-credentials.sh
+      - name: Credential source lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: ./src
+          args: --timeout=5m
+      - name: Build backend and controller targets
+        run: |
+          docker build --target backend -t task2612-backend:ci src
+          docker build --target credential-controller -t task2612-controller:ci src
+      - name: Upload coverage only (never fixture directories or secret responses)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosquitto-credential-coverage
+          path: /tmp/opencode/task2612-*.cover
+          if-no-files-found: error
+
   mosquitto-runtime-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20

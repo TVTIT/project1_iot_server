@@ -420,7 +420,8 @@ class WorkflowGuards(unittest.TestCase):
         self.assertEqual(set(jobs), {'lint-and-test', 'cross-compile', 'migration-check',
                                    'docker-build', 'authorization-integration',
                                    'provisioning-integration', 'auth-integration',
-                                   'mosquitto-runtime-integration'})
+                                   'mosquitto-runtime-integration',
+                                   'mosquitto-credential-integration'})
         job = workflow.split('  mosquitto-runtime-integration:', 1)[1]
         self.assertIn('sh scripts/test-stage2-mosquitto-runtime.sh', job)
         self.assertIn("-p 'test_stage2_mosquitto_runtime.py'", job)
