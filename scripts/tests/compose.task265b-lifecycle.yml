@@ -1,0 +1,34 @@
+# Isolated fixture only. No production network, mounts, .env or runtime changes.
+services:
+  broker:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    user: "1883:1883"
+    entrypoint: ["/bin/sh", "-ec", "exec /controller < /fixture/startup.json"]
+    ports: ["127.0.0.1::8883", "127.0.0.1::8884"]
+    volumes:
+      - ${DYNSEC_FIXTURE:?isolated fixture}/broker:/fixture:ro
+      - ${DYNSEC_FIXTURE:?isolated fixture}/controller:/controller:ro
+      - security:/security
+      - control:/control
+    environment:
+      PGPASSWORD: forbidden-child-fixture-marker
+      JWT_SECRET: forbidden-child-fixture-marker
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: "no"
+  setup:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    entrypoint: ["/bin/sh"]
+    network_mode: none
+    volumes:
+      - security:/security
+      - control:/control
+      - ${DYNSEC_FIXTURE:?isolated fixture}/broker:/fixture
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+volumes:
+  security:
+  control:
