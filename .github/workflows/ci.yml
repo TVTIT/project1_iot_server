@@ -86,7 +86,7 @@ jobs:
           for i in $(seq 1 90); do
             if docker exec migration-check \
               psql -U ci_admin -d ci_custom_db -Atc \
-              "SELECT count(*) FROM schema_migrations WHERE version = 10 AND name = 'stage2_auth_and_provisioning';" \
+              "SELECT count(*) FROM schema_migrations WHERE version = 16 AND name = 'mqtt_event_authority_guard';" \
               2>/dev/null | grep -qx 1; then
               migration_ready=true
               break
@@ -99,7 +99,7 @@ jobs:
             sleep 1
           done
           if [ "$migration_ready" != true ]; then
-            echo "Timed out waiting for migration version 10 to commit."
+            echo "Timed out waiting for migration version 16 to commit."
             docker logs migration-check
             exit 1
           fi
@@ -109,6 +109,18 @@ jobs:
             < scripts/sql/verify-migration-000009.sql
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
             < scripts/sql/verify-migration-000010.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000011.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000012.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000013.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000014.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000015.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000016.sql
           docker exec migration-check psql -U ci_admin -d ci_custom_db -c \
             "CREATE TABLE auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}');"
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
