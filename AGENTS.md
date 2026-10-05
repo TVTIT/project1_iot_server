@@ -83,6 +83,8 @@ The following features are deferred unless the user explicitly restores them:
 - Large-video upload, resumable upload, and transcoding.
 - A custom administration application.
 - Advanced observability, orchestration, or multi-node high availability.
+- Public self-service user registration and automated Gateway self-claiming
+  or enrollment.
 
 Do not let deferred features complicate the MVP interfaces or schedule.
 
@@ -398,8 +400,11 @@ log plaintext credentials or tokens.
 ### 6.4 Expected relational entities
 
 - `profiles`
+- `platform_admins`
 - `gateways`
 - `user_gateways`
+- `gateway_mqtt_credentials`
+- `gateway_mqtt_credential_events`
 - `sensors`
 - `telemetry`
 - `processed_messages`
@@ -424,6 +429,97 @@ auth.users / profiles
 
 Use parameterized SQL, least-privilege database roles, and transactions for
 related writes.
+
+### 6.5 Centralized provisioning and authorization policy
+
+To protect the system and minimize initial complexity, the project selects a
+centralized administrative model for both human users and Gateways:
+
+- **No public self-signup:** Human user accounts are provisioned exclusively by
+  platform administrators (privileged infrastructure operators, distinct from the
+  per-Gateway `operator` membership role) using supported Supabase Auth administrative
+  tooling (such as Supabase Studio or protected tools calling the Admin API).
+  Do not build a custom parallel identity database or allow anonymous users
+  to register.
+- **Implementation status distinction:** Treating self-signup as disabled is a
+  product and architecture requirement, not proof that the current local or
+  staged environment is fully locked down. The prototype Supabase configuration
+  may still allow open registration until explicitly reconfigured and verified
+  on the direct Supabase Auth route. Hiding signup buttons in the Flutter UI is
+  purely cosmetic and does not constitute security enforcement.
+- **JWT roles and service secrets:** Authenticated human clients hold JWTs with
+  the standard Supabase role `authenticated`. Never grant or expose the
+  Supabase `service_role` key to Flutter clients, web apps, or Gateways.
+- **Global administrative authority:** Platform-level admin status is governed
+  authoritatively by the `platform_admins` table in PostgreSQL (`user_id`
+  referencing `profiles.id`). The Go backend must verify platform admin rights
+  via explicit database queries. Platform admin status must not silently bypass
+  per-resource checks or Gateway access rules unless an explicit policy is
+  documented.
+- **Centralized Gateway provisioning:** Users cannot create or claim a Gateway
+  merely by presenting a `gateway_id`, nor does creating an account grant
+  access to any Gateway. Gateways, their initial MQTT credentials, and HTTP
+  credentials must be provisioned, rotated, and revoked by platform
+  administrators through authorized backend administrative operations.
+- **Gateway membership and roles:** Platform administrators assign user
+  memberships to Gateways in `user_gateways`. The schema defines allowed roles
+  as `owner`, `operator`, and `viewer` (`CHECK (role IN ('owner', 'operator', 'viewer'))`).
+  Preserve this schema constraint and do not remove or rename `operator`.
+- **MVP permission baseline:**
+  - `owner`: Has full read access to Gateway telemetry, history, media, Digital
+    Twin state, and command status for their assigned Gateway. Manages sensor
+    metadata and durable device configuration (`desired_state`) via authorized
+    Go APIs. May also issue the same server-allowlisted safe operational commands
+    as `operator`, subject to ownership checks; owner role does not imply arbitrary,
+    unvalidated, or unsafe command execution.
+  - `operator`: Has read access to Gateway telemetry, history, media, Digital
+    Twin current state, and command status for their assigned Gateway where
+    membership authorizes. In the target operational policy, `operator` may issue
+    only explicitly server-allowlisted safe operational (one-shot) commands
+    validated against strict server schemas (such as `capture-image`, as an
+    illustrative action only if implemented, authorized, and tested). An `operator`
+    has no blanket action permissions, cannot execute arbitrary commands, shell
+    operations, or unsafe actions (such as default `reboot`), and cannot write
+    durable `desired_state`/device configuration, add/modify/delete sensor metadata,
+    provision/claim Gateways, manage broker/HTTP credentials, create/invite user
+    accounts, or modify memberships/ownership.
+  - `viewer`: Strictly read-only access to telemetry, media, and Digital
+    Twin current state and command status for their assigned Gateway; all write,
+    sensor configuration, desired-state, command, and administrative requests are
+    rejected.
+  - For the smallest MVP, only platform administrators grant, revoke, or
+    change `user_gateways` memberships. An `owner` cannot invite new accounts,
+    provision broker credentials, assign other users, transfer ownership, or
+    exercise global privileges merely because they own a Gateway.
+- **Policy vs. implementation status (Stage 2 boundary):** Distinguish target
+  permission policy from currently deployed permissions. Until the Digital Twin
+  command execution slice is fully implemented with per-action role checks,
+  schema validation, and authorization tests, all command and write endpoints
+  fail closed (treating `operator` as read-only). Documenting this target policy
+  does not extend Stage 2 API/control scope or imply that command endpoints are
+  already implemented or active.
+- **Per-Gateway permission matrix:**
+
+| Action / Resource | Platform Admin | Gateway Owner | Gateway Operator | Gateway Viewer | Non-member |
+|---|---|---|---|---|---|
+| Read telemetry, history, media, Digital Twin state, command status | Explicit / audited | Allowed (assigned GW) | Allowed (assigned GW) | Allowed (assigned GW) | Denied |
+| Manage sensor metadata & durable configuration (`desired_state`) | Yes (admin API) | Allowed (assigned GW) | Denied | Denied | Denied |
+| Allowlisted safe operational commands (e.g. `capture-image`) | Yes (admin API) | Allowed (assigned GW, allowlisted only) | Target policy: allowed (assigned GW, allowlisted only) | Denied | Denied |
+| Unsafe / arbitrary commands (raw payloads, shell, unapproved reboot) | Denied (server schema) | Denied | Denied | Denied | Denied |
+| User provisioning & `user_gateways` membership management | Allowed (platform tooling) | Denied | Denied | Denied | Denied |
+| Gateway provisioning, MQTT/HTTP credential management | Allowed (platform tooling) | Denied | Denied | Denied | Denied |
+- **Sensor authorization hierarchy:** Sensors inherit permissions strictly from
+  their owning Gateway (`gateway_id`). Users never receive independent global
+  grants for individual sensors.
+- **No telemetry auto-provisioning:** Reject telemetry and entities for unknown
+  sensors by default unless a pending discovery mode is explicitly enabled.
+  Creating new sensors requires an authorized request by a Gateway `owner` or
+  platform admin through the Go API, validated against Gateway ownership.
+- **No custom admin app required:** Day-to-day administrative operations use
+  Supabase Studio and protected operator tools alongside planned Go REST
+  management endpoints. Do not assume Go provisioning and management endpoints
+  are already complete; verify their implementation status before depending on
+  them.
 
 ## 7. MQTT security baseline
 
@@ -454,10 +550,11 @@ Gateway publish/subscribe permissions required by its ingress and command
 roles. A leaked credential must be revocable for one Gateway without rotating
 every Gateway.
 
-Provision new credentials through an authenticated admin operation. Generate
-secrets server-side using a cryptographically secure random generator and
-transfer the plaintext secret once through USB, SSH on a trusted local network,
-or an explicitly designed one-time enrollment flow.
+Provision new credentials through an authenticated backend admin operation
+restricted to platform administrators (see section 6.5). Generate secrets
+server-side using a cryptographically secure random generator and transfer the
+plaintext secret once through USB, SSH on a trusted local network, or an
+explicitly designed one-time enrollment flow.
 
 ## 8. TLS and CA lifecycle
 
@@ -983,7 +1080,25 @@ At minimum, test:
 - Per-Gateway MQTT ACL isolation and credential revocation.
 - Invalid/expired TLS certificates, hostname mismatch, and incorrect time.
 - Supabase login/refresh and Go JWT validation.
+- Direct public signup calls to Supabase Auth / API Gateway are rejected when
+  self-service registration is disabled.
+- Non-admin user cannot provision Gateways, rotate/revoke MQTT credentials, or
+  grant/modify `user_gateways` memberships.
+- Non-member user cannot claim or access a Gateway merely by supplying its
+  `gateway_id`.
 - User A cannot access User B's Gateway history, WebSocket stream, or media.
+- Gateway `owner` can manage only sensors belonging to their assigned Gateway;
+  sensor access to another Gateway is denied.
+- Gateway `viewer` write, sensor configuration, desired-state update, and
+  device control requests are rejected.
+- Once the command slice is implemented, Gateway `operator` is permitted to issue
+  only explicitly server-allowlisted safe operational commands (e.g. `capture-image`)
+  on their assigned Gateway; cross-Gateway commands, arbitrary actions, and unsafe
+  commands are denied.
+- Gateway `operator` attempts to write durable `desired_state`, modify sensor
+  metadata, grant/modify memberships, or manage Gateway credentials are rejected.
+- Telemetry from unknown sensors or Gateways is rejected without creating
+  unauthorized database entities.
 - WebSocket authentication, reconnect, disconnect cleanup, and slow-client
   behavior.
 - Signed upload/read URL expiry, object-path restriction, size/type rejection,
@@ -1068,6 +1183,21 @@ and command status query once device control is presented as an MVP feature.
 - Route Supabase Auth and Storage through the Supabase API Gateway. Nginx is the
   external reverse proxy, not a substitute for that internal gateway.
 - Do not give a Gateway a Supabase human account or `service_role` key.
+- Enforce the centralized management model: do not implement public self-signup
+  or Gateway self-claiming. Disabling public signup must be enforced at the
+  Supabase Auth / Gateway boundary, not merely by hiding UI buttons.
+- Check `platform_admins` in PostgreSQL for global administrative operations;
+  never grant or rely on JWT `service_role` or assume platform admins bypass
+  per-resource checks without documented policy.
+- Respect the `user_gateways` role hierarchy (`owner`, `operator`, `viewer` per
+  schema): keep `viewer` strictly read-only; enforce fail-closed authorization
+  for `operator` until the command slice is implemented with explicit server-allowlisted
+  safe actions (denying durable desired-state and sensor writes); and restrict membership,
+  Gateway provisioning, and credential management to platform administrators.
+- Do not automatically provision sensors or entities on incoming telemetry;
+  require explicit authorized creation paths under the parent Gateway.
+- Do not assume Go administrative or provisioning endpoints are already
+  complete; inspect the codebase, migrations, and tests first.
 - Treat `.env` as the default source for environment-dependent values. When a
   service requires a native config file, keep the real file ignored and commit
   only a sanitized `.example` or template. Never introduce a real domain,

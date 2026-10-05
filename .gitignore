@@ -55,6 +55,8 @@ coverage.html
 # Temporary files
 tmp/
 temp/
+__pycache__/
+*.py[cod]
 
 # Supabase
 supabase/.temp
@@ -70,3 +72,11 @@ build/
 
 # Keep example env
 !.env.example
+# Optional local runtime directories only. The tracked prototype passwd is
+# deliberately preserved; Compose uses a named volume, not that file.
+/config/mosquitto/auth-runtime/
+/config/mosquitto/control-runtime/
+/config/mosquitto/lifecycle.conf
+/config/mosquitto/lifecycle-startup.json
+/config/mosquitto/dynsec-runtime/
+/config/mosquitto/controller-runtime/

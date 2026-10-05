@@ -1,0 +1,56 @@
+# SPIKE ONLY. PID1 wrapper owns ingress and child. No autonomous broker restart.
+services:
+  db:
+    image: postgres@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/fixture-password
+    volumes:
+      - ${DYNSEC_FIXTURE:?required}/db-password:/run/fixture-password:ro
+      - database:/var/lib/postgresql/data
+    networks: [management]
+    restart: "no"
+  broker:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    user: "1883:1883"
+    entrypoint: ["/gate"]
+    environment:
+      GATE_FAULT: ${GATE_FAULT:-}
+    ports: ["127.0.0.1:${GATE_PORT:?required}:8883", "127.0.0.1:${TUNNEL_PORT:?required}:8884"]
+    networks: [management]
+    volumes:
+      - ${DYNSEC_FIXTURE:?required}/broker:/fixture:ro
+      - ${DYNSEC_FIXTURE:?required}/gate:/gate:ro
+      - ${DYNSEC_FIXTURE:?required}/snapshot:/snapshot:ro
+      - security:/security
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    restart: "no"
+  setup:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    entrypoint: ["/bin/sh"]
+    network_mode: none
+    volumes:
+      - security:/security
+      - ${DYNSEC_FIXTURE:?required}/broker:/fixture
+      - ${DYNSEC_FIXTURE:?required}/snapshot:/snapshot:ro
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+  ungated:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    user: "1883:1883"
+    entrypoint: ["mosquitto", "-c", "/fixture/ungated.conf"]
+    ports: ["127.0.0.1::8883"]
+    networks: [management]
+    volumes:
+      - ${DYNSEC_FIXTURE:?required}/broker:/fixture:ro
+      - security:/security
+    restart: "no"
+networks:
+  management: {}
+volumes:
+  database:
+  security:

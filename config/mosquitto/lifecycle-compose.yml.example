@@ -1,0 +1,59 @@
+# NOT VERIFIED deployment template, NOT an override for the legacy Compose.
+# Existing volumes are not initialized/imported by this file. Prepare protected
+# native snapshot (1883:1883, directory 0700/file 0600), controller directory
+# (1883:1883, 0700), and ignored runtime config from root .env explicitly.
+# Controller reads sanitized startup JSON via stdin; no secret belongs there.
+# Bring only THIS broker into the selected topology, never alongside a legacy
+# broker/reloader. Populate backend environment through protected Compose env
+# keys as in root Compose; manager password is NOT a Gateway one-time secret.
+services:
+  mosquitto:
+    build:
+      context: ../../src
+      target: credential-controller
+    user: "1883:1883"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-ec", "exec /app/mosquitto-credential-controller < /mosquitto/config/lifecycle-startup.json"]
+    ports: ["${MQTT_TLS_PORT:-8883}:8883"]
+    volumes:
+      - ${MQTT_LIFECYCLE_STARTUP_SOURCE:?required}:/mosquitto/config/lifecycle-startup.json:ro
+      - ${MQTT_LIFECYCLE_CONFIG_SOURCE:?required}:/mosquitto/config/lifecycle.conf:ro
+      - ${MQTT_BROKER_CERT_SOURCE:?required}:/mosquitto/config/certs:ro
+      - ${MQTT_DYNSEC_DIRECTORY_SOURCE:?required}:/mosquitto/dynsec
+      - ${MQTT_CONTROLLER_DIRECTORY_SOURCE:?required}:/mosquitto/controller
+      - broker_data:/mosquitto/data
+  backend:
+    build: {context: ../../src, target: backend}
+    user: "1883:1883"
+    environment:
+      MQTT_CREDENTIAL_API_ENABLED: "false" # retain until isolated qualification
+      MQTT_CREDENTIAL_RUNTIME_ENABLED: "false"
+      INGRESS_GATE_ENABLED: "true"
+      MQTT_CONTROLLER_DIR: /mosquitto/controller
+      MQTT_DYNSEC_JSON_PATH: /mosquitto/dynsec/dynamic-security.json
+      MQTT_INTERNAL_MANAGEMENT_URL: ${MQTT_INTERNAL_MANAGEMENT_URL:?required}
+      MQTT_DYNSEC_MANAGER_USERNAME: ${MQTT_DYNSEC_MANAGER_USERNAME:?required}
+      MQTT_DYNSEC_MANAGER_PASSWORD: ${MQTT_DYNSEC_MANAGER_PASSWORD:?required}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?required}
+      MQTT_TLS_CA_FILE: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}
+      DATABASE_URL: ${DATABASE_URL:?required}
+      SUPABASE_JWT_SECRET: ${JWT_SECRET:?required}
+      SUPABASE_JWT_ISSUER: ${GOTRUE_JWT_ISSUER:?required}
+      SUPABASE_JWT_AUDIENCE: authenticated
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-55s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-55s}
+    volumes:
+      - ${MQTT_CONTROLLER_DIRECTORY_SOURCE:?required}:/mosquitto/controller:ro
+      - ${MQTT_DYNSEC_DIRECTORY_SOURCE:?required}:/mosquitto/dynsec:ro
+      - type: bind
+        source: ${MQTT_TLS_CA_SOURCE:?required}
+        target: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}
+        read_only: true
+        bind: {create_host_path: false}
+# Rathole local_addr remains mosquitto:8883 on this same private network.
+# No host management :18884 mapping and no independent plaintext listener.
+volumes:
+  broker_data:

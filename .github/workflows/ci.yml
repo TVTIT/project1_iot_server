@@ -14,6 +14,50 @@ defaults:
     working-directory: ./src
 
 jobs:
+  stage2-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    env:
+      STAGE2_CI_DIR: /tmp/opencode/stage2-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Verify runner prerequisites
+        run: |
+          mkdir -p /tmp/opencode
+          python3 --version
+          openssl version
+          docker version
+          docker compose version
+          go version
+      - name: CI and response-loss regression guards
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_ci.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_ci_functional.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_response_loss.py'
+      - name: Two clean complete source-built unified executions
+        run: |
+          # Each supervisor creates a random protected fixture-only password.
+          # The harness builds server/controller from this checkout, never deployment binaries.
+          STAGE2_CI_DIR="$STAGE2_CI_DIR/run-1" python3 scripts/tests/stage2_ci.py
+          STAGE2_CI_DIR="$STAGE2_CI_DIR/run-2" python3 scripts/tests/stage2_ci.py
+      - name: Verify owned cleanup after failure or cancellation
+        if: always()
+        run: python3 scripts/tests/stage2_ci.py --cleanup
+      - name: Upload allowlisted scanned execution reports only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-e2e-safe-reports
+          path: /tmp/opencode/stage2-ci-${{ github.run_id }}-${{ github.run_attempt }}/run-*/safe/report.json
+          if-no-files-found: error
+
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +98,13 @@ jobs:
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/server
       - name: Build gateway (linux/armv7 for AM5728)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -o /dev/null ./cmd/gateway
+      - name: Build runtime commands (linux/amd64 and linux/armv7)
+        run: |
+          for arch in amd64 arm; do
+            for command in mosquitto-auth-init mosquitto-reloader; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOARM=7 go build -o /dev/null "./cmd/$command"
+            done
+          done
 
   migration-check:
     runs-on: ubuntu-latest
@@ -70,15 +121,16 @@ jobs:
             -e POSTGRES_USER=ci_admin \
             -e POSTGRES_PASSWORD=test_admin_password \
             -e POSTGRES_DB=ci_custom_db \
-            -e AUTH_DB_PASSWORD=test_auth_password \
-            -e STORAGE_DB_PASSWORD=test_storage_password \
+            -e AUTH_DB_PASSWORD=test_auth_password_1234 \
+            -e STORAGE_DB_PASSWORD=test_storage_password_1234 \
+            -e BACKEND_DB_PASSWORD=test_backend_password_1234 \
             -v "$PWD/migrations:/docker-entrypoint-initdb.d:ro" \
             -d timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
           migration_ready=false
           for i in $(seq 1 90); do
             if docker exec migration-check \
               psql -U ci_admin -d ci_custom_db -Atc \
-              "SELECT count(*) FROM schema_migrations WHERE version = 9 AND name = 'migration_tracking_and_sensor_urn';" \
+              "SELECT count(*) FROM schema_migrations WHERE version = 16 AND name = 'mqtt_event_authority_guard';" \
               2>/dev/null | grep -qx 1; then
               migration_ready=true
               break
@@ -91,7 +143,7 @@ jobs:
             sleep 1
           done
           if [ "$migration_ready" != true ]; then
-            echo "Timed out waiting for migration version 9 to commit."
+            echo "Timed out waiting for migration version 16 to commit."
             docker logs migration-check
             exit 1
           fi
@@ -99,6 +151,20 @@ jobs:
             < scripts/sql/verify-schema-hardening.sql
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
             < scripts/sql/verify-migration-000009.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
+            < scripts/sql/verify-migration-000010.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000011.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000012.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000013.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000014.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000015.sql
+          docker exec -i migration-check psql -U ci_admin -d ci_custom_db -v ON_ERROR_STOP=1 \
+            < scripts/sql/verify-migration-000016.sql
           docker exec migration-check psql -U ci_admin -d ci_custom_db -c \
             "CREATE TABLE auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}');"
           docker exec -i migration-check psql -U ci_admin -d ci_custom_db \
@@ -118,20 +184,23 @@ jobs:
             "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey';" \
             | grep -qx 1
           docker run --rm --network container:migration-check \
-            -e PGPASSWORD=test_auth_password \
+            -e PGPASSWORD=test_auth_password_1234 \
             timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a \
             psql -h 127.0.0.1 -U supabase_auth_admin -d ci_custom_db -Atc "SELECT current_user" \
             | grep -qx supabase_auth_admin
           docker run --rm --network container:migration-check \
-            -e PGPASSWORD=test_storage_password \
+            -e PGPASSWORD=test_storage_password_1234 \
             timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a \
             psql -h 127.0.0.1 -U supabase_storage_admin -d ci_custom_db -Atc "SELECT current_user" \
             | grep -qx supabase_storage_admin
           cleanup
           trap - EXIT
+      - name: Verify Stage 2 migration upgrades
+        run: sh scripts/test-stage2-migrations.sh
 
   docker-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
@@ -141,93 +210,143 @@ jobs:
         with:
           context: ./src
           file: ./src/Dockerfile
+          target: backend
           push: false
           load: true
           tags: iot-backend:ci
+      - name: Build Docker image (auth initializer)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          target: auth-init
+          push: false
+      - name: Build Docker image (reloader)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          target: reloader
+          push: false
       - name: Smoke test container
+        working-directory: .
+        env:
+          STAGE2_BACKEND_IMAGE: iot-backend:ci
+        run: sh scripts/test-backend-smoke.sh
+
+  authorization-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: PostgreSQL membership-scoped repository tests
+        working-directory: .
+        env:
+          AUTHORIZATION_TEST_COVERAGE_FILE: ${{ runner.temp }}/authorization-coverage.out
+        run: sh scripts/test-stage2-authorization.sh
+
+  provisioning-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Atomic Gateway/Sensor provisioning, HTTP and failure database tests
+        working-directory: .
+        run: sh scripts/test-stage2-provisioning.sh
+
+  auth-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Auth harness regression tests
+        working-directory: .
+        run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_auth.py'
+      - name: Centralized Auth, provisioning and membership through Nginx/Envoy
+        working-directory: .
+        run: sh scripts/test-stage2-auth.sh
+      - name: Admin checker database regressions
+        working-directory: .
+        run: sh scripts/test-stage2-admin.sh
+
+  mosquitto-credential-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Prepare redacted coverage directory
+        run: mkdir -p /tmp/opencode
+      - name: Credential harness guards
         run: |
-          cleanup() {
-            docker rm -f test-backend smoke-postgres >/dev/null 2>&1 || true
-            docker network rm backend-smoke >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          docker network create backend-smoke
-          docker run -d --name smoke-postgres --network backend-smoke \
-            -e POSTGRES_PASSWORD=test_password \
-            -e POSTGRES_DB=iot_platform \
-            timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_mqtt_credentials.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_task2612_standalone.py'
+      - name: HTTPS Nginx, PostgreSQL, native DynSec and lifecycle fault acceptance
+        env:
+          TASK2612_COVERAGE_OUT: /tmp/opencode/task2612-http.cover
+          TASK266_COVERAGE_OUT: /tmp/opencode/task2612-provision.cover
+          TASK267_COVERAGE_OUT: /tmp/opencode/task2612-rotate.cover
+          TASK268_COVERAGE_OUT: /tmp/opencode/task2612-revoke.cover
+          TASK269_COVERAGE_OUT: /tmp/opencode/task2612-startup.cover
+          TASK2611_COVERAGE_OUT: /tmp/opencode/task2612-composition.cover
+        run: sh scripts/test-stage2-mqtt-credentials.sh
+      - name: Credential source lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: ./src
+          args: --timeout=5m
+      - name: Build backend and controller targets
+        run: |
+          docker build --target backend -t task2612-backend:ci src
+          docker build --target credential-controller -t task2612-controller:ci src
+      - name: Upload coverage only (never fixture directories or secret responses)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosquitto-credential-coverage
+          path: /tmp/opencode/task2612-*.cover
+          if-no-files-found: error
 
-          postgres_initialized=false
-          for i in $(seq 1 90); do
-            if docker logs smoke-postgres 2>&1 \
-              | grep -F "PostgreSQL init process complete; ready for start up" >/dev/null; then
-              postgres_initialized=true
-              break
-            fi
-            if ! docker inspect -f '{{.State.Running}}' smoke-postgres | grep -qx true; then
-              echo "PostgreSQL container stopped during initialization."
-              docker logs smoke-postgres
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ "$postgres_initialized" != true ]; then
-            echo "Timed out waiting for PostgreSQL initialization."
-            docker logs smoke-postgres
-            exit 1
-          fi
-
-          postgres_ready=false
-          for i in $(seq 1 30); do
-            if docker exec smoke-postgres \
-              pg_isready -U postgres -d iot_platform >/dev/null 2>&1; then
-              postgres_ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [ "$postgres_ready" != true ]; then
-            echo "PostgreSQL did not become ready after initialization."
-            docker logs smoke-postgres
-            exit 1
-          fi
-
-          docker run -d --name test-backend --network backend-smoke -p 8080:8080 \
-            -e DATABASE_URL=postgres://postgres:test_password@smoke-postgres:5432/iot_platform?sslmode=disable \
-            iot-backend:ci
-
-          backend_ready=false
-          for i in $(seq 1 30); do
-            if curl --fail --silent --connect-timeout 1 --max-time 2 \
-              http://127.0.0.1:8080/readyz >/dev/null; then
-              backend_ready=true
-              break
-            fi
-            if ! docker inspect -f '{{.State.Running}}' test-backend | grep -qx true; then
-              echo "Backend container stopped before becoming ready."
-              docker logs test-backend
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ "$backend_ready" != true ]; then
-            echo "Timed out waiting for backend readiness."
-            docker logs test-backend
-            docker logs smoke-postgres
-            exit 1
-          fi
-
-          if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
-            http://127.0.0.1:8080/readyz; then
-            docker logs test-backend
-            docker logs smoke-postgres
-            exit 1
-          fi
-          if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
-            http://127.0.0.1:8080/healthz; then
-            docker logs test-backend
-            docker logs smoke-postgres
-            exit 1
-          fi
-          cleanup
-          trap - EXIT
+  mosquitto-runtime-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Prepare isolated harness artifact directory
+        run: mkdir -p /tmp/opencode
+      - name: Runtime harness regression tests (13 contracts plus workflow guard)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_mosquitto_runtime.py'
+      - name: Native Go adapter, TLS, ACL, initializer, reloader and fault regressions
+        run: sh scripts/test-stage2-mosquitto-runtime.sh
+      - name: Upload actual adapter integration coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosquitto-runtime-coverage
+          path: /tmp/opencode/mqtt_poc_*-adapter-*.cover
+          if-no-files-found: error

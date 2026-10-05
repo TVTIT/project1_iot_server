@@ -2,6 +2,33 @@
 
 Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biến thời gian thực từ các Gateway không đồng nhất (heterogeneous Gateways: ESP32, Luckfox Pico Plus, TI AM5728), lưu trữ chuỗi thời gian (time-series) trên TimescaleDB, hỗ trợ truy vấn lịch sử, streaming dữ liệu thời gian thực qua WebSocket, xác thực và phân quyền người dùng thông qua Supabase Auth/RLS, quản lý tải lên media (hình ảnh) qua private storage, và tích hợp phân hệ **Digital Twin** (quản lý thực thể theo chuẩn NGSI-LD, đồng bộ trạng thái `reported_state` / `desired_state`, điều khiển Gateway qua MQTT Transactional Outbox và lưu trữ lịch sử thuộc tính biến thiên theo thời gian).
 
+Đây là kiến trúc/mục tiêu MVP, không phải toàn bộ tính năng đã hoàn thành:
+- **Trạng thái phát triển hiện tại (Stage 2)**:
+  - **Task 2.2**: Đã triển khai xác thực JWT qua Supabase Auth và phân quyền platform admin trên PostgreSQL (`platform_admins`).
+  - **Task 2.3**: Đã triển khai API đọc danh sách Gateway (`/v1/gateways`) và danh sách Sensor (`/v1/gateways/{gateway_id}/sensors`) theo quan hệ thành viên (`user_gateways`).
+  - **Task 2.4**: Đã triển khai hai Admin PUT provision Gateway/Sensor và đồ thị Digital Twin (`twin_entities`, `twin_relationships`, `twin_states`) trong cùng transaction atomically.
+  - **Task 2.5 (Static Legacy Baseline)**: Đã hoàn thành hạ tầng runtime Mosquitto tĩnh (quản lý file mật khẩu `password_file` trong named volume `mosquitto_auth`, atomic replace có lock/fsync, reload qua Unix domain socket sidecar không dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS).
+  - **Task 2.6 (Dynamic Security Lifecycle)**: Đã hoàn thành triển khai 4 endpoint Admin MQTT Credential (`/v1/admin/gateways/{gateway_id}/mqtt-credential*`: GET metadata, POST provision, POST rotate, DELETE revoke), Mosquitto Dynamic Security (DynSec) adapter, hàng rào Ingress Gate fail-closed (khởi động `CLOSED`, chỉ `OPEN` sau khi đối soát authority DB, epoch và recovery checkpoint), recovery checkpoints và chuỗi migration CSDL đến version 16 (`000016_mqtt_event_authority_guard.up.sql`).
+- **Mặc định môi trường triển khai & Cổng nghiệm thu riêng (Rollout Gates)**:
+  - Trên môi trường triển khai chính (root deployment), tính năng quản lý credential MQTT mặc định bị **vô hiệu hóa** (`MQTT_CREDENTIAL_API_ENABLED=false`, các endpoint trả về HTTP `503 credential_runtime_disabled`).
+  - Việc kích hoạt trên production yêu cầu các cổng chuyển đổi riêng biệt (separate rollout gates) chưa hoàn thành: kiểm chứng topology Rathole thật không bypass qua Internet, chính sách xử lý mất kết nối CSDL sau khi Ingress Gate OPEN, và quy trình nghiệm thu bàn giao secret qua phần cứng USB/encrypted storage.
+- **Tình trạng CI & E2E (Task 2.7)**:
+  - Pipeline GitHub Actions hiện bao gồm **10 jobs độc lập** (9 jobs thành phần và job tích hợp thứ 10 `stage2-e2e`, xem mục 3.4).
+  - Job thứ 10 **`stage2-e2e`** đã được triển khai: thực thi 2 lượt chạy cô lập liên tiếp (`run-1` và `run-2`) bao phủ toàn bộ 27 kịch bản E01–E27 qua tất cả các selector, giới hạn thời gian 30 phút (`timeout-minutes: 30`), xuất báo cáo có cấu trúc đã qua quét an toàn (`safe-reports`), và kiểm chứng dọn dẹp tài nguyên sở hữu (`verified owned cleanup`).
+  - Các lượt chạy cục bộ tương đương CI (CI-equivalent local runs) đã PASS theo báo cáo của worker.
+  - Việc nghiệm thu CI từ xa trên GitHub Actions và chứng nhận commit exact-final-SHA vẫn ở trạng thái **PENDING** (chưa có remote exact-final-SHA acceptance; không tuyên bố toàn bộ Stage 2 đạt 10/10 remote hay production-ready). Các cổng kích hoạt môi trường triển khai thực tế (production rollout gates) tiếp tục được giữ tách biệt.
+- **Hạ tầng Mosquitto**:
+  - Phân biệt giữa hạ tầng file tĩnh legacy (Task 2.5: named volume `mosquitto_auth` mới chỉ seed tài khoản nội bộ `backend_service`, không tự động import tài khoản từ file prototype tracked trong git) và chu trình sống Dynamic Security (Task 2.6: quản lý tài khoản động qua DynSec adapter, Ingress Gate, global maintenance và thu hồi phiên tức thời).
+- Xem thêm:
+  [contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md),
+  [quản trị tài khoản tập trung Task 2.2A](docs/backend/stage-2-task-2.2A-centralized-accounts.md),
+  [contract authorization Task 2.3](docs/backend/stage-2-task-2.3-authorization.md),
+  [contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md),
+  [hạ tầng runtime Mosquitto Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md),
+  [sổ tay vận hành MQTT Credential Task 2.6](docs/backend/stage-2-task-2.6-mqtt-credentials.md) và
+  [nghiệm thu E2E Task 2.7](docs/backend/stage-2-task-2.7-acceptance.md)
+  để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
+
 ---
 
 ## 1. Kiến trúc tổng thể (System Architecture)
@@ -40,9 +67,11 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
    - `/auth/v1/*`: Định tuyến tới Supabase Auth (GoTrue qua Envoy gateway).
    - `/storage/v1/*`: Định tuyến tới Supabase Storage API (qua Envoy gateway).
 2. **Mosquitto MQTT Broker (`config/mosquitto/`)**:
-   - Chạy MQTTS (port `8883` công khai qua TLS, `18830` cục bộ).
-   - Xác thực Gateway độc lập bằng username/password (`config/mosquitto/passwd`).
-   - Phân quyền theo topic (`config/mosquitto/acl`) với pattern `%u` cách ly từng Gateway: telemetry, status, responses (Gateway publish), commands (Gateway subscribe).
+   - Chạy MQTTS (port `8883` công khai qua TLS, `18830` cục bộ cho mTLS/TCP nội bộ).
+   - Phân biệt hai cơ chế xác thực và vòng đời runtime:
+     - **Mô hình Static Legacy (Task 2.5 baseline)**: Xác thực đọc từ file tĩnh `password_file` (`/mosquitto/auth/passwd`) trong named volume `mosquitto_auth`, atomic replace có lock/fsync, reload qua Unix domain socket sidecar (`mosquitto-reloader`), phân quyền qua file `config/mosquitto/acl` với pattern `%u` cách ly từng Gateway. File `config/mosquitto/passwd` hiện là template prototype tracked trong git và không tự động import vào volume mới.
+     - **Chu trình sống Dynamic Security (DynSec - Task 2.6 đã triển khai)**: Sử dụng plugin Mosquitto Dynamic Security (`mosquitto_dynamic_security.so`), điều khiển qua Go DynSec adapter. Cơ chế Ingress Gate fail-closed: khởi động ở trạng thái `CLOSED`, chỉ chuyển sang `OPEN` sau khi đối soát authority DB, epoch và recovery checkpoint; hỗ trợ bảo trì toàn cục (global maintenance: `CloseDrain`, cold restart, fresh verification); khi rotate credential sẽ ngắt session cũ và từ chối CONNECT cũ; khi revoke sẽ ngắt active session ngay lập tức và từ chối fresh CONNECT; ghi nhật ký audit bất biến trong CSDL (`mqtt_credential_events`). Mặc định môi trường triển khai tắt API này (`MQTT_CREDENTIAL_API_ENABLED=false`).
+   - Phân quyền theo topic với pattern `%u` cách ly tuyệt đối từng Gateway: telemetry, status, responses (Gateway publish), acks, commands (Gateway subscribe).
 3. **Go Backend Modular Monolith (`src/cmd/server`)**:
    - Xử lý xác thực JWT Supabase, phân quyền quan hệ User–Gateway (`user_gateways`).
    - Thu thập telemetry từ Mosquitto, deduplication bằng `processed_messages`, lưu trữ TimescaleDB.
@@ -81,7 +110,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 ├── docs/
 │   └── protocols/
 │       └── mqtt-v1.md               # Đặc tả giao thức MQTT v1, payload batch, retry, command và URN
-├── migrations/                      # SQL migrations cho Database
+├── migrations/                      # SQL migrations cho Database (đến version 16)
 │   ├── 000000_configure_supabase_roles.sh # Provision và xoay vòng role database cho Supabase Auth/Storage
 │   ├── 000001_init_schema.up.sql    # Relational entities và telemetry hypertable
 │   ├── 000002_digital_twin_tables.up.sql # Digital Twin, command, outbox và temporal hypertable
@@ -91,7 +120,14 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 │   ├── 000006_add_gateway_ownership_columns.up.sql # Cột ownership và desired-state actor
 │   ├── 000007_backfill_twin_gateway_ownership.up.sql # Backfill ownership cho entity hiện hữu
 │   ├── 000008_schema_hardening.up.sql # FK, CHECK, UNIQUE và gỡ retention mặc định
-│   └── 000009_migration_tracking_and_sensor_urn.up.sql # Theo dõi version và URN Sensor theo Gateway
+│   ├── 000009_migration_tracking_and_sensor_urn.up.sql # Theo dõi version và URN Sensor theo Gateway
+│   ├── 000010_stage2_auth_and_provisioning.up.sql # Bảng platform_admins, gateway_mqtt_credentials và ràng buộc định danh
+│   ├── 000011_mqtt_credential_operations.up.sql # Nhật ký audit bất biến mqtt_credential_events và idempotency
+│   ├── 000012_mqtt_credential_maintenance.up.sql # Quản lý khóa bảo trì toàn cục mqtt_credential_maintenance
+│   ├── 000013_mqtt_maintenance_admission.up.sql # Ràng buộc trạng thái và điều kiện chấp thuận bảo trì
+│   ├── 000014_mqtt_credential_recovery.up.sql # Điểm checkpoint và cơ chế xử lý khôi phục sự cố
+│   ├── 000015_mqtt_recovery_authority_guards.up.sql # Rào chắn bảo vệ quyền thẩm định và khôi phục
+│   └── 000016_mqtt_event_authority_guard.up.sql # Rào chắn trigger đảm bảo tính bất biến của audit log
 ├── config/
 │   ├── nginx/
 │   │   └── nginx.conf.template      # Cấu hình Nginx reverse proxy mẫu
@@ -136,14 +172,31 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
    ```
 
 2. **Khởi tạo JWT Secret & Supabase API Keys**:
-   Chạy script để sinh `ANON_KEY` và `SERVICE_ROLE_KEY` tương ứng với `JWT_SECRET` của bạn (độ dài tối thiểu 32 ký tự):
-   ```bash
-   python3 scripts/gen-keys.py "super-secret-jwt-token-with-at-least-32-characters-long"
-   ```
-   Cập nhật các giá trị in ra vào file `.env`:
-   - `JWT_SECRET`
-   - `ANON_KEY`
-   - `SERVICE_ROLE_KEY`
+    Sinh signing secret ngẫu nhiên, lưu kín vào `JWT_SECRET` trong `.env`:
+    ```bash
+    openssl rand -hex 32
+    ```
+    Không dùng sample secret/placeholder; không commit hoặc chia sẻ output.
+    `ANON_KEY` và `SERVICE_ROLE_KEY` phải ký bằng cùng secret. Script hiện có
+    `scripts/gen-keys.py` hỗ trợ `JWT_SECRET` đã export, nhưng cũng có **public
+    fallback** nếu không cấu hình và in keys ra stdout. Không truyền secret qua
+    argv (lộ process listing/history), không bật `set -x`; bảo vệ output và
+    kiểm tra biến không rỗng nếu dùng cho local. Script chưa phải workflow
+    production an toàn cho tới khi được sửa/kiểm tra riêng. Không có xác nhận
+    secret đã rotate; đổi secret không mặc nhiên thu hồi refresh sessions.
+
+    Cấu hình `GOTRUE_JWT_ISSUER=http://localhost/auth/v1` cho local;
+    production dùng public HTTPS issuer đã chọn. Compose mapping biến này vào
+    `SUPABASE_JWT_ISSUER` của Go, audience/role phải là `authenticated`.
+    Token cũ thiếu issuer phải refresh/login lại. `service_role` không phải
+    human platform admin và không được cấp cho Gateway/Flutter. Xem
+    [hướng dẫn Task 2.2](docs/backend/stage-2-task-2.2-authentication.md).
+
+    MVP áp dụng mô hình quản trị tài khoản tập trung:
+    - **Yêu cầu kiến trúc (Architecture Requirement)**: Hệ thống cấm hoàn toàn tính năng tự đăng ký công khai (no public self-signup). Mọi tài khoản người dùng phải được tạo bởi platform administrator thông qua Supabase Auth Admin API (hoặc Supabase Studio được bảo vệ). Trong file `.env` và Docker Compose, bắt buộc cấu hình `GOTRUE_DISABLE_SIGNUP=true` (Compose mặc định `true`).
+    - **Thực tế kiểm chứng (Verification Status)**: Việc ẩn nút đăng ký trên giao diện người dùng (Flutter/Web) chỉ là biện pháp hình thức bên ngoài (purely cosmetic) và không mang giá trị bảo mật. Tính năng cấm đăng ký phải được kiểm chứng kỹ thuật bằng cách gửi request trực tiếp `POST /auth/v1/signup` tới Nginx / Envoy API Gateway và nhận phản hồi lỗi HTTP `422 signup_disabled`, không tạo ra bất kỳ bản ghi nào trong `auth.users`, `profiles`, hay `user_gateways`. Trong môi trường prototype / local chưa thực hiện bài kiểm tra trực tiếp này, không thể mặc định coi là hệ thống đã được khóa hoàn toàn.
+    - **Không tự cấp quyền**: Việc tạo tài khoản không tự động cấp quyền truy cập Gateway hay quyền platform admin (`platform_admins`). Quyền truy cập Gateway phải được platform admin phân quyền tường minh qua bảng `user_gateways`.
+    - Quy trình bootstrap, áp dụng vào stack cũ và giới hạn kiểm chứng tại [Task 2.2A](docs/backend/stage-2-task-2.2A-centralized-accounts.md).
 
 3. **Khởi tạo chứng chỉ TLS cho Mosquitto Broker**:
    ```bash
@@ -179,6 +232,12 @@ Backend yêu cầu `DATABASE_URL` hợp lệ và sẽ dừng ngay nếu không k
 PostgreSQL. Giới hạn pool, HTTP timeout và các giới hạn MQTT dự kiến đều được
 cấu hình qua `.env`; xem `.env.example` để biết tên biến.
 
+Compose yêu cầu `JWT_SECRET`, `GOTRUE_JWT_ISSUER` và
+`SUPABASE_JWT_AUDIENCE=authenticated`; backend nhận các biến
+`SUPABASE_JWT_SECRET`/`SUPABASE_JWT_ISSUER` qua mapping Compose.
+`SUPABASE_JWT_CLOCK_SKEW` mặc định `30s` (0–5m),
+`AUTHORIZATION_TIMEOUT` mặc định `2s` cho lookup platform admin.
+
 - **Cấu hình tiến trình & kết nối CSDL**:
   - `SERVER_PORT` (mặc định: `8080`), `SERVER_ENV` (`development` / `production`).
   - `DATABASE_URL`: URI kết nối PostgreSQL bắt buộc có scheme `postgres://` hoặc `postgresql://`.
@@ -193,21 +252,31 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 ```
 
 - `/healthz`: Liveness probe chỉ xác nhận tiến trình HTTP còn hoạt động (trả về `OK`).
-- `/readyz`: Readiness probe xác nhận backend hiện truy cập được CSDL PostgreSQL (`{"status":"ready"}` HTTP 200 hoặc `{"status":"not_ready"}` HTTP 503).
+- `/readyz`: Readiness probe xác nhận backend hiện truy cập được CSDL PostgreSQL (`{"status":"ready"}` HTTP 200 hoặc safe error envelope `service_unavailable` HTTP 503).
 - Toàn bộ HTTP request/response được gán hoặc chuyển tiếp header `X-Request-ID` (tự động tạo UUIDv4 nếu chưa có) phục vụ distributed tracing.
 - `docker compose stop backend` gửi tín hiệu `SIGTERM` để backend dừng tiếp nhận kết nối mới, hoàn tất request đang xử lý trong thời gian `SHUTDOWN_TIMEOUT` và đóng connection pool PostgreSQL an toàn.
 
-### 3.3 Áp dụng migration schema hardening
+### 3.3 Áp dụng migration
 
-Các file trong `migrations/` được mount vào `/docker-entrypoint-initdb.d` và chỉ tự chạy khi PostgreSQL khởi tạo một data volume mới. Restart container không áp dụng migration mới lên database hiện hữu.
+Hệ thống quản lý schema CSDL thông qua chuỗi **16 migrations** (`000001` đến `000016`):
+- Các migration `000001` đến `000009` trong `/docker-entrypoint-initdb.d` chỉ tự chạy khi PostgreSQL khởi tạo data volume mới.
+- Từ version 10 trở đi (`000010` đến `000016`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
+  - `000010`: Bổ sung bảng `platform_admins`, `gateway_mqtt_credentials`, ràng buộc định dạng định danh Gateway/Sensor, và phân quyền tối thiểu (least-privilege) cho role `iot_backend_app`.
+  - `000011`: Bổ sung bảng nhật ký audit bất biến `mqtt_credential_events`, quản lý thế hệ `generation` và khóa `idempotency_key`.
+  - `000012`: Bổ sung bảng khóa bảo trì toàn cục `mqtt_credential_maintenance`.
+  - `000013`: Bổ sung ràng buộc trạng thái bảo trì và điều kiện tiếp nhận (admission constraints).
+  - `000014`: Quản lý các điểm checkpoint khôi phục sự cố (`recovery_checkpoint`) và phương án xử lý (`recovery_disposition`).
+  - `000015`: Bổ sung rào chắn bảo vệ quyền thẩm định và ranh giới phục hồi lỗi.
+  - `000016`: Trigger và rào chắn bảo vệ tính bất biến tuyệt đối của nhật ký audit (`mqtt_event_authority_guard`).
 
 Migration `000009` tạo bảng `schema_migrations` sau khi schema hiện hữu đã được đối chiếu. Trên database hiện hữu, chỉ áp dụng migration này sau khi `000006`–`000008` đã được xác minh; không chạy lại các migration hardening khi constraint đã tồn tại.
 
-`AUTH_DB_PASSWORD` và `STORAGE_DB_PASSWORD` là hai mật khẩu riêng. Service
-one-shot `supabase-role-provisioner` tạo hoặc xoay vòng hai role database trước
+`AUTH_DB_PASSWORD`, `STORAGE_DB_PASSWORD` và `BACKEND_DB_PASSWORD` là ba mật
+khẩu riêng. Service one-shot `supabase-role-provisioner` tạo hoặc xoay vòng các role database trước
 khi GoTrue và Storage khởi động; không dùng lại mật khẩu PostgreSQL superuser
-cho hai dịch vụ này. Vì upstream nhận PostgreSQL URI, hai mật khẩu chỉ dùng ký
-tự URL-safe: chữ cái, chữ số, dấu `.`, `_`, `~` và `-`.
+cho các dịch vụ này. Password phải có ít nhất 22 ký tự URL-safe. Backend kết
+nối bằng `iot_backend_app`, không dùng PostgreSQL superuser; role này bị tước
+toàn bộ quyền DDL, không thể chỉnh sửa `schema_migrations` và không thể xóa dữ liệu audit log.
 
 `000005_seed_dev_data.up.sql` là dữ liệu development tùy chọn. Trên database
 mới file này được bỏ qua trong init vì GoTrue chưa tạo `auth.users`; nếu cần dữ
@@ -243,9 +312,20 @@ docker exec -i iot_postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 
 Các lệnh trên giả định `POSTGRES_USER` và `POSTGRES_DB` đã được export từ `.env`. Không chạy `docker compose down -v` trên database có dữ liệu cần giữ.
 
+Sau khi database đã có baseline version 9, các migration từ `000010` đến `000016` được áp dụng tự
+động khi chạy Compose thông qua service `application-migrations`. Để kiểm chứng toàn diện quy trình nâng cấp CSDL, chạy:
+
+```bash
+sh scripts/test-stage2-migrations.sh
+```
+
+Script sẽ kiểm tra: cài đặt mới (clean install), nâng cấp tuần tự từ version 9 lên 16, thực thi đồng thời hai runner, chạy kiểm tra tính lũy kế (idempotency), chạy toàn bộ các file xác minh `scripts/sql/verify-migration-000010.sql` đến `000016.sql`, và xác nhận role `iot_backend_app` bị từ chối mọi thao tác DDL hay can thiệp vào `schema_migrations`.
+
+Xem thêm quy trình Task 2.1, backend role và bootstrap platform admin tại [Tài liệu Task 2.1](docs/backend/stage-2-task-2.1-migrations.md).
+
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
-Repository tích hợp quy trình kiểm thử tự động toàn diện qua GitHub Actions (`.github/workflows/ci.yml`), bao gồm 4 luồng kiểm tra song song:
+Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.1**, hiện bao gồm **10 jobs CI độc lập**:
 
 1. **`lint-and-test`**:
    - Kiểm tra định dạng code Go với `gofmt`.
@@ -257,15 +337,54 @@ Repository tích hợp quy trình kiểm thử tự động toàn diện qua Git
 2. **`cross-compile`**:
    - Biên dịch độc lập Go Backend cho `linux/amd64`.
    - Biên dịch chéo Gateway Simulator (`linux/armv7` với `GOARM=7`) dành cho mục tiêu phần cứng bo TI AM5728.
+   - Biên dịch chéo các công cụ runtime phụ trợ (`mosquitto-auth-init`, `mosquitto-reloader`) cho cả `linux/amd64` và `linux/armv7`.
 3. **`migration-check`**:
    - Khởi động container TimescaleDB độc lập với cấu hình phân quyền ngẫu nhiên (`ci_admin`, `ci_custom_db`).
-   - Tự động kiểm tra chuỗi migration `000001` đến `000009` và bảng theo dõi `schema_migrations`.
-   - Chạy xác minh preflight, verification script cho schema hardening và URN format.
+   - Tự động kiểm tra chuỗi migration đầy đủ đến **version 16** (`000016_mqtt_event_authority_guard.up.sql`) và bảng theo dõi `schema_migrations`.
+   - Chạy toàn bộ các bộ script xác minh schema hardening, URN, platform admin, credential metadata, maintenance locks, recovery checkpoints và terminal event guard (`verify-migration-000009.sql` đến `000016.sql`).
    - Giả lập bảng `auth.users`, kiểm tra migration tương thích Supabase (`000004_supabase_compat.up.sql`), xác minh 6 policies RLS, trigger tự động tạo profile và khóa ngoại liên kết.
-   - Kiểm tra khả năng kết nối độc lập của 2 role CSDL `supabase_auth_admin` và `supabase_storage_admin`.
+   - Kiểm tra khả năng kết nối độc lập của các role CSDL Supabase và quyền tối thiểu của `iot_backend_app`.
+   - Chạy kiểm tra nâng cấp CSDL Stage 2 qua `sh scripts/test-stage2-migrations.sh`.
 4. **`docker-build`**:
-   - Đóng gói container image `iot-backend:ci` qua Docker Buildx.
-   - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`).
+   - Đóng gói các container images (`backend`, `auth-init`, `reloader`) qua Docker Buildx.
+   - Khởi chạy container backend song song với TimescaleDB, thực hiện smoke test liveness (`/healthz`) và readiness probe (`/readyz`) qua `sh scripts/test-backend-smoke.sh`.
+5. **`authorization-integration`**:
+   - Kiểm chứng repository Gateway/Sensor bằng PostgreSQL thật dưới quyền `iot_backend_app`: cách ly người dùng (user isolation), ma trận vai trò (role matrix), metadata nullable, thu hồi quyền thành viên (membership revocation) và kiểm tra deadline.
+   - Từ repo root: `sh scripts/test-stage2-authorization.sh`; sử dụng CSDL isolated, không đọc/sửa file `.env` deployment.
+   - Kiểm tra API đọc danh sách Gateway qua router thật, CSDL PostgreSQL và token JWT; kiểm tra API Sensor, phân biệt rõ Gateway rỗng với từ chối truy cập và timeout khi CSDL bị khóa.
+   - Dọn dẹp an toàn các anonymous volume thuộc container test; lỗi cleanup khiến harness trả về mã lỗi nonzero.
+   - Chi tiết contract và kết quả tại [Tài liệu Task 2.3](docs/backend/stage-2-task-2.3-authorization.md).
+6. **`provisioning-integration`**:
+   - Kiểm chứng trên PostgreSQL isolated dưới quyền `iot_backend_app` với router thật: kiểm tra tính nguyên tử (atomic) khi tạo Gateway/Sensor/Twin, cơ chế thử lại (retry), xử lý xung đột (conflict), rollback khi gặp lỗi, tương tranh (concurrency), timeout và thu hồi quyền admin.
+   - Từ repo root: `sh scripts/test-stage2-provisioning.sh`; không đọc/sửa file `.env`.
+   - Chi tiết contract, câu lệnh và giới hạn bằng chứng tại [Tài liệu Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md).
+7. **`auth-integration`**:
+   - Kiểm thử hồi quy xác thực bằng harness Python, kiểm chứng cấm đăng ký công khai (`POST /auth/v1/signup` trả về `422 signup_disabled`), tạo tài khoản fixture qua Auth Admin API, đăng nhập/làm mới token GoTrue qua Nginx/Envoy và bảo vệ platform admin trong PostgreSQL.
+   - Sử dụng access token GoTrue thật truyền qua Nginx tới Go backend để kiểm chứng cách ly Gateway/Sensor, platform admin không bypass quyền đọc nếu chưa có membership, và việc thu hồi quyền thành viên có hiệu lực ngay ở request kế tiếp.
+   - So sánh Sensor metadata/NULL/UTC với fixture và kiểm tra Gateway không tồn tại/không có quyền đều trả về `404` qua proxy.
+   - Từ repo root: `sh scripts/test-stage2-auth.sh` và `sh scripts/test-stage2-admin.sh`. Chi tiết tại [Tài liệu Task 2.2](docs/backend/stage-2-task-2.2-authentication.md).
+8. **`mosquitto-credential-integration`**:
+   - Kiểm chứng toàn diện 4 endpoint Admin MQTT Credential thông qua HTTPS Nginx, PostgreSQL thật, và Mosquitto Dynamic Security (DynSec) adapter.
+   - Kiểm chứng hàng rào Ingress Gate fail-closed (khởi động `CLOSED`, chỉ `OPEN` sau khi đối soát authority DB, epoch và checkpoint).
+   - Kiểm chứng chu trình đột biến credential (provision cấp mới secret 1 lần, rotate trong cửa sổ bảo trì toàn cục với drain/cold restart, revoke ngắt active session ngay lập tức và cấm fresh CONNECT).
+   - Kiểm chứng cơ chế startup recovery, đối soát sau sự cố (fault injection), bảo vệ tính bất biến của nhật ký audit (`mqtt_credential_events`) và xuất báo cáo độ bao phủ code.
+   - Từ repo root: `sh scripts/test-stage2-mqtt-credentials.sh` và các unit test liên quan. Chi tiết tại [Sổ tay vận hành Task 2.6](docs/backend/stage-2-task-2.6-mqtt-credentials.md).
+9. **`mosquitto-runtime-integration`**:
+   - Kiểm chứng hạ tầng runtime Mosquitto tĩnh legacy (Task 2.5 baseline): khởi tạo volume auth, atomic replace file mật khẩu `password_file` có lock/fsync, gửi tín hiệu reload qua Unix domain socket sidecar (không dùng Docker socket, không cần host PID).
+   - Kiểm chứng kết nối MQTT TLS thật, cách ly phân quyền ACL `%u`, probe xác thực fresh connection (phân biệt rõ negative probe chỉ kiểm chứng bằng password cũ đã biết, không dùng password ngẫu nhiên), và cơ chế tự động rollback/recovery khi có sự cố.
+   - Chạy 14 tests contract trong Python harness và tích hợp native Go adapter.
+   - Từ repo root: `sh scripts/test-stage2-mosquitto-runtime.sh` và `python3 -m unittest discover -s scripts/tests -p 'test_stage2_mosquitto_runtime.py'`. Chi tiết tại [Tài liệu Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md).
+10. **`stage2-e2e`**:
+   - Kiểm thử tích hợp đầu cuối toàn diện cho Stage 2 (tích hợp chuỗi GoTrue thật, Envoy gateway, Nginx reverse proxy, Go backend, PostgreSQL/TimescaleDB và Mosquitto DynSec Ingress Gate).
+   - Được giám sát bởi supervisor CI (`scripts/tests/stage2_ci.py`) với thời gian chờ tối đa 30 phút (`timeout-minutes: 30`).
+   - Thực thi 2 lượt chạy độc lập, cô lập hoàn toàn (`run-1` và `run-2`), biên dịch trực tiếp từ mã nguồn checkout hiện tại, chạy toàn bộ 27 kịch bản E01–E27 qua tất cả các selector (8 bộ chọn).
+   - Thu thập báo cáo có cấu trúc đã qua quét an toàn không rò rỉ secret/token (`safe-reports`), tự động kiểm chứng dọn dẹp sạch sẽ tài nguyên sở hữu (`verified owned cleanup`), kể cả trường hợp hủy hoặc thất bại (`if: always()`).
+   - Các lượt chạy cục bộ tương đương CI (CI-equivalent local runs) đã PASS theo báo cáo của worker. Chi tiết tại [Báo cáo nghiệm thu Task 2.7](docs/backend/stage-2-task-2.7-acceptance.md).
+
+*Lưu ý về tình trạng kiểm chứng và nghiệm thu CI*:
+- Việc pipeline CI đạt trạng thái xanh trên remote repository và chứng nhận commit exact-final-SHA hiện vẫn ở trạng thái **PENDING** (chưa có xác nhận độc lập thông qua exact remote run URL và final commit SHA cụ thể; không đưa ra tuyên bố remote 10/10 hay toàn bộ Stage 2 đã hoàn tất sẵn sàng production).
+- Các cổng chuyển đổi và kích hoạt trên môi trường triển khai thực tế (production rollout gates) tiếp tục được giữ tách biệt, phụ thuộc vào kiểm chứng topology Rathole thật, chính sách ngắt CSDL sau Ingress Gate OPEN và quy trình nghiệm thu bàn giao secret phần cứng.
+- Không tuyên bố các công cụ vận hành dự kiến chưa có, các API quản lý tài khoản tương lai, hay toàn bộ Stage 2 là đã hoàn thành.
 
 ---
 
@@ -273,42 +392,80 @@ Repository tích hợp quy trình kiểm thử tự động toàn diện qua Git
 
 ### 4.1 REST API (Go Backend)
 
-Mọi HTTP request/response của Go Backend đều được gán hoặc bảo toàn header truy vết `X-Request-ID`.
+Mọi HTTP request/response của Go Backend đều được gán hoặc bảo toàn header truy vết `X-Request-ID`. Hệ thống phân định rõ ràng 4 nhóm trạng thái endpoint:
 
-#### Endpoint hệ thống & Telemetry:
-| Phương thức | Đường dẫn | Xác thực | Mô tả | Trạng thái hiện tại |
+#### 1. Nhóm Endpoint đã triển khai (Implemented):
+Các route này đã được đăng ký trong router Go backend, có handler xử lý logic nghiệp vụ, phân quyền và kiểm thử tương ứng:
+
+| Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
 |---|---|---|---|---|
-| `GET` | `/healthz` | Không | Liveness probe cấp Nginx/container (trả về text `OK`) | Hoạt động (HTTP 200) |
-| `GET` | `/readyz` | Không | Readiness probe kiểm tra kết nối PostgreSQL (`{"status":"ready"}`) | Hoạt động (HTTP 200/503) |
-| `GET` | `/v1/health` | Không | Healthcheck Go Backend (`{"status":"running","service":"iot-backend","version":"v1"}`) | Hoạt động (HTTP 200) |
-| `GET` | `/v1/telemetry/history` | Bearer JWT (Supabase) | Lấy chuỗi lịch sử mẫu đo cảm biến (`time_bucket` downsampling) | 501 Not Implemented |
-| `GET` | `/v1/ws` | Bearer JWT / Query token | Nâng cấp kết nối WebSocket để streaming telemetry theo thời gian thực | 501 Not Implemented |
-| `POST` | `/v1/media/upload-url` | Bearer Gateway JWT | Gateway yêu cầu signed upload URL cho ảnh chụp | Đang phát triển |
+| `GET` | `/healthz` | Không yêu cầu | Liveness probe kiểm tra tiến trình HTTP backend còn sống | Hoạt động (HTTP 200 `OK`) |
+| `GET` | `/readyz` | Không yêu cầu | Readiness probe kiểm tra kết nối CSDL PostgreSQL | Hoạt động (HTTP 200 `{"status":"ready"}` hoặc 503) |
+| `GET` | `/v1/health` | Không yêu cầu | Healthcheck dịch vụ Go backend | Hoạt động (HTTP 200 `{"status":"running",...}`) |
+| `GET` | `/v1/gateways` | Bearer JWT `authenticated` | Lấy danh sách Gateway người dùng được cấp quyền theo `user_gateways`. Platform admin không bypass nếu chưa có membership | Đã triển khai: HTTP 200 `{"items":[...]}`, HTTP 401 nếu thiếu/sai JWT |
+| `GET` | `/v1/gateways/{gateway_id}/sensors` | Bearer JWT `authenticated` | Lấy danh sách Sensor thuộc Gateway mà người dùng có quyền truy cập | Đã triển khai: HTTP 200 `{"items":[...]}`, HTTP 404 nếu Gateway không tồn tại hoặc không thuộc quyền, HTTP 401 |
+| `PUT` | `/v1/admin/gateways/{gateway_id}` | Bearer JWT + `platform_admins` | Platform admin tạo mới Gateway, gán owner ban đầu và tạo thực thể Digital Twin trong cùng 1 transaction | Đã triển khai: HTTP 201 tạo mới, HTTP 200 retry no-op, HTTP 409 conflict, HTTP 401/403 |
+| `PUT` | `/v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` | Bearer JWT + `platform_admins` | Platform admin tạo mới Sensor, tạo thực thể Digital Twin và quan hệ `hasSensor` trong cùng 1 transaction | Đã triển khai: HTTP 201 tạo mới, HTTP 200 retry no-op, HTTP 409 conflict, HTTP 404 nếu Gateway cha không tồn tại, HTTP 401/403 |
+| `GET` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` | Lấy metadata credential MQTT của Gateway (không trả về secret hoặc hash) | Đã triển khai: HTTP 200 metadata (mặc định deployment tắt: HTTP 503), HTTP 404, HTTP 401/403 |
+| `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` + `Idempotency-Key` | Cấp mới credential MQTT cho Gateway kèm password Base64URL CSPRNG dùng 1 lần | Đã triển khai: HTTP 201 kèm secret lần đầu; replay cùng key trả về 201 metadata-only; HTTP 409 nếu đã có credential active; HTTP 503 nếu deployment tắt; HTTP 401/403 |
+| `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/rotate` | Bearer JWT + `platform_admins` + `Idempotency-Key` | Xoay vòng credential MQTT trong cửa sổ bảo trì toàn cục (drain/cold restart) | Đã triển khai: HTTP 200 kèm secret mới 1 lần; replay cùng key trả về 200 metadata-only; HTTP 409 nếu không active; HTTP 503 nếu deployment tắt; HTTP 401/403 |
+| `DELETE` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` + `Idempotency-Key` | Thu hồi vĩnh viễn (revoke) credential MQTT của Gateway, lập tức ngắt session active và cấm fresh CONNECT | Đã triển khai: HTTP 200 revoked; HTTP 503 nếu deployment tắt; HTTP 401/403 |
 
-*Ghi chú: Các endpoint trả về `501 Not Implemented` được giữ nguyên cấu trúc routing nhằm bảo toàn hợp đồng API trong quá trình hoàn thiện các service handler theo từng giai đoạn.*
+*Lưu ý về 4 endpoint Admin MQTT Credential*: Các route này đã được lập trình hoàn chỉnh trong code và kiểm thử trong harness test, nhưng trên cấu hình deployment thực tế mặc định bị vô hiệu hóa qua biến `MQTT_CREDENTIAL_API_ENABLED=false` (trả về lỗi an toàn HTTP `503 credential_runtime_disabled`).
 
-#### Digital Twin & Device Control API (`/v1/*`):
-| Phương thức | Đường dẫn | Xác thực | Mô tả |
+#### 2. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
+Các route này đã được khai báo và đăng ký trong router Go backend nhưng chưa triển khai logic nghiệp vụ; yêu cầu Bearer JWT hợp lệ trước khi trả về HTTP `501 Not Implemented`:
+
+| Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
+|---|---|---|---|---|
+| `GET` | `/v1/telemetry/history` | Bearer JWT `authenticated` | Truy vấn chuỗi lịch sử đo lường cảm biến (hỗ trợ downsampling `time_bucket`) | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
+| `GET` | `/v1/ws` | Bearer JWT `authenticated` (header) | Nâng cấp kết nối WebSocket để streaming dữ liệu cảm biến thời gian thực | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
+| `GET` | `/v1/digital-twins` | Bearer JWT `authenticated` | Lấy danh sách thực thể Digital Twin mà người dùng có quyền truy cập | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
+
+*Ghi chú*: Cả 3 stub trên bắt buộc xác thực token người dùng trước khi phản hồi `501`. Mã lỗi `501` chỉ phản ánh việc endpoint chưa có handler nghiệp vụ, tuyệt đối không được coi là bằng chứng đã kiểm tra quyền User–Gateway thành công.
+
+#### 3. Nhóm Endpoint dự kiến theo thiết kế MVP (Planned Endpoints):
+Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ án nhưng **chưa được đăng ký trong router** Go backend. Mọi request gửi tới các đường dẫn này sẽ nhận phản hồi HTTP `404 Not Found` (hoặc `405 Method Not Allowed` nếu path trùng route khác):
+
+| Phương thức | Đường dẫn | Xác thực dự kiến | Mô tả theo thiết kế MVP |
 |---|---|---|---|
 | `POST` | `/v1/digital-twins` | Bearer JWT (Supabase) | Tạo mới thực thể Digital Twin (Gateway / Sensor / Device) |
-| `GET` | `/v1/digital-twins` | Bearer JWT (Supabase) | Lấy danh sách thực thể người dùng có quyền truy cập |
 | `GET` | `/v1/digital-twins/{entity_id}` | Bearer JWT (Supabase) | Lấy thông tin chi tiết thực thể (định dạng NGSI-LD JSON) |
 | `PATCH` | `/v1/digital-twins/{entity_id}` | Bearer JWT (Supabase) | Cập nhật metadata / thuộc tính tĩnh của thực thể |
 | `GET` | `/v1/digital-twins/{entity_id}/state` | Bearer JWT (Supabase) | Xem trạng thái hiện thời (`reported_state` vs `desired_state`) |
-| `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Bearer JWT (Supabase) | Đặt cấu hình mong muốn (tạo command & outbox trong transaction) |
+| `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Bearer JWT (Supabase) | Đặt cấu hình mong muốn (tạo lệnh và outbox trong transaction) |
 | `GET` | `/v1/digital-twins/{entity_id}/history` | Bearer JWT (Supabase) | Truy vấn lịch sử thuộc tính biến thiên theo thời gian (TimescaleDB) |
 | `POST` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Phát lệnh điều khiển trực tiếp (vd: reboot, capture_image) |
 | `GET` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Lấy danh sách chỉ lệnh đã phát cho thực thể |
 | `GET` | `/v1/commands/{command_id}` | Bearer JWT (Supabase) | Kiểm tra trạng thái thực thi của command |
+| `POST` | `/v1/media/upload-url` | Gateway HTTP Credential riêng | Cấp Signed Upload URL cho Gateway tải ảnh chụp lên private Storage |
 
-### 4.2 Supabase Auth & Storage API (qua Nginx)
+*Lưu ý quan trọng về các tuyến đường không tồn tại*:
+- Router Go backend hiện **KHÔNG CÓ** endpoint xem chi tiết Gateway đơn lẻ (`GET /v1/gateways/{gateway_id}`) hay Sensor đơn lẻ (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`). Việc đọc danh sách Sensor được thực hiện thông qua route cha `GET /v1/gateways/{gateway_id}/sensors`.
+- Hệ thống hiện **KHÔNG CÓ** REST API công khai hay admin để quản lý thành viên (`user_gateways`). Việc phân quyền, thay đổi vai trò (Owner / Operator / Viewer) hoặc thu hồi quyền thành viên Gateway được thực hiện thông qua công cụ vận hành nội bộ được bảo vệ (protected operator tooling) can thiệp trực tiếp CSDL. Không tuyên bố các API quản lý tài khoản tương lai này là đã hoàn thành.
 
-| Đường dẫn | Dịch vụ tiếp nhận | Mô tả |
-|---|---|---|
-| `/auth/v1/signup` | Supabase GoTrue | Đăng ký tài khoản người dùng mới (tự kích hoạt profile qua trigger) |
-| `/auth/v1/token?grant_type=password` | Supabase GoTrue | Đăng nhập lấy access_token (JWT) |
-| `/storage/v1/object/sign/*` | Supabase Storage API | Cấp Signed URL đọc/ghi cho private bucket |
-| `/storage/v1/object/*` | Supabase Storage API | Upload/Download tệp tin trực tiếp qua Signed URL |
+#### 4. Danh mục tính năng tạm hoãn ngoài phạm vi MVP (Deferred Features per AGENTS.md §2):
+Các tính năng sau đây đã được quyết định loại bỏ hoặc hoãn lại để đảm bảo tính khả thi cho đồ án đơn thành viên, tránh làm phức tạp kiến trúc và giao diện:
+- **gRPC và gRPC-Web**: Toàn bộ giao tiếp sử dụng REST và WebSocket nhằm loại bỏ chi phí Protobuf, code-generation và proxy phức tạp.
+- **Đăng ký công khai người dùng**: Tự đăng ký (`/auth/v1/signup`) bị vô hiệu hóa; chỉ platform admin được tạo tài khoản người dùng.
+- **Gateway tự đăng ký hoặc tự nhận quyền**: Không hỗ trợ Gateway self-claiming hoặc automated enrollment; Gateway và credential chỉ do platform admin cấp phát tập trung.
+- **Context Broker NGSI-LD bên thứ ba**: Không triển khai Scorpio hay Orion-LD; CSDL PostgreSQL/TimescaleDB là nguồn chân lý duy nhất (source of truth) và Go backend tự xuất định dạng NGSI-LD tại biên API.
+- **Live-video streaming & Media Server**: Không hỗ trợ truyền video trực tiếp (RTSP/WebRTC/HLS) hay media server chuyên dụng; phân hệ media chỉ hỗ trợ lưu trữ ảnh tĩnh qua Supabase Storage.
+- **Tải lên video lớn, Resumable/TUS upload & Chuyển mã (Transcoding)**: Nằm ngoài phạm vi của MVP.
+- **Phân hệ cảnh báo hoàn chỉnh (Full Alert Engine)**: Tạm hoãn; tập trung vào thu thập, lưu trữ và Digital Twin.
+- **Lệnh điều khiển tự trị hoặc sinh bởi LLM**: Toàn bộ chỉ lệnh điều khiển phải xuất phát từ người dùng được ủy quyền qua REST API.
+- **Ứng dụng web quản trị tùy biến (Custom Admin App)**: Tạm hoãn; việc quản trị vận hành sử dụng Supabase Studio và công cụ dòng lệnh được bảo vệ.
+
+### 4.2 Supabase Auth & Storage API (qua Nginx / Envoy API Gateway)
+
+| Đường dẫn | Dịch vụ tiếp nhận | Xác thực | Mô tả & Trạng thái hiện tại |
+|---|---|---|---|
+| `POST /auth/v1/signup` | Supabase GoTrue | API Key | Đăng ký tài khoản công khai: **BỊ VÔ HIỆU HÓA** (`GOTRUE_DISABLE_SIGNUP=true`, trả về HTTP 422 `signup_disabled`). Phải được kiểm chứng độc lập ở biên API thay vì chỉ dựa vào việc ẩn nút trên giao diện. |
+| `POST /auth/v1/token?grant_type=password` | Supabase GoTrue | API Key + Email/Password | Đăng nhập tài khoản người dùng, trả về cặp `access_token` (JWT HS256) và `refresh_token`. |
+| `POST /auth/v1/token?grant_type=refresh_token` | Supabase GoTrue | API Key + Refresh Token | Làm mới phiên đăng nhập, cấp `access_token` mới khi token cũ hết hạn. |
+| `POST /storage/v1/object/sign/*` | Supabase Storage API | Service Role (Backend) | Go backend tạo Signed Upload/Read URL có thời hạn cho private bucket `media-images`. |
+| `PUT /storage/v1/object/*` | Supabase Storage API | Signed URL | Gateway upload trực tiếp tệp ảnh qua HTTPS lên private storage thông qua Signed Upload URL do backend cấp. |
+| `GET /storage/v1/object/*` | Supabase Storage API | Signed URL | Client tải ảnh chụp từ private storage thông qua Signed Read URL do backend cấp sau khi kiểm tra quyền User–Gateway. |
 
 ### 4.3 MQTT Topic Contract
 
@@ -376,7 +533,7 @@ nằm tại `docs/protocols/mqtt-v1.md`.
 
 ## 5. Phân hệ Digital Twin & Quản lý điều khiển (Digital Twin Subsystem)
 
-Thay vì tích hợp Federated Learning (đã được loại bỏ để tập trung vào mục tiêu trọng tâm của đồ án), hệ thống sở hữu phân hệ **Digital Twin** hoàn chỉnh được thiết kế theo kiến trúc Modular Monolith bên trong Go Backend:
+Thay vì tích hợp Federated Learning (đã được loại bỏ để tập trung vào mục tiêu trọng tâm của đồ án), hệ thống thiết kế phân hệ **Digital Twin** theo kiến trúc Modular Monolith bên trong Go Backend. Các mục dưới mô tả hành vi mục tiêu; schema đã có nhưng business handlers/đường điều khiển chưa hoàn thành:
 
 ### 5.1 Chuẩn định danh & Thực thể NGSI-LD
 - Mỗi thực thể vật lý (Gateway, Sensor, Device/Actuator) có định danh URN bền vững:

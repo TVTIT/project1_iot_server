@@ -1,0 +1,28 @@
+# Isolated investigation only. No production volumes, credentials or services.
+services:
+  broker:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    user: "1883:1883"
+    entrypoint: ["mosquitto", "-c", "/fixture/broker.conf"]
+    ports: ["127.0.0.1::8883"]
+    volumes:
+      - ${DYNSEC_FIXTURE:?protected fixture required}/broker:/fixture:ro
+      - security:/security
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    restart: "no"
+  setup:
+    image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+    entrypoint: ["/bin/sh"]
+    network_mode: none
+    volumes:
+      - security:/security
+      - ${DYNSEC_FIXTURE:?protected fixture required}/broker:/fixture
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    restart: "no"
+volumes:
+  security:
