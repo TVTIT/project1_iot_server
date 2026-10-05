@@ -18,7 +18,8 @@ Kế hoạch nguồn có thẩm quyền (authoritative plan) được lưu trữ
 
 - **Ngoài phạm vi Task 2.6 (chuyển giao cho Task 2.7 và các giai đoạn tiếp theo)**:
   - Task 2.6 không tuyên bố hoàn thành toàn bộ Giai đoạn 2 (Stage 2). Task 2.7 chịu trách nhiệm về kiểm thử luồng tích hợp đầu-cuối (E2E) toàn Giai đoạn 2, quy trình vận hành phân quyền thành viên Gateway (`user_gateways`), và nghiệm thu tổng thể Stage 2.
-  - Không bao gồm việc kích hoạt mặc định Admin Credential API trên môi trường production.
+  - Các phân hệ lưu trữ telemetry, xác nhận ứng dụng (application ACK), truy vấn lịch sử, WebSocket streaming, quản lý media, và điều khiển Digital Twin / desired-state thuộc phạm vi Giai đoạn 3 và các giai đoạn sau của MVP, hoàn toàn nằm ngoài phạm vi Stage 2.
+  - Không bao gồm việc kích hoạt mặc định Admin Credential API trên môi trường production (`MQTT_CREDENTIAL_API_ENABLED=false`).
   - Không bao gồm quy trình nạp thông tin xác thực vật lý qua cổng USB hoặc lưu trữ mã hóa phần cứng (flash/NVS) trên các thiết bị nhúng thực tế (ESP32, Luckfox Pico Plus, TI AM5728).
   - Không bao gồm chính sách xử lý mất kết nối cơ sở dữ liệu sau khi Ingress Gate đã mở (post-OPEN database-loss policy).
 
@@ -42,9 +43,9 @@ Cả hai đợt rà soát Go Code Review và Database Review đã độc lập n
 ### 2.2 Đánh giá An toàn Thông tin (Security Review)
 
 Phân hệ mã nguồn mới và các kịch bản kiểm thử trong fixture cô lập đạt chuẩn an toàn thông tin:
-1. **Quản lý bí mật (Secret Lifecycle)**: Mật khẩu Gateway được sinh bởi CSPRNG với độ dài tối thiểu quy định, mã hóa và truyền trực tiếp qua stdin của broker native; plaintext chỉ được trả về một lần trong phản hồi HTTP POST và lập tức bị xóa khỏi bộ nhớ tiến trình (zeroed/garbage collected). Không lưu plaintext hoặc hash tạm thời trong database hay log.
-2. **Ủy quyền nghiêm ngặt (Platform Admin Authorization)**: Toàn bộ các route `/v1/admin/gateways/:gateway_id/mqtt-credential*` đều bắt buộc xác thực qua middleware Supabase JWT và kiểm tra quyền platform admin thông qua truy vấn bảng `platform_admins`. Mọi vai trò khác (`owner`, `operator`, `viewer` trong `user_gateways`) hoặc người dùng vãng lai đều bị từ chối với mã lỗi `403 Forbidden` mà không gây ra bất kỳ tác dụng phụ nào trên hệ thống.
-3. **Cách ly Topic Broker**: Áp dụng cơ chế Mosquitto DynSec với ACL tĩnh tường minh gán theo tiền tố URN của Gateway, bảo đảm tính cách ly tuyệt đối: Gateway chỉ được phép publish/subscribe trên không gian topic của chính mình (`gateways/<gateway_id>/...`).
+1. **Quản lý bí mật (Secret Lifecycle)**: Mật khẩu Gateway được sinh bởi CSPRNG với ít nhất 128 bit entropy (chuỗi Base64URL 43 ký tự), mã hóa và truyền trực tiếp qua stdin của broker native; plaintext chỉ được trả về một lần trong phản hồi HTTP POST và không được lưu giữ dài hạn trong bộ nhớ tiến trình (được giải phóng bởi cơ chế garbage collection tiêu chuẩn của Go runtime; không cam kết zeroization phần cứng/bộ nhớ tuyệt đối). Không lưu plaintext hoặc hash tạm thời trong database hay log.
+2. **Ủy quyền nghiêm ngặt (Platform Admin Authorization)**: Toàn bộ các route `/v1/admin/gateways/:gateway_id/mqtt-credential*` đều bắt buộc xác thực qua middleware Supabase JWT và kiểm tra quyền platform admin thông qua truy vấn bảng `platform_admins`. Mọi vai trò khác (`owner`, `operator`, `viewer` trong `user_gateways`) hoặc người dùng vãng lai đều bị từ chối với mã lỗi `403 Forbidden` mà không gây ra bất kỳ tác dụng phụ nào trên hệ thống. Lưu ý: các kịch bản kiểm thử tại Task 2.6 sử dụng token JWT ký bằng khóa fixture (fixture-signed JWT) để cô lập kiểm thử logic middleware; luồng xác thực đầu-cuối với dịch vụ Supabase Auth (GoTrue) thực tế được chuyển giao cho Task 2.7.
+3. **Cách ly Topic Broker**: Áp dụng cơ chế Mosquitto DynSec với ACL tĩnh tường minh gán theo tiền tố URN của Gateway, kiểm soát phạm vi topic theo quy tắc nghiêm ngặt: Gateway chỉ được phép publish/subscribe trên không gian topic của chính mình (`gateways/<gateway_id>/...`) và không thể can thiệp vào namespace của Gateway khác hay topic quản trị DynSec (tính cách ly dựa trên quy tắc phân quyền phần mềm của Mosquitto DynSec plugin, không tuyên bố bảo đảm cách ly phần cứng tuyệt đối).
 4. **Nguyên tắc Mặc định Đóng (Fail-Closed Ingress Gate)**: Cổng Ingress Gate của Mosquitto chỉ mở (`OPEN`) khi cả ba điều kiện được xác nhận: broker RAM đã áp dụng, snapshot file đã ghi nhận, và kiểm chứng kết nối mới bằng TLS thành công. Bất kỳ lỗi nào trong quá trình thực hiện đều giữ cổng ở trạng thái `CLOSED`.
 
 ### 2.3 Bảo vệ Tầng Cơ sở Dữ liệu (Database Migration Guards)
@@ -90,11 +91,12 @@ Toàn bộ các nội dung kiểm thử đã được thực thi và xác nhận
 - **Kết quả**: `PASS`.
 - **Kiểm chứng tiến trình độc lập `cmd/server` (Standalone Server Execution)**:
   - Khởi chạy tiến trình `cmd/server` thực tế trong fixture mạng cô lập (loopback private broker, chỉ mở port TLS qua Ingress Gate).
-  - Xác nhận 4 route HTTP (`GET`, `POST`, `POST /rotate`, `DELETE`) hoạt động chính xác với cơ sở dữ liệu PostgreSQL thực tế và xác thực JWT.
+  - Xác nhận 4 route HTTP (`GET`, `POST`, `POST /rotate`, `DELETE`) hoạt động chính xác với cơ sở dữ liệu PostgreSQL thực tế và xác thực JWT (sử dụng fixture-signed JWT trong phạm vi harness cô lập).
   - Kiểm tra per-request database checker hoạt động fail-closed khi mất kết nối cơ sở dữ liệu.
   - Kiểm tra các tình huống lỗi bất định: lỗi ghi snapshot native dẫn đến phản hồi HTTP 503 và Ingress Gate giữ `CLOSED`; kiểm tra khôi phục sau khi tiến trình bị SIGKILL và khởi động lại.
   - Kiểm tra tắt dịch vụ duyên nợ (bounded SIGTERM shutdown) đảm bảo đóng cổng Ingress Gate trước khi tiến trình thoát.
-   - Kiểm tra trường hợp cấu hình tắt (`MQTT_CREDENTIAL_API_ENABLED=false`): toàn bộ route credential bị vô hiệu hóa an toàn mà không khởi tạo bất kỳ kết nối broker, CA hay controller nào.
+  - Kiểm tra trường hợp cấu hình tắt (`MQTT_CREDENTIAL_API_ENABLED=false`): toàn bộ route credential bị vô hiệu hóa an toàn mà không khởi tạo bất kỳ kết nối broker, CA hay controller nào.
+  - **Cập nhật khắc phục Standalone Test Harness (commit `55cdcd5`)**: Nhằm khắc phục tình trạng timeout không ổn định (flaky probe) từng ghi nhận trong CI run 37203894546, test harness `scripts/tests/task2612_standalone.py` đã được nâng cấp tại commit `55cdcd5`: tách biệt ngân sách timeout của `/readyz` khỏi timeout của các thao tác credential, bổ sung direct probe qua container BusyBox `wget` trong mạng nội bộ, và bổ sung hàm chẩn đoán `startup_diagnosis` thu thập trạng thái container cùng log tail đã ẩn danh hóa (redacted bounded tail).
 - **6 Bộ chọn Tên Bắt buộc (Six Required Named Selectors)**:
 
 | STT | Tên Selector | Thời gian chạy | Kết quả | Nội dung kiểm chứng chính |
@@ -240,11 +242,16 @@ Mỗi profile đại diện cho một lát cắt tích hợp chuyên biệt (ver
 │ 5. Actual Standalone Process Testing                                   │
 │    - Tiến trình cmd/server độc lập chạy trong container                │
 │    - Gửi request HTTP thực tế qua loopback network                     │
+│    - Xác thực JWT bằng fixture-signed token (chưa phải GoTrue E2E)     │
 │    - Kiểm chứng fail-closed, SIGTERM shutdown và khôi phục sự cố       │
+│    - Bổ sung harness readiness probe & redacted diagnosis (55cdcd5)    │
 ├────────────────────────────────────────────────────────────────────────┤
 │ 6. GitHub Actions CI                                                   │
 │    - Baseline CI lịch sử: Run 37110877029 (commit b856ecfb...)          │
-│    - Uncommitted changes hiện tại: CHƯA CÓ EXACT-SHA CI TRÊN GITHUB     │
+│    - Báo cáo ban đầu từ người dùng: CI Task 2.6 xanh (user-reported)   │
+│    - Run 37203894546 (cb37411): Thất bại do standalone harness probe   │
+│    - Exact-SHA CI Run 37204985289 (commit 55cdcd5): THÀNH CÔNG (GREEN) │
+│      (Toàn bộ 9/9 jobs pass trên develop vào 2026-10-04T13:15:41Z)     │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -254,16 +261,36 @@ Mỗi profile đại diện cho một lát cắt tích hợp chuyên biệt (ver
 
 Báo cáo này công bố minh bạch các giới hạn kỹ thuật và các nội dung **chưa được thực hiện (NOT RUN)** theo đúng nguyên tắc của kế hoạch phát triển:
 
-1. **Chưa có Exact-SHA GitHub CI**: Các kết quả kiểm thử trong báo cáo này được thực hiện trên môi trường máy trạm cục bộ sạch (`/tmp/opencode/task2613-final-regression.log`). Do các thay đổi mã nguồn chưa được commit và push theo quy trình được phê duyệt, **hiện tại chưa có GitHub Actions run tương ứng với mã băm commit (exact-SHA) của mã nguồn này**.
-2. **Trạng thái Hoàn tất Task 2.6.13**: Task 2.6.13 chỉ được coi là hoàn tất toàn bộ sau khi tài liệu nghiệm thu này được lưu trữ, mã nguồn được commit và push theo đúng quy trình ủy quyền, và pipeline CI trên GitHub trả về kết quả xanh (green).
-3. **Cấu hình Mặc định Production**: Cờ cấu hình `MQTT_CREDENTIAL_API_ENABLED` tiếp tục giữ giá trị `false` theo mặc định. Không tự ý kích hoạt cờ này trên production cho đến khi các bài kiểm thử staging được hoàn tất.
-4. **Giới hạn Cấu trúc Mạng và Phần cứng Thực tế**: Chưa kiểm chứng topology triển khai thực tế của mô hình một broker/controller đã chọn, reverse proxy Nginx production, đường hầm Rathole thực tế tới Gateway vật lý, hoặc quy trình nạp khóa USB và lưu trữ an toàn trên flash/NVS của các bo mạch ESP32, Luckfox Pico Plus, TI AM5728. Triển khai đa node/HA không thuộc MVP.
-5. **Chính sách Mất Database sau khi Mở Cổng (Post-OPEN Database Loss)**: Chính sách ứng xử khi mất kết nối cơ sở dữ liệu sau khi Ingress Gate đã mở (`OPEN`) vẫn ở mức thiết kế fail-closed cho các yêu cầu mới, chưa có cơ chế cô lập tự động broker nếu database gặp sự cố kéo dài khi broker đang phục vụ lưu lượng kết nối trực tiếp.
-6. **Các Kịch bản Wire-Loss Không Thực hiện (NOT RUN)**:
+1. **Trạng thái GitHub Actions CI và Exact-SHA Run**:
+   - Ban đầu, kết quả kiểm thử được thực hiện trên môi trường máy trạm cục bộ sạch và lưu vết đầy đủ tại `/tmp/opencode/task2613-final-regression.log`.
+   - Trong quá trình nghiệm thu, người dùng đã báo cáo kết quả CI Task 2.6 xanh (user-reported green).
+   - Qua rà soát độc lập bằng công cụ chỉ đọc (read-only verification qua GitHub CLI), lịch sử CI trên nhánh `develop` ghi nhận:
+     - Run 37203894546 (commit `cb37411`) từng thất bại ở job `mosquitto-credential-integration` do lỗi chờ `/readyz` trong harness standalone.
+     - Lỗi probe này đã được khắc phục triệt để tại commit `55cdcd57892d35df33c0caaa52bf6038613399e7` ("test(ci): siết timeout readiness probe và bổ sung chẩn đoán cho standalone harness").
+     - Pipeline GitHub Actions chính thức **Run 37204985289** (URL: `https://github.com/TVTIT/project1_iot_server/actions/runs/37204985289`), tương ứng với exact-SHA `55cdcd57892d35df33c0caaa52bf6038613399e7`, đã **hoàn thành thành công toàn bộ 9/9 jobs (GREEN)** vào ngày 2026-10-04T13:15:41Z.
+2. **Trạng thái Hoàn tất Task 2.6 và Tiến độ Task 2.7**:
+   - Task 2.6 đã hoàn thành đầy đủ phạm vi mã nguồn, tài liệu và kiểm thử, được xác nhận bởi CI xanh trên nhánh `develop`.
+   - Tuy nhiên, Task 2.6 chỉ là phân hệ thành phần của Stage 2. Quá trình kiểm thử tích hợp E2E toàn diện cho Giai đoạn 2 thuộc trách nhiệm của **Task 2.7**. Hiện tại Task 2.7 test runner đang được triển khai đồng thời (concurrent execution) và **chưa hoàn tất (not yet complete)**.
+3. **Phân định Token Xác thực (Fixture-signed JWT vs. Real GoTrue E2E)**:
+   - Toàn bộ các bài kiểm thử HTTP của Task 2.6 (cả unit test và standalone harness) sử dụng token JWT được ký bởi fixture bí mật cục bộ (fixture-signed JWT).
+   - Cơ chế này kiểm chứng được middleware Go và việc phân quyền qua bảng `platform_admins`, nhưng **không thay thế cho kiểm thử tích hợp đầu-cuối với dịch vụ Supabase Auth (GoTrue)** thực tế (luồng login, refresh token, cấp phát JWT thật qua API Gateway Envoy/Kong và Nginx). Luồng E2E với GoTrue thật được kiểm chứng tại Task 2.7.
+4. **Giới hạn Xóa Bộ nhớ (Memory Zeroization) và Cách ly Topic**:
+   - Mật khẩu plaintext chỉ xuất hiện một lần duy nhất trong phản hồi HTTP POST và không lưu trữ trong database hay log. Tuy nhiên, do thực thi trên nền tảng Go với garbage collector tiêu chuẩn, hệ thống **không cam kết hoặc tuyên bố bảo đảm xóa sạch bộ nhớ vật lý tuyệt đối (no absolute hardware/memory zeroization guarantees)**.
+   - Cơ chế cách ly topic của Gateway dựa trên phân quyền phần mềm của Mosquitto DynSec plugin, **không cam kết mức độ cách ly phần cứng tuyệt đối**.
+5. **Cấu hình Mặc định Production và Cổng Rollout Chờ Duyệt (Rollout Gates)**:
+   - Cờ cấu hình `MQTT_CREDENTIAL_API_ENABLED` tiếp tục giữ giá trị `false` theo mặc định trên môi trường production.
+   - Việc kích hoạt trên production bị chặn bởi các cổng kiểm soát triển khai (rollout gates) chưa hoàn thành:
+     - Chưa kiểm chứng topology triển khai thực tế có kết nối Internet / đường hầm Rathole không bypass.
+     - Chưa hoàn thiện chính sách xử lý mất cơ sở dữ liệu sau khi Ingress Gate đã mở (post-OPEN database loss policy).
+     - Chưa kiểm chứng quy trình nạp thông tin xác thực qua USB vật lý hoặc lưu trữ mã hóa an toàn trên flash/NVS của các bo mạch nhúng thực tế (ESP32, Luckfox Pico Plus, TI AM5728).
+     - Kiến trúc đa node/HA không thuộc phạm vi MVP.
+6. **Bản chất của Quan sát Snapshot**:
+   - Việc ghi nhận tệp snapshot trên broker native (`snapshot_observed = true`) là quan sát mức ứng dụng (application-level observation), **tuyệt đối không tương đương với chứng chỉ fsync phần cứng hay bảo đảm chống sập nguồn vật lý (power-loss proof)**. Hệ thống chỉ xác nhận file snapshot đã được Mosquitto ghi nhận trong hệ thống tệp tin của container, không cam kết mức độ bền vững trước sự cố mất điện đột ngột.
+7. **Bảo đảm Phân phối Thông điệp**:
+   - Hệ thống tuân thủ nguyên tắc phân phối ít nhất một lần (at-least-once) kết hợp với tính lũy đẳng cấp ứng dụng (idempotency key và operation ID), **tuyệt đối không cam kết hoặc tuyên bố cơ chế exactly-once delivery**.
+8. **Các Kịch bản Wire-Loss Không Thực hiện (NOT RUN)**:
    - Kịch bản rớt gói tin HTTP thực tế ngay sau khi transaction đã commit trên database (`dropped HTTP transport-response`) là **NOT RUN** (kiểm thử hủy bỏ kết nối phía caller không tương đương với rớt gói tin tầng mạng).
    - Kịch bản mất gói tin xác nhận commit trên đường truyền SQL (`SQL wire/commit-ACK loss`) là **NOT RUN** (kiểm thử trigger lỗi hoặc ngắt kết nối nhân tạo không phản ánh đầy đủ trạng thái in-flight packet drop).
-7. **Bản chất của Quan sát Snapshot**: Quan sát thấy snapshot file được ghi trên broker native (`snapshot_observed = true`) là quan sát mức ứng dụng, **không tương đương với chứng chỉ fsync phần cứng hay chống sập nguồn vật lý (power-loss proof)**.
-8. **Bảo đảm Phân phối Thông điệp**: Hệ thống tuân thủ nguyên tắc phân phối ít nhất một lần (at-least-once) kết hợp với tính lũy đẳng cấp ứng dụng (idempotency key và operation ID), **tuyệt đối không cam kết hoặc tuyên bố cơ chế exactly-once delivery**.
 
 ---
 
@@ -274,12 +301,19 @@ Báo cáo này công bố minh bạch các giới hạn kỹ thuật và các n�
 Phân hệ mã nguồn và bộ kiểm thử của **Task 2.6: Admin MQTT Credential Lifecycle API, DynSec Ingress Gate và PostgreSQL Transactional Operations** đã hoàn thành toàn bộ các yêu cầu kỹ thuật:
 - Đã khắc phục triệt để finding duy nhất của đợt review liên quan đến `FinalizeTimeout`.
 - Đã hoàn thành bộ suite kiểm thử tích hợp đầy đủ gồm 6 bộ chọn tên, kiểm thử tiến trình standalone `cmd/server`, hồi quy runtime Mosquitto, và kiểm tra công cụ Go/Docker.
+- Đã khắc phục tính ổn định của test harness probe tại commit `55cdcd5` và đạt kết quả CI xanh hoàn toàn trên GitHub Actions Run 37204985289 (9/9 jobs pass).
 - Mọi tài nguyên kiểm thử tạm thời đã được dọn dẹp sạch sẽ, không ảnh hưởng đến môi trường phát triển chung.
 
 ### 7.2 Bàn giao sang Task 2.7
 
-- Toàn bộ các API và cơ chế kiểm soát cổng Ingress Gate đã sẵn sàng ở trạng thái kiểm chứng cục bộ (Proof Conditional / Decision Ready).
+- Toàn bộ các API credential và cơ chế kiểm soát cổng Ingress Gate đã sẵn sàng ở trạng thái kiểm chứng cục bộ và xác nhận CI trên `develop`.
 - Bàn giao phân hệ credential cho **Task 2.7** để tiến hành:
-  1. Tích hợp E2E toàn Giai đoạn 2: kết nối luồng xác thực người dùng Supabase Auth, phân quyền thành viên Gateway (`user_gateways`), nạp thông tin xác thực MQTT, và kiểm chứng Gateway gửi telemetry qua broker tới Go backend.
-  2. Bổ sung các kịch bản kiểm thử tích hợp với người dùng thực tế và hoàn thiện runbook vận hành tổng thể Stage 2.
-  3. Tiến hành các thủ tục commit, phê duyệt push, và kích hoạt gate CI chính thức trên GitHub.
+  1. Tích hợp E2E toàn Giai đoạn 2: kết nối luồng xác thực người dùng Supabase Auth (GoTrue thật qua Nginx và API Gateway), kiểm chứng từ chối public signup, và phân quyền quản trị nền tảng (`platform_admins`).
+  2. Bổ sung công cụ vận hành phân quyền thành viên Gateway (`user_gateways`) được bảo vệ dành cho platform admin, kiểm chứng cách ly đa người dùng (Owner A vs. Owner B, Viewer, Operator, Non-member).
+  3. Kiểm chứng đầu-cuối luồng cấp phát/xoay vòng/thu hồi thông tin xác thực MQTT và kết nối gated MQTT TLS với ACL topic tương ứng.
+  4. Thực hiện diễn tập nâng cấp cơ sở dữ liệu trên persistent volume (schema migration v16) và chạy bộ kiểm thử E2E sạch.
+  5. Bổ sung job CI `stage2-e2e` nâng tổng số job CI lên 10 jobs.
+
+*Lưu ý ranh giới phạm vi*: Các phân hệ lưu trữ và xử lý telemetry (telemetry ingestion/persistence/application ACK), truy vấn lịch sử (historical queries), truyền phát WebSocket thời gian thực, quản lý media và điều khiển thiết bị/Digital Twin thuộc Giai đoạn 3 (Stage 3) và các giai đoạn tiếp theo của MVP, hoàn toàn **nằm ngoài phạm vi của Giai đoạn 2 và Task 2.7**.
+
+*Trạng thái Task 2.7*: Hiện tại, kịch bản kiểm thử tích hợp E2E và công cụ quản trị membership của Task 2.7 đang được triển khai đồng thời (concurrent implementation) và **chưa hoàn tất**.

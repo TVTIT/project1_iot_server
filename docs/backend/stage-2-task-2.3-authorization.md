@@ -23,7 +23,16 @@ GET /v1/gateways/{gateway_id}/sensors
 Không thêm provisioning, membership API, sensor writes, MQTT credentials,
 telemetry, WebSocket hoặc Digital Twin control. Owner/operator/viewer chỉ đọc
 Gateway được cấp; platform admin không bypass membership trên API người dùng.
-Không tự tạo Gateway/Sensor/profile hoặc quyền từ request.
+Không tự tạo Gateway/Sensor/profile hoặc quyền từ request. Tuyệt đối không có
+public endpoint cho việc tự đăng ký (public signup disabled), tự nhận Gateway
+(self-claiming) hay tự quản lý membership. Công cụ vận hành membership có bảo
+vệ cho administrator là thiết kế dự kiến (planned) của Task 2.7.1, chưa được
+triển khai trong mã nguồn hiện hành.
+
+Ranh giới nghiệm thu và E2E: Task 2.3 hoàn thành và nghiệm thu lát cắt đọc
+dữ liệu Gateway/Sensor. Quá trình kiểm chứng E2E toàn diện trên toàn stack
+(Task 2.7) đang tiếp diễn trong giai đoạn preflight đồng thời; tài liệu này
+tuyệt đối không tuyên bố E2E đã hoàn tất.
 
 Tái sử dụng JWT verifier, `auth.Principal`, error envelope, request ID,
 PostgreSQL pool và `auth.PlatformAdminChecker` của Task 2.2. Không viết lại
@@ -146,6 +155,43 @@ Dùng `AUTHORIZATION_TIMEOUT` hiện có (default 2s, configurable) để giới
 toàn bộ operation đọc quyền/tài nguyên. Context dẫn xuất từ request, propagate
 xuống query và release timer. Không coi HTTP ReadTimeout là query deadline.
 Không thêm goroutine per request để giả lập timeout khi driver đã hỗ trợ context.
+
+### 3.5. Ma trận phân quyền: Stage 2 hiện tại vs Chính sách điều khiển mục tiêu (Target Policy)
+
+Bảng đối chiếu phân quyền giữa lát cắt Stage 2 hiện tại và chính sách điều khiển thiết bị mục tiêu (Target Policy theo AGENTS.md §6.5):
+
+| Vai trò / Đối tượng | Lát cắt nghiệp vụ Stage 2 (Hiện tại) | Chính sách điều khiển mục tiêu (Target Policy — Digital Twin) |
+|---|---|---|
+| **Platform Admin** | - Xác thực qua bảng `platform_admins` trong PostgreSQL.<br>- Trên API người dùng (`/v1/gateways*`): **không bypass**, chỉ đọc tài nguyên nếu có mapping trong `user_gateways` (không mapping trả `items: []` hoặc `404`).<br>- Quyền admin chỉ áp dụng cho nhóm route quản trị `/v1/admin/*` (như provisioning Gateway/Sensor, MQTT credentials). | - Quản trị toàn hệ thống qua admin tooling/API chuyên trách.<br>- Không tự động bypass kiểm tra quyền per-resource trên API nghiệp vụ người dùng nếu không có chính sách văn bản rõ ràng.<br>- Quản lý provisioning Gateway, sensor metadata, credentials và phân bổ membership. |
+| **Gateway Owner** | - Quyền đọc đầy đủ danh sách Gateway và Sensors được phân quyền.<br>- **Fail-closed:** chưa có quyền ghi hoặc cấu hình do API ghi nghiệp vụ chưa mở ở Stage 2. | - Đọc toàn bộ telemetry, history, media, Digital Twin state và command status của Gateway được gán.<br>- Quản lý cấu hình lâu dài (`desired_state`) và sensor metadata qua Go API.<br>- Phát lệnh vận hành an toàn trong server allowlist (ví dụ: `capture-image`).<br>- **Bị từ chối:** lệnh tùy ý/không an toàn (raw payload, shell, unapproved reboot), tự cấp Gateway/credentials, quản lý membership. |
+| **Gateway Operator** | - Quyền đọc danh sách Gateway và Sensors được phân quyền.<br>- **Fail-closed (chỉ đọc):** không có quyền ghi hay phát lệnh ở Stage 2. | - Đọc telemetry, history, media, Digital Twin state và command status của Gateway được gán.<br>- **Chỉ phát các lệnh vận hành an toàn (one-shot operational commands)** nằm trong server allowlist nghiêm ngặt (ví dụ: `capture-image`).<br>- **Bị từ chối:** ghi cấu hình lâu dài `desired_state`, sửa sensor metadata, lệnh tùy ý/không an toàn, quản lý credentials/membership. |
+| **Gateway Viewer** | - Quyền đọc danh sách Gateway và Sensors được phân quyền.<br>- **Fail-closed:** chỉ đọc. | - **Hoàn toàn chỉ đọc (strictly read-only)** trên mọi tài nguyên hiện tại và tương lai (telemetry, media, state, command status).<br>- Bị từ chối mọi thao tác ghi, cấu hình, desired-state, phát lệnh hay quản trị. |
+| **Non-member** | - `GET /v1/gateways` trả `200` với danh sách rỗng `items: []`.<br>- `GET /v1/gateways/{gateway_id}/sensors` trả `404 Not Found` (ngăn rò rỉ sự tồn tại của Gateway). | - Bị từ chối toàn bộ quyền truy cập dữ liệu và điều khiển thiết bị. |
+
+**Ranh giới kiểm chứng và quy tắc cốt lõi:**
+1. **Trạng thái route lệnh tương lai không phải bằng chứng phân quyền vai trò (Missing command route status is not role authorization proof):**
+   - Các route như `/v1/digital-twins`, `/v1/telemetry/history`, `/v1/ws` hiện là stub đăng ký trả `501 Not Implemented`; các route lệnh tương lai (như `/v1/digital-twins/{entity_id}/commands` hoặc `/v1/commands/{command_id}`) chưa đăng ký và trả `404 Not Found` hoặc `405 Method Not Allowed`.
+   - Các mã trạng thái `404`, `405`, `501` này **hoàn toàn KHÔNG phải là bằng chứng chứng minh phân quyền vai trò đã hoạt động** (ví dụ: không chứng minh `operator` bị chặn lệnh hay `owner` được phát lệnh). Chúng chỉ phản ánh việc router chưa có handler hoặc handler đang là stub.
+   - Phân quyền vai trò cho lệnh điều khiển chỉ được xem là kiểm chứng hợp lệ khi lát cắt Digital Twin command execution được cài đặt hoàn chỉnh với per-action role check, schema validation và test suite chuyên biệt.
+2. **Tính cách ly người dùng (User Isolation):**
+   - Phân quyền theo quan hệ sở hữu/thành viên: User A chỉ thấy Gateway của User A. User A gọi xem sensor của Gateway B lập tức nhận `404 Not Found` (code `not_found`, message `resource not found`), hoàn toàn đồng nhất với Gateway không tồn tại, ngăn chặn việc dò quét suy đoán sự tồn tại tài nguyên.
+   - Các sensor trùng `sensor_id` ở các Gateway khác nhau (ví dụ `temp_01`) được phân định tuyệt đối nhờ câu truy vấn SQL scoped theo cặp `(user_id, gateway_id)`.
+   - Platform admin không có mapping trong `user_gateways` chỉ nhận danh sách rỗng hoặc 404 trên API người dùng, đảm bảo không rò rỉ dữ liệu giữa các tenant.
+
+### 3.6. Hiệu lực phân quyền động cùng Token và Trạng thái Công cụ Membership
+
+1. **Hiệu lực phân quyền động với cùng một token hợp lệ (Same-valid-token grant/change/revoke behavior):**
+   - Backend không cache quyền membership trong bộ nhớ tiến trình Go; mỗi request HTTP đến đều được kiểm tra trực tiếp qua câu truy vấn PostgreSQL kết nối với `Principal.UserID`.
+   - Khi người dùng sở hữu một access token Supabase JWT hợp lệ (chưa hết hạn, đúng issuer/audience/role, đúng `sub`):
+     - **Cấp quyền (Grant):** Ngay sau khi transaction thêm dòng vào `user_gateways` commit thành công, request tiếp theo gửi **cùng access token đó** sẽ thấy Gateway mới xuất hiện trong danh sách `GET /v1/gateways` và sensor của Gateway đó trả về `200`.
+     - **Thay đổi vai trò (Change/Update role):** Khi vai trò được cập nhật trong DB (ví dụ từ `viewer` sang `operator`), request tiếp theo với cùng token lập tức trả về chuỗi `role` mới trong DTO của `GET /v1/gateways`.
+     - **Thu hồi quyền (Revoke):** Khi membership của Gateway A bị xóa khỏi DB, request tiếp theo với cùng token lập tức loại bỏ Gateway A khỏi danh sách, và gọi `GET /v1/gateways/gateway_a/sensors` lập tức trả về `404 Not Found`. Các quyền trên Gateway khác của user này (nếu có) và tài nguyên của các user khác hoàn toàn không bị ảnh hưởng.
+   - Hệ thống không bắt buộc người dùng phải đăng xuất/đăng nhập lại hay chờ token hết hạn mới cập nhật được quyền hạn dữ liệu.
+
+2. **Trạng thái công cụ vận hành Membership (Protected Membership Workflow Status):**
+   - **Tuyệt đối không có public endpoint:** Hệ thống không cung cấp và không chấp nhận bất kỳ endpoint public nào cho việc tự đăng ký tài khoản (signup disabled), tự nhận Gateway (self-claiming), hay tự gán/sửa membership qua REST.
+   - **Trạng thái công cụ vận hành:** Công cụ vận hành có bảo vệ dành cho platform administrator (dự kiến trong Task 2.7.1 là script `scripts/manage-gateway-membership.sh` với cơ chế transaction, audit journal bất biến, locking và kiểm tra quyền `platform_admins`) hiện là **THIẾT KẾ DỰ KIẾN (PLANNED)**, **chưa được triển khai trong source code hiện tại**.
+   - **Cách thức kiểm chứng hiện nay:** Các harness kiểm thử hiện tại (Task 2.3.6, Task 2.4, Task 2.6) thực hiện gán, sửa hoặc thu hồi membership trực tiếp thông qua kết nối administrator DB isolated với JSON fixture tham số hóa (`psql`), đảm bảo kiểm chứng chính xác hành vi cơ sở dữ liệu và API mà không tạo ra các endpoint trái phép.
 
 ## 4. Contract repository và cấu trúc tiếp theo
 
@@ -482,15 +528,20 @@ tuyên bố PASS. Coverage HTTP subset không phải coverage toàn repository.
 
 ### Checklist nghiệm thu
 
-- [x] Hai API đọc, DTO/NULL/UTC/order, role matrix và timeout được tài liệu hóa.
+- [x] Hai API đọc, DTO/NULL/UTC/order, role matrix (Stage 2 vs Target Policy) và timeout được tài liệu hóa.
 - [x] SQL membership-scoped, admin không bypass, parent-empty/404, revoke có tests.
 - [x] PostgreSQL và access token GoTrue thật chứng minh isolation; coverage ≥80%.
+- [x] Cơ chế cùng token hợp lệ (same-valid-token grant/change/revoke) và cách ly tenant được ghi nhận và kiểm chứng.
+- [x] Xác định rõ: trạng thái route lệnh tương lai (404/405/501) không phải bằng chứng phân quyền vai trò.
+- [x] Xác nhận công cụ vận hành membership là thiết kế dự kiến (planned ở Task 2.7.1, chưa có trong source code); không mở public membership/self-claim endpoint.
 - [x] Findings cleanup và metadata regression đã xử lý local.
 - [x] Không thêm sensor writes, provisioning/membership API hoặc operator/viewer writes.
 - [x] History, WebSocket và Digital Twin routes vẫn authenticated `501`; chưa triển khai control.
 - [ ] Commit/push M5 và xác minh CI đúng SHA mới.
+- [ ] E2E toàn stack (Task 2.7): đang chạy concurrent runner preflight; không tuyên bố E2E hoàn thành trong Task 2.3.
 - [ ] Deployment thật: signup denial, signing-secret rotation và origin/edge security
   vẫn là scope vận hành riêng; không được suy ra từ nghiệm thu isolated.
 
 Phần implementation/tài liệu Task 2.3.0–2.3.7 đã có bằng chứng local; chưa
-đánh dấu mốc giao GitHub hoàn tất trước CI mới và không chứng nhận production.
+đánh dấu mốc giao GitHub hoàn tất trước CI mới, không tuyên bố E2E hoàn tất
+trong khi preflight đang tiếp diễn, và không chứng nhận production.

@@ -1,25 +1,34 @@
-# Tài liệu Client — 01: Tổng quan và Kiến trúc ứng dụng Flutter Web
+# Tài liệu Client — 01: Tổng quan và Kiến trúc ứng dụng Client (Flutter)
 
-**Cập nhật:** 2026-10-03  
-**Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
-**Tài liệu tham chiếu:** `AGENTS.md`, `docs/backend/stage-2-task-2.2-authentication.md`, `docs/backend/stage-2-task-2.3-authorization.md`, `docs/backend/stage-2-task-2.4-provisioning.md`, `config/nginx/nginx.conf.template`.
+**Cập nhật:** 2026-10-05
+**Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
+**Tài liệu tham chiếu:** `AGENTS.md`, `docs/backend/stage-2-task-2.2-authentication.md`, `docs/backend/stage-2-task-2.3-authorization.md`, `docs/backend/stage-2-task-2.4-provisioning.md`, `docs/backend/stage-2-task-2.6-acceptance.md`, `docs/backend/stage-2-task-2.7-acceptance.md`, `config/nginx/nginx.conf.template`, `docker-compose.yml`.
+**Bộ tài liệu Client liên quan:**
+- [`02_AUTHENTICATION_AND_SESSION.md`](02_AUTHENTICATION_AND_SESSION.md): Cơ chế xác thực, quản lý phiên và xử lý JWT.
+- [`03_USER_GATEWAY_AUTHORIZATION.md`](03_USER_GATEWAY_AUTHORIZATION.md): Mô hình phân quyền User–Gateway (`owner`, `operator`, `viewer`).
+- [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md): Hợp đồng REST API người dùng hiện hữu.
+- [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md): Lộ trình tính năng Giai đoạn 3 (Telemetry, History, WebSocket, Digital Twin).
+- [`06_PROJECT_SETUP_AND_ENV.md`](06_PROJECT_SETUP_AND_ENV.md): Hướng dẫn thiết lập môi trường và cấu hình Client.
+- [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md): Hợp đồng REST API quản trị nền tảng (Platform Admin) và chính sách công cụ quản trị.
+- [`08_API_INTEGRATION_AND_STATE_HANDLING.md`](08_API_INTEGRATION_AND_STATE_HANDLING.md): Hướng dẫn tích hợp API, mô hình dữ liệu và quản lý trạng thái Client.
 
 ---
 
-## 1. Mục tiêu ứng dụng Flutter Web
+## 1. Mục tiêu ứng dụng Client (Flutter)
 
-Ứng dụng **Flutter Web** đóng vai trò là bảng điều khiển trung tâm (Dashboard giám sát và vận hành) cho hệ thống IoT Gateway–Server, chạy trực tiếp trên các trình duyệt hiện đại (Chrome, Edge, Firefox, Safari) và tương thích tốt trên desktop, tablet cũng như mobile browser.
+Ứng dụng **Flutter Client** đóng vai trò là giao diện giám sát và vận hành cho hệ thống IoT Gateway–Server:
 
-- **Đối tượng sử dụng:**
-  - **Người dùng cuối / Chủ sở hữu trạm (`owner`):** Theo dõi trạng thái hoạt động, thông số cảm biến, lịch sử dữ liệu và cấu hình thiết bị thuộc quyền quản lý của mình.
-  - **Người vận hành kỹ thuật (`operator`):** Giám sát trạng thái hoạt động tức thời, nhận cảnh báo và thực thi các thao tác vận hành an toàn được cho phép trên trạm được giao.
+- **Đối tượng người dùng ứng dụng:**
+  - **Chủ sở hữu trạm (`owner`):** Theo dõi trạng thái hoạt động, thông số cảm biến và cấu hình thiết bị thuộc quyền quản lý của mình trên trạm được gán.
+  - **Người vận hành kỹ thuật (`operator`):** Giám sát trạng thái hoạt động tức thời trên trạm được giao. (Trong Giai đoạn 2, vai trò này tuân thủ nguyên tắc *fail-closed* chỉ đọc; các lệnh vận hành one-shot an toàn theo allowlist của máy chủ sẽ được triển khai ở giai đoạn sau).
   - **Người xem (`viewer`):** Giám sát dữ liệu đo và trạng thái trạm ở chế độ chỉ đọc (Read-only).
+  - *(Lưu ý về Platform Admin):* Quản trị viên nền tảng (`platform_admins`) chịu trách nhiệm cấp phát Gateway/Sensor, gán quyền thành viên và quản lý chứng thực. Thao tác quản trị chủ yếu sử dụng công cụ dòng lệnh được bảo vệ hoặc Supabase Studio; hệ thống **không yêu cầu** xây dựng ứng dụng Web Admin riêng biệt (xem [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)).
 - **Định hướng nền tảng:**
-  - **Ưu tiên Web trước cho đồ án:** Trong giai đoạn phát triển ban đầu và nghiệm thu Đồ án 1, trọng tâm phát triển được đặt vào **Flutter Web**. Lựa chọn này giúp sinh viên dễ dàng triển khai, trình diễn trực quan trên trình duyệt máy tính, kiểm thử nhanh chóng bằng công cụ Developer Tools mà không phụ thuộc vào thiết bị phần cứng di động chuyên biệt hay máy ảo Android Emulator nặng nề.
-  - **Bảo toàn khả năng đóng gói sang Android:** Mã nguồn được thiết kế chặt chẽ theo kiến trúc phân tầng (Clean Architecture), tách biệt hoàn toàn giữa tầng giao diện, quản lý trạng thái, tầng nghiệp vụ và tầng giao tiếp dữ liệu. Thiết kế độc lập nền tảng này đảm bảo hệ thống có thể đóng gói (build) sang ứng dụng di động Android ở giai đoạn sau mà không phải thay đổi cấu trúc mã nguồn cốt lõi.
-- **Tiêu chí phát triển:**
-  - Đơn giản, hoàn chỉnh và có khả năng giải trình kỹ thuật cao (phù hợp với quy mô Đồ án 1 do một sinh viên thực hiện).
-  - Tách bạch rõ ràng giữa định danh người dùng (Supabase Auth) và phân quyền nghiệp vụ (Go Backend).
+  - **Nền tảng mục tiêu chuẩn theo `AGENTS.md`:** Căn cứ `AGENTS.md` (Mục 3 và Mục 17), nền tảng mục tiêu mặc định cho ứng dụng MVP là **di động (ưu tiên Android)** nhằm phục vụ mục đích kiểm thử và demo đồ án gọn nhẹ, tin cậy.
+  - **Vai trò của Web trong quá trình phát triển:** Việc chạy thử nghiệm trên trình duyệt Web (Flutter Web) trong môi trường phát triển cục bộ là giải pháp hỗ trợ sinh viên kiểm thử nhanh giao diện và theo dõi network qua Developer Tools. Thiết kế kiến trúc phân tầng (Clean Architecture) bảo đảm mã nguồn dùng chung không bị phụ thuộc vào môi trường Web và sẵn sàng đóng gói trực tiếp sang ứng dụng di động Android mà không phải sửa đổi tầng logic cốt lõi.
+- **Ranh giới hiện trạng triển khai:**
+  - Mọi sơ đồ màn hình, BLoC/Cubit và cấu trúc thư mục `lib/` trong tài liệu này là **hướng dẫn thiết kế kiến trúc mục tiêu (guidance / target architecture)**, không phải bằng chứng là mã nguồn Client UI đã hoàn thành triển khai.
+  - Trọng tâm tài liệu này là xác lập ranh giới mạng, ranh giới bảo mật và ma trận endpoint Backend đang thực sự hoạt động để phục vụ tích hợp Client.
 
 ---
 
@@ -27,198 +36,158 @@
 
 ### 2.1. Sơ đồ tổng thể
 
-Khác với ứng dụng di động native, ứng dụng Flutter Web chạy trong môi trường bảo mật của trình duyệt, chịu sự ràng buộc nghiêm ngặt của **Chính sách cùng nguồn gốc (Same-Origin Policy - SOP)** và cơ chế **Chia sẻ tài nguyên liên nguồn gốc (CORS)**.
-
-Toàn bộ lưu lượng mạng từ Flutter Web đi vào hệ thống thông qua một cổng tiếp nhận duy nhất là **Nginx Reverse Proxy** (ở môi trường Production đứng sau Cloudflare Tunnel, hoặc kết nối trực tiếp trong môi trường phát triển cục bộ).
+Mọi yêu cầu mạng từ Client đi vào hạ tầng thông qua **Nginx Reverse Proxy** (chạy tại cổng 80 nội bộ, đứng sau Cloudflare Tunnel trong môi trường triển khai thực tế):
 
 ```text
 +-------------------------------------------------------------------------+
-|                        Flutter Web Client                               |
-|            (Trình duyệt Chrome / Edge / Firefox / Safari)               |
+|                          Flutter Client App                             |
+|          (Android Mobile App / Trình duyệt Web khi chạy dev)            |
 +------------------------------------+------------------------------------+
                                      |
-                                     | HTTP / HTTPS / WSS
+                                     | HTTP / HTTPS
                                      v
 +-------------------------------------------------------------------------+
 |                           Nginx Reverse Proxy                           |
 |                    (Port 80/443, Quản lý định tuyến)                    |
 +---------+----------------+-------------------+----------------+---------+
           |                |                   |                |
-          | /              | /auth/v1/*        | /storage/v1/*  | /v1/* & /v1/ws
+          | /healthz       | /auth/v1/*        | /storage/v1/*  | /v1/*
           v                v                   v                v
 +-------------------+  +-------------------+  +---------------+  +-------------------+
-|  Flutter Web App  |  |    Supabase       |  |   Supabase    |  |    Go Backend     |
-|   (Static Build)  |  |   API Gateway     |  |  API Gateway  |  | (Modular Monolith |
-| HTML/JS/CanvasKit |  |  (Envoy / Kong)   |  | (Envoy / Kong)|  |    Port 8080)     |
+|    Nginx 200 OK   |  |    Supabase       |  |   Supabase    |  |    Go Backend     |
+|   (Direct check)  |  |   API Gateway     |  |  API Gateway  |  | (Modular Monolith |
+|                   |  |  (Envoy :8000)    |  | (Envoy :8000) |  |    Port 8080)     |
 +-------------------+  +---------+---------+  +-------+-------+  +---------+---------+
                                  |                    |                    |
                                  v                    v                    v
                        +-------------------+  +---------------+  +-------------------+
                        |   Supabase Auth   |  |SupabaseStorage|  | PostgreSQL 16 +   |
                        |     (GoTrue)      |  |(Private Bucket|  |   TimescaleDB     |
+                       |   (Port 9999)     |  | (Port 5000)   |  |   (Port 5432)     |
                        +-------------------+  +---------------+  +-------------------+
 ```
 
 ### 2.2. Chi tiết phân luồng qua Nginx
 
-Cấu hình định tuyến tại Nginx (`config/nginx/nginx.conf.template`) quy định rõ ranh giới trách nhiệm cho các dịch vụ:
+Căn cứ tệp cấu hình thực tế `config/nginx/nginx.conf.template` và `docker-compose.yml`:
 
-1. **Phục vụ tệp tĩnh Web Dashboard (`/` hoặc `/dashboard/*`):**
-   - Nginx phục vụ trực tiếp gói mã nguồn tĩnh của Flutter Web (gồm `index.html`, `main.dart.js`, `flutter.js`, `assets/`, font, CanvasKit WASM binaries).
-   - Khi truy cập địa chỉ gốc, trình duyệt tải ứng dụng Web về và thực thi phía Client.
-2. **Xác thực người dùng (`/auth/v1/*`):**
-   - Nginx chuyển tiếp tới Supabase API Gateway (Envoy/Kong), đích đến là dịch vụ `supabase-auth` (GoTrue).
-   - Flutter Web sử dụng `supabase_flutter` SDK để gọi API đăng nhập qua Email/Password, nhận về cặp mã xác thực `access_token` (JWT) và `refresh_token`.
-3. **API Nghiệp vụ (`/v1/*`):**
-   - Nginx chuyển tiếp trực tiếp tới `backend:8080` (Go Backend).
-   - Mọi request nghiệp vụ đều bắt buộc đính kèm header `Authorization: Bearer <access_token>`.
-   - Go Backend xác minh chữ ký JWT tại chỗ (HS256) và truy vấn PostgreSQL để kiểm tra quyền truy cập tài nguyên (User–Gateway membership).
-4. **Dữ liệu thời gian thực (`/v1/ws` hoặc `/v1/telemetry/ws`):**
-   - Nginx nâng cấp kết nối HTTP thành WebSocket (`Upgrade: $http_upgrade`, `Connection: "upgrade"`) và chuyển tới Go Backend.
-   - Trình duyệt Web duy trì kết nối WebSocket để nhận dữ liệu đo mới (telemetry) trực tiếp từ server ngay sau khi transaction lưu trữ cơ sở dữ liệu được commit.
-5. **Lưu trữ tệp đa phương tiện (`/storage/v1/*`):**
-   - Nginx chuyển tiếp tới Supabase API Gateway để vào `supabase-storage`.
-   - Lưu trữ ảnh private (ví dụ ảnh chụp hiện trường từ Gateway).
-   - Flutter Web không truy cập trực tiếp bằng `service_role` key; việc đọc ảnh private bắt buộc thông qua **Signed Read URL** có thời hạn ngắn do Go Backend cấp sau khi kiểm tra quyền người dùng.
+1. **Xác thực người dùng (`/auth/v1/*`):**
+   - Nginx chuyển tiếp tới Supabase API Gateway (`supabase_envoy:8000`), từ đó Envoy chuyển tiếp tới dịch vụ xác thực `supabase-auth` (GoTrue).
+   - Client sử dụng `supabase_flutter` SDK để gọi API đăng nhập (`/auth/v1/token?grant_type=password`), nhận về cặp mã xác thực `access_token` (JWT) và `refresh_token` (xem chi tiết tại [`02_AUTHENTICATION_AND_SESSION.md`](02_AUTHENTICATION_AND_SESSION.md)).
+2. **API Nghiệp vụ Go Backend (`/v1/*`):**
+   - Nginx chuyển tiếp trực tiếp tới `backend:8080` (Go Backend modular monolith).
+   - Yêu cầu nghiệp vụ bắt buộc đính kèm header `Authorization: Bearer <access_token>`.
+   - Go Backend tự xác minh chữ ký JWT tại chỗ (HS256) và đối soát quyền truy cập tài nguyên dựa trên CSDL PostgreSQL (`user_gateways` cho người dùng thường, `platform_admins` cho quản trị viên).
+3. **Lưu trữ tệp đa phương tiện (`/storage/v1/*`):**
+   - Nginx chuyển tiếp tới Supabase API Gateway (Envoy) để tới dịch vụ `supabase-storage`.
+   - Đây là hạ tầng lưu trữ đối tượng private (Private Bucket). Hiện tại Go Backend **chưa triển khai API nghiệp vụ media** (`/v1/media/*`), nên Client chưa có luồng lấy Signed Upload/Read URL từ Go Backend.
+4. **Đường dẫn WebSocket (`/v1/ws` và `/v1/telemetry/ws`):**
+   - Nginx có khối cấu hình `location ~ ^/v1/(ws|telemetry/ws)` chuyển tiếp tới Go Backend và thiết lập header `Upgrade: $http_upgrade`.
+   - **Tuy nhiên, tại Go Backend:** Hiện tại route `/v1/ws` mới chỉ đăng ký dạng **stub 501 Not Implemented**, còn route `/v1/telemetry/ws` **chưa được đăng ký** trong Go router (gọi tới sẽ nhận `404 Not Found`). Do đó Client chưa thể kích hoạt kết nối WebSocket thời gian thực ở giai đoạn này.
+5. **Kiểm tra trạng thái Nginx (`/healthz`):**
+   - Nginx trực tiếp trả về `200 OK` (plain text) cho các bộ cân bằng tải hoặc kịch bản kiểm tra sơ bộ.
+6. **Lưu ý về tệp tĩnh và CORS:**
+   - Cấu hình Nginx hiện hành **không phục vụ tệp tĩnh (No static Flutter Web hosting)**. Không có khối cấu hình `root /usr/share/nginx/html;` cho giao diện Web.
+   - Nginx và Go Backend hiện tại chưa xử lý CORS cho Go API `/v1/*`. Web khác origin cần proxy phát triển cùng origin hoặc cấu hình CORS được phê duyệt và kiểm tra preflight. Không tắt bảo mật trình duyệt để bỏ qua lỗi; xem `06_PROJECT_SETUP_AND_ENV.md`.
 
-### 2.3. Giải pháp giải quyết bài toán CORS trên Web
+### 2.3. Nguyên tắc bảo mật trên Client
 
-Trình duyệt áp dụng chính sách Same-Origin Policy để bảo vệ người dùng. Một request được coi là Cross-Origin khi khác Protocol, Domain hoặc Port so với trang Web đang mở.
-
-1. **Trong môi trường Triển khai Production / Staging (Khuyến nghị chuẩn):**
-   - Bản build tĩnh của Flutter Web (`flutter build web --release`) được Nginx phục vụ trực tiếp tại root domain (hoặc sub-path), ví dụ `https://iot.example.com/`.
-   - Các API Backend (`/v1/*`), Auth (`/auth/v1/*`) và Storage (`/storage/v1/*`) cũng nằm trên **CÙNG MỘT DOMAIN** thông qua Nginx Reverse Proxy.
-   - **Kết quả:** Request từ Flutter Web tới API là **Same-Origin** hoàn toàn, loại bỏ triệt để rủi ro phát sinh lỗi CORS và không cần cấu hình header CORS phức tạp ở backend.
-2. **Trong môi trường Phát triển cục bộ (Local Development):**
-   - Khi chạy lệnh phát triển `flutter run -d chrome --web-port=3000`, Flutter Web chạy trên máy chủ phát triển cục bộ tại `http://localhost:3000`.
-   - Khi ứng dụng gửi request tới Nginx Reverse Proxy tại `http://localhost:80` (hoặc `http://localhost`), đây là request liên cổng (Cross-Origin).
-   - **Giải pháp xử lý:**
-     - Nginx và Go Backend được cấu hình xử lý preflight request (`OPTIONS`) và trả về các header CORS cần thiết:
-       ```http
-       Access-Control-Allow-Origin: http://localhost:3000
-       Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
-       Access-Control-Allow-Headers: Authorization, Content-Type, Accept, apikey, X-Client-Info
-       ```
-     - Hoặc có thể cấu hình Nginx cục bộ để proxy cả cổng của Flutter dev server, đưa toàn bộ về chung một origin `http://localhost:80`.
-
-### 2.4. Nguyên tắc bảo mật trên Client
-
-- **Tuyệt đối không nhúng `service_role` key vào mã nguồn Client:** `service_role` key là khóa quản trị kỹ thuật tối cao của Supabase, chỉ được lưu ở môi trường backend nội bộ. Client chỉ được phép giữ `SUPABASE_ANON_KEY`.
-- **Lưu trữ phiên an toàn trên trình duyệt:** SDK `supabase_flutter` tự động quản lý phiên và lưu trữ token an toàn trong `localStorage` của trình duyệt. Không lưu trữ thông tin nhạy cảm ở các biến toàn cục không được bảo vệ.
-- **JWT hợp lệ không đồng nghĩa với có quyền truy cập:** Token JWT chỉ chứng minh danh tính người dùng (`authenticated`). Mọi quyền đọc/ghi trên từng Gateway đều do Go Backend thẩm định dựa trên bảng `user_gateways` trong cơ sở dữ liệu.
+- **Tuyệt đối không nhúng `service_role` key vào mã nguồn Client:** `service_role` key là khóa quản trị tối cao của Supabase, chỉ được lưu ở môi trường backend nội bộ. Client chỉ được phép giữ `SUPABASE_ANON_KEY`.
+- **Rủi ro bảo mật lưu trữ Web Storage (`localStorage`):**
+  - Trên nền tảng Web, SDK `supabase_flutter` mặc định lưu trữ phiên làm việc vào `localStorage` của trình duyệt. Cần nhận thức rõ: **`localStorage` không an toàn tuyệt đối trước các cuộc tấn công XSS (Cross-Site Scripting)** nếu mã nguồn ứng dụng hoặc thư viện bên thứ ba bị chèn mã độc.
+  - Trên nền tảng di động Android (nền tảng mục tiêu chính của đồ án), token cần được lưu trữ thông qua cơ chế lưu trữ bảo mật của hệ điều hành (`EncryptedSharedPreferences` / Android Keystore) thông qua các plugin an toàn như `flutter_secure_storage`.
+- **JWT hợp lệ không đồng nghĩa với có quyền truy cập:** Token JWT chỉ chứng minh danh tính người dùng (`authenticated`). Mọi quyền đọc/ghi trên từng Gateway đều do Go Backend thẩm định dựa trên bảng `user_gateways` trong PostgreSQL.
 - **Không tự tin cậy dữ liệu phía client:** Mọi tham số như `user_id` không được truyền qua URL query hay request body để đòi quyền. Go Backend lấy `user_id` duy nhất từ claim `sub` của JWT đã xác minh.
 
 ---
 
-## 3. Phạm vi chức năng hiện tại (Giai đoạn 2)
+## 3. Hiện trạng API Backend và Ma trận Endpoint (Stage 2 Baseline)
 
-Trong Giai đoạn 2 của dự án, ứng dụng Flutter Web tập trung hoàn thiện các tính năng nền tảng sau:
+Hệ thống Backend đã hoàn thành kiểm chứng tích hợp Giai đoạn 2 (Local E2E 27/27 kịch bản PASS, CI Review APPROVED, đang chờ xác nhận Remote Final SHA). Tính năng quản trị vòng đời chứng thực MQTT (cờ triển khai `MQTT_CREDENTIAL_API_ENABLED=false`, mã hóa trong Go router qua `deps.CredentialAPIEnabled`) mặc định **TẮT (disabled)** trong môi trường triển khai chuẩn.
 
-### 3.1. Đăng nhập tập trung (Centralized Authentication)
-- Màn hình đăng nhập yêu cầu Email và Password với giao diện đáp ứng (responsive), hiển thị tối ưu trên cả desktop lẫn màn hình di động.
-- Gọi trực tiếp API của Supabase Auth qua SDK (`supabase.auth.signInWithPassword(...)`).
-- Quản lý phiên làm việc (`access_token` và `refresh_token`), tự động làm mới token trong nền khi gần hết hạn (thời gian sống mặc định 3600 giây).
-- Đăng xuất (Sign out): Hủy session tại Supabase Auth và làm sạch dữ liệu phiên trong bộ nhớ trình duyệt.
+Dưới đây là ma trận phân định chính xác giữa các endpoint **đã triển khai**, các endpoint **stub 501**, và các endpoint **chưa đăng ký (404)**:
 
-### 3.2. Danh sách Gateway theo phân quyền (`GET /v1/gateways`)
-- Gọi tới Go Backend để lấy danh sách các Gateway mà người dùng hiện tại có quyền truy cập.
-- **Contract phản hồi:**
-  ```json
-  {
-    "items": [
-      {
-        "gateway_id": "gw-lab-01",
-        "name": "Trạm quan trắc Phòng Thí Nghiệm",
-        "description": "Gateway AM5728 đo rung và nhiệt độ",
-        "role": "owner",
-        "created_at": "2026-10-02T08:30:00Z"
-      }
-    ]
-  }
-  ```
-- Hiển thị vai trò của người dùng trên từng Gateway (`owner`, `operator`, `viewer`) dưới dạng nhãn trực quan.
-- Trường hợp người dùng chưa được phân quyền Gateway nào: hiển thị danh sách rỗng (`items: []`) kèm thông báo hướng dẫn liên hệ quản trị viên.
+| Nhóm chức năng | Phương thức & Đường dẫn | Quyền truy cập | Trạng thái hiện tại | Hành vi kỹ thuật |
+|---|---|---|---|---|
+| **Health & Readiness** | `GET /healthz` | Public (Không cần Auth) | **Đã triển khai** | Trả về `200 OK` (plain text `"OK"`). |
+| | `GET /readyz` | Public (Không cần Auth) | **Đã triển khai** | Kiểm tra kết nối CSDL; trả `200 {"status": "ready"}` hoặc `503 {"error": "service_unavailable"}` nếu mất CSDL. |
+| | `GET /v1/health` | Public (Không cần Auth) | **Đã triển khai** | Trả về `200 {"status": "running", "service": "iot-backend", "version": "v1"}`. |
+| **User Gateway & Sensor** | `GET /v1/gateways` | Authenticated (JWT) | **Đã triển khai** | Trả danh sách Gateway mà user có quyền (`user_gateways`). Nếu chưa được gán trạm nào: trả `200 {"items": []}`. Chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md). |
+| | `GET /v1/gateways/:gateway_id/sensors` | Authenticated (JWT) | **Đã triển khai** | Trả danh sách sensor của trạm. Trả `404 Not Found` nếu trạm không tồn tại hoặc user không thuộc trạm đó. Chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md). |
+| **Admin Provisioning** | `PUT /v1/admin/gateways/:gateway_id` | Platform Admin | **Đã triển khai** | Tạo Gateway (`201`) hoặc replay payload trùng khớp (`200`); thay đổi bản ghi hiện hữu trả `409`, không phải API cập nhật. Non-admin nhận `403`. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| | `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Platform Admin | **Đã triển khai** | Tạo Sensor (`201`) hoặc replay trùng khớp (`200`); payload khác trả `409`. Non-admin nhận `403`. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin MQTT Credential** | `GET /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Lấy metadata chứng thực MQTT. Trả về `503 credential_runtime_disabled` khi tắt cờ triển khai (`MQTT_CREDENTIAL_API_ENABLED=false`). Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| | `POST /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Cấp mới chứng thực MQTT (trả secret 1 lần duy nhất). Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| | `POST /v1/admin/gateways/:gateway_id/mqtt-credential/rotate` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Xoay vòng chứng thực MQTT (trả secret mới 1 lần). Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| | `DELETE /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Thu hồi chứng thực MQTT của trạm. Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Authenticated Stubs** | `GET /v1/telemetry/history` | Authenticated (JWT) | **Stub 501** | Trả về `501 Not Implemented` (`{"error": "not_implemented", "message": "endpoint not implemented"}`). Lộ trình tại [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md). |
+| | `GET /v1/ws` | Authenticated (JWT) | **Stub 501** | Trả về `501 Not Implemented` (`{"error": "not_implemented", "message": "endpoint not implemented"}`). Lộ trình tại [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md). |
+| | `GET /v1/digital-twins` | Authenticated (JWT) | **Stub 501** | Trả về `501 Not Implemented` (`{"error": "not_implemented", "message": "endpoint not implemented"}`). Lộ trình tại [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md). |
+| **Chưa đăng ký (Unregistered)** | `GET /v1/telemetry/ws` | Bất kỳ | **Chưa đăng ký (404)** | Không có route trong Go backend. Gin NoRoute trả về `404 Not Found`. |
+| | `GET /v1/media/*` hoặc `/v1/gateways/:id/media` | Bất kỳ | **Chưa đăng ký (404)** | Chưa có Go Media API. Supabase Storage tồn tại ở mức hạ tầng, chưa mở qua nghiệp vụ Go. |
+| | Mọi route khác ngoài bảng trên | Bất kỳ | **Chưa đăng ký (404)** | Trả về `404 Not Found` (`{"error": "not_found", "message": "resource not found"}`). |
 
-### 3.3. Danh sách Sensor theo Gateway (`GET /v1/gateways/{gateway_id}/sensors`)
-- Khi người dùng chọn một Gateway cụ thể, ứng dụng điều hướng sang màn hình chi tiết và gọi API lấy danh sách sensor trực thuộc:
-- **Contract phản hồi:**
-  ```json
-  {
-    "gateway_id": "gw-lab-01",
-    "items": [
-      {
-        "sensor_id": "sensor-temp-01",
-        "name": "Cảm biến nhiệt độ môi trường",
-        "unit": "°C",
-        "created_at": "2026-10-02T08:35:00Z"
-      }
-    ]
-  }
-  ```
-- Xử lý mã lỗi chuẩn từ Backend:
-  - `401 Unauthorized`: Token hết hạn hoặc không hợp lệ -> Điều hướng người dùng về màn hình đăng nhập.
-  - `404 Not Found`: Gateway không tồn tại hoặc người dùng không có quyền truy cập (Backend trả cùng lỗi 404 để bảo toàn tính cô lập dữ liệu).
+> **Ghi chú về Công cụ Quản trị Nền tảng:**
+> Hệ thống áp dụng chính sách quản trị tập trung. Các thao tác quản trị nền tảng (gán quyền membership, cấp phát Gateway, xoay vòng chứng thực) được thực thi thông qua công cụ dòng lệnh được bảo vệ (`scripts/manage-gateway-membership.sh`, `scripts/bootstrap-platform-admin.sh`) hoặc Supabase Studio. Các API `/v1/admin/*` là giao diện lập trình tùy chọn dành cho quản trị viên, **không bắt buộc xây dựng giao diện người dùng Web Admin riêng**. Xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md).
 
 ---
 
 ## 4. Các tính năng ngoài phạm vi (Deferred) hoặc chờ giai đoạn sau
 
-Nhằm đảm bảo hoàn thành MVP đúng hạn và đúng định hướng kiến trúc tại `AGENTS.md`, các tính năng sau **không** thuộc phạm vi triển khai của Client ở giai đoạn hiện tại:
+Căn cứ `AGENTS.md` (Mục 2 và Mục 6.5), các tính năng sau **không** thuộc phạm vi triển khai của Client ở giai đoạn hiện tại:
 
 1. **Không có chức năng Đăng ký tài khoản công khai (Public Self-Signup Disabled):**
-   - Hệ thống áp dụng chính sách quản trị tập trung (`GOTRUE_DISABLE_SIGNUP=true`). Tài khoản người dùng được cấp phát độc quyền bởi Platform Administrator thông qua Supabase Studio hoặc công cụ quản trị nội bộ.
-   - Giao diện Client **không có nút "Đăng ký" (Sign Up)**. Không tạo form đăng ký tự do.
+   - Hệ thống áp dụng chính sách quản trị tập trung (`GOTRUE_DISABLE_SIGNUP=true`). Tài khoản người dùng được cấp phát độc quyền bởi Platform Administrator qua Supabase Studio hoặc công cụ quản trị nội bộ.
+   - Giao diện Client **tuyệt đối không có nút hoặc form "Đăng ký" (Sign Up)**.
 2. **Không có tính năng Tự nhận Gateway (No Gateway Self-Claiming):**
    - Người dùng không thể tự nhập mã Gateway để chiếm quyền sở hữu. Quan hệ sở hữu và vận hành (`user_gateways`) do Platform Administrator thiết lập tập trung.
-3. **Chưa triển khai lệnh điều khiển hai chiều phức tạp (Device Downlink Control Deferred):**
-   - Chưa tích hợp gửi lệnh cấu hình `desired_state` hay các lệnh one-shot (như reboot, capture-image) trên giao diện Client.
-   - Toàn bộ cơ chế Digital Twin Command & Transactional Outbox thuộc phạm vi phát triển Backend Giai đoạn 3; Client hiện fail-closed ở chế độ chỉ đọc dữ liệu Gateway/Sensor.
+3. **Chưa triển khai lệnh điều khiển hai chiều (Device Downlink Control Deferred):**
+   - Chưa tích hợp gửi lệnh cấu hình `desired_state` hay các lệnh one-shot (reboot, capture-image) trên giao diện Client. Phân hệ Digital Twin Command & Transactional Outbox thuộc Giai đoạn 3.
 4. **Không phát video trực tiếp (No Live-streaming / No Media Server):**
-   - Hệ thống không hỗ trợ WebRTC, RTSP hay HLS streaming.
-   - Phân hệ Media chỉ phục vụ ảnh tĩnh chụp theo sự kiện thông qua Supabase Storage.
+   - Hệ thống không hỗ trợ WebRTC, RTSP hay HLS streaming. Phân hệ Media chỉ phục vụ ảnh tĩnh chụp theo sự kiện khi phân hệ media backend được hoàn thiện.
 5. **Không dùng gRPC hay gRPC-Web:**
-   - Client giao tiếp thuần túy qua REST (JSON) và WebSocket chuẩn của nền tảng web.
+   - Client giao tiếp thuần túy qua REST (JSON) và WebSocket chuẩn khi được kích hoạt.
+6. **Không xây dựng ứng dụng Web Admin riêng biệt:**
+   - Việc quản trị nền tảng không yêu cầu giao diện Web Admin; Platform Admin sử dụng công cụ quản trị nội bộ đã được kiểm chứng.
 
 ---
 
 ## 5. Cấu hình môi trường Client (.env)
 
-### 5.1. Các biến môi trường bắt buộc
+### 5.1. Các biến môi trường bắt buộc (Sử dụng Placeholder an toàn)
 
-Ứng dụng sử dụng compile-time environment variables qua cờ `--dart-define` (hoặc gói cấu hình môi trường) để quản lý cấu hình. File cấu hình `.env` cho Client được thiết lập:
+Ứng dụng Client sử dụng cấu hình biến môi trường dạng placeholder (tuyệt đối không hardcode bí mật, token thật hay đường dẫn máy cá nhân):
 
 ```ini
-# Base URL của Go Backend REST API (phải có tiền tố /v1)
-# Trong môi trường Local Web, kết nối qua Nginx reverse proxy tại localhost:80
+# Base URL của Go Backend REST API (tiền tố /v1)
+# Kết nối qua Nginx reverse proxy tại cổng 80 của môi trường triển khai
 BACKEND_API_BASE_URL=http://localhost/v1
 
 # URL của Supabase API Gateway (phục vụ Auth & Storage)
 SUPABASE_URL=http://localhost
 
-# Khóa công khai của Supabase (Anonymous Key - an toàn khi nhúng Client Web)
-SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+# Khóa công khai của Supabase (Anonymous Key - an toàn khi nhúng Client)
+# Sử dụng giá trị placeholder an toàn; thay thế bằng khóa thật từ môi trường triển khai
+SUPABASE_ANON_KEY=your-supabase-anon-key-placeholder
 
-# WebSocket URL phục vụ dữ liệu thời gian thực
+# WebSocket URL phục vụ dữ liệu thời gian thực (hiện đang stub 501 tại backend)
 BACKEND_WS_URL=ws://localhost/v1/ws
 ```
 
-> **Lưu ý quan trọng về địa chỉ mạng:**  
-> Không sử dụng địa chỉ `10.0.2.2` trên Flutter Web. Địa chỉ `10.0.2.2` là alias nội bộ dành riêng cho Android Emulator. Khi chạy trên trình duyệt Web (Chrome/Edge/Firefox), máy khách chính là máy host, do đó địa chỉ trỏ tới Nginx proxy cục bộ là `http://localhost` (cổng 80) hoặc `http://localhost:<nginx_port>`. Khi triển khai Production cùng domain, có thể sử dụng relative URL hoặc domain chính thức.
-
-### 5.2. Cấu hình địa chỉ mạng theo môi trường chạy
-
-| Môi trường chạy | Địa chỉ Nginx / Backend (`BACKEND_API_BASE_URL`) | Địa chỉ Supabase (`SUPABASE_URL`) | Ghi chú kỹ thuật |
-|---|---|---|---|
-| **Flutter Web Local Dev** | `http://localhost/v1` | `http://localhost` | Web chạy trên trình duyệt qua `flutter run -d chrome`. Trỏ tới Nginx cổng 80. |
-| **Flutter Web Production** | `https://iot.example.com/v1` (hoặc `/v1`) | `https://iot.example.com` | Web build tĩnh được phục vụ chung domain qua Nginx. Triệt tiêu hoàn toàn CORS. |
-| **Android Emulator (Dự phòng mở rộng)** | `http://10.0.2.2/v1` | `http://10.0.2.2` | Dành riêng cho kịch bản đóng gói Android sau này. `10.0.2.2` trỏ về máy host. |
-| **Thiết bị thật / LAN (Dự phòng)** | `http://192.168.1.x/v1` | `http://192.168.1.x` | Thiết bị cầm tay và máy tính cùng chung một lớp mạng Wi-Fi nội bộ. |
+> **Lưu ý quan trọng về địa chỉ mạng:**
+>
+> - Khi chạy trên **Android Emulator**, địa chỉ trỏ về máy host chạy Docker/Nginx là `http://10.0.2.2/v1` và `http://10.0.2.2`.
+> - Khi chạy trên **Trình duyệt Web (Local Dev)**, địa chỉ trỏ về Nginx là `http://localhost/v1` và `http://localhost`.
+> - Khi chạy trên **Thiết bị thật qua mạng LAN**, sử dụng địa chỉ IP nội bộ của máy host, ví dụ `http://192.168.1.x/v1`.
+> - Khi chạy trên **Production**, sử dụng domain định tuyến qua Nginx/Cloudflare, ví dụ `https://api.example.com/v1`.
+>
+> Chi tiết hướng dẫn thiết lập biến môi trường xem tại [`06_PROJECT_SETUP_AND_ENV.md`](06_PROJECT_SETUP_AND_ENV.md).
 
 ---
 
 ## 6. Kiến trúc phân tầng mã nguồn Client đề xuất
 
-Để đảm bảo mã nguồn dễ bảo trì, dễ viết kiểm thử đơn vị (Unit Test) và giữ khả năng đóng gói đa nền tảng (Web trước, mở rộng Android sau) mà không phải viết lại code, ứng dụng được tổ chức theo kiến trúc phân tầng chuẩn (**Clean Architecture thực dụng cho Flutter**):
+Để bảo đảm mã nguồn dễ bảo trì, dễ viết kiểm thử đơn vị (Unit Test) và giữ khả năng đóng gói đa nền tảng (trực tiếp lên Android và hỗ trợ Web khi cần), kiến trúc phân tầng đề xuất cho Client được tổ chức theo mô hình **Clean Architecture thực dụng**:
 
 ```text
 +-------------------------------------------------------------------------+
@@ -244,37 +213,26 @@ BACKEND_WS_URL=ws://localhost/v1/ws
                                      v
 +-------------------------------------------------------------------------+
 |                            Data Source Layer                            |
-|    (Supabase Client SDK, Go Backend HTTP Client, Web Storage Adapter)   |
+|    (Supabase Client SDK, Go Backend HTTP Client, Secure Storage)        |
 +-------------------------------------------------------------------------+
 ```
 
 ### 6.1. Chi tiết các tầng
 
 1. **Presentation Layer (Tầng Giao diện):**
-   - **Screens/Pages:** `LoginScreen`, `GatewayListScreen`, `SensorListScreen`. Được thiết kế hỗ trợ Responsive Layout (co giãn tốt theo chiều rộng màn hình từ PC đến điện thoại).
-   - **Widgets:** Các thành phần UI dùng lại như `GatewayCard`, `SensorListItem`, `RoleBadge`, `ErrorStateView`, `LoadingIndicator`.
-   - Lớp này hoàn toàn không chứa business logic hay gọi HTTP trực tiếp; chỉ phát sự kiện và lắng nghe trạng thái từ BLoC/Cubit để vẽ UI.
+   - **Screens/Pages:** `LoginScreen`, `GatewayListScreen`, `SensorListScreen`.
+   - **Widgets:** `GatewayCard`, `SensorListItem`, `RoleBadge`, `ErrorStateView`, `LoadingIndicator`.
+   - Lớp này không chứa business logic hay gọi HTTP trực tiếp; chỉ phát sự kiện và lắng nghe trạng thái từ BLoC/Cubit để vẽ giao diện.
 2. **State Management Layer (Tầng Quản lý Trạng thái):**
-   - Khuyến nghị sử dụng thư viện chuẩn công nghiệp: `flutter_bloc` (hoặc Cubit cho các luồng đơn giản). Hoạt động hoàn toàn độc lập với nền tảng hiển thị (Web hay Mobile).
-   - **`AuthBloc`:** Quản lý trạng thái xác thực người dùng:
-     - Trạng thái: `AuthInitial`, `AuthLoading`, `Authenticated(user)`, `Unauthenticated`, `AuthFailure(error)`.
-   - **`GatewayListCubit`:** Quản lý danh sách Gateway:
-     - Trạng thái: `GatewayListLoading`, `GatewayListLoaded(items)`, `GatewayListEmpty`, `GatewayListError(error)`.
-   - **`SensorListCubit`:** Quản lý danh sách Sensor theo Gateway:
-     - Trạng thái: `SensorListLoading`, `SensorListLoaded(gatewayId, items)`, `SensorListError(error)`.
+   - Khuyến nghị sử dụng `flutter_bloc` (hoặc Cubit cho các luồng đơn giản), hoạt động độc lập với nền tảng hiển thị.
+   - Chi tiết về mô hình trạng thái, quản lý vòng đời dữ liệu và luồng xử lý lỗi được trình bày cụ thể tại [`08_API_INTEGRATION_AND_STATE_HANDLING.md`](08_API_INTEGRATION_AND_STATE_HANDLING.md).
 3. **Domain & Repository Layer (Tầng Nghiệp vụ & Kho dữ liệu):**
-   - **Models / Entities:** `UserModel`, `GatewayModel`, `SensorModel`. Các model có phương thức chuyển đổi `fromJson` khớp chính xác với JSON contract của Backend.
-   - **`AuthRepository`:** Định nghĩa các hợp đồng nghiệp vụ xác thực (đăng nhập, đăng xuất, lấy session hiện tại).
-   - **`GatewayRepository`:** Chịu trách nhiệm lấy danh sách Gateway và danh sách Sensor; chuyển đổi lỗi mạng (Network/HTTP status) thành Domain Exceptions dễ hiểu (`UnauthorizedException`, `ResourceNotFoundException`, `ServerException`).
-4. **Data Source Layer (Tầng Nguồn dữ liệu & Tương thích Nền tảng):**
-   - **`SupabaseAuthDataSource`:** Đóng gói tương tác với `Supabase.instance.client.auth`. Trên Web, SDK tự động sử dụng trình lưu trữ phiên tích hợp (`localStorage` của trình duyệt) mà không cần cấu hình native phức tạp.
-   - **`BackendApiClient`:** Đóng gói HTTP client (sử dụng thư viện `dio` hoặc `http`). Trên Web, các client này tự động chuyển đổi sang các cuộc gọi `fetch`/`XMLHttpRequest` tương thích trình duyệt. Cấu hình tự động chèn header:
-     ```http
-     Authorization: Bearer <current_supabase_access_token>
-     Content-Type: application/json
-     Accept: application/json
-     ```
-   - **`AppStorageService`:** Trừu tượng hóa cơ chế lưu trữ cục bộ. Trên Web, sử dụng Web Storage (`localStorage` / `shared_preferences`); khi chuyển sang Android/iOS, có thể cắm triển khai bằng Keystore / Keychain thông qua cùng một giao diện interface mà không làm thay đổi tầng Domain/Logic.
+   - **Models / Entities:** `UserModel`, `GatewayModel`, `SensorModel`. Các model có phương thức chuyển đổi `fromJson` khớp chính xác với JSON contract của Backend (xem [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md)).
+   - **Repositories:** Chịu trách nhiệm tương tác Data Source và chuyển đổi mã lỗi HTTP thành Domain Exceptions (`UnauthorizedException`, `ResourceNotFoundException`, `ServerException`).
+4. **Data Source Layer (Tầng Nguồn dữ liệu & Lưu trữ an toàn):**
+   - **`SupabaseAuthDataSource`:** Đóng gói tương tác với `Supabase.instance.client.auth` (xem [`02_AUTHENTICATION_AND_SESSION.md`](02_AUTHENTICATION_AND_SESSION.md)).
+   - **`BackendApiClient`:** Đóng gói HTTP client (sử dụng thư viện `dio` hoặc `http`). Cấu hình tự động chèn header `Authorization: Bearer <token>`.
+   - **`SecureStorageService`:** Trừu tượng hóa lưu trữ khóa/token an toàn (sử dụng Keystore/EncryptedSharedPreferences trên Android và Web Storage có cảnh báo XSS trên Web).
 
 ### 6.2. Cấu trúc thư mục mã nguồn đề xuất (`lib/`)
 
@@ -282,11 +240,11 @@ BACKEND_WS_URL=ws://localhost/v1/ws
 lib/
 ├── main.dart                   # Điểm khởi chạy ứng dụng, nạp biến môi trường, cấu hình DI/BlocProviders
 ├── core/
-│   ├── constants/              # Các hằng số API endpoints, storage keys
-│   ├── errors/                 # Định nghĩa các Exception và Failure chuẩn
-│   ├── network/                # HTTP Client, Auth Interceptor, Network Info
-│   ├── storage/                # Trừu tượng hóa LocalStorage / SecureStorage
-│   ├── theme/                  # Định nghĩa màu sắc, typography, responsive breakpoints
+│   ├── constants/              # Hằng số API endpoints, storage keys
+│   ├── errors/                 # Định nghĩa Exception và Failure chuẩn
+│   ├── network/                # HTTP Client, Auth Interceptor
+│   ├── storage/                # Trừu tượng hóa SecureStorage / LocalStorage
+│   ├── theme/                  # Định nghĩa màu sắc, typography
 │   └── utils/                  # Format ngày tháng (RFC3339), validator
 ├── data/
 │   ├── datasources/            # Tầng gọi API / SDK thô
@@ -320,7 +278,6 @@ lib/
         ├── common_button.dart
         ├── error_banner.dart
         ├── loading_overlay.dart
-        ├── responsive_layout.dart
         └── role_badge.dart
 ```
 
@@ -328,12 +285,11 @@ lib/
 
 ## 7. Tóm tắt kế hoạch kiểm thử và nghiệm thu Client
 
-1. **Kiểm thử trên trình duyệt (Web Testing):**
-   - Thực thi ứng dụng trên Chrome/Edge/Firefox, kiểm tra tab Console và Network trong Developer Tools để xác nhận không phát sinh lỗi script, lỗi tải WASM/CanvasKit hoặc chặn CORS.
-2. **Kiểm thử xác thực:** Đăng nhập thành công với tài khoản được Admin cấp trước; thử nghiệm đăng nhập sai mật khẩu; kiểm tra token được lưu trữ an toàn trong Web Storage và tự động đính kèm Bearer token vào các request `/v1/*`.
-3. **Kiểm thử đọc dữ liệu phân quyền:**
-   - Tài khoản có quyền `owner`/`operator`/`viewer` trên Gateway A: Hiển thị đúng Gateway A và danh sách Sensor của Gateway A.
-   - Tài khoản không có quyền trên Gateway B: Không nhìn thấy Gateway B trong danh sách; nếu cố tình request ID của Gateway B thì nhận lỗi `404 Not Found` và ứng dụng hiển thị thông báo lỗi thân thiện.
-   - Tài khoản mới chưa gán Gateway: Hiển thị giao diện rỗng một cách rõ ràng, không bị crash hoặc treo màn hình.
-4. **Kiểm thử xử lý mất phiên (Token Expiry):** Khi access token hết hạn và không thể refresh, client phải hủy phiên lưu trữ trong trình duyệt và chủ động điều hướng người dùng về màn hình đăng nhập.
-5. **Kiểm tra tính tương thích Responsive:** Kiểm tra giao diện co giãn hiển thị tốt ở cả kích thước màn hình máy tính để bàn (Desktop viewport) và kích thước mô phỏng màn hình di động (Mobile viewport).
+1. **Kiểm thử xác thực:** Đăng nhập thành công với tài khoản được cấp trước; kiểm tra xử lý mật khẩu sai; xác nhận token được lưu trữ an toàn và tự động đính kèm vào header các request `/v1/*`.
+2. **Kiểm thử đọc dữ liệu phân quyền:**
+   - Tài khoản có quyền trên Gateway A: Hiển thị đúng Gateway A và danh sách Sensor của Gateway A.
+   - Tài khoản không có quyền trên Gateway B: Không thấy Gateway B; nếu gọi trực tiếp ID của Gateway B thì nhận `404 Not Found`.
+   - Tài khoản chưa gán Gateway: Hiển thị danh sách rỗng (`items: []`), không crash.
+3. **Kiểm thử xử lý mất phiên (Token Expiry):** Khi access token hết hạn và không thể làm mới, ứng dụng điều hướng an toàn về màn hình đăng nhập.
+4. **Kiểm thử mã phản hồi đặc biệt:** Ứng dụng xử lý đúng phản hồi `501 Not Implemented` khi người dùng truy cập các tính năng thuộc giai đoạn sau (lịch sử đo, telemetry stream) với thông báo phù hợp thay vì báo lỗi mất kết nối mạng.
+5. **Đồng bộ với hiện trạng kiểm thử Backend:** Phân hệ Backend đã vượt qua 27/27 kịch bản E2E kiểm chứng chuỗi xác thực, phân quyền và cô lập dữ liệu. Các kịch bản kiểm thử Client cần bám sát các trường hợp kiểm thử này để bảo đảm tính nhất quán toàn hệ thống.

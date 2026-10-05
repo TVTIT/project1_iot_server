@@ -17,7 +17,7 @@ Tất cả 4 endpoint quản trị đều được đăng ký dưới nhóm rout
 1. **Xác thực danh tính (Authentication):** Header `Authorization: Bearer <human_jwt>` hợp lệ cấp bởi Supabase Auth (role `authenticated`, đúng issuer/audience/thời hạn).
 2. **Ủy quyền nền tảng (Authorization):** Actor `user_id` phải tồn tại trong bảng `public.platform_admins` trên PostgreSQL. Quyền sở hữu Gateway (`owner`), vận hành (`operator`) hay người xem (`viewer`) trong `user_gateways` **KHÔNG CÓ QUYỀN** quản lý credential và sẽ nhận `403 Forbidden`.
 3. **Chống lưu đệm (Anti-Caching):** Middleware `credentialCacheMiddleware` tự động gán `Cache-Control: no-store` và `Pragma: no-cache` cho toàn bộ các request vào prefix credential.
-4. **Không nhận body (Strict No-Body):** Mọi request mutation (POST, DELETE) cũng như GET metadata đều bị từ chối với `400 Bad Request` hoặc `413 Request Entity Too Large` nếu có payload body (giới hạn `AdminMaxBodyBytes = 0` byte).
+4. **Không nhận body (Strict No-Body):** GET/POST/DELETE đều không nhận body hoặc query. Body không rỗng, kể cả whitespace, nhận `400`; vượt giới hạn cấu hình `ADMIN_MAX_BODY_BYTES` nhận `413`. `AdminMaxBodyBytes` không phải 0: mặc định 16 KiB, tối đa 1 MiB, dùng làm giới hạn đọc trước khi kiểm tra empty-body.
 5. **Idempotency bắt buộc cho Mutation:** Cả 3 hành động thay đổi trạng thái (Provision, Rotate, Revoke) bắt buộc truyền header `Idempotency-Key: <UUIDv4/UUIDv7>`. Không nhận key rỗng/sai cú pháp hoặc truyền lặp lại header.
 6. **Bảo mật phản hồi lỗi:** Khi gặp lỗi nghiệp vụ hoặc adapter, API trả về mã lỗi an toàn từ `DomainError`. Tuyệt đối **không tự bịa đặt `operation_id`** trong error envelope khi tầng service chưa xác nhận bản ghi intent bền vững.
 
@@ -47,13 +47,16 @@ Hệ thống phân định rạch ròi 4 khái niệm dữ liệu và vòng đ�
 [Native Snapshot Readback & Positive Verification] (dynamic-security.json & TLS Probe)
                  │
                  ▼
-[Terminal DB Finalization & One-Time Secret Output] (API Response: ClearSecret in RAM)
+[Terminal DB Finalization] → [Verified OPEN & Completed Maintenance]
+                 │
+                 ▼
+[One-Time Secret Output] (ClearSecret clears references, not physical zeroization)
                  │
                  ▼
 [Manual Offline USB / Encrypted Hardware Handoff] (Operator Physical Action -> Device Flash)
 ```
 
-1. **Thẩm quyền Nghiệp vụ (Desired Credential Authority):** Lưu trữ tại PostgreSQL (`gateway_mqtt_credentials` và `gateway_mqtt_credential_events`). PostgreSQL là nguồn thẩm quyền duy nhất (sole business authority). Tuyệt đối **KHÔNG lưu trữ mật khẩu plaintext hay password hash** trong database.
+1. **Thẩm quyền Nghiệp vụ (Desired Credential Authority):** Lưu tại PostgreSQL (`gateway_mqtt_credentials` và `gateway_mqtt_credential_events`). Business DB không lưu mật khẩu plaintext/hash; native DynSec store giữ dữ liệu xác thực của broker. `ClearSecret()` loại bỏ tham chiếu trong DTO, không bảo đảm xóa vật lý mọi bản sao trong bộ nhớ Go/HTTP.
 2. **Chốt chặn Bảo trì (Maintenance Checkpoint & Fence):** Bảng `public.mqtt_credential_maintenance` ghi nhận trạng thái cửa sổ bảo trì (`in_progress`, `completed`, `recovery_needed`). Mọi mutation đều có fence epoch/nonce; trạng thái `terminal success` của operation trên DB không đồng nghĩa với việc Ingress Gate đã `OPEN`.
 3. **Bản ghi Phục hồi Liên kết (Linked Recovery Record):** Bảng `public.mqtt_credential_recovery` liên kết chặt chẽ với operation cần phục hồi qua `recovery_id`. Bản ghi này bảo toàn lịch sử kiểm toán (audit trail), không bao giờ ghi đè hoặc xóa event gốc.
 4. **Bàn giao Thiết bị (Device Handoff Receipt):** Việc nạp mật khẩu mới vào bộ nhớ mã hóa của Gateway (ESP32 NVS, Luckfox/AM5728 flash) được thực hiện thủ công offline qua USB bởi operator. **Tuyệt đối KHÔNG gửi mật khẩu tới Gateway qua MQTT**. Phản hồi API thành công (`terminal success`) chỉ xác nhận broker đã nạp và verify; trạng thái bàn giao thiết bị (`delivery_status`) vẫn là `unknown` cho đến khi có biên nhận nạp phần cứng độc lập.
@@ -66,15 +69,15 @@ Hệ thống phân định rạch ròi 4 khái niệm dữ liệu và vòng đ�
    - Khi tiến trình Go Backend hoặc Mosquitto khởi động, Ingress Gate (proxy TCP/TLS kiểm soát ingress của Gateway) mặc định ở trạng thái `CLOSED`. Cổng này đóng toàn bộ lưu lượng Gateway từ cổng host ngoài lẫn Rathole reverse tunnel.
    - Trạng thái đóng được giữ vững trước khi kết nối cơ sở dữ liệu được thiết lập và trước khi quy trình đối soát khởi động hoàn tất.
 2. **Quy trình Đối soát Khởi động (Startup Reconciliation):**
-   - Bộ đối soát (`StartupReconciler`) đọc danh sách các quyết định thu hồi (`revoked`) bền vững từ PostgreSQL theo từng trang (`BatchSize=64`, giới hạn `MaxPages=16`, bound bởi `ReconcileTimeout`).
-   - Lệnh vô hiệu hóa (`DisableStartup`) được áp dụng lên DynSec RAM qua kênh quản trị nội bộ (`$CONTROL/dynamic-security/v1`), đối chiếu trạng thái RAM (`disabled=true`) và đọc lại file snapshot native trên đĩa (`dynamic-security.json`).
+   - `StartupReconciler` quét unresolved operations, unfinished maintenance (kể cả event đã succeeded), pending recovery, durable revokes và current inventory. Batch/max-pages/timeouts cấu hình được; mặc định batch 64, max-pages 16. Scan thiếu hoặc cạn budget không được coi là inventory sạch.
+   - `DisableStartup` đối chiếu RAM disabled và protected snapshot. Principal vắng mặt chỉ được chấp nhận với correlated native not-found và protected snapshot absence trong đúng epoch; generic error/file không đọc được không phải bằng chứng absence. Snapshot observed không phải fsync/power-loss proof.
    - Kiểm tra xác thực tài khoản nội bộ `backend_service` và manager trên listener nội bộ của broker trong cùng epoch khởi động.
 3. **Điều kiện MỞ (OPEN Barrier):**
    - Chỉ khi toàn bộ danh sách thu hồi được xác minh thành công, snapshot đồng nhất và chu kỳ broker chứng minh đúng `epoch` và `nonce` khớp với checkpoint, Ingress Gate mới mở cổng cho Gateway kết nối (`OpenVerified`).
 4. **Bảo vệ khi Sự cố Khởi động:**
    - Nếu mất kết nối database, file snapshot sai lệch UID/quyền hạn, hoặc broker phản hồi bất thường, Ingress Gate duy trì trạng thái **ĐÓNG (CLOSED)**, giải phóng tài nguyên cục bộ (`CloseDrain`) và yêu cầu operator can thiệp. Không bao giờ tự động mở cổng khi chưa xác minh.
 5. **Thời hạn Độc lập `FinalizeTimeout`:**
-   - Cấu hình phân tách rạch ròi ngân sách thời gian: `DBTimeout` (2s) dành cho truy vấn metadata/admission ngắn; `FinalizeTimeout` (5s) dành độc lập cho transaction hoàn tất (`ConditionalFinalize`) có khóa dòng `FOR UPDATE`; `RequestTimeout` (40s) bao trùm mutation và drain. Không dùng chung một timeout ngắn làm đứt gãy pha finalize sau khi broker đã nạp mật khẩu.
+   - Các giá trị mặc định cấu hình được: `DBTimeout=2s` cho read/admission và ambiguity lookup, `FinalizeTimeout=5s` cho `ConditionalFinalize`/`FailKnown`/`RequireRecovery`, `RequestTimeout=40s` cho service request. Caller deadline vẫn là giới hạn trên; detached recovery có budget riêng. Timeout COMMIT là outcome unknown, không chứng minh rollback.
 
 ---
 
@@ -82,17 +85,10 @@ Hệ thống phân định rạch ròi 4 khái niệm dữ liệu và vòng đ�
 
 ### 4.1. Điều kiện Tiên quyết An toàn
 
-- Máy trạm operator có cài đặt `curl`, `jq`, `openssl`.
-- Đã export token JWT hợp lệ của Platform Admin (`ADMIN_JWT`) vào phiên shell (không truyền trực tiếp qua tham số lệnh dài để tránh lộ history).
-- Đã xác định Gateway ID mục tiêu (`TARGET_GW`).
-- Base URL của Go Backend nội bộ hoặc qua proxy (`API_BASE_URL`, ví dụ: `http://127.0.0.1:8080` hoặc domain quản trị).
-
-```bash
-# Thiết lập biến môi trường phiên làm việc (dùng giá trị placeholder an toàn)
-export API_BASE_URL="http://127.0.0.1:8080"
-export TARGET_GW="gateway_001"
-# ADMIN_JWT phải được sinh từ quy trình quản trị Supabase Auth an toàn
-```
+- Client quản trị trên máy tin cậy, ví dụ Bruno, dùng URL deployment được cấu hình và human JWT của platform admin; không dùng `service_role` để gọi Go business API.
+- Token/password dùng secret storage hoặc biến runtime không persist, không Git sync/export/log. HTTPS bắt buộc trên đường mạng không tin cậy; không đưa token vào URL/argv.
+- Xác định Gateway đã provision và readiness của lifecycle; bật feature flag không thay thế qualification topology.
+- Giữ riêng UUID idempotency cho từng operation. Retry cùng operation dùng lại key; không tự sinh key mới trên mỗi retry. Trong Bruno phải kiểm tra pre-request script để không phá replay semantics.
 
 ---
 
@@ -100,23 +96,14 @@ export TARGET_GW="gateway_001"
 
 Quy trình áp dụng khi Gateway đã được tạo qua Admin PUT (`/v1/admin/gateways/{gateway_id}`) nhưng chưa từng có credential hoặc credential trước đó đã ở trạng thái `revoked`/`failed`:
 
-1. **Sinh Idempotency Key:**
-   ```bash
-   IDEM_KEY=$(uuidgen | tr '[:upper:]' '[:lower:]')
-   ```
-2. **Gửi lệnh Provision:**
-   ```bash
-   curl -sS -X POST "${API_BASE_URL}/v1/admin/gateways/${TARGET_GW}/mqtt-credential" \
-     -H "Authorization: Bearer ${ADMIN_JWT}" \
-     -H "Idempotency-Key: ${IDEM_KEY}" \
-     -H "Content-Type: application/json"
-   ```
+1. **Chuẩn bị Idempotency Key:** UUID hợp lệ khác nil, không trùng operation khác.
+2. **Gửi bằng client quản trị:** POST credential path với `Authorization: Bearer <human_jwt>` và `Idempotency-Key: <operation_uuid>`; body None, không query. Không xuất response secret ra terminal/log hoặc lưu trong collection.
 3. **Xử lý phản hồi (HTTP 201 Created):**
    Phản hồi JSON chứa mật khẩu sinh ngẫu nhiên CSPRNG (256-bit entropy):
    ```json
    {
-     "gateway_id": "gateway_001",
-     "username": "gateway_001",
+      "gateway_id": "<target_gateway_id>",
+      "username": "<target_gateway_id>",
      "credential_version": 1,
      "status": "active",
      "last_operation_id": "0195e18c-...",
@@ -136,18 +123,10 @@ Quy trình áp dụng khi Gateway đã được tạo qua Admin PUT (`/v1/admin/
 
 Quy trình áp dụng định kỳ hoặc khi nghi ngờ lộ mật khẩu, khi credential hiện tại đang `active`:
 
-1. **Sinh Idempotency Key mới:**
-   ```bash
-   ROTATE_IDEM_KEY=$(uuidgen | tr '[:upper:]' '[:lower:]')
-   ```
-2. **Gửi lệnh Rotate:**
-   ```bash
-   curl -sS -X POST "${API_BASE_URL}/v1/admin/gateways/${TARGET_GW}/mqtt-credential/rotate" \
-     -H "Authorization: Bearer ${ADMIN_JWT}" \
-     -H "Idempotency-Key: ${ROTATE_IDEM_KEY}"
-   ```
+1. **Chuẩn bị key mới:** chỉ tạo key mới khi thực sự yêu cầu lượt rotate mới.
+2. **Gửi bằng client quản trị:** POST credential `/rotate` với human JWT và UUID key; body None. Retry giữ nguyên key.
 3. **Hành vi Hệ thống trong Cửa sổ Bảo trì:**
-   - Hệ thống tự động đóng Ingress Gate và drain toàn bộ kết nối hiện hữu.
+    - Hệ thống đóng Ingress Gate và drain toàn bộ kết nối hiện hữu: Gateway B cũng có thể gián đoạn trong global maintenance nhưng phải reconnect bằng credential không đổi. Không hứa zero outage.
    - Cập nhật mật khẩu mới trên DynSec RAM qua TLS quản trị nội bộ.
    - Cold reload broker từ snapshot đĩa và probe kiểm tra đăng nhập thành công bằng mật khẩu mới trên listener nội bộ.
    - Finalize cập nhật phiên bản mới (`credential_version = n + 1`) vào PostgreSQL.
@@ -160,21 +139,13 @@ Quy trình áp dụng định kỳ hoặc khi nghi ngờ lộ mật khẩu, khi 
 
 Quy trình áp dụng khi Gateway bị vô hiệu hóa, bị mất cắp hoặc ngắt dịch vụ:
 
-1. **Sinh Idempotency Key:**
-   ```bash
-   REVOKE_IDEM_KEY=$(uuidgen | tr '[:upper:]' '[:lower:]')
-   ```
-2. **Gửi lệnh Revoke:**
-   ```bash
-   curl -sS -X DELETE "${API_BASE_URL}/v1/admin/gateways/${TARGET_GW}/mqtt-credential" \
-     -H "Authorization: Bearer ${ADMIN_JWT}" \
-     -H "Idempotency-Key: ${REVOKE_IDEM_KEY}"
-   ```
+1. **Chuẩn bị key cho revoke:** UUID hợp lệ; retry cùng key.
+2. **Gửi bằng client quản trị:** DELETE credential path với human JWT và UUID key; body None. Revoke không sinh hoặc trả password.
 3. **Xử lý phản hồi (HTTP 200 OK):**
    ```json
    {
-     "gateway_id": "gateway_001",
-     "username": "gateway_001",
+      "gateway_id": "<target_gateway_id>",
+      "username": "<target_gateway_id>",
      "credential_version": 2,
      "status": "revoked",
      "last_operation_id": "0195e18c-...",
@@ -183,7 +154,7 @@ Quy trình áp dụng khi Gateway bị vô hiệu hóa, bị mất cắp hoặc 
      "next_action": "provision_with_new_idempotency_key"
    }
    ```
-   *Lưu ý:* Thao tác thu hồi là bất khả biến và dứt khoát trên broker (`disabled=true`). Mọi kết nối MQTT hiện hữu của Gateway bị ngắt lập tức; kết nối mới bị từ chối fail-closed.
+    *Lưu ý:* Revoke thành công có verification native disable/session disconnect và fresh rejection trong fixture. Historical event bất biến nhưng current authority có thể thay đổi qua authorized re-provision thế hệ mới; không coi revoke là cấm cấp lại vĩnh viễn.
 
 ---
 
@@ -193,12 +164,8 @@ Hệ thống thiết kế theo nguyên tắc bảo mật tối cao: **Không bao
 
 #### Trường hợp A: Phát lại với cùng Idempotency Key (Idempotent Replay)
 Nếu client gọi lại request POST provision/rotate với cùng `Idempotency-Key` đã hoàn tất thành công:
-```bash
-curl -sS -X POST "${API_BASE_URL}/v1/admin/gateways/${TARGET_GW}/mqtt-credential/rotate" \
-  -H "Authorization: Bearer ${ADMIN_JWT}" \
-  -H "Idempotency-Key: ${ROTATE_IDEM_KEY}"
-```
-- Phản hồi trả về `HTTP 200 OK` nhưng **CHỈ CHỨA METADATA**, trường `secret_returned: false`, `password` hoàn toàn vắng mặt.
+- Dùng lại đúng method/path và key trong client quản trị; không thay key khi gửi lại.
+- Provision replay trả `201`, rotate replay trả `200`; đều metadata-only, `secret_returned: false`, không `password`, không chạy lại broker mutation.
 - Trường `next_action` gợi ý: `"rotate_with_new_idempotency_key"`.
 
 #### Trường hợp B: Operator đánh mất mật khẩu khi vừa nhận (Lost Secret)
@@ -213,30 +180,24 @@ curl -sS -X POST "${API_BASE_URL}/v1/admin/gateways/${TARGET_GW}/mqtt-credential
 
 ### 4.6. Chẩn đoán Sự cố & Quy trình Phục hồi (`recovery_needed`)
 
-Khi xảy ra lỗi mất điện đột ngột hoặc sập mạng giữa pha nạp broker và pha commit database, Gateway credential rơi vào trạng thái bảo vệ: `status = recovery_needed`.
+Gián đoạn có thể để lại operation pending/recovery-needed, hoặc terminal succeeded nhưng maintenance chưa hoàn tất. Không kết luận chỉ từ một trường status; cần đối chiếu authority, event, checkpoint và recovery record. Không có power-loss durability guarantee.
 
 #### Dấu hiệu nhận biết:
-- Gọi API mutation nhận `HTTP 409 Conflict` hoặc `HTTP 503 Service Unavailable` kèm mã lỗi:
+- Recovery-required/finalization-pending/runtime-busy được HTTP mapper trả `503`. `409` dành cho conflict theo contract, không phải mặc định cho recovery. Safe error envelope nằm trong trường `error`:
   ```json
-  {"code": "credential_recovery_required", "message": "credential request failed"}
+   {"error": {"code": "credential_recovery_required", "message": "credential request failed", "request_id": "<request_id>"}}
   ```
-- Kiểm tra metadata:
-  ```bash
-  curl -sS "${API_BASE_URL}/v1/admin/gateways/${TARGET_GW}/mqtt-credential" \
-    -H "Authorization: Bearer ${ADMIN_JWT}"
-  ```
-  Trả về `status: "recovery_needed"`, `operation_status: "recovery_needed"`.
+- Đọc metadata qua GET bằng client quản trị; kiểm tra checkpoint/recovery qua protected operator DB tooling. Metadata có thể còn active/succeeded khi checkpoint unresolved; không diễn giải thành quyền thực hiện operation tiếp theo.
 
 #### Quy trình Xử lý Phục hồi An toàn:
 1. **Khởi động lại Backend để kích hoạt Startup Reconciliation:**
-   - Tiến trình startup sẽ quét bảng `gateway_mqtt_credential_events` tìm các operation `recovery_needed`.
+    - Chỉ restart theo change window được duyệt; startup quét cả unresolved events, unfinished checkpoints và pending recovery, không chỉ `recovery_needed`.
    - Adapter thực hiện gọi `DisableStartup` trên broker để vô hiệu hóa dứt khoát client trên RAM và ghi nhận snapshot.
-   - Bản ghi `mqtt_credential_recovery` được cập nhật trạng thái `completed` với bằng chứng `RAMDisabled=true`, `SnapshotObserved=true`.
-   - Trạng thái credential được chuyển về `revoked`.
+    - Durable recovery intent được ghi trước disable. Khi proof đúng epoch đủ, transaction chuyển recovery sang **`disabled`**, current authority sang `revoked` và checkpoint sang `completed`, liên kết disposition mà không sửa terminal event gốc. Chưa đủ proof thì giữ pending/fence/CLOSED.
 2. **Cấm bypass thủ công:**
    - **Tuyệt đối KHÔNG** can thiệp trực tiếp sửa đổi các dòng kiểm toán trong database (`UPDATE ... SET status='active'`).
    - **Tuyệt đối KHÔNG** tự ý hạ fence bảo trì (`mqtt_credential_maintenance`) hoặc sửa file `dynamic-security.json` bằng tay.
-   - Thao tác sửa database tay sẽ làm hỏng tính toàn vẹn thế hệ (`generation mismatch`) và khiến Ingress Gate từ chối `OPEN` vĩnh viễn ở lần khởi động sau.
+    - Sửa tay có thể vi phạm guards hoặc tạo contradictory authority phải diagnosis; không hứa có thể tự sửa hay khẳng định một lỗi sẽ khóa vĩnh viễn.
 3. **Cấp phát lại mật khẩu mới:**
    - Sau khi tiến trình phục hồi đưa credential về `revoked`, Quản trị viên sử dụng API **Provision** với một `Idempotency-Key` mới để cấp lại mật khẩu sạch từ đầu và nạp USB cho Gateway.
 
@@ -254,15 +215,15 @@ Các lệnh kiểm chứng dưới đây sử dụng harness kiểm thử độc
    ```bash
    cd src && go test -v -race -run 'TestDynSec.*' ./internal/mqttcredential/...
    ```
-3. **Kiểm thử Hàng rào Khởi động & Đối soát Fail-Closed (PostgreSQL Integration):**
+3. **Kiểm thử startup đơn vị (live integration có thể SKIP nếu chưa có fixture):**
    ```bash
    cd src && go test -v -race -run 'TestStartup.*' ./internal/mqttcredential/...
    ```
-4. **Harness Python Hợp nhất (Harness Suite cho Task 2.6):**
+4. **Harness triển khai Task 2.6, chạy HTTP standalone và selectors native thật:**
    ```bash
-   python3 scripts/tests/task26_credential_spike.py
+   sh scripts/test-stage2-mqtt-credentials.sh
    ```
-   *Bằng chứng ghi nhận:* Toàn bộ các kịch bản DynSec, Revoke, Startup Gate và Maintenance Rotate đều đạt kết quả PASS trong môi trường fixture độc lập.
+    Xem [báo cáo nghiệm thu](stage-2-task-2.6-acceptance.md) cho actual PASS/selectors/coverage. Chạy spike provenance riêng bằng `python3 scripts/tests/task26_credential_spike.py --scenario all`; không thay fixture deployment acceptance bằng spike hoặc skipped Go test.
 
 ---
 
@@ -284,14 +245,14 @@ Các lệnh kiểm chứng dưới đây sử dụng harness kiểm thử độc
 - Nếu rollback mã nguồn Go Backend về phiên bản trước Task 2.6:
   - Phải duy trì schema database ở version hiện tại (không chạy `down.sql` làm mất mát dữ liệu kiểm toán lịch sử).
   - Vô hiệu hóa tính năng credential bằng cách đặt `MQTT_CREDENTIAL_API_ENABLED=false`.
-  - Hệ thống runtime Task 2.5 legacy (`password_file`) vẫn được bảo toàn nguyên vẹn trong codebase làm phương án dự phòng.
+   - Task 2.5 legacy còn trong source để regression, không phải automatic fallback từ DynSec. Chuyển runtime phải có approved cutover, backup và re-provision; không bật lại credential cũ để bypass revoke.
 
 ---
 
 ## 7. Giới hạn Nghiệm thu Còn lại (Remaining Limits)
 
 Trước khi nghiệm thu toàn bộ Giai đoạn 2 (Stage 2 acceptance), các rào cản và giới hạn sau cần được ghi nhận trung thực:
-1. **Chưa có CI Xanh cho SHA Cuối:** Toàn bộ công việc Task 2.6 và các chỉnh sửa timeout/fence hiện nằm trong local worktree, chưa được commit lên remote branch và chưa chạy GitHub Actions CI xác nhận trên commit SHA cuối cùng.
+1. **CI Task 2.6:** Xem acceptance report cho run `37204985289`, SHA `55cdcd5`, 9 jobs xanh. Không áp bằng chứng này cho các thay đổi Task 2.7 chưa commit hoặc job `stage2-e2e` chưa nghiệm thu.
 2. **Chưa Triển khai Production:** Tính năng bị tắt mặc định trên Compose gốc (`MQTT_CREDENTIAL_API_ENABLED=false`). Chưa thực hiện deploy lên máy chủ staging/production.
 3. **Chưa Thẩm định Phần cứng Thật (Hardware Qualification):** Quy trình nạp USB offline và khả năng lưu trữ mã hóa an toàn trên các vi điều khiển/bo mạch vật lý (ESP32, Luckfox Pico Plus, TI AM5728) chưa được nghiệm thu thực tế.
 4. **Chính sách Mất DB sau khi MỞ (Post-OPEN DB Loss):** Hiện tại hệ thống chưa tích hợp cơ chế tự động ngắt kết nối Gateway nếu PostgreSQL bị sập sau khi Ingress Gate đã mở thành công (`OPEN`).
@@ -306,8 +267,8 @@ Task 2.7 chịu trách nhiệm nghiệm thu tích hợp E2E toàn bộ Giai đo�
 
 1. **Hợp đồng API Đã Khóa:** Bốn endpoint `/v1/admin/gateways/{gateway_id}/mqtt-credential*` đã hoàn tất triển khai trong codebase, kiểm thử unit và HTTP integration pass 100%. Task 2.7 có thể xây dựng kịch bản kiểm thử E2E dựa trên đúng HTTP contract này.
 2. **Tài liệu Kế hoạch Bên ngoài:** Lưu ý rằng file kế hoạch chi tiết `docs/backend_plan/task_2.6_detail_plan.md` nằm bên ngoài git repository `main_src/`. Mọi cập nhật trạng thái của Task 2.6 đã được ghi nhận trực tiếp vào tài liệu kế hoạch đó.
-3. **Báo cáo Nghiệm thu:** Tham chiếu chi tiết các bằng chứng kiểm thử và ma trận lỗi tại [Báo cáo Nghiệm thu Stage 2 Task 2.6](stage-2-task-2.6-acceptance.md) (đang được hoàn thiện đồng thời).
+3. **Báo cáo Nghiệm thu:** Tham chiếu bằng chứng và ma trận lỗi tại [Task 2.6 acceptance](stage-2-task-2.6-acceptance.md); [Task 2.7 acceptance](stage-2-task-2.7-acceptance.md) vẫn pending cho E2E/CI mới.
 4. **Phạm vi Tiếp theo của Task 2.7:**
-   - Xây dựng kịch bản E2E phối hợp: `Admin Provision Gateway (Task 2.4)` → `Admin Provision Credential (Task 2.6)` → `Gateway Simulator kết nối MQTT TLS với credential vừa cấp` → `User tra cứu Telemetry/Sensor (Task 2.3)`.
+    - E2E: real GoTrue login/refresh → Admin Gateway/Sensor provisioning → credential lifecycle → gated MQTT TLS/ACL → user Gateway/Sensor reads. Telemetry ingestion/history/WebSocket/media/control không thuộc Stage 2 acceptance.
    - Thẩm định quy trình phân quyền membership `user_gateways` phối hợp với tài khoản quản trị.
    - Đóng gói tài liệu bàn giao tổng thể cho toàn bộ Milestone Backend Giai đoạn 2.

@@ -1,30 +1,56 @@
 # Giai đoạn 2 — Task 2.2: Xác thực và platform-admin guard
 
-**Cập nhật:** 2026-10-02. Nguồn đối chiếu: `src/internal/auth/`,
+**Cập nhật:** 2026-10-04. Nguồn đối chiếu: `src/internal/auth/`,
 `src/internal/httpserver/router.go`, `src/internal/config/config.go`,
-`docker-compose.yml`, `.env.example` và các harness trong `scripts/`.
+`docker-compose.yml`, `.env.example`, `scripts/`,
+[Task 2.3](stage-2-task-2.3-authorization.md),
+[Task 2.4](stage-2-task-2.4-provisioning.md),
+[Task 2.6](stage-2-task-2.6-mqtt-credentials.md),
+[Task 2.6 Acceptance](stage-2-task-2.6-acceptance.md) và kế hoạch [Task 2.7](../backend_plan/task_2.7_detail_plan.md).
 
 ## 1. Phạm vi đã triển khai
 
-Go xác minh access token của người dùng Supabase tại chỗ, chuyển danh tính đã
-xác minh thành `Principal`, và cung cấp guard tra quyền platform admin trong
-PostgreSQL. Không gọi GoTrue cho từng business request, không dùng JWKS trong
+Go xác minh access token của người dùng Supabase tại chỗ bằng chữ ký đối xứng
+HS256, chuyển danh tính đã xác minh thành `Principal` (`UserID`, `Role`), và cung
+cấp guard tra cứu quyền platform admin trong PostgreSQL (`platform_admins`).
+Hệ thống không gọi GoTrue cho từng business request, **không sử dụng JWKS** trong
 contract HS256 hiện tại. Router từ chối khởi tạo nếu thiếu dependency bắt buộc,
-kể cả interface chứa typed nil; cấu hình JWT sai làm backend dừng khi startup.
+kể cả interface chứa typed nil; cấu hình JWT sai làm backend dừng ngay khi startup.
 
 ```text
 Authorization: Bearer <access_token>
-  -> HS256 verifier -> Principal -> authenticated stub (501)
-                              -> admin group -> PostgreSQL membership guard
+  -> HS256 verifier -> Principal
+                        |-> authenticated user routes:
+                        |     ├── GET /v1/gateways (tra user_gateways qua GatewayReader)
+                        |     ├── GET /v1/gateways/:id/sensors (tra user_gateways qua SensorReader)
+                        |     └── stubs (501): /v1/telemetry/history, /v1/ws, /v1/digital-twins
+                        |
+                        └─> admin group -> PostgreSQL platform_admins guard
+                              ├── PUT /v1/admin/gateways/:id (Task 2.4 provisioning)
+                              ├── PUT /v1/admin/gateways/:id/sensors/:id (Task 2.4 provisioning)
+                              └── /v1/admin/gateways/:id/mqtt-credential[*] (Task 2.6, gated)
 ```
 
-Chưa có production admin handler. Guard được kiểm thử bằng route chỉ có trong
-test. Chưa triển khai User–Gateway authorization trong business handler,
-historical queries, WebSocket upgrade/fan-out hay nghiệp vụ Digital Twin.
-`501` chỉ chứng minh request vượt qua authentication tới stub, không chứng minh
-người dùng có quyền trên Gateway và không phải tính năng đã hoàn thành. Backend
-role có `BYPASSRLS`, nên các handler tương lai phải tự kiểm tra `user_gateways`
-trước khi đọc/ghi dữ liệu; xem [Task 2.1](stage-2-task-2.1-migrations.md).
+Ở trạng thái hiện hành:
+- **Đã có production handlers:**
+  - Authenticated user routes: `GET /v1/gateways` và `GET /v1/gateways/:gateway_id/sensors`
+    đã triển khai kiểm tra quyền User–Gateway qua bảng `user_gateways` (xem [Task 2.3](stage-2-task-2.3-authorization.md)).
+  - Platform admin routes: `PUT /v1/admin/gateways/:gateway_id` và
+    `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` đã triển khai provisioning
+    (xem [Task 2.4](stage-2-task-2.4-provisioning.md)); 4 route quản lý MQTT credential
+    tại `/v1/admin/gateways/:gateway_id/mqtt-credential[*]` đã đăng ký và được bật/tắt
+    theo runtime gate `MQTT_CREDENTIAL_API_ENABLED` (xem [Task 2.6](stage-2-task-2.6-mqtt-credentials.md)).
+- **Chưa triển khai (stub hoặc ngoài phạm vi):**
+  - Stubs `501`: `GET /v1/telemetry/history`, `GET /v1/ws`, `GET /v1/digital-twins`. Phản hồi
+    `501` chỉ chứng minh request vượt qua authentication tới stub, không phải tính năng hoàn thành.
+  - Chưa triển khai telemetry ingestion/persistence, application ACK, historical queries,
+    WebSocket fan-out, hay command/desired-state mutation slice (các lệnh điều khiển thiết bị
+    fail-closed; xem [AGENTS.md](../../AGENTS.md) §6.5).
+  - Chưa triển khai user CRUD API hay membership management API trên Go backend; việc tạo
+    tài khoản người dùng vẫn thực hiện qua Supabase Auth Admin tooling/scripts, và membership
+    được vận hành qua công cụ operator được bảo vệ (xem [Task 2.2A](stage-2-task-2.2A-centralized-accounts.md)).
+  - Backend role có quyền `BYPASSRLS`, do đó mọi handler nghiệp vụ bắt buộc phải tự kiểm
+    tra `user_gateways` trước khi đọc/ghi tài nguyên; xem [Task 2.1](stage-2-task-2.1-migrations.md).
 
 ## 2. JWT contract thực tế
 
@@ -33,7 +59,7 @@ chỉ chấp nhận token khớp tất cả điều kiện:
 
 | Thành phần | Điều kiện |
 |---|---|
-| Algorithm/signature | Chỉ `HS256`, kiểm tra chữ ký với secret cấu hình; không chấp nhận `none`, HS384/HS512 hoặc RSA |
+| Algorithm/signature | Chỉ `HS256`, kiểm tra chữ ký với secret cấu hình; không chấp nhận `none`, HS384/HS512 hoặc RSA/JWKS |
 | `iss` | Bắt buộc, bằng chính xác `SUPABASE_JWT_ISSUER`; không tự sửa scheme, hostname, path hoặc trailing slash |
 | `aud` | Bắt buộc chứa `authenticated`; chấp nhận chuỗi `authenticated` hoặc array có phần tử này, không yêu cầu array chỉ có một audience |
 | `role` | Bằng chính xác `authenticated` |
@@ -63,7 +89,22 @@ typed trong Gin context dưới key nội bộ `authenticated_principal`;
 `PrincipalFrom` trả `(Principal, bool)`. Không giữ raw token trong Principal và
 không truyền toàn bộ unverified claims sang nghiệp vụ.
 
-## 3. Issuer và cấu hình
+### Luồng cấp phát, đăng nhập và refresh token
+
+Go backend không sở hữu endpoint cấp phát hay refresh token của người dùng. Luồng
+xác thực danh tính thực hiện qua Supabase Auth (GoTrue):
+1. **Đăng nhập (Login):** Client gửi yêu cầu tới GoTrue qua Nginx và Supabase API
+   Gateway (Envoy): `POST /auth/v1/token?grant_type=password` kèm `apikey` header
+   và body JSON chứa `email` và `password`. GoTrue xác thực mật khẩu và trả về
+   `access_token` (HS256, thời hạn mặc định `3600s` theo `JWT_EXPIRY`) cùng `refresh_token`.
+2. **Sử dụng:** Client đính kèm `access_token` trong header `Authorization: Bearer <access_token>`
+   khi gọi các API nghiệp vụ trên Go backend (`/v1/*`).
+3. **Làm mới (Refresh):** Khi `access_token` sắp hoặc đã hết hạn, client gọi
+   `POST /auth/v1/token?grant_type=refresh_token` tới GoTrue qua Nginx/Envoy để lấy
+   cặp token mới. Go backend xác minh tính hợp lệ của `access_token` độc lập tại chỗ
+   qua secret chung mà không cần truy vấn GoTrue mỗi request.
+
+## 3. Issuer, proxy và cấu hình môi trường
 
 Compose lấy cấu hình từ repository-root `.env` (không commit), mapping:
 
@@ -72,7 +113,7 @@ Compose lấy cấu hình từ repository-root `.env` (không commit), mapping:
 | `JWT_SECRET` | GoTrue: `GOTRUE_JWT_SECRET`; backend: `SUPABASE_JWT_SECRET`; cùng secret HS256 |
 | `GOTRUE_JWT_ISSUER` | GoTrue: cùng tên; backend: `SUPABASE_JWT_ISSUER` |
 | `SUPABASE_JWT_AUDIENCE` | GoTrue: `GOTRUE_JWT_AUD`; backend: cùng tên; bắt buộc `authenticated` |
-| `SUPABASE_JWT_CLOCK_SKEW` | Backend, mặc định `30s` |
+| `SUPABASE_JWT_CLOCK_SKEW` | Backend, mặc định `30s` (cho phép `0s` đến `5m`) |
 | `AUTHORIZATION_TIMEOUT` | Backend, timeout lookup admin, mặc định `2s`, phải dương |
 | `JWT_EXPIRY` | GoTrue `GOTRUE_JWT_EXP`, mặc định `3600` giây |
 | `SUPABASE_PUBLIC_URL` | Public URL cho Supabase; **không thay thế** issuer explicit |
@@ -83,8 +124,16 @@ Local theo `.env.example`: `SUPABASE_PUBLIC_URL=http://localhost`,
 `GOTRUE_JWT_ISSUER=http://localhost/auth/v1`. Production dùng public HTTPS URL
 đã chọn, ví dụ sanitized `https://supabase.example.com/auth/v1`, và cấu hình
 issuer **giống hệt** ở GoTrue và backend. Issuer là định danh token, không phải
-địa chỉ nội bộ `http://supabase-envoy:8000`. Nginx vẫn chuyển Auth/Storage qua
-Supabase API Gateway, không bypass Envoy.
+địa chỉ nội bộ `http://supabase-envoy:8000`.
+
+### Định tuyến Nginx và API Gateway
+
+Nginx đóng vai trò reverse proxy bên ngoài; Supabase API Gateway (Envoy) là thành
+phần nội bộ của stack Supabase:
+- Nginx chuyển tiếp các route `/auth/v1/*` và `/storage/v1/*` sang Supabase API Gateway (Envoy).
+- Nginx chuyển tiếp các route nghiệp vụ `/v1/*`, `/healthz`, `/readyz` sang Go backend.
+- Tuyệt đối không bypass Envoy để trỏ trực tiếp từ Nginx vào container GoTrue/Storage
+  mà không tái hiện đầy đủ header/CORS và routing contract của Supabase API Gateway.
 
 Nếu chạy Go trực tiếp thay vì Compose, phải export `SUPABASE_JWT_SECRET`,
 `SUPABASE_JWT_ISSUER`, `SUPABASE_JWT_AUDIENCE`, `DATABASE_URL` và cấu hình tùy
@@ -116,24 +165,45 @@ secret trong Task tài liệu này. Nếu đang dùng sample secret, cần xử 
 riêng, đồng bộ signing secret/API keys/dịch vụ và xác minh lại sessions; không
 giả định thay secret tự thu hồi refresh tokens.
 
+### Trạng thái vô hiệu hóa đăng ký công khai (Signup)
+
+Theo [AGENTS.md](../../AGENTS.md) §6.5: Việc coi tính năng tự đăng ký công khai (self-signup)
+bị vô hiệu hóa là **yêu cầu kiến trúc và sản phẩm**, không phải bằng chứng mặc nhiên
+rằng mọi môi trường triển khai thực tế hay staging đã được khóa cứng.
+- Trong cấu hình mẫu và Compose, `GOTRUE_DISABLE_SIGNUP=true` được thiết lập nhằm ngăn
+  chặn đăng ký tự do; yêu cầu kiểm tra endpoint công khai `POST /auth/v1/signup` phải
+  trả về `422 signup_disabled` và không tạo dữ liệu mới trong `auth.users` hay `profiles`.
+- Việc ẩn nút đăng ký trên giao diện người dùng (Flutter/Web) chỉ là biện pháp hiển thị,
+  không có giá trị thay thế việc thực thi tại ranh giới GoTrue / API Gateway.
+- Không tuyên bố toàn bộ mọi deployment đã tự động vô hiệu hóa nếu chưa có kiểm tra
+  trực tiếp trên route public của môi trường đó.
+
 ## 4. Route matrix hiện tại
 
-| Method | Route | Policy | Response hiện tại |
+Dưới đây là ma trận các route đã được đăng ký trong `src/internal/httpserver/router.go`:
+
+| Method | Route | Policy | Response / Trạng thái hiện tại |
 |---|---|---|---|
 | GET | `/healthz` | Public | `200`, text `OK` |
 | GET | `/readyz` | Public, ping PostgreSQL có timeout | `200 {"status":"ready"}` hoặc safe error `503` |
-| GET | `/v1/health` | Public | `200`, status/service/version |
-| GET | `/v1/telemetry/history` | Human Bearer JWT | `401` nếu invalid/missing; `501` nếu valid |
-| GET | `/v1/ws` | Human Bearer JWT | `401` nếu invalid/missing; `501` nếu valid, kể cả upgrade request |
-| GET | `/v1/digital-twins` | Human Bearer JWT | `401` nếu invalid/missing; `501` nếu valid |
+| GET | `/v1/health` | Public | `200`, JSON `{"status":"running","service":"iot-backend","version":"v1"}` |
+| GET | `/v1/gateways` | Human Bearer JWT (`authenticated`) | `200` danh sách Gateway user có quyền trong `user_gateways` ([Task 2.3](stage-2-task-2.3-authorization.md)); `401` nếu thiếu/sai JWT |
+| GET | `/v1/gateways/:gateway_id/sensors` | Human Bearer JWT (`authenticated`) | `200` danh sách sensor thuộc Gateway nếu user có quyền; `404` nếu không có quyền/không tồn tại; `401` nếu thiếu/sai JWT |
+| GET | `/v1/telemetry/history` | Human Bearer JWT (`authenticated`) | `401` nếu invalid/missing; `501 not_implemented` nếu valid (stub) |
+| GET | `/v1/ws` | Human Bearer JWT (`authenticated`) | `401` nếu invalid/missing; `501 not_implemented` nếu valid (stub, kể cả upgrade request) |
+| GET | `/v1/digital-twins` | Human Bearer JWT (`authenticated`) | `401` nếu invalid/missing; `501 not_implemented` nếu valid (stub) |
+| PUT | `/v1/admin/gateways/:gateway_id` | Platform Admin (`platform_admins`) | `201/200` provision Gateway ([Task 2.4](stage-2-task-2.4-provisioning.md)); `401` thiếu/sai JWT; `403` không phải platform admin; `409` conflict |
+| PUT | `/v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Platform Admin (`platform_admins`) | `201/200` provision Sensor ([Task 2.4](stage-2-task-2.4-provisioning.md)); `401` thiếu/sai JWT; `403` không phải admin; `404` parent Gateway chưa có |
+| GET | `/v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin (`platform_admins`) | `200` metadata credential ([Task 2.6](stage-2-task-2.6-mqtt-credentials.md)); `503` nếu runtime disabled |
+| POST | `/v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin (`platform_admins`) | `201` provision credential, trả password 1 lần ([Task 2.6](stage-2-task-2.6-mqtt-credentials.md)); `Idempotency-Key` bắt buộc, no-body |
+| POST | `/v1/admin/gateways/:gateway_id/mqtt-credential/rotate` | Platform Admin (`platform_admins`) | `200` rotate credential, trả password mới 1 lần ([Task 2.6](stage-2-task-2.6-mqtt-credentials.md)); `Idempotency-Key` bắt buộc, no-body |
+| DELETE | `/v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin (`platform_admins`) | `200` revoke credential ([Task 2.6](stage-2-task-2.6-mqtt-credentials.md)); `Idempotency-Key` bắt buộc, no-body |
 
-`/v1/admin` là group chứa authentication rồi `PlatformAdminMiddleware`, chưa
-đăng ký endpoint production nào. Request tới admin path chưa có handler là
-`404`, không phải probe membership. Media upload, Digital Twin detail/write,
-desired-state và command routes trong thiết kế MVP chưa được đăng ký.
-Một method chưa đăng ký trên path đã có method khác có thể trả `405` thay vì
-`404`, ví dụ `POST /v1/digital-twins`. Handler admin tương lai phải đăng ký qua `groups.admin`; tạo group khác cùng
-prefix không kế thừa policy trong Gin.
+Nhóm `/v1/admin` thực thi tuần tự `AuthenticationMiddleware` rồi `PlatformAdminMiddleware`
+trước khi chuyển tiếp tới các handler quản trị. Request tới admin path chưa có handler
+hoặc không tồn tại trả về `404 not_found`. Sai method trên route đã đăng ký trả về
+`405 method_not_allowed` (ví dụ `POST /v1/digital-twins`). Handler admin tương lai
+bắt buộc phải đăng ký qua `groups.admin`; tạo group khác cùng prefix không kế thừa policy trong Gin.
 
 ### Guard PostgreSQL fail closed
 
@@ -165,7 +235,7 @@ Lỗi HTTP có dạng:
 |---|---|---|
 | 401 | `unauthorized` | `authentication required`; lỗi authentication; header `WWW-Authenticate: Bearer` |
 | 403 | `forbidden` | `insufficient permissions`; user hợp lệ không có admin membership trên test/admin guard |
-| 503 | `service_unavailable` | `service unavailable`; lookup admin lỗi hoặc readiness DB lỗi |
+| 503 | `service_unavailable` | `service unavailable`; lookup admin lỗi, readiness DB lỗi, hoặc credential API runtime disabled |
 | 501 | `not_implemented` | `endpoint not implemented`; authenticated business stub |
 | 404 | `not_found` | `resource not found`; route không tồn tại |
 | 405 | `method_not_allowed` | `method not allowed`; sai method trên route đã đăng ký |
@@ -208,7 +278,7 @@ bootstrap admin đầu tiên, không phải công cụ thêm admin tùy ý. Lu�
 admin có actor/audit thuộc task sau. Không chạy script từ checkout có thể bị
 process không tin cậy sửa.
 
-## 7. Lệnh verification có thể chạy
+## 7. Lệnh verification có thể chạy và phạm vi bằng chứng
 
 Tất cả block dưới bắt đầu từ **repo root**, không source `.env`. Go module ở
 `src/`: dùng Go **1.27.1** và `golangci-lint` **v2.14.0** như CI; cần C compiler
@@ -250,6 +320,19 @@ code hiện tại**, nếu không sẽ build image test. Không tự set
 `ADMIN_TEST_ISOLATED`/database URLs tới deployment: integration fixture là
 destructive, chỉ chạy qua `test-stage2-admin.sh`. Unit test bình thường skip
 integration này. Xem [CI](../../.github/workflows/ci.yml) để đối chiếu jobs.
+
+### Phạm vi bằng chứng CI và trạng thái Task 2.7
+
+- **Bằng chứng CI Task 2.6:** Người dùng báo CI xanh; pipeline GitHub Actions chính thức
+  **Run 37204985289** (commit `55cdcd57892d35df33c0caaa52bf6038613399e7`) đã hoàn
+  thành thành công toàn bộ 9/9 jobs (GREEN) vào ngày 2026-10-04T13:15:41Z. Chi tiết
+  đối soát xem tại [Sổ tay Nghiệm thu Task 2.6](stage-2-task-2.6-acceptance.md).
+- **Trạng thái E2E Task 2.7:** Theo kế hoạch [Task 2.7](../backend_plan/task_2.7_detail_plan.md),
+  harness kiểm thử E2E tích hợp đầy đủ (GoTrue thật + backend thật + DynSec Mosquitto
+  + gated TLS) đã được phê duyệt và đang hoạt động trong môi trường isolated, nhưng
+  **chưa có kết quả nghiệm thu cuối cùng (no complete result yet)**. Không ghi nhận
+  các kết quả kiểm tra cục bộ tạm thời làm bằng chứng hoàn thành Stage 2 E2E cho tới khi
+  toàn bộ kịch bản E01–E27 đạt chuẩn và job CI `stage2-e2e` được tích hợp thành công.
 
 ## 8. Troubleshooting không log token
 

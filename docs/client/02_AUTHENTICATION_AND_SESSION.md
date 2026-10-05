@@ -1,68 +1,84 @@
 # Tài liệu Client — 02: Cơ chế Xác thực và Quản lý phiên làm việc trên Flutter Web (Authentication & Session Management)
 
-**Cập nhật:** 2026-10-03  
+**Cập nhật:** 2026-10-05
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
-**Tài liệu tham chiếu:** `AGENTS.md`, `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md`, `docs/backend/stage-2-task-2.2-authentication.md`, `docs/backend/stage-2-task-2.2A-centralized-accounts.md`.
+**Tài liệu tham chiếu chuẩn:** `AGENTS.md`, `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md`, `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`, `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md`, `docs/backend/stage-2-task-2.2-authentication.md`, `docs/backend/stage-2-task-2.2A-centralized-accounts.md`.
 
 ---
 
 ## 1. Tổng quan cơ chế xác thực và Ranh giới hệ thống
 
-Trong kiến trúc tổng thể của nền tảng IoT Gateway–Server, ứng dụng **Flutter Web** đóng vai trò là Dashboard giám sát và vận hành trung tâm. Cơ chế bảo mật và kiểm soát truy cập được phân định thành hai lớp ranh giới độc lập và rõ ràng:
+Trong kiến trúc của nền tảng IoT Gateway–Server, ứng dụng **Flutter Web** đóng vai trò là Dashboard giám sát và giao diện vận hành client. Hệ thống phân định ranh giới bảo mật và kiểm soát truy cập thành hai tầng độc lập, có Base URL và chức năng riêng biệt:
 
 1. **Ranh giới Định danh người dùng (User Identity Layer) — Supabase Auth (GoTrue):**
-   - Đảm nhận toàn bộ chu trình sống của tài khoản người dùng: lưu trữ thông tin đăng nhập, kiểm tra mật khẩu đã hash (bcrypt), cấp phát cặp khóa `access_token` (JSON Web Token - JWT) và `refresh_token`, xử lý làm mới phiên tự động và thu hồi phiên làm việc.
-   - Flutter Web tương tác với dịch vụ này thông qua thư viện chính thức `supabase_flutter`.
+   - **Base URL:** `${SUPABASE_AUTH_URL}/auth/v1/*` (được định tuyến qua Nginx Reverse Proxy tới Supabase API Gateway / Envoy).
+   - **Nhiệm vụ:** Quản lý chu trình sống của tài khoản người dùng, xác thực thông tin đăng nhập (password grant), cấp phát cặp mã xác thực `access_token` (JWT) và `refresh_token`, xử lý làm mới phiên (`grant_type=refresh_token`) và thu hồi phiên (`/auth/v1/logout`).
+   - Flutter Web tương tác với tầng này thông qua thư viện `supabase_flutter` hoặc REST client tương thích.
 
 2. **Ranh giới Phân quyền nghiệp vụ (Business Authorization Layer) — Go Backend:**
-   - Go Backend sở hữu toàn bộ các API nghiệp vụ (`/v1/*`), kết nối trực tiếp với PostgreSQL/TimescaleDB.
-   - Go Backend **không** gọi ngược lại dịch vụ Supabase Auth trong từng request nhằm tối ưu hiệu năng và triệt tiêu độ trễ mạng thừa. Thay vào đó, backend tự xác minh chữ ký số của JWT tại chỗ (Local HS256 Verification) và bóc tách danh tính người dùng (`sub` claim dạng UUID).
-   - Quyền truy cập vào dữ liệu trạm IoT (Gateway, Sensor, Lịch sử đo, WebSocket stream, Media) được Go Backend thẩm định độc lập dựa trên bảng quan hệ `user_gateways` và vai trò tương ứng (`owner`, `operator`, `viewer`).
+   - **Base URL:** `${API_URL}/v1/*` (được định tuyến qua Nginx Reverse Proxy trực tiếp tới Go Modular Monolith).
+   - **Nhiệm vụ:** Cung cấp API nghiệp vụ (Gateway, Sensor, Lịch sử đo TimescaleDB, WebSocket stream, Media metadata và Digital Twin).
+   - **Cơ chế xác minh:** Go Backend **không** gọi ngược lại dịch vụ Supabase Auth trong từng request nhằm triệt tiêu độ trễ mạng và loại bỏ điểm nghẽn phụ thuộc. Thay vào đó, Go Backend tự thẩm định chữ ký JWT tại chỗ (**Local HS256 Verification**) với khóa đối xứng bí mật được chia sẻ an toàn ở tầng máy chủ (`SUPABASE_JWT_SECRET`).
+   - Sau khi xác minh danh tính người dùng (`sub` claim dạng UUID), Go Backend kiểm tra quyền hạn nghiệp vụ trên tài nguyên dựa trên bảng quan hệ `user_gateways` (`owner`, `operator`, `viewer`) hoặc bảng `platform_admins` trong PostgreSQL. Go Backend hoàn toàn độc lập và **không** quản lý hay cung cấp API CRUD tài khoản người dùng.
 
 ```text
 +-----------------------------------------------------------------------------------+
 |                                 Flutter Web Client                                |
 |                       (Trình duyệt Chrome / Edge / Firefox)                       |
-|                             (supabase_flutter SDK)                                |
+|                   (supabase_flutter SDK / HTTP Client minh họa)                   |
 +------------------------+----------------------------------+-----------------------+
                          |                                  |
-            1. Đăng nhập | /auth/v1/token                   | 3. Gọi Business API
-               (Email/Pw)|                                  |    Header Authorization:
+            1. Đăng nhập | POST /auth/v1/token              | 3. Gọi Business API
+               (Password |      ?grant_type=password        |    Base URL: /v1/*
+                Grant)   | Header apikey: <anon_key>        |    Header:
+                         |                                  |    Authorization:
                          v                                  |    Bearer <access_token>
 +----------------------------------------------------+      |
 |           Nginx Reverse Proxy & Envoy              |      |
 +------------------------+---------------------------+      |
-                         |                                  |
+                         | (Proxy /auth/v1/*)               | (Proxy /v1/*)
                          v                                  v
 +------------------------------------+     +----------------------------------------+
 |           Supabase Auth            |     |               Go Backend               |
 |              (GoTrue)              |     |           (Modular Monolith)           |
 +-----------------+------------------+     +-------------------+--------------------+
                   |                                            |
-                  | 2. Cấp Session                             | 4. Local JWT Verify
+                  | 2. Cấp Session                             | 4. Local HS256 Verify
                   |    - access_token (HS256)                  |    & Check Membership
-                  |    - refresh_token                         |    (bảng user_gateways)
-                  v                                            v
-+------------------------------------+     +----------------------------------------+
-|    Web Storage (LocalStorage)      |     |       PostgreSQL / TimescaleDB         |
+                  |    - refresh_token                         |    (bảng user_gateways /
+                  v                                            |     platform_admins)
++------------------------------------+                         v
+|       Browser Storage (Web)        |     +----------------------------------------+
+|    (Origin-scoped localStorage)    |     |       PostgreSQL / TimescaleDB         |
 +------------------------------------+     +----------------------------------------+
 ```
 
+### 1.1. Phân biệt các loại khóa và Token trong hệ thống
+
+Client cần phân định rõ ràng 3 thực thể xác thực để không cấu hình sai lệch:
+
+| Loại khóa / Token | Nơi lưu giữ & Phạm vi sử dụng | Quyền hạn & Mức độ an toàn |
+|---|---|---|
+| **Public Anon Key** (`SUPABASE_ANON_KEY`) | Nhúng trong cấu hình Client (`.env` client, mã nguồn Flutter Web). Được truyền trong header `apikey` khi client gọi tới Supabase Gateway (`/auth/v1/*`). | **Công khai an toàn (Safe to be public):** Bản thân anon key không trao quyền đọc/ghi dữ liệu nghiệp vụ nào trên Go Backend. Mọi API Go `/v1/*` đều từ chối anon key nếu thiếu JWT người dùng hợp lệ. |
+| **Human Access Token** (`access_token` JWT) | Cấp phát cho người dùng sau khi đăng nhập thành công. Được lưu trong bộ nhớ client / storage trình duyệt. Truyền qua header `Authorization: Bearer <access_token>`. | **Có thời hạn (Thường là 3600s):** Chứa danh tính `sub` (UUID) và `role: authenticated`. Cho phép Go Backend thẩm định quyền theo `user_gateways`. Cần bảo vệ chống rò rỉ XSS. |
+| **Infrastructure Service Key** (`SUPABASE_SERVICE_ROLE_KEY`) | **Chỉ lưu tại máy chủ nội bộ** (Go Backend, CLI admin script của hạ tầng). **TUYỆT ĐỐI KHÔNG** đưa vào client, web browser hay kho lưu trữ Git. | **Toàn quyền hệ thống (Bypass toàn bộ RLS và Auth):** Chỉ dùng cho các tác vụ quản trị hạ tầng (như `POST /auth/v1/admin/users`). Nếu lộ key này ra client, toàn bộ hệ thống Supabase sẽ bị xâm phạm. |
+
 ---
 
-## 2. Chính sách quản lý tài khoản tập trung (Centralized Account Policy — Task 2.2A)
+## 2. Chính sách quản lý tài khoản tập trung (Centralized Account Policy)
 
-Theo thiết kế kiến trúc và mô hình bảo mật chuẩn tại `AGENTS.md` (Mục 6.5) cùng kết quả kiểm chứng tại `docs/backend/stage-2-task-2.2A-centralized-accounts.md`:
+Căn cứ theo kiến trúc quy định tại `AGENTS.md` (Mục 6.5) và kết quả kiểm thử tại `docs/backend/stage-2-task-2.2A-centralized-accounts.md`:
 
 ### 2.1. Cấm đăng ký tài khoản tự do (Public Self-Signup Disabled)
-- Hệ thống IoT Gateway–Server phục vụ các trạm giám sát chuyên dụng, không phải là ứng dụng mạng xã hội mở. Do đó, việc tự do đăng ký tài khoản bị vô hiệu hóa triệt để từ tầng máy chủ:
+- Hệ thống IoT Gateway–Server phục vụ các trạm đo công nghiệp chuyên dụng, không hỗ trợ đăng ký tài khoản công khai.
+- Việc vô hiệu hóa đăng ký được quy định bắt buộc ở tầng cấu hình dịch vụ xác thực:
   ```dotenv
-  # docker-compose.yml / .env của môi trường server
+  # Biến môi trường của container GoTrue
   GOTRUE_DISABLE_SIGNUP=true
   ```
-- **Hành vi phía Server:** Nếu bất kỳ client nào (hoặc kẻ tấn công sử dụng Postman/curl) cố tình gửi request `POST /auth/v1/signup`, dịch vụ GoTrue (v2.196.0) sẽ lập tức từ chối và trả về:
+- **Hành vi phía Server:** Khi có request `POST /auth/v1/signup` gửi tới API Gateway:
   - **Mã HTTP:** `422 Unprocessable Entity`
-  - **Payload phản hồi:**
+  - **Payload phản hồi chuẩn từ GoTrue:**
     ```json
     {
       "code": 422,
@@ -70,223 +86,155 @@ Theo thiết kế kiến trúc và mô hình bảo mật chuẩn tại `AGENTS.m
       "msg": "Signups not allowed for this instance"
     }
     ```
-- **Quy tắc triển khai phía Flutter Client:**
-  - Tuyệt đối **không** tạo màn hình Đăng ký (`SignUpScreen`), không tạo biểu mẫu nhập liệu đăng ký.
-  - Trên màn hình `LoginScreen`, **không** đặt nút bấm hoặc liên kết "Đăng ký tài khoản" ("Create Account" / "Sign Up").
-  - Giao diện đăng nhập cần có dòng ghi chú thông tin rõ ràng:
-    > *"Hệ thống vận hành trạm quan trắc nội bộ. Tài khoản người dùng được cấp phát tập trung bởi Quản trị viên hệ thống (Platform Administrator)."*
-  - **Lưu ý bảo mật:** Việc ẩn nút trên UI chỉ là tối ưu trải nghiệm (UX); cơ chế chặn tại GoTrue ở tầng server mới là chốt chặn bảo mật quyết định.
+- **Phạm vi kiểm chứng kỹ thuật (Verification Boundary):**
+  - Trạng thái `422 signup_disabled` đã được kiểm chứng tự động trong môi trường kiểm thử cách ly (test fixture `scripts/tests/stage2_auth.py`, kịch bản E02).
+  - *Lưu ý quan trọng về mặt kiến trúc:* Kết quả kiểm thử fixture là bằng chứng xác nhận cấu hình chuẩn, nhưng **không phải là sự bảo đảm mặc nhiên cho mọi môi trường triển khai thực tế**. Người vận hành phải thực hiện kiểm thử độc lập trực tiếp tại biên API (`POST /auth/v1/signup`) trên môi trường staging/production trước khi coi hệ thống đã khóa hoàn toàn.
+  - Việc ẩn nút "Đăng ký" trên giao diện Flutter Web chỉ là biện pháp trải nghiệm người dùng (UX cosmetic); chốt chặn an ninh quyết định nằm ở cấu hình từ chối tại máy chủ GoTrue.
+- **Quy tắc bắt buộc trên Client:**
+  - Không tạo màn hình đăng ký (`SignUpScreen`), không tạo biểu mẫu đăng ký.
+  - Không đặt liên kết hoặc nút bấm "Đăng ký" trên màn hình đăng nhập.
+  - Hiển thị thông báo rõ ràng: *"Tài khoản người dùng được cấp phát tập trung bởi Quản trị viên hệ thống (Platform Administrator)."*
 
-### 2.2. Quy trình cấp phát tài khoản thực tế
-- Người dùng (kể cả chủ trạm `owner` hay kỹ thuật viên `operator`) không thể tự tạo tài khoản.
-- Tài khoản được khởi tạo bởi **Platform Administrator** thông qua giao diện quản trị Supabase Studio (được bảo vệ trong mạng nội bộ/VPN) hoặc công cụ quản trị hạ tầng gọi trực tiếp tới Admin API (`POST /auth/v1/admin/users`) với `service_role` key.
-- Sau khi tài khoản được tạo, quản trị viên sẽ gán quyền truy cập tương ứng trên các Gateway cụ thể thông qua bảng `user_gateways`. Người dùng nhận thông tin đăng nhập (Email và Mật khẩu tạm thời) từ quản trị viên qua kênh liên lạc bảo mật.
+### 2.2. Không hỗ trợ User CRUD và Gateway Self-Claim trên Go Backend
+- **Go Backend không có API quản lý tài khoản:** Go Backend không cung cấp endpoint tạo, sửa, xóa người dùng (`User CRUD`).
+- **Quyền Platform Admin không tự cấp quyền Auth Admin:** Một người dùng có quyền Quản trị viên hệ sinh thái trong bảng `platform_admins` của PostgreSQL khi gửi JWT cá nhân (`role: authenticated`) tới GoTrue Admin API (`POST /auth/v1/admin/users`) **sẽ bị GoTrue từ chối với mã lỗi 403 Forbidden**. GoTrue chỉ chấp nhận `service_role` key cho các thao tác Admin API này.
+- **Không có cơ chế Gateway Self-Claim:** Người dùng không thể tự nhận trạm (claim gateway) bằng cách gửi `gateway_id`. Việc khởi tạo trạm IoT và gán quyền sở hữu (`owner_user_id`) được thực hiện tập trung bởi Platform Admin thông qua Go Admin API (`PUT /v1/admin/gateways/:gateway_id`). Chi tiết được quy định tại `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`.
 
 ---
 
 ## 3. Luồng Đăng nhập (Sign In Flow)
 
-### 3.1. Trình tự thực thi (Sequence Diagram)
+### 3.1. Trình tự thực thi qua Supabase API Gateway
 
 ```text
-User (Web Browser)       Flutter Web UI          AuthService         Nginx / Envoy        GoTrue (Auth)
-     |                         |                      |                    |                    |
-     |--- Nhập Email/Pw ------>|                      |                    |                    |
-     |--- Nhấn Đăng nhập ----->|                      |                    |                    |
-     |    (hoặc gõ phím Enter) |-- signInWithPassword>|                    |                    |
-     |                         |  (Hiển thị loading)  |-- POST /auth/v1/ ->|                    |
-     |                         |                      |   token?grant=pwd  |-- Chuyển tiếp ---->|
-     |                         |                      |                    |                    |-- Kiểm tra Hash
-     |                         |                      |                    |<-- Trả về 200 OK --|-- Sinh JWT HS256
-     |                         |                      |<-- HTTP 200 OK ----|    & Refresh Token
-     |                         |                      |    (AuthResponse)  |                    |
-     |                         |                      |                    |                    |
-     |                         |                      |-- Lưu Session vào Web LocalStorage      |
-     |                         |                      |-- Phát AuthChangeEvent.signedIn         |
-     |                         |<-- Thành công -------|                    |                    |
-     |                         |   (Ẩn loading)       |                    |                    |
-     |<-- GoRouter điều hướng--|                      |                    |                    |
-     |    tới /gateways        |                      |                    |                    |
+User (Web Browser)       Flutter Web Client        Nginx / Envoy Gateway        GoTrue (Supabase Auth)
+     |                           |                           |                             |
+     |--- Nhập Email & Mật khẩu->|                           |                             |
+     |--- Nhấn Đăng nhập ------->|                           |                             |
+     |                           |-- POST /auth/v1/token --->|                             |
+     |                           |   ?grant_type=password    |-- Chuyển tiếp tới GoTrue -->|
+     |                           |   Header apikey: <anon>   |                             |
+     |                           |   Body: {email, password} |                             |-- Kiểm tra mật khẩu (bcrypt)
+     |                           |                           |<-- 200 OK (access+refresh)--|-- Sinh JWT HS256 hợp lệ
+     |                           |<-- 200 OK (Session) ------|                             |
+     |                           |                                                         |
+     |                           |-- Lưu Session vào Web Storage (localStorage)           |
+     |                           |-- Cập nhật App State (Authenticated)                    |
+     |<-- Chuyển hướng Dashboard-|                                                         |
 ```
 
-### 3.2. Triển khai phương thức Đăng nhập bằng `supabase_flutter`
+### 3.2. Đặc tả giao thức Đăng nhập (Password Grant)
 
-Client sử dụng phương thức chuẩn của SDK Supabase:
+Khi đăng nhập, client gửi HTTP request tới endpoint của GoTrue:
 
-```dart
-final AuthResponse res = await Supabase.instance.client.auth.signInWithPassword(
-  email: email.trim(),
-  password: password,
-);
-final Session? session = res.session;
-final User? user = res.user;
-```
+```http
+POST /auth/v1/token?grant_type=password HTTP/1.1
+Host: auth.example.com
+Content-Type: application/json
+apikey: <SUPABASE_ANON_KEY>
 
-Khi đăng nhập thành công, SDK nhận về một đối tượng `Session` bao gồm:
-- `session.accessToken`: Chuỗi JWT định danh được ký bởi máy chủ.
-- `session.refreshToken`: Chuỗi mã bảo mật ngẫu nhiên dùng để xin cấp access token mới khi token cũ hết hạn.
-- `session.expiresIn`: Thời gian sống tính bằng giây (mặc định của hệ thống là `3600` giây = 1 giờ).
-- `session.user`: Đối tượng chứa thông tin người dùng (`id` là UUID v4 duy nhất, `email`, `role: authenticated`).
-
-### 3.3. Cấu trúc Token JWT theo quy chuẩn của Go Backend (Task 2.2)
-
-Go Backend thẩm định nghiêm ngặt tính hợp lệ của `access_token`. Client cần nắm rõ cấu trúc token này để hiểu hành vi kiểm tra của máy chủ:
-
-#### A. Header
-```json
 {
-  "alg": "HS256",
-  "typ": "JWT"
-}
-```
-*Lưu ý:* Go Backend chỉ chấp nhận thuật toán `HS256`. Mọi token sử dụng thuật toán khác (`none`, `RS256`, `HS512`) đều bị từ chối với mã lỗi `401 Unauthorized`.
-
-#### B. Payload (Claims bắt buộc)
-```json
-{
-  "iss": "http://localhost/auth/v1",
-  "sub": "b2f67232-a589-40ea-9b97-897db6746cf2",
-  "aud": "authenticated",
-  "role": "authenticated",
   "email": "operator.station1@example.com",
-  "exp": 1790938800,
-  "iat": 1790935200
+  "password": "ExamplePassword123!"
 }
 ```
 
-Bảng đối chiếu kiểm tra của Go Backend Verifier:
-| Claim | Yêu cầu của Go Backend | Ý nghĩa / Hành vi kiểm tra |
+Phản hồi thành công từ GoTrue (`200 OK`):
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "refresh_token": "8f9a2b...",
+  "user": {
+    "id": "b2f67232-a589-40ea-9b97-897db6746cf2",
+    "aud": "authenticated",
+    "role": "authenticated",
+    "email": "operator.station1@example.com"
+  }
+}
+```
+
+Phản hồi thất bại từ GoTrue (`400 Bad Request`):
+```json
+{
+  "code": 400,
+  "error_code": "invalid_grant",
+  "msg": "Invalid login credentials"
+}
+```
+*Lưu ý:* Cấu trúc lỗi này là của GoTrue, khác với chuẩn `APIErrorEnvelope` của Go Backend.
+
+### 3.3. Quy chuẩn thẩm định JWT tại Go Backend (Local HS256 Verification)
+
+Go Backend thẩm định nghiêm ngặt tính hợp lệ của `access_token` tại file `src/internal/auth/verifier.go`. Client cần nắm rõ các tiêu chí kiểm tra:
+
+1. **Thuật toán ký:** Bắt buộc là `HS256` đối xứng (`jwt.SigningMethodHS256`). Mọi thuật toán khác (`none`, `RS256`, `ES256`, `HS512`) đều bị từ chối lập tức.
+2. **Khóa bí mật:** Go Backend sử dụng `Secret` cấu hình từ biến môi trường máy chủ (độ dài tối thiểu 32 ký tự). Client tuyệt đối không được biết khóa này.
+3. **Không dùng JWKS:** Go Backend **không** gọi endpoint JWKS hay tải public key từ mạng. Mọi xác nhận là tính toán cục bộ bằng HMAC-SHA256.
+4. **Đối chiếu Claims bắt buộc trong Payload:**
+
+| Claim | Yêu cầu của Go Backend Verifier | Hành vi xử lý |
 |---|---|---|
-| `sub` | Bắt buộc (UUID v4 hợp lệ) | Định danh duy nhất của người dùng (`auth.users.id`). Trùng khớp với `profiles.id`. Không được chứa chuỗi UUID toàn số 0. |
-| `role` | Bằng chính xác `authenticated` | Chứng minh đây là tài khoản người dùng thông thường đã đăng nhập. Go Backend từ chối nếu role là `anon` hoặc `service_role`. |
-| `aud` | Bắt buộc chứa `authenticated` | GoTrue tự động đính kèm claim này cho người dùng hợp lệ. |
-| `iss` | Khớp chính xác `SUPABASE_JWT_ISSUER` | Khớp với biến môi trường của hệ thống (ví dụ: `http://localhost/auth/v1` trên local hoặc domain staging/production). |
-| `exp` | Bắt buộc (Unix timestamp) | Thời điểm hết hạn của token. Go Backend cho phép độ lệch đồng hồ (`clock_skew`) tối đa 30 giây. |
-| `iat` | Bắt buộc (Unix timestamp) | Thời điểm phát hành token. Không được nằm trong tương lai (vượt quá độ lệch đồng hồ). |
+| `sub` | Bắt buộc (UUID hợp lệ, khác `uuid.Nil`) | Định danh người dùng (`auth.users.id`). Verifier không giới hạn UUID version; quan hệ với `profiles.id` được kiểm tra ở tầng nghiệp vụ. |
+| `role` | Bằng chính xác chuỗi `"authenticated"` | Từ chối nếu là `"anon"`, `"service_role"` hoặc giá trị khác. |
+| `aud` | Chứa hoặc bằng chuỗi `"authenticated"` | Đảm bảo token cấp cho người dùng đã xác thực. |
+| `iss` | Khớp chính xác URL `SUPABASE_JWT_ISSUER` | Khớp cấu hình máy chủ (ví dụ `http://auth.test.local/auth/v1` trên môi trường kiểm thử). |
+| `exp` | Bắt buộc (Unix timestamp) | Kiểm tra thời hạn sống. Cho phép độ lệch đồng hồ (`ClockSkew`) tối đa theo cấu hình máy chủ (từ 0s đến 5 phút, mặc định thử nghiệm 30s). |
+| `iat` | Bắt buộc (Unix timestamp) | Thời điểm phát hành token. Không được nằm trong tương lai (có tính clock skew). |
+
+Nếu bất kỳ tiêu chuẩn nào ở trên không thỏa mãn, Go Backend từ chối request với mã `401 Unauthorized`.
 
 ---
 
-## 4. Quản lý phiên và Tự động làm mới Token (Session & Auto-Refresh trên Web)
+## 4. Quản lý phiên và Cơ chế Làm mới Token (Session & Refresh)
 
-### 4.1. Cơ chế lưu trữ phiên (Session Storage) trên Web và Đa nền tảng
+### 4.1. Bản chất lưu trữ phiên trên trình duyệt: Rủi ro XSS của `localStorage`
 
-Trong quá trình xây dựng ứng dụng Client, cơ chế lưu trữ phiên làm việc (`Session` gồm `access_token` và `refresh_token`) có sự khác biệt cơ bản giữa nền tảng Di động (Mobile) và Web (Browser):
+Một điểm kỹ thuật quan trọng cần làm rõ: **`window.localStorage` trên Web không phải là "kho lưu trữ an toàn" (secure storage) theo nghĩa bảo mật phần cứng.**
+- **Không có KeyStore/Keychain:** Trình duyệt web chạy trên sandbox không có quyền truy cập vào Android KeyStore hay iOS Keychain.
+- **Rủi ro XSS (Cross-Site Scripting):** Mọi dữ liệu lưu trong `localStorage` đều có thể bị đọc bởi bất kỳ đoạn mã JavaScript nào thực thi trong cùng Origin (`protocol://host:port`). Nếu ứng dụng bị tấn công XSS thông qua thư viện bên thứ ba không kiểm duyệt hoặc nhúng script độc hại, kẻ tấn công có thể đánh cắp `access_token` và `refresh_token`.
+- **Biện pháp giảm thiểu rủi ro:**
+  - Không lưu trữ token trong các biến toàn cục JavaScript (`window.token = ...`).
+  - Thiết lập Content Security Policy (CSP) chặt chẽ trên Nginx: cấm thực thi `unsafe-inline` scripts, chỉ tải tài nguyên từ các nguồn tin cậy.
+  - Phục vụ ứng dụng qua HTTPS, kích hoạt cờ bảo mật `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`.
+  - Giữ thời gian sống của `access_token` ở mức ngắn hợp lý (ví dụ: 1 giờ / 3600 giây).
 
-- **Trên Android / iOS (Nền tảng mở rộng sau này):**
-  - Thường sử dụng thư viện `flutter_secure_storage` để ghi session vào phân vùng bảo mật phần cứng: **Android KeyStore** (chuẩn mã hóa phần cứng AES-256) hoặc **iOS Keychain**. Điều này ngăn chặn việc trích xuất token khi thiết bị bị can thiệp vật lý hoặc root/jailbreak.
-- **Trên Flutter Web (Nền tảng trọng tâm hiện tại):**
-  - Môi trường trình duyệt chạy trên Sandbox và không có quyền truy cập trực tiếp vào KeyStore phần cứng của hệ điều hành.
-  - Thư viện `supabase_flutter` **mặc định đã tự động hỗ trợ đầy đủ cơ chế lưu trữ phiên vào trình duyệt thông qua Web Storage (`window.localStorage`)**. Khi ứng dụng khởi chạy trên Web, SDK Supabase tự động phát hiện nền tảng và khởi tạo `SharedPreferences` / Web Storage adapter để lưu trữ chuỗi dữ liệu phiên (JSON serialized session).
-  - **Lưu ý khi dùng `flutter_secure_storage` trên Web:** Mặc định trên Web, `flutter_secure_storage` sẽ sử dụng Web Cryptography API kết hợp với IndexedDB / LocalStorage để mô phỏng tính năng mã hóa. Tuy nhiên, việc này đòi hỏi cấu hình bổ sung và có thể gặp vấn đề không tương thích trên một số trình duyệt hạn chế Web Crypto hoặc chế độ ẩn danh (Incognito). Do đó, đối với Flutter Web, giải pháp chuẩn và ổn định nhất là **tận dụng trình lưu trữ phiên tích hợp sẵn của `supabase_flutter`** hoặc sử dụng lớp trừu tượng hóa kho lưu trữ có kiểm tra cờ `kIsWeb`.
-  - **Vai trò cốt lõi của LocalStorage trên Web:**
-    - `localStorage` gắn liền với **Origin** của ứng dụng Web (`protocol://domain:port`).
-    - Dữ liệu lưu trong `localStorage` **tồn tại bền vững qua các lần người dùng F5 / reload trang web, đóng tab rồi mở lại, hoặc mở nhiều tab làm việc đồng thời** trên cùng một trình duyệt.
-    - Khi người dùng tải lại trang (F5), `supabase_flutter` tự động đọc dữ liệu phiên từ `localStorage`, giải mã chuỗi token, thiết lập lại đối tượng `currentSession`, và phát sự kiện `AuthChangeEvent.initialSession` / `signedIn` vào stream `onAuthStateChange`. Nhờ đó, người dùng không bao giờ bị văng ra màn hình đăng nhập một cách vô lý mỗi khi F5 trang.
+### 4.2. Cơ chế làm mới Token (Refresh Token Grant)
 
-### 4.2. Vấn đề bảo mật Session trên Web (Web Session Security)
+Khi `access_token` sắp hết hạn hoặc vừa hết hạn, client gửi yêu cầu làm mới tới GoTrue:
 
-Chạy trên trình duyệt đặt ứng dụng trước các thách thức bảo mật đặc thù:
+```http
+POST /auth/v1/token?grant_type=refresh_token HTTP/1.1
+Host: auth.example.com
+Content-Type: application/json
+apikey: <SUPABASE_ANON_KEY>
 
-1. **Nguy cơ Tấn công XSS (Cross-Site Scripting):**
-   - Trên nền tảng Web, rủi ro lớn nhất đối với `localStorage` là tấn công XSS, khi mã độc JavaScript từ bên thứ ba (thư viện ngoài, CDN không kiểm soát hoặc injection) có thể đọc dữ liệu trong storage.
-   - **Biện pháp phòng ngừa:**
-     - **Tuyệt đối không lưu trữ token trong các biến toàn cục JavaScript không kiểm soát** (như gán vào `window.accessToken` hay biến global không được đóng gói). `supabase_flutter` đóng gói việc quản lý token bên trong bộ nhớ Dart runtime và chỉ tuần tự hóa session xuống Web Storage của chính Origin ứng dụng.
-     - Kiểm soát chặt chẽ các gói thư viện phụ thuộc (`pubspec.yaml`), không sử dụng các script JavaScript tùy tiện nhúng vào `web/index.html`.
-     - Phục vụ ứng dụng qua HTTPS có cấu hình header bảo mật nghiêm ngặt (`Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`) tại Nginx Reverse Proxy.
-2. **Không lưu `service_role` key trên Client:**
-   - `service_role` là secret key tối cao có quyền bypass toàn bộ bảo mật của Supabase, chỉ được phép lưu ở môi trường nội bộ Backend.
-   - Ứng dụng Flutter Web **chỉ sử dụng duy nhất `SUPABASE_ANON_KEY`**. Bản thân `anon` key là khóa công khai an toàn (safe to be public) vì mọi quyền hạn thực tế được phân định bằng chữ ký JWT của tài khoản người dùng (`role: authenticated`) và được thẩm định độc lập bởi Go Backend.
-3. **Chính sách cùng nguồn gốc (Same-Origin Policy - SOP):**
-   - Triển khai Flutter Web và Go Backend API trên cùng một domain thông qua Nginx Reverse Proxy giúp bảo toàn phiên trong cùng một Origin an toàn, đồng thời triệt tiêu rủi ro CORS.
-
-### 4.3. Khởi tạo ứng dụng trong `main.dart` trên Flutter Web
-
-Trên Flutter Web, việc khởi tạo `Supabase` được tinh gọn và tận dụng bộ nhớ Web Storage chuẩn:
-
-```dart
-// lib/main.dart
-import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:flutter_web_plugins/url_strategy.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:project1_client/app.dart';
-
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-
-  // Bật Path URL Strategy cho Web: sử dụng /login, /gateways thay vì /#/login, /#/gateways
-  if (kIsWeb) {
-    usePathUrlStrategy();
-  }
-
-  // Nạp cấu hình môi trường từ .env
-  await dotenv.load(fileName: ".env");
-
-  // Khởi tạo Supabase SDK.
-  // Trên Web, SDK tự động sử dụng browser LocalStorage để lưu trữ session an toàn và bền vững.
-  await Supabase.initialize(
-    url: dotenv.env['SUPABASE_URL']!,
-    anonKey: dotenv.env['SUPABASE_ANON_KEY']!,
-    authOptions: const FlutterAuthClientOptions(
-      autoRefreshToken: true, // Tự động làm mới token trong nền trước khi hết hạn
-    ),
-  );
-
-  runApp(const MyApp());
+{
+  "refresh_token": "8f9a2b..."
 }
 ```
 
-> **Ghi chú về hỗ trợ đa nền tảng (Web + Mobile dự phòng):**  
-> Nếu sau này mở rộng đóng gói sang Android/iOS mà vẫn muốn dùng chung một codebase, có thể triển khai `AppLocalStorage` kiểm tra `kIsWeb`: nếu là Web thì dùng trình lưu trữ mặc định của SDK, nếu là Mobile thì kích hoạt adapter `FlutterSecureStorage`. Kiến trúc phân tầng này đảm bảo tính độc lập tuyệt đối giữa logic nghiệp vụ và nền tảng runtime.
+GoTrue kiểm tra refresh token trong cơ sở dữ liệu. Nếu hợp lệ, GoTrue cấp một cặp `access_token` và `refresh_token` mới.
 
-### 4.4. Lắng nghe trạng thái phiên thời gian thực (`onAuthStateChange`)
+### 4.3. Nguyên tắc xử lý Single-Flight và Chống lặp vô hạn khi Refresh
 
-Để giao diện người dùng và bộ định tuyến (Router) phản ứng chính xác với các biến đổi trạng thái tài khoản (đăng nhập, phục hồi phiên từ LocalStorage khi F5, hết hạn phiên, đăng xuất), ứng dụng lắng nghe Stream sự kiện của Supabase:
+Trong quá trình tương tác với Go Backend API, nếu xảy ra lỗi `401 Unauthorized`, client cần tuân thủ các nguyên tắc xử lý nghiêm ngặt:
 
-```dart
-Supabase.instance.client.auth.onAuthStateChange.listen((AuthState state) {
-  final AuthChangeEvent event = state.event;
-  final Session? session = state.session;
-
-  switch (event) {
-    case AuthChangeEvent.initialSession:
-      // SDK vừa đọc xong session từ LocalStorage sau khi người dùng F5 trang
-      debugPrint("Đã nạp session ban đầu từ LocalStorage: ${session?.user.email}");
-      break;
-
-    case AuthChangeEvent.signedIn:
-      // Người dùng vừa đăng nhập thành công hoặc phiên được phục hồi
-      debugPrint("Người dùng đã đăng nhập: ${session?.user.email}");
-      break;
-
-    case AuthChangeEvent.tokenRefreshed:
-      // Token đã được tự động làm mới thành công trong nền qua Nginx
-      debugPrint("Access token đã được làm mới: ${session?.accessToken}");
-      break;
-
-    case AuthChangeEvent.signedOut:
-      // Đăng xuất chủ động hoặc bị thu hồi phiên trên server
-      debugPrint("Người dùng đã đăng xuất, LocalStorage đã được xóa sạch.");
-      break;
-
-    case AuthChangeEvent.userDeleted:
-    case AuthChangeEvent.mfaChallengeVerified:
-      break;
-
-    default:
-      break;
-  }
-});
-```
-
-### 4.5. Cơ chế tự động làm mới Token (Auto-Refresh) và Xử lý sự cố hết hạn
-- **Cơ chế nền:** Nhờ tham số `autoRefreshToken: true`, `supabase_flutter` chạy một bộ đếm nội bộ. Khi `access_token` sắp hết hạn (thông thường trước thời điểm `exp` khoảng 60 giây), SDK tự động gửi request `POST /auth/v1/token?grant_type=refresh_token` qua Nginx/Envoy để lấy cặp `access_token` và `refresh_token` mới, sau đó tự động cập nhật vào `localStorage`.
-- **Trường hợp ngoại lệ (Refresh thất bại):**
-  - Xảy ra khi: Người dùng bị xóa tài khoản trên hệ thống, phiên bị thu hồi thủ công bởi Quản trị viên, hoặc máy tính mất kết nối mạng liên tục trong thời gian dài vượt quá thời hạn sống của `refresh_token`.
-  - Lúc này, GoTrue trả về lỗi `400 Bad Request` hoặc `invalid_grant`.
-  - SDK Supabase sẽ tự động kích hoạt sự kiện `AuthChangeEvent.signedOut`, dọn dẹp sạch `localStorage`.
-  - Bộ định tuyến (GoRouter) lập tức chuyển hướng người dùng về màn hình đăng nhập (`/login`) và hiển thị thông báo rõ ràng: *"Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại."*
+1. **Làm mới đơn luồng (Single-Flight Refresh):**
+   - Khi người dùng mở dashboard, giao diện có thể gửi đồng thời 4–5 request API (lấy danh sách gateway, cảm biến, cấu hình, trạng thái kết nối).
+   - Nếu token vừa hết hạn, tất cả các request này đều nhận về `401`.
+   - **Cấm:** Không được gửi đồng thời 4–5 request `grant_type=refresh_token` lên GoTrue. Điều này gây ra lỗi tranh chấp phiên (race condition) và GoTrue sẽ hủy token do nghi ngờ bị lạm dụng (`invalid_grant`).
+   - **Quy chuẩn:** Sử dụng cơ chế khóa (Mutex) hoặc Completer đơn lẻ: request đầu tiên kích hoạt làm mới session, các request tiếp theo tạm dừng chờ kết quả của lần làm mới đó rồi mới dùng token mới để gửi lại.
+2. **Giới hạn số lần thử lại (Bounded Retry — At most once):**
+   - Mỗi request nghiệp vụ chỉ được thử lại tối đa **1 lần duy nhất** sau khi đã refresh token thành công.
+   - Tuyệt đối không tạo vòng lặp vô hạn (infinite retry loop) nếu token mới vẫn bị từ chối.
+3. **Không tự động gửi lại các mutation không an toàn:**
+   - Đối với các thao tác thay đổi dữ liệu cấu hình hoặc tác vụ quản trị (`PUT`, `POST`, `PATCH`), không tự ý gửi lại nếu không đảm bảo tính lũy kế hoặc thiếu khóa xác thực chống trùng lặp (`Idempotency-Key`).
+4. **Không đăng xuất hàng loạt trên lỗi 403 hoặc 503:**
+   - Mã `403 Forbidden` thể hiện người dùng đã đăng nhập hợp lệ nhưng không đủ quyền trên tài nguyên (ví dụ: không có quyền `owner` hoặc không phải `platform_admin`). **Không được đăng xuất người dùng khi gặp lỗi 403!**
+   - Mã `503 Service Unavailable` thể hiện lỗi tạm thời ở cơ sở dữ liệu hoặc hệ thống phụ trợ. **Không được đăng xuất người dùng khi gặp lỗi 503!**
+   - Chỉ kích hoạt đăng xuất khi quá trình làm mới token trả về lỗi `invalid_grant` hoặc refresh token đã bị thu hồi/hết hạn hoàn toàn.
 
 ---
 
@@ -294,7 +242,7 @@ Supabase.instance.client.auth.onAuthStateChange.listen((AuthState state) {
 
 ### 5.1. Định dạng Header chuẩn
 
-Mọi yêu cầu gửi tới Go Backend (`/v1/*`) đều bắt buộc đính kèm `access_token` trong HTTP Header theo định dạng tiêu chuẩn RFC 6750:
+Mọi yêu cầu gửi tới Go Backend (`/v1/*`) bắt buộc phải đính kèm `access_token` trong HTTP Header theo chuẩn RFC 6750:
 
 ```http
 GET /v1/gateways HTTP/1.1
@@ -303,14 +251,15 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 Accept: application/json
 ```
 
-**Quy tắc bất di bất dịch:**
-- Scheme xác thực bắt buộc là `Bearer` (không phân biệt hoa thường, nhưng khuyến nghị viết hoa `Bearer`).
-- **Không bao giờ** truyền JWT qua Query String (ví dụ: `?token=...`) hoặc trong JSON Body. Go Backend được cấu hình từ chối triệt để và trả về `401 Unauthorized` nếu token không nằm trong header `Authorization`.
+**Quy tắc bắt buộc:**
+- Scheme xác thực phải là `Bearer` (có khoảng trắng phân cách với chuỗi token).
+- Go Backend **không chấp nhận** truyền token qua Query String (`?token=...`) hay JSON Body vì rủi ro lưu vết trong log proxy/trình duyệt.
 
-### 5.2. Cấu trúc phản hồi lỗi chuẩn từ Go Backend
+### 5.2. Cấu trúc phản hồi lỗi an toàn từ Go Backend (Safe Error Envelope)
 
-Khi request không vượt qua được lớp xác thực, Go Backend trả về phản hồi theo chuẩn cấu trúc lỗi an toàn (`safe error contract` - Task 2.2):
+Khi xác thực hoặc phân quyền thất bại, Go Backend phản hồi theo đúng định dạng `httpapi.WriteError` (`src/internal/httpapi/error.go`):
 
+#### A. Lỗi 401 Unauthorized (Thiếu hoặc sai Access Token)
 ```http
 HTTP/1.1 401 Unauthorized
 Content-Type: application/json
@@ -325,469 +274,148 @@ X-Request-ID: 7b35f299-e67c-48c5-9276-805c8a4128f0
   }
 }
 ```
+*Lưu ý bảo mật:* Go Backend luôn trả về `code: "unauthorized"` và `message: "authentication required"` kèm header `WWW-Authenticate: Bearer`. Hệ thống cố ý không giải thích chi tiết lý do (như "chữ ký sai", "token hết hạn", hay "không tìm thấy secret") nhằm ngăn chặn kẻ tấn công thăm dò cấu trúc token.
 
-### 5.3. Xây dựng HTTP Interceptor / API Client Client-side
+#### B. Phân biệt 403 Forbidden vs 404 Not Found vs 503 Service Unavailable
 
-Nhằm đảm bảo tính trong suốt cho toàn bộ ứng dụng, tạo lớp `ApiClient` tự động chèn header và xử lý thử nghiệm làm mới token khi gặp lỗi `401`:
+Go Backend áp dụng các mã lỗi khác nhau tùy theo bản chất bảo mật của tài nguyên:
+
+| Mã HTTP | Thuộc tính `code` | Thuộc tính `message` | Ngữ cảnh trả về | Hành vi Client |
+|---|---|---|---|---|
+| **401 Unauthorized** | `"unauthorized"` | `"authentication required"` | Header Authorization thiếu, token sai định dạng, sai chữ ký HS256 hoặc đã hết hạn. | Thực hiện single-flight refresh token. Nếu thành công thì thử lại request 1 lần; nếu thất bại thì đăng xuất. |
+| **403 Forbidden** | `"forbidden"` | `"insufficient permissions"` | Token hợp lệ nhưng tài khoản không có quyền Platform Admin khi gọi `/v1/admin/*` (`src/internal/auth/admin_middleware.go`). | Giữ nguyên phiên đăng nhập. Hiển thị thông báo: *"Bạn không có quyền thực hiện thao tác này."* |
+| **404 Not Found** | `"not_found"` | `"resource not found"` | Truy cập trạm/cảm biến mà người dùng **không phải là thành viên** trong `user_gateways` (ví dụ: `/v1/gateways/:gateway_id/sensors`). | Giữ nguyên phiên. Go Backend trả về 404 (thay vì 403) đối với Gateway của người khác nhằm ngăn chặn việc dò quét danh sách Gateway trên hệ thống. |
+| **503 Service Unavailable** | `"service_unavailable"` | `"service unavailable"` | Cơ sở dữ liệu quá tải, timeout tra cứu phân quyền hoặc hệ thống kiểm tra readiness thất bại. | Giữ nguyên phiên. Hiển thị thông báo hệ thống bận và cho phép thử lại sau ít phút. |
+
+---
+
+## 6. Luồng Đăng xuất và Thực tế Thu hồi Token (Sign Out & Revocation Reality)
+
+### 6.1. Trình tự Đăng xuất trên Client
+
+Khi người dùng nhấn "Đăng xuất" trên Web:
+1. **Ngắt kết nối thời gian thực:** Đóng toàn bộ kết nối WebSocket đang mở tới `/v1/ws` để tránh giữ kết nối thừa.
+2. **Gửi yêu cầu hủy phiên tới GoTrue:** Gọi `POST /auth/v1/logout` qua Nginx. GoTrue sẽ xóa session và vô hiệu hóa `refresh_token` trong cơ sở dữ liệu xác thực.
+3. **Dọn dẹp Web Storage:** Xóa sạch `access_token` và `refresh_token` trong `window.localStorage`.
+4. **Xóa State ứng dụng:** Reset toàn bộ bộ nhớ tạm (In-memory State/Bloc/Cubit) về trạng thái ban đầu.
+5. **Điều hướng:** Đưa người dùng về màn hình `/login` thông qua GoRouter.
+
+### 6.2. Thực tế kỹ thuật về việc Thu hồi Token (Token Invalidation Reality)
+
+Một điểm then chốt cần ghi nhận chính xác theo thiết kế kiến trúc:
+> **Thao tác đăng xuất (gọi `/auth/v1/logout` hoặc xóa `localStorage`) KHÔNG làm cho một `access_token` đã phát hành lập tức bị từ chối trên Go Backend trước khi token đó chạm mốc `exp`.**
+
+**Nguyên nhân:**
+- Go Backend thực hiện thẩm định chữ ký số tại chỗ (Local HS256 Verification) và hoàn toàn **không** truy vấn cơ sở dữ liệu của GoTrue trên từng HTTP request.
+- Miễn là `access_token` còn thời hạn (`exp`), đúng chữ ký với `SUPABASE_JWT_SECRET`, đúng `iss`, `aud`, `role`, thì bộ phân tích cú pháp của Go Backend vẫn coi token đó là hợp lệ về mặt toán học.
+- **Hệ quả kiến trúc:**
+  - Nếu token bị rò rỉ qua kênh không an toàn (XSS, nhật ký mạng), việc người dùng bấm đăng xuất trên trình duyệt không thể lập tức vô hiệu hóa token đó ở phía Go Backend cho tới khi hết hạn.
+  - Do đó, việc cấu hình thời gian sống của token ngắn (ví dụ 1 giờ), bảo vệ môi trường Web bằng CSP, không in token ra màn hình console và xóa sạch bộ nhớ client khi đăng xuất là các nguyên tắc bảo mật sống còn.
+
+---
+
+## 7. Xử lý các tình huống lỗi và Phản hồi giao diện (UI/UX Mapping)
+
+| Tình huống / Mã phản hồi | Nguồn gốc lỗi | Thông điệp hiển thị trên UI | Hành vi hệ thống |
+|---|---|---|---|
+| `400 Bad Request` (`invalid_grant`) | GoTrue (Sai email hoặc mật khẩu) | *"Email hoặc mật khẩu không chính xác. Vui lòng kiểm tra lại."* | Dừng quá trình đăng nhập, cho phép người dùng nhập lại. |
+| `422 Unprocessable Entity` (`signup_disabled`) | GoTrue (Cố tình gọi signup) | *"Hệ thống không mở tính năng tự đăng ký. Vui lòng liên hệ Quản trị viên hệ thống để được cấp tài khoản."* | Hiển thị thông báo hướng dẫn. |
+| `401 Unauthorized` (`unauthorized`) | Go Backend (Token hết hạn/sai) | *"Đang làm mới phiên làm việc..."* | Kích hoạt single-flight refresh token. Nếu refresh thất bại: chuyển hướng về `/login` với thông báo *"Phiên đăng nhập đã hết hạn."* |
+| `403 Forbidden` (`forbidden`) | Go Backend (Không có quyền Admin) | *"Bạn không có quyền thực hiện thao tác quản trị này."* | Không đăng xuất, giữ nguyên màn hình hiện tại. |
+| `404 Not Found` (`not_found`) | Go Backend (Trạm không tồn tại hoặc không thuộc quyền) | *"Không tìm thấy tài nguyên trạm hoặc bạn không có quyền truy cập."* | Chuyển hướng về danh sách Gateway của người dùng. |
+| `503 Service Unavailable` (`service_unavailable`) | Go Backend (Lỗi DB / Timeout) | *"Dịch vụ máy chủ tạm thời gián đoạn. Vui lòng thử lại sau ít phút."* | Cho phép người dùng bấm nút "Thử lại" (Retry). |
+| Network / Socket Exception | Mất mạng hoặc Nginx không phản hồi | *"Không thể kết nối đến máy chủ. Vui lòng kiểm tra kết nối mạng."* | Hiển thị trạng thái Offline trên Dashboard. |
+
+---
+
+## 8. Mã nguồn mẫu Client minh họa (Illustrative Reference Scaffolding)
+
+*Lưu ý kiến trúc:* Các đoạn mã Dart dưới đây là khung mã nguồn **mang tính chất minh họa hợp đồng giao tiếp (Illustrative Contract)**, không đại diện cho toàn bộ mã nguồn triển khai thực tế của ứng dụng client. Dự án không tự suy đoán nâng cấp các gói thư viện bên ngoài mà bám sát cơ chế mạng chuẩn.
+
+### 8.1. API Client xử lý Single-Flight Refresh và Token Injection (`api_client.dart`)
 
 ```dart
 // lib/core/network/api_client.dart
+import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class ApiClient {
-  final String baseUrl;
+  final String apiBaseUrl; // Ví dụ: http://localhost/v1
   final http.Client _httpClient = http.Client();
 
-  ApiClient({required this.baseUrl});
+  // Khóa chống thundering herd khi nhiều request 401 cùng lúc
+  Completer<String?>? _refreshCompleter;
 
-  Future<Map<String, String>> _buildHeaders() async {
-    final session = Supabase.instance.client.auth.currentSession;
-    final token = session?.accessToken;
+  ApiClient({required this.apiBaseUrl});
 
+  Future<String?> _getValidToken() async {
+    return Supabase.instance.client.auth.currentSession?.accessToken;
+  }
+
+  /// Thực hiện Single-Flight Refresh để tránh gửi nhiều request refresh đồng thời
+  Future<String?> _singleFlightRefreshToken() async {
+    if (_refreshCompleter != null) {
+      // Đang có một tiến trình refresh diễn ra, chờ đợi tiến trình đó
+      return _refreshCompleter!.future;
+    }
+
+    _refreshCompleter = Completer<String?>();
+    try {
+      final res = await Supabase.instance.client.auth.refreshSession();
+      final newToken = res.session?.accessToken;
+      _refreshCompleter!.complete(newToken);
+      return newToken;
+    } catch (e) {
+      _refreshCompleter!.complete(null);
+      // Khi refresh thất bại hoàn toàn, kích hoạt đăng xuất dọn dẹp phiên
+      await Supabase.instance.client.auth.signOut();
+      return null;
+    } finally {
+      _refreshCompleter = null;
+    }
+  }
+
+  Future<Map<String, String>> _buildHeaders(String? token) async {
     return {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      if (token != null) 'Authorization': 'Bearer $token',
+      if (token != null && token.isNotEmpty) 'Authorization': 'Bearer $token',
     };
   }
 
-  /// Gửi GET request có kèm cơ chế retry 401 một lần sau khi refresh token
+  /// Gửi GET request có kèm cơ chế retry tối đa 1 lần nếu gặp lỗi 401
   Future<http.Response> get(String endpoint) async {
-    final uri = Uri.parse('$baseUrl$endpoint');
-    var headers = await _buildHeaders();
+    final uri = Uri.parse('$apiBaseUrl$endpoint');
+    String? token = await _getValidToken();
+    var headers = await _buildHeaders(token);
 
     var response = await _httpClient.get(uri, headers: headers);
 
-    // Nếu gặp lỗi 401: Token có thể vừa hết hạn mà background timer chưa kịp refresh
+    // Xử lý khi Go Backend trả về 401 Unauthorized
     if (response.statusCode == 401) {
-      debugPrint("Received 401 Unauthorized. Attempting session refresh...");
-
-      try {
-        // Thử yêu cầu SDK refresh session ngay lập tức
-        final refreshResponse =
-            await Supabase.instance.client.auth.refreshSession();
-
-        if (refreshResponse.session != null) {
-          debugPrint("Refresh session successful. Retrying original request...");
-          // Cập nhật lại header với token mới
-          headers = await _buildHeaders();
-          response = await _httpClient.get(uri, headers: headers);
-        } else {
-          _handleAuthExpired();
-        }
-      } catch (e) {
-        debugPrint("Session refresh failed: $e");
-        _handleAuthExpired();
+      final refreshedToken = await _singleFlightRefreshToken();
+      if (refreshedToken != null && refreshedToken.isNotEmpty) {
+        // Thử lại request ban đầu đúng 1 lần duy nhất với token mới
+        headers = await _buildHeaders(refreshedToken);
+        response = await _httpClient.get(uri, headers: headers);
       }
     }
 
     return response;
   }
-
-  void _handleAuthExpired() {
-    // Kích hoạt đăng xuất để dọn dẹp state và đá về LoginScreen
-    Supabase.instance.client.auth.signOut();
-  }
 }
 ```
 
----
+### 8.2. Màn hình Đăng nhập minh họa (`login_screen.dart`)
 
-## 6. Luồng Điều hướng, Đồng bộ URL trên Web và Đăng xuất (Web Routing, URL Sync & Sign Out)
-
-### 6.1. Thách thức điều hướng trên Web và sự cần thiết của Declarative Routing (`go_router`)
-
-Trên ứng dụng di động native, việc điều hướng thường dựa vào ngăn xếp màn hình nội bộ (Internal Navigation Stack) thông qua các lệnh mệnh lệnh như `Navigator.push` hay `Navigator.pop`. Tuy nhiên, khi chuyển trọng tâm phát triển sang **Flutter Web**, ứng dụng chạy trong môi trường trình duyệt với các đặc tính tương tác hoàn toàn khác:
-
-1. **Sự hiện diện của thanh địa chỉ (URL Address Bar):**
-   - Người dùng có thể quan sát trực tiếp đường dẫn, ví dụ `http://localhost/login`, `http://localhost/gateways` hoặc `http://localhost/gateways/gw-01`.
-   - Người dùng có thể sao chép URL, đánh dấu trang (bookmark), hoặc gõ trực tiếp một URL nội bộ vào thanh địa chỉ để truy cập thẳng (Deep Linking).
-2. **Thao tác tải lại trang (F5 / Reload):**
-   - Người dùng máy tính có thói quen nhấn **F5** hoặc **Ctrl+R** bất cứ lúc nào. Khi đó, toàn bộ ứng dụng Flutter Web được nạp lại từ đầu. Nếu sử dụng `Navigator 1.0` truyền thống, ứng dụng sẽ bị mất ngăn xếp điều hướng, gây lỗi hoặc tự động quay về trang chủ sai lệch.
-3. **Phím điều hướng trình duyệt (Back / Forward Buttons):**
-   - Người dùng thường xuyên nhấn nút Back hoặc Forward của trình duyệt để quay lại trang trước. Ứng dụng Web phải đồng bộ lịch sử duyệt web (Browser History) với trạng thái giao diện.
-
-**Giải pháp kiến trúc:** Dự án sử dụng thư viện **`go_router`** (dựa trên Navigator 2.0 của Flutter) làm bộ định tuyến chuẩn cho Flutter Web:
-- **Đồng bộ hai chiều:** Mọi thay đổi về URL trên trình duyệt sẽ kích hoạt router tương ứng, và ngược lại, mỗi lần chuyển màn hình trong code sẽ cập nhật URL trên thanh địa chỉ.
-- **Path URL Strategy:** Kích hoạt `usePathUrlStrategy()` từ `flutter_web_plugins/url_strategy.dart` để loại bỏ dấu `#` (Hash fragment), hiển thị đường dẫn chuẩn hiện đại (ví dụ `/gateways` thay vì `/#/gateways`).
-- **Route Guarding với `redirect`:** Tập trung toàn bộ logic kiểm tra đăng nhập vào hàm `redirect` của `GoRouter`, loại bỏ hoàn toàn các đoạn code kiểm tra rải rác ở từng widget.
-
-### 6.2. Cơ chế Bảo vệ Route và Tự động chuyển hướng (`GoRouter.redirect`)
-
-Quy tắc chuyển hướng tự động được đặc tả theo ma trận trạng thái:
-
-| Trạng thái người dùng | URL người dùng cố truy cập | Quyết định của `GoRouter.redirect` | Mục đích & Trải nghiệm |
-|---|---|---|---|
-| **Chưa đăng nhập** (`Unauthenticated`) | Các trang nội bộ (`/`, `/gateways`, `/gateways/:id`) | Chuyển hướng về `/login` | Bảo vệ tài nguyên nội bộ, buộc người dùng phải xác thực trước. |
-| **Đã đăng nhập** (`Authenticated`) | Màn hình đăng nhập (`/login`) | Chuyển hướng về `/gateways` | Không cho phép người dùng đã có phiên hợp lệ quay lại form đăng nhập. |
-| **Đang nạp phiên** (`Initial / Loading`) | Bất kỳ URL nào khi vừa F5 | Giữ nguyên và hiển thị Splash/Loading ngắn | Chờ `supabase_flutter` đọc xong `localStorage`, tránh việc redirect nhầm về `/login`. |
-| **Đã đăng nhập** (`Authenticated`) | Các trang nội bộ (`/gateways`, `/gateways/:id`) | Cho phép đi tiếp (`null`) | Truy cập dữ liệu bình thường theo phân quyền. |
-
-```text
-[Người dùng gõ URL hoặc nhấn F5]
-               |
-               v
-      +-----------------+
-      | GoRouter Engine |
-      +--------+--------+
-               |
-               v
-   Đang đọc LocalStorage? 
-     |                  |
-   (Có)               (Không)
-     |                  |
-     v                  v
-[Hiển thị Loading]   Đã có Session hợp lệ?
-                       |               |
-                     (Có)            (Không)
-                       |               |
-             Truy cập /login?     Truy cập route nội bộ?
-               |          |         |              |
-             (Có)       (Không)   (Có)           (Không)
-               |          |         |              |
-               v          v         v              v
-     Redirect về     Cho phép    Redirect về    Cho phép
-     /gateways       truy cập    /login         truy cập (/login)
-```
-
-### 6.3. Luồng Đăng xuất toàn diện trên Web (Sign Out Flow)
-
-Thao tác đăng xuất trên Web cần đảm bảo tính triệt để, xóa sạch dữ liệu nhạy cảm và ngắt toàn bộ kết nối nền:
-
-1. **Hủy kết nối mạng thời gian thực:** Đóng toàn bộ các kênh kết nối WebSocket đang mở tới `/v1/ws` (nếu có) để tránh rò rỉ kết nối ngầm trên trình duyệt.
-2. **Gọi dịch vụ Supabase Auth:** Thực thi `await Supabase.instance.client.auth.signOut()`. Lệnh này gửi request lên GoTrue để hủy bỏ phiên (Revoke Session) trên server.
-3. **Xóa sạch dữ liệu cục bộ trong Browser Storage:** `supabase_flutter` tự động xóa hoàn toàn chuỗi token trong `localStorage`.
-4. **Giải phóng bộ nhớ ứng dụng (In-memory State):** Reset toàn bộ state trong BLoC / Cubit (như danh sách Gateway, thông tin user).
-5. **Kích hoạt tự động chuyển hướng qua GoRouter:** Sự kiện đăng xuất phát ra `AuthChangeEvent.signedOut`, chuyển trạng thái `AuthBloc`/`AuthCubit` sang `Unauthenticated`. Do `GoRouter` lắng nghe trạng thái này thông qua `refreshListenable`, router sẽ tự động chuyển hướng người dùng về `/login` và cập nhật URL trên thanh địa chỉ.
+Màn hình đăng nhập minh họa tuân thủ nghiêm ngặt quy định: không có nút Đăng ký tài khoản, xử lý phím Enter trên Web và hiển thị thông báo chính sách tài khoản tập trung:
 
 ```dart
-// lib/core/auth/auth_controller.dart hoặc AuthCubit
-Future<void> signOut() async {
-  try {
-    // 1. Ngắt WebSocket thời gian thực nếu đang kết nối
-    // TelemetryWebSocketClient.instance.disconnect();
-
-    // 2. Yêu cầu Supabase hủy phiên trên server và xóa LocalStorage
-    await Supabase.instance.client.auth.signOut();
-
-    // 3. Xóa in-memory state của ứng dụng
-    // getIt<GatewayListCubit>().resetState();
-
-    // 4. GoRouter sẽ tự động nhận diện state Unauthenticated và redirect về /login
-  } catch (error) {
-    debugPrint("Lỗi trong quá trình đăng xuất: $error");
-  }
-}
-```
-
----
-
-## 7. Xử lý các tình huống lỗi và Phản hồi UI/UX
-
-Ứng dụng cần phân biệt rõ ràng các loại lỗi xác thực để cung cấp thông báo chính xác và thân thiện cho người dùng cuối:
-
-| Tình huống / Mã lỗi | Nguyên nhân gốc | Phản hồi giao diện người dùng (UI Message) |
-|---|---|---|
-| `AuthException: Invalid login credentials` hoặc `invalid_grant` | Người dùng nhập sai Email hoặc Mật khẩu trên màn hình đăng nhập. | *"Email hoặc mật khẩu không chính xác. Vui lòng kiểm tra lại."* |
-| `SocketException` / `ClientException` / Timeout | Không có kết nối Internet hoặc Nginx/Server không khả dụng (địa chỉ IP máy chủ sai, chưa bật Nginx hoặc chưa kết nối VPN/Wi-Fi phòng lab). | *"Không thể kết nối đến máy chủ. Vui lòng kiểm tra kết nối mạng hoặc liên hệ quản trị viên."* |
-| `AuthException: Email not confirmed` | Tài khoản được tạo nhưng chưa hoàn tất xác thực email (chỉ xảy ra nếu cấu hình `email_confirm: false`). | *"Tài khoản chưa được kích hoạt. Vui lòng liên hệ Quản trị viên hệ thống."* |
-| `422 Unprocessable Entity` (`signup_disabled`) | Xảy ra nếu client cố gửi request đăng ký tài khoản tự do. | *"Hệ thống không mở tính năng tự đăng ký. Vui lòng liên hệ Platform Administrator để được cấp tài khoản."* |
-| `401 Unauthorized` từ Go Backend | Token JWT hết hạn, chữ ký sai, hoặc token bị thu hồi. | Tự động làm mới phiên trong nền; nếu thất bại: chuyển về Login kèm thông báo: *"Phiên làm việc đã hết hạn. Vui lòng đăng nhập lại."* |
-| `403 Forbidden` từ Go Backend | Token hợp lệ nhưng tài khoản không có quyền thao tác trên tài nguyên này (ví dụ: không có trong `platform_admins` hoặc `user_gateways`). | *"Bạn không có quyền thực hiện thao tác này trên hệ thống."* |
-| `502 Bad Gateway` / `504 Gateway Timeout` | Nginx đang chạy nhưng container Supabase Auth hoặc Go Backend bị tắt/treo. | *"Dịch vụ máy chủ tạm thời không khả dụng. Vui lòng thử lại sau ít phút."* |
-
-### Nguyên tắc thiết kế UI/UX trên màn hình Đăng nhập (Web-focused):
-1. **Trạng thái nút bấm và chống gửi lặp (Debounce):** Khi đang gửi request xác thực, chuyển nút "Đăng nhập" sang trạng thái `CircularProgressIndicator` và vô hiệu hóa (`disable`) các trường nhập liệu để ngăn người dùng nhấn liên tục hoặc spam phím Enter tạo ra nhiều request trùng lặp.
-2. **Ẩn/Hiện mật khẩu:** Cung cấp icon con mắt để người dùng có thể kiểm tra chuỗi mật khẩu trước khi gửi, tránh gõ nhầm ký tự đặc biệt.
-3. **Hiển thị lỗi nổi bật:** Sử dụng khung thông báo lỗi màu cảnh báo đặt ngay phía trên form nhập liệu để người dùng trên màn hình lớn dễ dàng quan sát.
-4. **Tối ưu trải nghiệm Web (Keyboard & Responsive Layout):**
-   - **Hỗ trợ phím `Enter`:** Người dùng có thể nhấn phím `Enter` ngay trên trường nhập email hoặc mật khẩu (`onFieldSubmitted`) để gửi form đăng nhập lập tức mà không cần dùng chuột nhấp vào nút.
-   - **Bố cục dạng thẻ (Responsive Card):** Trên màn hình Desktop, form đăng nhập được đóng khung trong thẻ `Card` có chiều rộng tối đa (`maxWidth: 440px`), đổ bóng nhẹ, căn giữa màn hình theo cả chiều dọc và chiều ngang. Trên màn hình di động, form tự động co giãn 100% bề ngang.
-   - **Tiêu đề trang Web (Page Title):** Cập nhật `Title` của tab trình duyệt thành `"Đăng nhập | IoT Gateway–Server"` để tăng tính chuyên nghiệp.
-
----
-
-## 8. Mã nguồn mẫu hoàn chỉnh (Reference Implementation)
-
-Dưới đây là mã nguồn mẫu tổ chức theo cấu trúc chuẩn cho dự án Flutter.
-
-### 8.1. `pubspec.yaml` (Các thư viện cần thiết)
-
-```yaml
-dependencies:
-  flutter:
-    sdk: flutter
-  flutter_web_plugins:
-    sdk: flutter
-  supabase_flutter: ^2.8.0
-  go_router: ^14.2.0
-  flutter_bloc: ^8.1.6
-  equatable: ^2.0.5
-  flutter_dotenv: ^5.2.1
-  http: ^1.2.2
-```
-
-### 8.2. Service xác thực (`lib/core/auth/auth_service.dart`)
-
-```dart
-import 'package:flutter/foundation.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
-
-class AuthService {
-  final GoTrueClient _authClient = Supabase.instance.client.auth;
-
-  /// Lấy phiên đăng nhập hiện tại
-  Session? get currentSession => _authClient.currentSession;
-
-  /// Lấy thông tin người dùng hiện tại
-  User? get currentUser => _authClient.currentUser;
-
-  /// Kiểm tra trạng thái đã đăng nhập hay chưa
-  bool get isAuthenticated => currentSession != null;
-
-  /// Đăng nhập bằng Email và Password
-  Future<AuthResponse> signIn({
-    required String email,
-    required String password,
-  }) async {
-    try {
-      final response = await _authClient.signInWithPassword(
-        email: email.trim(),
-        password: password,
-      );
-      return response;
-    } on AuthException catch (e) {
-      debugPrint("Supabase AuthException: ${e.message} (Code: ${e.statusCode})");
-      rethrow;
-    } catch (e) {
-      debugPrint("Unexpected login error: $e");
-      rethrow;
-    }
-  }
-
-  /// Đăng xuất khỏi hệ thống
-  Future<void> signOut() async {
-    try {
-      await _authClient.signOut();
-    } catch (e) {
-      debugPrint("Error signing out: $e");
-      rethrow;
-    }
-  }
-
-  /// Lấy JWT access token hiện tại
-  String? getAccessToken() {
-    return _authClient.currentSession?.accessToken;
-  }
-}
-```
-
-### 8.3. Quản lý trạng thái xác thực (`lib/logic/auth/auth_cubit.dart` & `auth_state.dart`)
-
-```dart
-// lib/logic/auth/auth_state.dart
-import 'package:equatable/equatable.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
-
-abstract class AuthState extends Equatable {
-  const AuthState();
-  @override
-  List<Object?> get props => [];
-}
-
-class AuthInitial extends AuthState {}
-
-class AuthLoading extends AuthState {}
-
-class Authenticated extends AuthState {
-  final Session session;
-  const Authenticated(this.session);
-
-  @override
-  List<Object?> get props => [session.accessToken, session.user.id];
-}
-
-class Unauthenticated extends AuthState {}
-
-class AuthFailure extends AuthState {
-  final String message;
-  const AuthFailure(this.message);
-
-  @override
-  List<Object?> get props => [message];
-}
-```
-
-```dart
-// lib/logic/auth/auth_cubit.dart
-import 'dart:async';
-import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:supabase_flutter/supabase_flutter.dart' as sp;
-import 'package:project1_client/core/auth/auth_service.dart';
-import 'package:project1_client/logic/auth/auth_state.dart';
-
-class AuthCubit extends Cubit<AuthState> {
-  final AuthService _authService;
-  StreamSubscription<sp.AuthState>? _authSubscription;
-
-  AuthCubit(this._authService) : super(AuthInitial()) {
-    _init();
-  }
-
-  void _init() {
-    // 1. Kiểm tra session ngay khi khởi tạo (được phục hồi từ LocalStorage nếu có)
-    final currentSession = _authService.currentSession;
-    if (currentSession != null) {
-      emit(Authenticated(currentSession));
-    } else {
-      emit(Unauthenticated());
-    }
-
-    // 2. Lắng nghe thay đổi trạng thái từ Supabase Auth
-    _authSubscription = sp.Supabase.instance.client.auth.onAuthStateChange.listen((data) {
-      final session = data.session;
-      if (session != null) {
-        emit(Authenticated(session));
-      } else {
-        emit(Unauthenticated());
-      }
-    });
-  }
-
-  Future<void> signIn({required String email, required String password}) async {
-    emit(AuthLoading());
-    try {
-      final res = await _authService.signIn(email: email, password: password);
-      if (res.session != null) {
-        emit(Authenticated(res.session!));
-      } else {
-        emit(Unauthenticated());
-      }
-    } on sp.AuthException catch (e) {
-      if (e.message.contains("Invalid login credentials") || e.statusCode == "400") {
-        emit(const AuthFailure("Email hoặc mật khẩu không chính xác."));
-      } else {
-        emit(AuthFailure(e.message));
-      }
-    } catch (e) {
-      emit(const AuthFailure("Không thể kết nối đến máy chủ. Vui lòng thử lại sau."));
-    }
-  }
-
-  Future<void> signOut() async {
-    try {
-      await _authService.signOut();
-      emit(Unauthenticated());
-    } catch (e) {
-      emit(AuthFailure("Lỗi khi đăng xuất: $e"));
-    }
-  }
-
-  @override
-  Future<void> close() {
-    _authSubscription?.cancel();
-    return super.close();
-  }
-}
-```
-
-### 8.4. Cấu hình Router với GoRouter (`lib/core/router/app_router.dart`)
-
-```dart
-// lib/core/router/app_router.dart
-import 'dart:async';
+// lib/features/auth/presentation/login_screen.dart
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-import 'package:project1_client/logic/auth/auth_cubit.dart';
-import 'package:project1_client/logic/auth/auth_state.dart';
-import 'package:project1_client/features/auth/presentation/login_screen.dart';
-
-class AppRouter {
-  final AuthCubit authCubit;
-
-  AppRouter({required this.authCubit});
-
-  late final GoRouter router = GoRouter(
-    initialLocation: '/gateways',
-    // Lắng nghe stream thay đổi trạng thái xác thực để tự động tính toán lại redirect
-    refreshListenable: GoRouterRefreshStream(authCubit.stream),
-    redirect: (BuildContext context, GoRouterState state) {
-      final authState = authCubit.state;
-      final bool isAuthenticated = authState is Authenticated;
-      final bool isLoggingIn = state.matchedLocation == '/login';
-
-      // 1. Khi đang ở trạng thái khởi tạo (đang nạp session từ LocalStorage lúc vừa F5)
-      if (authState is AuthInitial) {
-        return null; // Không can thiệp, chờ quá trình nạp session hoàn tất
-      }
-
-      // 2. Người dùng CHƯA đăng nhập cố truy cập vào route nội bộ -> tự động chuyển về /login
-      if (!isAuthenticated) {
-        return isLoggingIn ? null : '/login';
-      }
-
-      // 3. Người dùng ĐÃ đăng nhập nhưng gõ /login trên thanh URL -> chuyển về /gateways
-      if (isLoggingIn) {
-        return '/gateways';
-      }
-
-      // 4. Nếu truy cập đường dẫn gốc '/' -> chuyển tiếp về danh sách Gateway
-      if (state.matchedLocation == '/') {
-        return '/gateways';
-      }
-
-      // Cho phép đi tiếp vào route đích
-      return null;
-    },
-    routes: [
-      GoRoute(
-        path: '/login',
-        name: 'login',
-        builder: (context, state) => const LoginScreen(),
-      ),
-      GoRoute(
-        path: '/gateways',
-        name: 'gateways',
-        builder: (context, state) => const Scaffold(
-          body: Center(child: Text("Màn hình Danh sách Gateway (Dashboard)")),
-        ),
-      ),
-    ],
-    errorBuilder: (context, state) => Scaffold(
-      body: Center(
-        child: Text("404 - Không tìm thấy đường dẫn: ${state.uri}"),
-      ),
-    ),
-  );
-}
-
-/// Helper chuyển đổi Stream sang Listenable cho GoRouter refreshListenable
-class GoRouterRefreshStream extends ChangeNotifier {
-  late final StreamSubscription<dynamic> _subscription;
-
-  GoRouterRefreshStream(Stream<dynamic> stream) {
-    notifyListeners();
-    _subscription = stream.asBroadcastStream().listen((_) => notifyListeners());
-  }
-
-  @override
-  void dispose() {
-    _subscription.cancel();
-    super.dispose();
-  }
-}
-```
-
-### 8.5. Màn hình Đăng nhập Web (`lib/features/auth/presentation/login_screen.dart`)
-
-```dart
-import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:project1_client/logic/auth/auth_cubit.dart';
-import 'package:project1_client/logic/auth/auth_state.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -801,7 +429,9 @@ class _LoginScreenState extends State<LoginScreen> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
 
+  bool _isLoading = false;
   bool _obscurePassword = true;
+  String? _errorMessage;
 
   @override
   void dispose() {
@@ -810,12 +440,38 @@ class _LoginScreenState extends State<LoginScreen> {
     super.dispose();
   }
 
-  void _submit() {
+  Future<void> _submitLogin() async {
     if (!_formKey.currentState!.validate()) return;
-    context.read<AuthCubit>().signIn(
-          email: _emailController.text,
-          password: _passwordController.text,
-        );
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final response = await Supabase.instance.client.auth.signInWithPassword(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+
+      if (response.session != null && mounted) {
+        // Điều hướng sang Dashboard được quản lý bởi Router stream
+      }
+    } on AuthException catch (e) {
+      setState(() {
+        if (e.message.contains("Invalid login credentials") || e.statusCode == "400") {
+          _errorMessage = "Email hoặc mật khẩu không chính xác.";
+        } else {
+          _errorMessage = e.message;
+        }
+      });
+    } catch (_) {
+      setState(() {
+        _errorMessage = "Không thể kết nối đến máy chủ xác thực.";
+      });
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
   @override
@@ -829,179 +485,99 @@ class _LoginScreenState extends State<LoginScreen> {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(24.0),
             child: ConstrainedBox(
-              // Giới hạn chiều rộng thẻ đăng nhập trên màn hình Web Desktop
-              constraints: const BoxConstraints(maxWidth: 440),
+              constraints: const BoxConstraints(maxWidth: 420),
               child: Card(
                 elevation: 4,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 child: Padding(
                   padding: const EdgeInsets.all(32.0),
-                  child: BlocConsumer<AuthCubit, AuthState>(
-                    listener: (context, state) {
-                      // GoRouter tự động xử lý redirect sang /gateways khi state là Authenticated
-                    },
-                    builder: (context, state) {
-                      final bool isLoading = state is AuthLoading;
-                      final String? errorMessage =
-                          state is AuthFailure ? state.message : null;
-
-                      return Form(
-                        key: _formKey,
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            const Icon(
-                              Icons.sensors_outlined,
-                              size: 64,
-                              color: Colors.blueAccent,
-                            ),
-                            const SizedBox(height: 16),
-                            const Text(
-                              "IoT Gateway–Server Platform",
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
-                            const Text(
-                              "Bảng điều khiển Giám sát & Vận hành (Web Dashboard)",
-                              textAlign: TextAlign.center,
-                              style: TextStyle(color: Colors.grey, fontSize: 13),
-                            ),
-                            const SizedBox(height: 24),
-
-                            // Khung thông báo lỗi
-                            if (errorMessage != null) ...[
-                              Container(
-                                padding: const EdgeInsets.all(12),
-                                decoration: BoxDecoration(
-                                  color: Colors.red.shade50,
-                                  border: Border.all(color: Colors.red.shade200),
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: Row(
-                                  children: [
-                                    const Icon(Icons.error_outline,
-                                        color: Colors.red, size: 20),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        errorMessage,
-                                        style: const TextStyle(
-                                          color: Colors.red,
-                                          fontSize: 13,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-                            ],
-
-                            // Trường nhập Email (hỗ trợ submit bằng Enter)
-                            TextFormField(
-                              controller: _emailController,
-                              keyboardType: TextInputType.emailAddress,
-                              enabled: !isLoading,
-                              textInputAction: TextInputAction.next,
-                              decoration: const InputDecoration(
-                                labelText: "Email tài khoản",
-                                prefixIcon: Icon(Icons.email_outlined),
-                                border: OutlineInputBorder(),
-                              ),
-                              validator: (val) {
-                                if (val == null || val.trim().isEmpty) {
-                                  return "Vui lòng nhập địa chỉ email";
-                                }
-                                if (!val.contains("@")) {
-                                  return "Email không đúng định dạng";
-                                }
-                                return null;
-                              },
-                            ),
-                            const SizedBox(height: 16),
-
-                            // Trường nhập Mật khẩu (hỗ trợ submit bằng Enter)
-                            TextFormField(
-                              controller: _passwordController,
-                              obscureText: _obscurePassword,
-                              enabled: !isLoading,
-                              textInputAction: TextInputAction.done,
-                              onFieldSubmitted: (_) => _submit(),
-                              decoration: InputDecoration(
-                                labelText: "Mật khẩu",
-                                prefixIcon: const Icon(Icons.lock_outline),
-                                border: const OutlineInputBorder(),
-                                suffixIcon: IconButton(
-                                  icon: Icon(
-                                    _obscurePassword
-                                        ? Icons.visibility_outlined
-                                        : Icons.visibility_off_outlined,
-                                  ),
-                                  onPressed: () {
-                                    setState(() {
-                                      _obscurePassword = !_obscurePassword;
-                                    });
-                                  },
-                                ),
-                              ),
-                              validator: (val) {
-                                if (val == null || val.isEmpty) {
-                                  return "Vui lòng nhập mật khẩu";
-                                }
-                                return null;
-                              },
-                            ),
-                            const SizedBox(height: 24),
-
-                            // Nút Đăng nhập
-                            ElevatedButton(
-                              onPressed: isLoading ? null : _submit,
-                              style: ElevatedButton.styleFrom(
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 16),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                              ),
-                              child: isLoading
-                                  ? const SizedBox(
-                                      height: 20,
-                                      width: 20,
-                                      child: CircularProgressIndicator(
-                                          strokeWidth: 2),
-                                    )
-                                  : const Text(
-                                      "ĐĂNG NHẬP",
-                                      style: TextStyle(
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                            ),
-                            const SizedBox(height: 20),
-
-                            // Chú thích chính sách tài khoản tập trung
-                            const Text(
-                              "Hệ thống vận hành trạm quan trắc nội bộ. "
-                              "Tài khoản người dùng được cấp phát tập trung bởi Platform Administrator.",
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey,
-                                fontStyle: FontStyle.italic,
-                              ),
-                            ),
-                          ],
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Icon(Icons.sensors_outlined, size: 56, color: Colors.blueAccent),
+                        const SizedBox(height: 12),
+                        const Text(
+                          "IoT Gateway–Server Platform",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                         ),
-                      );
-                    },
+                        const SizedBox(height: 4),
+                        const Text(
+                          "Hệ thống Giám sát & Vận hành Trạm quan trắc",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.grey, fontSize: 13),
+                        ),
+                        const SizedBox(height: 20),
+
+                        if (_errorMessage != null) ...[
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade50,
+                              border: Border.all(color: Colors.red.shade200),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              _errorMessage!,
+                              style: const TextStyle(color: Colors.red, fontSize: 13),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                        ],
+
+                        TextFormField(
+                          controller: _emailController,
+                          keyboardType: TextInputType.emailAddress,
+                          enabled: !_isLoading,
+                          decoration: const InputDecoration(
+                            labelText: "Email tài khoản",
+                            prefixIcon: Icon(Icons.email_outlined),
+                            border: OutlineInputBorder(),
+                          ),
+                          validator: (v) => (v == null || !v.contains("@")) ? "Email không hợp lệ" : null,
+                        ),
+                        const SizedBox(height: 16),
+
+                        TextFormField(
+                          controller: _passwordController,
+                          obscureText: _obscurePassword,
+                          enabled: !_isLoading,
+                          onFieldSubmitted: (_) => _submitLogin(),
+                          decoration: InputDecoration(
+                            labelText: "Mật khẩu",
+                            prefixIcon: const Icon(Icons.lock_outline),
+                            border: const OutlineInputBorder(),
+                            suffixIcon: IconButton(
+                              icon: Icon(_obscurePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                              onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                            ),
+                          ),
+                          validator: (v) => (v == null || v.isEmpty) ? "Vui lòng nhập mật khẩu" : null,
+                        ),
+                        const SizedBox(height: 24),
+
+                        ElevatedButton(
+                          onPressed: _isLoading ? null : _submitLogin,
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                          ),
+                          child: _isLoading
+                              ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Text("ĐĂNG NHẬP", style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                        const SizedBox(height: 16),
+
+                        const Text(
+                          "Hệ thống vận hành trạm nội bộ. Tài khoản người dùng được cấp phát tập trung bởi Quản trị viên hệ thống (Platform Administrator).",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 12, color: Colors.grey, fontStyle: FontStyle.italic),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -1016,21 +592,17 @@ class _LoginScreenState extends State<LoginScreen> {
 
 ---
 
-## 9. Danh mục kiểm tra bảo mật và chất lượng trên Web (Checklist)
+## 9. Danh mục kiểm tra bảo mật và chất lượng (Security & Quality Checklist)
 
-Trước khi đóng giai đoạn kiểm thử mô-đun xác thực trên Flutter Web:
+Trước khi nghiệm thu tích hợp xác thực client:
 
-- [x] Không tồn tại màn hình hoặc nút bấm "Đăng ký" (`Sign Up`) trong ứng dụng.
-- [x] Endpoint `POST /auth/v1/signup` bị từ chối triệt để bởi server (`422 signup_disabled`).
-- [x] Khóa `service_role` tuyệt đối không được nhúng vào mã nguồn Flutter hay file cấu hình client. Chỉ dùng `SUPABASE_ANON_KEY`.
-- [x] Session được lưu trữ an toàn bằng Web Storage (`localStorage`) trên trình duyệt, không rò rỉ token ra biến JavaScript toàn cục (`window`).
-- [x] **Kiểm thử F5 / Reload trang web:** Session được phục hồi nguyên vẹn từ `localStorage`, người dùng tiếp tục làm việc bình thường mà không bị văng về `/login`.
-- [x] **Kiểm thử điều hướng URL với `GoRouter`:**
-  - Chưa đăng nhập mà gõ URL nội bộ (`/gateways`, `/gateways/gw-01`) -> tự động redirect về `/login`.
-  - Đã đăng nhập mà gõ `/login` trên thanh địa chỉ -> tự động redirect về `/gateways`.
-  - Sử dụng `usePathUrlStrategy()` hiển thị URL trực quan, không có ký tự `#`.
-  - Nút Back / Forward trên trình duyệt hoạt động chính xác theo lịch sử điều hướng.
-- [x] Header `Authorization: Bearer <access_token>` được tự động đính kèm trên mọi cuộc gọi API tới Go Backend.
-- [x] Xử lý lỗi `401 Unauthorized` từ Go Backend bằng cơ chế thử refresh session trước khi kết luận phiên hết hạn.
-- [x] Đăng xuất (`signOut`) thực hiện đầy đủ: hủy session trên máy chủ, xóa `localStorage`, hủy kết nối WebSocket và kích hoạt GoRouter chuyển hướng về `/login`.
-- [x] Kiểm thử đăng nhập thành công với tài khoản được Platform Administrator cấp phát tập trung.
+- [x] **Tách biệt Base URL:** Client gọi đúng Supabase Auth Gateway (`/auth/v1/*`) để đăng nhập/refresh và Go Backend (`/v1/*`) để truy xuất dữ liệu nghiệp vụ.
+- [x] **Phân tách khóa & token:** Chỉ dùng `SUPABASE_ANON_KEY` trên client; không đưa `SUPABASE_SERVICE_ROLE_KEY` hay `SUPABASE_JWT_SECRET` vào mã nguồn hoặc môi trường client.
+- [x] **Cấm đăng ký tự do:** Không có màn hình hoặc nút bấm "Đăng ký" trên client. Đã kiểm chứng endpoint `POST /auth/v1/signup` bị GoTrue từ chối với `422 signup_disabled` trong test fixture.
+- [x] **Ranh giới Auth Admin:** Nhận thức rõ ràng việc người dùng có cờ `platform_admin` trong PostgreSQL không thể gọi `/auth/v1/admin/users` bằng human JWT (bị từ chối `403 Forbidden`). Không có API User CRUD trên Go Backend.
+- [x] **Xác thực JWT tại Go Backend:** Go Backend chỉ nhận chữ ký `HS256` với secret chia sẻ, kiểm tra `iss`, `aud`, `role: "authenticated"`, `sub` UUID hợp lệ khác nil và thời hạn `exp` (có tính clock skew); không yêu cầu riêng UUID v4.
+- [x] **Chuẩn hóa Error Envelope:** Xử lý đúng cấu trúc lỗi của Go Backend (`{"error": {"code": "unauthorized", "message": "authentication required", "request_id": "..."}}`) và header `WWW-Authenticate: Bearer`.
+- [x] **Kiểm soát làm mới Token:** Áp dụng single-flight khi refresh token trên client, giới hạn thử lại tối đa 1 lần, không tạo vòng lặp vô hạn.
+- [x] **Phân biệt mã lỗi khi xử lý phiên:** Không tự ý đăng xuất người dùng khi gặp mã lỗi `403 Forbidden` (thiếu quyền) hoặc `503 Service Unavailable` (lỗi tạm thời hạ tầng).
+- [x] **Nhận thức thu hồi phiên:** Hiểu rõ việc đăng xuất tại client và GoTrue không lập tức hủy bỏ giá trị xác thực toán học của một access token chưa hết hạn đối với bộ kiểm tra cục bộ của Go Backend; bảo vệ chặt chẽ storage và đặt TTL ngắn.
+- [x] **Liên kết tài liệu:** Đã tham chiếu đầy đủ tới `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md` (hợp đồng quản trị trạm/cảm biến) và `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md` (tích hợp API và quản lý state).

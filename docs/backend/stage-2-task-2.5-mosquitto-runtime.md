@@ -1,8 +1,17 @@
-# Stage 2 — Task 2.5: Hạ tầng Runtime Credential cho Mosquitto
+# Stage 2 — Task 2.5: Hạ tầng Runtime Credential File Tĩnh cho Mosquitto (Legacy Baseline & Regression)
+
+> **Thông báo Quan trọng về Phạm vi Lịch sử & Kế thừa (Superseded Scope Notice):**
+> - **Bản chất tài liệu:** Tài liệu này đặc tả kiến trúc kỹ thuật, cơ chế an toàn và bằng chứng kiểm thử của **Hạ tầng Runtime Credential File Tĩnh (`password_file` + SIGHUP)** thuộc Task 2.5. Phân hệ này còn trong codebase và root Compose để vận hành legacy/kiểm thử hồi quy. Đây **không phải automatic fallback** từ DynSec; chuyển runtime cần cutover được duyệt, không được khôi phục credential cũ để bypass revoke.
+> - **Đã được thay thế bởi Task 2.6 & Task 2.7:** Đối với luồng nghiệp vụ quản trị credential động thời gian thực của Gateway, giải pháp chỉnh sửa file tĩnh và phát tín hiệu SIGHUP tại Task 2.5 đã được **thay thế hoàn toàn (superseded)** bởi kiến trúc **Mosquitto Dynamic Security (DynSec) plugin kết hợp cổng Ingress Gate** tại [Sổ tay Vận hành Task 2.6](stage-2-task-2.6-mqtt-credentials.md), [Báo cáo Nghiệm thu Task 2.6](stage-2-task-2.6-acceptance.md) và kế hoạch nghiệm thu tích hợp [Kế hoạch Chi tiết Task 2.7](/media/trung/SSD2-Data/Project1_ET3290/docs/backend_plan/task_2.7_detail_plan.md).
+> - **Không đồng nhất chứng cứ đĩa cũ với DynSec:** Các nhân chứng đĩa cục bộ của Task 2.5 (`.op-<opID>/candidate`, `passwd.last-good`, marker `.credential.pending`, `fsync` file và thư mục) là cơ chế đồng bộ riêng của file tĩnh legacy, **tuyệt đối không được diễn giải lại thành bằng chứng vận hành hay chứng cứ an toàn cho DynSec**. DynSec sử dụng kênh quản trị `$CONTROL/dynamic-security/v1`, đối soát trạng thái RAM/snapshot `dynamic-security.json` và hàng rào Ingress Gate `CLOSED/OPEN`.
+> - **Hiện trạng Root Compose và Cờ API:** File `docker-compose.yml` gốc của dự án hiện vẫn đang cấu hình dịch vụ Mosquitto gắn với named volume tĩnh legacy (`mosquitto_auth:/mosquitto/auth:ro`, `password_file /mosquitto/auth/passwd`) và **chủ động vô hiệu hóa API quản trị credential** (`MQTT_CREDENTIAL_API_ENABLED: "false"`). Các template cấu hình lifecycle và fixture isolated harness **không đồng nghĩa với việc phê duyệt tự động bật trên môi trường production** (no automatic rollout approval).
+> - **Phân định lưu trữ mật khẩu:** PostgreSQL là nguồn thẩm quyền nghiệp vụ duy nhất nhưng **tuyệt đối KHÔNG lưu mật khẩu plaintext hay password hash**. Chuỗi băm mật khẩu native chỉ tồn tại trong file mật khẩu broker (`passwd` đối với legacy static runtime hoặc `dynamic-security.json` đối với DynSec). Không có cơ chế import hash trong suốt (transparent hash import) vào CSDL nghiệp vụ.
+
+---
 
 ## 1. Mục tiêu và ranh giới
 
-Tài liệu này đặc tả kiến trúc, cơ chế bảo mật, quy trình vận hành và kết quả kiểm chứng của **Task 2.5: Hạ tầng runtime credential cho Mosquitto**.
+Tài liệu này ghi nhận kiến trúc, cơ chế bảo mật, quy trình vận hành và kết quả kiểm chứng lịch sử của **Task 2.5: Hạ tầng runtime credential file tĩnh cho Mosquitto**.
 
 ### 1.1 Mục tiêu
 
@@ -25,7 +34,7 @@ Yêu cầu thao tác (OpID)
 
 ### 1.2 Ranh giới nghiệp vụ (Boundaries)
 
-- **Thuộc phạm vi Task 2.5**:
+- **Thuộc phạm vi Task 2.5 (Historical Scope)**:
   - Quản lý file mật khẩu runtime trong named volume, loại bỏ việc dùng file tracked trong git làm runtime store.
   - One-shot initializer chuẩn bị quyền hạn thư mục và tài khoản hệ thống nội bộ `backend_service`.
   - Tích hợp công cụ native `mosquitto_passwd` (PBKDF2-SHA512) qua wrapper Go an toàn.
@@ -34,13 +43,12 @@ Yêu cầu thao tác (OpID)
   - Probe kiểm chứng xác thực bằng kết nối MQTT TLS 1.2 mới toanh.
   - Bộ kiểm thử tự động (Python harness + Go unit/race/integration) và bổ sung job CI tương ứng.
 
-- **Ngoài phạm vi Task 2.5 (chuyển tiếp sang Task 2.6 và các task sau)**:
-  - Chưa mở bất kỳ HTTP REST endpoint nào cho việc provision/rotate/revoke/metadata MQTT credential của Gateway (đây là nhiệm vụ của **Task 2.6**).
-  - Chưa có bộ sinh mật khẩu CSPRNG cho Gateway hay logic trả về mật khẩu plaintext một lần.
-  - Chưa kết nối thao tác cập nhật file với các bảng PostgreSQL (`gateway_mqtt_credentials`, `gateway_mqtt_credential_events`).
-  - Chưa có API quản lý membership, phân quyền người dùng, public signup hay self-claim.
+- **Ranh giới chuyển tiếp và ranh giới ngoài phạm vi (Superseded Boundary)**:
+  - Tại thời điểm hoàn thành Task 2.5, chưa mở HTTP REST endpoint nào cho việc provision/rotate/revoke/metadata MQTT credential của Gateway. Các API này đã được triển khai tại **Task 2.6** qua kiến trúc Mosquitto Dynamic Security (DynSec), không dùng file tĩnh.
+  - Chưa kết nối thao tác cập nhật file với các bảng PostgreSQL (`gateway_mqtt_credentials`, `gateway_mqtt_credential_events`, `mqtt_credential_maintenance`, `mqtt_credential_recovery`) — các bảng này được quản lý đồng bộ với DynSec tại Task 2.6.
+  - Chưa có API quản lý membership, phân quyền người dùng, public signup hay self-claim (thuộc phạm vi bảo vệ tại Task 2.2A, 2.3 và Task 2.7).
   - Chưa triển khai luồng thu thập telemetry, streaming WebSocket hay điều khiển thiết bị Digital Twin.
-  - Không sử dụng Mosquitto Dynamic Security plugin, không dùng database auth plugin.
+  - Task 2.5 không sử dụng Mosquitto Dynamic Security plugin; việc chuyển đổi sang DynSec được thực hiện từ Task 2.6 trở đi.
   - Không cam kết duy trì nhiều replica backend cùng ghi một volume hay hỗ trợ nhiều active password cùng lúc cho một Gateway.
 
 ---
@@ -87,7 +95,7 @@ mosquitto_control (Named Volume)
    - Do đó, Mosquitto bắt buộc phải mount cả thư mục volume (`mosquitto_auth:/mosquitto/auth:ro`). Khi nhận tín hiệu SIGHUP, Mosquitto mở lại file `/mosquitto/auth/passwd` theo đường dẫn và thấy ngay inode mới.
 
 3. **Từ chối triệt để Docker Socket và Host PID**:
-   - Hệ thống **tuyệt đối không mount Docker socket** (`/var/run/docker.sock`) vào bất kỳ container nào, loại bỏ hoàn toàn nguy cơ leo thang đặc quyền từ container ra máy chủ.
+   - Các container thuộc runtime này không mount Docker socket (`/var/run/docker.sock`), giảm một đường leo thang đặc quyền; điều này không loại bỏ mọi rủi ro container/host.
    - Không chia sẻ PID với máy chủ chủ quản (`pid: host`). Reloader chỉ chia sẻ PID cục bộ với container Mosquitto (`pid: "service:mosquitto"`).
    - Reloader và Initializer được cô lập mạng hoàn toàn (`network_mode: none`).
 
@@ -131,9 +139,9 @@ Dịch vụ `mosquitto-auth-init` chạy one-shot trước khi Mosquitto và Bac
 
 ---
 
-## 4. Cơ chế Atomic Persistence & Khóa đồng bộ
+## 4. Cơ chế Atomic Persistence & Khóa đồng bộ File Tĩnh
 
-Tất cả các thao tác thay đổi mật khẩu (upsert hoặc remove) trong Go Backend đều đi qua `mqttcredential.Runtime`.
+Tất cả các thao tác thay đổi mật khẩu (upsert hoặc remove) trong Go Backend đối với file tĩnh legacy đều đi qua `mqttcredential.Runtime`.
 
 ### 4.1 Serialization và Bounded Admission
 
@@ -271,61 +279,64 @@ Module `mqttcredential.Probe` sử dụng thư viện `paho.mqtt.golang` để t
 
 ## 7. Hợp đồng phiên MQTT (MQTT Session Contract)
 
-Dựa trên kết quả thực nghiệm spike Task 2.0 và kiểm tra mã nguồn Mosquitto 2.0.18 (`mosquitto_security_apply_default()`):
+> **Cảnh báo Kế thừa & Phân biệt Semantics (Superseded Contract Notice):**
+> Phần 7 này chỉ mô tả đặc tính kỹ thuật của Mosquitto v2.0.18 khi reload file tĩnh bằng tín hiệu `SIGHUP` trong Task 2.5 legacy. Trong kiến trúc Dynamic Security (DynSec) được lựa chọn tại **Task 2.6** và **Task 2.7**, semantics phiên và thu hồi **hoàn toàn khác biệt**:
+> - **Xoay vòng (Rotate):** Diễn ra trong cửa sổ bảo trì toàn cục (**global maintenance**), Ingress Gate chủ động đóng lại (`CloseDrain`), broker được cold restart và verify fresh TLS connection trước khi mở lại cổng. Phiên cũ của mọi Gateway có thể bị ngắt (kể cả Gateway khác); Gateway khác phải reconnect bằng credential không đổi. Hệ thống **không hứa hẹn zero-outage**.
+> - **Thu hồi (Revoke):** Native DynSec disable ngắt session mục tiêu; lifecycle kiểm chứng RAM/snapshot và fresh rejection trước khi báo thành công. Đây không phải cam kết thời gian ngắt bằng 0 hoặc bảo đảm cho mọi topology chưa nghiệm thu. Không dùng semantics "chỉ ảnh hưởng kết nối mới" của thời kỳ SIGHUP để nghiệm thu Task 2.6.
+> Chi tiết xem tại [docs/backend/stage-2-task-2.6-mqtt-credentials.md](stage-2-task-2.6-mqtt-credentials.md).
 
-### 7.1 Hành vi của Mosquitto khi Reload
+### 7.1 Hành vi của Mosquitto khi Reload bằng SIGHUP (Legacy Static-File)
 
-Khi nhận tín hiệu `SIGHUP`, Mosquitto đọc lại file mật khẩu và áp dụng cấu hình bảo mật mặc định. Trong mã nguồn `v2.0.18`, Mosquitto duyệt qua danh sách client đang kết nối và kiểm tra lại thông tin xác thực đối với username/password. Các client có thông tin không còn hợp lệ trong file mới có thể bị broker đóng kết nối ngay lập tức.
+Khi nhận tín hiệu `SIGHUP`, Mosquitto đọc lại file mật khẩu và áp dụng cấu hình bảo mật mặc định (`mosquitto_security_apply_default()`). Trong mã nguồn `v2.0.18`, Mosquitto duyệt qua danh sách client đang kết nối và kiểm tra lại thông tin xác thực đối với username/password. Các client có thông tin không còn hợp lệ trong file mới có thể bị broker đóng kết nối ngay lập tức.
 
-### 7.2 Cam kết của hệ thống (Contract)
+### 7.2 Cam kết lịch sử của hệ thống File Tĩnh (Legacy Contract)
 
-1. **Cam kết kết nối mới**: Sau khi thao tác rotate/revoke được probe xác nhận thành công, credential cũ **chắc chắn không thể tạo kết nối MQTT mới**.
-2. **Không cam kết trạng thái phiên cũ**:
+1. **Cam kết kết nối mới**: Sau khi thao tác rotate/revoke trên file tĩnh được probe xác nhận thành công, credential cũ **chắc chắn không thể tạo kết nối MQTT mới**.
+2. **Không cam kết trạng thái phiên cũ trong cơ chế SIGHUP**:
    - Phiên kết nối đang tồn tại có thể bị broker ngắt kết nối trên phiên bản Mosquitto hiện tại.
-   - Hệ thống **không cam kết giữ phiên cũ** tiếp tục hoạt động.
-   - Hệ thống **cũng không cam kết ngắt ngay lập tức mọi phiên đang mở** trong mọi tình huống (ví dụ: trường hợp client đang dở dang gói tin QoS hoặc phiên bản broker thay đổi).
-3. **Quy tắc kiểm thử**: Không viết test hay thiết kế API phụ thuộc vào việc "phiên cũ bắt buộc phải sống" hay "phiên cũ bắt buộc phải bị ngắt ngay lập tức".
+   - Hệ thống file tĩnh **không cam kết giữ phiên cũ** tiếp tục hoạt động.
+   - Hệ thống file tĩnh **cũng không cam kết ngắt ngay lập tức mọi phiên đang mở** trong mọi tình huống (ví dụ: trường hợp client đang dở dang gói tin QoS hoặc phiên bản broker thay đổi).
+3. **Quy tắc kiểm thử**: Không viết test hay thiết kế API phụ thuộc vào việc "phiên cũ bắt buộc phải sống" hay "phiên cũ bắt buộc phải bị ngắt ngay lập tức" đối với runtime file tĩnh SIGHUP.
 
 ---
 
-## 8. Handoff sang Task 2.6 (Credential Management API)
+## 8. Handoff sang Task 2.6 và Liên kết Kế thừa DynSec
 
-Task 2.5 đã hoàn thành toàn bộ nền tảng runtime. Task 2.6 sẽ xây dựng tầng REST API quản lý credential dựa trên nền tảng này với các điểm lưu ý kỹ thuật:
+Task 2.5 đã hoàn thành toàn bộ nền tảng runtime file tĩnh phục vụ baseline kiểm thử hồi quy. Tuy nhiên, để đáp ứng yêu cầu quản trị credential động an toàn và không downtime cho toàn bộ hệ thống, **Task 2.6 đã chuyển sang sử dụng Mosquitto Dynamic Security (DynSec)** thay cho cơ chế chỉnh sửa file tĩnh SIGHUP.
 
-### 8.1 Bài toán nhất quán 3 tầng: PostgreSQL — File — Broker
+### 8.1 Phân định Thẩm quyền Nghiệp vụ và Bí mật Broker
 
-Task 2.6 phải phối hợp hai pha (two-phase coordination):
-1. **Pha 1 (PostgreSQL Intent)**: Ghi nhận trạng thái dự định thay đổi credential vào bảng `gateway_mqtt_credentials` và `gateway_mqtt_credential_events`.
-2. **Pha 2 (Runtime Execution)**: Gọi `mqttcredential.Runtime` để cập nhật file `passwd`, gửi reload và probe broker.
-3. **Pha 3 (PostgreSQL Finalize)**: Cập nhật trạng thái thành công trong PostgreSQL.
+Cần phân định rạch ròi giữa Thẩm quyền Nghiệp vụ (PostgreSQL) và Bí mật Xác thực (Broker Store):
 
-**Xử lý lỗi và phân định trạng thái phục hồi (Recovery Contract)**:
-- **Trường hợp Rollback có kiểm chứng (Verified Rollback)**:
-  * Nếu bước 2 thất bại với các lỗi runtime thông thường (không kèm theo `ErrRecoveryRequired`), runtime đã tự động kích hoạt rollback snapshot thành công và `RecoveryProbe` xác nhận broker đã khôi phục trạng thái credential trước đó.
-  * Trong trường hợp này, trạng thái file và broker được đảm bảo giữ nguyên vẹn như trước khi mutation xảy ra; Task 2.6 có thể đánh dấu event trong CSDL là `failed`.
-- **Trường hợp Trạng thái bất định (Uncertain State) khi gặp `ErrRecoveryRequired`**:
-  * Khi bước 2 trả về lỗi kết hợp `ErrRecoveryRequired` (hoặc xảy ra sự cố sập nguồn/crash giữa các bước fsync/rename/promote), runtime **KHÔNG BẢO ĐẢM** được việc rollback đã hoàn tất.
-  * Ví dụ: Broker có thể đã nạp credential mới qua SIGHUP nhưng promotion `passwd.last-good` bị lỗi I/O, hoặc rollback snapshot gặp lỗi phân quyền/đĩa đầy.
-  * **Ràng buộc đối với Task 2.6**: CSDL **TUYỆT ĐỐI KHÔNG ĐƯỢC** tự ý đánh dấu event là "failed" như thể rollback đã hoàn tất. CSDL bắt buộc phải duy trì trạng thái intent dở dang hoặc chuyển sang trạng thái `recovery_needed` / `pending_reconciliation` để tiến trình đối soát (reconciliation worker) hoặc quản trị viên can thiệp xử lý có chủ đích.
+1. **PostgreSQL là nguồn thẩm quyền nghiệp vụ duy nhất (Sole Business Authority):**
+   - Các bảng `gateway_mqtt_credentials`, `gateway_mqtt_credential_events`, `mqtt_credential_maintenance`, `mqtt_credential_recovery` lưu trữ trạng thái nghiệp vụ, phiên bản (`credential_version`), thế hệ (`generation`), mã thao tác (`operation_id`), actor kiểm toán (`issued_by`), và các mốc thời gian UTC.
+   - **PostgreSQL TUYỆT ĐỐI KHÔNG LƯU MẬT KHẨU PLAINTEXT VÀ CŨNG TUYỆT ĐỐI KHÔNG LƯU MQTT PASSWORD HASH**.
+   - Bất kỳ nhận định nào cho rằng "CSDL lưu chuỗi hash an toàn của MQTT password" đều là sai lệch so với kiến trúc dự án.
+2. **Broker Authentication Store lưu trữ bí mật Native:**
+   - Chuỗi băm mật khẩu native (`sha512-pbkdf2` format `$7$...`) là bí mật nội bộ do Mosquitto quản lý, chỉ tồn tại trong `/mosquitto/auth/passwd` (đối với legacy static runtime) hoặc `dynamic-security.json` (đối với DynSec runtime).
+   - Tuyệt đối **không có cơ chế import hash trong suốt (transparent hash import)** từ broker vào PostgreSQL hay ngược lại.
 
-### 8.2 Thách thức kiểm chứng Revoke và Contract cho Task 2.6
+**Quy trình Điều phối Hai pha (Two-Phase Coordination) & Phục hồi:**
+- **Pha 1 (PostgreSQL Intent)**: Ghi nhận trạng thái dự định thay đổi credential vào bảng `gateway_mqtt_credentials` và `gateway_mqtt_credential_events`.
+- **Pha 2 (Runtime Execution)**:
+  * Trong Task 2.5 legacy: Gọi `mqttcredential.Runtime` cập nhật file `passwd`, gửi SIGHUP và probe broker.
+  * Trong Task 2.6 DynSec: Gọi DynSec adapter gửi mutation payload qua kênh quản trị `$CONTROL/dynamic-security/v1`, đối chiếu snapshot và probe qua listener nội bộ.
+- **Pha 3 (PostgreSQL Finalize)**: Cập nhật trạng thái thành công trong PostgreSQL có kiểm soát fence/epoch.
+- **Xử lý lỗi và phân định trạng thái phục hồi (`ErrRecoveryRequired` / `recovery_needed`)**:
+  * Khi mutation runtime thất bại sau khi broker đã nhận thay đổi hoặc trạng thái bất định, CSDL **TUYỆT ĐỐI KHÔNG ĐƯỢC** tự ý đánh dấu event là "failed" như thể rollback đã hoàn tất. CSDL bắt buộc phải duy trì intent dở dang hoặc chuyển sang trạng thái `recovery_needed` để tiến trình đối soát (reconciler) can thiệp có chủ đích.
 
-- Để bảo vệ mật khẩu, PostgreSQL **không bao giờ lưu mật khẩu plaintext** của Gateway (chỉ lưu chuỗi hash an toàn).
-- Khi người quản trị gọi API Revoke một Gateway, Backend **không có mật khẩu cũ** để thực hiện negative probe (gửi mật khẩu cũ lên broker xem có bị từ chối kết nối hay không).
-- **Phân tích bản chất kỹ thuật của Negative Probe**:
-  * Auth rejection (`CONNACK` return code 4 hoặc 5) chỉ chứng minh cặp `(username, password)` cụ thể được gửi đi bị từ chối xác thực.
-  * Thử một **mật khẩu ngẫu nhiên** và nhận phản hồi từ chối **hoàn toàn KHÔNG chứng minh** được username đã bị xóa khỏi broker hay credential cũ đã hết hiệu lực. Nếu broker chưa nạp lại cấu hình và credential cũ vẫn còn hiệu lực, một mật khẩu ngẫu nhiên gửi lên vẫn chắc chắn bị từ chối như thường — gây ra hiện tượng **false-green (kết luận thành công giả)** cực kỳ nguy hiểm.
-  * Integration test của Task 2.5 sở dĩ kiểm chứng được revoke an toàn là vì test case kiểm thử trực tiếp nắm giữ plaintext password cũ đã biết để probe và nhận đúng `CONNACK` rejection sau reload.
-- **Contract chuyển tiếp bắt buộc cho Task 2.6**:
-  * Task 2.6 **TUYỆT ĐỐI KHÔNG ĐƯỢC** tự ý sinh mật khẩu ngẫu nhiên để probe rồi báo revoke thành công.
-  * Task 2.6 **TUYỆT ĐỐI KHÔNG ĐƯỢC** giải quyết bằng cách lưu trữ mật khẩu plaintext lâu dài trong CSDL hay bộ nhớ backend.
-  * Task 2.6 **KHÔNG ĐƯỢC** tin tưởng mù quáng vào tín hiệu ACK `signalled\n` từ sidecar reloader (bởi tín hiệu này chỉ xác nhận SIGHUP đã phát tới kernel, không chứng minh broker đã nạp xong file mới).
-  * Về mặt offline: Runtime Task 2.5 đảm bảo username đã bị loại bỏ hoàn toàn khỏi file `candidate`, `fsync` file và thư mục, atomic rename đè lên `passwd`, và ghi nhận `passwd.last-good`.
-  * Về mặt online: Nếu không có bằng chứng generation-specific hoặc operation-specific đáng tin cậy để probe revoke mà không cần plaintext cũ, Task 2.6 phải thiết kế trạng thái revoke rõ ràng: đánh dấu trạng thái CSDL theo mô hình two-phase/pending-reconciliation, hoặc giữ trạng thái chưa xác nhận đầy đủ (unconfirmed revocation) theo đúng thiết kế, thay vì ngụy tạo bằng chứng giả.
+### 8.2 Thách thức kiểm chứng Revoke và Giải pháp DynSec tại Task 2.6
+
+- Trong mô hình file tĩnh Task 2.5, Backend không lưu mật khẩu cũ nên không thể thực hiện negative probe (gửi mật khẩu cũ xem broker có từ chối không) khi quản trị viên gọi API Revoke.
+- **Nguyên tắc kỹ thuật**: Thử một mật khẩu ngẫu nhiên và nhận phản hồi từ chối **hoàn toàn KHÔNG chứng minh** được tài khoản đã bị thu hồi (gây ra hiện tượng kết luận thành công giả — false-green).
+- **Giải pháp DynSec được chọn tại Task 2.6**:
+  * Task 2.6 giải quyết triệt để vấn đề này bằng cách gửi lệnh vô hiệu hóa trực tiếp tới DynSec plugin (`disabled=true`), vô hiệu hóa client trong RAM broker ngay lập tức, ngắt kết nối hiện hữu và đọc lại snapshot `dynamic-security.json`.
+  * Startup Reconciler của Task 2.6 đối soát danh sách `revoked` từ PostgreSQL và ép trạng thái `disabled=true` trên broker trước khi Ingress Gate mở (`OPEN`).
+  * Chi tiết thiết kế và bằng chứng nghiệm thu xem tại [docs/backend/stage-2-task-2.6-mqtt-credentials.md](stage-2-task-2.6-mqtt-credentials.md).
 
 ---
 
-## 9. Quy trình vận hành & Kế hoạch Migration khỏi Tracked Prototype File
+## 9. Quy trình vận hành & Kế hoạch Chuyển đổi khỏi Tracked Prototype File
 
 ### 9.1 Hiện trạng
 
@@ -343,7 +354,7 @@ password_file /mosquitto/auth/passwd
 
 **Lưu ý quan trọng về dữ liệu khởi tạo:** Named volume `mosquitto_auth` khi được container `mosquitto-auth-init` khởi tạo lần đầu chỉ tự động seed duy nhất một tài khoản hệ thống nội bộ là `backend_service`. Initializer **hoàn toàn không tự động import** các tài khoản Gateway từ file prototype tracked trong git (`config/mosquitto/passwd`).
 
-### 9.2 Runbook chuyển đổi trên môi trường thực tế (Migration Runbook)
+### 9.2 Runbook chuyển đổi lịch sử (Historical Migration Runbook)
 
 Việc chuyển dịch từ file prototype sang store runtime trên môi trường thực tế/production bắt buộc phải tuân thủ quy trình phê duyệt vận hành chặt chẽ theo 5 bước:
 
@@ -354,9 +365,9 @@ Việc chuyển dịch từ file prototype sang store runtime trên môi trườ
 
 2. **Bước 2 — Duyệt maintenance window và chọn phương án migration**:
    - Quản trị viên phê duyệt khung thời gian bảo trì (maintenance window) phù hợp để tránh ảnh hưởng tới luồng thu thập dữ liệu cảm biến.
-   - Chọn rõ ràng một trong hai phương án chuyển đổi:
+   - Chọn rõ ràng phương án chuyển đổi được phê duyệt:
      * **Phương án A (Chuyển tiếp credential hiện hữu)**: Thực hiện copy có kiểm soát các dòng credential Gateway hiện tại vào store mới, chạy kiểm tra tính tương thích cú pháp của parser, quyền hạn file (`0600`, UID `1883`), đồng thời bảo đảm tài khoản `backend_service` sử dụng mật khẩu mạnh được sinh mới cho môi trường production.
-     * **Phương án B (Provisioning lại có kiểm soát ở Task 2.6)**: Chấp nhận gián đoạn kết nối Gateway trong khung bảo trì, khởi tạo volume sạch chỉ với `backend_service`, sau đó sử dụng Admin API của Task 2.6 để provision lại credential mới cho từng Gateway và nạp lại vào thiết bị vật lý.
+     * **Phương án B (Provisioning lại có kiểm soát ở Task 2.6 DynSec)**: Khởi tạo volume sạch chỉ với `backend_service`, sau đó sử dụng Admin API của Task 2.6 để provision lại credential mới cho từng Gateway và nạp lại vào thiết bị vật lý qua USB offline.
 
 3. **Bước 3 — Xác minh sau khi nạp store mới**:
    - Khởi động stack dịch vụ và kiểm tra logs khởi tạo của `mosquitto-auth-init` (đảm bảo thoát mã 0, quyền file/thư mục đạt chuẩn `0700`/`0600`).
@@ -373,9 +384,9 @@ Việc chuyển dịch từ file prototype sang store runtime trên môi trườ
 
 ---
 
-## 10. Bằng chứng kiểm chứng Local & CI (Verification Evidence)
+## 10. Bằng chứng kiểm chứng Local & CI (Historical Verification Evidence)
 
-Toàn bộ các yêu cầu của Task 2.5 đã được kiểm chứng độc lập trên môi trường local với kết quả 100% PASS, và CI pipeline trên GitHub Actions đã xác nhận thành công.
+Toàn bộ các yêu cầu của Task 2.5 đã được kiểm chứng độc lập trên môi trường local với kết quả 100% PASS, và CI pipeline trên GitHub Actions đã xác nhận thành công tại mốc baseline lịch sử.
 
 ### 10.1 Tổng hợp các lệnh kiểm chứng
 
@@ -412,8 +423,14 @@ git diff --check
 
 ### 10.3 Lưu ý ranh giới thực tế và bảo mật
 
-- **Baseline CI `674e8db`**: Mốc CI PASS 8/8 tại commit `674e8db` là mốc trước khi áp dụng các commit sửa lỗi theo review (chưa bao phủ các commit kế tiếp về chặn password placeholder/whitespace tại initializer `fafc565` và thu hẹp mount chứng chỉ backend chỉ đọc CA công khai `d5375ce`). Các commit này đã được kiểm chứng local đầy đủ.
+- **Baseline CI `674e8db`**: Mốc CI PASS 8/8 tại commit `674e8db` là bằng chứng lịch sử trước khi áp dụng các commit sửa lỗi theo review (chặn password placeholder/whitespace tại initializer `fafc565` và thu hẹp mount chứng chỉ backend chỉ đọc CA công khai `d5375ce`). Các commit này đã được kiểm chứng local đầy đủ.
 - **Ranh giới Coverage**: Phân định rõ giữa Unit coverage và Feature union coverage: các package nghiệp vụ cốt lõi đều đạt >80%, còn CLI entrypoint initializer có instrumented coverage thấp do phụ thuộc vào đặc quyền Linux container được kiểm chứng bằng integration harness.
-- **Ranh giới Bảo mật Thực tế**: Tuyệt đối **không tuyên bố hệ thống production đã hoàn toàn secure** hay **đã hoàn tất rotate secret production** khi chưa có thao tác vận hành thực tế theo runbook chuyển đổi trên môi trường triển khai thật.
+- **Không tự phong bảo mật (No Blanket Security Claims)**: Tuyệt đối **không tuyên bố hệ thống production đã hoàn toàn secure** hay **đã hoàn tất rotate secret production** khi chưa có thao tác vận hành thực tế theo runbook chuyển đổi trên môi trường triển khai thật.
+- **Ranh giới Nghiệm thu Task 2.7 (Pending E2E Evidence)**:
+  * Toàn bộ luồng E2E phối hợp giữa GoTrue Auth, Envoy Gateway, Go Backend, PostgreSQL, DynSec và gated MQTT TLS đang được kiểm chứng trong Task 2.7 với 27 kịch bản (E01–E27) theo [Kế hoạch Chi tiết Task 2.7](/media/trung/SSD2-Data/Project1_ET3290/docs/backend_plan/task_2.7_detail_plan.md).
+  * Nghiệm thu Task 2.7 yêu cầu job CI thứ 10 (`stage2-e2e`) xanh trên commit SHA cuối cùng trước khi đóng toàn bộ Milestone Backend Stage 2. Không được ngụy tạo kết quả E2E PASS hoặc SHA verification trước khi job này chạy thành công.
+- **Kỷ luật TLS & Bí mật**: Tuyệt đối không hạ chuẩn TLS (bắt buộc TLS 1.2+ với CA trust bundle), không sử dụng mật khẩu fixture làm ví dụ sản xuất, không ghi log plaintext secrets hay bearer tokens.
 
-Tài liệu này xác nhận hạ tầng runtime credential của Task 2.5 đã hoàn thành đầy đủ, đáp ứng toàn bộ các tiêu chí thiết kế, bảo mật và sẵn sàng làm nền tảng vững chắc cho Task 2.6.
+---
+
+Tài liệu này xác nhận hạ tầng runtime credential file tĩnh của Task 2.5 đã hoàn thành đầy đủ vai trò nền tảng kiểm thử hồi quy (regression baseline) và phục vụ đối chiếu kiến trúc trong quá trình phát triển hệ thống.
