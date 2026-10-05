@@ -14,6 +14,50 @@ defaults:
     working-directory: ./src
 
 jobs:
+  stage2-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    env:
+      STAGE2_CI_DIR: /tmp/opencode/stage2-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: src/go.sum
+      - name: Verify runner prerequisites
+        run: |
+          mkdir -p /tmp/opencode
+          python3 --version
+          openssl version
+          docker version
+          docker compose version
+          go version
+      - name: CI and response-loss regression guards
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_ci.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_ci_functional.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_stage2_response_loss.py'
+      - name: Two clean complete source-built unified executions
+        run: |
+          # Each supervisor creates a random protected fixture-only password.
+          # The harness builds server/controller from this checkout, never deployment binaries.
+          STAGE2_CI_DIR="$STAGE2_CI_DIR/run-1" python3 scripts/tests/stage2_ci.py
+          STAGE2_CI_DIR="$STAGE2_CI_DIR/run-2" python3 scripts/tests/stage2_ci.py
+      - name: Verify owned cleanup after failure or cancellation
+        if: always()
+        run: python3 scripts/tests/stage2_ci.py --cleanup
+      - name: Upload allowlisted scanned execution reports only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-e2e-safe-reports
+          path: /tmp/opencode/stage2-ci-${{ github.run_id }}-${{ github.run_attempt }}/run-*/safe/report.json
+          if-no-files-found: error
+
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
