@@ -26,10 +26,12 @@ type DynSecController interface {
 // NewClient MUST allocate a new lifetime, never return a cached manager client.
 // Login MUST perform a fresh authenticated TLS CONNECT (not network liveness).
 type DynSecAdapterConfig struct {
-	Controller               DynSecController
-	NewClient                func(context.Context) (*DynSecClient, error)
-	Observe                  func(context.Context, string) (DynSecClientMetadata, error)
-	Login                    func(context.Context, string, string) error
+	Controller DynSecController
+	NewClient  func(context.Context) (*DynSecClient, error)
+	Observe    func(context.Context, string) (DynSecClientMetadata, error)
+	Login      func(context.Context, string, string) error
+	// Rejected requires an explicit authentication-denied CONNACK, never a transport error.
+	Rejected                 func(context.Context, string, string) error
 	ProtectedUsernames       []string
 	Timeout, RecoveryTimeout time.Duration
 }
@@ -50,6 +52,8 @@ type DynSecAdapterResult struct {
 	Outcome     ExecutionOutcome
 	Evidence    VerificationEvidence
 	receipt     VerificationReceipt
+	// continuousOpen is distinct from a CLOSED nonce receipt; it cannot open a gate.
+	continuousOpen bool
 }
 
 // NewDynSecAdapter validates configuration and constructs a DynSecAdapter.
@@ -86,7 +90,8 @@ func (a *DynSecAdapter) target(o Operation) bool {
 // Execute accepts only a service-confirmed committed intent. It cannot prove a
 // commit from an Operation value: service/repository admission is mandatory.
 // Global admission is nonblocking (no secret queue) and remains held after a
-// verified result until OPEN acknowledgment or explicit maintenance release.
+// verified result until OPEN acknowledgment (or continuous OPEN verification)
+// or explicit maintenance release.
 func (a *DynSecAdapter) Execute(ctx context.Context, o Operation, generate func(context.Context) (string, error)) (result DynSecAdapterResult, err error) {
 	result = DynSecAdapterResult{OperationID: o.OperationID, Outcome: ExecutionUnchangedFailure}
 	if !a.target(o) {
@@ -104,11 +109,21 @@ func (a *DynSecAdapter) Execute(ctx context.Context, o Operation, generate func(
 	ctx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
 	defer cancel()
 	result.Outcome = ExecutionMaintenanceClosed
-	if a.cfg.Controller.CloseDrain(ctx) != nil {
+	if o.Action == ActionRevoke {
+		// An OPEN attempt is not CLOSED evidence, including preflight failures.
+		result.Outcome = ExecutionRecoveryRequired
+	}
+	if o.Action != ActionRevoke && a.cfg.Controller.CloseDrain(ctx) != nil {
 		return result, ErrLifecycleUnavailable
 	}
 	before, e := a.cfg.Controller.Describe(ctx)
-	if e != nil || before.Open || !before.Alive || before.Epoch == "" || before.Nonce == "" {
+	// Recovery/owned maintenance callers may already be CLOSED. Preserve their
+	// nonce challenge contract; only a revoke that began OPEN is continuous.
+	continuousOpen := o.Action == ActionRevoke && before.Open
+	if e != nil || !before.Alive || before.Epoch == "" || (continuousOpen && (!before.Open || before.Nonce != "")) || (!continuousOpen && (before.Open || before.Nonce == "")) {
+		recovery, stop := context.WithTimeout(context.Background(), a.cfg.RecoveryTimeout)
+		defer stop()
+		_ = a.cfg.Controller.CloseDrain(recovery)
 		return result, ErrLifecycleUnavailable
 	}
 	// Every failure below keeps maintenance CLOSED; recovery uses a detached,
@@ -214,6 +229,14 @@ func (a *DynSecAdapter) Execute(ctx context.Context, o Operation, generate func(
 		return result, ErrRecoveryRequired
 	}
 	result.Evidence.SnapshotObserved = true
+	if disabled {
+		// No old plaintext is retained. A disabled native client must reject any
+		// password; probe with independent ephemeral entropy and require denial.
+		probe, x := generatePassword()
+		if x != nil || a.cfg.Rejected == nil || a.cfg.Rejected(ctx, o.GatewayID, probe) != nil {
+			return result, ErrRecoveryRequired
+		}
+	}
 	if !disabled {
 		c.Close()
 		c = nil
@@ -245,10 +268,11 @@ func (a *DynSecAdapter) Execute(ctx context.Context, o Operation, generate func(
 		}
 	}
 	d, e := a.cfg.Controller.Describe(ctx)
-	if e != nil || !d.Alive || d.Open || d.Epoch != before.Epoch || d.Nonce != before.Nonce {
+	if e != nil || !d.Alive || d.Open != continuousOpen || d.Epoch != before.Epoch || d.Nonce != before.Nonce {
 		return result, ErrRecoveryRequired
 	}
 	result.receipt = VerificationReceipt{Epoch: d.Epoch, Nonce: d.Nonce}
+	result.continuousOpen = continuousOpen
 	result.Outcome = ExecutionVerifiedSuccess
 	return result, nil
 }
@@ -356,6 +380,8 @@ func (a *DynSecAdapter) ensureRole(ctx context.Context, c *DynSecClient, u, role
 // OpenAfterFinalization is an explicit trusted service seam, not DB proof.
 // Service MUST confirm finalization commit (resolve ambiguity on a new DB
 // connection), reconcile ALL current authority and acknowledge this exact ID.
+// A continuous OPEN revoke is acknowledged by a fresh same-epoch Describe;
+// it never supplies a nonce or invokes the controller's CLOSED-to-OPEN seam.
 // Same-UID capability compromise is outside this unit's trust boundary.
 func (a *DynSecAdapter) OpenAfterFinalization(ctx context.Context, r DynSecAdapterResult, finalized uuid.UUID) error {
 	a.mu.Lock()
@@ -363,8 +389,15 @@ func (a *DynSecAdapter) OpenAfterFinalization(ctx context.Context, r DynSecAdapt
 	if !a.busy || r != a.pending || r.Outcome != ExecutionVerifiedSuccess || finalized == uuid.Nil || finalized != r.OperationID {
 		return ErrLifecycleUnavailable
 	}
-	if e := a.cfg.Controller.OpenVerified(ctx, r.receipt); e != nil {
-		return ErrLifecycleUnavailable
+	if r.continuousOpen {
+		d, e := a.cfg.Controller.Describe(ctx)
+		if e != nil || !d.Alive || !d.Open || d.Epoch != r.receipt.Epoch || d.Nonce != "" {
+			return ErrLifecycleUnavailable
+		}
+	} else {
+		if e := a.cfg.Controller.OpenVerified(ctx, r.receipt); e != nil {
+			return ErrLifecycleUnavailable
+		}
 	}
 	a.busy = false
 	a.opened = r
@@ -407,7 +440,7 @@ func (a *DynSecAdapter) VerifyRevocations(ctx context.Context, r DynSecAdapterRe
 	ctx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
 	defer cancel()
 	d, e := a.cfg.Controller.Describe(ctx)
-	if e != nil || d.Open || !d.Alive || d.Epoch != r.receipt.Epoch || d.Nonce != r.receipt.Nonce {
+	if e != nil || d.Open != r.continuousOpen || !d.Alive || d.Epoch != r.receipt.Epoch || d.Nonce != r.receipt.Nonce {
 		return ErrLifecycleUnavailable
 	}
 	if len(decisions) == 0 {
@@ -454,7 +487,7 @@ func (a *DynSecAdapter) VerifyRevocations(ctx context.Context, r DynSecAdapterRe
 		}
 	}
 	d, e = a.cfg.Controller.Describe(ctx)
-	if e != nil || d.Open || !d.Alive || d.Epoch != r.receipt.Epoch || d.Nonce != r.receipt.Nonce {
+	if e != nil || d.Open != r.continuousOpen || !d.Alive || d.Epoch != r.receipt.Epoch || d.Nonce != r.receipt.Nonce {
 		return ErrLifecycleUnavailable
 	}
 	return nil

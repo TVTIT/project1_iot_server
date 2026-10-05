@@ -116,7 +116,10 @@ func composeCredentials(ctx context.Context, pool *pgxpool.Pool, c config.Creden
 	login := func(ctx context.Context, user, password string) error {
 		return privateCredentialLogin(ctx, ctrl, &tls.Config{RootCAs: roots, ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}, c.ClientTimeout, user, password)
 	}
-	adapter, e := mqttcredential.NewDynSecAdapter(mqttcredential.DynSecAdapterConfig{Controller: ctrl, NewClient: newClient, Observe: reader.Observe, Login: login, ProtectedUsernames: protected, Timeout: c.OperationTimeout, RecoveryTimeout: c.RecoveryTimeout})
+	rejected := func(ctx context.Context, user, password string) error {
+		return privateCredentialCheck(ctx, ctrl, &tls.Config{RootCAs: roots, ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}, c.ClientTimeout, user, password, true)
+	}
+	adapter, e := mqttcredential.NewDynSecAdapter(mqttcredential.DynSecAdapterConfig{Controller: ctrl, NewClient: newClient, Observe: reader.Observe, Login: login, Rejected: rejected, ProtectedUsernames: protected, Timeout: c.OperationTimeout, RecoveryTimeout: c.RecoveryTimeout})
 	if e != nil {
 		return out, e
 	}
@@ -155,6 +158,10 @@ func composeCredentials(ctx context.Context, pool *pgxpool.Pool, c config.Creden
 }
 
 func privateCredentialLogin(ctx context.Context, ctrl mqttcredential.ControllerClient, tlsConfig *tls.Config, timeout time.Duration, user, password string) error {
+	return privateCredentialCheck(ctx, ctrl, tlsConfig, timeout, user, password, false)
+}
+
+func privateCredentialCheck(ctx context.Context, ctrl mqttcredential.ControllerClient, tlsConfig *tls.Config, timeout time.Duration, user, password string, negative bool) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	conn, e := ctrl.DialManagementTLS(ctx, tlsConfig)
@@ -190,7 +197,16 @@ func privateCredentialLogin(ctx context.Context, ctrl mqttcredential.ControllerC
 		return mqttcredential.ErrVerificationFailed
 	}
 	ack, ok := reply.(*packets.ConnackPacket)
-	if !ok || ack.ReturnCode != 0 || ctx.Err() != nil {
+	if !ok || ctx.Err() != nil {
+		return mqttcredential.ErrVerificationFailed
+	}
+	if negative {
+		if ack.ReturnCode == packets.ErrRefusedBadUsernameOrPassword || ack.ReturnCode == packets.ErrRefusedNotAuthorised {
+			return nil
+		}
+		return mqttcredential.ErrVerificationFailed
+	}
+	if ack.ReturnCode != 0 {
 		return mqttcredential.ErrVerificationFailed
 	}
 	return nil

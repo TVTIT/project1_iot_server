@@ -43,7 +43,8 @@ type MaintenanceGuard struct {
 
 // MaintenanceRepository manages database persistence for maintenance checkpoints. Separate capability preserves the existing Repository and its test doubles.
 // CompleteMaintenance is called only AFTER reconcile + epoch-correlated OPEN
-// ACK; secret return requires its confirmed commit. Unknown commit or absent
+// ACK (or same-epoch continuously OPEN revoke verification); secret return
+// requires its confirmed commit. Unknown commit or absent
 // lookup never authorizes runtime replay or secret return.
 type MaintenanceRepository interface {
 	ResolveMaintenance(context.Context, uuid.UUID) (MaintenanceCheckpoint, error)

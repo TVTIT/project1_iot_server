@@ -272,7 +272,8 @@ func (s *ProvisionService) mutate(ctx context.Context, actor uuid.UUID, in Mutat
 	if e != nil || result.OperationID != id || result.Outcome != ExecutionVerifiedSuccess || !validEpoch(result.receipt.Epoch) {
 		return out, &DomainError{Code: CodeRecoveryRequired}
 	}
-	// Execute cold-restarts the broker. Bind the actual resulting lifetime, not
+	// Execute cold-restarts provision/rotate, but revoke preserves OPEN. Bind the
+	// verified lifetime, not
 	// an earlier Describe receipt invalidated by CloseDrain/RestartClosed.
 	cp, e = s.maintenance.BindMaintenanceEpoch(ctx, maintenanceGuard(o, m, cp), result.receipt.Epoch)
 	if e != nil {

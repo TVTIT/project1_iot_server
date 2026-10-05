@@ -75,7 +75,7 @@ func servicePinnedBrokerPostgres(t *testing.T, rotate bool, revoke ...bool) {
 	if os.Getenv("TASK266_ISOLATED") != "1" {
 		t.Skip("owned isolated PostgreSQL v13 + native broker fixture required")
 	}
-	var input struct{ Password, AppDSN, AdminDSN string }
+	var input struct{ Password, AppDSN, AdminDSN, Broker string }
 	if json.NewDecoder(os.Stdin).Decode(&input) != nil {
 		t.Fatal("fixture input")
 	}
@@ -136,6 +136,9 @@ func servicePinnedBrokerPostgres(t *testing.T, rotate bool, revoke ...bool) {
 		t.Fatal(e)
 	}
 	cfg.Observe = reader.Observe
+	cfg.Rejected = func(ctx context.Context, u, p string) error {
+		return integrationRejected(ctx, ctrl, roots, u, p)
+	}
 	cfg.Login = func(ctx context.Context, u, p string) error {
 		conn, e := ctrl.DialManagementTLS(ctx, &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12})
 		if e != nil {
@@ -218,7 +221,7 @@ func servicePinnedBrokerPostgres(t *testing.T, rotate bool, revoke ...bool) {
 		return s, runtime
 	}
 	if len(revoke) == 1 && revoke[0] {
-		revokePinnedCases(ctx, t, repo, actor, sql, cfg, ctrl, create)
+		revokePinnedCases(ctx, t, repo, actor, sql, cfg, ctrl, input.Broker, create)
 		return
 	}
 	// Every case uses an independent process-owned service/adapter and a new

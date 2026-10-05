@@ -14,6 +14,30 @@ import (
 	"github.com/google/uuid"
 )
 
+func integrationRejected(ctx context.Context, ctrl ControllerClient, roots *x509.CertPool, user, password string) error {
+	conn, e := ctrl.DialManagementTLS(ctx, &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12})
+	if e != nil {
+		return ErrVerificationFailed
+	}
+	defer func() { _ = conn.Close() }()
+	if conn.SetDeadline(time.Now().Add(3*time.Second)) != nil {
+		return ErrVerificationFailed
+	}
+	p := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
+	p.ProtocolName, p.ProtocolVersion, p.CleanSession = "MQTT", 4, true
+	p.ClientIdentifier, p.UsernameFlag, p.PasswordFlag, p.Username, p.Password = uuid.NewString(), true, true, user, []byte(password)
+	defer clear(p.Password)
+	if p.Write(conn) != nil {
+		return ErrVerificationFailed
+	}
+	r, e := packets.ReadPacket(conn)
+	ack, ok := r.(*packets.ConnackPacket)
+	if e != nil || !ok || (ack.ReturnCode != packets.ErrRefusedBadUsernameOrPassword && ack.ReturnCode != packets.ErrRefusedNotAuthorised) {
+		return ErrVerificationFailed
+	}
+	return nil
+}
+
 // Revoke-only application seams. Native Execute and PostgreSQL writes remain
 // real. The marker is reached AFTER correlated native disable/cold-load proof,
 // not after an invented MQTT PUBACK. Python kills the owned controller PID1.
@@ -71,7 +95,7 @@ func (r revokeKillMaintenance) CompleteMaintenance(_ context.Context, _ Maintena
 	return MaintenanceCheckpoint{}, &DomainError{Code: CodeServiceUnavailable}
 }
 
-func revokePinnedCases(ctx context.Context, t *testing.T, repo *PostgresRepository, actor uuid.UUID, sql func(string, ...any), cfg DynSecAdapterConfig, ctrl ControllerClient, create func(string) (*ProvisionService, *provisionFaultRuntime)) {
+func revokePinnedCases(ctx context.Context, t *testing.T, repo *PostgresRepository, actor uuid.UUID, sql func(string, ...any), cfg DynSecAdapterConfig, ctrl ControllerClient, broker string, create func(string) (*ProvisionService, *provisionFaultRuntime)) {
 	t.Helper()
 	provision := func() (string, string) {
 		g := "fixture_" + uuid.NewString()
@@ -121,29 +145,52 @@ func revokePinnedCases(ctx context.Context, t *testing.T, repo *PostgresReposito
 	ca, _ := os.ReadFile("/ca.crt")
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(ca)
-	conn, e := ctrl.DialManagementTLS(ctx, &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12})
+	// Both original sessions must traverse the public gate, never management IPC.
+	description, e := ctrl.Describe(ctx)
+	if e != nil || !description.Open || len(description.Addresses) == 0 {
+		t.Fatal("public gate unavailable")
+	}
+	_, port, e := net.SplitHostPort(description.Addresses[0])
 	if e != nil {
-		t.Fatal("session dial")
+		t.Fatal("public gate address")
 	}
+	dial := func(user, pass string) net.Conn {
+		t.Helper()
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", net.JoinHostPort(broker, port), &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12})
+		if err != nil {
+			t.Fatal("public gated session dial")
+		}
+		if conn.SetDeadline(time.Now().Add(5*time.Second)) != nil {
+			t.Fatal("session deadline")
+		}
+		p := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
+		p.ProtocolName, p.ProtocolVersion, p.CleanSession = "MQTT", 4, true
+		p.ClientIdentifier, p.UsernameFlag, p.PasswordFlag, p.Username, p.Password = uuid.NewString(), true, true, user, []byte(pass)
+		if p.Write(conn) != nil {
+			t.Fatal("session CONNECT")
+		}
+		r, err := packets.ReadPacket(conn)
+		ack, ok := r.(*packets.ConnackPacket)
+		if err != nil || !ok || ack.ReturnCode != 0 {
+			t.Fatal("session authentication")
+		}
+		return conn
+	}
+	otherConn := dial(other, otherPassword)
+	defer func() { _ = otherConn.Close() }()
+	conn := dial(g, password)
 	defer func() { _ = conn.Close() }() // Revoke intentionally disconnects this peer.
-	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal("session deadline failed")
-	}
-	p := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
-	p.ProtocolName, p.ProtocolVersion, p.CleanSession = "MQTT", 4, true
-	p.ClientIdentifier, p.UsernameFlag, p.PasswordFlag, p.Username, p.Password = uuid.NewString(), true, true, g, []byte(password)
-	if p.Write(conn) != nil {
-		t.Fatal("session CONNECT")
-	}
-	r, e := packets.ReadPacket(conn)
-	ack, ok := r.(*packets.ConnackPacket)
-	if e != nil || !ok || ack.ReturnCode != 0 {
-		t.Fatal("session authentication")
-	}
 	in := MutationInput{g, uuid.New(), ActionRevoke}
 	v, e := s.Revoke(ctx, actor, in)
 	if e != nil || v.Status != CredentialRevoked || v.CredentialVersion != 1 || v.SecretReturned {
 		t.Fatal("revoke result", e)
+	}
+	if otherConn.SetDeadline(time.Now().Add(3*time.Second)) != nil || packets.NewControlPacket(packets.Pingreq).Write(otherConn) != nil {
+		t.Fatal("unrelated original gated session write")
+	}
+	ping, pingErr := packets.ReadPacket(otherConn)
+	if _, ok := ping.(*packets.PingrespPacket); pingErr != nil || !ok {
+		t.Fatal("unrelated ORIGINAL gated socket lost")
 	}
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal("disconnect probe deadline failed")
@@ -151,6 +198,9 @@ func revokePinnedCases(ctx context.Context, t *testing.T, repo *PostgresReposito
 	b := make([]byte, 1)
 	if _, e = conn.Read(b); e == nil {
 		t.Fatal("session not disconnected")
+	}
+	if timeout, ok := e.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("target disconnect was only a timeout")
 	}
 	if cfg.Login(ctx, g, password) == nil {
 		t.Fatal("old fixture credential accepted")

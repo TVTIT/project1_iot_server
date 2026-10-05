@@ -34,6 +34,9 @@ func TestDynSecAdapterPinnedBroker(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(ca)
 	cfg := DynSecAdapterConfig{Controller: ctrl, ProtectedUsernames: []string{"admin", BackendUsername}, Timeout: 20 * time.Second, RecoveryTimeout: 5 * time.Second}
+	cfg.Rejected = func(ctx context.Context, u, p string) error {
+		return integrationRejected(ctx, ctrl, roots, u, p)
+	}
 	cfg.NewClient = func(ctx context.Context) (*DynSecClient, error) {
 		for attempt := 0; attempt < 20; attempt++ {
 			c, e := NewDynSecClient(ctx, DynSecConfig{BrokerURL: "ssl://localhost:18884", CAPEM: ca, ManagerUsername: "admin", ManagerPassword: input.Password, ProtectedUsernames: []string{BackendUsername}, Timeout: 3 * time.Second, MaxPayloadBytes: 16384, MaxInflight: 4, QueueSize: 8, ValidateTarget: func(u string) bool { return u == "A" || u == "C" || u == "D" }, ValidateRole: func(u, r string) bool { return r == "gateway_"+u }, ManagementDial: ctrl.ManagementDial})
