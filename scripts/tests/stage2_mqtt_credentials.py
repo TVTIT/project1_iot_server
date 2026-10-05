@@ -25,7 +25,7 @@ def qualify_network(spike, inspected):
     print('PASS isolated network: loopback private broker, only gated TLS host bindings', flush=True)
 
 
-def start_proxy(directory, network, name, backend, publish=False):
+def start_proxy(directory, network, name, backend, publish=False, labels=()):
     config = directory / 'nginx.conf'
     config.write_text('pid /tmp/nginx.pid; events {} http { access_log off; '
                       'error_log /dev/stderr warn; client_body_temp_path /tmp/body; '
@@ -37,7 +37,7 @@ def start_proxy(directory, network, name, backend, publish=False):
                       'proxy_pass http://$backend; proxy_read_timeout 60s; '
                       'proxy_set_header Authorization $http_authorization; } } }')
     config.chmod(0o600)
-    run(['docker', 'run', '-d', '--name', name, '--network', network, *(['-p', '127.0.0.1::8443'] if publish else []), '--user', f'{os.getuid()}:{os.getgid()}',
+    run(['docker', 'run', '-d', *labels, '--name', name, '--network', network, *(['-p', '127.0.0.1::8443'] if publish else []), '--user', f'{os.getuid()}:{os.getgid()}',
          '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true',
          '--tmpfs', '/tmp', '--mount', f'type=bind,src={config},dst=/etc/nginx/nginx.conf,readonly',
          '--mount', f'type=bind,src={directory}/server.crt,dst=/tls/server.crt,readonly',

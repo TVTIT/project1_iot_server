@@ -113,6 +113,7 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
         artifacts.mkdir(mode=0o777, exist_ok=True)
         artifacts.chmod(0o777)
         payload = dict(Password=spike.passwords['admin'],
+                       Broker=inspected['Name'].lstrip('/'),
                        AppDSN=f'postgres://iot_backend_app:{app_password}@{database}:5432/fixture_service?sslmode=disable',
                        AdminDSN=f'postgres://fixture_admin:{admin_password}@{database}:5432/fixture_service?sslmode=disable')
         if standalone:
