@@ -57,6 +57,14 @@ fi
 
 # 3. Generate Server Key & CSR (RSA 2048-bit)
 echo "=== 2. Generating Server Key & CSR (RSA 2048-bit) ==="
+# Remove existing key/csr to avoid permission errors if previously owned by 1883:1883
+if [ -f "${MOSQUITTO_CERTS_DIR}/server.key" ] && ! rm -f "${MOSQUITTO_CERTS_DIR}/server.key" 2>/dev/null; then
+    if command -v sudo >/dev/null 2>&1; then
+        sudo rm -f "${MOSQUITTO_CERTS_DIR}/server.key" 2>/dev/null || true
+    fi
+fi
+rm -f "${MOSQUITTO_CERTS_DIR}/server.csr"
+
 openssl req -new -newkey rsa:2048 -nodes \
     -keyout "${MOSQUITTO_CERTS_DIR}/server.key" \
     -out "${MOSQUITTO_CERTS_DIR}/server.csr" \
@@ -138,10 +146,44 @@ openssl x509 -req -in "${MOSQUITTO_CERTS_DIR}/server.csr" \
 
 # 6. Set Secure Permissions
 echo "=== 5. Setting Secure Permissions ==="
+chmod 755 "${MOSQUITTO_CERTS_DIR}"
+chmod 700 "${SECURE_CA_DIR}" 2>/dev/null || true
 chmod 600 "${CA_KEY}"
-chmod 600 "${MOSQUITTO_CERTS_DIR}/server.key"
 chmod 644 "${CA_CRT}"
 chmod 644 "${MOSQUITTO_CERTS_DIR}/server.crt"
+
+# Set permissions for Mosquitto container (runs under UID/GID 1883:1883)
+set_mosquitto_permissions() {
+    local target="$1"
+    [ -f "${target}" ] || return 0
+
+    if [ "$(id -u)" -eq 0 ]; then
+        chown 1883:1883 "${target}" 2>/dev/null || true
+        chmod 600 "${target}"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo chown 1883:1883 "${target}" 2>/dev/null || true
+        sudo chmod 600 "${target}"
+    elif command -v sudo >/dev/null 2>&1; then
+        echo " -> Cấp quyền cho user 1883:1883 (Mosquitto) qua sudo cho $(basename "${target}")..."
+        if sudo chown 1883:1883 "${target}" 2>/dev/null; then
+            sudo chmod 600 "${target}"
+        else
+            echo " -> Cảnh báo: sudo chown thất bại, fallback đặt chmod 644 cho $(basename "${target}")"
+            chmod 644 "${target}"
+        fi
+    else
+        # Fallback when sudo is unavailable: chmod 644 allows container UID 1883 to read key/acl
+        echo " -> Cảnh báo: Không có quyền sudo, fallback đặt chmod 644 cho $(basename "${target}")"
+        chmod 644 "${target}"
+    fi
+}
+
+set_mosquitto_permissions "${MOSQUITTO_CERTS_DIR}/server.key"
+
+ACL_FILE="${PROJECT_ROOT}/config/mosquitto/acl"
+if [ -f "${ACL_FILE}" ]; then
+    set_mosquitto_permissions "${ACL_FILE}"
+fi
 
 # Clean temporary files
 rm -f "${MOSQUITTO_CERTS_DIR}/server.csr" "${MOSQUITTO_CERTS_DIR}/server.ext"
