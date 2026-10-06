@@ -68,4 +68,13 @@ server {
         return 200 'OK';
         add_header Content-Type text/plain;
     }
+
+    # 6. Readiness check (Go Backend + Database Ping)
+    location = /readyz {
+        proxy_pass http://backend_api;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 }
