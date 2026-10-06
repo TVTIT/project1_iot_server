@@ -172,18 +172,13 @@ set_mosquitto_permissions() {
             chmod 644 "${target}"
         fi
     else
-        # Fallback when sudo is unavailable: chmod 644 allows container UID 1883 to read key/acl
+        # Fallback when sudo is unavailable: chmod 644 allows container UID 1883 to read key
         echo " -> Cảnh báo: Không có quyền sudo, fallback đặt chmod 644 cho $(basename "${target}")"
         chmod 644 "${target}"
     fi
 }
 
 set_mosquitto_permissions "${MOSQUITTO_CERTS_DIR}/server.key"
-
-ACL_FILE="${PROJECT_ROOT}/config/mosquitto/acl"
-if [ -f "${ACL_FILE}" ]; then
-    set_mosquitto_permissions "${ACL_FILE}"
-fi
 
 # Clean temporary files
 rm -f "${MOSQUITTO_CERTS_DIR}/server.csr" "${MOSQUITTO_CERTS_DIR}/server.ext"
