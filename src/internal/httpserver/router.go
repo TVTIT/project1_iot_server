@@ -78,6 +78,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	router.HandleMethodNotAllowed = true
 	router.Use(httpapi.RequestIDMiddleware(), httpapi.RecoveryMiddleware(slog.Default()))
 	router.Use(credentialCacheMiddleware())
+	router.Use(permissionCacheMiddleware())
 	router.NoRoute(func(c *gin.Context) {
 		httpapi.WriteError(c, http.StatusNotFound, "not_found", "resource not found")
 	})
@@ -116,6 +117,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	groups.admin.PUT("/gateways/:gateway_id", provisionGateway(deps.GatewayProvisioner, deps.AdminMaxBodyBytes))
 	groups.admin.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensor(deps.SensorProvisioner, deps.AdminMaxBodyBytes))
 	authenticated := groups.authenticated
+	authenticated.GET("/me/permissions", getMyPermissions(deps.PlatformAdminChecker, deps.AuthorizationTimeout))
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
 	authenticated.GET("/telemetry/history", notImplemented)
