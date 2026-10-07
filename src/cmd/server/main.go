@@ -117,6 +117,7 @@ func run() error {
 		AuthorizationTimeout:       cfg.AuthorizationTimeout,
 		TokenVerifier:              tokenVerifier,
 		PlatformAdminChecker:       adminChecker,
+		CORSAllowedOrigins:         cfg.CORSAllowedOrigins,
 	})
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)

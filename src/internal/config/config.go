@@ -19,6 +19,7 @@ type LookupFunc func(string) (string, bool)
 type Config struct {
 	Credential             CredentialConfig
 	MQTTCredentialRuntime  mqttcredential.StartupConfig
+	CORSAllowedOrigins     []string
 	ServerPort             int
 	ServerEnv              string
 	DatabaseURL            string
@@ -96,6 +97,10 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 
 	if cfg.ServerPort, err = integer(lookup, "SERVER_PORT", 8080, 1, 65535); err != nil {
+		return Config{}, err
+	}
+	corsRaw, _ := lookup("CORS_ALLOWED_ORIGINS")
+	if cfg.CORSAllowedOrigins, err = parseCORSAllowedOrigins(corsRaw); err != nil {
 		return Config{}, err
 	}
 	maxConns, err := integer(lookup, "DATABASE_MAX_CONNS", 10, 1, 1000)

@@ -254,6 +254,12 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 - `/healthz`: Liveness probe chỉ xác nhận tiến trình HTTP còn hoạt động (trả về `OK`).
 - `/readyz`: Readiness probe xác nhận backend hiện truy cập được CSDL PostgreSQL (`{"status":"ready"}` HTTP 200 hoặc safe error envelope `service_unavailable` HTTP 503).
 - Toàn bộ HTTP request/response được gán hoặc chuyển tiếp header `X-Request-ID` (tự động tạo UUIDv4 nếu chưa có) phục vụ distributed tracing.
+- **Cấu hình CORS cho Go Business REST API (`CORS_ALLOWED_ORIGINS`)**:
+  - `CORS_ALLOWED_ORIGINS` nhận danh sách exact web origin phân tách bằng dấu phẩy. Nếu để trống hoặc không cấu hình, backend tự động vô hiệu hóa quyền cross-origin của trình duyệt nhưng vẫn cho phép các request không có header `Origin` (như `/healthz`, `/readyz` và gọi trực tiếp giữa các service).
+  - **Development (Flutter Web)**: Cấu hình cổng cố định cho Flutter Web, ví dụ `http://localhost:12345` trong `.env` (`flutter run -d chrome --web-port=12345`).
+  - **Production**: Cấu hình tường minh HTTPS origin của frontend (ví dụ `https://dashboard.example.com`). Origin phải có scheme `http` hoặc `https`, hostname, port số hợp lệ nếu có; cấm path, trailing slash `/`, userinfo, query (kể cả `?` rỗng), fragment (kể cả `#` rỗng) hoặc wildcard `*`; port được khai báo tường minh không được rỗng. Host chỉ chấp nhận `localhost`, IPv4/IPv6 literal hợp lệ, hoặc DNS labels ASCII thông thường. Unicode domain bị từ chối vì backend không thực hiện IDNA; dùng hostname ASCII punycode đã được chuyển đổi (ví dụ `xn--...`) nếu cần. Trailing slash bị từ chối lúc khởi động để bảo đảm khớp origin chính xác.
+  - **Tái tạo container khi đổi biến môi trường**: Khi chỉnh sửa `CORS_ALLOWED_ORIGINS` trong `.env`, cần chạy `docker compose up -d` để Docker Compose tái tạo container backend với biến môi trường mới thay vì `docker compose restart` (lệnh restart không đọc lại `.env`).
+  - **Phạm vi độc lập (Scope)**: Middleware này chỉ áp dụng cho Go business REST API (`/v1/*`, `/healthz`, `/readyz`). Không bao gồm hay thay thế CORS của Supabase Auth/Storage trên Envoy API Gateway, và không thay thế Origin check khi upgrade kết nối WebSocket (`/v1/ws`).
 - `docker compose stop backend` gửi tín hiệu `SIGTERM` để backend dừng tiếp nhận kết nối mới, hoàn tất request đang xử lý trong thời gian `SHUTDOWN_TIMEOUT` và đóng connection pool PostgreSQL an toàn.
 
 ### 3.3 Áp dụng migration

@@ -40,6 +40,7 @@ services:
       MQTT_PASSWORD: ${MQTT_PASSWORD:?required}
       MQTT_TLS_CA_FILE: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}
       DATABASE_URL: ${DATABASE_URL:?required}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       SUPABASE_JWT_SECRET: ${JWT_SECRET:?required}
       SUPABASE_JWT_ISSUER: ${GOTRUE_JWT_ISSUER:?required}
       SUPABASE_JWT_AUDIENCE: authenticated

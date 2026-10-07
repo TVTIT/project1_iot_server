@@ -35,6 +35,7 @@ type RouterDependencies struct {
 	CredentialRequestTimeout   time.Duration
 	CredentialManager          CredentialManager
 	CredentialStartupReadiness CredentialStartupReadiness
+	CORSAllowedOrigins         []string
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -76,7 +77,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
-	router.Use(httpapi.RequestIDMiddleware(), httpapi.RecoveryMiddleware(slog.Default()))
+	router.Use(httpapi.RequestIDMiddleware(), corsMiddleware(deps.CORSAllowedOrigins), httpapi.RecoveryMiddleware(slog.Default()))
 	router.Use(credentialCacheMiddleware())
 	router.Use(permissionCacheMiddleware())
 	router.NoRoute(func(c *gin.Context) {
