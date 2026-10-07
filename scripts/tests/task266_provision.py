@@ -17,6 +17,102 @@ from task26_harness_helpers import require
 from task265b_lifecycle import IMAGE
 
 PG_IMAGE = 'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a'
+IMAGE_TIMEOUT = 300
+CONTAINER_TIMEOUT = 60
+DATABASE_TIMEOUT = 90
+PROBE_TIMEOUT = 2
+
+
+def prepare_database_image():
+    """Inspect the exact digest; only an absent local image needs a pull."""
+    try:
+        inspected = subprocess.run(['docker', 'image', 'inspect', PG_IMAGE], env=ENV,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+        if inspected.returncode == 0:
+            return
+        if b'no such image: ' + PG_IMAGE.encode() not in inspected.stderr.lower():
+            raise RuntimeError('image_inspect_failed')
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('image_inspect_timeout') from None
+    except OSError:
+        raise RuntimeError('image_inspect_failed') from None
+    try:
+        run(['docker', 'pull', PG_IMAGE], timeout=IMAGE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('image_pull_timeout') from None
+    except (RuntimeError, OSError):
+        raise RuntimeError('image_pull_failed') from None
+
+
+def start_database(database, network, env_file):
+    try:
+        run(['docker', 'run', '--pull=never', '-d', '--name', database,
+             '--network', network, '--env-file', str(env_file), PG_IMAGE],
+            capture=True, timeout=CONTAINER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # The daemon may already have created the named container. The caller's
+        # finally always removes that owned name, even without a returned ID.
+        raise RuntimeError('container_start_timeout') from None
+    except (RuntimeError, OSError):
+        raise RuntimeError('container_start_failed') from None
+
+
+def wait_database(database, timeout=DATABASE_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('database_not_ready')
+        try:
+            # TCP excludes the entrypoint's temporary Unix-only server.
+            result = subprocess.run(
+                ['docker', 'exec', database, 'pg_isready', '-h', '127.0.0.1',
+                 '-U', 'fixture_admin', '-d', 'fixture_service'], env=ENV,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=min(PROBE_TIMEOUT, remaining))
+            if result.returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError:
+            raise RuntimeError('database_probe_failed') from None
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                # Only status, never Env, logs, or initialization SQL.
+                state = subprocess.run(
+                    ['docker', 'inspect', '-f', '{{.State.Status}}', database],
+                    env=ENV, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=min(PROBE_TIMEOUT, remaining))
+                if state.returncode == 0 and state.stdout.strip() in (b'exited', b'dead', b'removing'):
+                    raise RuntimeError('database_not_ready:' + state.stdout.strip().decode('ascii'))
+            except subprocess.TimeoutExpired:
+                pass
+            except OSError:
+                raise RuntimeError('database_probe_failed') from None
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1, remaining))
+
+
+def cleanup_container(owned):
+    """Absence is success only with Docker's specific not-found evidence."""
+    try:
+        removed = subprocess.run(['docker', 'rm', '-f', '-v', owned], env=ENV,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
+        check = subprocess.run(['docker', 'inspect', owned], env=ENV,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+        absent = check.returncode != 0 and (
+            b'no such container: ' + owned.encode() in check.stderr.lower() or
+            b'no such object: ' + owned.encode() in check.stderr.lower())
+        require(absent, 'owned container cleanup failed')
+        require(removed.returncode == 0 or
+                b'no such container: ' + owned.encode() in (removed.stderr or b'').lower(),
+                'owned container cleanup failed')
+        # rm may report not-found for an uncreated/already removed container;
+        # a successful absence check is the authoritative cleanup postcondition.
+    except (subprocess.TimeoutExpired, OSError):
+        raise RuntimeError('owned container cleanup failed') from None
 
 
 def main(rotate=False, revoke=False, startup=False, composition=False, http=False, standalone=False):
@@ -68,16 +164,9 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
         env_file = directory / 'database.env'
         env_file.write_text('POSTGRES_USER=fixture_admin\nPOSTGRES_DB=fixture_service\nPOSTGRES_PASSWORD=' + admin_password + '\nBACKEND_DB_PASSWORD=' + app_password + '\nAUTH_DB_PASSWORD=' + secrets.token_hex(32) + '\nSTORAGE_DB_PASSWORD=' + secrets.token_hex(32) + '\n')
         env_file.chmod(0o600)
-        run(['docker', 'run', '-d', '--name', database, '--network', network, '--env-file', str(env_file), PG_IMAGE], capture=True)
-        ready = False
-        for _ in range(90):
-            # TCP readiness excludes the entrypoint's temporary Unix-only server.
-            p = subprocess.run(['docker', 'exec', database, 'pg_isready', '-h', '127.0.0.1', '-U', 'fixture_admin', '-d', 'fixture_service'], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if p.returncode == 0:
-                ready = True
-                break
-            time.sleep(1)
-        require(ready, 'owned PG readiness')
+        prepare_database_image()
+        start_database(database, network, env_file)
+        wait_database(database)
         # Shell initialization uses container env, never secret command arguments.
         for migration in sorted((ROOT / 'migrations').iterdir()):
             if not migration.name.startswith('0000') or (not migration.name.endswith('.sql') and not migration.name.endswith('.sh')):
@@ -197,15 +286,16 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
         if coverage_out:
             shutil.copyfile(artifacts / 'service.cover', coverage_out)
     finally:
+        cleanup_failed = False
         for owned in (test_container + '-readiness', test_container, database, proxy):
-            subprocess.run(['docker', 'rm', '-f', '-v', owned], env=ENV,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-            check = subprocess.run(['docker', 'inspect', owned], env=ENV,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-            require(check.returncode != 0, 'owned container cleanup unconfirmed')
+            try:
+                cleanup_container(owned)
+            except RuntimeError:
+                cleanup_failed = True
         spike.setup(f'chown -R {os.getuid()}:{os.getgid()} /fixture; chmod 700 /fixture')
         spike.cleanup()
         shutil.rmtree(directory)
+        require(not cleanup_failed, 'owned container cleanup failed')
 
 
 if __name__ == '__main__':

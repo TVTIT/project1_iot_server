@@ -30,7 +30,7 @@ class CredentialHarnessTests(unittest.TestCase):
         for contract in ('test', '-coverpkg=', 'startup-unreadable',
                          'chmod 000 /security/dynsec.json; chmod 500 /security',
                          "['docker', 'rm', '-f', '-v', owned]",
-                         "require(check.returncode != 0", 'verify_selector(output)',
+                          "require(absent, 'owned container cleanup failed')", 'verify_selector(output)',
                          'generated Gateway secret log leak', "'--- PASS: Test'"):
             self.assertIn(contract, source)
         self.assertNotIn("ROOT / '.env'", source)
