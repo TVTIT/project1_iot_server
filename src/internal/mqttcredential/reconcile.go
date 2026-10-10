@@ -158,6 +158,18 @@ func (s *StartupReconciler) Run(ctx context.Context) (err error) {
 		return ErrRecoveryRequired
 	}
 	for id := range jobs {
+		if id == uuid.Nil {
+			return ErrRecoveryRequired
+		}
+		op, e := s.repo.ResolveCommitAmbiguity(ctx, id)
+		if e != nil {
+			return e
+		}
+		if op.OperationID != id || (op.Action != ActionProvision && op.Action != ActionRevoke) {
+			return ErrRecoveryRequired
+		}
+	}
+	for id := range jobs {
 		if e := s.recover(ctx, receipt, id, pending[id]); e != nil {
 			return e
 		}
@@ -219,9 +231,15 @@ func (s *StartupReconciler) Run(ctx context.Context) (err error) {
 }
 
 func (s *StartupReconciler) recover(ctx context.Context, receipt VerificationReceipt, id uuid.UUID, r RecoveryRecord) error {
+	if id == uuid.Nil {
+		return ErrRecoveryRequired
+	}
 	o, e := s.repo.ResolveCommitAmbiguity(ctx, id)
 	if e != nil {
 		return e
+	}
+	if o.OperationID != id || (o.Action != ActionProvision && o.Action != ActionRevoke) {
+		return ErrRecoveryRequired
 	}
 	cp, e := s.maintenance.ResolveMaintenance(ctx, id)
 	if e != nil {
