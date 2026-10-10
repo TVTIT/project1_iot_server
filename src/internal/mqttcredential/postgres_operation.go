@@ -73,8 +73,8 @@ func (r *PostgresRepository) BeginOperation(ctx context.Context, req BeginReques
 	// must wait for all prior maintenance, even when its audit event is terminal.
 	// The Gateway lock also serializes this check with checkpoint completion.
 	if err = tx.QueryRow(ctx, `SELECT COALESCE(bool_or(status IN ('pending','in_progress')),false), COALESCE(bool_or(status='recovery_needed'),false) FROM (
-SELECT status FROM public.gateway_mqtt_credential_events WHERE gateway_id=$1 AND status IN ('pending','recovery_needed') AND recovery_id IS NULL
-UNION ALL SELECT status FROM public.mqtt_credential_maintenance WHERE gateway_id=$1 AND status <> 'completed'
+SELECT status FROM public.gateway_mqtt_credential_events WHERE gateway_id=$1 AND status IN ('pending','recovery_needed') AND recovery_id IS NULL AND public.mqtt_operation_effective(operation_id)
+UNION ALL SELECT status FROM public.mqtt_credential_maintenance WHERE gateway_id=$1 AND status <> 'completed' AND public.mqtt_operation_effective(operation_id)
 UNION ALL SELECT 'recovery_needed' FROM public.mqtt_credential_recovery WHERE gateway_id=$1 AND status='pending'
 ) unresolved`, parent).Scan(&pending, &recovery); err != nil {
 		return BeginResult{}, safeReadError(err)

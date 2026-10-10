@@ -48,7 +48,7 @@ func (r *PostgresRepository) ListPendingMaintenance(ctx context.Context, cursor 
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	rows, err := r.pool.Query(ctx, `SELECT `+maintenanceColumns+` FROM public.mqtt_credential_maintenance WHERE status <> 'completed' AND operation_id>$1 ORDER BY operation_id LIMIT $2`, cursor, limit)
+	rows, err := r.pool.Query(ctx, `SELECT `+maintenanceColumns+` FROM public.mqtt_credential_maintenance WHERE status <> 'completed' AND public.mqtt_operation_effective(operation_id) AND operation_id>$1 ORDER BY operation_id LIMIT $2`, cursor, limit)
 	if err != nil {
 		return nil, safeReadError(err)
 	}

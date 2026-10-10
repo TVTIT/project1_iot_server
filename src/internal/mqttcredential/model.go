@@ -187,6 +187,9 @@ type Operation struct {
 	Previous          *CredentialSnapshot  `json:"previous,omitempty"`
 	ErrorCode         *ErrorCode           `json:"error_code,omitempty"`
 	RecoveryID        *uuid.UUID           `json:"recovery_id,omitempty"`
+	// ReplacementPredecessorID identifies a manual current-operation replacement,
+	// not permission to execute or a result for the predecessor.
+	ReplacementPredecessorID *uuid.UUID `json:"replacement_predecessor_id,omitempty"`
 }
 
 // Validate checks a live operation's UUID identities and semantic enum groups.
@@ -202,6 +205,9 @@ func (o Operation) Validate() error {
 // migration projection; this validates the new operation contract only.
 func (o Operation) ValidateHistorical() error {
 	if o.OperationID == uuid.Nil {
+		return &DomainError{Code: CodeInvalidRequest}
+	}
+	if o.ReplacementPredecessorID != nil && (*o.ReplacementPredecessorID == uuid.Nil || *o.ReplacementPredecessorID == o.OperationID || o.Action != ActionRotate) {
 		return &DomainError{Code: CodeInvalidRequest}
 	}
 	// Use the nonnil operation identity solely for syntax validation, not authority.
@@ -312,7 +318,7 @@ func CompleteOperation(o Operation, outcome ExecutionOutcome, evidence Verificat
 	if o.ValidateHistorical() != nil || o.Terminal() || at.IsZero() || at.Before(o.CreatedAt) || at.Before(o.UpdatedAt) {
 		return invalid()
 	}
-	if o.Action != ActionProvision && (o.Previous == nil || o.Previous.Status != CredentialActive) {
+	if o.Action != ActionProvision && (o.Previous == nil || (o.Previous.Status != CredentialActive && o.ReplacementPredecessorID == nil)) {
 		return invalid()
 	}
 	if o.Previous != nil {

@@ -201,7 +201,7 @@ func (r *PostgresRepository) ListUnresolved(ctx context.Context, cursor uuid.UUI
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	rows, err := r.pool.Query(ctx, `SELECT `+operationColumns+` FROM public.gateway_mqtt_credential_events WHERE status IN ('pending','recovery_needed') AND recovery_id IS NULL AND operation_id>$1 ORDER BY operation_id LIMIT $2`, cursor, limit)
+	rows, err := r.pool.Query(ctx, `SELECT `+operationColumns+` FROM public.gateway_mqtt_credential_events WHERE status IN ('pending','recovery_needed') AND recovery_id IS NULL AND public.mqtt_operation_effective(operation_id) AND operation_id>$1 ORDER BY operation_id LIMIT $2`, cursor, limit)
 	if err != nil {
 		return nil, safeReadError(err)
 	}
