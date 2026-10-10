@@ -2,10 +2,12 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -678,9 +680,1129 @@ func TestPostgresProvisioningIntegration(t *testing.T) {
 			t.Fatal("committed Sensor not resolved as retry")
 		}
 	})
+	t.Run("owner sensor provisioning real postgres tests", func(t *testing.T) {
+		testPostgresOwnerSensorProvisioning(ctx, t, setup, app, input)
+	})
 }
 
-// A network error from COMMIT is ambiguous: the server may already have
+func testPostgresOwnerSensorProvisioning(ctx context.Context, t *testing.T, setup, app *pgxpool.Pool, baseInput ProvisionGatewayInput) {
+	adminRepo, err := NewPostgresProvisioningRepository(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerRepo, err := NewPostgresOwnerSensorProvisioningRepository(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := setup.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("setup fixture: %v", err)
+		}
+	}
+
+	admin, owner, operator, viewer, nonMember, otherOwner := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{admin, owner, operator, viewer, nonMember, otherOwner} {
+		exec("INSERT INTO profiles(id) VALUES ($1)", id)
+	}
+	exec("INSERT INTO platform_admins(user_id) VALUES ($1)", admin)
+
+	gwID := "ownergw_" + uuid.NewString()[:8]
+	otherGwID := "othergw_" + uuid.NewString()[:8]
+
+	gwInput := baseInput
+	gwInput.GatewayID = gwID
+	gwInput.OwnerUserID = owner
+	if _, err := adminRepo.ProvisionGateway(ctx, admin, gwInput); err != nil {
+		t.Fatalf("provision owner parent gateway: %v", err)
+	}
+
+	otherGwInput := baseInput
+	otherGwInput.GatewayID = otherGwID
+	otherGwInput.OwnerUserID = otherOwner
+	if _, err := adminRepo.ProvisionGateway(ctx, admin, otherGwInput); err != nil {
+		t.Fatalf("provision other parent gateway: %v", err)
+	}
+
+	exec("INSERT INTO user_gateways(user_id, gateway_id, role) VALUES ($1, $2, 'operator')", operator, gwID)
+	exec("INSERT INTO user_gateways(user_id, gateway_id, role) VALUES ($1, $2, 'viewer')", viewer, gwID)
+
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = setup.Exec(cleanup, "DELETE FROM gateways WHERE gateway_id IN ($1, $2)", gwID, otherGwID)
+		_, _ = setup.Exec(cleanup, "DELETE FROM platform_admins WHERE user_id=$1", admin)
+		for _, id := range []uuid.UUID{admin, owner, operator, viewer, nonMember, otherOwner} {
+			_, _ = setup.Exec(cleanup, "DELETE FROM profiles WHERE id=$1", id)
+		}
+	}()
+
+	sensorInput := ProvisionSensorInput{
+		GatewayID: gwID,
+		SensorID:  "temp_01",
+		Name:      "Temperature Sensor",
+		Unit:      func(s string) *string { return &s }("°C"),
+	}
+
+	// 1. Role denials on owner route: operator (403), viewer (403), non-member (404), other owner (404), admin without owner (404)
+	roleDenialBaseline := snapshotOwnerGraph(t, ctx, setup)
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, operator, sensorInput); !errors.Is(err, ErrProvisioningForbidden) {
+		t.Fatalf("operator expected ErrProvisioningForbidden, got %v", err)
+	}
+	assertOwnerGraphEqual(t, roleDenialBaseline, snapshotOwnerGraph(t, ctx, setup))
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, viewer, sensorInput); !errors.Is(err, ErrProvisioningForbidden) {
+		t.Fatalf("viewer expected ErrProvisioningForbidden, got %v", err)
+	}
+	assertOwnerGraphEqual(t, roleDenialBaseline, snapshotOwnerGraph(t, ctx, setup))
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, nonMember, sensorInput); !errors.Is(err, ErrProvisioningNotFound) {
+		t.Fatalf("non-member expected ErrProvisioningNotFound, got %v", err)
+	}
+	assertOwnerGraphEqual(t, roleDenialBaseline, snapshotOwnerGraph(t, ctx, setup))
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, otherOwner, sensorInput); !errors.Is(err, ErrProvisioningNotFound) {
+		t.Fatalf("cross-gateway owner expected ErrProvisioningNotFound, got %v", err)
+	}
+	assertOwnerGraphEqual(t, roleDenialBaseline, snapshotOwnerGraph(t, ctx, setup))
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, admin, sensorInput); !errors.Is(err, ErrProvisioningNotFound) {
+		t.Fatalf("admin without owner membership expected ErrProvisioningNotFound, got %v", err)
+	}
+	assertOwnerGraphEqual(t, roleDenialBaseline, snapshotOwnerGraph(t, ctx, setup))
+	// Missing gateway parent -> ErrProvisioningNotFound
+	missingGwInput := sensorInput
+	missingGwInput.GatewayID = "missing_gw"
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, missingGwInput); !errors.Is(err, ErrProvisioningNotFound) {
+		t.Fatalf("missing parent expected ErrProvisioningNotFound, got %v", err)
+	}
+	assertOwnerGraphEqual(t, roleDenialBaseline, snapshotOwnerGraph(t, ctx, setup))
+
+	// 2. Owner success: creates Sensor, Twin entity, Twin state, and hasSensor atomically
+	created, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, sensorInput)
+	if err != nil || !created.Created {
+		t.Fatalf("owner create failed: res=%+v err=%v", created, err)
+	}
+	if created.CreatedAt == nil {
+		t.Fatal("created_at must be populated on create")
+	}
+
+	// Verify database rows exist and cohere
+	var sensorCount, twinCount, stateCount, relCount int
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM sensors WHERE gateway_id=$1 AND sensor_id=$2", gwID, sensorInput.SensorID).Scan(&sensorCount); err != nil || sensorCount != 1 {
+		t.Fatalf("sensors table count = %d, err = %v", sensorCount, err)
+	}
+	sensorEntityURN := "urn:ngsi-ld:Sensor:" + gwID + ":" + sensorInput.SensorID
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_entities WHERE entity_id=$1 AND entity_type='Sensor'", sensorEntityURN).Scan(&twinCount); err != nil || twinCount != 1 {
+		t.Fatalf("twin_entities count = %d", twinCount)
+	}
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=$1", sensorEntityURN).Scan(&stateCount); err != nil || stateCount != 1 {
+		t.Fatalf("twin_states count = %d", stateCount)
+	}
+	parentGatewayURN := "urn:ngsi-ld:Gateway:" + gwID
+	if err := setup.QueryRow(ctx, `SELECT count(*) FROM twin_relationships r
+		JOIN twin_entities p ON p.id=r.source_entity_id
+		JOIN twin_entities c ON c.id=r.target_entity_id
+		WHERE p.entity_id=$1 AND c.entity_id=$2 AND r.relationship_type='hasSensor'`, parentGatewayURN, sensorEntityURN).Scan(&relCount); err != nil || relCount != 1 {
+		t.Fatalf("hasSensor relationship count = %d", relCount)
+	}
+
+	// Advance twin state to verify retry does NOT reset state
+	var entityUUID uuid.UUID
+	if err := setup.QueryRow(ctx, "SELECT id FROM twin_entities WHERE entity_id=$1", sensorEntityURN).Scan(&entityUUID); err != nil {
+		t.Fatal(err)
+	}
+	exec("UPDATE twin_states SET reported_version=42, reported_state='{\"temp\":25.5}'::jsonb WHERE entity_id=$1", entityUUID)
+	exec(`UPDATE twin_states SET desired_state='{"sampling_interval_seconds":7,"enabled":false}'::jsonb,
+	 desired_version=23, last_desired_by=$2, last_reported_at='2026-09-01T01:02:03Z',
+	 last_desired_at='2026-09-02T02:03:04Z', updated_at='2026-09-03T03:04:05Z' WHERE entity_id=$1`, entityUUID, owner)
+	exec(`UPDATE twin_entities SET attributes='{"fixture":"preserve","nested":{"n":9}}'::jsonb,
+	 created_at='2026-08-01T01:02:03Z', updated_at='2026-08-02T02:03:04Z' WHERE id=$1`, entityUUID)
+	exec("UPDATE twin_relationships SET created_at='2026-08-03T03:04:05Z' WHERE target_entity_id=$1", entityUUID)
+	advancedGraph := snapshotOwnerGraph(t, ctx, setup)
+
+	// 3. Identical retry: returns 200 (created=false), preserves timestamps, IDs, and does NOT reset advanced twin state
+	retried, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, sensorInput)
+	if err != nil || retried.Created {
+		t.Fatalf("owner retry failed: res=%+v err=%v", retried, err)
+	}
+	if retried.CreatedAt == nil || !retried.CreatedAt.Equal(*created.CreatedAt) {
+		t.Fatalf("retry createdAt mismatch: got %v, want %v", retried.CreatedAt, created.CreatedAt)
+	}
+	if retried.GatewayID != created.GatewayID || retried.SensorID != created.SensorID || retried.EntityID != created.EntityID {
+		t.Fatalf("retry returned identity changed: %+v -> %+v", created, retried)
+	}
+	assertOwnerGraphEqual(t, advancedGraph, snapshotOwnerGraph(t, ctx, setup))
+	t.Log("owner identical retry preserved full four-table snapshot: reported+desired JSON, versions, actor, all timestamps, Sensor metadata, internal/public identities and exact hasSensor endpoints")
+	var repVer int64
+	var repState string
+	if err := setup.QueryRow(ctx, "SELECT reported_version, reported_state::text FROM twin_states WHERE entity_id=$1", entityUUID).Scan(&repVer, &repState); err != nil || repVer != 42 || !strings.Contains(repState, "25.5") {
+		t.Fatalf("retry reset advanced twin state: ver=%d state=%s", repVer, repState)
+	}
+
+	// 4. Same ID with different metadata -> ErrProvisioningConflict (409)
+	diffInput := sensorInput
+	diffInput.Name = "Different Name"
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, diffInput); !errors.Is(err, ErrProvisioningConflict) {
+		t.Fatalf("expected ErrProvisioningConflict on name change, got %v", err)
+	}
+	assertOwnerGraphEqual(t, advancedGraph, snapshotOwnerGraph(t, ctx, setup))
+	t.Log("owner name conflict preserved full four-table snapshot")
+	diffUnitInput := sensorInput
+	diffUnitInput.Unit = func(s string) *string { return &s }("Kelvin")
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, diffUnitInput); !errors.Is(err, ErrProvisioningConflict) {
+		t.Fatalf("expected ErrProvisioningConflict on unit change, got %v", err)
+	}
+	assertOwnerGraphEqual(t, advancedGraph, snapshotOwnerGraph(t, ctx, setup))
+	t.Log("owner unit conflict preserved full four-table snapshot")
+
+	// 5. Inconsistent parent / orphan twin -> ErrProvisioningInconsistent (no auto-heal)
+	orphanSensorID := "orphan_s"
+	orphanURN := "urn:ngsi-ld:Sensor:" + gwID + ":" + orphanSensorID
+	exec("INSERT INTO twin_entities(entity_id, entity_type, name, gateway_id) VALUES ($1, 'Sensor', 'Orphan', $2)", orphanURN, gwID)
+	orphanBaseline := snapshotOwnerGraph(t, ctx, setup)
+	orphanInput := sensorInput
+	orphanInput.SensorID = orphanSensorID
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, orphanInput); !errors.Is(err, ErrProvisioningInconsistent) {
+		t.Fatalf("expected ErrProvisioningInconsistent for orphan twin, got %v", err)
+	}
+	assertOwnerGraphEqual(t, orphanBaseline, snapshotOwnerGraph(t, ctx, setup))
+
+	// 6. Deleted profile -> ErrProvisioningNotFound
+	deletedOwnerID := uuid.New()
+	exec("INSERT INTO profiles(id) VALUES ($1)", deletedOwnerID)
+	exec("INSERT INTO user_gateways(user_id, gateway_id, role) VALUES ($1, $2, 'owner')", deletedOwnerID, gwID)
+	exec("DELETE FROM profiles WHERE id=$1", deletedOwnerID) // Cascades user_gateways
+	deletedProfileBaseline := snapshotOwnerGraph(t, ctx, setup)
+	if _, err := ownerRepo.ProvisionSensorForOwner(ctx, deletedOwnerID, ProvisionSensorInput{GatewayID: gwID, SensorID: "deleted_s", Name: "temp"}); !errors.Is(err, ErrProvisioningNotFound) {
+		t.Fatalf("deleted profile expected ErrProvisioningNotFound, got %v", err)
+	}
+	assertOwnerGraphEqual(t, deletedProfileBaseline, snapshotOwnerGraph(t, ctx, setup))
+
+	// 7. Concurrent same-payload (exactly one create, one retry) and different-metadata (exactly one create, one conflict)
+	t.Run("concurrent same-payload exactly one create one retry", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		var wg sync.WaitGroup
+		defer cleanupOwnerWorkers(t, cancel, func() {}, &wg)
+		before := snapshotOwnerGraph(t, ctx, setup)
+		concurrentSameID := "conc_same_s"
+		sameIn := sensorInput
+		sameIn.SensorID = concurrentSameID
+		sameIn.Name = "Concurrent Same"
+		type resType struct {
+			res ProvisionSensorResult
+			err error
+		}
+		chRes := make(chan resType, 2)
+		startCh := make(chan struct{})
+		for range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startCh
+				r, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, sameIn)
+				chRes <- resType{res: r, err: err}
+			}()
+		}
+		close(startCh)
+		createdCount := 0
+		retriedCount := 0
+		var firstCreatedAt time.Time
+		var winner, retry ProvisionSensorResult
+		for range 2 {
+			var out resType
+			select {
+			case out = <-chRes:
+			case <-ctx.Done():
+				t.Fatal("concurrent owner completion deadline")
+			}
+			if out.err != nil {
+				t.Fatalf("concurrent same payload failed: %v", out.err)
+			}
+			if out.res.Created {
+				winner = out.res
+				createdCount++
+				firstCreatedAt = *out.res.CreatedAt
+			} else {
+				retry = out.res
+				retriedCount++
+			}
+		}
+		if createdCount != 1 || retriedCount != 1 {
+			t.Fatalf("expected exactly 1 create and 1 retry, got created=%d retried=%d", createdCount, retriedCount)
+		}
+		if retry.CreatedAt == nil || winner.CreatedAt == nil || !retry.CreatedAt.Equal(*winner.CreatedAt) || retry.EntityID != winner.EntityID || retry.GatewayID != winner.GatewayID || retry.SensorID != winner.SensorID || retry.Name != winner.Name || !reflect.DeepEqual(retry.Unit, winner.Unit) {
+			t.Fatal("concurrent retry representation differs from winner")
+		}
+		assertPersistedOwnerWinner(t, before, snapshotOwnerGraph(t, ctx, setup), winner)
+		var countSame int
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM sensors WHERE gateway_id=$1 AND sensor_id=$2", gwID, concurrentSameID).Scan(&countSame); err != nil || countSame != 1 {
+			t.Fatalf("concurrent same created %d rows", countSame)
+		}
+		var dbCreatedAt time.Time
+		if err := setup.QueryRow(ctx, "SELECT created_at FROM sensors WHERE gateway_id=$1 AND sensor_id=$2", gwID, concurrentSameID).Scan(&dbCreatedAt); err != nil || !dbCreatedAt.Equal(firstCreatedAt) {
+			t.Fatalf("stable created_at mismatch: db=%v first=%v", dbCreatedAt, firstCreatedAt)
+		}
+	})
+
+	t.Run("concurrent different-metadata exactly one create one conflict", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		var wg sync.WaitGroup
+		defer cleanupOwnerWorkers(t, cancel, func() {}, &wg)
+		before := snapshotOwnerGraph(t, ctx, setup)
+		concurrentDiffID := "conc_diff_s"
+		diffInA := sensorInput
+		diffInA.SensorID = concurrentDiffID
+		diffInA.Name = "Payload A"
+		diffInB := sensorInput
+		diffInB.SensorID = concurrentDiffID
+		diffInB.Name = "Payload B"
+
+		type resType struct {
+			res ProvisionSensorResult
+			err error
+		}
+		chRes := make(chan resType, 2)
+		startCh := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-startCh
+			r, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, diffInA)
+			chRes <- resType{res: r, err: err}
+		}()
+		go func() {
+			defer wg.Done()
+			<-startCh
+			r, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, diffInB)
+			chRes <- resType{res: r, err: err}
+		}()
+		close(startCh)
+
+		createdCount := 0
+		conflictCount := 0
+		var winner ProvisionSensorResult
+		for range 2 {
+			var out resType
+			select {
+			case out = <-chRes:
+			case <-ctx.Done():
+				t.Fatal("concurrent owner completion deadline")
+			}
+			if out.err == nil && out.res.Created {
+				winner = out.res
+				createdCount++
+			} else if errors.Is(out.err, ErrProvisioningConflict) {
+				conflictCount++
+			} else {
+				t.Fatalf("unexpected concurrent outcome: %+v %v", out.res, out.err)
+			}
+		}
+		if createdCount != 1 || conflictCount != 1 {
+			t.Fatalf("expected exactly 1 create and 1 conflict, got created=%d conflict=%d", createdCount, conflictCount)
+		}
+		assertPersistedOwnerWinner(t, before, snapshotOwnerGraph(t, ctx, setup), winner)
+	})
+
+	// RDB-01: exercise the actual owner entrypoint in both serial orders.
+	for _, firstAdmin := range []bool{false, true} {
+		for _, different := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mixed admin owner admin-first=%t different=%t", firstAdmin, different), func(t *testing.T) {
+				c, cancel := context.WithTimeout(ctx, 8*time.Second)
+				reached, started := make(chan uint32, 1), make(chan uint32, 1)
+				releaseCh := make(chan struct{})
+				var once sync.Once
+				release := func() { once.Do(func() { close(releaseCh) }) }
+				var wg sync.WaitGroup
+				defer cleanupOwnerWorkers(t, cancel, release, &wg)
+				before := snapshotOwnerGraph(t, c, setup)
+				firstDB := barrierSensorDatabase{ProvisioningDatabase: app, onParentAcquired: func(c context.Context, pid uint32) error {
+					reached <- pid
+					select {
+					case <-releaseCh:
+						return nil
+					case <-c.Done():
+						return c.Err()
+					}
+				}}
+				secondDB := barrierSensorDatabase{ProvisioningDatabase: app, onBegin: func(pid uint32) { started <- pid }}
+				firstRepo, err := NewPostgresProvisioningRepository(firstDB)
+				if err != nil {
+					t.Fatal(err)
+				}
+				secondRepo, err := NewPostgresProvisioningRepository(secondDB)
+				if err != nil {
+					t.Fatal(err)
+				}
+				firstOwnerRepo, err := NewPostgresOwnerSensorProvisioningRepository(firstDB)
+				if err != nil {
+					t.Fatal(err)
+				}
+				secondOwnerRepo, err := NewPostgresOwnerSensorProvisioningRepository(secondDB)
+				if err != nil {
+					t.Fatal(err)
+				}
+				input := sensorInput
+				input.SensorID = fmt.Sprintf("mixed_%t_%t", firstAdmin, different)
+				otherInput := input
+				if different {
+					otherInput.Name = "Mixed loser metadata"
+				}
+				var winner, second ProvisionSensorResult
+				firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					var e error
+					if firstAdmin {
+						winner, e = firstRepo.ProvisionSensor(c, admin, input)
+					} else {
+						winner, e = firstOwnerRepo.ProvisionSensorForOwner(c, owner, input)
+					}
+					firstDone <- e
+				}()
+				blocker := awaitProvisioningPID(t, c, reached)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					var e error
+					if firstAdmin {
+						second, e = secondOwnerRepo.ProvisionSensorForOwner(c, owner, otherInput)
+					} else {
+						second, e = secondRepo.ProvisionSensor(c, admin, otherInput)
+					}
+					secondDone <- e
+				}()
+				waiter := awaitProvisioningPID(t, c, started)
+				assertProvisioningLockWait(t, c, setup, waiter, blocker, "SELECT name FROM public.gateways WHERE gateway_id=$1 FOR UPDATE", secondDone)
+				release()
+				if err := awaitProvisioningWorker(t, c, firstDone); err != nil {
+					t.Fatal(err)
+				}
+				err = awaitProvisioningWorker(t, c, secondDone)
+				if different {
+					if !errors.Is(err, ErrProvisioningConflict) {
+						t.Fatalf("mixed conflict: %v", err)
+					}
+				} else if err != nil || second.Created || second.EntityID != winner.EntityID || second.CreatedAt == nil || !second.CreatedAt.Equal(*winner.CreatedAt) {
+					t.Fatalf("mixed retry: %+v %v", second, err)
+				}
+				assertPersistedOwnerWinner(t, before, snapshotOwnerGraph(t, c, setup), winner)
+			})
+		}
+	}
+	t.Run("absent membership grant after lookup does not authorize in flight", func(t *testing.T) {
+		actor := uuid.New()
+		exec("INSERT INTO profiles(id) VALUES ($1)", actor)
+		defer exec("DELETE FROM profiles WHERE id=$1", actor)
+		c, cancel := context.WithTimeout(ctx, 8*time.Second)
+		reached := make(chan uint32, 1)
+		releaseCh := make(chan struct{})
+		var once sync.Once
+		release := func() { once.Do(func() { close(releaseCh) }) }
+		var wg sync.WaitGroup
+		defer cleanupOwnerWorkers(t, cancel, release, &wg)
+		db := barrierSensorDatabase{ProvisioningDatabase: app, onMembershipAbsent: func(c context.Context, pid uint32) error {
+			reached <- pid
+			select {
+			case <-releaseCh:
+				return nil
+			case <-c.Done():
+				return c.Err()
+			}
+		}}
+		repo, err := NewPostgresOwnerSensorProvisioningRepository(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := sensorInput
+		input.SensorID = "absent_grant_s"
+		before := snapshotOwnerGraph(t, c, setup)
+		done := make(chan error, 1)
+		wg.Add(1)
+		go func() { defer wg.Done(); _, e := repo.ProvisionSensorForOwner(c, actor, input); done <- e }()
+		pid := awaitProvisioningPID(t, c, reached)
+		// Scan returned ErrNoRows: no nonexistent membership-row lock is claimed.
+		// The INSERT's FK parent check instead waits on the held Gateway lock.
+		const grantSQL = "INSERT INTO user_gateways(user_id,gateway_id,role) VALUES ($1,$2,'owner')"
+		conn, err := setup.Acquire(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		grantPID := conn.Conn().PgConn().PID()
+		grantDone := make(chan error, 1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer conn.Release()
+			_, e := conn.Exec(c, grantSQL, actor, gwID)
+			grantDone <- e
+		}()
+		assertProvisioningLockWait(t, c, setup, grantPID, pid, grantSQL, grantDone)
+		release()
+		if err := awaitProvisioningWorker(t, c, done); !errors.Is(err, ErrProvisioningNotFound) {
+			t.Fatalf("in-flight absent membership: %v", err)
+		}
+		if err := awaitProvisioningWorker(t, c, grantDone); err != nil {
+			t.Fatal(err)
+		}
+		assertOwnerGraphEqual(t, before, snapshotOwnerGraph(t, c, setup))
+		winner, err := ownerRepo.ProvisionSensorForOwner(c, actor, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPersistedOwnerWinner(t, before, snapshotOwnerGraph(t, c, setup), winner)
+		t.Logf("exact owner pid=%d observed ErrNoRows before committed grant; denied unchanged; fresh request created", pid)
+	})
+
+	for _, mutation := range []struct {
+		name, sql string
+		denied    error
+	}{
+		{"UPDATE", "UPDATE user_gateways SET role='viewer' WHERE user_id=$1 AND gateway_id=$2", ErrProvisioningForbidden},
+		{"DELETE", "DELETE FROM user_gateways WHERE user_id=$1 AND gateway_id=$2", ErrProvisioningNotFound},
+		{"PROFILE_DELETE", "DELETE FROM profiles WHERE id=$1 AND $2::text IS NOT NULL", ErrProvisioningNotFound},
+	} {
+		for _, authFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("lock ordering %s auth-first=%t", mutation.name, authFirst), func(t *testing.T) {
+				actor := owner
+				if mutation.name == "PROFILE_DELETE" {
+					actor = uuid.New()
+					exec("INSERT INTO profiles(id) VALUES ($1)", actor)
+					defer exec("DELETE FROM profiles WHERE id=$1", actor)
+					exec("INSERT INTO user_gateways(user_id,gateway_id,role) VALUES ($1,$2,'owner')", actor, gwID)
+				}
+				exec("INSERT INTO user_gateways(user_id,gateway_id,role) VALUES ($1,$2,'owner') ON CONFLICT (user_id,gateway_id) DO UPDATE SET role='owner'", owner, gwID)
+				defer exec("INSERT INTO user_gateways(user_id,gateway_id,role) VALUES ($1,$2,'owner') ON CONFLICT (user_id,gateway_id) DO UPDATE SET role='owner'", owner, gwID)
+				runCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+				releaseCh := make(chan struct{})
+				var once sync.Once
+				release := func() { once.Do(func() { close(releaseCh) }) }
+				var workers sync.WaitGroup
+				var lockTx pgx.Tx
+				// Registered before starting any worker: Fatal/timeout releases all locks,
+				// cancels SQL and the barrier, and joins before fixture pools close.
+				defer func() {
+					cancel()
+					release()
+					if lockTx != nil {
+						rollbackProvisioning(lockTx)
+					}
+					joined := make(chan struct{})
+					go func() { workers.Wait(); close(joined) }()
+					select {
+					case <-joined:
+					case <-time.After(5 * time.Second):
+						t.Error("lock workers failed to join after cancellation")
+					}
+				}()
+				started := make(chan uint32, 1)
+				acquired := make(chan uint32, 1)
+				db := barrierSensorDatabase{ProvisioningDatabase: app,
+					onBegin: func(pid uint32) { started <- pid },
+					onMembershipAcquired: func(c context.Context, pid uint32) error {
+						if !authFirst {
+							return nil
+						}
+						acquired <- pid
+						select {
+						case <-releaseCh:
+							return nil
+						case <-c.Done():
+							return c.Err()
+						}
+					},
+				}
+				repo, err := NewPostgresOwnerSensorProvisioningRepository(db)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !authFirst {
+					lockTx, err = setup.Begin(runCtx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err = lockTx.Exec(runCtx, "SELECT name FROM gateways WHERE gateway_id=$1 FOR UPDATE", gwID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				input := sensorInput
+				input.SensorID = fmt.Sprintf("lock_%s_%t", mutation.name, authFirst)
+				snapshotBeforeProvision := snapshotOwnerGraph(t, runCtx, setup)
+				var winner ProvisionSensorResult // Read only after provDone synchronizes worker completion.
+				provDone := make(chan error, 1)
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					var e error
+					winner, e = repo.ProvisionSensorForOwner(runCtx, actor, input)
+					provDone <- e
+				}()
+				ownerPID := awaitProvisioningPID(t, runCtx, started)
+				if !authFirst {
+					assertProvisioningLockWait(t, runCtx, setup, ownerPID, lockTx.Conn().PgConn().PID(), "SELECT name FROM public.gateways WHERE gateway_id=$1 FOR UPDATE", provDone)
+					beforeMutation := snapshotOwnerGraph(t, runCtx, setup)
+					if _, err := setup.Exec(runCtx, mutation.sql, actor, gwID); err != nil {
+						t.Fatal(err)
+					}
+					// profiles/user_gateways cascade is intended; graph tables have no
+					// disposable actor references and must remain exactly unchanged.
+					deniedBaseline := snapshotOwnerGraph(t, runCtx, setup)
+					assertOwnerGraphEqual(t, beforeMutation, deniedBaseline)
+					if mutation.name == "PROFILE_DELETE" {
+						assertDeletedOwnerProfile(t, runCtx, setup, actor)
+					}
+					if err := lockTx.Rollback(runCtx); err != nil {
+						t.Fatal(err)
+					}
+					if err := awaitProvisioningWorker(t, runCtx, provDone); !errors.Is(err, mutation.denied) {
+						t.Fatalf("denial after committed %s: %v", mutation.name, err)
+					}
+					assertOwnerGraphEqual(t, deniedBaseline, snapshotOwnerGraph(t, runCtx, setup))
+					t.Logf("%s revoke-first denial: full four-table graph unchanged across intended authority mutation and denied owner call", mutation.name)
+					var count int
+					if err := setup.QueryRow(runCtx, "SELECT count(*) FROM sensors WHERE gateway_id=$1 AND sensor_id=$2", gwID, input.SensorID).Scan(&count); err != nil || count != 0 {
+						t.Fatalf("denied sensor count=%d error=%v", count, err)
+					}
+					return
+				}
+				if pid := awaitProvisioningPID(t, runCtx, acquired); pid != ownerPID {
+					t.Fatal("membership barrier changed backend")
+				}
+				idle, err := observeProvisioningLock(runCtx, setup, ownerPID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if idle.waitEvent != "ClientRead" || idle.matches(ownerPID, idle.query) {
+					t.Fatalf("idle negative witness: %+v", idle)
+				}
+				t.Logf("native negative idle witness pid=%d state=%s type=%s event=%s rejected", ownerPID, idle.state, idle.waitType, idle.waitEvent)
+				conn, err := setup.Acquire(runCtx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Worker owns/relinquishes this exact competing connection.
+				mutationPID := conn.Conn().PgConn().PID()
+				mutationDone := make(chan error, 1)
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					defer conn.Release()
+					_, e := conn.Exec(runCtx, mutation.sql, actor, gwID)
+					mutationDone <- e
+				}()
+				assertProvisioningLockWait(t, runCtx, setup, mutationPID, ownerPID, mutation.sql, mutationDone)
+				unrelated, err := observeProvisioningLock(runCtx, setup, mutationPID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if unrelated.matches(mutationPID, mutation.sql) {
+					t.Fatal("unrelated blocker accepted")
+				}
+				t.Logf("native negative unrelated lock witness waiter=%d actual_blockers=%v expected_wrong_blocker=%d rejected", mutationPID, unrelated.blockers, mutationPID)
+				release()
+				if err := awaitProvisioningWorker(t, runCtx, provDone); err != nil {
+					t.Fatal(err)
+				}
+				if err := awaitProvisioningWorker(t, runCtx, mutationDone); err != nil {
+					t.Fatal(err)
+				}
+				assertPersistedOwnerWinner(t, snapshotBeforeProvision, snapshotOwnerGraph(t, runCtx, setup), winner)
+				if mutation.name == "PROFILE_DELETE" {
+					assertDeletedOwnerProfile(t, runCtx, setup, actor)
+					var complete bool
+					if err := setup.QueryRow(runCtx, `SELECT EXISTS (
+					 SELECT 1 FROM sensors s JOIN twin_entities e ON e.entity_id=$3 AND e.gateway_id=s.gateway_id AND e.entity_type='Sensor'
+					 JOIN twin_states st ON st.entity_id=e.id
+					 JOIN twin_relationships r ON r.target_entity_id=e.id AND r.relationship_type='hasSensor'
+					 JOIN twin_entities p ON p.id=r.source_entity_id AND p.entity_id=$4 AND p.gateway_id=s.gateway_id
+					 WHERE s.gateway_id=$1 AND s.sensor_id=$2 AND s.name=$5 AND s.unit IS NOT DISTINCT FROM $6
+					 AND e.name=$5)`, gwID, input.SensorID, "urn:ngsi-ld:Sensor:"+gwID+":"+input.SensorID, parentGatewayURN, input.Name, input.Unit).Scan(&complete); err != nil || !complete {
+						t.Fatalf("profile auth-first complete committed graph=%t error=%v", complete, err)
+					}
+					t.Log("profile auth-first: complete committed Sensor/entity/state/exact parent-hasSensor graph survives intended profile/membership cascade")
+				}
+				postMutationGraph := snapshotOwnerGraph(t, runCtx, setup)
+				if _, err := ownerRepo.ProvisionSensorForOwner(runCtx, actor, ProvisionSensorInput{GatewayID: gwID, SensorID: "after_lock_s", Name: "temp"}); !errors.Is(err, mutation.denied) {
+					t.Fatalf("subsequent denial: %v", err)
+				}
+				assertOwnerGraphEqual(t, postMutationGraph, snapshotOwnerGraph(t, runCtx, setup))
+			})
+		}
+	}
+	t.Run("lock barrier cancellation rolls back and joins", func(t *testing.T) {
+		runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		reached := make(chan uint32, 1)
+		db := barrierSensorDatabase{ProvisioningDatabase: app, onMembershipAcquired: func(c context.Context, pid uint32) error {
+			reached <- pid
+			<-c.Done()
+			return c.Err()
+		}}
+		repo, err := NewPostgresOwnerSensorProvisioningRepository(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		joined := make(chan struct{})
+		defer func() {
+			cancel()
+			select {
+			case <-joined:
+			case <-time.After(5 * time.Second):
+				t.Error("cancelled barrier worker failed to join")
+			}
+		}()
+		input := sensorInput
+		input.SensorID = "cancelled_barrier_s"
+		go func() {
+			defer close(joined)
+			_, err := repo.ProvisionSensorForOwner(runCtx, owner, input)
+			done <- err
+		}()
+		pid := awaitProvisioningPID(t, runCtx, reached)
+		cancel()
+		cleanupCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		defer stop()
+		if err := awaitProvisioningWorker(t, cleanupCtx, done); !errors.Is(err, context.Canceled) {
+			t.Fatalf("barrier cancellation: %v", err)
+		}
+		// A fresh mutation must finish after rollback; no leaked membership lock.
+		if _, err := setup.Exec(cleanupCtx, "UPDATE user_gateways SET role='owner' WHERE user_id=$1 AND gateway_id=$2", owner, gwID); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("cancelled real owner barrier pid=%d returned, rolled back and joined; fresh membership UPDATE completed", pid)
+	})
+
+	// 9. Actual owner-path fault rollback and parent-corruption assertions
+	t.Run("owner-path fault rollback and parent corruption", func(t *testing.T) {
+		faultSensorID := "fault_rollback_s"
+		faultInput := sensorInput
+		faultInput.SensorID = faultSensorID
+
+		// Injected fault trigger on twin_relationships
+		exec(`CREATE FUNCTION test_owner_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owner-path injected relationship fault'; END $$`)
+		exec("CREATE TRIGGER test_owner_fault BEFORE INSERT ON twin_relationships FOR EACH ROW EXECUTE FUNCTION test_owner_fault()")
+		defer exec("DROP FUNCTION test_owner_fault() CASCADE")
+		faultBaseline := snapshotOwnerGraph(t, ctx, setup)
+
+		_, err := ownerRepo.ProvisionSensorForOwner(ctx, owner, faultInput)
+		if err == nil {
+			t.Fatal("expected failure on injected trigger, got success")
+		}
+		assertOwnerGraphEqual(t, faultBaseline, snapshotOwnerGraph(t, ctx, setup))
+
+		// Verify complete rollback: zero rows in sensors, twin_entities, twin_states, twin_relationships
+		var sCnt, eCnt, stCnt, rCnt int
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM sensors WHERE gateway_id=$1 AND sensor_id=$2", gwID, faultSensorID).Scan(&sCnt); err != nil || sCnt != 0 {
+			t.Fatalf("sensor table was not rolled back: %d", sCnt)
+		}
+		faultURN := "urn:ngsi-ld:Sensor:" + gwID + ":" + faultSensorID
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_entities WHERE entity_id=$1", faultURN).Scan(&eCnt); err != nil || eCnt != 0 {
+			t.Fatalf("twin_entities was not rolled back: %d", eCnt)
+		}
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=$1", faultURN).Scan(&stCnt); err != nil || stCnt != 0 {
+			t.Fatalf("twin_states was not rolled back: %d", stCnt)
+		}
+		if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_relationships r JOIN twin_entities e ON e.id=r.target_entity_id WHERE e.entity_id=$1", faultURN).Scan(&rCnt); err != nil || rCnt != 0 {
+			t.Fatalf("twin_relationships was not rolled back: %d", rCnt)
+		}
+
+		// Parent gateway twin corruption: duplicate parent gateway twin entities
+		dupParentURN := "urn:ngsi-ld:Gateway:" + gwID + "_dup"
+		exec("INSERT INTO twin_entities(entity_id, entity_type, name, gateway_id) VALUES ($1, 'Gateway', 'Corrupted Gateway', $2)", dupParentURN, gwID)
+		defer exec("DELETE FROM twin_entities WHERE entity_id=$1", dupParentURN)
+		corruptBaseline := snapshotOwnerGraph(t, ctx, setup)
+
+		_, err = ownerRepo.ProvisionSensorForOwner(ctx, owner, ProvisionSensorInput{GatewayID: gwID, SensorID: "corrupted_parent_s", Name: "temp"})
+		if !errors.Is(err, ErrProvisioningInconsistent) {
+			t.Fatalf("expected ErrProvisioningInconsistent on corrupted parent gateway twin, got %v", err)
+		}
+		assertOwnerGraphEqual(t, corruptBaseline, snapshotOwnerGraph(t, ctx, setup))
+	})
+}
+
+// Whole-table snapshots are safe only in this owned, serial isolated fixture.
+// One statement/snapshot captures every column (including nullable actor,
+// identities, timestamps and exact relationship endpoints), not joined counts
+// which could hide an orphan. Canonical JSONB ordering makes equality exact.
+type ownerGraphSnapshot [4]string
+
+func cleanupOwnerWorkers(t *testing.T, cancel context.CancelFunc, release func(), wg *sync.WaitGroup) {
+	t.Helper()
+	cancel()
+	release()
+	joined := make(chan struct{})
+	go func() { wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Error("owner evidence workers failed bounded join")
+	}
+}
+
+// Validate exactly one complete new graph and byte-semantic preservation of
+// every pre-existing row. Missing/orphan/extra rows cannot hide in an inner join.
+func comparePersistedOwnerWinner(before, after ownerGraphSnapshot, winner ProvisionSensorResult) error {
+	if !winner.Created || winner.CreatedAt == nil || winner.EntityID != "urn:ngsi-ld:Sensor:"+winner.GatewayID+":"+winner.SensorID {
+		return errors.New("invalid winner representation")
+	}
+	var added [4]map[string]any
+	for table := range before {
+		var oldRows, newRows []map[string]any
+		if err := json.Unmarshal([]byte(before[table]), &oldRows); err != nil {
+			return err
+		}
+		if err := json.Unmarshal([]byte(after[table]), &newRows); err != nil {
+			return err
+		}
+		remaining := append([]map[string]any(nil), newRows...)
+		for _, old := range oldRows {
+			found := -1
+			for i, row := range remaining {
+				if reflect.DeepEqual(old, row) {
+					found = i
+					break
+				}
+			}
+			if found < 0 {
+				return fmt.Errorf("existing graph row changed in table %d", table)
+			}
+			remaining = append(remaining[:found], remaining[found+1:]...)
+		}
+		if len(remaining) != 1 {
+			return fmt.Errorf("expected one added graph row in table %d, got %d", table, len(remaining))
+		}
+		added[table] = remaining[0]
+	}
+	s, e, st, r := added[0], added[1], added[2], added[3]
+	var unit any
+	if winner.Unit != nil {
+		unit = *winner.Unit
+	}
+	stamp, err := time.Parse(time.RFC3339Nano, fmt.Sprint(s["created_at"]))
+	if err != nil || !stamp.Equal(*winner.CreatedAt) || s["gateway_id"] != winner.GatewayID || s["sensor_id"] != winner.SensorID || s["name"] != winner.Name || s["unit"] != unit {
+		return errors.New("persisted Sensor does not match actual winner")
+	}
+	if e["entity_id"] != winner.EntityID || e["entity_type"] != "Sensor" || e["gateway_id"] != winner.GatewayID || e["name"] != winner.Name || st["entity_id"] != e["id"] || r["target_entity_id"] != e["id"] || r["relationship_type"] != "hasSensor" {
+		return errors.New("winner entity/state/relationship identities mismatch")
+	}
+	if st["reported_version"] != float64(0) || st["desired_version"] != float64(0) || !reflect.DeepEqual(st["reported_state"], map[string]any{}) || !reflect.DeepEqual(st["desired_state"], map[string]any{}) {
+		return errors.New("unexpected new winner state")
+	}
+	var entities []map[string]any
+	if err := json.Unmarshal([]byte(before[1]), &entities); err != nil {
+		return err
+	}
+	for _, parent := range entities {
+		if parent["entity_id"] == "urn:ngsi-ld:Gateway:"+winner.GatewayID && parent["entity_type"] == "Gateway" && parent["id"] == r["source_entity_id"] {
+			return nil
+		}
+	}
+	return errors.New("hasSensor source is not exact parent")
+}
+
+func assertPersistedOwnerWinner(t *testing.T, before, after ownerGraphSnapshot, winner ProvisionSensorResult) {
+	t.Helper()
+	if err := comparePersistedOwnerWinner(before, after, winner); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("full four-table winner graph and unchanged existing rows: %s/%s name=%q entity=%s", winner.GatewayID, winner.SensorID, winner.Name, winner.EntityID)
+}
+
+func TestPersistedOwnerWinnerCounterexamples(t *testing.T) {
+	stamp := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	winner := ProvisionSensorResult{Created: true, GatewayID: "fixture", SensorID: "s", Name: "winner", EntityID: "urn:ngsi-ld:Sensor:fixture:s", CreatedAt: &stamp}
+	before := ownerGraphSnapshot{"[]", `[{"id":"parent","entity_id":"urn:ngsi-ld:Gateway:fixture","entity_type":"Gateway"}]`, "[]", "[]"}
+	after := ownerGraphSnapshot{
+		`[{"gateway_id":"fixture","sensor_id":"s","name":"winner","unit":null,"created_at":"2026-09-01T00:00:00Z"}]`,
+		`[{"id":"parent","entity_id":"urn:ngsi-ld:Gateway:fixture","entity_type":"Gateway"},{"id":"child","entity_id":"urn:ngsi-ld:Sensor:fixture:s","entity_type":"Sensor","gateway_id":"fixture","name":"winner"}]`,
+		`[{"entity_id":"child","reported_version":0,"desired_version":0,"reported_state":{},"desired_state":{}}]`,
+		`[{"source_entity_id":"parent","target_entity_id":"child","relationship_type":"hasSensor"}]`,
+	}
+	if err := comparePersistedOwnerWinner(before, after, winner); err != nil {
+		t.Fatal(err)
+	}
+	for table := range after {
+		partial := after
+		partial[table] = before[table]
+		if err := comparePersistedOwnerWinner(before, partial, winner); err == nil {
+			t.Fatalf("partial graph table%d accepted", table)
+		}
+	}
+	wrong := winner
+	wrong.Name = "loser"
+	if err := comparePersistedOwnerWinner(before, after, wrong); err == nil {
+		t.Fatal("wrong winner accepted")
+	}
+	for _, replacement := range []struct {
+		table    int
+		old, new string
+	}{
+		{3, `"source_entity_id":"parent"`, `"source_entity_id":"other"`},
+		{2, `"desired_version":0`, `"desired_version":9`},
+		{1, `"id":"parent"`, `"id":"changed-parent"`},
+	} {
+		changed := after
+		changed[replacement.table] = strings.ReplaceAll(changed[replacement.table], replacement.old, replacement.new)
+		if err := comparePersistedOwnerWinner(before, changed, winner); err == nil {
+			t.Fatal("endpoint/state/existing row mutation accepted")
+		}
+	}
+}
+
+//nolint:revive // Match the existing test-helper convention: testing.T first.
+func assertDeletedOwnerProfile(t *testing.T, ctx context.Context, pool *pgxpool.Pool, actor uuid.UUID) {
+	t.Helper()
+	var profiles, memberships int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM profiles WHERE id=$1),
+	 (SELECT count(*) FROM user_gateways WHERE user_id=$1)`, actor).Scan(&profiles, &memberships); err != nil || profiles != 0 || memberships != 0 {
+		t.Fatalf("profile cascade incomplete: profiles=%d memberships=%d err=%v", profiles, memberships, err)
+	}
+}
+
+//nolint:revive // Match the existing test-helper convention: testing.T first.
+func snapshotOwnerGraph(t *testing.T, ctx context.Context, pool *pgxpool.Pool) ownerGraphSnapshot {
+	t.Helper()
+	var s ownerGraphSnapshot
+	err := pool.QueryRow(ctx, `SELECT
+	 (SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY gateway_id,sensor_id),'[]'::jsonb)::text FROM sensors s),
+	 (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY id),'[]'::jsonb)::text FROM twin_entities e),
+	 (SELECT COALESCE(jsonb_agg(to_jsonb(st) ORDER BY entity_id),'[]'::jsonb)::text FROM twin_states st),
+	 (SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY source_entity_id,relationship_type,target_entity_id),'[]'::jsonb)::text FROM twin_relationships r)`).Scan(&s[0], &s[1], &s[2], &s[3])
+	if err != nil {
+		t.Fatalf("full owner graph snapshot: %v", err)
+	}
+	return s
+}
+
+func compareOwnerGraph(before, after ownerGraphSnapshot) error {
+	for i, table := range []string{"sensors", "twin_entities", "twin_states", "twin_relationships"} {
+		if before[i] != after[i] {
+			return fmt.Errorf("persisted owner graph changed: %s", table)
+		}
+	}
+	return nil
+}
+
+func assertOwnerGraphEqual(t *testing.T, before, after ownerGraphSnapshot) {
+	t.Helper()
+	if err := compareOwnerGraph(before, after); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOwnerGraphSnapshotCounterexamples(t *testing.T) {
+	baseline := ownerGraphSnapshot{
+		`[{"gateway_id":"fixture","sensor_id":"s","name":"Temperature","unit":"C","created_at":"time1"}]`,
+		`[{"id":"internal","entity_id":"urn:ngsi-ld:Sensor:fixture:s","entity_type":"Sensor","gateway_id":"fixture","name":"Temperature","attributes":{"n":9},"created_at":"time2","updated_at":"time3"}]`,
+		`[{"entity_id":"internal","reported_state":{"temp":25.5},"desired_state":{"enabled":false},"reported_version":42,"desired_version":23,"last_desired_by":"actor","last_reported_at":"time4","last_desired_at":"time5","updated_at":"time6"}]`,
+		`[{"source_entity_id":"parent","target_entity_id":"internal","relationship_type":"hasSensor","created_at":"time7"}]`,
+	}
+	assertOwnerGraphEqual(t, baseline, baseline)
+	for table, serialized := range baseline {
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(serialized), &rows); err != nil {
+			t.Fatal(err)
+		}
+		canonical, err := json.Marshal(rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		baseline[table] = string(canonical)
+		serialized = baseline[table]
+		for field := range rows[0] {
+			t.Run(fmt.Sprintf("table%d/%s", table, field), func(t *testing.T) {
+				var changedRows []map[string]any
+				if err := json.Unmarshal([]byte(serialized), &changedRows); err != nil {
+					t.Fatal(err)
+				}
+				changedRows[0][field] = "mutated"
+				encoded, err := json.Marshal(changedRows)
+				if err != nil {
+					t.Fatal(err)
+				}
+				changed := baseline
+				changed[table] = string(encoded)
+				// compareOwnerGraph is the exact assertion engine used above.
+				if err := compareOwnerGraph(baseline, changed); err == nil {
+					t.Fatal("snapshot mutation escaped assertion helper")
+				}
+			})
+		}
+		removed := baseline
+		removed[table] = "[]"
+		if err := compareOwnerGraph(baseline, removed); err == nil {
+			t.Fatal("row deletion escaped assertion helper")
+		}
+	}
+}
+
+// Query only the backend captured from the real connection. SQL text is an
+// additional operation check, never a substitute for PID and blocker identity.
+const provisioningLockObservationSQL = `SELECT state, COALESCE(wait_event_type,''), COALESCE(wait_event,''), query, pg_blocking_pids(pid)
+ FROM pg_stat_activity WHERE pid=$1`
+
+type provisioningLockObservation struct {
+	state, waitType, waitEvent, query string
+	blockers                          []int32
+}
+
+func (o provisioningLockObservation) matches(blocker uint32, statement string) bool {
+	if o.state != "active" || o.waitType != "Lock" || o.query != statement {
+		return false
+	}
+	for _, pid := range o.blockers {
+		if uint32(pid) == blocker {
+			return true
+		}
+	}
+	return false
+}
+
+func observeProvisioningLock(ctx context.Context, pool *pgxpool.Pool, pid uint32) (provisioningLockObservation, error) {
+	var o provisioningLockObservation
+	err := pool.QueryRow(ctx, provisioningLockObservationSQL, pid).Scan(&o.state, &o.waitType, &o.waitEvent, &o.query, &o.blockers)
+	return o, err
+}
+
+//nolint:revive // Match the existing test-helper convention: testing.T first.
+func assertProvisioningLockWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, waiter, blocker uint32, statement string, done <-chan error) {
+	t.Helper()
+	deadline, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		o, err := observeProvisioningLock(deadline, pool, waiter)
+		if err != nil {
+			t.Fatalf("observe exact lock waiter PID=%d: %v", waiter, err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("operation completed before lock release: %v", err)
+		default:
+		}
+		if o.matches(blocker, statement) {
+			t.Logf("native lock evidence waiter=%d blocker=%d state=%s wait_event_type=%s wait_event=%s blocking_pids=%v statement=%q", waiter, blocker, o.state, o.waitType, o.waitEvent, o.blockers, o.query)
+			return
+		}
+		select {
+		case <-deadline.Done():
+			t.Fatalf("no exact lock evidence waiter=%d blocker=%d last=%+v", waiter, blocker, o)
+		case err := <-done:
+			t.Fatalf("operation completed before lock evidence: %v", err)
+		case <-tick.C: // Sampling cadence only; passage of time is not lock proof.
+		}
+	}
+}
+
+//nolint:revive // Match the existing test-helper convention: testing.T first.
+func awaitProvisioningPID(t *testing.T, ctx context.Context, ch <-chan uint32) uint32 {
+	t.Helper()
+	select {
+	case pid := <-ch:
+		return pid
+	case <-ctx.Done():
+		t.Fatal("backend/barrier deadline")
+		return 0
+	}
+}
+
+//nolint:revive // Match the existing test-helper convention: testing.T first.
+func awaitProvisioningWorker(t *testing.T, ctx context.Context, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		t.Fatal("worker deadline")
+		return ctx.Err()
+	}
+}
+
+func TestProvisioningLockOracle(t *testing.T) {
+	const statement = "UPDATE user_gateways SET role='viewer' WHERE user_id=$1 AND gateway_id=$2"
+	for _, o := range []provisioningLockObservation{
+		{state: "idle", waitType: "Client", waitEvent: "ClientRead", query: statement, blockers: []int32{42}},
+		{state: "active", waitType: "Lock", query: statement, blockers: []int32{99}},
+		{state: "active", waitType: "Lock", query: "unrelated statement", blockers: []int32{42}},
+	} {
+		if o.matches(42, statement) {
+			t.Fatalf("false lock witness accepted: %+v", o)
+		}
+	}
+	if !(provisioningLockObservation{state: "active", waitType: "Lock", query: statement, blockers: []int32{42}}).matches(42, statement) {
+		t.Fatal("real witness rejected")
+	}
+}
+
+type barrierSensorDatabase struct {
+	ProvisioningDatabase
+	onBegin              func(uint32)
+	onMembershipAcquired func(context.Context, uint32) error
+	onMembershipAbsent   func(context.Context, uint32) error
+	onParentAcquired     func(context.Context, uint32) error
+}
+
+func (d barrierSensorDatabase) BeginTx(ctx context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := d.ProvisioningDatabase.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	if d.onBegin != nil {
+		d.onBegin(tx.Conn().PgConn().PID())
+	}
+	return &barrierSensorTx{
+		Tx:                   tx,
+		onMembershipAcquired: d.onMembershipAcquired,
+		onMembershipAbsent:   d.onMembershipAbsent,
+		onParentAcquired:     d.onParentAcquired,
+	}, nil
+}
+
+type barrierSensorTx struct {
+	pgx.Tx
+	onMembershipAcquired func(context.Context, uint32) error
+	onMembershipAbsent   func(context.Context, uint32) error
+	onParentAcquired     func(context.Context, uint32) error
+}
+
+func (tx *barrierSensorTx) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	row := tx.Tx.QueryRow(ctx, query, args...)
+	if strings.Contains(query, "SELECT role FROM public.user_gateways WHERE user_id=$1 AND gateway_id=$2 FOR SHARE") {
+		return &barrierRow{
+			Row:                  row,
+			ctx:                  ctx,
+			pid:                  tx.Conn().PgConn().PID(),
+			onMembershipAcquired: tx.onMembershipAcquired,
+			onAbsent:             tx.onMembershipAbsent,
+		}
+	}
+	if query == "SELECT name FROM public.gateways WHERE gateway_id=$1 FOR UPDATE" && tx.onParentAcquired != nil {
+		return &barrierRow{Row: row, ctx: ctx, pid: tx.Conn().PgConn().PID(), onMembershipAcquired: tx.onParentAcquired}
+	}
+	return row
+}
+
+type barrierRow struct {
+	pgx.Row
+	ctx                  context.Context
+	pid                  uint32
+	onMembershipAcquired func(context.Context, uint32) error
+	onAbsent             func(context.Context, uint32) error
+}
+
+func (r *barrierRow) Scan(dest ...any) error {
+	err := r.Row.Scan(dest...)
+	if errors.Is(err, pgx.ErrNoRows) && r.onAbsent != nil {
+		if pauseErr := r.onAbsent(r.ctx, r.pid); pauseErr != nil {
+			return pauseErr
+		}
+	}
+	if err == nil && r.onMembershipAcquired != nil {
+		return r.onMembershipAcquired(r.ctx, r.pid)
+	}
+	return err
+}
+
 // committed. Do not promise rollback; return no success and let an identical
 // retry resolve the authoritative graph. This adapter deliberately commits and
 // then loses the confirmation to exercise that boundary without network sleeps.

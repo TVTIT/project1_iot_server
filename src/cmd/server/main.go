@@ -102,6 +102,27 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create provisioning service: %w", err)
 	}
+	ownerSensorRepo, err := gateway.NewPostgresOwnerSensorProvisioningRepository(pool)
+	if err != nil {
+		return fmt.Errorf("create owner sensor provisioning repository: %w", err)
+	}
+	ownerSensorService, err := gateway.NewOwnerSensorProvisioningService(ownerSensorRepo, cfg.AuthorizationTimeout)
+	if err != nil {
+		return fmt.Errorf("create owner sensor provisioning service: %w", err)
+	}
+	adminGatewayRepository, err := gateway.NewPostgresAdminGatewayRepository(pool)
+	if err != nil {
+		return fmt.Errorf("create admin gateway repository: %w", err)
+	}
+	adminGatewayService, err := gateway.NewAdminGatewayService(
+		adminGatewayRepository,
+		cfg.AuthorizationTimeout,
+		cfg.AdminInventoryDefaultLimit,
+		cfg.AdminInventoryMaxLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("create admin gateway service: %w", err)
+	}
 	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
 		CredentialAPIEnabled:       cfg.Credential.Enabled,
 		CredentialRequestTimeout:   cfg.Credential.RequestTimeout,
@@ -109,6 +130,10 @@ func run() error {
 		CredentialStartupReadiness: credentials.ready,
 		GatewayProvisioner:         provisioningService,
 		SensorProvisioner:          provisioningService,
+		OwnerSensorProvisioner:     ownerSensorService,
+		AdminGatewayLister:         adminGatewayService,
+		AdminInventoryDefaultLimit: cfg.AdminInventoryDefaultLimit,
+		AdminInventoryMaxLimit:     cfg.AdminInventoryMaxLimit,
 		AdminMaxBodyBytes:          int64(cfg.AdminMaxBodyBytes),
 		GatewayReader:              gatewayService,
 		SensorReader:               gatewayService,

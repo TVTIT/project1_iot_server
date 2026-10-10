@@ -42,8 +42,66 @@ func (r *postgresProvisioningRepository) ProvisionSensor(ctx context.Context, ac
 	if err != nil {
 		return ProvisionSensorResult{}, fmt.Errorf("lock Sensor parent: %w", err)
 	}
+
+	result, err := executeSensorGraphProvisioning(ctx, tx, input, parentName)
+	if err != nil {
+		return ProvisionSensorResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("commit Sensor provisioning: %w", err)
+	}
+	return result, nil
+}
+
+func (r *postgresProvisioningRepository) ProvisionSensorForOwner(ctx context.Context, actor uuid.UUID, input ProvisionSensorInput) (ProvisionSensorResult, error) {
+	if err := ValidateProvisionSensorInput(actor, input); err != nil {
+		return ProvisionSensorResult{}, err
+	}
+	tx, err := r.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("begin owner Sensor provisioning: %w", classifyOwnerProvisioningError(err))
+	}
+	defer rollbackProvisioning(tx)
+
+	// All same-parent provisioning takes this lock first. Subsequent statements
+	// get fresh READ COMMITTED snapshots after a competing operation commits.
+	var parentName string
+	err = tx.QueryRow(ctx, `SELECT name FROM public.gateways WHERE gateway_id=$1 FOR UPDATE`, input.GatewayID).Scan(&parentName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProvisionSensorResult{}, ErrProvisioningNotFound
+	}
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("lock Sensor parent: %w", classifyOwnerProvisioningError(err))
+	}
+
+	// Verify and lock membership with FOR SHARE to prevent concurrent role mutation / revocation.
+	var role Role
+	err = tx.QueryRow(ctx, `SELECT role FROM public.user_gateways WHERE user_id=$1 AND gateway_id=$2 FOR SHARE`, actor, input.GatewayID).Scan(&role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProvisionSensorResult{}, ErrProvisioningNotFound
+	}
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("lookup owner membership: %w", classifyOwnerProvisioningError(err))
+	}
+	if role != RoleOwner {
+		return ProvisionSensorResult{}, ErrProvisioningForbidden
+	}
+
+	result, err := executeSensorGraphProvisioning(ctx, tx, input, parentName)
+	if err != nil {
+		return ProvisionSensorResult{}, classifyOwnerProvisioningError(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		// A lost confirmation is unavailable, not evidence that writes rolled back.
+		return ProvisionSensorResult{}, fmt.Errorf("commit owner Sensor provisioning: %w", classifyOwnerProvisioningError(err))
+	}
+	return result, nil
+}
+
+func executeSensorGraphProvisioning(ctx context.Context, tx pgx.Tx, input ProvisionSensorInput, parentName string) (ProvisionSensorResult, error) {
 	var parent uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT e.id FROM public.twin_entities e JOIN public.twin_states s ON s.entity_id=e.id
+	err := tx.QueryRow(ctx, `SELECT e.id FROM public.twin_entities e JOIN public.twin_states s ON s.entity_id=e.id
 	WHERE e.entity_id=$1 AND e.entity_type='Gateway' AND e.gateway_id=$2 AND e.name=$3
 	AND (SELECT count(*) FROM public.twin_entities WHERE gateway_id=$2 AND entity_type='Gateway')=1`,
 		mapper.GatewayEntityID(input.GatewayID), input.GatewayID, parentName).Scan(&parent)
@@ -83,9 +141,6 @@ func (r *postgresProvisioningRepository) ProvisionSensor(ctx context.Context, ac
 		}
 	default:
 		return ProvisionSensorResult{}, fmt.Errorf("insert Sensor: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return ProvisionSensorResult{}, fmt.Errorf("commit Sensor provisioning: %w", err)
 	}
 	return result, nil
 }

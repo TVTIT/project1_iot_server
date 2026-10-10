@@ -195,15 +195,23 @@ func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
 		SensorProvisioner: sensorProvisionerFunc(func(context.Context, uuid.UUID, gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error) {
 			return gateway.ProvisionSensorResult{}, gateway.ErrProvisioningInconsistent
 		}),
+		OwnerSensorProvisioner: ownerSensorProvisionerFunc(func(context.Context, uuid.UUID, gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error) {
+			return gateway.ProvisionSensorResult{}, gateway.ErrProvisioningInconsistent
+		}),
 		GatewayProvisioner: gatewayProvisionerFunc(func(context.Context, uuid.UUID, gateway.ProvisionGatewayInput) (gateway.ProvisionGatewayResult, error) {
 			return gateway.ProvisionGatewayResult{}, gateway.ErrProvisioningInconsistent
 		}),
-		AdminMaxBodyBytes:    16384,
-		SensorReader:         sensorReaderFunc(func(context.Context, uuid.UUID, string) ([]gateway.Sensor, error) { return nil, nil }),
-		GatewayReader:        gatewayReaderFunc(func(context.Context, uuid.UUID) ([]gateway.Gateway, error) { return nil, nil }),
-		ReadinessChecker:     readiness,
-		ReadinessTimeout:     time.Second,
-		AuthorizationTimeout: time.Second,
+		AdminMaxBodyBytes: 16384,
+		SensorReader:      sensorReaderFunc(func(context.Context, uuid.UUID, string) ([]gateway.Sensor, error) { return nil, nil }),
+		GatewayReader:     gatewayReaderFunc(func(context.Context, uuid.UUID) ([]gateway.Gateway, error) { return nil, nil }),
+		AdminGatewayLister: adminGatewayListerFunc(func(context.Context, uuid.UUID, gateway.AdminGatewayInventoryQuery) (gateway.AdminGatewayInventoryPage, error) {
+			return gateway.AdminGatewayInventoryPage{Items: []gateway.AdminGateway{}}, nil
+		}),
+		AdminInventoryDefaultLimit: 100,
+		AdminInventoryMaxLimit:     200,
+		ReadinessChecker:           readiness,
+		ReadinessTimeout:           time.Second,
+		AuthorizationTimeout:       time.Second,
 		TokenVerifier: tokenVerifierFunc(func(context.Context, string) (auth.Principal, error) {
 			return auth.Principal{UserID: uuid.New(), Role: "authenticated"}, nil
 		}),

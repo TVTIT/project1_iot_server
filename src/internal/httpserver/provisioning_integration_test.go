@@ -95,7 +95,23 @@ func TestGatewayProvisioningHTTPIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := NewRouter(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: writer, SensorProvisioner: writer, AdminMaxBodyBytes: 16384})
+	adminRepo, err := gateway.NewPostgresAdminGatewayRepository(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminService, err := gateway.NewAdminGatewayService(adminRepo, time.Second, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerSensorRepo, err := gateway.NewPostgresOwnerSensorProvisioningRepository(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerSensorService, err := gateway.NewOwnerSensorProvisioningService(ownerSensorRepo, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRouter(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: writer, SensorProvisioner: writer, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +333,7 @@ func TestGatewayProvisioningHTTPIntegration(t *testing.T) {
 		for _, sensor := range []bool{false, true} {
 			exec("INSERT INTO platform_admins(user_id) VALUES ($1) ON CONFLICT DO NOTHING", admin)
 			wrapper := &revokeBeforeProvisioning{delegate: writer, before: func() { exec("DELETE FROM platform_admins WHERE user_id=$1", admin) }}
-			r, err := NewRouter(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: wrapper, SensorProvisioner: wrapper, AdminMaxBodyBytes: 16384})
+			r, err := NewRouter(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: wrapper, SensorProvisioner: wrapper, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384})
 			if err != nil {
 				t.Fatal(err)
 			}
