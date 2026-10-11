@@ -34,9 +34,8 @@ func loadCredential(lookup LookupFunc, cfg Config) (CredentialConfig, error) {
 	if !c.Enabled {
 		return c, nil
 	}
-	gate, err := strconv.ParseBool(valueOrDefault(lookup, "INGRESS_GATE_ENABLED", "true"))
-	if err != nil || !gate || cfg.MQTTCredentialRuntime.Enabled {
-		return c, fmt.Errorf("credential API requires ingress gate and disabled legacy runtime")
+	if _, err := strconv.ParseBool(valueOrDefault(lookup, "INGRESS_GATE_ENABLED", "true")); err != nil || cfg.MQTTCredentialRuntime.Enabled {
+		return c, fmt.Errorf("credential API requires valid ingress gate flag and disabled legacy runtime")
 	}
 	c.ManagerUsername = valueOrDefault(lookup, "MQTT_DYNSEC_MANAGER_USERNAME", "")
 	if c.ManagerUsername == "" || c.ManagerUsername == mqttcredential.BackendUsername {
@@ -52,9 +51,13 @@ func loadCredential(lookup LookupFunc, cfg Config) (CredentialConfig, error) {
 	if e != nil || u.Scheme != "ssl" || u.Hostname() == "" || u.Port() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		return c, fmt.Errorf("MQTT_INTERNAL_MANAGEMENT_URL must be ssl URL with hostname and port")
 	}
-	for key, dest := range map[string]*string{"MQTT_TLS_CA_FILE": &c.CAFile, "MQTT_DYNSEC_JSON_PATH": &c.SnapshotPath, "MQTT_CONTROLLER_DIR": &c.ControlDir} {
+	c.CAFile = valueOrDefault(lookup, "MQTT_TLS_CA_FILE", "")
+	if !filepath.IsAbs(c.CAFile) || filepath.Clean(c.CAFile) != c.CAFile {
+		return c, fmt.Errorf("MQTT_TLS_CA_FILE must be a clean absolute path")
+	}
+	for key, dest := range map[string]*string{"MQTT_DYNSEC_JSON_PATH": &c.SnapshotPath, "MQTT_CONTROLLER_DIR": &c.ControlDir} {
 		*dest = valueOrDefault(lookup, key, "")
-		if !filepath.IsAbs(*dest) || filepath.Clean(*dest) != *dest {
+		if *dest != "" && (!filepath.IsAbs(*dest) || filepath.Clean(*dest) != *dest) {
 			return c, fmt.Errorf("%s must be a clean absolute path", key)
 		}
 	}

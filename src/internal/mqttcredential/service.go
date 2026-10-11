@@ -3,6 +3,7 @@ package mqttcredential
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"time"
 
@@ -34,6 +35,39 @@ type ProvisionServiceOptions struct {
 	StartupReady func() bool
 }
 
+// SimplifiedOperationRepository defines the narrow repository capabilities required by
+// simplified credential operations (provision, rotate, revoke, reset).
+type SimplifiedOperationRepository interface {
+	IsPlatformAdmin(context.Context, uuid.UUID) (bool, error)
+	BeginSimplifiedOperation(context.Context, BeginRequest) (BeginResult, error)
+	BeginReset(context.Context, BeginResetRequest) (BeginResult, error)
+	ConditionalFinalize(context.Context, OperationUpdate) (Metadata, error)
+	FailKnown(context.Context, OperationUpdate) (Metadata, error)
+	RequireRecovery(context.Context, OperationUpdate) (Metadata, error)
+	GetMetadata(context.Context, string) (Metadata, error)
+	ResolveCommitAmbiguity(context.Context, uuid.UUID) (Operation, error)
+	LookupResetReplay(context.Context, uuid.UUID, ResetInput) (Operation, Metadata, bool, error)
+}
+
+// SimplifiedExecutor defines the narrow executor capabilities for simplified DynSec operations.
+type SimplifiedExecutor interface {
+	Execute(context.Context, Operation, func(context.Context) (string, error)) (SimplifiedExecutionResult, error)
+	CheckRevoked(context.Context, string) error
+}
+
+// ResetPrerequisite defines the operator-supervised quiescence check required before admitting a reset.
+type ResetPrerequisite interface {
+	SupervisedQuiescencePrerequisite(ctx context.Context, gatewayID string) error
+}
+
+// SimplifiedProvisionServiceOptions configures simplified credential provisioning options.
+type SimplifiedProvisionServiceOptions struct {
+	RecoveryTimeout  time.Duration
+	GeneratePassword func() (string, error)
+	NewOperationID   func() (uuid.UUID, error)
+	StartupReady     func() bool
+}
+
 // ProvisionResponse holds the mutation result and optional plaintext secret.
 type ProvisionResponse struct {
 	MutationResult
@@ -48,6 +82,12 @@ type ProvisionService struct {
 	cfg            ProvisionServiceOptions
 	mu             sync.Mutex
 	busy, poisoned bool
+
+	// Simplified dependencies (nil when operating on legacy lifecycle path)
+	simplifiedRepo     SimplifiedOperationRepository
+	simplifiedExecutor SimplifiedExecutor
+	resetPrereq        ResetPrerequisite
+	simplifiedCfg      SimplifiedProvisionServiceOptions
 }
 
 // NewProvisionService constructs a ProvisionService after validating dependencies and options.
@@ -63,6 +103,31 @@ func NewProvisionService(r Repository, m MaintenanceRepository, a ProvisionRunti
 	}
 	return &ProvisionService{repo: r, maintenance: m, runtime: a, cfg: c}, nil
 }
+
+// NewSimplifiedProvisionService is a transitional explicit constructor returning the SAME
+// *ProvisionService with simplified dependencies to preserve current callers/tests until next wiring cutover.
+func NewSimplifiedProvisionService(
+	r SimplifiedOperationRepository,
+	e SimplifiedExecutor,
+	p ResetPrerequisite,
+	c SimplifiedProvisionServiceOptions,
+) (*ProvisionService, error) {
+	if dynSecNil(r) || dynSecNil(e) || dynSecNil(p) || c.RecoveryTimeout <= 0 || c.RecoveryTimeout > time.Minute {
+		return nil, &DomainError{Code: CodeInvalidRequest}
+	}
+	if c.GeneratePassword == nil {
+		c.GeneratePassword = generatePassword
+	}
+	if c.NewOperationID == nil {
+		c.NewOperationID = uuid.NewRandom
+	}
+	return &ProvisionService{
+		simplifiedRepo:     r,
+		simplifiedExecutor: e,
+		resetPrereq:        p,
+		simplifiedCfg:      c,
+	}, nil
+}
 func serviceError(e error) error {
 	var d *DomainError
 	if errors.As(e, &d) {
@@ -71,19 +136,146 @@ func serviceError(e error) error {
 	return &DomainError{Code: CodeServiceUnavailable}
 }
 
+func isNilKind(err error) bool {
+	if err == nil {
+		return true
+	}
+	val := reflect.ValueOf(err)
+	switch val.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return val.IsNil()
+	default:
+		return false
+	}
+}
+
+// inspectAdmissionError walks the admission error tree within a strict total-work budget (64 nodes).
+// It verifies that all leaves are concrete non-nil *DomainError with allowed safe codes.
+// It never invokes arbitrary As() or Error(), rejecting typed nil receivers and children prior to Unwrap().
+// It returns safeRejection=true and the first safe ErrorCode only if all leaves are valid and safe.
+func inspectAdmissionError(err error) (safeRejection bool, publicCode ErrorCode) {
+	if isNilKind(err) {
+		return false, CodeServiceUnavailable
+	}
+
+	remainingBudget := 64
+	var firstSafeCode ErrorCode
+	allLeavesSafe := true
+
+	type singleUnwrap interface {
+		Unwrap() error
+	}
+	type multiUnwrap interface {
+		Unwrap() []error
+	}
+
+	var traverse func(curr error)
+	traverse = func(curr error) {
+		if remainingBudget <= 0 {
+			allLeavesSafe = false
+			return
+		}
+		remainingBudget--
+
+		if isNilKind(curr) {
+			allLeavesSafe = false
+			return
+		}
+
+		// Concrete CommitOutcomeUnknown always indicates uncertainty
+		if _, isUnknown := curr.(*CommitOutcomeUnknown); isUnknown {
+			allLeavesSafe = false
+			return
+		}
+
+		// Check multi-error unwrap: Unwrap() []error
+		if mu, ok := curr.(multiUnwrap); ok {
+			children := mu.Unwrap()
+			if len(children) == 0 || len(children) > remainingBudget {
+				allLeavesSafe = false
+				return
+			}
+			for _, child := range children {
+				traverse(child)
+				if !allLeavesSafe {
+					return
+				}
+			}
+			return
+		}
+
+		// Leaf inspection: MUST be concrete *DomainError with allowed safe code
+		if d, ok := curr.(*DomainError); ok {
+			switch d.Code {
+			case CodeInvalidRequest,
+				CodeForbidden,
+				CodeNotFound,
+				CodeCredentialConflict,
+				CodeIdempotencyConflict,
+				CodeOperationInProgress:
+				if firstSafeCode == "" {
+					firstSafeCode = d.Code
+				}
+				return
+			default:
+				allLeavesSafe = false
+				return
+			}
+		}
+
+		// Check single error unwrap: Unwrap() error
+		if su, ok := curr.(singleUnwrap); ok {
+			child := su.Unwrap()
+			traverse(child)
+			return
+		}
+
+		allLeavesSafe = false
+	}
+
+	traverse(err)
+
+	if allLeavesSafe && firstSafeCode != "" {
+		return true, firstSafeCode
+	}
+	return false, CodeServiceUnavailable
+}
+
+// evaluateAdmissionError evaluates admission rejection safely and returns whether it is a safe rejection
+// and the corresponding public DomainError. Non-zero BeginResult or unsafe errors poison and fail closed.
+func evaluateAdmissionError(b BeginResult, e error) (safeRejection bool, publicErr error) {
+	safe, code := inspectAdmissionError(e)
+	if !reflect.DeepEqual(b, BeginResult{}) {
+		return false, &DomainError{Code: CodeServiceUnavailable}
+	}
+	if !safe {
+		return false, &DomainError{Code: CodeServiceUnavailable}
+	}
+	return true, &DomainError{Code: code}
+}
+
 // Metadata retrieves credential metadata for a gateway if the actor is a platform admin.
 func (s *ProvisionService) Metadata(ctx context.Context, actor uuid.UUID, g string) (Metadata, error) {
 	if actor == uuid.Nil || gateway.ValidateGatewayID(g) != nil {
 		return Metadata{}, &DomainError{Code: CodeInvalidRequest}
 	}
-	ok, e := s.repo.IsPlatformAdmin(ctx, actor)
+	var adminChecker func(context.Context, uuid.UUID) (bool, error)
+	var metaGetter func(context.Context, string) (Metadata, error)
+	if s.simplifiedRepo != nil {
+		adminChecker = s.simplifiedRepo.IsPlatformAdmin
+		metaGetter = s.simplifiedRepo.GetMetadata
+	} else {
+		adminChecker = s.repo.IsPlatformAdmin
+		metaGetter = s.repo.GetMetadata
+	}
+	ok, e := adminChecker(ctx, actor)
 	if e != nil {
 		return Metadata{}, serviceError(e)
 	}
 	if !ok {
 		return Metadata{}, &DomainError{Code: CodeForbidden}
 	}
-	m, e := s.repo.GetMetadata(ctx, g)
+	m, e := metaGetter(ctx, g)
 	return m, serviceErrorOrNil(e)
 }
 func serviceErrorOrNil(e error) error {
@@ -122,6 +314,9 @@ func (s *ProvisionService) Revoke(ctx context.Context, actor uuid.UUID, in Mutat
 }
 
 func (s *ProvisionService) mutate(ctx context.Context, actor uuid.UUID, in MutationInput, action Action) (out ProvisionResponse, err error) {
+	if s.simplifiedRepo != nil {
+		return s.mutateSimplified(ctx, actor, in, action)
+	}
 	if s.cfg.StartupReady != nil && !s.cfg.StartupReady() {
 		return out, &DomainError{Code: CodeServiceUnavailable}
 	}
@@ -327,6 +522,421 @@ func (s *ProvisionService) mutate(ctx context.Context, actor uuid.UUID, in Mutat
 		out.SecretReturned = true
 	}
 	success = true
+	return out, nil
+}
+
+// Reset deliberately fails closed until the repository offers an actor/key
+// read-only reset lookup. BeginReset is mutation admission, not that lookup:
+// calling it before quiescence or creating a prerequisite on replay is unsafe.
+// The prerequisite seam is retained for subsequent supervised composition; no
+// production quiescence or automatic clearing of poison is claimed here.
+func replayResetOperation(o Operation, actor uuid.UUID, in ResetInput, current Metadata) (MutationResult, error) {
+	if ValidateResetInput(actor, in) != nil {
+		return MutationResult{}, &DomainError{Code: CodeInvalidRequest}
+	}
+	if o.ActorUserID != actor || o.IdempotencyKey != in.IdempotencyKey || o.GatewayID != in.GatewayID || o.Action != ActionReset {
+		return MutationResult{}, &DomainError{Code: CodeIdempotencyConflict}
+	}
+	if o.ResetReason == nil || *o.ResetReason != in.Reason {
+		return MutationResult{}, &DomainError{Code: CodeIdempotencyConflict}
+	}
+	if err := o.Validate(); err != nil {
+		return MutationResult{}, err
+	}
+	switch o.Status {
+	case OperationPending:
+		return MutationResult{}, &DomainError{Code: CodeOperationInProgress}
+	case OperationRecoveryNeeded:
+		return MutationResult{}, &DomainError{Code: CodeRecoveryRequired}
+	}
+	if current.GatewayID != o.GatewayID {
+		return MutationResult{}, &DomainError{Code: CodeInvalidRequest}
+	}
+	result := MutationResult{Metadata: current, OperationID: o.OperationID, ReplayedStatus: o.Status, ErrorCode: o.ErrorCode}
+	if o.Status == OperationSucceeded && current.Status != CredentialRevoked {
+		result.NextAction = "rotate_with_new_idempotency_key"
+	} else if current.Status == CredentialRevoked {
+		result.NextAction = "provision_with_new_idempotency_key"
+	}
+	return result, nil
+}
+
+func (s *ProvisionService) Reset(ctx context.Context, actor uuid.UUID, in ResetInput) (ProvisionResponse, error) {
+	if ValidateResetInput(actor, in) != nil {
+		return ProvisionResponse{}, &DomainError{Code: CodeInvalidRequest}
+	}
+	if s.simplifiedRepo == nil {
+		return ProvisionResponse{}, &DomainError{Code: CodeServiceUnavailable}
+	}
+	if s.simplifiedCfg.StartupReady != nil && !s.simplifiedCfg.StartupReady() {
+		return ProvisionResponse{}, &DomainError{Code: CodeServiceUnavailable}
+	}
+	ok, err := s.simplifiedRepo.IsPlatformAdmin(ctx, actor)
+	if err != nil {
+		return ProvisionResponse{}, serviceError(err)
+	}
+	if !ok {
+		return ProvisionResponse{}, &DomainError{Code: CodeForbidden}
+	}
+
+	// 1. Check read-only reset lookup before acquiring serialized worker lock.
+	// Matching historical replay or pending/recovery status is returned immediately
+	// without admission, generator, native execution, or quiescence prerequisite.
+	existingOp, currentMeta, found, err := s.simplifiedRepo.LookupResetReplay(ctx, actor, in)
+	if err != nil {
+		return ProvisionResponse{}, serviceError(err)
+	}
+	if found {
+		if !validSimplifiedMetadata(currentMeta, in.GatewayID) {
+			s.poison()
+			return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+		}
+		replay, replayErr := replayResetOperation(existingOp, actor, in, currentMeta)
+		if replayErr != nil || existingOp.ExecutionContract != ContractSimplified {
+			s.poison()
+			return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+		}
+		// Safe metadata-only response, zero secret
+		return ProvisionResponse{MutationResult: replay}, nil
+	}
+
+	// 2. New reset path: acquire serialized service owner lock
+	s.mu.Lock()
+	if s.busy || s.poisoned {
+		s.mu.Unlock()
+		return ProvisionResponse{}, &DomainError{Code: CodeRuntimeBusy}
+	}
+	s.busy = true
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.busy = false; s.mu.Unlock() }()
+
+	// 3. Inspect current metadata and predecessor operation to bind prerequisite and subsequent admission
+	// to exact current predecessor authority and verify pure eligibility BEFORE disruptive prerequisite.
+	currentPredecessorMeta, err := s.simplifiedRepo.GetMetadata(ctx, in.GatewayID)
+	if err != nil {
+		s.poison()
+		return ProvisionResponse{}, serviceError(err)
+	}
+	if !validSimplifiedMetadata(currentPredecessorMeta, in.GatewayID) {
+		s.poison()
+		return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+	}
+	boundPredecessorID := currentPredecessorMeta.LastOperationID
+
+	// Read exact current operation record via existing read-only capability
+	predOp, err := s.simplifiedRepo.ResolveCommitAmbiguity(ctx, boundPredecessorID)
+	if err != nil {
+		s.poison()
+		return ProvisionResponse{}, serviceError(err)
+	}
+	if predOp.GatewayID != in.GatewayID || predOp.ExecutionContract != ContractSimplified {
+		s.poison()
+		return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+	}
+
+	// Validate CheckResetEligibility BEFORE running prerequisite actions
+	if err := CheckResetEligibility(currentPredecessorMeta, predOp, in.Reason); err != nil {
+		return ProvisionResponse{}, err
+	}
+
+	targetGuard := operationGuard(predOp, currentPredecessorMeta)
+
+	// 4. Run operator-supervised quiescence prerequisite dependency
+	if s.resetPrereq == nil {
+		return ProvisionResponse{}, &DomainError{Code: CodeServiceUnavailable}
+	}
+	if err := s.resetPrereq.SupervisedQuiescencePrerequisite(ctx, in.GatewayID); err != nil {
+		return ProvisionResponse{}, serviceError(err)
+	}
+
+	// 5. Admit new reset via BeginReset with expected predecessor and exact target guard
+	newOpID, err := s.simplifiedCfg.NewOperationID()
+	if err != nil || newOpID == uuid.Nil {
+		return ProvisionResponse{}, &DomainError{Code: CodeInternalError}
+	}
+	b, err := s.simplifiedRepo.BeginReset(ctx, BeginResetRequest{
+		ActorUserID:           actor,
+		OperationID:           newOpID,
+		Input:                 in,
+		ExpectedPredecessorID: boundPredecessorID,
+		ExpectedTargetGuard:   &targetGuard,
+	})
+	if err != nil {
+		safe, pubErr := evaluateAdmissionError(b, err)
+		if !safe {
+			s.poison()
+		}
+		return ProvisionResponse{}, pubErr
+	}
+
+	o, m := b.Operation, b.Metadata
+	if b.Replay != nil {
+		// BeginReset should not return Replay for a new key; if it does, validate strictly
+		if b.Execute || !validSimplifiedMetadata(m, in.GatewayID) || b.Replay.SecretReturned || !sameSimplifiedMetadata(b.Replay.Metadata, m) {
+			s.poison()
+			return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+		}
+		replay, replayErr := replayResetOperation(o, actor, in, m)
+		if replayErr != nil || o.ExecutionContract != ContractSimplified || !reflect.DeepEqual(replay, *b.Replay) {
+			s.poison()
+			return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+		}
+		return ProvisionResponse{MutationResult: *b.Replay}, nil
+	}
+
+	// Verify newly admitted reset operation invariants
+	if !b.Execute || o.Validate() != nil || o.ExecutionContract != ContractSimplified ||
+		o.OperationID != newOpID || o.ActorUserID != actor || o.GatewayID != in.GatewayID ||
+		o.IdempotencyKey != in.IdempotencyKey || o.Action != ActionReset || o.Status != OperationPending ||
+		o.Phase != PhaseIntent || o.Evidence != (VerificationEvidence{}) ||
+		o.ResetReason == nil || *o.ResetReason != in.Reason ||
+		o.ResetPredecessorID == nil || *o.ResetPredecessorID != boundPredecessorID ||
+		!validSimplifiedMetadata(m, in.GatewayID) || m.LastOperationID != newOpID ||
+		m.CredentialVersion != o.CredentialVersion || m.OperationStatus != OperationPending ||
+		m.Status != CredentialRotating {
+		s.poison()
+		return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+	}
+
+	// 6. Generate CSPRNG password
+	var secret string
+	defer func() { secret = "" }()
+	gen := func(c context.Context) (string, error) {
+		if c.Err() != nil || secret != "" {
+			return "", &DomainError{Code: CodeInternalError}
+		}
+		p, err := s.simplifiedCfg.GeneratePassword()
+		if err != nil || c.Err() != nil || !validPassword(p) {
+			return "", &DomainError{Code: CodeInternalError}
+		}
+		secret = p
+		return p, nil
+	}
+
+	// 7. Execute reset on native adapter
+	r, execErr := s.simplifiedExecutor.Execute(ctx, o, gen)
+	evidence := VerificationEvidence{}
+	if r.OperationID == newOpID {
+		evidence.RAMApplied, evidence.FreshPositiveVerified = r.Evidence.RAMApplied, r.Evidence.FreshPositiveVerified
+	}
+	verified := execErr == nil && r.OperationID == newOpID && r.Mutated &&
+		r.Outcome == ExecutionVerifiedSuccess && evidence.RAMApplied &&
+		evidence.FreshPositiveVerified && !r.Evidence.ProtocolDenialVerified &&
+		!r.Evidence.SessionHandlingVerified && validPassword(secret)
+
+	if !verified {
+		outcome := ExecutionRecoveryRequired
+		known := r.OperationID == newOpID && !r.Mutated && r.Outcome == ExecutionUnchangedFailure && r.Evidence == (SimplifiedExecutionEvidence{})
+		if known {
+			outcome = ExecutionUnchangedFailure
+		} else {
+			s.poison()
+		}
+		c, ce := CompleteOperation(o, outcome, evidence, time.Now().UTC())
+		if ce == nil {
+			recovery, stop := context.WithTimeout(context.Background(), s.simplifiedCfg.RecoveryTimeout)
+			if known {
+				_, ce = s.simplifiedRepo.FailKnown(recovery, OperationUpdate{operationGuard(o, m), c})
+			} else {
+				_, ce = s.simplifiedRepo.RequireRecovery(recovery, OperationUpdate{operationGuard(o, m), c})
+			}
+			stop()
+		}
+		if ce != nil {
+			s.poison()
+		}
+		return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+	}
+
+	// 8. Finalize before secret disclosure
+	c, e := CompleteOperation(o, ExecutionVerifiedSuccess, evidence, time.Now().UTC())
+	if e != nil {
+		s.poison()
+		return ProvisionResponse{}, &DomainError{Code: CodeRecoveryRequired}
+	}
+	finalized, finalizeErr := s.simplifiedRepo.ConditionalFinalize(ctx, OperationUpdate{operationGuard(o, m), c})
+
+	// 9. Exact completion readback before disclosure
+	recovery, stop := context.WithTimeout(context.Background(), s.simplifiedCfg.RecoveryTimeout)
+	confirmed, oe := s.simplifiedRepo.ResolveCommitAmbiguity(recovery, newOpID)
+	latest, me := s.simplifiedRepo.GetMetadata(recovery, in.GatewayID)
+	stop()
+
+	if oe != nil || me != nil ||
+		!sameCompletion(Completion{Operation: confirmed, Credential: c.Credential}, c) ||
+		!validSimplifiedMetadata(latest, in.GatewayID) ||
+		latest.LastOperationID != newOpID ||
+		latest.CredentialVersion != c.Credential.CredentialVersion ||
+		latest.Status != c.Credential.Status ||
+		latest.OperationStatus != OperationSucceeded ||
+		!reflect.DeepEqual(canonicalSnapshot(CredentialSnapshot{Status: latest.Status, CredentialVersion: latest.CredentialVersion, ActivatedAt: latest.ActivatedAt, RevokedAt: latest.RevokedAt}), canonicalSnapshot(c.Credential)) ||
+		latest.LastErrorCode != nil ||
+		(finalizeErr == nil && !sameSimplifiedMetadata(finalized, latest)) {
+		s.poison()
+		return ProvisionResponse{}, &DomainError{Code: CodeFinalizationPending}
+	}
+
+	out := ProvisionResponse{
+		MutationResult: MutationResult{Metadata: latest, OperationID: newOpID},
+	}
+	v := NewSecretResult(latest, newOpID, secret)
+	out.Secret = &v
+	out.SecretReturned = true
+	return out, nil
+}
+
+func validSimplifiedMetadata(m Metadata, g string) bool {
+	return m.GatewayID == g && m.Username == g && m.CredentialVersion > 0 && m.LastOperationID != uuid.Nil && m.Status.Validate() == nil && m.OperationStatus.Validate() == nil
+}
+
+func sameSimplifiedMetadata(a, b Metadata) bool {
+	canonical := func(m Metadata) Metadata {
+		s := canonicalSnapshot(CredentialSnapshot{ActivatedAt: m.ActivatedAt, RevokedAt: m.RevokedAt})
+		m.ActivatedAt, m.RevokedAt = s.ActivatedAt, s.RevokedAt
+		return m
+	}
+	return reflect.DeepEqual(canonical(a), canonical(b))
+}
+
+func (s *ProvisionService) mutateSimplified(ctx context.Context, actor uuid.UUID, in MutationInput, action Action) (out ProvisionResponse, err error) {
+	if ValidateMutationInput(actor, in) != nil || in.Action != action {
+		return out, &DomainError{Code: CodeInvalidRequest}
+	}
+	if s.simplifiedCfg.StartupReady != nil && !s.simplifiedCfg.StartupReady() {
+		return out, &DomainError{Code: CodeServiceUnavailable}
+	}
+	ok, e := s.simplifiedRepo.IsPlatformAdmin(ctx, actor)
+	if e != nil {
+		return out, serviceError(e)
+	}
+	if !ok {
+		return out, &DomainError{Code: CodeForbidden}
+	}
+	s.mu.Lock()
+	if s.busy || s.poisoned {
+		s.mu.Unlock()
+		return out, &DomainError{Code: CodeRuntimeBusy}
+	}
+	s.busy = true
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.busy = false; s.mu.Unlock() }()
+	id, e := s.simplifiedCfg.NewOperationID()
+	if e != nil || id == uuid.Nil {
+		return out, &DomainError{Code: CodeInternalError}
+	}
+	b, e := s.simplifiedRepo.BeginSimplifiedOperation(ctx, BeginRequest{actor, id, in})
+	if e != nil {
+		safe, pubErr := evaluateAdmissionError(b, e)
+		if !safe {
+			s.poison()
+		}
+		return out, pubErr
+	}
+	o, m := b.Operation, b.Metadata
+	if b.Replay != nil {
+		if b.Execute || !validSimplifiedMetadata(m, in.GatewayID) || b.Replay.SecretReturned || !sameSimplifiedMetadata(b.Replay.Metadata, m) {
+			s.poison()
+			return out, &DomainError{Code: CodeRecoveryRequired}
+		}
+		if b.Replay.OperationID == uuid.Nil {
+			if action != ActionRevoke || m.Status != CredentialRevoked || s.simplifiedExecutor.CheckRevoked(ctx, in.GatewayID) != nil {
+				s.poison()
+				return out, &DomainError{Code: CodeRecoveryRequired}
+			}
+			latest, x := s.simplifiedRepo.GetMetadata(ctx, in.GatewayID)
+			if x != nil || !sameSimplifiedMetadata(latest, m) {
+				s.poison()
+				return out, &DomainError{Code: CodeRecoveryRequired}
+			}
+		} else {
+			replay, x := ReplayOperation(o, actor, in, m)
+			if x != nil || o.ExecutionContract != ContractSimplified || !reflect.DeepEqual(replay, *b.Replay) {
+				s.poison()
+				return out, &DomainError{Code: CodeRecoveryRequired}
+			}
+		}
+		out.MutationResult = *b.Replay
+		return out, nil
+	}
+	expected, x := BeginCredentialStatus("", action)
+	if o.Previous != nil {
+		expected, x = BeginCredentialStatus(o.Previous.Status, action)
+	}
+	if !b.Execute || x != nil || o.Validate() != nil || o.ExecutionContract != ContractSimplified || o.OperationID != id || o.ActorUserID != actor || o.GatewayID != in.GatewayID || o.IdempotencyKey != in.IdempotencyKey || o.Action != action || o.Status != OperationPending || o.Phase != PhaseIntent || o.Evidence != (VerificationEvidence{}) || !validSimplifiedMetadata(m, in.GatewayID) || m.LastOperationID != id || m.CredentialVersion != o.CredentialVersion || m.OperationStatus != OperationPending || m.Status != expected {
+		s.poison()
+		return out, &DomainError{Code: CodeRecoveryRequired}
+	}
+	var secret string
+	defer func() { secret = "" }()
+	var gen func(context.Context) (string, error)
+	if action != ActionRevoke {
+		gen = func(c context.Context) (string, error) {
+			if c.Err() != nil || secret != "" {
+				return "", &DomainError{Code: CodeInternalError}
+			}
+			p, err := s.simplifiedCfg.GeneratePassword()
+			if err != nil || c.Err() != nil || !validPassword(p) {
+				return "", &DomainError{Code: CodeInternalError}
+			}
+			secret = p
+			return p, nil
+		}
+	}
+	r, execErr := s.simplifiedExecutor.Execute(ctx, o, gen)
+	evidence := VerificationEvidence{}
+	if r.OperationID == id {
+		evidence.RAMApplied, evidence.FreshPositiveVerified = r.Evidence.RAMApplied, r.Evidence.FreshPositiveVerified
+	}
+	verified := execErr == nil && r.OperationID == id && r.Mutated && r.Outcome == ExecutionVerifiedSuccess && evidence.RAMApplied
+	if action == ActionRevoke {
+		verified = verified && r.Evidence.ProtocolDenialVerified && r.Evidence.SessionHandlingVerified && !r.Evidence.FreshPositiveVerified && secret == ""
+	} else {
+		verified = verified && evidence.FreshPositiveVerified && !r.Evidence.ProtocolDenialVerified && !r.Evidence.SessionHandlingVerified && validPassword(secret)
+	}
+	if !verified {
+		outcome := ExecutionRecoveryRequired
+		known := r.OperationID == id && !r.Mutated && r.Outcome == ExecutionUnchangedFailure && r.Evidence == (SimplifiedExecutionEvidence{})
+		if known {
+			outcome = ExecutionUnchangedFailure
+		} else {
+			s.poison()
+		}
+		c, ce := CompleteOperation(o, outcome, evidence, time.Now().UTC())
+		if ce == nil {
+			recovery, stop := context.WithTimeout(context.Background(), s.simplifiedCfg.RecoveryTimeout)
+			if known {
+				_, ce = s.simplifiedRepo.FailKnown(recovery, OperationUpdate{operationGuard(o, m), c})
+			} else {
+				_, ce = s.simplifiedRepo.RequireRecovery(recovery, OperationUpdate{operationGuard(o, m), c})
+			}
+			stop()
+		}
+		if ce != nil {
+			s.poison()
+		}
+		return out, &DomainError{Code: CodeRecoveryRequired}
+	}
+	c, e := CompleteOperation(o, ExecutionVerifiedSuccess, evidence, time.Now().UTC())
+	if e != nil {
+		s.poison()
+		return out, &DomainError{Code: CodeRecoveryRequired}
+	}
+	finalized, finalizeErr := s.simplifiedRepo.ConditionalFinalize(ctx, OperationUpdate{operationGuard(o, m), c})
+	// Always verify the exact current completion, including after a lost COMMIT ACK.
+	recovery, stop := context.WithTimeout(context.Background(), s.simplifiedCfg.RecoveryTimeout)
+	confirmed, oe := s.simplifiedRepo.ResolveCommitAmbiguity(recovery, id)
+	latest, me := s.simplifiedRepo.GetMetadata(recovery, in.GatewayID)
+	stop()
+	if oe != nil || me != nil || !sameCompletion(Completion{Operation: confirmed, Credential: c.Credential}, c) || !validSimplifiedMetadata(latest, in.GatewayID) || latest.LastOperationID != id || latest.CredentialVersion != c.Credential.CredentialVersion || latest.Status != c.Credential.Status || latest.OperationStatus != OperationSucceeded || !reflect.DeepEqual(canonicalSnapshot(CredentialSnapshot{Status: latest.Status, CredentialVersion: latest.CredentialVersion, ActivatedAt: latest.ActivatedAt, RevokedAt: latest.RevokedAt}), canonicalSnapshot(c.Credential)) || latest.LastErrorCode != nil || (finalizeErr == nil && !sameSimplifiedMetadata(finalized, latest)) {
+		s.poison()
+		return out, &DomainError{Code: CodeFinalizationPending}
+	}
+	out.MutationResult = MutationResult{Metadata: latest, OperationID: id}
+	if action != ActionRevoke {
+		v := NewSecretResult(latest, id, secret)
+		out.Secret = &v
+		out.SecretReturned = true
+	}
 	return out, nil
 }
 

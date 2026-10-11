@@ -18,7 +18,26 @@ const (
 	ActionProvision Action = "provision"
 	ActionRotate    Action = "rotate"
 	ActionRevoke    Action = "revoke"
+	ActionReset     Action = "reset"
 )
+
+// ExecutionContract discriminates legacy/complex lifecycle operations from simplified journal operations.
+type ExecutionContract string
+
+const (
+	ContractLifecycle  ExecutionContract = "lifecycle"
+	ContractSimplified ExecutionContract = "simplified"
+)
+
+// Validate rejects unknown execution contracts.
+func (c ExecutionContract) Validate() error {
+	switch c {
+	case ContractLifecycle, ContractSimplified:
+		return nil
+	default:
+		return &DomainError{Code: CodeInvalidRequest}
+	}
+}
 
 // CredentialStatus describes business metadata, not a device handoff receipt.
 type CredentialStatus string
@@ -190,6 +209,12 @@ type Operation struct {
 	// ReplacementPredecessorID identifies a manual current-operation replacement,
 	// not permission to execute or a result for the predecessor.
 	ReplacementPredecessorID *uuid.UUID `json:"replacement_predecessor_id,omitempty"`
+	// ExecutionContract identifies the lifecycle or simplified execution contract.
+	ExecutionContract ExecutionContract `json:"execution_contract,omitempty"`
+	// ResetPredecessorID identifies the superseded predecessor operation of a reset.
+	ResetPredecessorID *uuid.UUID `json:"reset_predecessor_id,omitempty"`
+	// ResetReason identifies the operator intent for a reset.
+	ResetReason *ResetReason `json:"reset_reason,omitempty"`
 }
 
 // Validate checks a live operation's UUID identities and semantic enum groups.
@@ -210,9 +235,30 @@ func (o Operation) ValidateHistorical() error {
 	if o.ReplacementPredecessorID != nil && (*o.ReplacementPredecessorID == uuid.Nil || *o.ReplacementPredecessorID == o.OperationID || o.Action != ActionRotate) {
 		return &DomainError{Code: CodeInvalidRequest}
 	}
-	// Use the nonnil operation identity solely for syntax validation, not authority.
-	if err := ValidateMutationInput(o.OperationID, MutationInput{GatewayID: o.GatewayID, IdempotencyKey: o.IdempotencyKey, Action: o.Action}); err != nil {
-		return err
+	if o.ExecutionContract != "" && o.ExecutionContract.Validate() != nil {
+		return &DomainError{Code: CodeInvalidRequest}
+	}
+	if o.Action == ActionReset {
+		if o.ExecutionContract != ContractSimplified {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
+		if o.ResetPredecessorID == nil || *o.ResetPredecessorID == uuid.Nil || *o.ResetPredecessorID == o.OperationID || o.ResetReason == nil || o.ResetReason.Validate() != nil {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
+		if o.RecoveryID != nil || o.ReplacementPredecessorID != nil {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
+		if err := ValidateResetInput(o.OperationID, ResetInput{GatewayID: o.GatewayID, IdempotencyKey: o.IdempotencyKey, Reason: *o.ResetReason}); err != nil {
+			return err
+		}
+	} else {
+		if o.ResetPredecessorID != nil || o.ResetReason != nil {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
+		// Use the nonnil operation identity solely for syntax validation, not authority.
+		if err := ValidateMutationInput(o.OperationID, MutationInput{GatewayID: o.GatewayID, IdempotencyKey: o.IdempotencyKey, Action: o.Action}); err != nil {
+			return err
+		}
 	}
 	for _, err := range []error{o.Status.Validate(), o.Phase.Validate(), o.DeliveryStatus.Validate()} {
 		if err != nil {
@@ -230,8 +276,16 @@ func (o Operation) ValidateHistorical() error {
 	}
 	// A terminal success must retain the operation-specific proof. Legacy audit
 	// rows lacking this evidence need a separate projection, not invented proof.
-	if o.Status == OperationSucceeded && (!o.Evidence.RAMApplied || !o.Evidence.SnapshotObserved || (o.Action != ActionRevoke && !o.Evidence.FreshPositiveVerified)) {
-		return &DomainError{Code: CodeInvalidRequest}
+	if o.Status == OperationSucceeded {
+		if !o.Evidence.RAMApplied {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
+		if o.ExecutionContract != ContractSimplified && !o.Evidence.SnapshotObserved {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
+		if o.Action != ActionRevoke && !o.Evidence.FreshPositiveVerified {
+			return &DomainError{Code: CodeInvalidRequest}
+		}
 	}
 	if o.Previous != nil && (o.Previous.CredentialVersion <= 0 || o.Previous.Status.Validate() != nil) {
 		return &DomainError{Code: CodeInvalidRequest}
@@ -318,7 +372,7 @@ func CompleteOperation(o Operation, outcome ExecutionOutcome, evidence Verificat
 	if o.ValidateHistorical() != nil || o.Terminal() || at.IsZero() || at.Before(o.CreatedAt) || at.Before(o.UpdatedAt) {
 		return invalid()
 	}
-	if o.Action != ActionProvision && (o.Previous == nil || (o.Previous.Status != CredentialActive && o.ReplacementPredecessorID == nil)) {
+	if o.Action != ActionProvision && (o.Previous == nil || (o.Previous.Status != CredentialActive && o.ReplacementPredecessorID == nil && o.Action != ActionReset)) {
 		return invalid()
 	}
 	if o.Previous != nil {
@@ -338,7 +392,13 @@ func CompleteOperation(o Operation, outcome ExecutionOutcome, evidence Verificat
 	}
 	switch outcome {
 	case ExecutionVerifiedSuccess:
-		if !evidence.RAMApplied || !evidence.SnapshotObserved || (o.Action != ActionRevoke && !evidence.FreshPositiveVerified) {
+		if !evidence.RAMApplied {
+			return invalid()
+		}
+		if o.ExecutionContract != ContractSimplified && !evidence.SnapshotObserved {
+			return invalid()
+		}
+		if o.Action != ActionRevoke && !evidence.FreshPositiveVerified {
 			return invalid()
 		}
 		state.CredentialVersion = o.CredentialVersion
