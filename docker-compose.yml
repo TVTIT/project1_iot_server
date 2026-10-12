@@ -16,7 +16,7 @@ services:
     networks:
       - iot_net
 
-  # 2. MQTT Broker (Eclipse Mosquitto)
+  # 2. MQTT Broker (Eclipse Mosquitto with Dynamic Security)
   mosquitto:
     image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
     user: "1883:1883"
@@ -24,9 +24,6 @@ services:
     security_opt: [no-new-privileges:true]
     entrypoint: ["/usr/sbin/mosquitto"]
     command: ["-c", "/mosquitto/config/mosquitto.conf"]
-    depends_on:
-      mosquitto-auth-init:
-        condition: service_completed_successfully
     container_name: iot_mosquitto
     restart: unless-stopped
     ports:
@@ -34,53 +31,11 @@ services:
       - "8883:8883"
     volumes:
       - ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - mosquitto_auth:/mosquitto/auth:ro
-      - ./config/mosquitto/acl:/mosquitto/config/acl:ro
       - ./config/mosquitto/certs:/mosquitto/config/certs:ro
+      - mosquitto_dynsec:/mosquitto/dynsec
       - mosquitto_data:/mosquitto/data
     networks:
       - iot_net
-
-  # Root is confined to fresh named-volume roots; init then drops UID/GID.
-  mosquitto-auth-init:
-    build:
-      context: ./src
-      target: auth-init
-    user: "0:0"
-    restart: "no"
-    network_mode: none
-    read_only: true
-    cap_drop: [ALL]
-    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
-    security_opt: [no-new-privileges:true]
-    tmpfs: ["/tmp:rw,noexec,nosuid,size=1m,mode=0700,uid=1883,gid=1883"]
-    environment:
-      MQTT_USERNAME: ${MQTT_USERNAME:-backend_service}
-      MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD is required}
-    volumes:
-      - mosquitto_auth:/mosquitto/auth
-      - mosquitto_control:/mosquitto/control
-
-  mosquitto-reloader:
-    build:
-      context: ./src
-      target: reloader
-    user: "1883:1883"
-    restart: unless-stopped
-    network_mode: none
-    pid: service:mosquitto
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    environment:
-      MQTT_RELOAD_SOCKET: /mosquitto/control/reload.sock
-      MQTT_RELOAD_TIMEOUT: ${MQTT_RELOAD_TIMEOUT:-2s}
-      MQTT_RELOAD_MAX_CONNECTIONS: ${MQTT_RELOAD_MAX_CONNECTIONS:-8}
-    volumes:
-      - mosquitto_control:/mosquitto/control
-    depends_on:
-      mosquitto:
-        condition: service_started
 
   # portmap_openvpn:
   #   image: alpine:latest
@@ -316,8 +271,8 @@ services:
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=1m,mode=0700,uid=1883,gid=1883"]
     volumes:
-      - mosquitto_auth:/mosquitto/auth
-      - mosquitto_control:/mosquitto/control:ro
+      # Mount dedicated native store directory volume read-only for snapshot observation.
+      - mosquitto_dynsec:/mosquitto/dynsec:ro
       # Backend verifies the broker with a public CA; never mount broker keys.
       - type: bind
         source: ${MQTT_TLS_CA_SOURCE:-./config/mosquitto/certs/ca.crt}
@@ -340,9 +295,9 @@ services:
       ADMIN_MAX_BODY_BYTES: ${ADMIN_MAX_BODY_BYTES:-16384}
       HTTP_READ_HEADER_TIMEOUT: ${HTTP_READ_HEADER_TIMEOUT:-5s}
       HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-15s}
-      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-30s}
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-55s}
       HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-60s}
-      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-55s}
       MQTT_BROKER_URL: ${MQTT_BROKER_URL:-ssl://mosquitto:8883}
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-backend_monolith}
       MQTT_USERNAME: ${MQTT_USERNAME:-backend_service}
@@ -350,21 +305,33 @@ services:
       MQTT_QUEUE_CAPACITY: ${MQTT_QUEUE_CAPACITY:-256}
       MQTT_WORKER_COUNT: ${MQTT_WORKER_COUNT:-4}
       MQTT_MAX_PAYLOAD_BYTES: ${MQTT_MAX_PAYLOAD_BYTES:-1048576}
-      MQTT_CREDENTIAL_RUNTIME_ENABLED: ${MQTT_CREDENTIAL_RUNTIME_ENABLED:-true}
-      # Legacy broker cannot safely enable the DynSec API. Use the reviewed
-      # lifecycle composition template; never opt in on this ungated service.
-      MQTT_CREDENTIAL_API_ENABLED: "false"
-      MQTT_AUTH_DIR: /mosquitto/auth
-      MQTT_RELOAD_SOCKET: /mosquitto/control/reload.sock
-      MOSQUITTO_PASSWD_PATH: /usr/bin/mosquitto_passwd
+      # Explicit legacy runtime disabled.
+      MQTT_CREDENTIAL_RUNTIME_ENABLED: "false"
+      # Credential API configurable through environment; defaults false until prerequisites are supplied.
+      MQTT_CREDENTIAL_API_ENABLED: ${MQTT_CREDENTIAL_API_ENABLED:-false}
+      INGRESS_GATE_ENABLED: ${INGRESS_GATE_ENABLED:-true}
       MQTT_TLS_CA_FILE: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}
+      MQTT_INTERNAL_MANAGEMENT_URL: ${MQTT_INTERNAL_MANAGEMENT_URL:-ssl://mosquitto:8883}
+      MQTT_DYNSEC_MANAGER_USERNAME: ${MQTT_DYNSEC_MANAGER_USERNAME:-credential_manager}
+      MQTT_DYNSEC_MANAGER_PASSWORD: ${MQTT_DYNSEC_MANAGER_PASSWORD:-}
+      MQTT_DYNSEC_JSON_PATH: ${MQTT_DYNSEC_JSON_PATH:-/mosquitto/dynsec/dynamic-security.json}
+      MQTT_DYNSEC_WRITER_UID: ${MQTT_DYNSEC_WRITER_UID:-}
+      MQTT_DYNSEC_IMAGE_REFERENCE: ${MQTT_DYNSEC_IMAGE_REFERENCE:-eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9}
+      MQTT_DYNSEC_IMAGE_CONFIG_ID: ${MQTT_DYNSEC_IMAGE_CONFIG_ID:-sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9}
+      MQTT_DYNSEC_PLATFORM: ${MQTT_DYNSEC_PLATFORM:-linux/amd64}
+      MQTT_DYNSEC_TIMEOUT: ${MQTT_DYNSEC_TIMEOUT:-3s}
+      MQTT_DYNSEC_QUEUE_SIZE: ${MQTT_DYNSEC_QUEUE_SIZE:-16}
+      MQTT_DYNSEC_MAX_INFLIGHT: ${MQTT_DYNSEC_MAX_INFLIGHT:-1}
+      MQTT_DYNSEC_MAX_PAYLOAD_BYTES: ${MQTT_DYNSEC_MAX_PAYLOAD_BYTES:-65536}
+      MQTT_DYNSEC_MAX_SNAPSHOT_BYTES: ${MQTT_DYNSEC_MAX_SNAPSHOT_BYTES:-1048576}
+      MQTT_CREDENTIAL_DB_TIMEOUT: ${MQTT_CREDENTIAL_DB_TIMEOUT:-2s}
+      MQTT_CREDENTIAL_FINALIZE_TIMEOUT: ${MQTT_CREDENTIAL_FINALIZE_TIMEOUT:-5s}
+      MQTT_CREDENTIAL_RECONCILE_TIMEOUT: ${MQTT_CREDENTIAL_RECONCILE_TIMEOUT:-2m}
+      MQTT_CREDENTIAL_RECONCILE_BATCH_SIZE: ${MQTT_CREDENTIAL_RECONCILE_BATCH_SIZE:-64}
+      MQTT_CREDENTIAL_RECONCILE_MAX_PAGES: ${MQTT_CREDENTIAL_RECONCILE_MAX_PAGES:-16}
       MQTT_CREDENTIAL_OPERATION_TIMEOUT: ${MQTT_CREDENTIAL_OPERATION_TIMEOUT:-10s}
-      MQTT_PASSWORD_TOOL_TIMEOUT: ${MQTT_PASSWORD_TOOL_TIMEOUT:-3s}
-      MQTT_RELOAD_TIMEOUT: ${MQTT_RELOAD_TIMEOUT:-2s}
-      MQTT_CREDENTIAL_PROBE_TIMEOUT: ${MQTT_CREDENTIAL_PROBE_TIMEOUT:-3s}
+      MQTT_CREDENTIAL_REQUEST_TIMEOUT: ${MQTT_CREDENTIAL_REQUEST_TIMEOUT:-40s}
       MQTT_CREDENTIAL_RECOVERY_TIMEOUT: ${MQTT_CREDENTIAL_RECOVERY_TIMEOUT:-5s}
-      MQTT_CREDENTIAL_MAX_FILE_BYTES: ${MQTT_CREDENTIAL_MAX_FILE_BYTES:-1048576}
-      MQTT_CREDENTIAL_MAX_PENDING: ${MQTT_CREDENTIAL_MAX_PENDING:-8}
       SUPABASE_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       SUPABASE_JWT_ISSUER: ${GOTRUE_JWT_ISSUER:?GOTRUE_JWT_ISSUER is required}
       SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:?SUPABASE_JWT_AUDIENCE is required}
@@ -375,10 +342,6 @@ services:
         condition: service_healthy
       mosquitto:
         condition: service_started
-      mosquitto-reloader:
-        condition: service_started
-      mosquitto-auth-init:
-        condition: service_completed_successfully
       supabase-compat-migration:
         condition: service_completed_successfully
       application-migrations:
@@ -409,6 +372,7 @@ services:
 volumes:
   postgres_data:
   mosquitto_data:
+  mosquitto_dynsec:
   mosquitto_auth:
   mosquitto_control:
   storage_data:

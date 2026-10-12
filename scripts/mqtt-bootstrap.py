@@ -228,21 +228,30 @@ def publish(directory_fd, name, data, uid, gid):
             pass
 
 
+def verify_native_tool(tool):
+    """Check the installed binary without reading credentials or touching a store."""
+    executable = Path(tool)
+    try:
+        meta = executable.stat()
+    except OSError:
+        raise BootstrapError('native tool missing or inaccessible; install trusted Mosquitto 2.0.18 on host') from None
+    if not executable.is_absolute() or executable.is_symlink() or not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0 or meta.st_mode & 0o022:
+        raise BootstrapError('trusted root-owned native executable required')
+    for ancestor in executable.parents:
+        meta = ancestor.lstat()
+        if ancestor.is_symlink() or meta.st_uid != 0 or meta.st_mode & 0o022:
+            raise BootstrapError('unsafe native executable ancestor')
+    version = subprocess.run([str(executable), '--help'], capture_output=True,
+                             timeout=5, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+    if b'mosquitto_ctrl version 2.0.18 running on libmosquitto 2.0.18.' not in version.stdout:
+        raise BootstrapError('Mosquitto/libmosquitto 2.0.18 required')
+    return str(executable)
+
+
 def bootstrap(cfg, tool):
     directory_fd = guard_directory(Path(cfg['store']), cfg['broker_uid'], cfg['broker_gid'])
     try:
-        executable = Path(tool)
-        meta = executable.stat()
-        if not executable.is_absolute() or executable.is_symlink() or not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0 or meta.st_mode & 0o022:
-            raise BootstrapError('trusted root-owned native executable required')
-        for ancestor in executable.parents:
-            meta = ancestor.lstat()
-            if ancestor.is_symlink() or meta.st_uid != 0 or meta.st_mode & 0o022:
-                raise BootstrapError('unsafe native executable ancestor')
-        version = subprocess.run([str(executable), '--help'], capture_output=True,
-                                 timeout=5, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-        if b'mosquitto_ctrl version 2.0.18 running on libmosquitto 2.0.18.' not in version.stdout:
-            raise BootstrapError('Mosquitto/libmosquitto 2.0.18 required')
+        executable = verify_native_tool(tool)
         old_umask = os.umask(0o077)
         try:
             data = build_store(cfg, str(executable))
@@ -256,8 +265,14 @@ def bootstrap(cfg, tool):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--native-tool', default='/usr/bin/mosquitto_ctrl')
+    parser.add_argument('--check-native-tool', action='store_true',
+                        help='verify installed dependency only; no stdin or store access')
     args = parser.parse_args()
     try:
+        if args.check_native_tool:
+            verify_native_tool(args.native_tool)
+            print('native tool dependency verified; no store written; NOT READY')
+            return 0
         bootstrap(parse_config(sys.stdin), args.native_tool)
     except BootstrapError as error:
         print(str(error), file=sys.stderr)
