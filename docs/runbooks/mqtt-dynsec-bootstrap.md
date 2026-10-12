@@ -183,37 +183,29 @@ Script sẽ in ra siêu dữ liệu an toàn dưới định dạng JSON (không
 
 ---
 
-## 5. Cấu hình Docker Compose Override cho Volume mới
+## 5. Cấu hình Docker Compose với Volume mới qua `.env`
 
-Để áp dụng volume vừa khởi tạo vào hệ thống mà không làm thay đổi file `docker-compose.yml` gốc đã theo dõi trong Git, ta sử dụng một file Compose override cục bộ.
-
-### Bước 5.1: Loại trừ file override khỏi Git
-**Trước khi tạo hoặc lưu file override**, hãy chắc chắn rằng file này không bị Git theo dõi. Thêm đường dẫn file vào `.git/info/exclude` (hoặc file `.gitignore` cục bộ):
-
-```bash
-# Thực hiện thủ công bởi operator (không tự động can thiệp vào .git):
-echo "docker-compose.override.dynsec.yml" >> .git/info/exclude
-```
-
-### Bước 5.2: Tạo file `docker-compose.override.dynsec.yml`
-Tạo file override cục bộ với nội dung khai báo volume logic `mosquitto_dynsec` ở mức top-level trỏ tới volume ngoài (`external: true`):
-
+Tệp `docker-compose.yml` gốc đã tích hợp sẵn hỗ trợ định danh volume linh hoạt:
 ```yaml
-version: "3.8"
-
 volumes:
   mosquitto_dynsec:
-    external: true
-    name: ${MQTT_DYNSEC_BOOTSTRAP_VOLUME:?MQTT_DYNSEC_BOOTSTRAP_VOLUME is required}
+    name: ${MQTT_DYNSEC_BOOTSTRAP_VOLUME:-mosquitto_dynsec}
 ```
 
-*Lưu ý:*
-- Tên volume logic ở mức top-level phải khớp chính xác với `mosquitto_dynsec` trong `docker-compose.yml` gốc. Cả hai điểm gắn kết (mount) của `mosquitto` (đọc-ghi) và `backend` (chỉ đọc) đều được giữ nguyên vẹn.
-- Biến môi trường `MQTT_DYNSEC_BOOTSTRAP_VOLUME` là biến mới chỉ phục vụ cho file override này (không phải là biến dựng sẵn của compose gốc). Khai báo giá trị này trong `.env` cục bộ với giá trị `volume_name` thu được từ Bước 4:
-  ```bash
-  # Thêm vào file .env cục bộ:
-  MQTT_DYNSEC_BOOTSTRAP_VOLUME=mosquitto_dynsec_a1b2c3d4e5f60718293a4b5c
-  ```
+Do đó, Platform Operator **không cần tạo thêm tệp override cục bộ**, mà chỉ cần cấu hình trực tiếp vào tệp `.env`:
+
+1. Mở tệp `.env` bằng trình soạn thảo an toàn.
+2. Thiết lập biến `MQTT_DYNSEC_BOOTSTRAP_VOLUME` bằng giá trị `volume_name` thu được từ Bước 4:
+   ```bash
+   # Cập nhật trong .env:
+   MQTT_DYNSEC_BOOTSTRAP_VOLUME=mosquitto_dynsec_a1b2c3d4e5f60718293a4b5c
+   ```
+3. Đồng thời xác nhận các biến thông tin đăng nhập trong `.env` đã được điền chính xác:
+   - `MQTT_DYNSEC_MANAGER_USERNAME`: Khớp với tên manager đã nhập.
+   - `MQTT_DYNSEC_MANAGER_PASSWORD`: Khớp với mật khẩu manager đã nhập.
+   - `MQTT_USERNAME`: Khớp với tên backend đã nhập.
+   - `MQTT_PASSWORD`: Khớp với mật khẩu backend đã nhập.
+   - `MQTT_CREDENTIAL_API_ENABLED=true`: Bật API quản trị credential sau khi store đã sẵn sàng.
 
 ---
 
@@ -231,11 +223,11 @@ Dừng dịch vụ `backend` và `mosquitto` hiện tại:
 docker compose stop backend mosquitto
 ```
 
-### Bước 6.2: Khởi tạo lại với file override
-Tạo lại và khởi động hai dịch vụ với cấu hình volume mới:
+### Bước 6.2: Khởi tạo lại với volume mới
+Tạo lại và khởi động hai dịch vụ (Docker Compose sẽ tự động nhận diện `MQTT_DYNSEC_BOOTSTRAP_VOLUME` từ `.env`):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.override.dynsec.yml up -d mosquitto backend
+docker compose up -d mosquitto backend
 ```
 
 > **Lưu ý về cờ `--no-deps`:**

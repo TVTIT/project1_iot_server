@@ -20,10 +20,10 @@ services:
   mosquitto:
     image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
     user: "1883:1883"
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    entrypoint: ["/usr/sbin/mosquitto"]
-    command: ["-c", "/mosquitto/config/mosquitto.conf"]
+    cap_drop: [ ALL ]
+    security_opt: [ no-new-privileges:true ]
+    entrypoint: [ "/usr/sbin/mosquitto" ]
+    command: [ "-c", "/mosquitto/config/mosquitto.conf" ]
     container_name: iot_mosquitto
     restart: unless-stopped
     ports:
@@ -74,8 +74,6 @@ services:
     depends_on:
       - mosquitto
 
-
-
   # 3. Database: PostgreSQL with TimescaleDB
   postgres:
     image: timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
@@ -96,7 +94,7 @@ services:
     networks:
       - iot_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-iot_platform}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-iot_platform}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -118,7 +116,7 @@ services:
       BACKEND_DB_PASSWORD: ${BACKEND_DB_PASSWORD:?BACKEND_DB_PASSWORD is required}
     volumes:
       - ./migrations/000000_configure_supabase_roles.sh:/migrations/000000_configure_supabase_roles.sh:ro
-    command: ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"]
+    command: [ "/bin/sh", "/migrations/000000_configure_supabase_roles.sh" ]
     networks:
       - iot_net
 
@@ -139,7 +137,7 @@ services:
     volumes:
       - ./migrations:/migrations:ro
       - ./scripts/run-migrations.sh:/run-migrations.sh:ro
-    command: ["/bin/sh", "/run-migrations.sh"]
+    command: [ "/bin/sh", "/run-migrations.sh" ]
     networks:
       - iot_net
 
@@ -162,7 +160,7 @@ services:
       SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-admin}
-    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
+    entrypoint: [ "/bin/sh", "/docker-entrypoint.sh" ]
     networks:
       iot_net:
         aliases:
@@ -178,7 +176,7 @@ services:
       supabase-role-provisioner:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health" ]
       timeout: 5s
       interval: 10s
       retries: 3
@@ -235,7 +233,7 @@ services:
       supabase-role-provisioner:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status" ]
       timeout: 5s
       interval: 10s
       retries: 3
@@ -266,10 +264,10 @@ services:
       dockerfile: Dockerfile
       target: backend
     user: "1883:1883"
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
+    cap_drop: [ ALL ]
+    security_opt: [ no-new-privileges:true ]
     read_only: true
-    tmpfs: ["/tmp:rw,noexec,nosuid,size=1m,mode=0700,uid=1883,gid=1883"]
+    tmpfs: [ "/tmp:rw,noexec,nosuid,size=1m,mode=0700,uid=1883,gid=1883" ]
     volumes:
       # Mount dedicated native store directory volume read-only for snapshot observation.
       - mosquitto_dynsec:/mosquitto/dynsec:ro
@@ -347,7 +345,7 @@ services:
       application-migrations:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/readyz"]
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/readyz" ]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -373,6 +371,7 @@ volumes:
   postgres_data:
   mosquitto_data:
   mosquitto_dynsec:
+    name: ${MQTT_DYNSEC_BOOTSTRAP_VOLUME:-mosquitto_dynsec}
   mosquitto_auth:
   mosquitto_control:
   storage_data:
