@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -103,6 +106,11 @@ func (f *fakeSimplifiedExecutor) CheckRevoked(ctx context.Context, gatewayID str
 }
 
 func baseValidConfig() config.CredentialConfig {
+	qual, _ := mqttcredential.NewNativeDisableQualification(
+		mqttcredential.QualifiedMosquittoImageRef,
+		mqttcredential.QualifiedMosquittoConfigID,
+		mqttcredential.QualifiedMosquittoPlatform,
+	)
 	return config.CredentialConfig{
 		Enabled:          true,
 		ManagerUsername:  "admin",
@@ -110,6 +118,10 @@ func baseValidConfig() config.CredentialConfig {
 		BackendPassword:  "backend_pass_12345",
 		ManagementURL:    "ssl://localhost:8883",
 		CAFile:           "/valid/ca.crt",
+		SnapshotPath:     "/security/dynsec.json",
+		WriterUID:        1883,
+		MaxSnapshotBytes: 1 << 20,
+		Qualification:    qual,
 		DBTimeout:        time.Second,
 		FinalizeTimeout:  2 * time.Second,
 		ReconcileTimeout: 5 * time.Second,
@@ -123,6 +135,52 @@ func baseValidConfig() config.CredentialConfig {
 		MaxInflight:      1,
 		MaxPayloadBytes:  65536,
 	}
+}
+
+func TestActiveComposition_PrerequisitesValidation(t *testing.T) {
+	pool := &pgxpool.Pool{}
+	seam := compositionSeam{
+		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			t.Fatal("acquireOwner must not be called when prerequisites are invalid")
+			return nil, nil
+		},
+	}
+
+	validCfg := baseValidConfig()
+
+	// 1. Missing / invalid qualification
+	t.Run("missing qualification", func(t *testing.T) {
+		cfg := validCfg
+		cfg.Qualification = mqttcredential.NativeDisableQualification{}
+		_, err := composeCredentialsWithSeam(context.Background(), pool, cfg, seam)
+		if err == nil {
+			t.Fatal("expected error on missing qualification")
+		}
+	})
+
+	// 2. Missing / non-absolute / unclean snapshot path
+	t.Run("invalid snapshot path", func(t *testing.T) {
+		for _, p := range []string{"", "relative/path.json", "/unclean/../path.json"} {
+			cfg := validCfg
+			cfg.SnapshotPath = p
+			_, err := composeCredentialsWithSeam(context.Background(), pool, cfg, seam)
+			if err == nil {
+				t.Fatalf("expected error on invalid snapshot path %q", p)
+			}
+		}
+	})
+
+	// 3. Invalid max snapshot bytes
+	t.Run("invalid max snapshot bytes", func(t *testing.T) {
+		for _, b := range []int{0, -1, (64 << 20) + 1} {
+			cfg := validCfg
+			cfg.MaxSnapshotBytes = b
+			_, err := composeCredentialsWithSeam(context.Background(), pool, cfg, seam)
+			if err == nil {
+				t.Fatalf("expected error on invalid max snapshot bytes %d", b)
+			}
+		}
+	})
 }
 
 func validTestCA(t *testing.T) []byte {
@@ -781,6 +839,135 @@ func TestActiveComposition_BrokerAuthFailure_ReadinessFalse(t *testing.T) {
 	}
 	if err := comp.close(); err != nil {
 		t.Fatalf("expected clean close: %v", err)
+	}
+}
+
+func TestActiveComposition_WiredQualificationAndSnapshotVerifier(t *testing.T) {
+	conn := &fakeTestOwnerConn{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return boolRow(true)
+		},
+	}
+	pool := &pgxpool.Pool{}
+
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
+	snapPath := filepath.Join(dir, "native.json")
+
+	// Target gateway
+	targetGW := "gateway_001"
+	acls := []map[string]any{
+		{"acltype": "publishClientSend", "topic": "gateways/gateway_001/telemetry/#", "priority": 0, "allow": true},
+		{"acltype": "publishClientSend", "topic": "gateways/gateway_001/status", "priority": 0, "allow": true},
+		{"acltype": "publishClientSend", "topic": "gateways/gateway_001/responses/#", "priority": 0, "allow": true},
+		{"acltype": "publishClientReceive", "topic": "gateways/gateway_001/acks/#", "priority": 0, "allow": true},
+		{"acltype": "publishClientReceive", "topic": "gateways/gateway_001/commands/#", "priority": 0, "allow": true},
+		{"acltype": "subscribeLiteral", "topic": "gateways/gateway_001/acks/#", "priority": 0, "allow": true},
+		{"acltype": "subscribeLiteral", "topic": "gateways/gateway_001/commands/#", "priority": 0, "allow": true},
+		{"acltype": "unsubscribeLiteral", "topic": "gateways/gateway_001/acks/#", "priority": 0, "allow": true},
+		{"acltype": "unsubscribeLiteral", "topic": "gateways/gateway_001/commands/#", "priority": 0, "allow": true},
+	}
+
+	buildStoreJSON := func(disabled bool, customACLs []map[string]any) []byte {
+		payload := map[string]any{
+			"clients": []any{
+				map[string]any{
+					"username": targetGW,
+					"disabled": disabled,
+					"roles":    []any{map[string]any{"rolename": "gateway_" + targetGW, "priority": 0}},
+				},
+			},
+			"roles": []any{
+				map[string]any{
+					"rolename": "gateway_" + targetGW,
+					"acls":     customACLs,
+				},
+			},
+		}
+		data, _ := json.Marshal(payload)
+		return data
+	}
+
+	// Write synthetic store file: disabled: true and expected ACLs
+	if err := os.WriteFile(snapPath, buildStoreJSON(true, acls), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedCfg mqttcredential.SimplifiedDynSecConfig
+	seam := compositionSeam{
+		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
+		},
+		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
+		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+			return &mqttcredential.PostgresRepository{}, nil
+		},
+		newClassifier: func(r mqttcredential.SimplifiedStartupRepository, opts mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
+			return &mqttcredential.SimplifiedStartupClassifier{}, nil
+		},
+		classifyTarget: func(ctx context.Context, c *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
+			return mqttcredential.ClassificationResult{Status: mqttcredential.ClassificationCompleted}, nil
+		},
+		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+			return nil
+		},
+		newExecutor: func(cfg mqttcredential.SimplifiedDynSecConfig) (mqttcredential.SimplifiedExecutor, error) {
+			capturedCfg = cfg
+			return &fakeSimplifiedExecutor{}, nil
+		},
+	}
+
+	cfg := baseValidConfig()
+	cfg.SnapshotPath = snapPath
+	cfg.WriterUID = uint32(os.Getuid())
+
+	comp, err := composeCredentialsWithSeam(context.Background(), pool, cfg, seam)
+	if err != nil {
+		t.Fatalf("unexpected composition error: %v", err)
+	}
+	defer func() { _ = comp.close() }()
+
+	// 1. Verify qualification was injected
+	if capturedCfg.Qualification != cfg.Qualification {
+		t.Fatalf("expected qualification %+v, got %+v", cfg.Qualification, capturedCfg.Qualification)
+	}
+
+	// 2. Verify VerifyRevoked was injected and is backed by the real protected reader
+	if capturedCfg.VerifyRevoked == nil {
+		t.Fatal("expected VerifyRevoked to be injected, got nil")
+	}
+
+	// Test 2a: Matches revoked disabled store -> returns nil
+	if err := capturedCfg.VerifyRevoked(context.Background(), targetGW); err != nil {
+		t.Fatalf("expected nil error for valid revoked snapshot, got: %v", err)
+	}
+
+	// Test 2b: Target excluded/protected (e.g. backend or manager) -> rejected
+	if err := capturedCfg.VerifyRevoked(context.Background(), cfg.ManagerUsername); err == nil {
+		t.Fatal("expected error when validating protected manager target")
+	}
+	if err := capturedCfg.VerifyRevoked(context.Background(), mqttcredential.BackendUsername); err == nil {
+		t.Fatal("expected error when validating protected backend target")
+	}
+
+	// Test 2c: Mismatch when store has disabled: false -> returns error
+	if err := os.WriteFile(snapPath, buildStoreJSON(false, acls), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := capturedCfg.VerifyRevoked(context.Background(), targetGW); err == nil {
+		t.Fatal("expected error when client in snapshot is enabled")
+	}
+
+	// Test 2d: Mismatch when store has wrong ACLs -> returns error
+	wrongACLs := []map[string]any{
+		{"type": "publishClientSend", "topic": "gateways/gateway_001/telemetry/#", "priority": 0, "allow": false},
+	}
+	if err := os.WriteFile(snapPath, buildStoreJSON(true, wrongACLs), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := capturedCfg.VerifyRevoked(context.Background(), targetGW); err == nil {
+		t.Fatal("expected error when role in snapshot has wrong ACLs")
 	}
 }
 

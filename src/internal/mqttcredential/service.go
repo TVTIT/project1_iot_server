@@ -886,12 +886,17 @@ func (s *ProvisionService) mutateSimplified(ctx context.Context, actor uuid.UUID
 	evidence := VerificationEvidence{}
 	if r.OperationID == id {
 		evidence.RAMApplied, evidence.FreshPositiveVerified = r.Evidence.RAMApplied, r.Evidence.FreshPositiveVerified
+		// Revoke's protected native-store observation is filesystem evidence,
+		// not fsync durability or proof of an exact persisted new password.
+		if action == ActionRevoke {
+			evidence.SnapshotObserved = r.Evidence.NativePersistedRoleACLObserved
+		}
 	}
 	verified := execErr == nil && r.OperationID == id && r.Mutated && r.Outcome == ExecutionVerifiedSuccess && evidence.RAMApplied
 	if action == ActionRevoke {
-		verified = verified && r.Evidence.ProtocolDenialVerified && r.Evidence.SessionHandlingVerified && !r.Evidence.FreshPositiveVerified && secret == ""
+		verified = verified && r.Evidence.NativeDisabledObserved && r.Evidence.NativePersistedRoleACLObserved && r.Evidence.Qualification.Valid() && !r.Evidence.ProtocolDenialVerified && !r.Evidence.SessionHandlingVerified && !r.Evidence.FreshPositiveVerified && secret == ""
 	} else {
-		verified = verified && evidence.FreshPositiveVerified && !r.Evidence.ProtocolDenialVerified && !r.Evidence.SessionHandlingVerified && validPassword(secret)
+		verified = verified && evidence.FreshPositiveVerified && !r.Evidence.ProtocolDenialVerified && !r.Evidence.SessionHandlingVerified && !r.Evidence.NativeDisabledObserved && !r.Evidence.NativePersistedRoleACLObserved && r.Evidence.Qualification.IsZero() && validPassword(secret)
 	}
 	if !verified {
 		outcome := ExecutionRecoveryRequired
@@ -922,12 +927,14 @@ func (s *ProvisionService) mutateSimplified(ctx context.Context, actor uuid.UUID
 		return out, &DomainError{Code: CodeRecoveryRequired}
 	}
 	finalized, finalizeErr := s.simplifiedRepo.ConditionalFinalize(ctx, OperationUpdate{operationGuard(o, m), c})
-	// Always verify the exact current completion, including after a lost COMMIT ACK.
+	// Read back the exact completion, including after a lost COMMIT ACK, without
+	// rewriting terminal database truth or retrying broker mutation. An error from
+	// finalization still forbids success/secret disclosure for this request.
 	recovery, stop := context.WithTimeout(context.Background(), s.simplifiedCfg.RecoveryTimeout)
 	confirmed, oe := s.simplifiedRepo.ResolveCommitAmbiguity(recovery, id)
 	latest, me := s.simplifiedRepo.GetMetadata(recovery, in.GatewayID)
 	stop()
-	if oe != nil || me != nil || !sameCompletion(Completion{Operation: confirmed, Credential: c.Credential}, c) || !validSimplifiedMetadata(latest, in.GatewayID) || latest.LastOperationID != id || latest.CredentialVersion != c.Credential.CredentialVersion || latest.Status != c.Credential.Status || latest.OperationStatus != OperationSucceeded || !reflect.DeepEqual(canonicalSnapshot(CredentialSnapshot{Status: latest.Status, CredentialVersion: latest.CredentialVersion, ActivatedAt: latest.ActivatedAt, RevokedAt: latest.RevokedAt}), canonicalSnapshot(c.Credential)) || latest.LastErrorCode != nil || (finalizeErr == nil && !sameSimplifiedMetadata(finalized, latest)) {
+	if finalizeErr != nil || oe != nil || me != nil || !sameCompletion(Completion{Operation: confirmed, Credential: c.Credential}, c) || !validSimplifiedMetadata(latest, in.GatewayID) || latest.LastOperationID != id || latest.CredentialVersion != c.Credential.CredentialVersion || latest.Status != c.Credential.Status || latest.OperationStatus != OperationSucceeded || !reflect.DeepEqual(canonicalSnapshot(CredentialSnapshot{Status: latest.Status, CredentialVersion: latest.CredentialVersion, ActivatedAt: latest.ActivatedAt, RevokedAt: latest.RevokedAt}), canonicalSnapshot(c.Credential)) || latest.LastErrorCode != nil || !sameSimplifiedMetadata(finalized, latest) {
 		s.poison()
 		return out, &DomainError{Code: CodeFinalizationPending}
 	}

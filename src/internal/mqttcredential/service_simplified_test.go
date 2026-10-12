@@ -142,10 +142,17 @@ func simplifiedServiceFixture(t *testing.T, action Action) (*ProvisionService, *
 	}
 	m := Metadata{GatewayID: in.GatewayID, Username: in.GatewayID, CredentialVersion: o.CredentialVersion, Status: status, LastOperationID: id, OperationStatus: OperationPending}
 	r := &spySimplifiedRepo{admin: true, beginResult: BeginResult{Execute: true, Operation: o, Metadata: m}}
-	// SYNTHETIC CONTRACT FIXTURE (mock-only): When action == ActionRevoke, SessionHandlingVerified
-	// is explicitly set to true ONLY to test the service-layer qualified success contract.
-	// This is a unit test spy assertion and does NOT constitute native session proof or qualification.
-	e := &spySimplifiedExecutor{generate: true, execResult: SimplifiedExecutionResult{OperationID: id, Outcome: ExecutionVerifiedSuccess, Mutated: true, Evidence: SimplifiedExecutionEvidence{RAMApplied: true, FreshPositiveVerified: action != ActionRevoke, ProtocolDenialVerified: action == ActionRevoke, SessionHandlingVerified: action == ActionRevoke}}}
+	// Mock contract evidence only; this fixture is not native execution proof.
+	e := &spySimplifiedExecutor{generate: action != ActionRevoke, execResult: SimplifiedExecutionResult{OperationID: id, Outcome: ExecutionVerifiedSuccess, Mutated: true, Evidence: SimplifiedExecutionEvidence{RAMApplied: true, FreshPositiveVerified: action != ActionRevoke}}}
+	if action == ActionRevoke {
+		q, err := NewNativeDisableQualification(QualifiedMosquittoImageRef, QualifiedMosquittoConfigID, QualifiedMosquittoPlatform)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.execResult.Evidence.Qualification = q
+		e.execResult.Evidence.NativeDisabledObserved = true
+		e.execResult.Evidence.NativePersistedRoleACLObserved = true
+	}
 	s, err := NewSimplifiedProvisionService(r, e, &spyResetPrerequisite{}, SimplifiedProvisionServiceOptions{RecoveryTimeout: time.Second, NewOperationID: func() (uuid.UUID, error) { return id, nil }, GeneratePassword: func() (string, error) { return strings.Repeat("a", 48), nil }})
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +175,7 @@ func TestSimplifiedService_Orchestration(t *testing.T) {
 			if err == nil || out.Secret != nil {
 				t.Fatal("disclosed without readback")
 			}
-			if r.completion.Operation.Status != OperationSucceeded || r.completion.Operation.Evidence.SnapshotObserved {
+			if r.completion.Operation.Status != OperationSucceeded || r.completion.Operation.Evidence.SnapshotObserved != (action == ActionRevoke) {
 				t.Fatal("completion evidence")
 			}
 		})
@@ -185,7 +192,11 @@ func TestSimplifiedService_FinalizeBeforeDisclosure(t *testing.T) {
 					r.finalizeErr = errors.New("lost commit acknowledgement")
 				}
 				out, err := s.mutate(context.Background(), a, in, action)
-				if err != nil || out.SecretReturned != (action != ActionRevoke) || (out.Secret != nil) != (action != ActionRevoke) {
+				if ambiguous {
+					if err == nil || err.Error() != string(CodeFinalizationPending) || out.SecretReturned || out.Secret != nil || !s.poisoned {
+						t.Fatalf("ambiguous finalization must not succeed/disclose: %v", err)
+					}
+				} else if err != nil || out.SecretReturned != (action != ActionRevoke) || (out.Secret != nil) != (action != ActionRevoke) {
 					t.Fatalf("completion %v", err)
 				}
 				if !reflect.DeepEqual(r.calls, []string{"IsPlatformAdmin", "BeginSimplifiedOperation:" + string(action), "ConditionalFinalize", "ResolveCommitAmbiguity", "GetMetadata"}) {
@@ -193,6 +204,72 @@ func TestSimplifiedService_FinalizeBeforeDisclosure(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestSimplifiedService_QualifiedEvidenceFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action Action
+		change func(*SimplifiedExecutionResult)
+	}{
+		{"qualification", ActionRevoke, func(r *SimplifiedExecutionResult) { r.Evidence.Qualification = NativeDisableQualification{} }},
+		{"disabled", ActionRevoke, func(r *SimplifiedExecutionResult) { r.Evidence.NativeDisabledObserved = false }},
+		{"persisted", ActionRevoke, func(r *SimplifiedExecutionResult) { r.Evidence.NativePersistedRoleACLObserved = false }},
+		{"fake denial", ActionRevoke, func(r *SimplifiedExecutionResult) { r.Evidence.ProtocolDenialVerified = true }},
+		{"fake session", ActionRevoke, func(r *SimplifiedExecutionResult) { r.Evidence.SessionHandlingVerified = true }},
+		{"wrong operation", ActionRevoke, func(r *SimplifiedExecutionResult) { r.OperationID = uuid.New() }},
+		{"rotate disabled", ActionRotate, func(r *SimplifiedExecutionResult) { r.Evidence.NativeDisabledObserved = true }},
+		{"rotate persisted", ActionRotate, func(r *SimplifiedExecutionResult) { r.Evidence.NativePersistedRoleACLObserved = true }},
+		{"provision qualification", ActionProvision, func(r *SimplifiedExecutionResult) {
+			q, _ := NewNativeDisableQualification(QualifiedMosquittoImageRef, QualifiedMosquittoConfigID, QualifiedMosquittoPlatform)
+			r.Evidence.Qualification = q
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, e, a, in := simplifiedServiceFixture(t, tc.action)
+			r.autoComplete = true
+			tc.change(&e.execResult)
+			out, err := s.mutate(context.Background(), a, in, tc.action)
+			if err == nil || err.Error() != string(CodeRecoveryRequired) || out.Secret != nil || out.SecretReturned || !s.poisoned {
+				t.Fatalf("invalid evidence accepted: %v", err)
+			}
+			if len(e.calls) != 1 || r.calls[len(r.calls)-1] != "RequireRecovery" {
+				t.Fatalf("must recover without compensating execution: %v %v", e.calls, r.calls)
+			}
+		})
+	}
+}
+
+func TestSimplifiedService_FinalizeErrorPreservesSuccessAndReplay(t *testing.T) {
+	s, r, e, a, in := simplifiedServiceFixture(t, ActionRotate)
+	r.autoComplete = true
+	r.finalizeErr = errors.New("lost commit acknowledgement")
+	out, err := s.Rotate(context.Background(), a, in)
+	if err == nil || err.Error() != string(CodeFinalizationPending) || out.Secret != nil || out.SecretReturned {
+		t.Fatalf("ambiguous request must not succeed/disclose: %v", err)
+	}
+	if r.ambiguityOp.Status != OperationSucceeded || r.getMeta.OperationStatus != OperationSucceeded || len(e.calls) != 1 {
+		t.Fatal("terminal database success must remain intact")
+	}
+	for _, call := range r.calls {
+		if call == "RequireRecovery" || call == "FailKnown" {
+			t.Fatal("terminal success rewritten")
+		}
+	}
+	// The fake exposes the committed completion as a same-key metadata-only replay.
+	replay, err := ReplayOperation(r.ambiguityOp, a, in, r.getMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.beginResult = BeginResult{Operation: r.ambiguityOp, Metadata: r.getMeta, Replay: &replay}
+	fresh, err := NewSimplifiedProvisionService(r, e, &spyResetPrerequisite{}, s.simplifiedCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = fresh.Rotate(context.Background(), a, in)
+	if err != nil || out.Secret != nil || out.SecretReturned || out.ReplayedStatus != OperationSucceeded || len(e.calls) != 1 {
+		t.Fatalf("replay must be metadata-only without another mutation: %v", err)
 	}
 }
 
@@ -346,13 +423,11 @@ func TestSimplifiedService_CompileRED(t *testing.T) {
 	_ = svc
 }
 
-// RED contract test: Revoke executor without SessionHandlingVerified must fail closed
-// and require recovery (poisoning the service), NOT finalize succeeded.
-func TestSimplifiedService_Revoke_MissingSessionEvidence_MustRequireRecovery(t *testing.T) {
+// Legacy flags cannot substitute for typed qualification and native observations.
+func TestSimplifiedService_Revoke_LegacyOnlyEvidence_MustRequireRecovery(t *testing.T) {
 	s, r, e, a, in := simplifiedServiceFixture(t, ActionRevoke)
 	r.autoComplete = true
-	// Executor returns Mutated=true, ExecutionVerifiedSuccess, RAMApplied=true, ProtocolDenialVerified=true,
-	// but SessionHandlingVerified=false (missing active session handling evidence).
+	// Old denial/session booleans are not native qualification or persisted readback.
 	e.execResult = SimplifiedExecutionResult{
 		OperationID: r.beginResult.Operation.OperationID,
 		Outcome:     ExecutionVerifiedSuccess,
@@ -361,48 +436,38 @@ func TestSimplifiedService_Revoke_MissingSessionEvidence_MustRequireRecovery(t *
 			RAMApplied:              true,
 			FreshPositiveVerified:   false,
 			ProtocolDenialVerified:  true,
-			SessionHandlingVerified: false,
+			SessionHandlingVerified: true,
 		},
 	}
 
 	res, err := s.mutate(context.Background(), a, in, ActionRevoke)
 	if err == nil {
-		t.Fatal("expected error when SessionHandlingVerified is false, got nil")
+		t.Fatal("legacy-only evidence must not succeed")
 	}
 	if res.SecretReturned || res.Secret != nil {
 		t.Fatal("secret returned on failed revoke")
 	}
 	// Service must require recovery and poison
 	if !s.poisoned {
-		t.Fatal("service must be poisoned when executor reports Mutated+VerifiedSuccess without active session evidence")
+		t.Fatal("service must be poisoned after unqualified mutated execution")
 	}
 	if len(r.calls) == 0 || r.calls[len(r.calls)-1] != "RequireRecovery" {
 		t.Fatalf("expected last call to be RequireRecovery, got calls: %v", r.calls)
 	}
 	for _, call := range r.calls {
 		if call == "ConditionalFinalize" {
-			t.Fatal("ConditionalFinalize must NOT be called when session evidence is missing")
+			t.Fatal("ConditionalFinalize must NOT be called without native qualification")
 		}
 	}
 }
 
 // Contract tests for all predicate boundary conditions on simplified operations.
 func TestSimplifiedService_EvidenceContractMatrix(t *testing.T) {
-	t.Run("Revoke: synthetic contract test with all evidence verified succeeds", func(t *testing.T) {
+	t.Run("Revoke: typed qualified observation succeeds without generator", func(t *testing.T) {
 		s, r, e, a, in := simplifiedServiceFixture(t, ActionRevoke)
 		r.autoComplete = true
-		// SYNTHETIC CONTRACT TEST (explicitly mock/spy only, NOT native session proof):
-		e.execResult = SimplifiedExecutionResult{
-			OperationID: r.beginResult.Operation.OperationID,
-			Outcome:     ExecutionVerifiedSuccess,
-			Mutated:     true,
-			Evidence: SimplifiedExecutionEvidence{
-				RAMApplied:              true,
-				FreshPositiveVerified:   false,
-				ProtocolDenialVerified:  true,
-				SessionHandlingVerified: true,
-			},
-		}
+		s.simplifiedCfg.GeneratePassword = func() (string, error) { t.Fatal("revoke called generator"); return "", nil }
+		e.generate = true // Spy tries generation only if service supplies a callback.
 		out, err := s.mutate(context.Background(), a, in, ActionRevoke)
 		if err != nil {
 			t.Fatalf("synthetic complete evidence must succeed in service unit test, got: %v", err)
@@ -413,62 +478,35 @@ func TestSimplifiedService_EvidenceContractMatrix(t *testing.T) {
 		if s.poisoned {
 			t.Fatal("service should not be poisoned on valid synthetic completion")
 		}
+		if !r.completion.Operation.Evidence.SnapshotObserved || r.completion.Operation.Evidence.FreshPositiveVerified {
+			t.Fatal("persisted revoke observation must map to snapshot evidence only")
+		}
 	})
 
 	t.Run("Revoke: missing RAMApplied fails closed with recovery", func(t *testing.T) {
 		s, r, e, a, in := simplifiedServiceFixture(t, ActionRevoke)
 		r.autoComplete = true
-		e.execResult = SimplifiedExecutionResult{
-			OperationID: r.beginResult.Operation.OperationID,
-			Outcome:     ExecutionVerifiedSuccess,
-			Mutated:     true,
-			Evidence: SimplifiedExecutionEvidence{
-				RAMApplied:              false,
-				FreshPositiveVerified:   false,
-				ProtocolDenialVerified:  true,
-				SessionHandlingVerified: true,
-			},
-		}
+		e.execResult.Evidence.RAMApplied = false
 		_, err := s.mutate(context.Background(), a, in, ActionRevoke)
 		if err == nil || !s.poisoned {
 			t.Fatal("missing RAMApplied must poison and fail closed")
 		}
 	})
 
-	t.Run("Revoke: missing ProtocolDenialVerified fails closed with recovery", func(t *testing.T) {
+	t.Run("Revoke: missing native disabled observation fails closed with recovery", func(t *testing.T) {
 		s, r, e, a, in := simplifiedServiceFixture(t, ActionRevoke)
 		r.autoComplete = true
-		e.execResult = SimplifiedExecutionResult{
-			OperationID: r.beginResult.Operation.OperationID,
-			Outcome:     ExecutionVerifiedSuccess,
-			Mutated:     true,
-			Evidence: SimplifiedExecutionEvidence{
-				RAMApplied:              true,
-				FreshPositiveVerified:   false,
-				ProtocolDenialVerified:  false,
-				SessionHandlingVerified: true,
-			},
-		}
+		e.execResult.Evidence.NativeDisabledObserved = false
 		_, err := s.mutate(context.Background(), a, in, ActionRevoke)
 		if err == nil || !s.poisoned {
-			t.Fatal("missing ProtocolDenialVerified must poison and fail closed")
+			t.Fatal("missing native disabled observation must poison and fail closed")
 		}
 	})
 
 	t.Run("Revoke: contradictory FreshPositiveVerified true fails closed with recovery", func(t *testing.T) {
 		s, r, e, a, in := simplifiedServiceFixture(t, ActionRevoke)
 		r.autoComplete = true
-		e.execResult = SimplifiedExecutionResult{
-			OperationID: r.beginResult.Operation.OperationID,
-			Outcome:     ExecutionVerifiedSuccess,
-			Mutated:     true,
-			Evidence: SimplifiedExecutionEvidence{
-				RAMApplied:              true,
-				FreshPositiveVerified:   true,
-				ProtocolDenialVerified:  true,
-				SessionHandlingVerified: true,
-			},
-		}
+		e.execResult.Evidence.FreshPositiveVerified = true
 		_, err := s.mutate(context.Background(), a, in, ActionRevoke)
 		if err == nil || !s.poisoned {
 			t.Fatal("contradictory FreshPositiveVerified on revoke must poison")

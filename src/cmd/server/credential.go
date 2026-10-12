@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -157,6 +158,7 @@ type compositionSeam struct {
 	readCA         func(path string) ([]byte, error)
 	newClient      func(ctx context.Context, cfg mqttcredential.DynSecConfig) (*mqttcredential.DynSecClient, error)
 	probeAuth      func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error
+	newExecutor    func(cfg mqttcredential.SimplifiedDynSecConfig) (mqttcredential.SimplifiedExecutor, error)
 }
 
 var defaultCompositionSeam = compositionSeam{
@@ -181,6 +183,9 @@ var defaultCompositionSeam = compositionSeam{
 	},
 	newClient: mqttcredential.NewDynSecClient,
 	probeAuth: probePrivateCredential,
+	newExecutor: func(cfg mqttcredential.SimplifiedDynSecConfig) (mqttcredential.SimplifiedExecutor, error) {
+		return mqttcredential.NewSimplifiedDynSecExecutor(cfg)
+	},
 }
 
 func validateManagementURLSemantics(raw string) error {
@@ -211,6 +216,35 @@ func composeCredentialsWithSeam(ctx context.Context, pool *pgxpool.Pool, c confi
 	}
 	if pool == nil {
 		return out, fmt.Errorf("credential database required")
+	}
+
+	// 0. Validate required qualification and persistence reader prerequisites BEFORE
+	// owner acquisition, broker probes, client factories, or mutation.
+	if c.Qualification.IsZero() || !c.Qualification.Valid() {
+		return out, fmt.Errorf("credential qualification required and must match qualified identity")
+	}
+	if !filepath.IsAbs(c.SnapshotPath) || filepath.Clean(c.SnapshotPath) != c.SnapshotPath {
+		return out, fmt.Errorf("credential snapshot path must be a clean absolute path")
+	}
+	if c.MaxSnapshotBytes <= 0 || c.MaxSnapshotBytes > 64<<20 {
+		return out, fmt.Errorf("credential max snapshot bytes invalid")
+	}
+
+	validateTarget := func(u string) bool {
+		return gateway.ValidateGatewayID(u) == nil && u != c.ManagerUsername && u != mqttcredential.BackendUsername
+	}
+	validateRole := func(u, r string) bool {
+		return validateTarget(u) && r == "gateway_"+u
+	}
+
+	snapshotReader, err := mqttcredential.NewDynSecSnapshotReader(mqttcredential.DynSecSnapshotConfig{
+		Path:           c.SnapshotPath,
+		WriterUID:      c.WriterUID,
+		MaxBytes:       int64(c.MaxSnapshotBytes),
+		ValidateTarget: validateTarget,
+	})
+	if err != nil {
+		return out, fmt.Errorf("create credential snapshot reader: %w", err)
 	}
 
 	// 1. Acquire dedicated credentialOwner BEFORE classification or any broker access.
@@ -278,12 +312,6 @@ func composeCredentialsWithSeam(ctx context.Context, pool *pgxpool.Pool, c confi
 
 	// 7. Verify management and backend fresh authentication checks only if classification completed.
 	protectedUsernames := []string{mqttcredential.BackendUsername, c.ManagerUsername}
-	validateTarget := func(u string) bool {
-		return gateway.ValidateGatewayID(u) == nil && u != c.ManagerUsername
-	}
-	validateRole := func(u, r string) bool {
-		return validateTarget(u) && r == "gateway_"+u
-	}
 
 	var managerAuthErr error
 	var backendAuthErr error
@@ -335,9 +363,17 @@ func composeCredentialsWithSeam(ctx context.Context, pool *pgxpool.Pool, c confi
 		Rejected:           rejectedFunc,
 		ProtectedUsernames: protectedUsernames,
 		Timeout:            c.OperationTimeout,
+		VerifyRevoked:      snapshotReader.VerifyRevoked,
+		Qualification:      c.Qualification,
 	}
 
-	rawExecutor, err := mqttcredential.NewSimplifiedDynSecExecutor(dynSecCfg)
+	newExec := seam.newExecutor
+	if newExec == nil {
+		newExec = func(cfg mqttcredential.SimplifiedDynSecConfig) (mqttcredential.SimplifiedExecutor, error) {
+			return mqttcredential.NewSimplifiedDynSecExecutor(cfg)
+		}
+	}
+	rawExecutor, err := newExec(dynSecCfg)
 	if err != nil {
 		return out, fmt.Errorf("create simplified executor: %w", err)
 	}
