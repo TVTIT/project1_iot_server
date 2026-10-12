@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Offline fresh Mosquitto 2.0.18 DynSec store. Never opens the ingress gate.
 
-Read one strict JSON object from protected stdin (not a shell command argument).
-Run with a trusted, installed Mosquitto 2.0.18 mosquitto_ctrl. The containing
-directory must already be empty, 0700 and owned by the mapped broker UID/GID.
-Rootless uid_map/gid_map are operator-verified Docker mappings, not guesses.
-No deployment discovery, legacy import, directory chown, or DB access occurs.
+Supports two modes:
+1. Container mode (recommended): Runs inside the verified pinned local Mosquitto
+   2.0.18 image (linux/amd64). Provisions a fresh, owned Docker named volume
+   holding dynamic-security.json with 1883:1883 permissions (0700 dir, 0600 file).
+   Outputs the safe new volume name.
+2. Host mode: Run with a trusted, root-owned host Mosquitto 2.0.18 mosquitto_ctrl.
+   The containing directory must already be empty, 0700 and owned by mapped UID/GID.
+
+Read one strict JSON object from protected stdin or protected file.
+No deployment discovery, legacy import, directory chown outside owned volume,
+or DB access occurs.
 """
 import argparse
 import base64
@@ -13,11 +19,23 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import sys
 import tempfile
 import uuid
+
+PINNED_IMAGE = 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
+PINNED_DIGEST = 'd12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
+EXPECTED_VERSION_BANNER = b'mosquitto_ctrl version 2.0.18 running on libmosquitto 2.0.18.'
+SAFE_IDENTIFIER_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$')
+SAFE_HEX_64_PATTERN = re.compile(r'^[0-9a-fA-F]{64}$')
+SAFE_LABEL_KEY_PATTERN = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9_.-]{0,126}[a-zA-Z0-9])?$')
+RESERVED_LABEL_KEYS = frozenset({'bootstrap.managed', 'bootstrap.nonce', 'com.docker.compose.volume'})
+MAX_LABEL_KEY_LEN = 128
+MAX_LABEL_VAL_LEN = 256
+MAX_TOTAL_LABELS = 32
 
 
 class BootstrapError(Exception):
@@ -60,15 +78,54 @@ def mapped_id(rows):
     return result
 
 
-def parse_config(stream):
+def parse_config(stream, container_mode=False):
     text = stream.read(16385)
     if len(text) > 16384:
         raise BootstrapError('configuration too large')
     cfg = strict_json(text)
-    required = {'store', 'manager', 'backend', 'manager_password', 'backend_password',
-                'mapping', 'broker_uid', 'broker_gid'}
-    if not isinstance(cfg, dict) or not required <= cfg.keys() or cfg.keys() - required - {'uid_map', 'gid_map'}:
-        raise BootstrapError('configuration fields missing or unknown')
+    if not isinstance(cfg, dict):
+        raise BootstrapError('configuration must be a JSON object')
+
+    if container_mode:
+        required = {'manager', 'backend', 'manager_password', 'backend_password'}
+        optional = {'volume_name', 'labels'}
+        if not required <= cfg.keys() or cfg.keys() - required - optional:
+            raise BootstrapError('configuration fields missing or unknown')
+        if 'volume_name' in cfg:
+            vol = cfg['volume_name']
+            if not isinstance(vol, str) or not SAFE_IDENTIFIER_PATTERN.fullmatch(vol):
+                raise BootstrapError('invalid volume_name')
+        if 'labels' in cfg:
+            labels = cfg['labels']
+            if not isinstance(labels, dict) or len(labels) > MAX_TOTAL_LABELS:
+                raise BootstrapError('labels must be a JSON object within size limits')
+            for k, v in labels.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise BootstrapError('label keys and values must be strings')
+                if len(k) > MAX_LABEL_KEY_LEN or len(v) > MAX_LABEL_VAL_LEN:
+                    raise BootstrapError('label length exceeded')
+                if not SAFE_LABEL_KEY_PATTERN.fullmatch(k):
+                    raise BootstrapError('invalid label key format')
+                if k in RESERVED_LABEL_KEYS:
+                    raise BootstrapError(f'reserved label key rejected: {k}')
+    else:
+        required = {'store', 'manager', 'backend', 'manager_password', 'backend_password',
+                    'mapping', 'broker_uid', 'broker_gid'}
+        if not required <= cfg.keys() or cfg.keys() - required - {'uid_map', 'gid_map'}:
+            raise BootstrapError('configuration fields missing or unknown')
+        if not isinstance(cfg['store'], str) or not Path(cfg['store']).is_absolute() or '\x00' in cfg['store']:
+            raise BootstrapError('absolute store path required')
+        if cfg['mapping'] == 'rootful':
+            ids = (1883, 1883)
+            if 'uid_map' in cfg or 'gid_map' in cfg:
+                raise BootstrapError('unexpected rootful map')
+        elif cfg['mapping'] == 'rootless':
+            ids = (mapped_id(cfg.get('uid_map')), mapped_id(cfg.get('gid_map')))
+        else:
+            raise BootstrapError('explicit ownership mapping required')
+        if any(type(cfg[k]) is not int for k in ('broker_uid', 'broker_gid')) or ids != (cfg['broker_uid'], cfg['broker_gid']):
+            raise BootstrapError('ownership does not match broker 1883 mapping')
+
     for key in ('manager', 'backend'):
         if not isinstance(cfg[key], str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}', cfg[key]):
             raise BootstrapError('invalid principal')
@@ -76,24 +133,10 @@ def parse_config(stream):
         raise BootstrapError('principals must differ')
     for key in ('manager_password', 'backend_password'):
         value = cfg[key]
-        # Native get_password has a 200-byte buffer. Restrict to printable ASCII
-        # so stdin framing and native truncation cannot change the secret.
         if not isinstance(value, str) or not 32 <= len(value) <= 128 or any(not 33 <= ord(c) <= 126 for c in value):
             raise BootstrapError('invalid credential; use independently generated random secrets')
     if cfg['manager_password'] == cfg['backend_password']:
         raise BootstrapError('credentials must differ')
-    if not isinstance(cfg['store'], str) or not Path(cfg['store']).is_absolute() or '\x00' in cfg['store']:
-        raise BootstrapError('absolute store path required')
-    if cfg['mapping'] == 'rootful':
-        ids = (1883, 1883)
-        if 'uid_map' in cfg or 'gid_map' in cfg:
-            raise BootstrapError('unexpected rootful map')
-    elif cfg['mapping'] == 'rootless':
-        ids = (mapped_id(cfg.get('uid_map')), mapped_id(cfg.get('gid_map')))
-    else:
-        raise BootstrapError('explicit ownership mapping required')
-    if any(type(cfg[k]) is not int for k in ('broker_uid', 'broker_gid')) or ids != (cfg['broker_uid'], cfg['broker_gid']):
-        raise BootstrapError('ownership does not match broker 1883 mapping')
     return cfg
 
 
@@ -109,7 +152,6 @@ def guard_directory(path, uid, gid):
             os.close(fd)
             fd = next_fd
             meta = os.fstat(fd)
-            # Root-owned sticky shared temp is safe with a private child.
             sticky_root = meta.st_uid == 0 and bool(meta.st_mode & stat.S_ISVTX)
             if meta.st_uid not in (0, os.geteuid(), uid) or (meta.st_mode & 0o022 and not sticky_root):
                 raise BootstrapError('unsafe ancestor ownership or permissions')
@@ -166,7 +208,6 @@ def compose_store(manager, backend):
 
 
 def build_store(cfg, tool, initializer=native_init):
-    # Private temporary native files; never export a hash through stdout.
     with tempfile.TemporaryDirectory(prefix='mqtt-bootstrap-') as directory:
         sources = []
         for name in ('manager', 'backend'):
@@ -180,7 +221,6 @@ def build_store(cfg, tool, initializer=native_init):
             if client.get('username') != cfg[name]:
                 raise BootstrapError('native principal mismatch')
             try:
-                # Shape only, NOT a homemade password verifier/hash generator.
                 if (len(base64.b64decode(client['password'], validate=True)) != 64 or
                         len(base64.b64decode(client['salt'], validate=True)) != 12 or
                         type(client['iterations']) is not int or client['iterations'] <= 0):
@@ -210,7 +250,6 @@ def publish(directory_fd, name, data, uid, gid):
             raise BootstrapError('cannot establish protected broker ownership')
         if os.listdir(directory_fd) != [temporary]:
             raise BootstrapError('guarded directory changed during initialization')
-        # Hard-link publication is atomic and unlike rename cannot overwrite.
         os.link(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
                 follow_symlinks=False)
         os.unlink(temporary, dir_fd=directory_fd)
@@ -229,7 +268,6 @@ def publish(directory_fd, name, data, uid, gid):
 
 
 def verify_native_tool(tool):
-    """Check the installed binary without reading credentials or touching a store."""
     executable = Path(tool)
     try:
         meta = executable.stat()
@@ -243,7 +281,7 @@ def verify_native_tool(tool):
             raise BootstrapError('unsafe native executable ancestor')
     version = subprocess.run([str(executable), '--help'], capture_output=True,
                              timeout=5, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-    if b'mosquitto_ctrl version 2.0.18 running on libmosquitto 2.0.18.' not in version.stdout:
+    if EXPECTED_VERSION_BANNER not in version.stdout:
         raise BootstrapError('Mosquitto/libmosquitto 2.0.18 required')
     return str(executable)
 
@@ -262,26 +300,523 @@ def bootstrap(cfg, tool):
         os.close(directory_fd)
 
 
+# --- Container Bootstrap Mode ---
+
+def run_docker(cmd, input_data=None, timeout=30, capture=True, runner=subprocess.run):
+    try:
+        res = runner(cmd, input=input_data, capture_output=capture,
+                     timeout=timeout, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res.returncode != 0:
+            raise BootstrapError('docker command failed')
+        return res
+    except (subprocess.TimeoutExpired, BootstrapError):
+        raise
+    except Exception:
+        raise BootstrapError('docker command error') from None
+
+
+def verify_image(image_ref, runner=subprocess.run):
+    try:
+        res = runner(['docker', 'image', 'inspect', image_ref], capture_output=True,
+                     timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res.returncode != 0:
+            raise BootstrapError('pinned image not found locally; pulling is forbidden')
+        data = strict_json(res.stdout.decode())
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            raise BootstrapError('invalid image inspect metadata')
+        inspect = data[0]
+        arch = inspect.get('Architecture')
+        os_name = inspect.get('Os')
+        if arch != 'amd64' or os_name != 'linux':
+            raise BootstrapError('image architecture or OS mismatch; linux/amd64 required')
+
+        digests = inspect.get('RepoDigests', [])
+        if not any(d == PINNED_IMAGE for d in digests):
+            raise BootstrapError('image RepoDigests exact pin mismatch')
+
+        raw_id = inspect.get('Id', '')
+        if raw_id.startswith('sha256:'):
+            raw_id = raw_id[7:]
+        if not SAFE_HEX_64_PATTERN.fullmatch(raw_id) or raw_id.lower() != PINNED_DIGEST.lower():
+            raise BootstrapError('image Id immutable digest mismatch')
+
+        version_res = runner(['docker', 'run', '--rm', '--network', 'none', '--pull=never',
+                              '--entrypoint', 'mosquitto_ctrl', image_ref, '--help'],
+                             capture_output=True, timeout=10, check=False,
+                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if EXPECTED_VERSION_BANNER not in version_res.stdout and EXPECTED_VERSION_BANNER not in version_res.stderr:
+            raise BootstrapError('Mosquitto/libmosquitto 2.0.18 required inside image')
+        return 'sha256:' + raw_id
+    except BootstrapError:
+        raise
+    except (subprocess.SubprocessError, OSError):
+        raise BootstrapError('image verification failed or timed out') from None
+
+
+def check_volume_absent(volume_name, runner=subprocess.run):
+    try:
+        res = runner(['docker', 'volume', 'inspect', volume_name], capture_output=True,
+                     timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res.returncode == 0:
+            raise BootstrapError(f'volume collision; volume {volume_name} already exists')
+        err = res.stderr.decode()
+        if 'no such volume' not in err.lower():
+            raise BootstrapError('volume presence check failed: daemon returned unexpected error or timeout')
+    except BootstrapError:
+        raise
+    except (subprocess.SubprocessError, OSError):
+        raise BootstrapError('volume presence check failed') from None
+
+
+def verify_volume_receipt(volume_name, expected_labels, runner=subprocess.run):
+    try:
+        res = runner(['docker', 'volume', 'inspect', volume_name], capture_output=True,
+                     timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res.returncode != 0:
+            raise BootstrapError('created volume inspect failed')
+        data = strict_json(res.stdout.decode())
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            raise BootstrapError('invalid volume inspect metadata')
+        inspect = data[0]
+        if inspect.get('Name') != volume_name:
+            raise BootstrapError('volume receipt name mismatch')
+        labels = inspect.get('Labels') or {}
+        for k, v in expected_labels.items():
+            if labels.get(k) != v:
+                raise BootstrapError('volume receipt label mismatch')
+        return inspect
+    except BootstrapError:
+        raise
+    except (subprocess.SubprocessError, OSError):
+        raise BootstrapError('volume verification failed') from None
+
+
+def inspect_container_state(cid, runner=subprocess.run):
+    try:
+        res = runner(['docker', 'container', 'inspect', cid], capture_output=True,
+                     timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res.returncode != 0:
+            raise BootstrapError('container inspect failed')
+        data = strict_json(res.stdout.decode())
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            raise BootstrapError('invalid container inspect metadata')
+        state = data[0].get('State') or {}
+        exit_code = state.get('ExitCode')
+        if type(exit_code) is not int:
+            raise BootstrapError('container inspect ExitCode invalid')
+        return state, exit_code
+    except BootstrapError:
+        raise
+    except (subprocess.SubprocessError, OSError):
+        raise BootstrapError('container inspect error') from None
+
+
+def remove_and_verify_container(cid, runner=subprocess.run):
+    try:
+        rm_res = runner(['docker', 'rm', cid], capture_output=True, timeout=10, check=False,
+                        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if rm_res.returncode != 0:
+            runner(['docker', 'rm', '-f', cid], capture_output=True, timeout=10, check=False,
+                   env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        insp_res = runner(['docker', 'container', 'inspect', cid], capture_output=True,
+                           timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if insp_res.returncode == 0:
+            return False
+        err = insp_res.stderr.decode().lower()
+        if 'no such container' in err:
+            return True
+        return False
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def cleanup_containers(tracker, runner=subprocess.run):
+    uncleaned = []
+    for item in list(tracker):
+        cid = item.get('id') if isinstance(item, dict) else item
+        if not cid:
+            continue
+        cleaned = remove_and_verify_container(cid, runner=runner)
+        if cleaned:
+            if item in tracker:
+                tracker.remove(item)
+        else:
+            uncleaned.append(cid)
+    return uncleaned
+
+
+def container_native_init(image_id, destination, username, password, tracker, runner=subprocess.run):
+    c_nonce = secrets.token_hex(8)
+    c_name = f'mqtt-boot-init-{c_nonce}'
+    work_dir = destination.parent
+    file_name = destination.name
+
+    create_cmd = ['docker', 'create', '--pull=never', '-i', '--name', c_name, '--network', 'none', '--log-driver', 'none',
+                  '--user', f'{os.getuid()}:{os.getgid()}',
+                  '--mount', f'type=bind,src={work_dir},dst=/work',
+                  '--entrypoint', 'mosquitto_ctrl', image_id,
+                  'dynsec', 'init', f'/work/{file_name}', username]
+    res_create = runner(create_cmd, capture_output=True, timeout=10, check=False,
+                        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+    if res_create.returncode != 0:
+        raise BootstrapError('container native init create failed')
+    cid = res_create.stdout.decode().strip()
+    if not SAFE_HEX_64_PATTERN.fullmatch(cid):
+        raise BootstrapError('invalid container ID returned')
+    tracker_item = {'id': cid, 'name': c_name, 'nonce': c_nonce, 'image': image_id}
+    tracker.append(tracker_item)
+
+    start_cmd = ['docker', 'start', '-a', '-i', cid]
+    res_start = runner(start_cmd, input=((password + '\n') * 2).encode(),
+                       capture_output=True, timeout=15, check=False,
+                       env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+
+    state, exit_code = inspect_container_state(cid, runner=runner)
+
+    if not remove_and_verify_container(cid, runner=runner):
+        raise BootstrapError('init container cleanup could not verify absence')
+    if tracker_item in tracker:
+        tracker.remove(tracker_item)
+
+    if res_start.returncode != 0 or exit_code != 0:
+        raise BootstrapError('container native init start failed')
+
+
+def check_config_file_security(config_path):
+    path_str = str(config_path)
+    if os.path.islink(path_str):
+        raise BootstrapError('configuration file cannot be a symlink')
+    try:
+        st = os.lstat(path_str)
+    except OSError:
+        raise BootstrapError('cannot stat configuration file') from None
+    if not stat.S_ISREG(st.st_mode):
+        raise BootstrapError('configuration must be a regular file')
+    if (st.st_mode & 0o777) != 0o600:
+        raise BootstrapError('configuration file permissions must be exactly 0600')
+    if st.st_uid != os.geteuid():
+        raise BootstrapError('configuration file must be owned by current user')
+
+    parent = os.path.dirname(os.path.abspath(path_str))
+    try:
+        pst = os.stat(parent)
+    except OSError:
+        raise BootstrapError('cannot stat configuration parent directory') from None
+    sticky = bool(pst.st_mode & stat.S_ISVTX)
+    if pst.st_uid not in (0, os.geteuid()):
+        raise BootstrapError('configuration parent directory must be owned by root or current user')
+    if (pst.st_mode & 0o002) and not (pst.st_uid == 0 and sticky):
+        raise BootstrapError('configuration parent directory cannot be world-writable without sticky bit')
+
+
+def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
+    verified_image_id = verify_image(image_ref, runner=runner)
+
+    volume_name = cfg.get('volume_name') or f'mosquitto_dynsec_{secrets.token_hex(12)}'
+    check_volume_absent(volume_name, runner=runner)
+
+    boot_nonce = secrets.token_hex(16)
+    labels = {
+        'com.docker.compose.volume': 'mosquitto_dynsec',
+        'bootstrap.managed': 'true',
+        'bootstrap.nonce': boot_nonce
+    }
+    if 'labels' in cfg:
+        labels.update(cfg['labels'])
+
+    create_vol_cmd = ['docker', 'volume', 'create']
+    for k, v in labels.items():
+        create_vol_cmd.extend(['--label', f'{k}={v}'])
+    create_vol_cmd.append(volume_name)
+
+    res_vol = runner(create_vol_cmd, capture_output=True, timeout=10, check=False,
+                     env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+    if res_vol.returncode != 0 or res_vol.stdout.decode().strip() != volume_name:
+        raise BootstrapError('volume creation failed')
+
+    verify_volume_receipt(volume_name, labels, runner=runner)
+
+    container_tracker = []
+    volume_retained = False
+    staging_cleaned = False
+    staging_path = None
+
+    try:
+        # Step 1: Generate native hashes in protected host temporary directory
+        staging_dir_parent = '/tmp/opencode' if os.path.exists('/tmp/opencode') else None
+        old_umask = os.umask(0o077)
+        try:
+            staging_obj = tempfile.TemporaryDirectory(dir=staging_dir_parent, prefix='mqtt-bootstrap-')
+            staging_path = staging_obj.name
+            os.chmod(staging_path, 0o700)
+            sources = []
+            for name in ('manager', 'backend'):
+                path = Path(staging_path) / (name + '.json')
+                container_native_init(verified_image_id, path, cfg[name], cfg[name + '_password'],
+                                      container_tracker, runner=runner)
+                with path.open() as stream:
+                    source = strict_json(stream.read(65537))
+                if not isinstance(source, dict) or not isinstance(source.get('clients'), list) or len(source['clients']) != 1 or not isinstance(source['clients'][0], dict):
+                    raise BootstrapError('unexpected native client schema')
+                client = source['clients'][0]
+                if client.get('username') != cfg[name]:
+                    raise BootstrapError('native principal mismatch')
+                try:
+                    if (len(base64.b64decode(client['password'], validate=True)) != 64 or
+                            len(base64.b64decode(client['salt'], validate=True)) != 12 or
+                            type(client['iterations']) is not int or client['iterations'] <= 0):
+                        raise ValueError()
+                except (KeyError, ValueError, TypeError):
+                    raise BootstrapError('unexpected native hash schema') from None
+                sources.append(source)
+
+            composed_dict = compose_store(*sources)
+            composed_bytes = json.dumps(composed_dict, separators=(',', ':')).encode()
+        finally:
+            os.umask(old_umask)
+
+        # Ensure container tracker is empty before staging directory cleanup
+        if container_tracker:
+            raise BootstrapError('active init containers remain before staging cleanup')
+        staging_obj.cleanup()
+        staging_cleaned = True
+
+        # Re-verify volume receipt before Step 2
+        verify_volume_receipt(volume_name, labels, runner=runner)
+
+        # Step 2: Root helper container to verify empty dir and chown 1883:1883 / chmod 0700
+        c_root_nonce = secrets.token_hex(8)
+        c_root_name = f'mqtt-boot-root-{c_root_nonce}'
+        root_script = (
+            'set -e\n'
+            'entries=$(ls -A /mosquitto/dynsec)\n'
+            'if [ -n "$entries" ]; then\n'
+            '  echo "non-empty directory; foreign replacement rejected" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'mkdir -p /mosquitto/dynsec\n'
+            'chown 1883:1883 /mosquitto/dynsec\n'
+            'chmod 0700 /mosquitto/dynsec\n'
+        )
+        cmd_root = ['docker', 'create', '--pull=never', '--user', '0:0', '--name', c_root_name,
+                    '--network', 'none', '--log-driver', 'none',
+                    '--mount', f'type=volume,src={volume_name},dst=/mosquitto/dynsec',
+                    '--entrypoint', '/bin/sh', verified_image_id,
+                    '-c', root_script]
+        res_croot = runner(cmd_root, capture_output=True, timeout=10, check=False,
+                           env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res_croot.returncode != 0:
+            raise BootstrapError('root ownership helper container creation failed')
+        c_root_id = res_croot.stdout.decode().strip()
+        if not SAFE_HEX_64_PATTERN.fullmatch(c_root_id):
+            raise BootstrapError('invalid container ID returned')
+        item_root = {'id': c_root_id, 'name': c_root_name, 'nonce': c_root_nonce, 'image': verified_image_id}
+        container_tracker.append(item_root)
+
+        res_sroot = runner(['docker', 'start', '-a', c_root_id], capture_output=True, timeout=15, check=False,
+                           env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        state_root, exit_root = inspect_container_state(c_root_id, runner=runner)
+        if not remove_and_verify_container(c_root_id, runner=runner):
+            raise BootstrapError('root helper container cleanup could not verify absence')
+        if item_root in container_tracker:
+            container_tracker.remove(item_root)
+        if res_sroot.returncode != 0 or exit_root != 0:
+            raise BootstrapError('root ownership helper execution failed')
+
+        # Re-verify volume receipt before Step 3
+        verify_volume_receipt(volume_name, labels, runner=runner)
+
+        # Step 3: Writer container (1883:1883) publishes file via stdin, temp link, chmod 0600
+        c_writer_nonce = secrets.token_hex(8)
+        c_writer_name = f'mqtt-boot-writer-{c_writer_nonce}'
+        writer_script = (
+            'set -e\n'
+            'umask 077\n'
+            'dir_meta=$(stat -c "%u:%g:%a" /mosquitto/dynsec)\n'
+            'if [ "$dir_meta" != "1883:1883:700" ]; then exit 1; fi\n'
+            'if [ -e /mosquitto/dynsec/dynamic-security.json ]; then exit 2; fi\n'
+            'tmp="/mosquitto/dynsec/.bootstrap-$1"\n'
+            'set -C\n'
+            'cat > "$tmp"\n'
+            'chmod 0600 "$tmp"\n'
+            'ln "$tmp" /mosquitto/dynsec/dynamic-security.json\n'
+            'rm -f "$tmp"\n'
+            'file_meta=$(stat -c "%u:%g:%a" /mosquitto/dynsec/dynamic-security.json)\n'
+            'if [ "$file_meta" != "1883:1883:600" ]; then exit 3; fi\n'
+        )
+        cmd_writer = ['docker', 'create', '--pull=never', '-i', '--name', c_writer_name,
+                      '--network', 'none', '--log-driver', 'none',
+                      '--user', '1883:1883',
+                      '--mount', f'type=volume,src={volume_name},dst=/mosquitto/dynsec',
+                      '--entrypoint', '/bin/sh', verified_image_id,
+                      '-c', writer_script, 'sh', c_writer_nonce]
+        res_cwriter = runner(cmd_writer, capture_output=True, timeout=10, check=False,
+                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res_cwriter.returncode != 0:
+            raise BootstrapError('writer container creation failed')
+        c_writer_id = res_cwriter.stdout.decode().strip()
+        if not SAFE_HEX_64_PATTERN.fullmatch(c_writer_id):
+            raise BootstrapError('invalid container ID returned')
+        item_writer = {'id': c_writer_id, 'name': c_writer_name, 'nonce': c_writer_nonce, 'image': verified_image_id}
+        container_tracker.append(item_writer)
+
+        res_swriter = runner(['docker', 'start', '-a', '-i', c_writer_id], input=composed_bytes,
+                             capture_output=True, timeout=15, check=False,
+                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        state_writer, exit_writer = inspect_container_state(c_writer_id, runner=runner)
+        if not remove_and_verify_container(c_writer_id, runner=runner):
+            raise BootstrapError('writer container cleanup could not verify absence')
+        if item_writer in container_tracker:
+            container_tracker.remove(item_writer)
+        if res_swriter.returncode != 0 or exit_writer != 0:
+            raise BootstrapError('writer container execution failed; no overwrite or improper permissions')
+
+        # Re-verify volume receipt before Step 4
+        verify_volume_receipt(volume_name, labels, runner=runner)
+
+        # Step 4: Verification reader container (1883:1883) readonly mount checks exact schema
+        c_reader_nonce = secrets.token_hex(8)
+        c_reader_name = f'mqtt-boot-reader-{c_reader_nonce}'
+        reader_script = (
+            'set -e\n'
+            'stat -c "%u:%g:%a" /mosquitto/dynsec /mosquitto/dynsec/dynamic-security.json\n'
+            'cat /mosquitto/dynsec/dynamic-security.json\n'
+        )
+        cmd_reader = ['docker', 'create', '--pull=never', '--name', c_reader_name,
+                      '--network', 'none', '--log-driver', 'none',
+                      '--user', '1883:1883',
+                      '--mount', f'type=volume,src={volume_name},dst=/mosquitto/dynsec,readonly',
+                      '--entrypoint', '/bin/sh', verified_image_id,
+                      '-c', reader_script]
+        res_creader = runner(cmd_reader, capture_output=True, timeout=10, check=False,
+                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res_creader.returncode != 0:
+            raise BootstrapError('reader verification container creation failed')
+        c_reader_id = res_creader.stdout.decode().strip()
+        if not SAFE_HEX_64_PATTERN.fullmatch(c_reader_id):
+            raise BootstrapError('invalid container ID returned')
+        item_reader = {'id': c_reader_id, 'name': c_reader_name, 'nonce': c_reader_nonce, 'image': verified_image_id}
+        container_tracker.append(item_reader)
+
+        res_sreader = runner(['docker', 'start', '-a', c_reader_id], capture_output=True,
+                             timeout=15, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        state_reader, exit_reader = inspect_container_state(c_reader_id, runner=runner)
+        if not remove_and_verify_container(c_reader_id, runner=runner):
+            raise BootstrapError('reader container cleanup could not verify absence')
+        if item_reader in container_tracker:
+            container_tracker.remove(item_reader)
+        if res_sreader.returncode != 0 or exit_reader != 0:
+            raise BootstrapError('reader verification failed')
+
+        lines = res_sreader.stdout.splitlines()
+        if len(lines) < 3:
+            raise BootstrapError('incomplete reader output')
+        dir_stat = lines[0].decode().strip()
+        file_stat = lines[1].decode().strip()
+        content = b'\n'.join(lines[2:]).strip()
+
+        if dir_stat != '1883:1883:700' or file_stat != '1883:1883:600':
+            raise BootstrapError('verified container permissions do not match 1883:1883 0700/0600')
+
+        verified_store = strict_json(content.decode())
+        if verified_store != composed_dict:
+            raise BootstrapError('verified store content does not match composed store exactly')
+
+        volume_retained = True
+        return volume_name
+    finally:
+        uncleaned_cids = cleanup_containers(container_tracker, runner=runner)
+        if uncleaned_cids:
+            print(f'CRITICAL: container cleanup failed for IDs: {uncleaned_cids}', file=sys.stderr)
+            if volume_retained:
+                # Cleanup failure vetoes store_created success, but do not delete successfully published store
+                print(f'Retained published volume due to uncleaned containers: {volume_name}', file=sys.stderr)
+                raise BootstrapError('cleanup failure vetoes store creation; containers retained')
+        if not volume_retained:
+            # Safe teardown of failed/partial newly created volume (never use -f)
+            try:
+                rec = verify_volume_receipt(volume_name, labels, runner=runner)
+                if rec.get('Name') == volume_name:
+                    runner(['docker', 'volume', 'rm', volume_name], capture_output=True,
+                           timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+            except Exception:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--native-tool', default='/usr/bin/mosquitto_ctrl')
+    parser.add_argument('--container', action='store_true',
+                        help='run bootstrap in pinned Mosquitto container targeting a fresh named volume')
+    parser.add_argument('--image', default=PINNED_IMAGE,
+                        help=f'pinned Mosquitto Docker image reference (default: {PINNED_IMAGE})')
+    parser.add_argument('--config', type=Path, default=None,
+                        help='path to protected JSON configuration file (default: stdin)')
+    parser.add_argument('--native-tool', default='/usr/bin/mosquitto_ctrl',
+                        help='path to native mosquitto_ctrl (host mode only)')
     parser.add_argument('--check-native-tool', action='store_true',
-                        help='verify installed dependency only; no stdin or store access')
+                        help='verify dependency only (host binary or container image); no store written')
     args = parser.parse_args()
+
+    if args.config is not None:
+        check_config_file_security(args.config)
+
     try:
-        if args.check_native_tool:
-            verify_native_tool(args.native_tool)
-            print('native tool dependency verified; no store written; NOT READY')
+        if args.container:
+            if args.check_native_tool:
+                verify_image(args.image)
+                print('container image dependency verified; no store written; NOT READY')
+                return 0
+            if args.config is not None:
+                try:
+                    stream = args.config.open('r')
+                except OSError:
+                    print('cannot open configuration file', file=sys.stderr)
+                    return 1
+            else:
+                stream = sys.stdin
+            try:
+                cfg = parse_config(stream, container_mode=True)
+            finally:
+                if args.config is not None:
+                    stream.close()
+            vol_name = bootstrap_container(cfg, image_ref=args.image)
+            output = {
+                'status': 'store_created',
+                'volume_name': vol_name,
+                'runtime_status': 'NOT_READY',
+                'gate': 'unchanged',
+                'ownership': '1883:1883',
+                'mode': 'container'
+            }
+            print(json.dumps(output, indent=2))
             return 0
-        bootstrap(parse_config(sys.stdin), args.native_tool)
+        else:
+            if args.check_native_tool:
+                verify_native_tool(args.native_tool)
+                print('native tool dependency verified; no store written; NOT READY')
+                return 0
+            if args.config is not None:
+                try:
+                    stream = args.config.open('r')
+                except OSError:
+                    print('cannot open configuration file', file=sys.stderr)
+                    return 1
+            else:
+                stream = sys.stdin
+            try:
+                cfg = parse_config(stream, container_mode=False)
+            finally:
+                if args.config is not None:
+                    stream.close()
+            bootstrap(cfg, args.native_tool)
+            print('fresh protected DynSec store published; gate unchanged; NOT READY')
+            return 0
     except BootstrapError as error:
         print(str(error), file=sys.stderr)
         return 1
     except (OSError, subprocess.SubprocessError):
         print('bootstrap refused/failed; store and ownership require offline verification', file=sys.stderr)
         return 1
-    print('fresh protected DynSec store published; gate unchanged; NOT READY')
-    return 0
 
 
 if __name__ == '__main__':

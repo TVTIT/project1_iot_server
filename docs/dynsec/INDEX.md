@@ -91,11 +91,35 @@ Hệ thống tuân thủ nghiêm ngặt nguyên tắc phân tách định danh q
    - Mọi request gọi tới route credential từ người dùng không có bản ghi trong bảng `public.platform_admins` đều bị từ chối ngay lập tức với mã lỗi HTTP `403 Forbidden` (`code: "forbidden"`) **trước khi bất kỳ thao tác nào diễn ra trên CSDL hay broker**.
    - Trường hợp tài khoản vừa là Gateway Owner vừa là Platform Admin: Hệ thống kiểm tra độc lập; quyền quản trị credential được cấp dựa trên tư cách Platform Admin trong `platform_admins`, không kế thừa từ vai trò `owner`.
    - **Lưu ý về các endpoint quản trị Gateway và Sensor:** Cả endpoint duyệt danh mục quản trị toàn hệ thống `GET /v1/admin/gateways` (Admin Gateway Inventory) và endpoint cấp phát/khởi tạo cảm biến cho chủ sở hữu `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` (Owner Sensor Provisioning) đều **ĐÃ ĐƯỢC HIỆN THỰC (IMPLEMENTED)** trong mã nguồn backend (`src/internal/httpserver/admin_gateway_handlers.go`, `src/internal/httpserver/owner_sensor_handlers.go`); việc hoàn tất nghiệm thu tổng hợp (aggregate acceptance) cho toàn bộ gói tính năng đang trong giai đoạn chờ kết nối nghiệm thu cuối, không phải là tính năng chưa được triển khai.
-3. **Phân tách ba Principal MQTT độc lập trên Broker:**
-   - `Manager Principal` (`MQTT_DYNSEC_MANAGER_USERNAME`): Chỉ dùng để gửi lệnh cấu hình DynSec qua topic điều khiển `$CONTROL/dynamic-security/v1`. Không tham gia vào luồng publish/subscribe dữ liệu sensor.
-   - `Backend Principal` (`MQTT_USERNAME`, mặc định `backend_service`): Tài khoản của dịch vụ backend để subscribe dữ liệu telemetry (`gateways/+/telemetry/#`) và gửi ACK (`gateways/+/acks/#`). Không có quyền quản trị DynSec.
-   - `Gateway Principal` (Username là `gateway_id`): Bị cô lập hoàn toàn trong namespace riêng `gateways/<gateway_id>/#`. Không thể đọc hoặc ghi sang namespace của Gateway khác và không thể gửi lệnh tới topic điều khiển.
+3. **Phân tách ba Principal MQTT độc lập và Ma trận Phân quyền Topic (ACL Matrix):**
+   - Mặc định toàn hệ thống: `defaultACLAccess` được đặt là `false` cho toàn bộ các hành động (`publishClientSend: false`, `publishClientReceive: false`, `subscribe: false`, `unsubscribe: false`). Mọi quyền truy cập bắt buộc phải được khai báo tường minh qua Role và ACL.
+   - `Manager Principal` (`MQTT_DYNSEC_MANAGER_USERNAME`): Chỉ dùng để gửi lệnh cấu hình DynSec qua topic điều khiển `$CONTROL/dynamic-security/v1` và nhận kết quả tại `$CONTROL/dynamic-security/v1/response`. Không tham gia vào luồng publish/subscribe dữ liệu sensor.
+   - `Backend Principal` (`MQTT_USERNAME`, mặc định `backend_service`): Tài khoản của dịch vụ Go backend dùng cho luồng thu thập dữ liệu (telemetry ingress).
+     * **Quyền hiện tại được cấp trong `bootstrap_backend`:**
+       - `subscribeLiteral` & `unsubscribeLiteral`: `gateways/+/telemetry/#` (chỉ cho phép đăng ký/hủy đăng ký đúng chuỗi bộ lọc này).
+       - `publishClientReceive`: `gateways/+/telemetry/#` (cho phép nhận tin nhắn khớp với pattern này).
+       - `publishClientSend`: `gateways/+/acks/#` (cho phép gửi tin nhắn ACK xác nhận đã lưu CSDL).
+     * **CÁC QUYỀN CHƯA ĐƯỢC CẤP TRÊN BACKEND HIỆN TẠI:**
+       - Backend **chưa có quyền** `publishClientSend` trên `gateways/+/commands/#` (chưa thể gửi lệnh điều khiển xuống Gateway).
+       - Backend **chưa có quyền** `subscribeLiteral` hay `publishClientReceive` trên `gateways/+/status` hay `gateways/+/responses/#` (chưa thể nhận trạng thái hay kết quả thực thi lệnh từ Gateway).
+     * **Quy tắc đăng ký nguyên văn (`subscribeLiteral`):** Mosquitto DynSec yêu cầu bộ lọc khi gọi `SUBSCRIBE` phải **khớp chính xác từng ký tự** với chuỗi topic được cấp quyền. Ví dụ: backend bắt buộc phải subscribe chuỗi `gateways/+/telemetry/#`; nếu cố tình subscribe topic cụ thể của một gateway (như `gateways/gw_001/telemetry/temp`), broker sẽ từ chối ngay với lỗi `"All subscription requests were denied."`.
+   - `Gateway Principal` (Username là `gateway_id`): Được cấp role riêng `gateway_<gateway_id>` và bị cô lập hoàn toàn trong namespace riêng `gateways/<gateway_id>/#`.
+     * Cho phép publish: `gateways/<gateway_id>/telemetry/#`, `gateways/<gateway_id>/status`, `gateways/<gateway_id>/responses/#`.
+     * Cho phép subscribe: `gateways/<gateway_id>/acks/#`, `gateways/<gateway_id>/commands/#`.
+     * **Cảnh báo ranh giới:** Việc Gateway có sẵn ACL cho topic `commands/#` và `responses/#` trong role của nó **không đồng nghĩa với việc luồng điều khiển thiết bị (downlink command pipeline) đã hoạt động**, vì `backend_service` chưa được cấp quyền tương ứng để phát lệnh hay thu nhận phản hồi.
    - Mật khẩu của Manager và Backend bắt buộc phải khác nhau và có độ dài tối thiểu đảm bảo an toàn.
+
+| Principal / Role | Thao Tác (ACL Type) | Topic Pattern | Trạng Thái Hiện Tại |
+|---|---|---|---|
+| **Manager** (`bootstrap_manager`) | `publishClientSend` | `$CONTROL/dynamic-security/v1` | **Đã kích hoạt** (Quản trị DynSec) |
+| | `publishClientReceive`<br>`subscribeLiteral`<br>`unsubscribeLiteral` | `$CONTROL/dynamic-security/v1/response` | **Đã kích hoạt** |
+| **Backend** (`bootstrap_backend`) | `subscribeLiteral`<br>`unsubscribeLiteral`<br>`publishClientReceive` | `gateways/+/telemetry/#` | **Đã kích hoạt** (Thu thập telemetry) |
+| | `publishClientSend` | `gateways/+/acks/#` | **Đã kích hoạt** (Gửi ACK cam kết CSDL) |
+| | `publishClientSend` | `gateways/+/commands/#` | **CHƯA CẤP QUYỀN** (Chờ Giai đoạn 2 Digital Twin) |
+| | `publishClientReceive`<br>`subscribeLiteral` | `gateways/+/status`<br>`gateways/+/responses/#` | **CHƯA CẤP QUYỀN** (Chờ Giai đoạn 2 Digital Twin) |
+| **Gateway** (`gateway_<id>`) | `publishClientSend` | `gateways/<id>/telemetry/#`<br>`gateways/<id>/status`<br>`gateways/<id>/responses/#` | **Đã cấp trong Role của Gateway** |
+| | `subscribeLiteral`<br>`unsubscribeLiteral`<br>`publishClientReceive` | `gateways/<id>/acks/#`<br>`gateways/<id>/commands/#` | **Đã cấp trong Role của Gateway** (Downlink chưa khả dụng phía backend) |
+| | Mọi topic khác (`#`, `$CONTROL/...`, v.v.) | Bất kỳ | **Bị từ chối (Default Deny)** |
 
 ---
 

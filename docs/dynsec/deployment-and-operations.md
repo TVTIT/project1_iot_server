@@ -123,6 +123,14 @@ backend:
    - `MQTT_DYNSEC_MANAGER_USERNAME` (ví dụ `credential_manager`) và mật khẩu `MQTT_DYNSEC_MANAGER_PASSWORD` (tối thiểu 128 bit entropy).
    - `MQTT_USERNAME` (mặc định `backend_service`) và mật khẩu `MQTT_PASSWORD` (tối thiểu 128 bit entropy).
    - Backend kiểm tra lúc nạp cấu hình (`config/credential.go`): Hai username và hai mật khẩu này bắt buộc phải **hoàn toàn khác nhau**.
+5. **Ma trận Topic ACL và Quy tắc Đăng ký Nguyên văn (`subscribeLiteral`):**
+   - Plugin DynSec của Mosquitto hoạt động theo nguyên tắc **Default Deny** (`defaultACLAccess = false`).
+   - `Manager` được cấp quyền publish/subscribe trên topic nội bộ `$CONTROL/dynamic-security/v1` và `$CONTROL/dynamic-security/v1/response`.
+   - `Backend` (`bootstrap_backend`) **chỉ được cấp quyền thu thập telemetry**:
+     * Nhận telemetry: `publishClientReceive` và `subscribeLiteral` trên `gateways/+/telemetry/#`.
+     * Gửi ACK: `publishClientSend` trên `gateways/+/acks/#`.
+     * **Cảnh báo:** Backend hiện **chưa có quyền** `publishClientSend` trên `gateways/+/commands/#` và chưa có quyền nhận `gateways/+/status` hay `gateways/+/responses/#`.
+   - **Quy tắc `subscribeLiteral`:** Mosquitto DynSec yêu cầu bộ lọc subscription khi client gọi lệnh `SUBSCRIBE` phải **trùng khớp chính xác từng ký tự** với chuỗi topic được cấp quyền trong store. Do đó, backend bắt buộc phải subscribe chuỗi `gateways/+/telemetry/#`; nếu subscribe chuỗi con cụ thể như `gateways/gw_001/telemetry/abc`, broker sẽ từ chối với lỗi `"All subscription requests were denied."`.
 
 ---
 
@@ -214,3 +222,26 @@ Nếu một thao tác gặp sự cố giữa chừng và trả về lỗi `503 S
    - Khởi động lại container Go backend để giải phóng cờ `poisoned` trong RAM (khi khởi động lại, `SimplifiedStartupClassifier` sẽ phân loại an toàn trạng thái CSDL).
    - Kiểm tra log chi tiết của broker Mosquitto và Go backend để xác định nguyên nhân (mất mạng, timeout, hoặc sai lệch ACL).
    - Thực hiện đánh giá trực tiếp trạng thái của Gateway trên broker qua công cụ dòng lệnh được cấp quyền trước khi tiến hành các bước tiếp theo.
+
+---
+
+### 2.5 Xử Lý Sự Cố Khi Subscribe Bị Từ Chối (`All subscription requests were denied`)
+
+Nếu một client MQTT (như công cụ kiểm thử `mosquitto_sub` sử dụng tài khoản `backend_service`) kết nối TLS thành công (xác thực mật khẩu hợp lệ) nhưng lệnh đăng ký topic lập tức bị từ chối với thông báo:
+```text
+All subscription requests were denied.
+```
+
+1. **Nguyên nhân cốt lõi:**
+   - Mosquitto DynSec quản lý quyền subscribe dưới dạng `subscribeLiteral` kết hợp nguyên tắc Default Deny (`defaultACLAccess = false`).
+   - Quyền được cấp cho `backend_service` là chuỗi nguyên văn `gateways/+/telemetry/#`.
+   - Nếu client gửi lệnh subscribe với topic cụ thể (ví dụ: `-t "gateways/gateway_001/telemetry/abc"`), broker so sánh chuỗi đăng ký với danh sách `subscribeLiteral` và từ chối vì không khớp nguyên văn chuỗi được cấp, mặc dù về mặt logic topic này nằm trong không gian wildcard `+` và `#`.
+2. **Cách khắc phục khi kiểm thử:**
+   - Đăng ký chính xác bằng chuỗi topic filter đã được cấp quyền trong store:
+     ```bash
+     mosquitto_sub -h <host> -p 8883 -t "gateways/+/telemetry/#" -u "backend_service" --cafile <ca_path>
+     ```
+   - Nhập mật khẩu qua prompt an toàn hoặc qua file, tránh dùng `-P <password>` lộ mật khẩu ra process list.
+3. **Cảnh báo về quyền điều khiển thiết bị (Downlink Commands):**
+   - Hiện tại tài khoản `backend_service` **chưa có quyền publish** lên `gateways/+/commands/#` và chưa có quyền subscribe `gateways/+/status`, `gateways/+/responses/#`.
+   - Mọi thao tác phát lệnh điều khiển từ `backend_service` sẽ bị broker từ chối cho đến khi lát cắt điều khiển Digital Twin được cấu hình và kiểm chứng bổ sung ở giai đoạn tiếp theo.
