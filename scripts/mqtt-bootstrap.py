@@ -20,6 +20,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -40,6 +42,39 @@ MAX_TOTAL_LABELS = 32
 
 class BootstrapError(Exception):
     """Safe error: never contains credential/input/native output."""
+
+
+_cancelled = False
+_cleaning = False
+_recovery_parent = '/tmp/opencode'
+
+
+def request_cancellation(signum, frame):
+    global _cancelled
+    _cancelled = True
+
+
+def cancellation_checkpoint():
+    if _cancelled and not _cleaning:
+        raise BootstrapError('bootstrap interrupted; cleanup required')
+
+
+def save_intent(item):
+    directory = tempfile.mkdtemp(dir=_recovery_parent, prefix='mqtt-bootstrap-intent-')
+    path = Path(directory) / 'recovery.json'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(item, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return str(path)
+
+
+def discard_intent(item):
+    path = item.get('receipt')
+    if path:
+        os.unlink(path)
+        os.rmdir(str(Path(path).parent))
 
 
 def strict_json(text):
@@ -340,12 +375,8 @@ def verify_image(image_ref, runner=subprocess.run):
         if not SAFE_HEX_64_PATTERN.fullmatch(raw_id) or raw_id.lower() != PINNED_DIGEST.lower():
             raise BootstrapError('image Id immutable digest mismatch')
 
-        version_res = runner(['docker', 'run', '--rm', '--network', 'none', '--pull=never',
-                              '--entrypoint', 'mosquitto_ctrl', image_ref, '--help'],
-                             capture_output=True, timeout=10, check=False,
-                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-        if EXPECTED_VERSION_BANNER not in version_res.stdout and EXPECTED_VERSION_BANNER not in version_res.stderr:
-            raise BootstrapError('Mosquitto/libmosquitto 2.0.18 required inside image')
+        # The exact immutable pin is the dependency receipt. Do not allocate an
+        # untracked container merely to repeat the pinned version banner check.
         return 'sha256:' + raw_id
     except BootstrapError:
         raise
@@ -433,16 +464,98 @@ def remove_and_verify_container(cid, runner=subprocess.run):
 def cleanup_containers(tracker, runner=subprocess.run):
     uncleaned = []
     for item in list(tracker):
-        cid = item.get('id') if isinstance(item, dict) else item
-        if not cid:
-            continue
-        cleaned = remove_and_verify_container(cid, runner=runner)
+        try:
+            cid = resolve_helper(item, runner=runner)
+            cleaned = cid is None or remove_and_verify_container(cid, runner=runner)
+            if cleaned:
+                discard_intent(item)
+        except (BootstrapError, OSError, subprocess.SubprocessError):
+            cid = item.get('name', 'unresolved')
+            cleaned = False
         if cleaned:
             if item in tracker:
                 tracker.remove(item)
         else:
             uncleaned.append(cid)
     return uncleaned
+
+
+def resolve_helper(item, runner=subprocess.run):
+    """Resolve only an exact intent name; daemon errors are not absence."""
+    res = runner(['docker', 'container', 'inspect', item.get('id') or item['name']],
+                 capture_output=True, timeout=10, check=False,
+                 env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+    if res.returncode:
+        if 'no such container' in res.stderr.decode().lower():
+            return None
+        raise BootstrapError('helper receipt unavailable; incomplete cleanup')
+    rows = strict_json(res.stdout.decode())
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise BootstrapError('helper receipt invalid')
+    rec = rows[0]
+    cid = rec.get('Id', '')
+    config = rec.get('Config') or {}
+    mounts = rec.get('HostConfig', {}).get('Mounts', [])
+    if not isinstance(mounts, list) or any(not isinstance(m, dict) for m in mounts):
+        raise BootstrapError('helper mount receipt invalid')
+    mounts = [{key: m.get(key, False if key == 'ReadOnly' else None)
+                for key in ('Type', 'Source', 'Target', 'ReadOnly')} for m in mounts]
+    if 'tmpfs' in item:
+        actual = rec.get('Mounts', [])
+        expected = {m['Target']: (m['Type'], m['Source'], m['ReadOnly']) for m in item['mounts']}
+        # Docker reports tmpfs in HostConfig.Tmpfs; some versions also include
+        # it in Mounts. All physical bind/volume mounts must be intentional.
+        physical = {m.get('Destination'): (m.get('Type'), m.get('Name') if m.get('Type') == 'volume' else m.get('Source'),
+                    not m.get('RW')) for m in actual if m.get('Type') != 'tmpfs'}
+        if (rec.get('HostConfig', {}).get('Tmpfs') != item['tmpfs'] or physical != expected
+                or len(actual) != len({m.get('Destination') for m in actual})
+                or any(m.get('Type') == 'tmpfs' and m.get('Destination') not in item['tmpfs'] for m in actual)):
+            raise BootstrapError('helper anonymous volume or tmpfs receipt mismatch; incomplete cleanup')
+    if (not SAFE_HEX_64_PATTERN.fullmatch(cid) or
+            rec.get('Name') != '/' + item['name'] or
+            rec.get('Image') != item['image'] or
+            config.get('Labels', {}).get('bootstrap.nonce') != item['nonce'] or
+            config.get('User') != item['user'] or
+            mounts != item['mounts'] or
+            (item.get('id') and item['id'] != cid)):
+        raise BootstrapError('helper ownership mismatch; incomplete cleanup')
+    item['id'] = cid
+    return cid
+
+
+def allocate_helper(cmd, tracker, kind, runner=subprocess.run):
+    """Record intent before create; keep it even when the reply is lost."""
+    nonce = secrets.token_hex(32)
+    mount = cmd[cmd.index('--mount') + 1]
+    fields = dict(part.split('=', 1) for part in mount.split(',') if '=' in part)
+    item = {'name': cmd[cmd.index('--name') + 1], 'nonce': nonce,
+            'image': cmd[cmd.index('--entrypoint') + 2], 'kind': kind,
+            'user': cmd[cmd.index('--user') + 1],
+            'mounts': [{'Type': fields['type'], 'Source': fields['src'],
+                         'Target': fields['dst'], 'ReadOnly': 'readonly' in mount.split(',')}]}
+    uid, gid = item['user'].split(':')
+    item['tmpfs'] = {path: f'rw,noexec,nosuid,nodev,size=1m,mode=0700,uid={uid},gid={gid}'
+                     for path in ('/mosquitto/data', '/mosquitto/log')}
+    # Mask every image VOLUME at the common allocation boundary, including init.
+    # Persist the expected masks before create; never delete anonymous volumes.
+    for path, options in item['tmpfs'].items():
+        cmd[2:2] = ['--tmpfs', path + ':' + options]
+    cancellation_checkpoint()
+    item['receipt'] = save_intent(item)
+    tracker.append(item)
+    cmd[2:2] = ['--label', 'bootstrap.nonce=' + nonce]
+    res = runner(cmd, capture_output=True, timeout=10, check=False,
+                 env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+    if res.returncode:
+        raise BootstrapError('helper creation failed; recovery required')
+    cid = res.stdout.decode().strip()
+    if not SAFE_HEX_64_PATTERN.fullmatch(cid):
+        raise BootstrapError('invalid helper create reply; recovery required')
+    item['id'] = cid
+    if resolve_helper(item, runner=runner) != cid:
+        raise BootstrapError('allocated helper absent')
+    cancellation_checkpoint()
+    return item, cid
 
 
 def container_native_init(image_id, destination, username, password, tracker, runner=subprocess.run):
@@ -456,15 +569,7 @@ def container_native_init(image_id, destination, username, password, tracker, ru
                   '--mount', f'type=bind,src={work_dir},dst=/work',
                   '--entrypoint', 'mosquitto_ctrl', image_id,
                   'dynsec', 'init', f'/work/{file_name}', username]
-    res_create = runner(create_cmd, capture_output=True, timeout=10, check=False,
-                        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-    if res_create.returncode != 0:
-        raise BootstrapError('container native init create failed')
-    cid = res_create.stdout.decode().strip()
-    if not SAFE_HEX_64_PATTERN.fullmatch(cid):
-        raise BootstrapError('invalid container ID returned')
-    tracker_item = {'id': cid, 'name': c_name, 'nonce': c_nonce, 'image': image_id}
-    tracker.append(tracker_item)
+    tracker_item, cid = allocate_helper(create_cmd, tracker, 'native-init', runner=runner)
 
     start_cmd = ['docker', 'start', '-a', '-i', cid]
     res_start = runner(start_cmd, input=((password + '\n') * 2).encode(),
@@ -473,7 +578,7 @@ def container_native_init(image_id, destination, username, password, tracker, ru
 
     state, exit_code = inspect_container_state(cid, runner=runner)
 
-    if not remove_and_verify_container(cid, runner=runner):
+    if cleanup_containers(tracker, runner=runner):
         raise BootstrapError('init container cleanup could not verify absence')
     if tracker_item in tracker:
         tracker.remove(tracker_item)
@@ -510,6 +615,8 @@ def check_config_file_security(config_path):
 
 
 def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
+    global _cleaning
+    _cleaning = False
     verified_image_id = verify_image(image_ref, runner=runner)
 
     volume_name = cfg.get('volume_name') or f'mosquitto_dynsec_{secrets.token_hex(12)}'
@@ -529,25 +636,28 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
         create_vol_cmd.extend(['--label', f'{k}={v}'])
     create_vol_cmd.append(volume_name)
 
-    res_vol = runner(create_vol_cmd, capture_output=True, timeout=10, check=False,
-                     env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-    if res_vol.returncode != 0 or res_vol.stdout.decode().strip() != volume_name:
-        raise BootstrapError('volume creation failed')
-
-    verify_volume_receipt(volume_name, labels, runner=runner)
-
     container_tracker = []
     volume_retained = False
     staging_cleaned = False
     staging_path = None
+    volume_intent = {'kind': 'volume', 'name': volume_name, 'labels': labels,
+                     'image': verified_image_id}
+    cancellation_checkpoint()
+    volume_intent['receipt'] = save_intent(volume_intent)
 
     try:
+        res_vol = runner(create_vol_cmd, capture_output=True, timeout=10, check=False,
+                         env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if res_vol.returncode != 0 or res_vol.stdout.decode().strip() != volume_name:
+            raise BootstrapError('volume creation failed')
+        verify_volume_receipt(volume_name, labels, runner=runner)
+        cancellation_checkpoint()
         # Step 1: Generate native hashes in protected host temporary directory
         staging_dir_parent = '/tmp/opencode' if os.path.exists('/tmp/opencode') else None
         old_umask = os.umask(0o077)
         try:
-            staging_obj = tempfile.TemporaryDirectory(dir=staging_dir_parent, prefix='mqtt-bootstrap-')
-            staging_path = staging_obj.name
+            # No automatic finalizer may unlink inputs still mounted by helpers.
+            staging_path = tempfile.mkdtemp(dir=staging_dir_parent, prefix='mqtt-bootstrap-')
             os.chmod(staging_path, 0o700)
             sources = []
             for name in ('manager', 'backend'):
@@ -578,7 +688,7 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
         # Ensure container tracker is empty before staging directory cleanup
         if container_tracker:
             raise BootstrapError('active init containers remain before staging cleanup')
-        staging_obj.cleanup()
+        shutil.rmtree(staging_path)
         staging_cleaned = True
 
         # Re-verify volume receipt before Step 2
@@ -603,20 +713,12 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
                     '--mount', f'type=volume,src={volume_name},dst=/mosquitto/dynsec',
                     '--entrypoint', '/bin/sh', verified_image_id,
                     '-c', root_script]
-        res_croot = runner(cmd_root, capture_output=True, timeout=10, check=False,
-                           env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-        if res_croot.returncode != 0:
-            raise BootstrapError('root ownership helper container creation failed')
-        c_root_id = res_croot.stdout.decode().strip()
-        if not SAFE_HEX_64_PATTERN.fullmatch(c_root_id):
-            raise BootstrapError('invalid container ID returned')
-        item_root = {'id': c_root_id, 'name': c_root_name, 'nonce': c_root_nonce, 'image': verified_image_id}
-        container_tracker.append(item_root)
+        item_root, c_root_id = allocate_helper(cmd_root, container_tracker, 'ownership', runner=runner)
 
         res_sroot = runner(['docker', 'start', '-a', c_root_id], capture_output=True, timeout=15, check=False,
                            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
         state_root, exit_root = inspect_container_state(c_root_id, runner=runner)
-        if not remove_and_verify_container(c_root_id, runner=runner):
+        if cleanup_containers(container_tracker, runner=runner):
             raise BootstrapError('root helper container cleanup could not verify absence')
         if item_root in container_tracker:
             container_tracker.remove(item_root)
@@ -650,21 +752,13 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
                       '--mount', f'type=volume,src={volume_name},dst=/mosquitto/dynsec',
                       '--entrypoint', '/bin/sh', verified_image_id,
                       '-c', writer_script, 'sh', c_writer_nonce]
-        res_cwriter = runner(cmd_writer, capture_output=True, timeout=10, check=False,
-                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-        if res_cwriter.returncode != 0:
-            raise BootstrapError('writer container creation failed')
-        c_writer_id = res_cwriter.stdout.decode().strip()
-        if not SAFE_HEX_64_PATTERN.fullmatch(c_writer_id):
-            raise BootstrapError('invalid container ID returned')
-        item_writer = {'id': c_writer_id, 'name': c_writer_name, 'nonce': c_writer_nonce, 'image': verified_image_id}
-        container_tracker.append(item_writer)
+        item_writer, c_writer_id = allocate_helper(cmd_writer, container_tracker, 'writer', runner=runner)
 
         res_swriter = runner(['docker', 'start', '-a', '-i', c_writer_id], input=composed_bytes,
                              capture_output=True, timeout=15, check=False,
                              env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
         state_writer, exit_writer = inspect_container_state(c_writer_id, runner=runner)
-        if not remove_and_verify_container(c_writer_id, runner=runner):
+        if cleanup_containers(container_tracker, runner=runner):
             raise BootstrapError('writer container cleanup could not verify absence')
         if item_writer in container_tracker:
             container_tracker.remove(item_writer)
@@ -688,20 +782,12 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
                       '--mount', f'type=volume,src={volume_name},dst=/mosquitto/dynsec,readonly',
                       '--entrypoint', '/bin/sh', verified_image_id,
                       '-c', reader_script]
-        res_creader = runner(cmd_reader, capture_output=True, timeout=10, check=False,
-                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-        if res_creader.returncode != 0:
-            raise BootstrapError('reader verification container creation failed')
-        c_reader_id = res_creader.stdout.decode().strip()
-        if not SAFE_HEX_64_PATTERN.fullmatch(c_reader_id):
-            raise BootstrapError('invalid container ID returned')
-        item_reader = {'id': c_reader_id, 'name': c_reader_name, 'nonce': c_reader_nonce, 'image': verified_image_id}
-        container_tracker.append(item_reader)
+        item_reader, c_reader_id = allocate_helper(cmd_reader, container_tracker, 'reader', runner=runner)
 
         res_sreader = runner(['docker', 'start', '-a', c_reader_id], capture_output=True,
                              timeout=15, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
         state_reader, exit_reader = inspect_container_state(c_reader_id, runner=runner)
-        if not remove_and_verify_container(c_reader_id, runner=runner):
+        if cleanup_containers(container_tracker, runner=runner):
             raise BootstrapError('reader container cleanup could not verify absence')
         if item_reader in container_tracker:
             container_tracker.remove(item_reader)
@@ -723,27 +809,47 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
             raise BootstrapError('verified store content does not match composed store exactly')
 
         volume_retained = True
+        cancellation_checkpoint()
+        discard_intent(volume_intent)
         return volume_name
     finally:
+        _cleaning = True
         uncleaned_cids = cleanup_containers(container_tracker, runner=runner)
         if uncleaned_cids:
-            print(f'CRITICAL: container cleanup failed for IDs: {uncleaned_cids}', file=sys.stderr)
-            if volume_retained:
-                # Cleanup failure vetoes store_created success, but do not delete successfully published store
-                print(f'Retained published volume due to uncleaned containers: {volume_name}', file=sys.stderr)
-                raise BootstrapError('cleanup failure vetoes store creation; containers retained')
+            recovery_dir = staging_path if staging_path and not staging_cleaned else tempfile.mkdtemp(
+                dir=_recovery_parent, prefix='mqtt-bootstrap-recovery-')
+            receipt_path = Path(recovery_dir) / 'recovery.json'
+            fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump({'helpers': container_tracker, 'volume': volume_name,
+                           'labels': labels}, stream)
+            raise BootstrapError(f'incomplete cleanup; protected recovery receipt: {receipt_path}')
+        if staging_path and not staging_cleaned:
+            shutil.rmtree(staging_path)
         if not volume_retained:
             # Safe teardown of failed/partial newly created volume (never use -f)
             try:
                 rec = verify_volume_receipt(volume_name, labels, runner=runner)
                 if rec.get('Name') == volume_name:
-                    runner(['docker', 'volume', 'rm', volume_name], capture_output=True,
-                           timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+                    res = runner(['docker', 'volume', 'rm', volume_name], capture_output=True,
+                                 timeout=10, check=False, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+                    if res.returncode:
+                        raise BootstrapError('volume removal failed')
+                    check_volume_absent(volume_name, runner=runner)
+                    discard_intent(volume_intent)
             except Exception:
-                pass
+                recovery_dir = tempfile.mkdtemp(dir=_recovery_parent, prefix='mqtt-bootstrap-recovery-')
+                receipt_path = Path(recovery_dir) / 'recovery.json'
+                fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'w') as stream:
+                    json.dump({'volume': volume_name, 'labels': labels}, stream)
+                raise BootstrapError(f'incomplete volume cleanup; protected recovery receipt: {receipt_path}') from None
+        _cleaning = False
+        cancellation_checkpoint()
 
 
 def main():
+    global _recovery_parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--container', action='store_true',
                         help='run bootstrap in pinned Mosquitto container targeting a fresh named volume')
@@ -751,11 +857,20 @@ def main():
                         help=f'pinned Mosquitto Docker image reference (default: {PINNED_IMAGE})')
     parser.add_argument('--config', type=Path, default=None,
                         help='path to protected JSON configuration file (default: stdin)')
+    parser.add_argument('--recovery-dir', type=Path, default=None,
+                        help='existing private 0700 directory for allocation recovery receipts')
     parser.add_argument('--native-tool', default='/usr/bin/mosquitto_ctrl',
                         help='path to native mosquitto_ctrl (host mode only)')
     parser.add_argument('--check-native-tool', action='store_true',
                         help='verify dependency only (host binary or container image); no store written')
     args = parser.parse_args()
+
+    if args.recovery_dir is not None:
+        info = args.recovery_dir.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
+                or info.st_uid != os.getuid()):
+            raise BootstrapError('recovery directory must be owned and private 0700')
+        _recovery_parent = str(args.recovery_dir.resolve())
 
     if args.config is not None:
         check_config_file_security(args.config)
@@ -820,4 +935,11 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    previous = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for signum in previous:
+            signal.signal(signum, request_cancellation)
+        sys.exit(main())
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)

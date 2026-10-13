@@ -42,6 +42,69 @@ DO $$ BEGIN
     ) THEN
         RAISE EXCEPTION 'Missing table mqtt_reset_dispositions';
     END IF;
+
+    -- Verify primary key on predecessor_id
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'p'
+          AND pg_get_constraintdef(oid) = 'PRIMARY KEY (predecessor_id)'
+    ) THEN
+        RAISE EXCEPTION 'Missing primary key constraint on mqtt_reset_dispositions';
+    END IF;
+
+    -- Verify unique constraint on successor_id
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'u'
+          AND pg_get_constraintdef(oid) = 'UNIQUE (successor_id)'
+    ) THEN
+        RAISE EXCEPTION 'Missing unique constraint on successor_id';
+    END IF;
+
+    -- Verify FK on predecessor_id to gateway_mqtt_credential_events(operation_id)
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'f'
+          AND confrelid = 'public.gateway_mqtt_credential_events'::regclass
+          AND pg_get_constraintdef(oid) LIKE '%FOREIGN KEY (predecessor_id) REFERENCES gateway_mqtt_credential_events(operation_id)%'
+    ) THEN
+        RAISE EXCEPTION 'Missing FK constraint on predecessor_id';
+    END IF;
+
+    -- Verify FK on successor_id to gateway_mqtt_credential_events(operation_id) (deferrable)
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'f'
+          AND confrelid = 'public.gateway_mqtt_credential_events'::regclass
+          AND pg_get_constraintdef(oid) LIKE '%FOREIGN KEY (successor_id) REFERENCES gateway_mqtt_credential_events(operation_id)%'
+          AND condeferrable
+    ) THEN
+        RAISE EXCEPTION 'Missing deferrable FK constraint on successor_id';
+    END IF;
+
+    -- Verify check constraints on mqtt_reset_dispositions (reason and disposition)
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%reason = ANY (%''recovery_after_unknown''%''lost_secret_recovery''%)%'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%disposition = ''reset_superseded''%'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.mqtt_reset_dispositions'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%predecessor_id <> successor_id%'
+    ) THEN
+        RAISE EXCEPTION 'Missing check constraints on mqtt_reset_dispositions';
+    END IF;
 END $$;
 
 -- 3. Verify columns and constraints on gateway_mqtt_credential_events

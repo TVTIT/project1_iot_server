@@ -5,6 +5,70 @@ DO $$ BEGIN
         RAISE EXCEPTION 'Migration 000011 is not recorded';
     END IF;
 END $$;
+-- Migration 17 replaces the partial index with serialized admission and
+-- deferred inventory guards. Absence of an index alone never selects a branch.
+DO $$
+DECLARE
+    replacement_schema boolean;
+    expected record;
+    definition text;
+BEGIN
+    SELECT COALESCE(max(version), 0) >= 17 INTO replacement_schema FROM schema_migrations;
+    IF replacement_schema AND NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE version = 17 AND name = 'mqtt_rotation_replacement'
+    ) THEN
+        RAISE EXCEPTION 'Unknown replacement migration history';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_index
+        WHERE indexrelid = to_regclass('public.uq_mqtt_operation_actor_key')
+          AND indrelid = to_regclass('public.gateway_mqtt_credential_events')
+          AND indisunique AND indisvalid AND indisready) THEN
+        RAISE EXCEPTION 'Missing unique actor-key index';
+    END IF;
+    IF NOT replacement_schema THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_index
+            WHERE indexrelid = to_regclass('public.uq_mqtt_operation_unresolved')
+              AND indrelid = to_regclass('public.gateway_mqtt_credential_events')
+              AND indisunique AND indisvalid AND indisready AND indpred IS NOT NULL) THEN
+            RAISE EXCEPTION 'Missing unresolved operation index';
+        END IF;
+    ELSE
+        IF to_regprocedure('public.mqtt_operation_effective(uuid)') IS NULL
+           OR to_regprocedure('public.validate_mqtt_replacement_inventory(text)') IS NULL THEN
+            RAISE EXCEPTION 'Missing replacement admission functions';
+        END IF;
+        -- Same exact bindings as the v18 guard verifier, without its v18-only
+        -- tracking assertion. Both admission and all deferred inventory sides
+        -- are required on v17 and later schemas.
+        FOR expected IN SELECT * FROM (VALUES
+            ('gateway_mqtt_credential_events', 'enforce_gateway_mqtt_event_transition', 'enforce_gateway_mqtt_event_transition()', 23, false),
+            ('gateway_mqtt_credential_events', 'enforce_mqtt_maintenance_admission', 'enforce_mqtt_maintenance_admission()', 7, false),
+            ('mqtt_rotation_replacements', 'check_mqtt_replacement_disposition', 'check_mqtt_replacement_inventory()', 5, true),
+            ('gateway_mqtt_credential_events', 'check_mqtt_replacement_event', 'check_mqtt_replacement_inventory()', 21, true),
+            ('gateway_mqtt_credentials', 'check_mqtt_replacement_projection', 'check_mqtt_replacement_inventory()', 21, true),
+            ('mqtt_credential_maintenance', 'check_mqtt_replacement_checkpoint', 'check_mqtt_replacement_inventory()', 29, true)
+        ) AS e(relation, name, signature, kind, deferred) LOOP
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger
+                WHERE tgrelid = to_regclass('public.' || expected.relation)
+                  AND tgname = expected.name AND tgfoid = to_regprocedure('public.' || expected.signature)
+                  AND tgtype = expected.kind AND tgenabled = 'O' AND NOT tgisinternal
+                  AND tgdeferrable = expected.deferred AND tginitdeferred = expected.deferred
+                  AND (NOT expected.deferred OR tgconstraint <> 0) AND tgqual IS NULL
+                  AND tgnargs = 0 AND tgattr = ''::int2vector) THEN
+                RAISE EXCEPTION 'Missing replacement admission trigger: %', expected.name;
+            END IF;
+        END LOOP;
+        FOREACH definition IN ARRAY ARRAY[
+            pg_get_functiondef(to_regprocedure('public.enforce_gateway_mqtt_event_transition()')),
+            pg_get_functiondef(to_regprocedure('public.enforce_mqtt_maintenance_admission()'))
+        ] LOOP
+            IF position('FOR UPDATE' IN definition) = 0
+               OR position('mqtt_operation_effective(operation_id)' IN definition) = 0 THEN
+                RAISE EXCEPTION 'Missing gateway-serialized effective admission';
+            END IF;
+        END LOOP;
+    END IF;
+END $$;
 CREATE FUNCTION pg_temp.must_reject(statement TEXT) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     BEGIN
@@ -91,10 +155,6 @@ DO $$ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname IN ('anon', 'authenticated') AND (has_table_privilege(rolname, 'gateway_mqtt_credentials', 'SELECT') OR has_table_privilege(rolname, 'gateway_mqtt_credential_events', 'SELECT'))) THEN
         RAISE EXCEPTION 'Public credential access';
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = 'uq_mqtt_operation_unresolved'::regclass AND indisunique AND indpred IS NOT NULL)
-       OR NOT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = 'uq_mqtt_operation_actor_key'::regclass AND indisunique) THEN
-        RAISE EXCEPTION 'Missing unique operation indexes';
     END IF;
 END $$;
 ROLLBACK;
