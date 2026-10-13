@@ -393,10 +393,12 @@ jobs:
     defaults:
       run:
         working-directory: .
-    env:
-      DYNSEC_NATIVE_REPORT: ${{ runner.temp }}/dynsec-native-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@v6
+      - name: Prepare native report path
+        run: |
+          printf 'DYNSEC_NATIVE_REPORT=%s/dynsec-native-%s-%s.json\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
@@ -429,10 +431,12 @@ jobs:
     defaults:
       run:
         working-directory: .
-    env:
-      DYNSEC_BOOTSTRAP_REPORT: ${{ runner.temp }}/dynsec-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@v6
+      - name: Prepare bootstrap report path
+        run: |
+          printf 'DYNSEC_BOOTSTRAP_REPORT=%s/dynsec-bootstrap-%s-%s.json\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - name: Bootstrap and helper unit regression suites
         run: |
           mkdir -p /tmp/opencode
