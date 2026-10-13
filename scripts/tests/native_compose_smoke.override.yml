@@ -1,0 +1,61 @@
+# Template fragment, not a standalone Compose file. Requires Compose >= 2.24.4.
+# prepare() merges these properties into generated service isolation stanzas.
+# Only Nginx publishes a host port; Docker allocates a loopback port at runtime.
+  nginx:
+    ports: !override
+      - target: 80
+        published: "0"
+        host_ip: "127.0.0.1"
+        protocol: tcp
+  mosquitto:
+    tmpfs: ["/mosquitto/log:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=1883,gid=1883"]
+    volumes: !override
+      - ${NCS_BROKER_CONFIG:?required}:/mosquitto/config/mosquitto.conf:ro
+      - ${NCS_CERT_DIR:?required}:/mosquitto/config/certs:ro
+      - mosquitto_dynsec:/mosquitto/dynsec
+      - mosquitto_data:/mosquitto/data
+  backend:
+    tmpfs: !override ["/tmp:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=1883,gid=1883", "/mosquitto/data:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=1883,gid=1883", "/mosquitto/log:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=1883,gid=1883"]
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+      application-migrations:
+        condition: service_completed_successfully
+      supabase-compat-migration:
+        condition: service_completed_successfully
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+      target: backend
+    volumes: !override
+      - mosquitto_dynsec:/mosquitto/dynsec:ro
+      - type: bind
+        source: ${MQTT_TLS_CA_SOURCE:?required}
+        target: /mosquitto/config/certs/ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
+  supabase-envoy:
+    depends_on: !override
+      supabase-auth:
+        condition: service_healthy
+  supabase-role-provisioner:
+    tmpfs: ["/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700"]
+  application-migrations:
+    tmpfs: ["/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700"]
+  supabase-compat-migration:
+    tmpfs: ["/var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=1m,mode=0700"]
+volumes: !override
+  postgres_data:
+    labels: {io.iot.native-smoke.run: "${NCS_RUN:?required}", io.iot.native-smoke.role: postgres_data}
+  mosquitto_data:
+    labels: {io.iot.native-smoke.run: "${NCS_RUN:?required}", io.iot.native-smoke.role: mosquitto_data}
+  mosquitto_dynsec:
+    # Bootstrap must create this fresh volume first; Compose must not create it.
+    external: true
+    name: ${MQTT_DYNSEC_BOOTSTRAP_VOLUME:?required}
+networks: !override
+  iot_net:
+    labels: {io.iot.native-smoke.run: "${NCS_RUN:?required}", io.iot.native-smoke.role: iot_net}

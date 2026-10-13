@@ -18,7 +18,6 @@ import (
 	"iot-platform/internal/database"
 	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpserver"
-	"iot-platform/internal/mqttcredential"
 )
 
 func main() {
@@ -39,14 +38,7 @@ func run() error {
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	// Fence a prior backend lifetime before any database connection attempt.
-	if cfg.Credential.Enabled {
-		ctrl := mqttcredential.ControllerClient{ControlDir: cfg.Credential.ControlDir, Timeout: cfg.Credential.ClientTimeout, MaxFrameBytes: 4096}
-		if ctrl.CloseDrain(rootCtx) != nil {
-			return fmt.Errorf("credential startup controller unavailable")
-		}
-	}
-
+	// Open database connection
 	pool, err := database.Open(
 		rootCtx,
 		cfg.DatabaseURL,

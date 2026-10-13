@@ -12,8 +12,10 @@
 - `docs/client/06_PROJECT_SETUP_AND_ENV.md` (Cấu hình môi trường và biến bảo mật)  
 - `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md` (Tích hợp API và Quản lý trạng thái Client)  
 - `docs/backend/stage-2-task-2.4-provisioning.md` (Chi tiết kỹ thuật Admin Provisioning)  
-- `docs/backend/stage-2-task-2.6-acceptance.md` (Báo cáo nghiệm thu và kiến trúc Mosquitto DynSec Ingress Gate)  
-- `docs/backend/platform-admin-account-management-goals.md` (Mục tiêu và ranh giới quản lý tài khoản)  
+- `docs/backend/stage-2-task-2.6-acceptance.md` (Báo cáo nghiệm thu và kiến trúc Mosquitto DynSec Ingress Gate)
+- `docs/backend/platform-admin-account-management-goals.md` (Mục tiêu và ranh giới quản lý tài khoản)
+- [docs/dynsec/INDEX.md](../dynsec/INDEX.md) (Tổng quan kiến trúc và ma trận bằng chứng DynSec)
+- [docs/dynsec/flows-and-api.md](../dynsec/flows-and-api.md) (Chi tiết các luồng vận hành và hợp đồng HTTP API DynSec)
 
 ---
 

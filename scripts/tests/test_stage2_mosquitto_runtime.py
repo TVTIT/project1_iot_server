@@ -8,6 +8,49 @@ import stage2_mosquitto_runtime as runtime
 
 
 class Contracts(unittest.TestCase):
+    def source_service(self, yaml_text, service_name):
+        # Static contract for checked-in block-style YAML, not a Compose parser.
+        services = yaml_text.split('services:\n', 1)[1]
+        match = re.search(r'^  ' + re.escape(service_name) + r':\n(.*?)(?=^  [\w-]+:|^\S|\Z)',
+                          services, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, f'missing service: {service_name}')
+        return '\n'.join(line for line in match.group(1).splitlines()
+                         if line.strip() and not line.lstrip().startswith('#'))
+
+    def assert_native_source_topology(self, yaml_text):
+        self.assert_source_yaml_ca_only(yaml_text, 'backend')
+        broker = self.source_service(yaml_text, 'mosquitto')
+        backend = self.source_service(yaml_text, 'backend')
+        self.assertRegex(broker, r'(?m)^    image: ' + re.escape(runtime.IMAGE) + r'$',
+                         'broker image must retain its pinned digest')
+        for service in (broker, backend):
+            self.assertIn('    user: "1883:1883"', service)
+            self.assertIn('    cap_drop: [ ALL ]', service)
+            self.assertIn('    security_opt: [ no-new-privileges:true ]', service)
+        self.assertRegex(backend, r'(?m)^    read_only: true$')
+        self.assertIn('      MQTT_CREDENTIAL_RUNTIME_ENABLED: "false"', backend)
+        self.assertIn('        target: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}', backend)
+        self.assertIn('        source: ${MQTT_TLS_CA_SOURCE:-./config/mosquitto/certs/ca.crt}', backend)
+        self.assertIn('      MQTT_TLS_CA_FILE: ${MQTT_TLS_CA_FILE:-/mosquitto/config/certs/ca.crt}', backend)
+        self.assertIn('      MQTT_DYNSEC_JSON_PATH: ${MQTT_DYNSEC_JSON_PATH:-/mosquitto/dynsec/dynamic-security.json}', backend)
+        for name, expected in (('mosquitto', 'mosquitto_dynsec:/mosquitto/dynsec'),
+                               ('backend', 'mosquitto_dynsec:/mosquitto/dynsec:ro')):
+            mounts = self.parse_yaml_service_volumes(yaml_text, name)
+            store = [v.strip() for v in mounts if '/mosquitto/dynsec' in v or 'mosquitto_dynsec:' in v]
+            self.assertEqual(store, ['- ' + expected], f'{name}: native store access contract')
+            if name == 'backend':
+                self.assertEqual(len(mounts), 2, 'backend permits only the read-only store and CA')
+        broker_mounts = [v.strip() for v in self.parse_yaml_service_volumes(yaml_text, 'mosquitto')]
+        self.assertIn('- ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro', broker_mounts)
+        self.assertIn('- ./config/mosquitto/certs:/mosquitto/config/certs:ro', broker_mounts)
+        # Legacy services and dependencies belong only to the isolated fixture.
+        active = '\n'.join(line for line in yaml_text.splitlines()
+                           if not line.lstrip().startswith('#'))
+        for legacy in ('mosquitto-auth-init', 'mosquitto-reloader'):
+            self.assertNotIn(legacy, active, 'active Compose must not depend on legacy services')
+        self.assertNotIn('/mosquitto/auth', backend)
+        self.assertNotIn('/mosquitto/control', backend)
+
     def parse_yaml_service_volumes(self, yaml_text, service_name):
         lines = yaml_text.splitlines()
         in_services = False
@@ -113,38 +156,45 @@ class Contracts(unittest.TestCase):
                 self.assertFalse(mount['source'].endswith(('.key', '/certs')))
 
     def test_actual_production_compose_ca_only(self):
-        import json
-        # No inherited deployment environment, implicit .env, or printed config.
-        env = dict(runtime.ENV, COMPOSE_DISABLE_ENV_FILE='1')
-        for key in ('MQTT_PASSWORD', 'POSTGRES_PASSWORD', 'AUTH_DB_PASSWORD',
-                    'STORAGE_DB_PASSWORD', 'BACKEND_DB_PASSWORD', 'JWT_SECRET',
-                    'DATABASE_URL', 'GOTRUE_JWT_ISSUER', 'SUPABASE_JWT_AUDIENCE'):
-            env[key] = 'isolated-test-placeholder'
-        env['MQTT_TLS_CA_SOURCE'] = '/tmp/opencode/public-fixture/ca.crt'
-        env['MQTT_TLS_CA_FILE'] = '/mqtt-public/ca.crt'
-        self.assert_source_yaml_ca_only(runtime.ROOT / 'docker-compose.yml', 'backend',
-                                       ('mosquitto-auth-init', 'mosquitto-reloader'))
-        config = json.loads(runtime.run(['docker', 'compose', '--env-file', '/dev/null',
-                                        '-f', str(runtime.ROOT / 'docker-compose.yml'),
-                                        'config', '--format', 'json'], env=env, capture=True))
-        self.assert_ca_only(config, 'backend', ('mosquitto-auth-init', 'mosquitto-reloader'))
-        ca = next(m for m in config['services']['backend']['volumes']
-                  if m['target'] == '/mqtt-public/ca.crt')
-        self.assertEqual(ca['source'], env['MQTT_TLS_CA_SOURCE'])
-        del env['MQTT_TLS_CA_SOURCE'], env['MQTT_TLS_CA_FILE']
-        defaults = json.loads(runtime.run(['docker', 'compose', '--env-file', '/dev/null',
-                                          '-f', str(runtime.ROOT / 'docker-compose.yml'),
-                                          'config', '--format', 'json'], env=env, capture=True))
-        self.assert_ca_only(defaults, 'backend', ('mosquitto-auth-init', 'mosquitto-reloader'))
-        self.assertEqual(defaults['services']['backend']['environment']['MQTT_TLS_CA_FILE'],
-                         '/mosquitto/config/certs/ca.crt')
+        # Read source only: no Docker, interpolation, or deployment .env.
+        self.assert_native_source_topology((runtime.ROOT / 'docker-compose.yml').read_text())
+
+    def test_native_topology_rejects_security_regressions(self):
+        source = (runtime.ROOT / 'docker-compose.yml').read_text()
+        counterexamples = {
+            'private key': source.replace('      - mosquitto_dynsec:/mosquitto/dynsec:ro',
+                                          '      - ./server.key:/app/server.key:ro\n      - mosquitto_dynsec:/mosquitto/dynsec:ro'),
+            'writable backend store': source.replace('mosquitto_dynsec:/mosquitto/dynsec:ro',
+                                                     'mosquitto_dynsec:/mosquitto/dynsec:rw'),
+            'implicit writable backend store': source.replace('mosquitto_dynsec:/mosquitto/dynsec:ro',
+                                                              'mosquitto_dynsec:/mosquitto/dynsec'),
+            'read-only broker store': source.replace('- mosquitto_dynsec:/mosquitto/dynsec\n',
+                                                     '- mosquitto_dynsec:/mosquitto/dynsec:ro\n'),
+            'legacy initializer dependency': source.replace('      mosquitto:\n',
+                                                            '      mosquitto-auth-init:\n        condition: service_completed_successfully\n      mosquitto:\n'),
+            'legacy reloader dependency': source.replace('      mosquitto:\n',
+                                                         '      mosquitto-reloader:\n        condition: service_started\n      mosquitto:\n'),
+            'unpinned broker': source.replace(runtime.IMAGE, 'eclipse-mosquitto:latest'),
+            'root UID': source.replace('user: "1883:1883"', 'user: "0:0"'),
+            'writable root filesystem': source.replace('\n    read_only: true\n', '\n    read_only: false\n'),
+        }
+        for name, candidate in counterexamples.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(candidate, source, 'counterexample must change the source')
+                with self.assertRaises(AssertionError):
+                    self.assert_native_source_topology(candidate)
 
     def test_fixture_compose_ca_only(self):
-        import json
+        # Keep the legacy fixture's own initializer/reloader security boundary.
         self.assert_source_yaml_ca_only(runtime.COMPOSE, 'backend', ('initializer', 'reloader'))
-        poc = runtime.PoC('/tmp/opencode/public-fixture')
-        config = json.loads(poc.command('config', '--format', 'json', capture=True))
-        self.assert_ca_only(config, 'backend', ('initializer', 'reloader'))
+        source = runtime.COMPOSE.read_text()
+        initializer = self.source_service(source, 'initializer')
+        reloader = self.source_service(source, 'reloader')
+        self.assertIn('      target: auth-init', initializer)
+        self.assertIn('      target: reloader', reloader)
+        self.assertIn('    pid: service:broker', reloader)
+        self.assertIn('    network_mode: none', initializer)
+        self.assertIn('    network_mode: none', reloader)
 
     def test_ca_mount_normalized_json_semantics_and_restrictions(self):
         def make_config(ca_bind=None, has_bind=True, read_only=True, ca_source='/etc/ca.crt',
@@ -220,8 +270,7 @@ class Contracts(unittest.TestCase):
 
     def test_source_yaml_ca_mount_contract_guards(self):
         # Both actual source YAML files must pass
-        self.assert_source_yaml_ca_only(runtime.ROOT / 'docker-compose.yml', 'backend',
-                                       ('mosquitto-auth-init', 'mosquitto-reloader'))
+        self.assert_native_source_topology((runtime.ROOT / 'docker-compose.yml').read_text())
         self.assert_source_yaml_ca_only(runtime.COMPOSE, 'backend', ('initializer', 'reloader'))
 
         good_yaml = '''services:
@@ -416,12 +465,15 @@ class WorkflowGuards(unittest.TestCase):
     def test_ci_keeps_baseline_and_runs_real_runtime(self):
         workflow = (runtime.ROOT / '.github/workflows/ci.yml').read_text()
         import re
-        jobs = re.findall(r'^  ([a-z-]+):\n    runs-on:', workflow, re.MULTILINE)
+        jobs = re.findall(r'^  ([a-z0-9-]+):\n(?:    name:.*\n)?    runs-on:', workflow, re.MULTILINE)
+        self.assertEqual(len(jobs), len(set(jobs)), 'duplicate jobs detected in workflow')
         self.assertEqual(set(jobs), {'lint-and-test', 'cross-compile', 'migration-check',
-                                   'docker-build', 'authorization-integration',
-                                   'provisioning-integration', 'auth-integration',
-                                   'mosquitto-runtime-integration',
-                                   'mosquitto-credential-integration'})
+                                    'docker-build', 'authorization-integration',
+                                    'provisioning-integration', 'auth-integration',
+                                    'mosquitto-runtime-integration',
+                                    'mosquitto-credential-integration', 'stage2-e2e',
+                                    'legacy-runtime-image-build', 'dynsec-native-integration',
+                                    'dynsec-bootstrap-tests', 'native-compose-smoke'})
         job = workflow.split('  mosquitto-runtime-integration:', 1)[1]
         self.assertIn('sh scripts/test-stage2-mosquitto-runtime.sh', job)
         self.assertIn("-p 'test_stage2_mosquitto_runtime.py'", job)

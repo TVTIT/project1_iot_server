@@ -25,7 +25,8 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   [contract authorization Task 2.3](docs/backend/stage-2-task-2.3-authorization.md),
   [contract provisioning Task 2.4](docs/backend/stage-2-task-2.4-provisioning.md),
   [hạ tầng runtime Mosquitto Task 2.5](docs/backend/stage-2-task-2.5-mosquitto-runtime.md),
-  [sổ tay vận hành MQTT Credential Task 2.6](docs/backend/stage-2-task-2.6-mqtt-credentials.md) và
+  [sổ tay vận hành MQTT Credential Task 2.6](docs/backend/stage-2-task-2.6-mqtt-credentials.md),
+  [kiến trúc và hướng dẫn vận hành DynSec Task 2.8a](docs/dynsec/INDEX.md) và
   [nghiệm thu E2E Task 2.7](docs/backend/stage-2-task-2.7-acceptance.md)
   để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
 
@@ -418,7 +419,7 @@ Các route này đã được đăng ký trong router Go backend, có handler x�
 | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/rotate` | Bearer JWT + `platform_admins` + `Idempotency-Key` | Xoay vòng credential MQTT trong cửa sổ bảo trì toàn cục (drain/cold restart) | Đã triển khai: HTTP 200 kèm secret mới 1 lần; replay cùng key trả về 200 metadata-only; HTTP 409 nếu không active; HTTP 503 nếu deployment tắt; HTTP 401/403 |
 | `DELETE` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` + `Idempotency-Key` | Thu hồi vĩnh viễn (revoke) credential MQTT của Gateway, lập tức ngắt session active và cấm fresh CONNECT | Đã triển khai: HTTP 200 revoked; HTTP 503 nếu deployment tắt; HTTP 401/403 |
 
-*Lưu ý về 4 endpoint Admin MQTT Credential*: Các route này đã được lập trình hoàn chỉnh trong code và kiểm thử trong harness test, nhưng trên cấu hình deployment thực tế mặc định bị vô hiệu hóa qua biến `MQTT_CREDENTIAL_API_ENABLED=false` (trả về lỗi an toàn HTTP `503 credential_runtime_disabled`).
+*Lưu ý về 4 endpoint Admin MQTT Credential*: Các route này đã được lập trình hoàn chỉnh trong code và kiểm thử trong harness test, nhưng trên cấu hình deployment thực tế mặc định bị vô hiệu hóa qua biến `MQTT_CREDENTIAL_API_ENABLED=false` (trả về lỗi an toàn HTTP `503 credential_runtime_disabled`). Chi tiết quy trình triển khai, hợp đồng API và giới hạn kỹ thuật xem tại [Tài liệu Kiến trúc DynSec](docs/dynsec/INDEX.md).
 
 #### 2. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
 Các route này đã được khai báo và đăng ký trong router Go backend nhưng chưa triển khai logic nghiệp vụ; yêu cầu Bearer JWT hợp lệ trước khi trả về HTTP `501 Not Implemented`:

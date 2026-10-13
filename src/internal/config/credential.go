@@ -12,9 +12,12 @@ import (
 
 // CredentialConfig is opt-in. No secrets are interpolated into child argv.
 type CredentialConfig struct {
-	Enabled                                                                                                        bool
-	ManagerUsername, ManagerPassword, BackendPassword                                                              string
-	ManagementURL, CAFile, SnapshotPath, ControlDir                                                                string
+	Enabled                                           bool
+	ManagerUsername, ManagerPassword, BackendPassword string
+	ManagementURL, CAFile, SnapshotPath, ControlDir   string
+	WriterUID                                         uint32
+	// Qualification binds operator/release identity, not remote broker attestation.
+	Qualification                                                                                                  mqttcredential.NativeDisableQualification
 	DBTimeout, FinalizeTimeout, ReconcileTimeout, OperationTimeout, RequestTimeout, RecoveryTimeout, ClientTimeout time.Duration
 	BatchSize, MaxPages, QueueSize, MaxInflight, MaxPayloadBytes, MaxSnapshotBytes                                 int
 }
@@ -34,9 +37,8 @@ func loadCredential(lookup LookupFunc, cfg Config) (CredentialConfig, error) {
 	if !c.Enabled {
 		return c, nil
 	}
-	gate, err := strconv.ParseBool(valueOrDefault(lookup, "INGRESS_GATE_ENABLED", "true"))
-	if err != nil || !gate || cfg.MQTTCredentialRuntime.Enabled {
-		return c, fmt.Errorf("credential API requires ingress gate and disabled legacy runtime")
+	if _, err := strconv.ParseBool(valueOrDefault(lookup, "INGRESS_GATE_ENABLED", "true")); err != nil || cfg.MQTTCredentialRuntime.Enabled {
+		return c, fmt.Errorf("credential API requires valid ingress gate flag and disabled legacy runtime")
 	}
 	c.ManagerUsername = valueOrDefault(lookup, "MQTT_DYNSEC_MANAGER_USERNAME", "")
 	if c.ManagerUsername == "" || c.ManagerUsername == mqttcredential.BackendUsername {
@@ -52,11 +54,32 @@ func loadCredential(lookup LookupFunc, cfg Config) (CredentialConfig, error) {
 	if e != nil || u.Scheme != "ssl" || u.Hostname() == "" || u.Port() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		return c, fmt.Errorf("MQTT_INTERNAL_MANAGEMENT_URL must be ssl URL with hostname and port")
 	}
-	for key, dest := range map[string]*string{"MQTT_TLS_CA_FILE": &c.CAFile, "MQTT_DYNSEC_JSON_PATH": &c.SnapshotPath, "MQTT_CONTROLLER_DIR": &c.ControlDir} {
-		*dest = valueOrDefault(lookup, key, "")
-		if !filepath.IsAbs(*dest) || filepath.Clean(*dest) != *dest {
-			return c, fmt.Errorf("%s must be a clean absolute path", key)
-		}
+	c.CAFile = valueOrDefault(lookup, "MQTT_TLS_CA_FILE", "")
+	if !filepath.IsAbs(c.CAFile) || filepath.Clean(c.CAFile) != c.CAFile {
+		return c, fmt.Errorf("MQTT_TLS_CA_FILE must be a clean absolute path")
+	}
+	c.SnapshotPath = valueOrDefault(lookup, "MQTT_DYNSEC_JSON_PATH", "")
+	if !filepath.IsAbs(c.SnapshotPath) || filepath.Clean(c.SnapshotPath) != c.SnapshotPath {
+		return c, fmt.Errorf("MQTT_DYNSEC_JSON_PATH must be a clean absolute path")
+	}
+	// Validate configuration only; composition owns construction of the reader.
+	writerUID, ok := lookup("MQTT_DYNSEC_WRITER_UID")
+	uid, uidErr := strconv.ParseUint(writerUID, 10, 32)
+	if !ok || uidErr != nil {
+		return c, fmt.Errorf("MQTT_DYNSEC_WRITER_UID must be an explicit base10 uint32")
+	}
+	c.WriterUID = uint32(uid)
+	imageRef, _ := lookup("MQTT_DYNSEC_IMAGE_REFERENCE")
+	configID, _ := lookup("MQTT_DYNSEC_IMAGE_CONFIG_ID")
+	platform, _ := lookup("MQTT_DYNSEC_PLATFORM")
+	c.Qualification, err = mqttcredential.NewNativeDisableQualification(imageRef, configID, platform)
+	if err != nil {
+		return c, fmt.Errorf("MQTT_DYNSEC_IMAGE_REFERENCE, MQTT_DYNSEC_IMAGE_CONFIG_ID and MQTT_DYNSEC_PLATFORM must match the qualified identity")
+	}
+	// ControlDir is compatibility-only; simplified persistence needs no controller.
+	c.ControlDir = valueOrDefault(lookup, "MQTT_CONTROLLER_DIR", "")
+	if c.ControlDir != "" && (!filepath.IsAbs(c.ControlDir) || filepath.Clean(c.ControlDir) != c.ControlDir) {
+		return c, fmt.Errorf("MQTT_CONTROLLER_DIR must be a clean absolute path")
 	}
 	if len(c.ControlDir) > 75 {
 		return c, fmt.Errorf("MQTT_CONTROLLER_DIR too long")

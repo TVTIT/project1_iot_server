@@ -1,23 +1,61 @@
 \set ON_ERROR_STOP on
 BEGIN;
-DO $$ BEGIN
+-- Only these two boundaries are supported. The v19 marker prevents a missing
+-- tracking row from masquerading as a valid v18 database.
+CREATE FUNCTION pg_temp.verify_guard_tracking() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE latest_version bigint;
+BEGIN
+    SELECT max(version) INTO latest_version FROM public.schema_migrations;
     IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 18 AND name = 'mqtt_guard_search_path') THEN
-        RAISE EXCEPTION 'Migration 000018 is not recorded';
+        RAISE EXCEPTION 'Migration 000018 is not recorded' USING ERRCODE = 'P0018';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 17 AND name = 'mqtt_rotation_replacement') THEN
-        RAISE EXCEPTION 'Migration 000017 is required';
+        RAISE EXCEPTION 'Migration 000017 is required' USING ERRCODE = 'P0018';
     END IF;
-    IF (SELECT max(version) FROM schema_migrations) <> 18
-       OR EXISTS (SELECT 1 FROM schema_migrations WHERE version BETWEEN 11 AND 18 AND
+    IF latest_version IS NULL OR latest_version NOT IN (18, 19)
+       OR ((latest_version = 19) IS DISTINCT FROM
+           (to_regclass('public.mqtt_reset_dispositions') IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM schema_migrations WHERE version BETWEEN 11 AND latest_version AND
            name IS DISTINCT FROM CASE version
              WHEN 11 THEN 'mqtt_credential_operations' WHEN 12 THEN 'mqtt_credential_maintenance'
              WHEN 13 THEN 'mqtt_maintenance_admission' WHEN 14 THEN 'mqtt_credential_recovery'
              WHEN 15 THEN 'mqtt_recovery_authority_guards' WHEN 16 THEN 'mqtt_event_authority_guard'
              WHEN 17 THEN 'mqtt_rotation_replacement'
-             WHEN 18 THEN 'mqtt_guard_search_path' END)
-       OR (SELECT count(*) FROM schema_migrations WHERE version BETWEEN 11 AND 18) <> 8 THEN
-        RAISE EXCEPTION 'Unknown or inconsistent credential migration tracking for schema 018';
+             WHEN 18 THEN 'mqtt_guard_search_path'
+             WHEN 19 THEN 'mqtt_simplified_journal' END)
+       OR (SELECT count(*) FROM schema_migrations WHERE version BETWEEN 11 AND latest_version) <> latest_version - 10 THEN
+        RAISE EXCEPTION 'Unknown or inconsistent credential migration tracking for schema 018' USING ERRCODE = 'P0018';
     END IF;
+END $$;
+SELECT pg_temp.verify_guard_tracking();
+
+-- Faults run in exception subtransactions: both tracking and schema remain
+-- unchanged. Catch only the tracking validator's dedicated SQLSTATE.
+DO $$ DECLARE mutation text; latest_version bigint; BEGIN
+    SELECT max(version) INTO latest_version FROM public.schema_migrations;
+    FOR mutation IN SELECT * FROM (VALUES
+        ('UPDATE public.schema_migrations SET name=''incorrect_guard'' WHERE version=18'),
+        ('DELETE FROM public.schema_migrations WHERE version=18'),
+        ('DELETE FROM public.schema_migrations WHERE version=17'),
+        ('UPDATE public.schema_migrations SET name=''incorrect_journal'' WHERE version=19'),
+        ('DELETE FROM public.schema_migrations WHERE version=19'),
+        ('INSERT INTO public.schema_migrations(version,name) VALUES(20,''unsupported_future'')')
+    ) AS faults(statement) LOOP
+        IF latest_version = 18 AND mutation LIKE '%version=19' THEN
+            CONTINUE;
+        END IF;
+        BEGIN
+            EXECUTE mutation;
+            PERFORM pg_temp.verify_guard_tracking();
+        EXCEPTION WHEN SQLSTATE 'P0018' THEN
+            CONTINUE;
+        END;
+        RAISE EXCEPTION 'Tracking fault unexpectedly accepted: %', mutation;
+    END LOOP;
+    PERFORM pg_temp.verify_guard_tracking();
+END $$;
+
+DO $$ BEGIN
     -- public schema must remain trusted; fail if unsafe CREATE privileges exist
     IF has_schema_privilege('iot_backend', 'public', 'CREATE')
        OR has_schema_privilege('iot_backend_app', 'public', 'CREATE')
