@@ -575,7 +575,7 @@ func TestSimplifiedHTTPNativeRotateRevoke(t *testing.T) {
 		if err != nil {
 			t.Fatalf("HTTP request failed (%s %s): %v", method, endpoint, err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("Pragma") != "no-cache" {
 			t.Fatalf("missing no-store/no-cache headers on %s %s", method, endpoint)

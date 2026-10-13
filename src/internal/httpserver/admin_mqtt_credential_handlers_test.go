@@ -18,13 +18,12 @@ import (
 )
 
 type credentialSpy struct {
-	calls        int
-	actor        uuid.UUID
-	input        mqttcredential.MutationInput
-	resetInput   mqttcredential.ResetInput
-	err          error
-	response     mqttcredential.ProvisionResponse
-	withoutReset bool
+	calls      int
+	actor      uuid.UUID
+	input      mqttcredential.MutationInput
+	resetInput mqttcredential.ResetInput
+	err        error
+	response   mqttcredential.ProvisionResponse
 }
 
 func (s *credentialSpy) Reset(_ context.Context, actor uuid.UUID, in mqttcredential.ResetInput) (mqttcredential.ProvisionResponse, error) {

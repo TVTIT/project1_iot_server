@@ -26,8 +26,16 @@ Verifies the workflow structure, steps, commands, and options for:
   * Uploads distinct provisioning coverage artifact.
 """
 
+import sys
 import unittest
 from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+SCRIPTS_TESTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+if str(SCRIPTS_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_TESTS_DIR))
 
 try:
     import yaml
@@ -182,7 +190,9 @@ class TestCIFeatureJobs(unittest.TestCase):
     def test_native_job_exact_validated_artifact_and_unique_report(self):
         job = self._extract_job_section('dynsec-native-integration')
         path = '${{ runner.temp }}/dynsec-native-${{ github.run_id }}-${{ github.run_attempt }}.json'
-        self.assertIn('DYNSEC_NATIVE_REPORT: ' + path, job)
+        self.assertNotIn('DYNSEC_NATIVE_REPORT: ' + path, job)
+        self.assertIn("printf 'DYNSEC_NATIVE_REPORT=%s/dynsec-native-%s-%s.json\\n'", job)
+        self.assertIn('"$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"', job)
         self.assertIn('--report "$DYNSEC_NATIVE_REPORT"', job)
         self.assertIn('--validate-report "$DYNSEC_NATIVE_REPORT"', job)
         self.assertIn('path: ' + path, job)
@@ -205,6 +215,50 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertIn('target: reloader', legacy)
         for old in ('stage2-e2e', 'mosquitto-credential-integration', 'mosquitto-runtime-integration'):
             self.assertIn('Legacy', self._extract_job_section(old))
+
+    def test_legacy_deferred_jobs_contracts_and_routing(self):
+        """Verifies deferred routing, exact labels, retained units/builds, and markers for legacy jobs."""
+        import re
+        from test_stage2_ci import assert_stage2_e2e_contract
+        from test_stage2_mqtt_credentials import assert_credential_job_contract
+        from test_stage2_mosquitto_runtime import assert_runtime_job_contract
+
+        stage2_job = self._extract_job_section('stage2-e2e')
+        cred_job = self._extract_job_section('mosquitto-credential-integration')
+        runtime_job = self._extract_job_section('mosquitto-runtime-integration')
+
+        # Check explicit job display labels
+        self.assertIn("name: Legacy E2E contracts", stage2_job)
+        self.assertIn("name: Legacy credential checks", cred_job)
+        self.assertIn("name: Legacy runtime contracts", runtime_job)
+
+        # Check explicit deferred markers in job definitions
+        self.assertIn("legacy-execution-deferred: stage2-e2e", stage2_job)
+        self.assertIn("legacy-execution-deferred: mosquitto-credential-integration", cred_job)
+        self.assertIn("legacy-execution-deferred: mosquitto-runtime-integration", runtime_job)
+
+        # Execute reviewed contract assertions
+        assert_stage2_e2e_contract(stage2_job)
+        assert_credential_job_contract(cred_job)
+        assert_runtime_job_contract(runtime_job)
+
+        # Verify all 14 job IDs remain defined
+        all_jobs = re.findall(r'^  ([a-z0-9-]+):\n(?:    name:.*\n)?    runs-on:', self.raw_content, re.MULTILINE)
+        self.assertEqual(len(all_jobs), 14, f"expected 14 jobs, found {len(all_jobs)}: {all_jobs}")
+        expected_jobs = {
+            'lint-and-test', 'cross-compile', 'migration-check',
+            'docker-build', 'authorization-integration',
+            'provisioning-integration', 'auth-integration',
+            'mosquitto-runtime-integration',
+            'mosquitto-credential-integration', 'stage2-e2e',
+            'legacy-runtime-image-build', 'dynsec-native-integration',
+            'dynsec-bootstrap-tests', 'native-compose-smoke',
+        }
+        self.assertEqual(set(all_jobs), expected_jobs)
+
+        # Verify gates/needs remain intact
+        smoke_job = self._extract_job_section('native-compose-smoke')
+        self.assertIn('needs: [lint-and-test, migration-check, dynsec-native-integration, dynsec-bootstrap-tests]', smoke_job)
 
     def _extract_job_section(self, job_name: str) -> str:
         lines = self.raw_content.splitlines()

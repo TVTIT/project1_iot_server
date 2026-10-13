@@ -18,6 +18,26 @@ from stage2_mosquitto_runtime import ENV, ROOT, run
 from task265b_lifecycle import IMAGE
 from task26_harness_helpers import require
 
+CONFIG_ID = 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4'
+PLATFORM = 'linux/amd64'
+
+
+def build_standalone_environment(payload, jwt_secret, spike, enabled=True):
+    env = dict(DATABASE_URL=payload['AppDSN'], SUPABASE_JWT_SECRET=jwt_secret,
+               SUPABASE_JWT_ISSUER='https://fixture.invalid/auth/v1',
+               SUPABASE_JWT_AUDIENCE='authenticated', SERVER_ENV='production',
+               HTTP_WRITE_TIMEOUT='60s', SHUTDOWN_TIMEOUT='50s',
+               MQTT_CREDENTIAL_API_ENABLED='true', MQTT_DYNSEC_MANAGER_USERNAME='admin',
+               MQTT_DYNSEC_MANAGER_PASSWORD=spike.passwords['admin'],
+               MQTT_PASSWORD=spike.passwords['backend'], MQTT_INTERNAL_MANAGEMENT_URL='ssl://localhost:18884',
+               MQTT_TLS_CA_FILE='/ca.crt', MQTT_DYNSEC_JSON_PATH='/security/dynsec.json',
+               MQTT_DYNSEC_WRITER_UID='1883', MQTT_DYNSEC_IMAGE_REFERENCE=IMAGE,
+               MQTT_DYNSEC_IMAGE_CONFIG_ID=CONFIG_ID, MQTT_DYNSEC_PLATFORM=PLATFORM,
+               MQTT_CONTROLLER_DIR='/control', MQTT_CREDENTIAL_RECONCILE_TIMEOUT='30s')
+    if not enabled:
+        env = {k: v for k, v in env.items() if not k.startswith('MQTT_')}
+    return env
+
 
 def readiness_status(port, tls, timeout):
     """Status only; do not parse/log bodies or inherit credential call timeouts."""
@@ -110,20 +130,12 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
 
     sql(f"INSERT INTO profiles(id) VALUES('{actor}'); INSERT INTO platform_admins(user_id) VALUES('{actor}'); "
         f"INSERT INTO gateways(gateway_id,name) VALUES('{gateway}','standalone fixture');")
-    environment = dict(DATABASE_URL=payload['AppDSN'], SUPABASE_JWT_SECRET=jwt_secret,
-                       SUPABASE_JWT_ISSUER='https://fixture.invalid/auth/v1',
-                       SUPABASE_JWT_AUDIENCE='authenticated', SERVER_ENV='production',
-                       HTTP_WRITE_TIMEOUT='60s', SHUTDOWN_TIMEOUT='50s',
-                       MQTT_CREDENTIAL_API_ENABLED='true', MQTT_DYNSEC_MANAGER_USERNAME='admin',
-                       MQTT_DYNSEC_MANAGER_PASSWORD=spike.passwords['admin'],
-                       MQTT_PASSWORD=spike.passwords['backend'], MQTT_INTERNAL_MANAGEMENT_URL='ssl://localhost:18884',
-                       MQTT_TLS_CA_FILE='/ca.crt', MQTT_DYNSEC_JSON_PATH='/security/dynsec.json',
-                       MQTT_CONTROLLER_DIR='/control', MQTT_CREDENTIAL_RECONCILE_TIMEOUT='30s')
+    environment = build_standalone_environment(payload, jwt_secret, spike)
     env_file = directory / 'server.env'
 
     def start(enabled=True):
         run(['docker', 'rm', '-f', backend], capture=True) if exists() else None
-        values = environment if enabled else {k: v for k, v in environment.items() if not k.startswith('MQTT_')}
+        values = build_standalone_environment(payload, jwt_secret, spike, enabled=enabled)
         env_file.write_text(''.join(k + '=' + v + '\n' for k, v in values.items()))
         env_file.chmod(0o600)
         args = ['docker', 'run', '-d', '--name', backend, '--network', network,

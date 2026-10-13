@@ -22,7 +22,7 @@ type fenceSpyRuntime struct {
 	drainCalls   int
 }
 
-func (f *fenceSpyRuntime) BeginStartup(ctx context.Context) (VerificationReceipt, error) {
+func (f *fenceSpyRuntime) BeginStartup(_ context.Context) (VerificationReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.begun = true
@@ -33,7 +33,7 @@ func (f *fenceSpyRuntime) BeginStartup(ctx context.Context) (VerificationReceipt
 	return VerificationReceipt{Epoch: ep, Nonce: nonce}, nil
 }
 
-func (f *fenceSpyRuntime) CloseDrain(ctx context.Context) error {
+func (f *fenceSpyRuntime) CloseDrain(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = true
@@ -42,7 +42,7 @@ func (f *fenceSpyRuntime) CloseDrain(ctx context.Context) error {
 	return nil
 }
 
-func (f *fenceSpyRuntime) DisableStartup(ctx context.Context, r VerificationReceipt, u string) (RecoveryDisableEvidence, error) {
+func (f *fenceSpyRuntime) DisableStartup(_ context.Context, r VerificationReceipt, u string) (RecoveryDisableEvidence, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.disabled = append(f.disabled, u)
@@ -50,11 +50,11 @@ func (f *fenceSpyRuntime) DisableStartup(ctx context.Context, r VerificationRece
 	return RecoveryDisableEvidence{RAMDisabled: true, SnapshotObserved: true, BrokerEpoch: r.Epoch}, nil
 }
 
-func (f *fenceSpyRuntime) VerifyStartupInventory(ctx context.Context, r VerificationReceipt, rows []Metadata) error {
+func (f *fenceSpyRuntime) VerifyStartupInventory(_ context.Context, _ VerificationReceipt, _ []Metadata) error {
 	return nil
 }
 
-func (f *fenceSpyRuntime) OpenStartup(ctx context.Context, r VerificationReceipt) error {
+func (f *fenceSpyRuntime) OpenStartup(_ context.Context, _ VerificationReceipt) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = false
@@ -98,7 +98,7 @@ func newFenceSpyRepo() *fenceSpyRepo {
 	}
 }
 
-func (r *fenceSpyRepo) ListUnresolved(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+func (r *fenceSpyRepo) ListUnresolved(_ context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.listUnresolvedCalls++
@@ -114,7 +114,7 @@ func (r *fenceSpyRepo) ListUnresolved(ctx context.Context, cursor uuid.UUID, lim
 	return res, nil
 }
 
-func (r *fenceSpyRepo) ListPendingMaintenance(ctx context.Context, cursor uuid.UUID, limit int) ([]MaintenanceCheckpoint, error) {
+func (r *fenceSpyRepo) ListPendingMaintenance(_ context.Context, cursor uuid.UUID, limit int) ([]MaintenanceCheckpoint, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.listPendingCPCalls++
@@ -130,7 +130,7 @@ func (r *fenceSpyRepo) ListPendingMaintenance(ctx context.Context, cursor uuid.U
 	return res, nil
 }
 
-func (r *fenceSpyRepo) ListPendingRecovery(ctx context.Context, cursor uuid.UUID, limit int) ([]RecoveryRecord, error) {
+func (r *fenceSpyRepo) ListPendingRecovery(_ context.Context, cursor uuid.UUID, limit int) ([]RecoveryRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.listPendingRecCalls++
@@ -146,7 +146,7 @@ func (r *fenceSpyRepo) ListPendingRecovery(ctx context.Context, cursor uuid.UUID
 	return res, nil
 }
 
-func (r *fenceSpyRepo) ListStartupInventory(ctx context.Context, key string, limit int) ([]Metadata, error) {
+func (r *fenceSpyRepo) ListStartupInventory(_ context.Context, key string, limit int) ([]Metadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var res []Metadata
@@ -177,7 +177,7 @@ func (r *fenceSpyRepo) ResolveCommitAmbiguity(ctx context.Context, id uuid.UUID)
 	return Operation{}, ErrRecoveryRequired
 }
 
-func (r *fenceSpyRepo) ResolveMaintenance(ctx context.Context, id uuid.UUID) (MaintenanceCheckpoint, error) {
+func (r *fenceSpyRepo) ResolveMaintenance(_ context.Context, id uuid.UUID) (MaintenanceCheckpoint, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.resolveCPCalls++
@@ -187,7 +187,7 @@ func (r *fenceSpyRepo) ResolveMaintenance(ctx context.Context, id uuid.UUID) (Ma
 	return MaintenanceCheckpoint{}, ErrRecoveryRequired
 }
 
-func (r *fenceSpyRepo) GetMetadata(ctx context.Context, gw string) (Metadata, error) {
+func (r *fenceSpyRepo) GetMetadata(_ context.Context, gw string) (Metadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.getMetadataCalls++
@@ -197,7 +197,7 @@ func (r *fenceSpyRepo) GetMetadata(ctx context.Context, gw string) (Metadata, er
 	return Metadata{}, ErrRecoveryRequired
 }
 
-func (r *fenceSpyRepo) BeginRecovery(ctx context.Context, q RecoveryRequest) (RecoveryRecord, error) {
+func (r *fenceSpyRepo) BeginRecovery(_ context.Context, q RecoveryRequest) (RecoveryRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.beginRecoveryCalls++
@@ -212,14 +212,14 @@ func (r *fenceSpyRepo) BeginRecovery(ctx context.Context, q RecoveryRequest) (Re
 	return rec, nil
 }
 
-func (r *fenceSpyRepo) BindRecoveryEpoch(ctx context.Context, id uuid.UUID, old, next string) (RecoveryRecord, error) {
+func (r *fenceSpyRepo) BindRecoveryEpoch(_ context.Context, id uuid.UUID, _, next string) (RecoveryRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.bindRecoveryCalls++
 	return RecoveryRecord{RecoveryID: id, BrokerEpoch: next, Status: RecoveryPending}, nil
 }
 
-func (r *fenceSpyRepo) CompleteRecovery(ctx context.Context, q RecoveryRequest, proof RecoveryDisableEvidence) (Metadata, error) {
+func (r *fenceSpyRepo) CompleteRecovery(_ context.Context, q RecoveryRequest, _ RecoveryDisableEvidence) (Metadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.completeRecCalls++
@@ -232,7 +232,7 @@ func (r *fenceSpyRepo) CompleteRecovery(ctx context.Context, q RecoveryRequest, 
 	return m, nil
 }
 
-func (r *fenceSpyRepo) ResolveRecovery(ctx context.Context, id uuid.UUID) (RecoveryRecord, error) {
+func (r *fenceSpyRepo) ResolveRecovery(_ context.Context, id uuid.UUID) (RecoveryRecord, error) {
 	return RecoveryRecord{RecoveryID: id, Status: RecoveryDisabled, Evidence: RecoveryDisableEvidence{RAMDisabled: true, SnapshotObserved: true, BrokerEpoch: "epoch"}}, nil
 }
 
@@ -685,7 +685,7 @@ func TestStartupRotationFenceProvisionRevokeRecoveryWorks(t *testing.T) {
 		Timeout:  time.Second,
 		PageSize: 10,
 		MaxPages: 5,
-		VerifyBackend: func(ctx context.Context, r VerificationReceipt) error {
+		VerifyBackend: func(_ context.Context, _ VerificationReceipt) error {
 			t.Logf("VerifyBackend called")
 			return nil
 		},
@@ -933,7 +933,7 @@ func TestStartupResolutionIntegritySecondResolutionMutated(t *testing.T) {
 		repo.checkpointsByID[jobID] = repo.checkpoints[0]
 		repo.metadataByGW["gw_mutate"] = Metadata{GatewayID: "gw_mutate", LastOperationID: jobID, Status: CredentialProvisioning}
 
-		repo.resolveOpFn = func(ctx context.Context, id uuid.UUID, callCount int) (Operation, error) {
+		repo.resolveOpFn = func(_ context.Context, _ uuid.UUID, callCount int) (Operation, error) {
 			if callCount == 1 {
 				return provOp, nil // preflight sees provision
 			}
@@ -997,7 +997,7 @@ func TestStartupResolutionIntegritySecondResolutionMutated(t *testing.T) {
 		repo.checkpointsByID[jobID] = repo.checkpoints[0]
 		repo.metadataByGW["gw_mutate2"] = Metadata{GatewayID: "gw_mutate2", LastOperationID: jobID, Status: CredentialProvisioning}
 
-		repo.resolveOpFn = func(ctx context.Context, id uuid.UUID, callCount int) (Operation, error) {
+		repo.resolveOpFn = func(_ context.Context, _ uuid.UUID, callCount int) (Operation, error) {
 			if callCount == 1 {
 				return provOp, nil // preflight sees jobID
 			}
@@ -1152,7 +1152,7 @@ func TestStartupRotationFenceRevokeRecoveryWorks(t *testing.T) {
 		Timeout:  time.Second,
 		PageSize: 10,
 		MaxPages: 5,
-		VerifyBackend: func(ctx context.Context, r VerificationReceipt) error {
+		VerifyBackend: func(_ context.Context, _ VerificationReceipt) error {
 			return nil
 		},
 	})

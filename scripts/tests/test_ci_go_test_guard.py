@@ -379,6 +379,263 @@ class TestCiGoTestGuard(unittest.TestCase):
         # Ensure raw file path or content does not leak secrets or unhandled trace
         self.assertNotIn("Traceback", res_nofile.stderr)
 
+    def test_default_strict_rejects_no_test_package_skip(self):
+        """Strict default behavior: package with [no test files] and skip is rejected without opt-in."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "iot-platform/cmd/gateway"},
+            {"Action": "output", "Package": "iot-platform/cmd/gateway", "Output": "?   \tiot-platform/cmd/gateway\t[no test files]\n"},
+            {"Action": "skip", "Package": "iot-platform/cmd/gateway"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires)
+        self.assertFalse(success, "Strict default must reject skipped package even with [no test files] marker")
+        self.assertTrue(any("iot-platform/cmd/gateway" in d for d in diags))
+
+    def test_opted_in_no_test_package_with_valid_evidence_passes(self):
+        """Opted-in package with full valid evidence (start, standard marker, skip, 0 tests) passes."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "iot-platform/cmd/gateway"},
+            {"Action": "output", "Package": "iot-platform/cmd/gateway", "Output": "?   \tiot-platform/cmd/gateway\t[no test files]\n"},
+            {"Action": "skip", "Package": "iot-platform/cmd/gateway"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(
+            path, requires, allow_no_test_packages=["iot-platform/cmd/gateway"]
+        )
+        self.assertTrue(success, f"Expected verification to pass with exact opt-in, got diags: {diags}")
+
+    def test_opted_in_no_test_package_missing_start_rejected(self):
+        """Opted-in package missing start event is rejected."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            # Missing Action: start
+            {"Action": "output", "Package": "pkg/empty", "Output": "?   \tpkg/empty\t[no test files]\n"},
+            {"Action": "skip", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Missing start event must be rejected")
+        self.assertTrue(any("pkg/empty" in d for d in diags))
+
+    def test_opted_in_no_test_package_missing_marker_rejected(self):
+        """Opted-in package missing standard marker is rejected."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            # Missing Action: output standard [no test files] marker
+            {"Action": "skip", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Missing marker output must be rejected")
+        self.assertTrue(any("pkg/empty" in d for d in diags))
+
+    def test_opted_in_no_test_package_wrong_package_marker_rejected(self):
+        """Opted-in package with marker for a different package is rejected."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            # Output references pkg/other instead of pkg/empty
+            {"Action": "output", "Package": "pkg/empty", "Output": "?   \tpkg/other\t[no test files]\n"},
+            {"Action": "skip", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Wrong package marker must be rejected")
+        self.assertTrue(any("pkg/empty" in d for d in diags))
+
+    def test_opted_in_no_test_package_truncated_rejected(self):
+        """Opted-in package truncated before terminal skip event is rejected."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            {"Action": "output", "Package": "pkg/empty", "Output": "?   \tpkg/empty\t[no test files]\n"},
+            # Missing Action: skip
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Truncated log without terminal skip must be rejected")
+        self.assertTrue(any("pkg/empty" in d for d in diags))
+
+    def test_opted_in_no_test_package_fail_after_marker_rejected(self):
+        """Opted-in package with failure terminal event is rejected."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            {"Action": "output", "Package": "pkg/empty", "Output": "?   \tpkg/empty\t[no test files]\n"},
+            {"Action": "fail", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Package failure must never pass")
+        self.assertTrue(any("fail" in d.lower() and "pkg/empty" in d for d in diags))
+
+    def test_opted_in_no_test_package_contradictory_pass_after_marker_rejected(self):
+        """Opted-in package with contradictory terminal events (both skip and pass) is rejected."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            {"Action": "output", "Package": "pkg/empty", "Output": "?   \tpkg/empty\t[no test files]\n"},
+            {"Action": "skip", "Package": "pkg/empty"},
+            {"Action": "pass", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Contradictory terminal events must be rejected")
+        self.assertTrue(any("pkg/empty" in d for d in diags))
+
+    def test_opted_in_package_with_required_target_rejected_if_skipped(self):
+        """Opted-in package that contains a required test cannot be exempted if it skipped."""
+        events = [
+            {"Action": "start", "Package": "pkg/empty"},
+            {"Action": "output", "Package": "pkg/empty", "Output": "?   \tpkg/empty\t[no test files]\n"},
+            {"Action": "skip", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/empty:TestRequired"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Opted-in package cannot bypass required test execution")
+        self.assertTrue(any("TestRequired" in d for d in diags))
+
+    def test_opted_in_package_with_real_test_events_not_exempted(self):
+        """Opted-in package having real test events cannot be exempted as a no-test package."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            # Real test event present
+            {"Action": "run", "Package": "pkg/empty", "Test": "TestReal"},
+            {"Action": "skip", "Package": "pkg/empty", "Test": "TestReal"},
+            {"Action": "skip", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertFalse(success, "Package with test events must not be exempted as no-test")
+        self.assertTrue(any("pkg/empty" in d for d in diags))
+
+    def test_opted_in_package_with_real_tests_passing_succeeds(self):
+        """Opted-in package that gains real tests succeeds when tests and package pass."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "pkg/empty"},
+            {"Action": "run", "Package": "pkg/empty", "Test": "TestReal"},
+            {"Action": "pass", "Package": "pkg/empty", "Test": "TestReal"},
+            {"Action": "pass", "Package": "pkg/empty"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=["pkg/empty"])
+        self.assertTrue(success, f"Package with passing tests should succeed, diags: {diags}")
+
+    def test_invalid_allow_no_test_package_specifications_rejected(self):
+        """Reject wildcards, regex, control characters, empty strings in --allow-no-test-package."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestLogin"},
+            {"Action": "pass", "Package": "pkg/auth"},
+        ]
+        path = self._write_jsonl(events)
+        requires = ["pkg/auth:TestLogin"]
+
+        invalid_inputs = [
+            "pkg/*",
+            "pkg/[a-z]+",
+            "",
+            "   ",
+            "pkg/name\x00extra",
+            "../escape",
+            "/absolute/pkg",
+            "pkg/name?",
+            "pkg/(group)",
+            "pkg/name^",
+        ]
+        for inv in invalid_inputs:
+            success, diags = ci_go_test_guard.verify_test_log(path, requires, allow_no_test_packages=[inv])
+            self.assertFalse(success, f"Invalid spec '{inv}' must be rejected")
+            # Diagnostics must be safe fixed messages without leaking raw input or control chars
+            for d in diags:
+                self.assertNotIn("\x00", d)
+                self.assertNotIn("Traceback", d)
+
+    def test_cli_allow_no_test_package_execution(self):
+        """CLI invocation with --allow-no-test-package accepts valid no-test package and rejects without it."""
+        events = [
+            {"Action": "run", "Package": "pkg/auth", "Test": "TestCLI"},
+            {"Action": "pass", "Package": "pkg/auth", "Test": "TestCLI"},
+            {"Action": "pass", "Package": "pkg/auth"},
+            {"Action": "start", "Package": "iot-platform/cmd/gateway"},
+            {"Action": "output", "Package": "iot-platform/cmd/gateway", "Output": "?   \tiot-platform/cmd/gateway\t[no test files]\n"},
+            {"Action": "skip", "Package": "iot-platform/cmd/gateway"},
+        ]
+        path = self._write_jsonl(events)
+        script_path = Path(__file__).resolve().parent.parent / "ci_go_test_guard.py"
+
+        # Without opt-in -> must fail (non-zero)
+        res_fail = subprocess.run(
+            [sys.executable, str(script_path), "--input", path, "--require", "pkg/auth:TestCLI"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(res_fail.returncode, 0, "Expected non-zero without opt-in")
+
+        # With opt-in -> must succeed (0)
+        res_pass = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--input",
+                path,
+                "--require",
+                "pkg/auth:TestCLI",
+                "--allow-no-test-package",
+                "iot-platform/cmd/gateway",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_pass.returncode, 0, f"Expected 0 with opt-in, stderr: {res_pass.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

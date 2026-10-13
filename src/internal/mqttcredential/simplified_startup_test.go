@@ -98,7 +98,7 @@ func TestSimplifiedStartupClassifier_InvalidOptions(t *testing.T) {
 // 2. Empty scan -> Completed with zero targets
 func TestSimplifiedStartupClassifier_EmptyScan(t *testing.T) {
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			return []Operation{}, nil
 		},
 	}
@@ -155,19 +155,19 @@ func TestSimplifiedStartupClassifier_PendingSimplified_RequiresRecovery(t *testi
 	}
 
 	repo := &mockClassifierRepo{}
-	repo.listUnresolvedFunc = func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+	repo.listUnresolvedFunc = func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 		if cursor == uuid.Nil {
 			return []Operation{pendingOp}, nil
 		}
 		return []Operation{}, nil
 	}
-	repo.getMetadataFunc = func(ctx context.Context, gid string) (Metadata, error) {
+	repo.getMetadataFunc = func(_ context.Context, gid string) (Metadata, error) {
 		if gid == gatewayID {
 			return meta, nil
 		}
 		return Metadata{}, &DomainError{Code: CodeNotFound}
 	}
-	repo.requireRecoveryFunc = func(ctx context.Context, u OperationUpdate) (Metadata, error) {
+	repo.requireRecoveryFunc = func(_ context.Context, u OperationUpdate) (Metadata, error) {
 		return Metadata{
 			GatewayID:         gatewayID,
 			Username:          gatewayID,
@@ -179,7 +179,7 @@ func TestSimplifiedStartupClassifier_PendingSimplified_RequiresRecovery(t *testi
 			RevokedAt:         u.Completion.Credential.RevokedAt,
 		}, nil
 	}
-	repo.resolveAmbiguityFunc = func(ctx context.Context, id uuid.UUID) (Operation, error) {
+	repo.resolveAmbiguityFunc = func(_ context.Context, id uuid.UUID) (Operation, error) {
 		if id == opID {
 			if len(repo.requireRecoveryCalls) > 0 {
 				return repo.requireRecoveryCalls[len(repo.requireRecoveryCalls)-1].Completion.Operation, nil
@@ -275,22 +275,22 @@ func TestSimplifiedStartupClassifier_PendingSimplified_PreservesExistingEvidence
 	}
 
 	repo := &mockClassifierRepo{}
-	repo.listUnresolvedFunc = func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+	repo.listUnresolvedFunc = func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 		if cursor == uuid.Nil {
 			return []Operation{pendingOp}, nil
 		}
 		return []Operation{}, nil
 	}
-	repo.getMetadataFunc = func(ctx context.Context, gid string) (Metadata, error) {
+	repo.getMetadataFunc = func(_ context.Context, _ string) (Metadata, error) {
 		return meta, nil
 	}
-	repo.resolveAmbiguityFunc = func(ctx context.Context, id uuid.UUID) (Operation, error) {
+	repo.resolveAmbiguityFunc = func(_ context.Context, _ uuid.UUID) (Operation, error) {
 		if len(repo.requireRecoveryCalls) > 0 {
 			return repo.requireRecoveryCalls[len(repo.requireRecoveryCalls)-1].Completion.Operation, nil
 		}
 		return pendingOp, nil
 	}
-	repo.requireRecoveryFunc = func(ctx context.Context, u OperationUpdate) (Metadata, error) {
+	repo.requireRecoveryFunc = func(_ context.Context, u OperationUpdate) (Metadata, error) {
 		return Metadata{
 			GatewayID:         gatewayID,
 			Username:          gatewayID,
@@ -359,16 +359,16 @@ func TestSimplifiedStartupClassifier_AlreadyRecoveryNeeded_ZeroWrites(t *testing
 	}
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{recOp}, nil
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return recOp, nil
 		},
 	}
@@ -429,16 +429,16 @@ func TestSimplifiedStartupClassifier_MismatchedTarget_ReturnsIncomplete(t *testi
 	}
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{pendingOp}, nil
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 			return staleMeta, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return pendingOp, nil
 		},
 	}
@@ -482,7 +482,7 @@ func TestSimplifiedStartupClassifier_LegacyUnresolved_ExplicitBlocker(t *testing
 	}
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{legacyOp}, nil
 			}
@@ -514,10 +514,10 @@ func TestSimplifiedStartupClassifier_LegacyUnresolved_ExplicitBlocker(t *testing
 func TestSimplifiedStartupClassifier_UnfinishedLifecycleAuthority_BlocksStartup(t *testing.T) {
 	listCalled := false
 	repo := &mockClassifierRepo{
-		hasUnfinishedFunc: func(ctx context.Context) (bool, error) {
+		hasUnfinishedFunc: func(_ context.Context) (bool, error) {
 			return true, nil
 		},
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			listCalled = true
 			return []Operation{}, nil
 		},
@@ -551,10 +551,10 @@ func TestSimplifiedStartupClassifier_UnfinishedLifecycleAuthority_ReadError(t *t
 	dbErr := errors.New("read error on unfinished check")
 	listCalled := false
 	repo := &mockClassifierRepo{
-		hasUnfinishedFunc: func(ctx context.Context) (bool, error) {
+		hasUnfinishedFunc: func(_ context.Context) (bool, error) {
 			return false, dbErr
 		},
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			listCalled = true
 			return []Operation{}, nil
 		},
@@ -587,7 +587,7 @@ func TestSimplifiedStartupClassifier_UnfinishedLifecycleAuthority_ReadError(t *t
 func TestSimplifiedStartupClassifier_DBReadError(t *testing.T) {
 	dbErr := errors.New("connection reset")
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			return nil, dbErr
 		},
 	}
@@ -641,19 +641,19 @@ func TestSimplifiedStartupClassifier_RequireRecoveryError(t *testing.T) {
 
 	writeErr := errors.New("deadlock / commit failed")
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{pendingOp}, nil
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return pendingOp, nil
 		},
-		requireRecoveryFunc: func(ctx context.Context, u OperationUpdate) (Metadata, error) {
+		requireRecoveryFunc: func(_ context.Context, _ OperationUpdate) (Metadata, error) {
 			return Metadata{}, writeErr
 		},
 	}
@@ -679,7 +679,7 @@ func TestSimplifiedStartupClassifier_MalformedPageOrder(t *testing.T) {
 	now := time.Now().UTC()
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			return []Operation{
 				{OperationID: op1, ExecutionContract: ContractSimplified, Status: OperationPending, CreatedAt: now, UpdatedAt: now},
 				{OperationID: op2, ExecutionContract: ContractSimplified, Status: OperationPending, CreatedAt: now, UpdatedAt: now},
@@ -707,7 +707,7 @@ func TestSimplifiedStartupClassifier_RepeatedCursor(t *testing.T) {
 	now := time.Now().UTC()
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			return []Operation{
 				{OperationID: op1, ExecutionContract: ContractSimplified, Status: OperationPending, CreatedAt: now, UpdatedAt: now},
 				{OperationID: op1, ExecutionContract: ContractSimplified, Status: OperationPending, CreatedAt: now, UpdatedAt: now},
@@ -735,7 +735,7 @@ func TestSimplifiedStartupClassifier_MaxPageExhaustion(t *testing.T) {
 	// Return a full page on every call
 	var allOps []Operation
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
 			ops := make([]Operation, limit)
 			for i := 0; i < limit; i++ {
 				id := uuid.New()
@@ -763,7 +763,7 @@ func TestSimplifiedStartupClassifier_MaxPageExhaustion(t *testing.T) {
 			}
 			return ops, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, gid string) (Metadata, error) {
 			var matchingID uuid.UUID
 			for _, o := range allOps {
 				if o.GatewayID == gid {
@@ -780,7 +780,7 @@ func TestSimplifiedStartupClassifier_MaxPageExhaustion(t *testing.T) {
 				OperationStatus:   OperationRecoveryNeeded,
 			}, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, id uuid.UUID) (Operation, error) {
 			for _, o := range allOps {
 				if o.OperationID == id {
 					return o, nil
@@ -817,7 +817,7 @@ func TestSimplifiedStartupClassifier_ContextCancelled(t *testing.T) {
 	cancel() // pre-cancelled
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(ctx context.Context, _ uuid.UUID, _ int) ([]Operation, error) {
 			return nil, ctx.Err()
 		},
 	}
@@ -872,7 +872,7 @@ func TestSimplifiedStartupClassifier_MultiPageSuccess(t *testing.T) {
 	}
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{op1}, nil
 			}
@@ -881,7 +881,7 @@ func TestSimplifiedStartupClassifier_MultiPageSuccess(t *testing.T) {
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, gid string) (Metadata, error) {
 			id := opID1
 			if gid == "gw-2" {
 				id = opID2
@@ -895,7 +895,7 @@ func TestSimplifiedStartupClassifier_MultiPageSuccess(t *testing.T) {
 				OperationStatus:   OperationRecoveryNeeded,
 			}, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, id uuid.UUID) (Operation, error) {
 			if id == opID1 {
 				return op1, nil
 			}
@@ -959,16 +959,16 @@ func TestSimplifiedStartupClassifier_AmbiguityResolvesMismatch(t *testing.T) {
 	corruptOp.ActorUserID = uuid.New()
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{pendingOp}, nil
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return corruptOp, nil
 		},
 	}
@@ -1022,16 +1022,16 @@ func TestSimplifiedStartupClassifier_AlreadyRecoveryNeeded_AmbiguityMismatch_Fai
 	mismatchedOp.GatewayID = "gw-other"
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{recOp}, nil
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return mismatchedOp, nil
 		},
 	}
@@ -1081,19 +1081,19 @@ func TestSimplifiedStartupClassifier_RequireRecovery_ReturnedWrongMetadata_Fails
 	corruptReturnedMeta.CredentialVersion = 999
 
 	repo := &mockClassifierRepo{
-		listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{pendingOp}, nil
 			}
 			return []Operation{}, nil
 		},
-		getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+		getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		},
-		resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return pendingOp, nil
 		},
-		requireRecoveryFunc: func(ctx context.Context, u OperationUpdate) (Metadata, error) {
+		requireRecoveryFunc: func(_ context.Context, _ OperationUpdate) (Metadata, error) {
 			return corruptReturnedMeta, nil
 		},
 	}
@@ -1141,16 +1141,16 @@ func TestSimplifiedStartupClassifier_RequireRecovery_ReadbackFailure(t *testing.
 
 	t.Run("ReadbackError", func(t *testing.T) {
 		repo := &mockClassifierRepo{}
-		repo.listUnresolvedFunc = func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		repo.listUnresolvedFunc = func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{pendingOp}, nil
 			}
 			return []Operation{}, nil
 		}
-		repo.getMetadataFunc = func(ctx context.Context, gid string) (Metadata, error) {
+		repo.getMetadataFunc = func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		}
-		repo.requireRecoveryFunc = func(ctx context.Context, u OperationUpdate) (Metadata, error) {
+		repo.requireRecoveryFunc = func(_ context.Context, u OperationUpdate) (Metadata, error) {
 			return Metadata{
 				GatewayID:         gatewayID,
 				Username:          gatewayID,
@@ -1163,7 +1163,7 @@ func TestSimplifiedStartupClassifier_RequireRecovery_ReadbackFailure(t *testing.
 			}, nil
 		}
 		readbackCalls := 0
-		repo.resolveAmbiguityFunc = func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		repo.resolveAmbiguityFunc = func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			readbackCalls++
 			if readbackCalls == 1 {
 				return pendingOp, nil
@@ -1186,16 +1186,16 @@ func TestSimplifiedStartupClassifier_RequireRecovery_ReadbackFailure(t *testing.
 
 	t.Run("ReadbackMismatchStillPending", func(t *testing.T) {
 		repo := &mockClassifierRepo{}
-		repo.listUnresolvedFunc = func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+		repo.listUnresolvedFunc = func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 			if cursor == uuid.Nil {
 				return []Operation{pendingOp}, nil
 			}
 			return []Operation{}, nil
 		}
-		repo.getMetadataFunc = func(ctx context.Context, gid string) (Metadata, error) {
+		repo.getMetadataFunc = func(_ context.Context, _ string) (Metadata, error) {
 			return meta, nil
 		}
-		repo.requireRecoveryFunc = func(ctx context.Context, u OperationUpdate) (Metadata, error) {
+		repo.requireRecoveryFunc = func(_ context.Context, u OperationUpdate) (Metadata, error) {
 			return Metadata{
 				GatewayID:         gatewayID,
 				Username:          gatewayID,
@@ -1208,7 +1208,7 @@ func TestSimplifiedStartupClassifier_RequireRecovery_ReadbackFailure(t *testing.
 			}, nil
 		}
 		// Returns pendingOp even after RequireRecovery (commit did not stick / mismatch)
-		repo.resolveAmbiguityFunc = func(ctx context.Context, id uuid.UUID) (Operation, error) {
+		repo.resolveAmbiguityFunc = func(_ context.Context, _ uuid.UUID) (Operation, error) {
 			return pendingOp, nil
 		}
 
@@ -1296,16 +1296,16 @@ func TestSimplifiedStartupClassifier_CorruptMetadataAndResolvedOp(t *testing.T) 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := &mockClassifierRepo{
-				listUnresolvedFunc: func(ctx context.Context, cursor uuid.UUID, limit int) ([]Operation, error) {
+				listUnresolvedFunc: func(_ context.Context, cursor uuid.UUID, _ int) ([]Operation, error) {
 					if cursor == uuid.Nil {
 						return []Operation{pendingOp}, nil
 					}
 					return []Operation{}, nil
 				},
-				getMetadataFunc: func(ctx context.Context, gid string) (Metadata, error) {
+				getMetadataFunc: func(_ context.Context, _ string) (Metadata, error) {
 					return tc.meta, nil
 				},
-				resolveAmbiguityFunc: func(ctx context.Context, id uuid.UUID) (Operation, error) {
+				resolveAmbiguityFunc: func(_ context.Context, _ uuid.UUID) (Operation, error) {
 					return tc.resolvedOp, nil
 				},
 			}

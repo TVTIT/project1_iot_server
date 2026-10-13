@@ -126,6 +126,92 @@ class MembershipToolGuards(unittest.TestCase):
 
 
 class E2EHarnessUnitGuards(unittest.TestCase):
+    def test_start_backend_server_uses_qualified_fixture_inputs(self):
+        import stage2_e2e
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = stage2_e2e.IsolatedTestStack(root)
+            stack.prefix = "mock_backend"
+            stack.network = "mock_network"
+            stack.pg_container = "mock_postgres"
+            stack.backend_db_password = "mock-db-secret"
+            stack.broker_mounts = {"/control": "control_volume", "/security": "security_volume"}
+            stack.spike = mock.Mock()
+            stack.spike.d = root / "dynsec"
+            stack.spike.passwords = {"admin": "mock-admin-secret", "backend": "mock-backend-secret"}
+            stack.spike.d.mkdir()
+            (stack.spike.d / "ca.crt").write_text("mock certificate")
+
+            docker_run = []
+
+            def fake_run(args, **kwargs):
+                if args[:2] == ["go", "build"]:
+                    Path(args[args.index("-o") + 1]).write_bytes(b"mock binary")
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if args[:2] == ["docker", "run"]:
+                    docker_run.extend(args)
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if args[:2] == ["docker", "port"]:
+                    return mock.Mock(returncode=0, stdout="127.0.0.1:43210\n", stderr="")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.dict(os.environ, {"MQTT_PASSWORD": "must-not-inherit"}, clear=True), \
+                    mock.patch.object(stage2_e2e.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(stage2_e2e, "wait_until"):
+                stack.start_backend_server(mqtt_enabled=True)
+
+            env_file = root / "backend.env"
+            contents = env_file.read_text()
+            self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+            expected = {
+                "MQTT_DYNSEC_WRITER_UID": "1883",
+                "MQTT_DYNSEC_IMAGE_REFERENCE": "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+                "MQTT_DYNSEC_IMAGE_CONFIG_ID": "sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4",
+                "MQTT_DYNSEC_PLATFORM": "linux/amd64",
+            }
+            parsed = dict(line.split("=", 1) for line in contents.splitlines())
+            for key, value in expected.items():
+                self.assertEqual(parsed.get(key), value)
+            self.assertEqual(parsed["MQTT_DYNSEC_JSON_PATH"], "/security/dynsec.json")
+            self.assertIn("--env-file", docker_run)
+            self.assertIn("type=volume,src=security_volume,dst=/security,readonly", docker_run)
+            self.assertIn("type=volume,src=control_volume,dst=/control", docker_run)
+            self.assertIn("1883:1883", docker_run)
+            self.assertNotIn("-e", docker_run)
+            self.assertNotIn("must-not-inherit", contents)
+
+    def test_start_backend_server_keeps_mqtt_disabled_path_minimal(self):
+        import stage2_e2e
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = stage2_e2e.IsolatedTestStack(root)
+            stack.prefix = "mock_backend"
+            stack.network = "mock_network"
+            stack.pg_container = "mock_postgres"
+            stack.backend_db_password = "mock-db-secret"
+            docker_run = []
+
+            def fake_run(args, **kwargs):
+                if args[:2] == ["go", "build"]:
+                    Path(args[args.index("-o") + 1]).write_bytes(b"mock binary")
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if args[:2] == ["docker", "run"]:
+                    docker_run.extend(args)
+                if args[:2] == ["docker", "port"]:
+                    return mock.Mock(returncode=0, stdout="127.0.0.1:43210\n", stderr="")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(stage2_e2e.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(stage2_e2e, "wait_until"):
+                stack.start_backend_server(mqtt_enabled=False)
+
+            parsed = dict(line.split("=", 1) for line in (root / "backend.env").read_text().splitlines())
+            self.assertEqual(parsed["MQTT_CREDENTIAL_API_ENABLED"], "false")
+            self.assertFalse(any(key.startswith("MQTT_DYNSEC_") for key in parsed))
+            self.assertIn("--env-file", docker_run)
+
     def test_harness_imports_and_selectors(self):
         import stage2_e2e
         selectors = stage2_e2e.VALID_SELECTORS

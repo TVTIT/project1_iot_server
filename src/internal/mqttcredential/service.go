@@ -561,6 +561,12 @@ func replayResetOperation(o Operation, actor uuid.UUID, in ResetInput, current M
 	return result, nil
 }
 
+// Reset executes an operator-supervised administrative credential reset for a gateway.
+// It enforces platform admin authorization, input validation, service readiness, and
+// checks existing replay records before acquiring the serialized service lock.
+// When admitted, it verifies predecessor operation eligibility, invokes the configured
+// supervised quiescence prerequisite, records intent via BeginReset, executes the
+// broker reset sequence, and commits or fails the operation with poisoned recovery handling on ambiguity.
 func (s *ProvisionService) Reset(ctx context.Context, actor uuid.UUID, in ResetInput) (ProvisionResponse, error) {
 	if ValidateResetInput(actor, in) != nil {
 		return ProvisionResponse{}, &DomainError{Code: CodeInvalidRequest}

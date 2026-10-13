@@ -23,8 +23,11 @@ var (
 // ClassificationStatus distinguishes completed classification from incomplete/unavailable.
 type ClassificationStatus string
 
+// ClassificationStatus values indicate whether startup classification completed or halted.
 const (
-	ClassificationCompleted  ClassificationStatus = "completed"
+	// ClassificationCompleted indicates all unresolved operations were scanned and classified.
+	ClassificationCompleted ClassificationStatus = "completed"
+	// ClassificationIncomplete indicates classification halted before all operations could be classified.
 	ClassificationIncomplete ClassificationStatus = "incomplete"
 )
 
@@ -220,7 +223,7 @@ func (c *SimplifiedStartupClassifier) Classify(ctx context.Context) (Classificat
 			}
 
 			// Expected credential status for pending operation
-			expectedStatus := CredentialRecoveryNeeded
+			var expectedStatus CredentialStatus
 			switch currentOp.Action {
 			case ActionProvision:
 				expectedStatus = CredentialProvisioning

@@ -57,7 +57,7 @@ func connectNativePool(t *testing.T, dsn string) *pgxpool.Pool {
 // TestCredentialOwner_NativeChildProcess acts as the entrypoint when spawned as a child process.
 // It reads TEST_CREDENTIAL_OWNER_CHILD_MODE and TEST_CREDENTIAL_OWNER_NATIVE_DSN_FILE.
 // It reports only safe tokens ("ACQUIRED", "DENIED", "FAILED") on stdout.
-func TestCredentialOwner_NativeChildProcess(t *testing.T) {
+func TestCredentialOwner_NativeChildProcess(_ *testing.T) {
 	mode := os.Getenv(childModeEnv)
 	if mode == "" {
 		// Not running in child mode; return immediately.

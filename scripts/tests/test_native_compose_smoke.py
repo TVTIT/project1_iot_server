@@ -119,6 +119,49 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing_interpolation"):
                 smoke.require_inputs("${NEW_REQUIRED:-production}", fixture.values)
 
+    def test_dynsec_qualification_defaults_match_verified_config_identity(self):
+        root = Path(__file__).resolve().parents[2]
+        env_text = (root / ".env.example").read_text()
+        compose_text = smoke.ROOT_COMPOSE.read_text()
+        image = "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
+        config_id = "sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4"
+        self.assertRegex(env_text, rf"(?m)^MQTT_DYNSEC_IMAGE_REFERENCE={re.escape(image)}$")
+        self.assertRegex(env_text, rf"(?m)^MQTT_DYNSEC_IMAGE_CONFIG_ID={re.escape(config_id)}$")
+        self.assertRegex(env_text, r"(?m)^MQTT_DYNSEC_PLATFORM=linux/amd64$")
+        self.assertRegex(compose_text, rf"(?m)^\s+MQTT_DYNSEC_IMAGE_REFERENCE: \$\{{MQTT_DYNSEC_IMAGE_REFERENCE:-{re.escape(image)}\}}$")
+        self.assertRegex(compose_text, rf"(?m)^\s+MQTT_DYNSEC_IMAGE_CONFIG_ID: \$\{{MQTT_DYNSEC_IMAGE_CONFIG_ID:-{re.escape(config_id)}\}}$")
+        self.assertRegex(compose_text, r"(?m)^\s+MQTT_DYNSEC_PLATFORM: \$\{MQTT_DYNSEC_PLATFORM:-linux/amd64\}$")
+
+    def test_prepared_fixture_contains_verified_dynsec_qualification_identity(self):
+        image = "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
+        config_id = "sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4"
+        platform = "linux/amd64"
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "MQTT_DYNSEC_IMAGE_CONFIG_ID": "sha256:deployment-leak",
+                "MQTT_DYNSEC_PLATFORM": "linux/arm64"}):
+            fixture = self.prepare(directory)
+            self.assertEqual(smoke.DEFAULTS["MQTT_DYNSEC_IMAGE_REFERENCE"], image)
+            self.assertEqual(smoke.DEFAULTS["MQTT_DYNSEC_IMAGE_CONFIG_ID"], config_id)
+            self.assertEqual(smoke.DEFAULTS["MQTT_DYNSEC_PLATFORM"], platform)
+            self.assertEqual(fixture.values["MQTT_DYNSEC_IMAGE_REFERENCE"], image)
+            self.assertEqual(fixture.values["MQTT_DYNSEC_IMAGE_CONFIG_ID"], config_id)
+            self.assertEqual(fixture.values["MQTT_DYNSEC_PLATFORM"], platform)
+            env_content = fixture.env_file.read_text()
+            self.assertIn(f"MQTT_DYNSEC_IMAGE_REFERENCE={image}\n", env_content)
+            self.assertIn(f"MQTT_DYNSEC_IMAGE_CONFIG_ID={config_id}\n", env_content)
+            self.assertIn(f"MQTT_DYNSEC_PLATFORM={platform}\n", env_content)
+            self.assertNotIn("deployment-leak", env_content)
+            # Consistency with production bootstrap and CLI qualification constants
+            bootstrap_spec = importlib.util.spec_from_file_location("mqtt_bootstrap", smoke.ROOT / "scripts/mqtt-bootstrap.py")
+            bootstrap_mod = importlib.util.module_from_spec(bootstrap_spec)
+            bootstrap_spec.loader.exec_module(bootstrap_mod)
+            self.assertEqual(fixture.values["MQTT_DYNSEC_IMAGE_CONFIG_ID"], getattr(bootstrap_mod, "PINNED_CONFIG_ID"))
+            cli_spec = importlib.util.spec_from_file_location("dynsec_bootstrap_cli", smoke.ROOT / "scripts/tests/dynsec_bootstrap_cli.py")
+            cli_mod = importlib.util.module_from_spec(cli_spec)
+            cli_spec.loader.exec_module(cli_mod)
+            self.assertEqual(fixture.values["MQTT_DYNSEC_IMAGE_CONFIG_ID"], getattr(cli_mod, "PINNED_CONFIG_ID"))
+
+
     def test_compose_command_is_explicit_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.prepare(directory)

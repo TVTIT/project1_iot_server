@@ -70,7 +70,9 @@ class TestCISmokeJobs(unittest.TestCase):
     def test_bootstrap_job_report_contract_and_artifact_upload(self):
         job = self._extract_job_section("dynsec-bootstrap-tests")
         report_env = "DYNSEC_BOOTSTRAP_REPORT: ${{ runner.temp }}/dynsec-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}.json"
-        self.assertIn(report_env, job)
+        self.assertNotIn(report_env, job)
+        self.assertIn("printf 'DYNSEC_BOOTSTRAP_REPORT=%s/dynsec-bootstrap-%s-%s.json\\n'", job)
+        self.assertIn('"$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"', job)
         self.assertIn('--report "$DYNSEC_BOOTSTRAP_REPORT"', job)
         self.assertIn("path: ${{ runner.temp }}/dynsec-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}.json", job)
         self.assertIn("if-no-files-found: error", job)
@@ -78,6 +80,35 @@ class TestCISmokeJobs(unittest.TestCase):
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("--dry-run", job)
         self.assertNotIn("*.json", job)
+
+    def test_report_paths_are_initialized_in_steps_not_job_env(self):
+        for job_name, variable, prefix in (
+            ("dynsec-native-integration", "DYNSEC_NATIVE_REPORT", "dynsec-native"),
+            ("dynsec-bootstrap-tests", "DYNSEC_BOOTSTRAP_REPORT", "dynsec-bootstrap"),
+        ):
+            with self.subTest(job=job_name):
+                job = self._extract_job_section(job_name)
+                before_steps = job.split("    steps:", 1)[0]
+                self.assertNotIn("runner.temp", before_steps)
+                match = re.search(
+                    r"      - name: Prepare (?:native|bootstrap) report path\n"
+                    r"        run: \|\n((?:          [^\n]*\n)+)", job + "\n"
+                )
+                self.assertIsNotNone(match, "Report initialization step must exist")
+                script = textwrap.dedent(match.group(1))
+                self.assertLess(job.index(match.group(0)), job.index('--report "$' + variable + '"'))
+                with tempfile.TemporaryDirectory(prefix="ci-report-path-") as temp:
+                    env_file = Path(temp) / "github-env"
+                    result = subprocess.run(
+                        ["/bin/sh", "-eu", "-c", script],
+                        env={"RUNNER_TEMP": temp, "GITHUB_RUN_ID": "123",
+                             "GITHUB_RUN_ATTEMPT": "2", "GITHUB_ENV": str(env_file)},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(env_file.read_text(),
+                                     f"{variable}={temp}/{prefix}-123-2.json\n")
 
     def test_compose_smoke_job_defined_with_bounded_timeout_and_root_cwd(self):
         job = self._extract_job_section("native-compose-smoke")
@@ -144,11 +175,11 @@ class TestCISmokeJobs(unittest.TestCase):
     def _extract_bootstrap_validator_script(self) -> str:
         job = self._extract_job_section("dynsec-bootstrap-tests")
         step_match = re.search(
-            r"- name: Validate safe bootstrap SUCCESS report\s+run: \|\s+python3 -c '(.*?)' \"\$DYNSEC_BOOTSTRAP_REPORT\"",
+            r"- name: Validate bootstrap report\s+run: \|\s+python3 -c '(.*?)' \"\$DYNSEC_BOOTSTRAP_REPORT\"",
             job,
             re.DOTALL,
         )
-        self.assertIsNotNone(step_match, "Validate safe bootstrap SUCCESS report inline script not found")
+        self.assertIsNotNone(step_match, "Validate bootstrap report inline script not found")
         return textwrap.dedent(step_match.group(1)).strip()
 
     def _run_bootstrap_validator(self, report_path: Path) -> subprocess.CompletedProcess:

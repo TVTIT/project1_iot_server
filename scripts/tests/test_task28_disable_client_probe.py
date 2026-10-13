@@ -1739,46 +1739,120 @@ class TestC1dHostFixtureCleanup(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir=self.test_base) as tmpdir:
             tmp_base = Path(tmpdir)
-            fix_dir, receipt = create_verified_host_fixture_dir(tmp_base)
-            self.assertTrue(fix_dir.exists())
-
-            # Simulate parent replaced: rename tmp_base, substitute with symlink to somewhere else
-            # Or rename tmp_base and recreate empty tmp_base with different inode
-            alt_dir = Path(tmpdir) / 'alt_dir'
-            alt_dir.mkdir(0o700)
-            target_in_alt = alt_dir / receipt['name']
-            target_in_alt.mkdir(0o700)
 
             # Case A: parent replaced by symlink pointing to alt_dir
-            # We move fix_dir under tmpdir_sub
-            sub_dir = Path(tmpdir) / 'sub'
+            sym_parent = tmp_base / 'sym_parent'
+            sym_parent.mkdir(0o700)
+            sym_fix, sym_receipt = create_verified_host_fixture_dir(sym_parent)
+            self.assertTrue(sym_fix.exists())
+
+            alt_dir = tmp_base / 'alt_dir'
+            alt_dir.mkdir(0o700)
+            target_in_alt = alt_dir / sym_receipt['name']
+            target_in_alt.mkdir(0o700)
+
+            # Retain original sym_parent at an owned alternate location while substituting with symlink
+            retained_sym_parent = tmp_base / 'retained_sym_parent'
+            self.os.rename(sym_parent, retained_sym_parent)
+            self.os.symlink(alt_dir, sym_parent)
+
+            with patch('task28_disable_client_probe.shutil.rmtree') as mock_rmtree:
+                res = verified_remove_host_fixture_dir(sym_receipt)
+                self.assertEqual(res['status'], 'rejected')
+                self.assertFalse(res['verified'])
+                self.assertEqual(mock_rmtree.call_count, 0)
+                # Ensure target in alt_dir was never touched or deleted
+                self.assertTrue(target_in_alt.exists())
+
+            # Cleanup symlink
+            sym_parent.unlink()
+
+            # Case B: parent replaced by different directory with guaranteed different inode
+            # Rename the original parent to an owned alternate location while retaining it,
+            # then create the replacement directory at the original path.
+            sub_dir = tmp_base / 'sub'
             sub_dir.mkdir(0o700)
             sub_fix, sub_receipt = create_verified_host_fixture_dir(sub_dir)
+            self.assertTrue(sub_fix.exists())
+
+            retained_orig_parent = tmp_base / 'retained_orig_sub'
+            self.os.rename(sub_dir, retained_orig_parent)
+
+            # Replacement directory created at the original path while original is retained
+            sub_dir.mkdir(0o700)
+
+            # Assert original and replacement st_dev/st_ino identity differs while both exist
+            orig_stat = self.os.lstat(str(retained_orig_parent))
+            repl_stat = self.os.lstat(str(sub_dir))
+            self.assertTrue((orig_stat.st_dev, orig_stat.st_ino) != (repl_stat.st_dev, repl_stat.st_ino))
+            self.assertNotEqual(orig_stat.st_ino, repl_stat.st_ino)
+            self.assertEqual(sub_receipt['parent_dev'], orig_stat.st_dev)
+            self.assertEqual(sub_receipt['parent_ino'], orig_stat.st_ino)
+
+            # Even if an entity creates a target inside the replaced parent with matching fixture name
+            fake_target = sub_dir / sub_receipt['name']
+            fake_target.mkdir(0o700)
 
             with patch('task28_disable_client_probe.shutil.rmtree') as mock_rmtree:
-                # Replace sub_dir with a symlink to alt_dir
-                sub_fix.rmdir()
-                sub_dir.rmdir()
-                self.os.symlink(alt_dir, sub_dir)
-
                 res = verified_remove_host_fixture_dir(sub_receipt)
                 self.assertEqual(res['status'], 'rejected')
                 self.assertFalse(res['verified'])
+                self.assertEqual(res['reason'], 'parent_identity_mismatch')
                 self.assertEqual(mock_rmtree.call_count, 0)
-                # Cleanup symlink
-                sub_dir.unlink()
+                self.assertTrue(fake_target.exists())
 
-            # Case B: parent replaced by different directory with different inode
-            new_sub_dir = Path(tmpdir) / 'sub'
-            new_sub_dir.mkdir(0o700)
+            # Even if target is absent in the replaced parent, parent identity mismatch must reject (never already_absent)
+            fake_target.rmdir()
+            self.assertFalse(fake_target.exists())
             with patch('task28_disable_client_probe.shutil.rmtree') as mock_rmtree:
-                res = verified_remove_host_fixture_dir(sub_receipt)
-                self.assertEqual(res['status'], 'rejected')
-                self.assertFalse(res['verified'])
+                res_absent = verified_remove_host_fixture_dir(sub_receipt)
+                self.assertEqual(res_absent['status'], 'rejected')
+                self.assertFalse(res_absent['verified'])
+                self.assertEqual(res_absent['reason'], 'parent_identity_mismatch')
                 self.assertEqual(mock_rmtree.call_count, 0)
 
-            # Clean up original fix_dir
-            verified_remove_host_fixture_dir(receipt)
+            # Clean up replacement sub_dir
+            sub_dir.rmdir()
+
+            # Case C: Focused counterexamples
+            # 1) Correct parent plus genuinely absent target returns already_absent
+            # Restore original parent back to its recorded path
+            self.os.rename(retained_orig_parent, sub_dir)
+            fix_in_orig = sub_dir / sub_receipt['name']
+            fix_in_orig.rmdir()
+            self.assertFalse(fix_in_orig.exists())
+            res_genuinely_absent = verified_remove_host_fixture_dir(sub_receipt)
+            self.assertEqual(res_genuinely_absent['status'], 'already_absent')
+            self.assertTrue(res_genuinely_absent['verified'])
+            self.assertEqual(res_genuinely_absent['reason'], 'verified_absent')
+
+            # 2) Inaccessible/unknown parent metadata never returns verified cleanup (fails closed)
+            real_lstat = self.os.lstat
+
+            def _inaccessible_parent_lstat(path_arg, *args, **kwargs):
+                if str(path_arg) == str(sub_dir):
+                    raise PermissionError("Inaccessible parent metadata")
+                return real_lstat(path_arg, *args, **kwargs)
+
+            with patch('task28_disable_client_probe.os.lstat', side_effect=_inaccessible_parent_lstat):
+                res_inaccessible = verified_remove_host_fixture_dir(sub_receipt)
+                self.assertEqual(res_inaccessible['status'], 'rejected')
+                self.assertFalse(res_inaccessible['verified'])
+                self.assertEqual(res_inaccessible['reason'], 'parent_validation_failed')
+
+            # Parent path missing completely on disk
+            sub_dir.rmdir()
+            res_missing = verified_remove_host_fixture_dir(sub_receipt)
+            self.assertEqual(res_missing['status'], 'rejected')
+            self.assertFalse(res_missing['verified'])
+            self.assertEqual(res_missing['reason'], 'parent_validation_failed')
+
+            # Clean up remaining owned fixtures
+            target_in_alt.rmdir()
+            alt_dir.rmdir()
+            retained_sym_fix = retained_sym_parent / sym_receipt['name']
+            retained_sym_fix.rmdir()
+            retained_sym_parent.rmdir()
 
     def test_verified_remove_host_fixture_dir_malformed_receipt_validation(self):
         """Malformed receipt path/parent/name nonstrings, noninteger dev/ino/uid/mode, invalid name, traversal -> stable invalid receipt."""

@@ -43,11 +43,40 @@ buộc dừng. Không có bước `always()` xóa Docker theo wildcard.
 - `legacy-runtime-image-build`: giữ build coverage của `auth-init` và `reloader`
   ngoài active backend job; không xóa source/tests legacy.
 - `cross-compile`: giữ server/gateway và compile regression initializer/reloader.
-- `stage2-e2e`: giữ unified server/controller harness cũ, đặt nhãn legacy.
-- `mosquitto-credential-integration`: giữ controller HTTP/lifecycle/fault coverage
-  cũ với broker DynSec thật, không thay thế simplified native gate.
-- `mosquitto-runtime-integration`: adapter TLS/ACL là native thật; phần topology
-  initializer/reloader là legacy. Giữ coverage artifact riêng như trước.
+- `stage2-e2e` (hiển thị: `Legacy E2E contracts`): giữ unit/contract tests
+  `test_stage2_ci.py`, `test_stage2_ci_functional.py`, `test_stage2_response_loss.py`.
+  Chỉ loại bỏ native runner `python3 scripts/tests/stage2_ci.py` (run-1/run-2), bước
+  native cleanup `--cleanup`, và upload artifact `stage2-e2e-safe-reports`.
+  Thêm executable notice step phát `legacy-execution-deferred: stage2-e2e` ra stdout
+  và `$GITHUB_STEP_SUMMARY`.
+  Disposition: historical remote run thất bại trước khi vào scenarios (nguyên nhân ẩn;
+  chia sẻ controller-coupled expectations). Không quy failure này cho fault-lost-ack của runtime job.
+  Được deferred vì phụ thuộc legacy harness, không cấp phát tài nguyên native; việc
+  current backend được kiểm riêng bởi `native-compose-smoke` và `dynsec-native-integration`;
+  không khẳng định hai jobs này tái hiện toàn bộ legacy scenarios.
+- `mosquitto-credential-integration` (hiển thị: `Legacy credential checks`): giữ
+  unit tests `test_stage2_mqtt_credentials.py`, `test_task2612_standalone.py`,
+  linter `golangci-lint v2.14.0`, và source Docker builds (`backend`, `credential-controller`).
+  Chỉ loại bỏ native script `sh scripts/test-stage2-mqtt-credentials.sh`, env coverage block,
+  và upload artifact `mosquitto-credential-coverage`.
+  Thêm executable notice step phát `legacy-execution-deferred: mosquitto-credential-integration`
+  ra stdout và `$GITHUB_STEP_SUMMARY`.
+  Disposition: standalone controller gate mismatch là source-proven (current `cmd/server`
+  không gọi legacy `OpenVerified`, gate 8883 đóng). Gate cutoff không tương đương MQTT
+  auth hoặc readiness. Không có claim hoàn tất native reset (production reset prerequisite
+  deny-only). Credential lifecycle thực tế hiện do `dynsec-native-integration`
+  (`TestSimplifiedServiceNativeRotateRevoke`, `TestSimplifiedHTTPNativeRotateRevoke`)
+  bảo đảm. `native-compose-smoke` kiểm business APIs admin inventory/owner sensor,
+  Auth/RBAC/JWT, persistence và Dockerfile/Compose, không thay thế credential lifecycle suite.
+- `mosquitto-runtime-integration` (hiển thị: `Legacy runtime contracts`): giữ
+  unit tests `test_stage2_mosquitto_runtime.py`, Go setup 1.27.1, và thư mục `/tmp/opencode`.
+  Chỉ loại bỏ native script `sh scripts/test-stage2-mosquitto-runtime.sh` và native coverage
+  upload `mosquitto-runtime-coverage`.
+  Thêm executable notice step phát `legacy-execution-deferred: mosquitto-runtime-integration`
+  ra stdout và `$GITHUB_STEP_SUMMARY`.
+  Disposition: legacy runtime fault-lost-ack exit 2 root cause UNKNOWN; deferred vì
+  adapter file/reloader là đường chạy legacy, không phải vì bug đã được sửa.
+  `legacy-runtime-image-build` vẫn giữ nguyên riêng biệt.
 - `lint-and-test`, `authorization-integration`, `provisioning-integration`: giữ
   behavior và coverage riêng; manifest Go unit vẫn có 25 tests bắt buộc.
 - `dynsec-bootstrap-tests`: regression unit suites (`test_task284_bootstrap.py`,
@@ -62,14 +91,26 @@ buộc dừng. Không có bước `always()` xóa Docker theo wildcard.
 ## Giới hạn và các bước tiếp theo
 
 Pipeline CI đã được kết nối thêm hai jobs `dynsec-bootstrap-tests` và
-`native-compose-smoke`. Lưu ý giới hạn hệ thống:
+`native-compose-smoke`, đồng thời chuyển 3 legacy jobs sang truthful deferred unit/build checks.
+Lưu ý các giới hạn hệ thống và ranh giới xác minh:
 - Bounded cancellation chỉ bảo vệ teardown trong tiến trình khi nhận SIGINT/SIGTERM;
-  không thể đảm bảo cleanup sau SIGKILL, OOM hoặc runner GitHub Actions bị ngắt cưỡng bức.
+  không thể đảm bảo cleanup sau SIGKILL, OOM hoặc runner GitHub Actions bị ngắt cưỡng bức
+  đối với các active native runners (`dynsec-native-integration`, `native-compose-smoke`,
+  `dynsec-bootstrap-tests`).
+- Các deferred jobs (`stage2-e2e`, `mosquitto-credential-integration`,
+  `mosquitto-runtime-integration`) hoàn toàn không phân bổ tài nguyên native và không phát
+  ra native cleanup hay artifact evidence; không có fake report hay fake coverage artifacts.
 - Kết quả test và smoke exit 0 hiện tại là kết quả thực thi cục bộ (local run),
   chưa phải là bằng chứng remote GitHub Actions run hoặc clean-checkout run từ xa.
-- Không sửa `migration-check` hay implementation runners trong slice này; các kiểm tra
-  chỉ verify contract wiring. Password persistence sau restart và reset usable vẫn là các gaps riêng.
-- Legacy unit contract `test_actual_production_compose_ca_only` vẫn yêu cầu services
-  initializer/reloader trong root Compose dù topology active đã đổi. Đây là blocker
-  legacy có sẵn, cần chủ sở hữu legacy contract xử lý riêng; không phục hồi services
-  cũ để làm test xanh. Không coi các kết quả local là GitHub Actions đã chạy.
+  Tuyệt đối không tuyên bố legacy PASS, full CI green hay clean checkout thành công.
+- Coverage không được tái hiện bởi current runners được ghi nhận là deferred thay vì khẳng
+  định tương đương.
+- Composition contract cũ
+  `test_task2611_composition.CompositionTemplates.test_legacy_compose_cannot_opt_in`
+  đã được thay bằng current opt-in contract và negative cases: default disabled,
+  manager credential chỉ qua environment, active backend không phụ thuộc controller.
+  Legacy template assertions giữ nguyên; composition tests đã PASS local, chưa remote proof.
+  Root Compose CA/security suite `test_stage2_mosquitto_runtime.py` đã được cập nhật và
+  PASS local; không coi nó là cùng failure hoặc phục hồi services cũ để làm test xanh.
+- Admin Inventory integration failure (đề mục 6), linting issues (đề mục 8), và final
+  clean-checkout gates vẫn là các blockers thực sự cần xử lý tiếp theo trước khi hoàn tất.

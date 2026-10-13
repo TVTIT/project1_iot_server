@@ -42,22 +42,22 @@ type spySimplifiedRepo struct {
 	calls []string
 }
 
-func (r *spySimplifiedRepo) IsPlatformAdmin(ctx context.Context, actor uuid.UUID) (bool, error) {
+func (r *spySimplifiedRepo) IsPlatformAdmin(_ context.Context, _ uuid.UUID) (bool, error) {
 	r.calls = append(r.calls, "IsPlatformAdmin")
 	return r.admin, r.adminErr
 }
 
-func (r *spySimplifiedRepo) BeginSimplifiedOperation(ctx context.Context, req BeginRequest) (BeginResult, error) {
+func (r *spySimplifiedRepo) BeginSimplifiedOperation(_ context.Context, req BeginRequest) (BeginResult, error) {
 	r.calls = append(r.calls, "BeginSimplifiedOperation:"+string(req.Input.Action))
 	return r.beginResult, r.beginErr
 }
 
-func (r *spySimplifiedRepo) BeginReset(ctx context.Context, req BeginResetRequest) (BeginResult, error) {
+func (r *spySimplifiedRepo) BeginReset(_ context.Context, req BeginResetRequest) (BeginResult, error) {
 	r.calls = append(r.calls, "BeginReset:"+string(req.Input.Reason))
 	return r.beginResetResult, r.beginResetErr
 }
 
-func (r *spySimplifiedRepo) ConditionalFinalize(ctx context.Context, u OperationUpdate) (Metadata, error) {
+func (r *spySimplifiedRepo) ConditionalFinalize(_ context.Context, u OperationUpdate) (Metadata, error) {
 	r.calls = append(r.calls, "ConditionalFinalize")
 	r.completion = u.Completion
 	if r.autoComplete {
@@ -76,22 +76,22 @@ func (r *spySimplifiedRepo) ConditionalFinalize(ctx context.Context, u Operation
 	return r.finalizeMeta, r.finalizeErr
 }
 
-func (r *spySimplifiedRepo) FailKnown(ctx context.Context, u OperationUpdate) (Metadata, error) {
+func (r *spySimplifiedRepo) FailKnown(_ context.Context, _ OperationUpdate) (Metadata, error) {
 	r.calls = append(r.calls, "FailKnown")
 	return r.failKnownMeta, r.failKnownErr
 }
 
-func (r *spySimplifiedRepo) RequireRecovery(ctx context.Context, u OperationUpdate) (Metadata, error) {
+func (r *spySimplifiedRepo) RequireRecovery(_ context.Context, _ OperationUpdate) (Metadata, error) {
 	r.calls = append(r.calls, "RequireRecovery")
 	return r.requireRecMeta, r.requireRecErr
 }
 
-func (r *spySimplifiedRepo) GetMetadata(ctx context.Context, g string) (Metadata, error) {
+func (r *spySimplifiedRepo) GetMetadata(_ context.Context, _ string) (Metadata, error) {
 	r.calls = append(r.calls, "GetMetadata")
 	return r.getMeta, r.getMetaErr
 }
 
-func (r *spySimplifiedRepo) ResolveCommitAmbiguity(ctx context.Context, id uuid.UUID) (Operation, error) {
+func (r *spySimplifiedRepo) ResolveCommitAmbiguity(_ context.Context, id uuid.UUID) (Operation, error) {
 	r.calls = append(r.calls, "ResolveCommitAmbiguity")
 	if r.ambiguityHook != nil {
 		return r.ambiguityHook(id)
@@ -99,7 +99,7 @@ func (r *spySimplifiedRepo) ResolveCommitAmbiguity(ctx context.Context, id uuid.
 	return r.ambiguityOp, r.ambiguityErr
 }
 
-func (r *spySimplifiedRepo) LookupResetReplay(ctx context.Context, actor uuid.UUID, in ResetInput) (Operation, Metadata, bool, error) {
+func (r *spySimplifiedRepo) LookupResetReplay(_ context.Context, _ uuid.UUID, in ResetInput) (Operation, Metadata, bool, error) {
 	r.calls = append(r.calls, "LookupResetReplay:"+string(in.Reason))
 	return r.lookupOp, r.lookupMeta, r.lookupFound, r.lookupErr
 }
@@ -390,7 +390,7 @@ func TestSimplifiedService_AuthorizationAndResetBlocker(t *testing.T) {
 	}
 }
 
-func (e *spySimplifiedExecutor) CheckRevoked(ctx context.Context, u string) error {
+func (e *spySimplifiedExecutor) CheckRevoked(_ context.Context, u string) error {
 	e.calls = append(e.calls, "CheckRevoked:"+u)
 	return e.revokedErr
 }
@@ -400,7 +400,7 @@ type spyResetPrerequisite struct {
 	calls    []string
 }
 
-func (p *spyResetPrerequisite) SupervisedQuiescencePrerequisite(ctx context.Context, g string) error {
+func (p *spyResetPrerequisite) SupervisedQuiescencePrerequisite(_ context.Context, g string) error {
 	p.calls = append(p.calls, "SupervisedQuiescencePrerequisite:"+g)
 	return p.checkErr
 }
@@ -1531,7 +1531,7 @@ func TestSimplifiedService_ResetFlows(t *testing.T) {
 			NewOperationID:  func() (uuid.UUID, error) { return resetOpID, nil },
 		})
 		res, err := s.Reset(context.Background(), actor, resetInput)
-		if err != nil || res.MutationResult.OperationID != resetOpID {
+		if err != nil || res.OperationID != resetOpID {
 			t.Fatalf("expected replay from BeginReset branch, got %v, err=%v", res, err)
 		}
 
@@ -2000,9 +2000,6 @@ func TestSimplifiedService_AdmissionErrorPoisonRemediation(t *testing.T) {
 		})
 
 		t.Run("DB04 conservative error tree validation matrix", func(t *testing.T) {
-			type customAsSpoof struct {
-				code ErrorCode
-			}
 			customAs := func(c ErrorCode) error {
 				return &spoofDomainError{code: c}
 			}
@@ -2610,36 +2607,13 @@ type multiErrWithNilChild struct {
 func (m *multiErrWithNilChild) Error() string   { return "multi error" }
 func (m *multiErrWithNilChild) Unwrap() []error { return m.errs }
 
-type cycleError struct {
-	depth int
-	next  *cycleError
-}
-
-func newCycleError(child error) *cycleError {
-	c := &cycleError{}
-	c.next = c // self-cycle
-	return c
-}
-
-func (c *cycleError) Error() string { return "cycle error" }
-func (c *cycleError) Unwrap() error {
-	// Standard library errors.As traverses Unwrap() without cycle detection.
-	// Allow a bounded number of unwraps (e.g. 100) before terminating so errors.As doesn't hang forever,
-	// while our helper's maxNodes=64 limit will detect cycle/excessive depth and fail closed first!
-	c.depth++
-	if c.depth > 100 {
-		return nil
-	}
-	return c.next
-}
-
 type deepError struct {
 	depth int
 	child error
 }
 
 func newDeepError(depth int, leaf error) error {
-	var cur error = leaf
+	cur := leaf
 	for i := 0; i < depth; i++ {
 		cur = &deepError{depth: i, child: cur}
 	}

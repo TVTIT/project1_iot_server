@@ -223,7 +223,7 @@ func (w *countingIntentAssertingExecutor) ExecuteCount() int64 {
 // denyResetPrereq satisfies ResetPrerequisite failing closed with CodeServiceUnavailable.
 type denyResetPrereq struct{}
 
-func (denyResetPrereq) SupervisedQuiescencePrerequisite(ctx context.Context, g string) error {
+func (denyResetPrereq) SupervisedQuiescencePrerequisite(_ context.Context, _ string) error {
 	return &DomainError{Code: CodeServiceUnavailable}
 }
 
@@ -633,8 +633,8 @@ func TestSimplifiedServiceNativeRotateRevoke(t *testing.T) {
 	if targetNewSecret == "" || targetNewSecret == targetInitialSecret {
 		t.Fatal("rotate returned invalid or unchanged secret")
 	}
-	if rotResp.Metadata.CredentialVersion != 2 {
-		t.Fatalf("expected credential version 2 after rotate, got %d", rotResp.Metadata.CredentialVersion)
+	if rotResp.CredentialVersion != 2 {
+		t.Fatalf("expected credential version 2 after rotate, got %d", rotResp.CredentialVersion)
 	}
 	expectedExecCount++ // rotate executed (3)
 	if got := wrappedExecutor.ExecuteCount(); got != expectedExecCount {
@@ -682,8 +682,8 @@ func TestSimplifiedServiceNativeRotateRevoke(t *testing.T) {
 	if rotReplayResp.Secret != nil || rotReplayResp.SecretReturned {
 		t.Fatal("rotate replay unexpectedly returned secret")
 	}
-	if rotReplayResp.Metadata.CredentialVersion != 2 {
-		t.Fatalf("expected replay credential version 2, got %d", rotReplayResp.Metadata.CredentialVersion)
+	if rotReplayResp.CredentialVersion != 2 {
+		t.Fatalf("expected replay credential version 2, got %d", rotReplayResp.CredentialVersion)
 	}
 	// Assert executor was NOT called on idempotent replay
 	if got := wrappedExecutor.ExecuteCount(); got != expectedExecCount {
@@ -721,11 +721,11 @@ func TestSimplifiedServiceNativeRotateRevoke(t *testing.T) {
 	}
 
 	// 2. SAME credential version
-	if revResp.Metadata.CredentialVersion != 2 {
-		t.Fatalf("expected version 2 to remain on revoke, got %d", revResp.Metadata.CredentialVersion)
+	if revResp.CredentialVersion != 2 {
+		t.Fatalf("expected version 2 to remain on revoke, got %d", revResp.CredentialVersion)
 	}
-	if revResp.Metadata.Status != CredentialRevoked {
-		t.Fatalf("expected status %q, got %q", CredentialRevoked, revResp.Metadata.Status)
+	if revResp.Status != CredentialRevoked {
+		t.Fatalf("expected status %q, got %q", CredentialRevoked, revResp.Status)
 	}
 
 	// 3. Target fresh connect explicit auth denial
@@ -818,7 +818,7 @@ func TestSimplifiedServiceNativeRotateRevoke(t *testing.T) {
 	if revReplayResp.SecretReturned {
 		t.Fatal("revoke replay unexpectedly reported secret returned")
 	}
-	if revReplayResp.Metadata.Status != CredentialRevoked || revReplayResp.Metadata.CredentialVersion != 2 {
+	if revReplayResp.Status != CredentialRevoked || revReplayResp.CredentialVersion != 2 {
 		t.Fatalf("unexpected metadata in revoke replay: %+v", revReplayResp.Metadata)
 	}
 	// Assert executor was NOT called on idempotent replay

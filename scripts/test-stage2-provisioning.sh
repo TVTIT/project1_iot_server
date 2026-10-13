@@ -16,7 +16,10 @@ cleanup() {
         fi
     fi
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
-        rm -f "$TEMP_DIR/test-report.json"
+        if ! rm -f "$TEMP_DIR/test-report.json" 2>/dev/null; then
+            echo 'Failed to remove temporary test report.' >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
         if ! rmdir "$TEMP_DIR" 2>/dev/null; then
             echo 'Failed to remove temporary directory.' >&2
             [ "$status" -ne 0 ] || status=1
@@ -61,7 +64,15 @@ PROVISIONING_TEST_BACKEND_URL="postgres://iot_backend_app:$BACKEND_DB_PASSWORD@1
 PROVISIONING_TEST_ISOLATED=1
 export PROVISIONING_TEST_SETUP_URL PROVISIONING_TEST_BACKEND_URL PROVISIONING_TEST_ISOLATED
 cd "$PROJECT_ROOT/src"
-TEMP_DIR="$(mktemp -d /tmp/opencode/prov-test.XXXXXX)"
+STAGE2_TMP_ROOT="${STAGE2_TEST_TMPDIR:-/tmp/opencode}"
+if [ ! -d "$STAGE2_TMP_ROOT" ]; then
+    if ! mkdir -p "$STAGE2_TMP_ROOT" 2>/dev/null; then
+        echo 'Failed to prepare temporary root directory.' >&2
+        exit 1
+    fi
+fi
+umask 077
+TEMP_DIR="$(mktemp -d "$STAGE2_TMP_ROOT/prov-test.XXXXXX")"
 JSON_LOG="$TEMP_DIR/test-report.json"
 
 # Fixtures share this isolated database; run packages serially so repository

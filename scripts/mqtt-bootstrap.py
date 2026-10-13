@@ -30,6 +30,12 @@ import uuid
 
 PINNED_IMAGE = 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
 PINNED_DIGEST = 'd12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
+# PINNED_IMAGE / PINNED_DIGEST pin the root OCI index digest.
+# PINNED_PLATFORM_MANIFEST_DIGEST pins the verified linux/amd64 platform manifest digest.
+PINNED_PLATFORM_MANIFEST_DIGEST = 'sha256:f43889926d948c1146751bce701373b71c16a81e5de9b2986b7589221fa4d9e9'
+# PINNED_CONFIG_ID pins the verified platform image configuration digest
+# (Docker inspect Id / linux-amd64 config ID), distinct from the root index digest.
+PINNED_CONFIG_ID = 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4'
 EXPECTED_VERSION_BANNER = b'mosquitto_ctrl version 2.0.18 running on libmosquitto 2.0.18.'
 SAFE_IDENTIFIER_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$')
 SAFE_HEX_64_PATTERN = re.compile(r'^[0-9a-fA-F]{64}$')
@@ -365,19 +371,100 @@ def verify_image(image_ref, runner=subprocess.run):
         if arch != 'amd64' or os_name != 'linux':
             raise BootstrapError('image architecture or OS mismatch; linux/amd64 required')
 
-        digests = inspect.get('RepoDigests', [])
-        if not any(d == PINNED_IMAGE for d in digests):
+        digests = inspect.get('RepoDigests')
+        if not isinstance(digests, list) or not any(d == PINNED_IMAGE for d in digests):
             raise BootstrapError('image RepoDigests exact pin mismatch')
 
         raw_id = inspect.get('Id', '')
-        if raw_id.startswith('sha256:'):
-            raw_id = raw_id[7:]
-        if not SAFE_HEX_64_PATTERN.fullmatch(raw_id) or raw_id.lower() != PINNED_DIGEST.lower():
+        if not isinstance(raw_id, str):
             raise BootstrapError('image Id immutable digest mismatch')
+        normalized_id = raw_id[7:] if raw_id.startswith('sha256:') else raw_id
+        if not SAFE_HEX_64_PATTERN.fullmatch(normalized_id):
+            raise BootstrapError('image Id immutable digest mismatch')
+        full_id = 'sha256:' + normalized_id.lower()
 
-        # The exact immutable pin is the dependency receipt. Do not allocate an
-        # untracked container merely to repeat the pinned version banner check.
-        return 'sha256:' + raw_id
+        expected_config_id = PINNED_CONFIG_ID.lower()
+        expected_root_id = ('sha256:' + PINNED_DIGEST).lower()
+
+        # Offline descriptor identity validation:
+        # Trust the local Docker daemon, combined with an independently release-verified
+        # pinned root/platform/config tuple. This is offline descriptor identity validation,
+        # NOT fresh cryptographic hashing of local content.
+        descriptor = inspect.get('Descriptor')
+        if full_id == expected_config_id:
+            # Classic Docker image store: Id matches pinned config digest.
+            # If Descriptor is present, reject malformed, contradictory, or unknown metadata.
+            if descriptor is not None:
+                if not isinstance(descriptor, dict):
+                    raise BootstrapError('malformed image descriptor metadata')
+                desc_digest = descriptor.get('digest')
+                desc_media_type = descriptor.get('mediaType')
+                if not isinstance(desc_digest, str) or not isinstance(desc_media_type, str):
+                    raise BootstrapError('malformed image descriptor metadata')
+                norm_desc_digest = desc_digest.lower()
+                # Supported descriptor pairs explicitly bound to verified release tuple:
+                supported_pairs = {
+                    expected_config_id: 'application/vnd.oci.image.config.v1+json',
+                    expected_root_id: 'application/vnd.oci.image.index.v1+json',
+                    PINNED_PLATFORM_MANIFEST_DIGEST.lower(): 'application/vnd.oci.image.manifest.v1+json',
+                }
+                if norm_desc_digest not in supported_pairs:
+                    raise BootstrapError('contradictory image descriptor digest')
+                if desc_media_type != supported_pairs[norm_desc_digest]:
+                    raise BootstrapError('unsupported image descriptor metadata')
+            return full_id
+        elif full_id == expected_root_id:
+            # Docker containerd image store: Id matches root OCI index digest.
+            # Require exact OCI index Descriptor digest and mediaType.
+            if not isinstance(descriptor, dict):
+                raise BootstrapError('missing or malformed root index descriptor metadata')
+            desc_digest = descriptor.get('digest')
+            desc_media_type = descriptor.get('mediaType')
+            if (not isinstance(desc_digest, str) or
+                    desc_digest.lower() != expected_root_id or
+                    desc_media_type != 'application/vnd.oci.image.index.v1+json'):
+                raise BootstrapError('root index descriptor mismatch')
+
+            # Independent bounded platform-specific inspect of the SAME immutable PINNED_IMAGE.
+            try:
+                res_plat = runner(['docker', 'image', 'inspect', '--platform', 'linux/amd64', image_ref],
+                                  capture_output=True, timeout=10, check=False,
+                                  env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+            except (subprocess.SubprocessError, OSError):
+                raise BootstrapError('platform-specific image inspect failed or timed out') from None
+            if res_plat.returncode != 0:
+                raise BootstrapError('platform-specific image inspect failed')
+            plat_data = strict_json(res_plat.stdout.decode())
+            if not isinstance(plat_data, list) or len(plat_data) != 1 or not isinstance(plat_data[0], dict):
+                raise BootstrapError('invalid platform-specific image inspect metadata')
+            plat_inspect = plat_data[0]
+            if plat_inspect.get('Architecture') != 'amd64' or plat_inspect.get('Os') != 'linux':
+                raise BootstrapError('platform-specific image inspect os/architecture mismatch')
+
+            plat_desc = plat_inspect.get('Descriptor')
+            if not isinstance(plat_desc, dict):
+                raise BootstrapError('missing or malformed platform image descriptor metadata')
+            plat_desc_digest = plat_desc.get('digest')
+            plat_desc_media_type = plat_desc.get('mediaType')
+            expected_plat_manifest = PINNED_PLATFORM_MANIFEST_DIGEST.lower()
+            if (not isinstance(plat_desc_digest, str) or
+                    plat_desc_digest.lower() != expected_plat_manifest or
+                    plat_desc_media_type != 'application/vnd.oci.image.manifest.v1+json'):
+                raise BootstrapError('platform-specific image descriptor mismatch')
+
+            plat_raw_id = plat_inspect.get('Id', '')
+            if not isinstance(plat_raw_id, str):
+                raise BootstrapError('platform-specific image Id mismatch')
+            plat_norm_id = plat_raw_id[7:] if plat_raw_id.startswith('sha256:') else plat_raw_id
+            if not SAFE_HEX_64_PATTERN.fullmatch(plat_norm_id):
+                raise BootstrapError('platform-specific image Id mismatch')
+            # In containerd image inspect --platform linux/amd64, Id matches the platform manifest f438
+            if ('sha256:' + plat_norm_id.lower()) != expected_plat_manifest:
+                raise BootstrapError('platform-specific image Id mismatch')
+
+            return full_id
+        else:
+            raise BootstrapError('image Id immutable digest mismatch')
     except BootstrapError:
         raise
     except (subprocess.SubprocessError, OSError):
@@ -519,6 +606,19 @@ def resolve_helper(item, runner=subprocess.run):
             mounts != item['mounts'] or
             (item.get('id') and item['id'] != cid)):
         raise BootstrapError('helper ownership mismatch; incomplete cleanup')
+
+    # For root-index daemon execution (containerd image store), verify container ImageManifestDescriptor
+    if item['image'].lower() == ('sha256:' + PINNED_DIGEST).lower():
+        imd = rec.get('ImageManifestDescriptor')
+        if not isinstance(imd, dict):
+            raise BootstrapError('helper missing container image manifest descriptor; incomplete cleanup')
+        imd_digest = imd.get('digest')
+        imd_media_type = imd.get('mediaType')
+        if (not isinstance(imd_digest, str) or
+                imd_digest.lower() != PINNED_PLATFORM_MANIFEST_DIGEST.lower() or
+                imd_media_type != 'application/vnd.oci.image.manifest.v1+json'):
+            raise BootstrapError('helper container image manifest descriptor mismatch; incomplete cleanup')
+
     item['id'] = cid
     return cid
 

@@ -15,9 +15,12 @@ import (
 // Qualified Mosquitto 2.0.18 native capability descriptor constants.
 // Qualification is a trusted release/composition binding, not a runtime remote broker
 // attestation via MQTT banner or runtime evidence parsing.
+// Note: QualifiedMosquittoImageRef pins the root OCI index digest, whereas
+// QualifiedMosquittoConfigID pins the verified platform image configuration digest
+// (config.digest from the linux/amd64 platform manifest), which must not be confused with the index digest.
 const (
 	QualifiedMosquittoImageRef = "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
-	QualifiedMosquittoConfigID = "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
+	QualifiedMosquittoConfigID = "sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4"
 	QualifiedMosquittoPlatform = "linux/amd64"
 	QualifiedMosquittoVersion  = "2.0.18"
 )
@@ -35,7 +38,7 @@ type NativeDisableQualification struct {
 // NewNativeDisableQualification constructs a validated NativeDisableQualification.
 // It accepts only the exact tested and qualified composition identity:
 // - imageRef: "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
-// - configID: "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
+// - configID: "sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4"
 // - platform: "linux/amd64"
 // Config ID must not generically be assumed equal to image digest.
 // Any absent, unpinned, mismatched, latest, or unsupported platform is rejected with ErrInvalidInput.
