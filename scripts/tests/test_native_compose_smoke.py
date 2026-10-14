@@ -1,5 +1,6 @@
 """Preparation and preflight regression tests; these tests never contact Docker."""
 import base64
+from contextlib import ExitStack
 import dataclasses
 import importlib.util
 import json
@@ -1532,26 +1533,27 @@ class AllocationTests(unittest.TestCase):
                 return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()
 
             stdout_buf = io.StringIO()
-            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--full-http"]), \
-                 patch.object(smoke, "prepare", return_value=f), \
-                 patch.object(smoke, "dry_effective_config", return_value=model), \
-                 patch.object(smoke, "build_native_image"), \
-                 patch.object(smoke, "generate_fixture_tls"), \
-                 patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd), \
-                 patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve), \
-                 patch.object(smoke.ResourceRegistry, "remove"), \
-                 patch.object(smoke, "allocate_bootstrap_store"), \
-                 patch.object(smoke, "allocation_readback"), \
-                 patch.object(smoke, "startup_state", return_value=True), \
-                 patch.object(smoke, "probe_startup", return_value=True), \
-                 patch.object(smoke, "run_positive_http_slice", return_value={"admin_inventory_status": 200, "owner_sensor_create_status": 201, "owner_sensor_retry_status": 200, "db_guarantees_verified": True}), \
-                 patch.object(smoke, "run_role_http_slice", return_value={"gateway_id": "gw1", "existing_sensor": "s1", "role_cases": {c["label"]: c["status"] for c in smoke.role_http_cases()}, "role_snapshot_comparisons": 10}), \
-                 patch.object(smoke, "run_jwt_denial_slice", return_value={"jwt_cases": {c["label"]: c["status"] for c in smoke.jwt_http_cases()}, "jwt_snapshot_comparisons": 6}), \
-                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
-                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
-                 patch("subprocess.run", side_effect=fake_subp), \
-                 patch.object(smoke, "full_http_summary", side_effect=ValueError("cleanup_acceptance_incomplete")), \
-                 patch("sys.stdout", stdout_buf):
+            with ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--full-http"]))
+                stack.enter_context(patch.object(smoke, "prepare", return_value=f))
+                stack.enter_context(patch.object(smoke, "dry_effective_config", return_value=model))
+                stack.enter_context(patch.object(smoke, "build_native_image"))
+                stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "remove"))
+                stack.enter_context(patch.object(smoke, "allocate_bootstrap_store"))
+                stack.enter_context(patch.object(smoke, "allocation_readback"))
+                stack.enter_context(patch.object(smoke, "startup_state", return_value=True))
+                stack.enter_context(patch.object(smoke, "probe_startup", return_value=True))
+                stack.enter_context(patch.object(smoke, "run_positive_http_slice", return_value={"admin_inventory_status": 200, "owner_sensor_create_status": 201, "owner_sensor_retry_status": 200, "db_guarantees_verified": True}))
+                stack.enter_context(patch.object(smoke, "run_role_http_slice", return_value={"gateway_id": "gw1", "existing_sensor": "s1", "role_cases": {c["label"]: c["status"] for c in smoke.role_http_cases()}, "role_snapshot_comparisons": 10}))
+                stack.enter_context(patch.object(smoke, "run_jwt_denial_slice", return_value={"jwt_cases": {c["label"]: c["status"] for c in smoke.jwt_http_cases()}, "jwt_snapshot_comparisons": 6}))
+                stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts"))
+                stack.enter_context(patch("subprocess.run", side_effect=fake_subp))
+                stack.enter_context(patch.object(smoke, "full_http_summary", side_effect=ValueError("cleanup_acceptance_incomplete")))
+                stack.enter_context(patch("sys.stdout", stdout_buf))
                 ret = smoke.main()
             self.assertEqual(ret, 1)
             rep = json.loads(stdout_buf.getvalue().strip())
@@ -1602,23 +1604,24 @@ class AllocationTests(unittest.TestCase):
                 return real_durable_json(path, data)
 
             stdout_buf = io.StringIO()
-            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
-                 patch.object(smoke, "prepare", return_value=f), \
-                 patch.object(smoke, "dry_effective_config", return_value=model), \
-                 patch.object(smoke, "build_native_image"), \
-                 patch.object(smoke, "generate_fixture_tls"), \
-                 patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd), \
-                 patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve), \
-                 patch.object(smoke.ResourceRegistry, "remove"), \
-                 patch.object(smoke, "allocate_bootstrap_store"), \
-                 patch.object(smoke, "allocation_readback"), \
-                 patch.object(smoke, "startup_state", return_value=True), \
-                 patch.object(smoke, "probe_startup", return_value=True), \
-                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
-                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
-                 patch("subprocess.run", side_effect=fake_subp), \
-                 patch.object(smoke, "durable_json", side_effect=selective_durable_json), \
-                 patch("sys.stdout", stdout_buf):
+            with ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]))
+                stack.enter_context(patch.object(smoke, "prepare", return_value=f))
+                stack.enter_context(patch.object(smoke, "dry_effective_config", return_value=model))
+                stack.enter_context(patch.object(smoke, "build_native_image"))
+                stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "remove"))
+                stack.enter_context(patch.object(smoke, "allocate_bootstrap_store"))
+                stack.enter_context(patch.object(smoke, "allocation_readback"))
+                stack.enter_context(patch.object(smoke, "startup_state", return_value=True))
+                stack.enter_context(patch.object(smoke, "probe_startup", return_value=True))
+                stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts"))
+                stack.enter_context(patch("subprocess.run", side_effect=fake_subp))
+                stack.enter_context(patch.object(smoke, "durable_json", side_effect=selective_durable_json))
+                stack.enter_context(patch("sys.stdout", stdout_buf))
                 ret = smoke.main()
             self.assertEqual(ret, 1)
             rep = json.loads(stdout_buf.getvalue().strip())
