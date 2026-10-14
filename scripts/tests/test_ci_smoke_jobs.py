@@ -167,10 +167,237 @@ class TestCISmokeJobs(unittest.TestCase):
         self.assertIn("validate_summary", job)
         self.assertIn("path: /tmp/opencode/native-compose-smoke-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/startup-summary.json", job)
         self.assertIn("if-no-files-found: error", job)
-        self.assertNotIn("if: always()", job)
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("prune", job)
         self.assertNotIn(".env", job)
+
+        # Execution and success steps must not have if: always()
+        smoke_run_idx = job.find("Run Compose smoke")
+        validate_report_idx = job.find("Validate smoke report")
+        upload_report_idx = job.find("name: Upload safe report")
+        self.assertNotEqual(smoke_run_idx, -1)
+        self.assertNotEqual(validate_report_idx, -1)
+        self.assertNotEqual(upload_report_idx, -1)
+
+        # Verify success acceptance validator requirements
+        self.assertIn('report.get("status") != "RBAC_JWT_HTTP_ACCEPTED"', job)
+        self.assertIn('report.get("http_accepted") is not True', job)
+        self.assertIn('report.get("exact_cleanup_verified") is not True', job)
+
+        # Stable step ID for smoke execution
+        self.assertIn("id: smoke", job)
+        self.assertIn('python3 scripts/tests/native_compose_smoke.py --prepare "$SMOKE_PREPARE_DIR" --full-http', job)
+
+        # Steps up to and including Upload safe report must not contain if: always()
+        success_section = job[:upload_report_idx + 150]
+        self.assertNotIn("if: always()", success_section)
+
+        # Failure diagnostic validation step contract
+        self.assertIn("Validate smoke failure report", job)
+        self.assertIn("id: failure_diagnostic", job)
+        self.assertIn("if: always() && steps.smoke.outcome == 'failure'", job)
+        self.assertIn("validate_failure_report", job)
+        self.assertIn('"$SMOKE_PREPARE_DIR/artifacts/smoke-failure.json"', job)
+        self.assertIn("${{ runner.temp }}/smoke-failure-staging/smoke-failure.json", job)
+
+        # Failure report upload step contract
+        self.assertIn("Upload safe failure report", job)
+        self.assertIn(
+            "if: always() && steps.smoke.outcome == 'failure' && steps.failure_diagnostic.outcome == 'success' && steps.failure_diagnostic.outputs.validated == 'true'",
+            job,
+        )
+        self.assertIn("name: native-compose-smoke-safe-failure-report", job)
+
+    def _extract_smoke_failure_validator_script(self) -> str:
+        job = self._extract_job_section("native-compose-smoke")
+        step_match = re.search(
+            r"- name: Validate smoke failure report\s+id: \S+\s+if: [^\n]+\s+run: \|\s+python3 -c '(.*?)'",
+            job,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(step_match, "Validate smoke failure report inline script not found")
+        return textwrap.dedent(step_match.group(1)).strip()
+
+    def _run_smoke_failure_validator(
+        self,
+        report_path: Path,
+        staging_path: Path,
+        env_vars: dict = None,
+    ) -> subprocess.CompletedProcess:
+        script = self._extract_smoke_failure_validator_script()
+        import os
+        env = dict(os.environ)
+        if env_vars:
+            env.update(env_vars)
+        return subprocess.run(
+            [sys.executable, "-c", script, str(report_path), str(staging_path)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            env=env,
+        )
+
+    def _valid_smoke_failure_report(self) -> dict:
+        return {
+            "schema_version": 1,
+            "status": "STARTUP_FAILED",
+            "phase": "preflight",
+            "error_type": "ValueError",
+            "error_code": "local_image_unavailable",
+            "http_accepted": False,
+            "cleanup_verified": False,
+        }
+
+    def test_smoke_failure_validator_accepts_valid_report_and_stages_exact_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            report_file = tmp_path / "artifacts" / "smoke-failure.json"
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_file.write_text(json.dumps(self._valid_smoke_failure_report()), encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+            github_output = tmp_path / "github_output"
+
+            res = self._run_smoke_failure_validator(
+                report_file, staging_file, env_vars={"GITHUB_OUTPUT": str(github_output)}
+            )
+            self.assertEqual(res.returncode, 0, f"Validator failed on valid report: {res.stderr}")
+            self.assertIn("Smoke failure diagnostic validated successfully", res.stdout)
+            self.assertTrue(staging_file.is_file(), "Staged file must exist")
+            staged_data = json.loads(staging_file.read_text(encoding="utf-8"))
+            self.assertEqual(staged_data, self._valid_smoke_failure_report())
+            self.assertTrue(github_output.is_file())
+            self.assertIn("validated=true", github_output.read_text(encoding="utf-8"))
+
+    def test_smoke_failure_validator_handles_missing_report(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            missing_file = tmp_path / "artifacts" / "smoke-failure.json"
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+            github_output = tmp_path / "github_output"
+
+            res = self._run_smoke_failure_validator(
+                missing_file, staging_file, env_vars={"GITHUB_OUTPUT": str(github_output)}
+            )
+            self.assertEqual(res.returncode, 0, f"Missing report must not crash step: {res.stderr}")
+            self.assertIn("Smoke failure report missing; no diagnostic artifact will be uploaded", res.stderr)
+            self.assertFalse(staging_file.exists(), "No staging file must be created on missing source")
+            if github_output.exists():
+                self.assertNotIn("validated=true", github_output.read_text(encoding="utf-8"))
+
+    def test_smoke_failure_validator_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            valid_file = tmp_path / "valid.json"
+            valid_file.write_text(json.dumps(self._valid_smoke_failure_report()), encoding="utf-8")
+            symlink_file = tmp_path / "symlink.json"
+            symlink_file.symlink_to(valid_file)
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(symlink_file, staging_file)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("invalid failure report: not a regular file", res.stderr)
+            self.assertFalse(staging_file.exists())
+
+            # Broken symlink
+            broken_symlink = tmp_path / "broken_symlink.json"
+            broken_symlink.symlink_to(tmp_path / "nonexistent.json")
+            res_broken = self._run_smoke_failure_validator(broken_symlink, staging_file)
+            self.assertNotEqual(res_broken.returncode, 0)
+            self.assertIn("invalid failure report: not a regular file", res_broken.stderr)
+            self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_oversized_report(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            oversized_file = tmp_path / "oversized.json"
+            # > 8192 bytes
+            oversized_file.write_text(" " * 8200, encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(oversized_file, staging_file)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("failure report size out of bounds", res.stderr)
+            self.assertFalse(staging_file.exists())
+
+            # Zero bytes
+            zero_file = tmp_path / "zero.json"
+            zero_file.write_text("", encoding="utf-8")
+            res_zero = self._run_smoke_failure_validator(zero_file, staging_file)
+            self.assertNotEqual(res_zero.returncode, 0)
+            self.assertIn("failure report size out of bounds", res_zero.stderr)
+            self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_malformed_json(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bad_json = tmp_path / "bad.json"
+            bad_json.write_text("{malformed: true", encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(bad_json, staging_file)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("invalid failure report JSON", res.stderr)
+            self.assertNotIn("malformed", res.stderr)
+            self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_unknown_or_extra_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            extra_payload = self._valid_smoke_failure_report()
+            extra_payload["unexpected_field"] = "evil"
+            extra_file = tmp_path / "extra.json"
+            extra_file.write_text(json.dumps(extra_payload), encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(extra_file, staging_file)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("failure report validation failed", res.stderr)
+            self.assertNotIn("unexpected_field", res.stderr)
+            self.assertNotIn("evil", res.stderr)
+            self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_secret_bearing_content(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            secret = "ghp_VERYSECRET_BEARER_TOKEN_9999"
+            secret_payload = self._valid_smoke_failure_report()
+            secret_payload["token"] = secret
+            sec_file = tmp_path / "secret.json"
+            sec_file.write_text(json.dumps(secret_payload), encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(sec_file, staging_file)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("failure report validation failed", res.stderr)
+            self.assertNotIn(secret, res.stderr)
+            self.assertNotIn(secret, res.stdout)
+            self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_invalid_values_and_types(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+            base = self._valid_smoke_failure_report()
+
+            for key, bad_val in (
+                ("status", "SUCCESS"),
+                ("status", "RBAC_JWT_HTTP_ACCEPTED"),
+                ("schema_version", 2),
+                ("schema_version", "1"),
+                ("phase", "invalid_phase"),
+                ("error_type", "BadType"),
+                ("error_code", "bad_code"),
+                ("http_accepted", True),
+                ("cleanup_verified", "true"),
+            ):
+                payload = dict(base)
+                payload[key] = bad_val
+                bad_file = tmp_path / f"bad_{key}.json"
+                bad_file.write_text(json.dumps(payload), encoding="utf-8")
+                res = self._run_smoke_failure_validator(bad_file, staging_file)
+                self.assertNotEqual(res.returncode, 0, f"Validator accepted bad {key}={bad_val}")
+                self.assertIn("failure report validation failed", res.stderr)
+                self.assertFalse(staging_file.exists())
 
     def _extract_bootstrap_validator_script(self) -> str:
         job = self._extract_job_section("dynsec-bootstrap-tests")

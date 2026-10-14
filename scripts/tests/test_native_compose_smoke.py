@@ -936,6 +936,776 @@ class AllocationTests(unittest.TestCase):
                 self.assertEqual(rep["positive_verifications"]["admin_inventory"], True)
                 smoke.validate_summary(rep)
 
+    def test_safe_failure_report_schema_and_allowlists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = smoke.prepare(Path(directory) / "fixture")
+            valid_report = {
+                "schema_version": 1,
+                "status": "STARTUP_FAILED",
+                "phase": "preflight",
+                "error_type": "ValueError",
+                "error_code": "local_image_unavailable",
+                "http_accepted": False,
+                "cleanup_verified": False,
+            }
+            smoke.validate_failure_report(valid_report)
+            smoke.record_failure_report(f, phase="preflight", exc=ValueError("local_image_unavailable"), cleanup_verified=False)
+            failure_path = f.artifacts / "smoke-failure.json"
+            self.assertTrue(failure_path.exists())
+            loaded = json.loads(failure_path.read_text())
+            smoke.validate_failure_report(loaded)
+            self.assertEqual(loaded["error_code"], "local_image_unavailable")
+            self.assertFalse(loaded["http_accepted"])
+            self.assertFalse(loaded["cleanup_verified"])
+
+            # Test invalid schemas: extra field, wrong types, unknown values, bool-as-int
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, extra="unexpected"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, schema_version=2))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, status="SUCCESS"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, phase="unknown_phase"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, error_type="EvilException"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, error_code="evil_code"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, http_accepted=True))
+            # bool-as-int: 1 or 0 instead of True/False
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, http_accepted=0))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, cleanup_verified=1))
+            # strict schema_version true and 1.0 rejection
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, schema_version=True))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(valid_report, schema_version=1.0))
+            # wrong unhashable phase/type/code/status values rejected predictably with ValueError, not TypeError
+            for unhashable in ([1, 2], {"bad": "type"}):
+                with self.assertRaises(ValueError):
+                    smoke.validate_failure_report(dict(valid_report, phase=unhashable))
+                with self.assertRaises(ValueError):
+                    smoke.validate_failure_report(dict(valid_report, error_type=unhashable))
+                with self.assertRaises(ValueError):
+                    smoke.validate_failure_report(dict(valid_report, error_code=unhashable))
+                with self.assertRaises(ValueError):
+                    smoke.validate_failure_report(dict(valid_report, status=unhashable))
+
+    def test_adversarial_exception_secret_leak_prevention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = smoke.prepare(Path(directory) / "fixture")
+            # Adversarial exception whose text is a plausible lowercase secret
+            secret_exc = ValueError("super_secret_token_12345")
+            report = smoke.record_failure_report(f, phase="positive_http", exc=secret_exc, cleanup_verified=False)
+            self.assertEqual(report["error_code"], "unclassified")
+            self.assertEqual(report["error_type"], "ValueError")
+            self.assertNotIn("super_secret_token_12345", json.dumps(report))
+
+            # Attacker-defined exception subclass with evil __str__
+            class AttackerExploitError(ValueError):
+                def __init__(self):
+                    self.called = False
+                def __str__(self):
+                    self.called = True
+                    raise RuntimeError("exploit __str__ invoked")
+            custom_exc = AttackerExploitError()
+            report2 = smoke.record_failure_report(f, phase="positive_http", exc=custom_exc, cleanup_verified=False)
+            self.assertEqual(report2["error_type"], "Exception")
+            self.assertEqual(report2["error_code"], "unclassified")
+            self.assertFalse(custom_exc.called)
+
+            # Class named ValueError that is not builtin
+            class FakeValueError(Exception):
+                pass
+            FakeValueError.__name__ = "ValueError"
+            fake_exc = FakeValueError("fake")
+            report3 = smoke.record_failure_report(f, phase="positive_http", exc=fake_exc, cleanup_verified=False)
+            self.assertEqual(report3["error_type"], "Exception")
+            self.assertEqual(report3["error_code"], "unclassified")
+
+    def test_unsafe_prepare_path_does_not_write_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unsafe_dir = Path(directory) / "unsafe symlink dir"
+            os.symlink(directory, unsafe_dir)
+            with self.assertRaises(ValueError):
+                smoke.prepare(unsafe_dir / "fixture")
+            self.assertFalse((unsafe_dir / "fixture").exists())
+
+    def test_main_prepare_failure_emits_safe_json_stdout_without_writes(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            unsafe_dir = Path(directory) / "unsafe_symlink_dir"
+            os.symlink(directory, unsafe_dir)
+            prep_target = unsafe_dir / "fixture"
+            stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_target)]), \
+                 patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            self.assertEqual(stderr_buf.getvalue(), "")
+            out_str = stdout_buf.getvalue().strip()
+            rep = json.loads(out_str)
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "prepare")
+            self.assertEqual(rep["error_code"], "unsafe_fixture_path")
+            self.assertFalse(rep["cleanup_verified"])
+            self.assertFalse(prep_target.exists())
+
+    def test_main_preflight_dry_config_failure_propagation(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", side_effect=ValueError("compose_preflight_failed")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "preflight")
+            self.assertEqual(rep["error_code"], "compose_preflight_failed")
+            self.assertFalse(rep["cleanup_verified"])
+            # Dedicated artifact matches stdout
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_main_bootstrap_failure_preserves_phase_and_cleanup_true(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", return_value=mock_model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()), \
+                 patch.object(smoke, "allocate_bootstrap_store", side_effect=ValueError("bootstrap_contract_rejected")), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "bootstrap")
+            self.assertEqual(rep["error_code"], "bootstrap_contract_rejected")
+            self.assertTrue(rep["cleanup_verified"])
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_main_service_envoy_readiness_failure_preserves_envoy_phase(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            def fake_dry(fixture, **kwargs):
+                return {
+                    "networks": {"iot_net": {"name": fixture.project + "_iot_net", "labels": {}}},
+                    "volumes": {},
+                    "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+                }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+
+            def fake_probe(reg, name, obj):
+                if name == "supabase-envoy":
+                    return False
+                return True
+
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                registry.allocating(item)
+                return item
+
+            running_obj = {
+                "Image": "img", "Id": "cid", "State": {"Status": "running", "Running": True, "ExitCode": 0},
+                "receipt": {"id": "cid"},
+                "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+            }
+            def fake_resolve(item):
+                if not item.get("allocation_attempted"):
+                    return None
+                item["receipt"] = {"id": "cid"}
+                return running_obj
+
+            expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                        for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+            def fake_cmd(cmd):
+                if "psql" in cmd:
+                    if "SELECT string_agg" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
+                return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
+
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", side_effect=fake_dry), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc), \
+                 patch.object(smoke, "allocation_readback", return_value=True), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
+                 patch.object(smoke, "BUDGETS", dict(smoke.BUDGETS, up=0.01)), \
+                 patch.object(smoke, "startup_state", return_value=True), \
+                 patch.object(smoke, "probe_startup", side_effect=fake_probe), \
+                 patch("subprocess.run", return_value=type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()), \
+                 patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve), \
+                 patch.object(smoke.ResourceRegistry, "remove"), \
+                 patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "supabase-envoy")
+            self.assertEqual(rep["error_code"], "phase_health_timeout")
+            self.assertTrue(rep["cleanup_verified"])
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_main_http_phases_preservation(self):
+        import io
+        for flag, failing_phase, helper_to_fail in (
+            ("--positive-http-only", "positive_http", "run_positive_http_slice"),
+            ("--role-http-only", "role_http", "run_role_http_slice"),
+            ("--full-http", "jwt_http", "run_jwt_denial_slice"),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                prep_dir = Path(directory) / "fixture"
+                def fake_dry(fixture, **kwargs):
+                    return {
+                        "networks": {"iot_net": {"name": fixture.project + "_iot_net", "labels": {}}},
+                        "volumes": {},
+                        "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+                    }
+                img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+                mock_lifecycle = smoke.bootstrap_lifecycle()
+                def fake_alloc(fixture, registry, lifecycle):
+                    item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                    registry.allocating(item)
+                    return item
+
+                running_obj = {
+                    "Image": "img", "Id": "cid", "State": {"Status": "running", "Running": True, "ExitCode": 0},
+                    "receipt": {"id": "cid"},
+                    "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+                }
+                def fake_resolve(item):
+                    if not item.get("allocation_attempted"):
+                        return None
+                    item["receipt"] = {"id": "cid"}
+                    return running_obj
+
+                expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                            for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+                def fake_cmd(cmd):
+                    if "psql" in cmd:
+                        if "SELECT string_agg" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
+                        if "profiles_id_fkey" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
+                    return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
+
+                dummy_positive = {"admin_inventory_status": 200, "owner_sensor_create_status": 201, "owner_sensor_retry_status": 200, "db_guarantees_verified": True}
+                dummy_role = {"role_cases": {c["label"]: c["status"] for c in smoke.role_http_cases()}, "role_snapshot_comparisons": 10, "gateway_id": "gw", "existing_sensor": "s"}
+
+                patches = [
+                    patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), flag]),
+                    patch.object(smoke, "dry_effective_config", side_effect=fake_dry),
+                    patch.object(smoke, "build_native_image"),
+                    patch.object(smoke, "generate_fixture_tls"),
+                    patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc),
+                    patch.object(smoke, "allocation_readback", return_value=True),
+                    patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle),
+                    patch.object(mock_lifecycle, "reconcile_child_receipts"),
+                    patch.object(smoke, "BUDGETS", dict(smoke.BUDGETS, up=0.01)),
+                    patch.object(smoke, "startup_state", return_value=True),
+                    patch.object(smoke, "probe_startup", return_value=True),
+                    patch("subprocess.run", return_value=type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()),
+                    patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve),
+                    patch.object(smoke.ResourceRegistry, "remove"),
+                    patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd),
+                ]
+                if helper_to_fail == "run_positive_http_slice":
+                    patches.append(patch.object(smoke, "run_positive_http_slice", side_effect=ValueError("response_contract_failed")))
+                elif helper_to_fail == "run_role_http_slice":
+                    patches.append(patch.object(smoke, "run_positive_http_slice", return_value=dummy_positive))
+                    patches.append(patch.object(smoke, "run_role_http_slice", side_effect=ValueError("role_case_inventory_owner_contract_failed")))
+                elif helper_to_fail == "run_jwt_denial_slice":
+                    patches.append(patch.object(smoke, "run_positive_http_slice", return_value=dummy_positive))
+                    patches.append(patch.object(smoke, "run_role_http_slice", return_value=dummy_role))
+                    patches.append(patch.object(smoke, "run_jwt_denial_slice", side_effect=ValueError("response_contract_failed")))
+
+                import contextlib
+                stdout_buf = io.StringIO()
+                patches.append(patch("sys.stdout", stdout_buf))
+
+                with contextlib.ExitStack() as stack:
+                    for p in patches:
+                        stack.enter_context(p)
+                    ret = smoke.main()
+                self.assertEqual(ret, 1)
+                rep = json.loads(stdout_buf.getvalue().strip())
+                smoke.validate_failure_report(rep)
+                self.assertEqual(rep["phase"], failing_phase)
+                self.assertTrue(rep["cleanup_verified"])
+                art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+                self.assertEqual(rep, art)
+
+    def test_main_cleanup_failure_overrides_primary_phase(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                registry.allocating(item)
+                raise ValueError("bootstrap_contract_rejected")
+
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", return_value=mock_model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()), \
+                 patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts", side_effect=RuntimeError("cleanup_daemon_dead")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "cleanup")
+            self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+            self.assertFalse(rep["cleanup_verified"])
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_main_report_validation_failure_preserves_its_own_phase(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            dummy_summary = {"status": "RBAC_JWT_HTTP_ACCEPTED", "exact_cleanup_verified": True}
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--full-http"]), \
+                 patch.object(smoke, "startup_only", return_value=dummy_summary), \
+                 patch.object(smoke, "validate_summary", side_effect=ValueError("unsafe_summary")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "report_validation")
+            self.assertEqual(rep["error_code"], "unsafe_summary")
+            self.assertTrue(rep["cleanup_verified"])
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_main_secret_bearing_service_error_sanitized(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            secret_leak = "password_super_secret_12345"
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", return_value=mock_model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()), \
+                 patch.object(smoke, "allocate_bootstrap_store", side_effect=ValueError(secret_leak)), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            raw_out = stdout_buf.getvalue()
+            self.assertNotIn(secret_leak, raw_out)
+            rep = json.loads(raw_out.strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["error_code"], "unclassified")
+            self.assertTrue(rep["cleanup_verified"])
+
+    def test_main_replaced_artifact_directory_symlink_refuses_writes(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            # First prepare properly
+            fixture = smoke.prepare(prep_dir)
+            # Now replace artifacts directory with a newly created dir (different inode) or symlink
+            import shutil
+            shutil.rmtree(fixture.artifacts)
+            os.symlink(directory, fixture.artifacts)
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "prepare", return_value=fixture), \
+                 patch.object(smoke, "dry_effective_config", side_effect=ValueError("compose_preflight_failed")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "preflight")
+            # Artifact was NOT written through symlink
+            self.assertFalse((fixture.artifacts / "smoke-failure.json").exists())
+
+    def test_main_artifact_persistence_failure_emits_json_and_omits_artifact(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", side_effect=ValueError("compose_preflight_failed")), \
+                 patch.object(smoke, "durable_json", side_effect=OSError("disk read-only")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "preflight")
+            self.assertFalse((prep_dir / "artifacts" / "smoke-failure.json").exists())
+
+    def test_cleanup_failure_reports_unresolved_not_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = smoke.prepare(Path(directory) / "fixture")
+            # If cleanup failed, cleanup_verified must be false
+            report = smoke.record_failure_report(f, phase="cleanup", exc=ValueError("startup_cleanup_unresolved_evidence_retained"), cleanup_verified=False)
+            self.assertEqual(report["phase"], "cleanup")
+            self.assertFalse(report["cleanup_verified"])
+            self.assertEqual(report["error_code"], "startup_cleanup_unresolved_evidence_retained")
+
+    def test_main_attacker_smoke_diagnostic_attribute_not_printed(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            attacker_secret = "secret_leak_in_smoke_diag_12345"
+            exc = RuntimeError("attacker_controlled")
+            exc._smoke_diagnostic = {"token": attacker_secret, "status": "EXPLOITED"}
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "startup_only", side_effect=exc), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            raw_out = stdout_buf.getvalue()
+            self.assertNotIn(attacker_secret, raw_out)
+            rep = json.loads(raw_out.strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "preflight")
+            self.assertEqual(rep["error_code"], "unclassified")
+
+    def test_main_hostile_getattribute_for_smoke_diagnostic_not_invoked(self):
+        import io
+        class HostileException(RuntimeError):
+            def __getattribute__(self, name):
+                if name == "_smoke_diagnostic":
+                    raise AssertionError("hostile attribute accessed")
+                return super().__getattribute__(name)
+
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "startup_only", side_effect=HostileException("boom")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "preflight")
+
+    def test_main_malformed_failure_diagnostic_fails_closed(self):
+        import io
+        secret_text = "super_secret_token_123"
+        malformed_reports = [
+            # Extra fields
+            {"schema_version": 1, "status": "STARTUP_FAILED", "phase": "preflight",
+             "error_type": "RuntimeError", "error_code": "unclassified",
+             "http_accepted": False, "cleanup_verified": False, "extra_leak": secret_text},
+            # Secret-bearing values
+            {"schema_version": 1, "status": "STARTUP_FAILED", "phase": "preflight",
+             "error_type": "RuntimeError", "error_code": secret_text,
+             "http_accepted": False, "cleanup_verified": False},
+            # False success
+            {"schema_version": 1, "status": "RBAC_JWT_HTTP_ACCEPTED", "phase": "preflight",
+             "error_type": "RuntimeError", "error_code": "unclassified",
+             "http_accepted": True, "cleanup_verified": True},
+        ]
+        for bad_rep in malformed_reports:
+            with tempfile.TemporaryDirectory() as directory:
+                prep_dir = Path(directory) / "fixture"
+                stdout_buf = io.StringIO()
+                diag = smoke.FailureDiagnostic(bad_rep)
+                with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir)]), \
+                     patch.object(smoke, "summary", side_effect=diag), \
+                     patch("sys.stdout", stdout_buf):
+                    ret = smoke.main()
+                self.assertEqual(ret, 1)
+                raw_out = stdout_buf.getvalue()
+                self.assertNotIn(secret_text, raw_out)
+                rep = json.loads(raw_out.strip())
+                smoke.validate_failure_report(rep)
+                self.assertEqual(rep["status"], "STARTUP_FAILED")
+                self.assertFalse(rep["http_accepted"])
+
+    def test_main_custom_report_object_repr_str_not_invoked(self):
+        import io
+        secret_repr = "custom_repr_secret_token_abc"
+        class HostileReport:
+            def __repr__(self):
+                return secret_repr
+            def __str__(self):
+                return secret_repr
+
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            stdout_buf = io.StringIO()
+            diag = smoke.FailureDiagnostic(HostileReport())
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir)]), \
+                 patch.object(smoke, "summary", side_effect=diag), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            raw_out = stdout_buf.getvalue()
+            self.assertNotIn(secret_repr, raw_out)
+            rep = json.loads(raw_out.strip())
+            smoke.validate_failure_report(rep)
+
+    def test_full_http_summary_failure_classified_as_report_validation(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            f = smoke.prepare(prep_dir)
+            model = smoke.dry_effective_config(f)
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            running_state = {"Status": "running", "Running": True, "ExitCode": 0}
+            running_obj = {
+                "Image": "img", "Id": "cid", "State": running_state, "receipt": {"id": "cid"},
+                "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+            }
+            started = [False]
+            def fake_resolve(item):
+                if not started[0]:
+                    return None
+                item["receipt"] = {"id": "cid"}
+                return running_obj
+
+            def fake_subp(*args, **kwargs):
+                started[0] = True
+                return type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+            expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                        for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+
+            def fake_cmd(cmd):
+                if 'psql' in cmd:
+                    if 'SELECT string_agg' in cmd[-1]:
+                        return type('Res', (), {'returncode': 0, 'stdout': expected_schema.encode(), 'stderr': b''})()
+                    if 'profiles_id_fkey' in cmd[-1]:
+                        return type('Res', (), {'returncode': 0, 'stdout': b'1\n', 'stderr': b''})()
+                return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()
+
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--full-http"]), \
+                 patch.object(smoke, "prepare", return_value=f), \
+                 patch.object(smoke, "dry_effective_config", return_value=model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd), \
+                 patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve), \
+                 patch.object(smoke.ResourceRegistry, "remove"), \
+                 patch.object(smoke, "allocate_bootstrap_store"), \
+                 patch.object(smoke, "allocation_readback"), \
+                 patch.object(smoke, "startup_state", return_value=True), \
+                 patch.object(smoke, "probe_startup", return_value=True), \
+                 patch.object(smoke, "run_positive_http_slice", return_value={"admin_inventory_status": 200, "owner_sensor_create_status": 201, "owner_sensor_retry_status": 200, "db_guarantees_verified": True}), \
+                 patch.object(smoke, "run_role_http_slice", return_value={"gateway_id": "gw1", "existing_sensor": "s1", "role_cases": {c["label"]: c["status"] for c in smoke.role_http_cases()}, "role_snapshot_comparisons": 10}), \
+                 patch.object(smoke, "run_jwt_denial_slice", return_value={"jwt_cases": {c["label"]: c["status"] for c in smoke.jwt_http_cases()}, "jwt_snapshot_comparisons": 6}), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
+                 patch("subprocess.run", side_effect=fake_subp), \
+                 patch.object(smoke, "full_http_summary", side_effect=ValueError("cleanup_acceptance_incomplete")), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "report_validation")
+            self.assertEqual(rep["error_code"], "cleanup_acceptance_incomplete")
+            self.assertTrue(rep["cleanup_verified"])
+
+    def test_durable_startup_summary_write_failure_classified_as_report_validation(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            f = smoke.prepare(prep_dir)
+            model = smoke.dry_effective_config(f)
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            running_state = {"Status": "running", "Running": True, "ExitCode": 0}
+            running_obj = {
+                "Image": "img", "Id": "cid", "State": running_state, "receipt": {"id": "cid"},
+                "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+            }
+            started = [False]
+            def fake_resolve(item):
+                if not started[0]:
+                    return None
+                item["receipt"] = {"id": "cid"}
+                return running_obj
+
+            def fake_subp(*args, **kwargs):
+                started[0] = True
+                return type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+            expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                        for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+
+            def fake_cmd(cmd):
+                if 'psql' in cmd:
+                    if 'SELECT string_agg' in cmd[-1]:
+                        return type('Res', (), {'returncode': 0, 'stdout': expected_schema.encode(), 'stderr': b''})()
+                    if 'profiles_id_fkey' in cmd[-1]:
+                        return type('Res', (), {'returncode': 0, 'stdout': b'1\n', 'stderr': b''})()
+                return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()
+
+            real_durable_json = smoke.durable_json
+            def selective_durable_json(path, data):
+                if str(path).endswith("startup-summary.json") and data.get("status") == "STARTUP_VERIFIED_NOT_HTTP_ACCEPTED":
+                    raise OSError("disk_write_error")
+                return real_durable_json(path, data)
+
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "prepare", return_value=f), \
+                 patch.object(smoke, "dry_effective_config", return_value=model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd), \
+                 patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve), \
+                 patch.object(smoke.ResourceRegistry, "remove"), \
+                 patch.object(smoke, "allocate_bootstrap_store"), \
+                 patch.object(smoke, "allocation_readback"), \
+                 patch.object(smoke, "startup_state", return_value=True), \
+                 patch.object(smoke, "probe_startup", return_value=True), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
+                 patch("subprocess.run", side_effect=fake_subp), \
+                 patch.object(smoke, "durable_json", side_effect=selective_durable_json), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "report_validation")
+            self.assertTrue(rep["cleanup_verified"])
+
+    def test_private_diagnostic_write_failure_does_not_suppress_primary_failure(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            real_durable_json = smoke.durable_json
+            def selective_durable_json(path, data):
+                # Fail private startup-failure.json write
+                if str(path).endswith("startup-failure.json"):
+                    raise OSError("private_diagnostic_write_failed")
+                return real_durable_json(path, data)
+
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", return_value=mock_model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()), \
+                 patch.object(smoke, "allocate_bootstrap_store", side_effect=ValueError("bootstrap_contract_rejected")), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts"), \
+                 patch.object(smoke, "durable_json", side_effect=selective_durable_json), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            # Primary controlled phase must be bootstrap, not preflight
+            self.assertEqual(rep["phase"], "bootstrap")
+            self.assertEqual(rep["error_code"], "bootstrap_contract_rejected")
+            self.assertTrue(rep["cleanup_verified"])
+
+    def test_private_diagnostic_write_failure_does_not_suppress_cleanup_failure(self):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            real_durable_json = smoke.durable_json
+            def selective_durable_json(path, data):
+                # Fail cleanup startup-summary.json write
+                if str(path).endswith("startup-summary.json") and data.get("status") == "CLEANUP_UNRESOLVED":
+                    raise OSError("cleanup_summary_write_failed")
+                return real_durable_json(path, data)
+
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.project + "_store", "img1", {})
+                registry.allocating(item)
+                raise ValueError("bootstrap_contract_rejected")
+
+            stdout_buf = io.StringIO()
+            with patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]), \
+                 patch.object(smoke, "dry_effective_config", return_value=mock_model), \
+                 patch.object(smoke, "build_native_image"), \
+                 patch.object(smoke, "generate_fixture_tls"), \
+                 patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()), \
+                 patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc), \
+                 patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle), \
+                 patch.object(mock_lifecycle, "reconcile_child_receipts", side_effect=RuntimeError("cleanup_daemon_dead")), \
+                 patch.object(smoke, "durable_json", side_effect=selective_durable_json), \
+                 patch("sys.stdout", stdout_buf):
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "cleanup")
+            self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+            self.assertFalse(rep["cleanup_verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -511,6 +511,7 @@ jobs:
           docker pull --platform linux/amd64 supabase/gotrue:v2.196.0
           docker pull --platform linux/amd64 envoyproxy/envoy:v1.39.1
       - name: Run Compose smoke
+        id: smoke
         run: |
           # The runner creates private isolated fixtures under SMOKE_PREPARE_DIR,
           # builds its own backend from src/Dockerfile, executes 14 role denials,
@@ -539,4 +540,70 @@ jobs:
         with:
           name: native-compose-smoke-safe-report
           path: /tmp/opencode/native-compose-smoke-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/startup-summary.json
+          if-no-files-found: error
+      - name: Validate smoke failure report
+        id: failure_diagnostic
+        if: always() && steps.smoke.outcome == 'failure'
+        run: |
+          python3 -c '
+          import json, os, sys
+          from pathlib import Path
+          from scripts.tests.native_compose_smoke import validate_failure_report
+
+          source_path = Path(sys.argv[1])
+          staging_path = Path(sys.argv[2])
+          staging_dir = staging_path.parent
+          staging_dir.mkdir(parents=True, exist_ok=True)
+
+          if staging_path.exists() or staging_path.is_symlink():
+              staging_path.unlink()
+
+          if not source_path.exists() and not source_path.is_symlink():
+              print("::warning::Smoke failure report missing; no diagnostic artifact will be uploaded", file=sys.stderr)
+              sys.exit(0)
+
+          if source_path.is_symlink() or not source_path.is_file():
+              sys.exit("invalid failure report: not a regular file")
+
+          try:
+              size = source_path.stat().st_size
+          except Exception:
+              sys.exit("unable to inspect failure report size")
+          if size <= 0 or size > 8192:
+              sys.exit("failure report size out of bounds")
+
+          try:
+              report = json.loads(source_path.read_text(encoding="utf-8"))
+          except Exception:
+              sys.exit("invalid failure report JSON")
+
+          try:
+              validate_failure_report(report)
+          except Exception:
+              sys.exit("failure report validation failed")
+
+          validated_fields = {
+              "schema_version": int(report["schema_version"]),
+              "status": str(report["status"]),
+              "phase": str(report["phase"]),
+              "error_type": str(report["error_type"]),
+              "error_code": str(report["error_code"]),
+              "http_accepted": bool(report["http_accepted"]),
+              "cleanup_verified": bool(report["cleanup_verified"]),
+          }
+          staging_path.write_text(json.dumps(validated_fields, indent=2) + "\n", encoding="utf-8")
+
+          github_output = os.getenv("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a", encoding="utf-8") as f:
+                  f.write("validated=true\n")
+
+          print("Smoke failure diagnostic validated successfully")
+          ' "$SMOKE_PREPARE_DIR/artifacts/smoke-failure.json" "${{ runner.temp }}/smoke-failure-staging/smoke-failure.json"
+      - name: Upload safe failure report
+        if: always() && steps.smoke.outcome == 'failure' && steps.failure_diagnostic.outcome == 'success' && steps.failure_diagnostic.outputs.validated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-compose-smoke-safe-failure-report
+          path: ${{ runner.temp }}/smoke-failure-staging/smoke-failure.json
           if-no-files-found: error

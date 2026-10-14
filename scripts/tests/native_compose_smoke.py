@@ -73,6 +73,8 @@ class Fixture:
     override: Path
     project: str
     values: dict[str, str]
+    artifacts_dev: int = 0
+    artifacts_ino: int = 0
 
 
 def private_write(path, text):
@@ -411,7 +413,9 @@ def prepare(base):
     private_write(override, "".join(stanzas) + template[resource_offset:])
     # Copy only the reviewed broker config, never deployment certificates.
     private_write(private / "mosquitto.conf", (ROOT / "config/mosquitto/mosquitto.conf").read_text())
-    return Fixture(base, private, artifacts, env_file, override, project, values)
+    art_stat = artifacts.stat()
+    return Fixture(base, private, artifacts, env_file, override, project, values,
+                   art_stat.st_dev, art_stat.st_ino)
 
 
 def process_env(fixture):
@@ -616,186 +620,214 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
     if registry is None:
         registry = ResourceRegistry(fixture)
     phase, failure, evidence = 'preflight', None, {}
-    model = dry_effective_config(fixture)
-    # Require all selected runtime images locally before allocation/build.
-    images = {}
-    for name, service in model['services'].items():
-        if name == 'backend':
-            continue
-        result = registry.command(['image', 'inspect', service['image']])
-        if result.returncode:
-            raise ValueError('local_image_unavailable')
-        images[name] = json.loads(result.stdout)[0]['Id']
-    build_native_image(fixture, prevalidated=True)
-    result = registry.command(['image', 'inspect', fixture.project + '-backend'])
-    if result.returncode:
-        raise ValueError('backend_build_image_unresolved')
-    images['backend'] = json.loads(result.stdout)[0]['Id']
     containers = {}
-    with lifecycle.cancellation_scope() as state:
-        try:
-            phase = 'bootstrap'
-            generate_fixture_tls(fixture)
-            volume = allocate_bootstrap_store(fixture, registry, lifecycle)
-            with lifecycle.defer_cancellation():
-                allocation_readback(fixture, registry, volume)
-            state.checkpoint()
-            # All intents precede Compose allocation (including implicit resources).
-            for kind, definitions in (('network', model['networks']), ('volume', model['volumes'])):
-                for role, resource in definitions.items():
-                    if resource.get('external'):
-                        continue
-                    labels = dict(resource['labels'])
-                    labels['com.docker.compose.project'] = fixture.project
-                    labels['com.docker.compose.' + kind] = role
-                    item = registry.intent(kind, resource['name'], None, labels)
+    images = {}
+    cleanup_verified = False
+
+    try:
+        phase = 'preflight'
+        model = dry_effective_config(fixture)
+        for name, service in model['services'].items():
+            if name == 'backend':
+                continue
+            result = registry.command(['image', 'inspect', service['image']])
+            if result.returncode:
+                raise ValueError('local_image_unavailable')
+            images[name] = json.loads(result.stdout)[0]['Id']
+        phase = 'build'
+        build_native_image(fixture, prevalidated=True)
+        result = registry.command(['image', 'inspect', fixture.project + '-backend'])
+        if result.returncode:
+            raise ValueError('backend_build_image_unresolved')
+        images['backend'] = json.loads(result.stdout)[0]['Id']
+
+        with lifecycle.cancellation_scope() as state:
+            try:
+                phase = 'bootstrap'
+                generate_fixture_tls(fixture)
+                volume = allocate_bootstrap_store(fixture, registry, lifecycle)
+                with lifecycle.defer_cancellation():
+                    allocation_readback(fixture, registry, volume)
+                state.checkpoint()
+                # All intents precede Compose allocation (including implicit resources).
+                for kind, definitions in (('network', model['networks']), ('volume', model['volumes'])):
+                    for role, resource in definitions.items():
+                        if resource.get('external'):
+                            continue
+                        labels = dict(resource['labels'])
+                        labels['com.docker.compose.project'] = fixture.project
+                        labels['com.docker.compose.' + kind] = role
+                        item = registry.intent(kind, resource['name'], None, labels)
+                        if registry.resolve(item) is not None:
+                            raise ValueError('resource_collision')
+                for name, service in model['services'].items():
+                    image_config = json.loads(registry.command(['image', 'inspect', images[name]]).stdout)[0]['Config']
+                    labels = dict(service['labels'])
+                    labels.update({'com.docker.compose.project': fixture.project, 'com.docker.compose.service': name,
+                                   'com.docker.compose.oneoff': 'False', 'com.docker.compose.container-number': '1'})
+                    item = registry.intent('container', fixture.project + '-' + name + '-1', images[name], labels)
+                    mounts = [(m['target'], m['type'], model['volumes'][m['source']]['name'] if m['type'] == 'volume' else m['source'], not m.get('read_only', False)) for m in service.get('volumes', [])]
+                    tmpfs = dict(t.split(':', 1) for t in service.get('tmpfs', []))
+                    item['expectation'] = {'mounts': mounts, 'tmpfs': tmpfs, 'user': service.get('user', image_config.get('User', '')),
+                        'readonly': service.get('read_only', False), 'cap_drop': service.get('cap_drop', []),
+                        'security_opt': service.get('security_opt', []), 'network': fixture.project + '_iot_net'}
+                    registry.save(item)
                     if registry.resolve(item) is not None:
                         raise ValueError('resource_collision')
-            for name, service in model['services'].items():
-                image_config = json.loads(registry.command(['image', 'inspect', images[name]]).stdout)[0]['Config']
-                labels = dict(service['labels'])
-                labels.update({'com.docker.compose.project': fixture.project, 'com.docker.compose.service': name,
-                               'com.docker.compose.oneoff': 'False', 'com.docker.compose.container-number': '1'})
-                item = registry.intent('container', fixture.project + '-' + name + '-1', images[name], labels)
-                mounts = [(m['target'], m['type'], model['volumes'][m['source']]['name'] if m['type'] == 'volume' else m['source'], not m.get('read_only', False)) for m in service.get('volumes', [])]
-                tmpfs = dict(t.split(':', 1) for t in service.get('tmpfs', []))
-                item['expectation'] = {'mounts': mounts, 'tmpfs': tmpfs, 'user': service.get('user', image_config.get('User', '')),
-                    'readonly': service.get('read_only', False), 'cap_drop': service.get('cap_drop', []),
-                    'security_opt': service.get('security_opt', []), 'network': fixture.project + '_iot_net'}
-                registry.save(item)
-                if registry.resolve(item) is not None:
-                    raise ValueError('resource_collision')
-                containers[name] = item
-            # Image-declared VOLUMEs must all be accounted for before create/up.
-            for name, item in containers.items():
-                img = json.loads(registry.command(['image', 'inspect', images[name]]).stdout)[0]
-                covered = {m[0] for m in item['expectation']['mounts']} | set(item['expectation']['tmpfs'])
-                if set(img.get('Config', {}).get('Volumes') or {}) - covered:
-                    raise ValueError('anonymous_volume_prevention_failed')
-            for name in SERVICES:
-                phase = name
-                state.checkpoint()
-                for item in registry.items:
-                    if item['kind'] != 'container' or item is containers[name]:
-                        registry.allocating(item)
-                command = compose_command(fixture, 'config')[:-3] + ['up', '--detach', '--no-deps', '--no-build', '--pull', 'never', name]
-                # config prefix ends in config --format json.
-                try:
-                    result = subprocess.run(command, capture_output=True, timeout=BUDGETS['up'], env=process_env(fixture), check=False)
-                except (OSError, subprocess.TimeoutExpired):
-                    raise ValueError('compose_phase_unresolved') from None
-                # Even a lost/nonzero reply is reconciled by the predeclared exact names.
-                for item in registry.items:
-                    if item['allocation_attempted']:
-                        registry.resolve(item)
-                if result.returncode:
-                    raise ValueError('compose_phase_failed')
-                deadline = time.monotonic() + BUDGETS['up']
-                while True:
+                    containers[name] = item
+                # Image-declared VOLUMEs must all be accounted for before create/up.
+                for name, item in containers.items():
+                    img = json.loads(registry.command(['image', 'inspect', images[name]]).stdout)[0]
+                    covered = {m[0] for m in item['expectation']['mounts']} | set(item['expectation']['tmpfs'])
+                    if set(img.get('Config', {}).get('Volumes') or {}) - covered:
+                        raise ValueError('anonymous_volume_prevention_failed')
+                for name in SERVICES:
+                    phase = name
                     state.checkpoint()
-                    obj = registry.resolve(containers[name])
-                    if obj is None:
-                        raise ValueError('phase_container_absent')
-                    ready = startup_state(name, obj['State']) if name in JOBS or name in ('postgres', 'supabase-auth', 'backend') else probe_startup(registry, name, obj)
-                    if ready:
-                        evidence[name] = {'image_id': obj['Image'], 'id': obj['Id'], 'exit': obj['State'].get('ExitCode'), 'health': obj['State'].get('Health', {}).get('Status', 'probe_ready')}
-                        break
-                    if time.monotonic() >= deadline:
-                        raise ValueError('phase_health_timeout')
-                    time.sleep(1)
-                if name == 'application-migrations':
-                    sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations"
-                    result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
-                    expected = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql') for p in sorted((ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
-                    if result.returncode or result.stdout.decode().strip() != expected or not expected.endswith('19:mqtt_simplified_journal'):
-                        raise ValueError('schema19_exact_rejected')
-                    evidence['schema19'] = True
-                if name == 'supabase-compat-migration':
-                    # Root psql command lacks ON_ERROR_STOP; exit0 alone cannot
-                    # prove that its FK statements actually took effect.
-                    sql = "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey' AND conrelid = 'public.profiles'::regclass AND confrelid = 'auth.users'::regclass AND contype = 'f'"
-                    result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
-                    if result.returncode or result.stdout.strip() != b'1':
-                        raise ValueError('compat_constraints_rejected')
-                durable_json(fixture.private / 'startup-progress.json', {'phase': phase, 'evidence': evidence})
-            obj = registry.resolve(containers['nginx'])
-            ports = obj['NetworkSettings']['Ports'].get('80/tcp') or []
-            if len(ports) != 1 or ports[0]['HostIp'] != '127.0.0.1' or not 0 < int(ports[0]['HostPort']) < 65536:
-                raise ValueError('mapped_endpoint_rejected')
-            endpoint = 'http://127.0.0.1:' + ports[0]['HostPort']
-            evidence['endpoint'] = endpoint
-            if positive_http or role_http or full_http:
-                phase = 'positive_http'
-                state.checkpoint()
-                http_evidence = run_positive_http_slice(fixture, registry, endpoint, containers['postgres']['receipt']['id'])
-                evidence['positive_http'] = http_evidence
-                if role_http or full_http:
-                    phase = 'role_http'
-                    evidence['role_http'] = run_role_http_slice(fixture, registry, endpoint, containers['postgres']['receipt']['id'])
-                if full_http:
-                    phase = 'jwt_http'
-                    role_evidence = evidence['role_http']
-                    evidence['jwt_http'] = run_jwt_denial_slice(
-                        fixture, registry, endpoint, containers['postgres']['receipt']['id'],
-                        role_evidence['gateway_id'], role_evidence['existing_sensor'])
-                durable_json(fixture.private / 'positive-http-progress.json', {'phase': phase, 'evidence': evidence})
-        except BaseException as exc:
-            failure = exc
-            code = str(exc)
-            durable_json(fixture.private / 'startup-failure.json', {
-                'phase': phase, 'error_type': type(exc).__name__,
-                'error_code': code if re.fullmatch(r'[a-z0-9_]+', code) else 'unclassified'})
-            if phase in containers and containers[phase]['allocation_attempted']:
+                    for item in registry.items:
+                        if item['kind'] != 'container' or item is containers[name]:
+                            registry.allocating(item)
+                    command = compose_command(fixture, 'config')[:-3] + ['up', '--detach', '--no-deps', '--no-build', '--pull', 'never', name]
+                    # config prefix ends in config --format json.
+                    try:
+                        result = subprocess.run(command, capture_output=True, timeout=BUDGETS['up'], env=process_env(fixture), check=False)
+                    except (OSError, subprocess.TimeoutExpired):
+                        raise ValueError('compose_phase_unresolved') from None
+                    # Even a lost/nonzero reply is reconciled by the predeclared exact names.
+                    for item in registry.items:
+                        if item['allocation_attempted']:
+                            registry.resolve(item)
+                    if result.returncode:
+                        raise ValueError('compose_phase_failed')
+                    deadline = time.monotonic() + BUDGETS['up']
+                    while True:
+                        state.checkpoint()
+                        obj = registry.resolve(containers[name])
+                        if obj is None:
+                            raise ValueError('phase_container_absent')
+                        ready = startup_state(name, obj['State']) if name in JOBS or name in ('postgres', 'supabase-auth', 'backend') else probe_startup(registry, name, obj)
+                        if ready:
+                            evidence[name] = {'image_id': obj['Image'], 'id': obj['Id'], 'exit': obj['State'].get('ExitCode'), 'health': obj['State'].get('Health', {}).get('Status', 'probe_ready')}
+                            break
+                        if time.monotonic() >= deadline:
+                            raise ValueError('phase_health_timeout')
+                        time.sleep(1)
+                    if name == 'application-migrations':
+                        sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations"
+                        result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
+                        expected = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql') for p in sorted((ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+                        if result.returncode or result.stdout.decode().strip() != expected or not expected.endswith('19:mqtt_simplified_journal'):
+                            raise ValueError('schema19_exact_rejected')
+                        evidence['schema19'] = True
+                    if name == 'supabase-compat-migration':
+                        # Root psql command lacks ON_ERROR_STOP; exit0 alone cannot
+                        # prove that its FK statements actually took effect.
+                        sql = "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey' AND conrelid = 'public.profiles'::regclass AND confrelid = 'auth.users'::regclass AND contype = 'f'"
+                        result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
+                        if result.returncode or result.stdout.strip() != b'1':
+                            raise ValueError('compat_constraints_rejected')
+                    durable_json(fixture.private / 'startup-progress.json', {'phase': phase, 'evidence': evidence})
+                obj = registry.resolve(containers['nginx'])
+                ports = obj['NetworkSettings']['Ports'].get('80/tcp') or []
+                if len(ports) != 1 or ports[0]['HostIp'] != '127.0.0.1' or not 0 < int(ports[0]['HostPort']) < 65536:
+                    raise ValueError('mapped_endpoint_rejected')
+                endpoint = 'http://127.0.0.1:' + ports[0]['HostPort']
+                evidence['endpoint'] = endpoint
+                if positive_http or role_http or full_http:
+                    phase = 'positive_http'
+                    state.checkpoint()
+                    http_evidence = run_positive_http_slice(fixture, registry, endpoint, containers['postgres']['receipt']['id'])
+                    evidence['positive_http'] = http_evidence
+                    if role_http or full_http:
+                        phase = 'role_http'
+                        evidence['role_http'] = run_role_http_slice(fixture, registry, endpoint, containers['postgres']['receipt']['id'])
+                    if full_http:
+                        phase = 'jwt_http'
+                        role_evidence = evidence['role_http']
+                        evidence['jwt_http'] = run_jwt_denial_slice(
+                            fixture, registry, endpoint, containers['postgres']['receipt']['id'],
+                            role_evidence['gateway_id'], role_evidence['existing_sensor'])
+                    durable_json(fixture.private / 'positive-http-progress.json', {'phase': phase, 'evidence': evidence})
+            except BaseException as exc:
+                failure = exc
+                code = sanitize_failure_code(exc)
                 try:
-                    obj = registry.resolve(containers[phase])
-                    if obj:
-                        durable_json(fixture.private / 'failed-phase-state.json', obj['State'])
-                        log = registry.command(['logs', '--tail', '30', obj['Id']])
-                        durable_json(fixture.private / 'failed-phase-private-log.json', {
-                            'stdout': log.stdout.decode(errors='replace'), 'stderr': log.stderr.decode(errors='replace')})
+                    durable_json(fixture.private / 'startup-failure.json', {
+                        'phase': phase, 'error_type': sanitize_failure_type(exc),
+                        'error_code': code})
+                    if phase in containers and containers[phase]['allocation_attempted']:
+                        obj = registry.resolve(containers[phase])
+                        if obj:
+                            durable_json(fixture.private / 'failed-phase-state.json', obj['State'])
+                            log = registry.command(['logs', '--tail', '30', obj['Id']])
+                            durable_json(fixture.private / 'failed-phase-private-log.json', {
+                                'stdout': log.stdout.decode(errors='replace'), 'stderr': log.stderr.decode(errors='replace')})
                 except Exception:
                     pass
-        finally:
-            state.unwinding = True
-            try:
-                if isinstance(failure, lifecycle.IncompleteCleanup):
-                    raise ValueError('child_cleanup_unresolved')
-                if registry.items:
-                    lifecycle.reconcile_child_receipts(fixture.private, registry.items[0]['name'], registry.items[0]['labels'])
-                # Consumers first, then infrastructure, then inputs. No down/prune.
-                ordered = sorted(reversed(registry.items), key=lambda i: {'container': 0, 'network': 1, 'volume': 2}[i['kind']])
-                cleanup_deadline = time.monotonic() + BUDGETS['cleanup'] * 2
-                for item in ordered:
-                    if time.monotonic() >= cleanup_deadline:
-                        raise ValueError('startup_cleanup_deadline')
-                    if item['allocation_attempted']:
-                        registry.remove(item)
-            except Exception:
-                durable_json(fixture.artifacts / 'startup-summary.json', {'status': 'CLEANUP_UNRESOLVED', 'phase': phase, 'http_accepted': False})
-                raise ValueError('startup_cleanup_unresolved_evidence_retained') from None
-            if state.signum is not None:
-                failure = lifecycle.RunnerInterrupted(state.signum)
+            finally:
+                state.unwinding = True
+                try:
+                    if isinstance(failure, lifecycle.IncompleteCleanup):
+                        raise ValueError('child_cleanup_unresolved')
+                    if registry.items:
+                        lifecycle.reconcile_child_receipts(fixture.private, registry.items[0]['name'], registry.items[0]['labels'])
+                    # Consumers first, then infrastructure, then inputs. No down/prune.
+                    ordered = sorted(reversed(registry.items), key=lambda i: {'container': 0, 'network': 1, 'volume': 2}[i['kind']])
+                    cleanup_deadline = time.monotonic() + BUDGETS['cleanup'] * 2
+                    for item in ordered:
+                        if time.monotonic() >= cleanup_deadline:
+                            raise ValueError('startup_cleanup_deadline')
+                        if item['allocation_attempted']:
+                            registry.remove(item)
+                    cleanup_verified = True
+                except Exception as cl_exc:
+                    cleanup_verified = False
+                    try:
+                        durable_json(fixture.artifacts / 'startup-summary.json', {'status': 'CLEANUP_UNRESOLVED', 'phase': phase, 'http_accepted': False})
+                    except Exception:
+                        pass
+                    cleanup_failure = ValueError('startup_cleanup_unresolved_evidence_retained')
+                    fail_report = record_failure_report(fixture, phase="cleanup", exc=cleanup_failure, cleanup_verified=False)
+                    raise FailureDiagnostic(fail_report, cause=cleanup_failure) from cl_exc
+                if state.signum is not None:
+                    failure = lifecycle.RunnerInterrupted(state.signum)
+    except FailureDiagnostic:
+        raise
+    except BaseException as exc:
+        failure = exc
+
     cleanup_counts = {k: sum(i['kind'] == k and i.get('removed', False) for i in registry.items) for k in ('container', 'network', 'volume')}
-    if full_http and not failure:
-        report = full_http_summary(fixture, evidence, cleanup_counts)
-        report['backend_image_id'] = images['backend']
-        report['phase'] = phase
-    elif role_http and not failure:
-        report = role_http_summary(fixture, evidence, cleanup_counts)
-        report['backend_image_id'] = images['backend']
-        report['phase'] = phase
-    elif positive_http and not failure:
-        report = positive_summary(fixture, evidence=evidence, cleanup_counts=cleanup_counts)
-        report['backend_image_id'] = images['backend']
-        report['phase'] = phase
-    else:
-        report = {'status': 'STARTUP_FAILED' if failure else 'STARTUP_VERIFIED_NOT_HTTP_ACCEPTED', 'phase': phase,
-                  'http_accepted': False, 'exact_cleanup_verified': True, 'evidence': evidence, 'backend_image_id': images['backend'],
-                  'cleanup_counts': cleanup_counts}
-    durable_json(fixture.artifacts / 'startup-summary.json', report)
     if failure:
-        raise failure
-    return report
+        fail_report = record_failure_report(fixture, phase=phase, exc=failure, cleanup_verified=cleanup_verified)
+        raise FailureDiagnostic(fail_report, cause=failure) from failure
+
+    try:
+        if full_http:
+            report = full_http_summary(fixture, evidence, cleanup_counts)
+            report['backend_image_id'] = images['backend']
+            report['phase'] = phase
+        elif role_http:
+            report = role_http_summary(fixture, evidence, cleanup_counts)
+            report['backend_image_id'] = images['backend']
+            report['phase'] = phase
+        elif positive_http:
+            report = positive_summary(fixture, evidence=evidence, cleanup_counts=cleanup_counts)
+            report['backend_image_id'] = images['backend']
+            report['phase'] = phase
+        else:
+            report = {'status': 'STARTUP_VERIFIED_NOT_HTTP_ACCEPTED', 'phase': phase,
+                      'http_accepted': False, 'exact_cleanup_verified': True, 'evidence': evidence, 'backend_image_id': images['backend'],
+                      'cleanup_counts': cleanup_counts}
+        durable_json(fixture.artifacts / 'startup-summary.json', report)
+        return report
+    except BaseException as exc:
+        fail_report = record_failure_report(
+            fixture,
+            phase="report_validation",
+            exc=exc,
+            cleanup_verified=cleanup_verified,
+        )
+        raise FailureDiagnostic(fail_report, cause=exc) from exc
 
 
 def probe_startup(registry, name, obj):
@@ -982,8 +1014,238 @@ def summary(fixture):
 
 def assert_safe_data(data):
     dumped = json.dumps(data)
-    if re.search(r"password|credential|secret|token|hash|jwt", dumped, re.I):
+    if re.search(r"password|credential|secret|token|hash|\bjwt\b", dumped, re.I):
         raise ValueError("secret_response_rejected")
+
+
+ALLOWED_FAILURE_STATUSES = {"STARTUP_FAILED"}
+ALLOWED_FAILURE_PHASES = {
+    "prepare", "preflight", "build", "bootstrap",
+    *SERVICES,
+    "positive_http", "role_http", "jwt_http",
+    "cleanup", "report_validation"
+}
+ALLOWED_FAILURE_ERROR_TYPES = {
+    "ValueError", "RuntimeError", "OSError", "TimeoutExpired",
+    "RunnerInterrupted", "IncompleteCleanup", "Exception"
+}
+ALLOWED_FAILURE_ERROR_CODES = {
+    "unsafe_fixture_path", "compose_override_version_unsupported",
+    "unsupported_compose_action", "missing_interpolation",
+    "compose_preflight_failed", "effective_json_rejected",
+    "effective_services_rejected", "effective_isolation_rejected",
+    "effective_image_rejected", "effective_dependencies_rejected",
+    "effective_ports_rejected", "effective_mounts_rejected",
+    "effective_build_rejected", "effective_security_rejected",
+    "effective_rootfs_rejected", "effective_migrations_rejected",
+    "effective_resources_rejected", "effective_names_rejected",
+    "effective_bootstrap_volume_rejected", "effective_labels_rejected",
+    "effective_network_rejected",
+    "local_image_unavailable", "backend_build_image_unresolved",
+    "native_dockerfile_build_blocked", "native_build_unresolved",
+    "fixture_tls_failed", "bootstrap_contract_rejected",
+    "bootstrap_nonce_rejected", "store_permissions_rejected",
+    "store_metadata_rejected", "readback_mounts_rejected",
+    "helper_collision", "helper_allocation_unresolved",
+    "helper_receipt_rejected", "allocation_readback_failed",
+    "allocation_child_unresolved_evidence_retained",
+    "allocation_cleanup_deadline", "allocation_cleanup_unresolved_evidence_retained",
+    "resource_collision", "resource_intent_rejected",
+    "resource_inspect_unresolved", "resource_ownership_refused",
+    "resource_replacement_refused", "helper_mount_replacement_refused",
+    "resource_cleanup_unresolved", "anonymous_volume_prevention_failed",
+    "compose_phase_unresolved", "compose_phase_failed",
+    "phase_container_absent", "phase_health_timeout",
+    "health_failed", "migration_nonzero",
+    "runtime_receipt_rejected", "schema19_exact_rejected",
+    "compat_constraints_rejected", "mapped_endpoint_rejected",
+    "admin_user_creation_failed", "admin_user_uuid_invalid",
+    "login_failed", "token_format_invalid",
+    "token_claims_decode_failed", "token_claims_mismatch",
+    "db_variable_invalid", "db_psql_execution_failed",
+    "denial_mutated_database", "admin_inventory_row_mismatch",
+    "sensor_create_body_mismatch", "sensor_create_entity_mismatch",
+    "sensor_retry_body_mismatch", "db_sensor_row_count_mismatch",
+    "db_twin_entity_count_mismatch", "db_twin_relationship_count_mismatch",
+    "positive_acceptance_incomplete", "role_acceptance_incomplete",
+    "jwt_acceptance_incomplete", "cleanup_acceptance_incomplete",
+    "response_contract_failed", "inventory_contract_failed",
+    "sensor_contract_failed", "secret_response_rejected",
+    "role_case_inventory_owner_contract_failed",
+    "role_case_inventory_operator_contract_failed",
+    "role_case_inventory_viewer_contract_failed",
+    "role_case_inventory_nonmember_contract_failed",
+    "role_case_operator_sensor_new_contract_failed",
+    "role_case_operator_sensor_existing_contract_failed",
+    "role_case_viewer_sensor_new_contract_failed",
+    "role_case_viewer_sensor_existing_contract_failed",
+    "role_case_nonmember_sensor_new_contract_failed",
+    "role_case_nonmember_sensor_existing_contract_failed",
+    "role_case_cross_gateway_owner_sensor_new_contract_failed",
+    "role_case_cross_gateway_owner_sensor_existing_contract_failed",
+    "role_case_platform_admin_without_membership_sensor_new_contract_failed",
+    "role_case_platform_admin_without_membership_sensor_existing_contract_failed",
+    "child_cleanup_unresolved", "startup_cleanup_deadline",
+    "startup_cleanup_unresolved_evidence_retained",
+    "runner_interrupted", "cleanup_veto",
+    "invalid_receipt", "ownership_refused",
+    "envoy_probe_unresolved", "envoy_probe_inspect_failed",
+    "envoy_probe_collision_or_unknown", "envoy_probe_allocation_unresolved",
+    "envoy_probe_ownership_refused", "envoy_probe_exit_unresolved",
+    "envoy_probe_replacement_refused", "envoy_probe_cleanup_failed",
+    "envoy_probe_cleanup_unresolved", "native_execution_deferred",
+    "http_body_too_large", "unsafe_summary", "unsafe_failure_report", "unclassified"
+}
+
+FALLBACK_FAILURE_DIAGNOSTIC = {
+    "schema_version": 1,
+    "status": "STARTUP_FAILED",
+    "phase": "preflight",
+    "error_type": "ValueError",
+    "error_code": "unsafe_failure_report",
+    "http_accepted": False,
+    "cleanup_verified": False,
+}
+
+
+class FailureDiagnostic(ValueError):
+    def __init__(self, report: dict, cause: BaseException | None = None):
+        if type(report) is dict:
+            code = report.get("error_code", "unclassified")
+            clean_code = code if type(code) is str and code in ALLOWED_FAILURE_ERROR_CODES else "unclassified"
+            self.report = dict(report)
+        else:
+            clean_code = "unclassified"
+            self.report = {}
+        super().__init__(clean_code)
+        self.cause = cause
+
+
+def _trusted_exception_types() -> dict[type, str]:
+    types = {
+        ValueError: "ValueError",
+        RuntimeError: "RuntimeError",
+        OSError: "OSError",
+        subprocess.TimeoutExpired: "TimeoutExpired",
+    }
+    try:
+        lifecycle = bootstrap_lifecycle()
+        types[lifecycle.RunnerInterrupted] = "RunnerInterrupted"
+        types[lifecycle.IncompleteCleanup] = "IncompleteCleanup"
+    except Exception:
+        pass
+    return types
+
+
+def sanitize_failure_type(exc: BaseException) -> str:
+    trusted = _trusted_exception_types()
+    return trusted.get(type(exc), "Exception")
+
+
+def sanitize_failure_code(exc: BaseException) -> str:
+    exc_type = type(exc)
+    if exc_type is ValueError or exc_type is RuntimeError or exc_type is OSError:
+        args = getattr(exc, "args", ())
+        if args and type(args[0]) is str:
+            raw_msg = args[0]
+            if raw_msg in ALLOWED_FAILURE_ERROR_CODES:
+                return raw_msg
+            if raw_msg.startswith("http_request_failed:"):
+                return "response_contract_failed"
+        return "unclassified"
+    try:
+        lifecycle = bootstrap_lifecycle()
+        if exc_type is lifecycle.RunnerInterrupted:
+            return "runner_interrupted"
+        if exc_type is lifecycle.IncompleteCleanup:
+            return "child_cleanup_unresolved"
+    except Exception:
+        pass
+    return "unclassified"
+
+
+def is_fixture_verified(fixture) -> bool:
+    try:
+        if fixture is None:
+            return False
+        base = fixture.base
+        if not base.exists() or base.is_symlink() or not base.is_dir():
+            return False
+        if any(p.is_symlink() for p in (base, *base.parents)):
+            return False
+        private, artifacts = fixture.private, fixture.artifacts
+        if not private.exists() or private.is_symlink() or not private.is_dir():
+            return False
+        if not artifacts.exists() or artifacts.is_symlink() or not artifacts.is_dir():
+            return False
+        if not fixture.override.exists() or fixture.override.is_symlink():
+            return False
+        if not fixture.env_file.exists() or fixture.env_file.is_symlink():
+            return False
+        if getattr(fixture, "artifacts_dev", 0) and getattr(fixture, "artifacts_ino", 0):
+            st = artifacts.stat()
+            if st.st_dev != fixture.artifacts_dev or st.st_ino != fixture.artifacts_ino:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def validate_failure_report(report: dict) -> None:
+    if type(report) is not dict:
+        raise ValueError("unsafe_failure_report")
+    required_keys = {"schema_version", "status", "phase", "error_type", "error_code",
+                     "http_accepted", "cleanup_verified"}
+    if set(report.keys()) != required_keys:
+        raise ValueError("unsafe_failure_report")
+    schema_ver = report.get("schema_version")
+    if type(schema_ver) is not int or schema_ver != 1:
+        raise ValueError("unsafe_failure_report")
+    for key in ("status", "phase", "error_type", "error_code"):
+        val = report.get(key)
+        if type(val) is not str:
+            raise ValueError("unsafe_failure_report")
+    if report.get("status") not in ALLOWED_FAILURE_STATUSES:
+        raise ValueError("unsafe_failure_report")
+    if report.get("phase") not in ALLOWED_FAILURE_PHASES:
+        raise ValueError("unsafe_failure_report")
+    if report.get("error_type") not in ALLOWED_FAILURE_ERROR_TYPES:
+        raise ValueError("unsafe_failure_report")
+    if report.get("error_code") not in ALLOWED_FAILURE_ERROR_CODES:
+        raise ValueError("unsafe_failure_report")
+    if type(report.get("http_accepted")) is not bool or report.get("http_accepted") is not False:
+        raise ValueError("unsafe_failure_report")
+    if type(report.get("cleanup_verified")) is not bool:
+        raise ValueError("unsafe_failure_report")
+    assert_safe_data(report)
+
+
+def sanitize_failure_phase(phase: str, code: str = "") -> str:
+    if type(phase) is str and phase in ALLOWED_FAILURE_PHASES:
+        return phase
+    return "preflight"
+
+
+def record_failure_report(fixture, phase: str, exc: BaseException, cleanup_verified: bool = False) -> dict:
+    safe_code = sanitize_failure_code(exc)
+    safe_phase = sanitize_failure_phase(phase, safe_code)
+    safe_type = sanitize_failure_type(exc)
+    report = {
+        "schema_version": 1,
+        "status": "STARTUP_FAILED",
+        "phase": safe_phase,
+        "error_type": safe_type,
+        "error_code": safe_code,
+        "http_accepted": False,
+        "cleanup_verified": True if cleanup_verified is True else False,
+    }
+    validate_failure_report(report)
+    if is_fixture_verified(fixture):
+        try:
+            durable_json(fixture.artifacts / "smoke-failure.json", report)
+        except Exception:
+            pass
+    return report
 
 
 def positive_summary(fixture, evidence=None, cleanup_counts=None):
@@ -1499,41 +1761,91 @@ def main():
     parser.add_argument('--role-http-only', action='store_true', help='Phased startup, positive slice, and bounded role denials; JWT acceptance remains false')
     parser.add_argument('--full-http', action='store_true', help='Phased startup, positive proofs, role and JWT denials, and exact cleanup acceptance')
     args = parser.parse_args()
-    fixture = prepare(args.prepare)
-    if args.startup_only:
+    fixture = None
+    try:
+        fixture = prepare(args.prepare)
+    except BaseException as exc:
+        report = {
+            "schema_version": 1,
+            "status": "STARTUP_FAILED",
+            "phase": "prepare",
+            "error_type": sanitize_failure_type(exc),
+            "error_code": sanitize_failure_code(exc),
+            "http_accepted": False,
+            "cleanup_verified": False,
+        }
         try:
-            print(json.dumps(startup_only(fixture)))
+            validate_failure_report(report)
+            payload = json.dumps(report)
         except BaseException:
-            print(json.dumps({'status': 'STARTUP_NOT_ACCEPTED', 'http_accepted': False, 'evidence_retained': True}))
-            return 1
-        return 0
-    if args.positive_http_only:
-        try:
-            print(json.dumps(startup_only(fixture, positive_http=True)))
-        except BaseException:
-            print(json.dumps({'status': 'POSITIVE_HTTP_NOT_ACCEPTED', 'http_accepted': False, 'evidence_retained': True}))
-            return 1
-        return 0
-    if args.role_http_only:
-        try:
-            print(json.dumps(startup_only(fixture, role_http=True)))
-        except BaseException:
-            print(json.dumps({'status': 'ROLE_HTTP_NOT_VERIFIED', 'http_accepted': False, 'evidence_retained': True}))
-            return 1
-        return 0
-    if args.full_http:
-        try:
-            report = startup_only(fixture, full_http=True)
-            validate_summary(report)
+            payload = json.dumps(FALLBACK_FAILURE_DIAGNOSTIC)
+        print(payload)
+        return 1
+
+    try:
+        if args.startup_only:
+            report = startup_only(fixture)
             print(json.dumps(report))
+            return 0
+        if args.positive_http_only:
+            report = startup_only(fixture, positive_http=True)
+            print(json.dumps(report))
+            return 0
+        if args.role_http_only:
+            report = startup_only(fixture, role_http=True)
+            print(json.dumps(report))
+            return 0
+        if args.full_http:
+            report = startup_only(fixture, full_http=True)
+            try:
+                validate_summary(report)
+            except BaseException as exc:
+                fail_report = record_failure_report(
+                    fixture,
+                    phase="report_validation",
+                    exc=exc,
+                    cleanup_verified=report.get("exact_cleanup_verified") is True,
+                )
+                raise FailureDiagnostic(fail_report, cause=exc) from exc
+            print(json.dumps(report))
+            return 0
+
+        # Default prepare-only run
+        try:
+            report = summary(fixture)
+            validate_summary(report)
+            private_write(fixture.artifacts / "summary.json", json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report))
+            return 0
+        except BaseException as exc:
+            fail_report = record_failure_report(fixture, phase="report_validation", exc=exc, cleanup_verified=False)
+            raise FailureDiagnostic(fail_report, cause=exc) from exc
+    except FailureDiagnostic as diag:
+        out = None
+        try:
+            rep = getattr(diag, "report", None)
+            if type(rep) is dict:
+                validate_failure_report(rep)
+                out = json.dumps(rep)
         except BaseException:
-            print(json.dumps({'status': 'FULL_HTTP_NOT_ACCEPTED', 'http_accepted': False, 'evidence_retained': True}))
-            return 1
-        return 0
-    report = summary(fixture)
-    validate_summary(report)
-    private_write(fixture.artifacts / "summary.json", json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report))
+            out = None
+        if out is None:
+            out = json.dumps(FALLBACK_FAILURE_DIAGNOSTIC)
+        print(out)
+        return 1
+    except BaseException as exc:
+        out = None
+        try:
+            fail_report = record_failure_report(fixture, phase="preflight", exc=exc, cleanup_verified=False)
+            if type(fail_report) is dict:
+                validate_failure_report(fail_report)
+                out = json.dumps(fail_report)
+        except BaseException:
+            out = None
+        if out is None:
+            out = json.dumps(FALLBACK_FAILURE_DIAGNOSTIC)
+        print(out)
+        return 1
 
 
 if __name__ == "__main__":
