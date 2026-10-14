@@ -15,6 +15,17 @@ import textwrap
 import unittest
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.tests.native_compose_smoke import (
+    PENDING,
+    SERVICES,
+    jwt_http_cases,
+    role_http_cases,
+)
+
 WORKFLOW_PATH = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 
 
@@ -246,7 +257,112 @@ class TestCISmokeJobs(unittest.TestCase):
             "error_code": "local_image_unavailable",
             "http_accepted": False,
             "cleanup_verified": False,
+            "primary_phase": None,
+            "primary_error_code": None,
+            "cleanup_step": None,
+            "cleanup_error_code": None,
+            "resource_kind": None,
         }
+
+    def _valid_cleanup_smoke_failure_report(
+        self,
+        primary_phase: str | None = "preflight",
+        primary_error_code: str | None = "compose_phase_failed",
+        cleanup_step: str = "remove_resource",
+        cleanup_error_code: str = "unclassified",
+        resource_kind: str | None = "container",
+    ) -> dict:
+        return {
+            "schema_version": 1,
+            "status": "STARTUP_FAILED",
+            "phase": "cleanup",
+            "error_type": "ValueError",
+            "error_code": "startup_cleanup_unresolved_evidence_retained",
+            "http_accepted": False,
+            "cleanup_verified": False,
+            "primary_phase": primary_phase,
+            "primary_error_code": primary_error_code,
+            "cleanup_step": cleanup_step,
+            "cleanup_error_code": cleanup_error_code,
+            "resource_kind": resource_kind,
+        }
+
+    def _extract_smoke_summary_validator_script(self) -> str:
+        job = self._extract_job_section("native-compose-smoke")
+        step_match = re.search(
+            r"- name: Validate smoke report\s+run: \|\s+python3 -c '(.*?)' \"\$SMOKE_PREPARE_DIR/artifacts/startup-summary.json\"",
+            job,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(step_match, "Validate smoke report inline script not found")
+        return textwrap.dedent(step_match.group(1)).strip()
+
+    def _run_smoke_summary_validator(self, report_path: Path) -> subprocess.CompletedProcess:
+        script = self._extract_smoke_summary_validator_script()
+        return subprocess.run(
+            [sys.executable, "-c", script, str(report_path)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+
+    def _valid_smoke_summary(self) -> dict:
+        return {
+            "schema_version": 1,
+            "status": "RBAC_JWT_HTTP_ACCEPTED",
+            "project": "ncs_0123456789ab",
+            "services": list(SERVICES),
+            "pending_assertions": list(PENDING),
+            "native_executed": True,
+            "http_accepted": True,
+            "exact_cleanup_verified": True,
+            "role_cases": {c["label"]: c["status"] for c in role_http_cases()},
+            "jwt_cases": {c["label"]: c["status"] for c in jwt_http_cases()},
+            "role_snapshot_comparisons": 10,
+            "jwt_snapshot_comparisons": 6,
+            "cleanup_counts": {"container": 10, "network": 1, "volume": 3},
+            "evidence": {},
+        }
+
+    def test_smoke_summary_validator_accepts_valid_summary_and_requires_exact_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            report_file = tmp_path / "artifacts" / "startup-summary.json"
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_file.write_text(json.dumps(self._valid_smoke_summary()), encoding="utf-8")
+
+            res = self._run_smoke_summary_validator(report_file)
+            self.assertEqual(res.returncode, 0, f"Summary validator failed on valid summary: {res.stderr}")
+            self.assertIn("Native compose smoke summary validated successfully", res.stdout)
+
+    def test_smoke_summary_validator_rejects_missing_symlink_or_unaccepted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            missing_file = tmp_path / "artifacts" / "startup-summary.json"
+            res = self._run_smoke_summary_validator(missing_file)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("report file missing or symlink", res.stderr)
+
+            valid_file = tmp_path / "valid-summary.json"
+            valid_file.write_text(json.dumps(self._valid_smoke_summary()), encoding="utf-8")
+            symlink_file = tmp_path / "symlink-summary.json"
+            symlink_file.symlink_to(valid_file)
+            res_sym = self._run_smoke_summary_validator(symlink_file)
+            self.assertNotEqual(res_sym.returncode, 0)
+            self.assertIn("report file missing or symlink", res_sym.stderr)
+
+            base = self._valid_smoke_summary()
+            for key, bad_val in (
+                ("status", "PREPARED_NOT_EXECUTED"),
+                ("http_accepted", False),
+                ("exact_cleanup_verified", False),
+            ):
+                payload = dict(base)
+                payload[key] = bad_val
+                bad_file = tmp_path / f"bad_{key}.json"
+                bad_file.write_text(json.dumps(payload), encoding="utf-8")
+                res_bad = self._run_smoke_summary_validator(bad_file)
+                self.assertNotEqual(res_bad.returncode, 0, f"Accepted bad {key}={bad_val}")
 
     def test_smoke_failure_validator_accepts_valid_report_and_stages_exact_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -265,8 +381,190 @@ class TestCISmokeJobs(unittest.TestCase):
             self.assertTrue(staging_file.is_file(), "Staged file must exist")
             staged_data = json.loads(staging_file.read_text(encoding="utf-8"))
             self.assertEqual(staged_data, self._valid_smoke_failure_report())
+            self.assertEqual(len(staged_data), 12, "Staged failure report must contain exactly 12 fields")
+            self.assertIsNone(staged_data["primary_phase"])
+            self.assertIsNone(staged_data["primary_error_code"])
+            self.assertIsNone(staged_data["cleanup_step"])
+            self.assertIsNone(staged_data["cleanup_error_code"])
+            self.assertIsNone(staged_data["resource_kind"])
+            raw_text = staging_file.read_text(encoding="utf-8")
+            self.assertIn('"primary_phase": null', raw_text)
+            self.assertNotIn('"None"', raw_text)
             self.assertTrue(github_output.is_file())
             self.assertIn("validated=true", github_output.read_text(encoding="utf-8"))
+
+    def test_smoke_failure_validator_retains_full_cleanup_context(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            report_file = tmp_path / "artifacts" / "smoke-failure.json"
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            cleanup_report = self._valid_cleanup_smoke_failure_report(
+                primary_phase="preflight",
+                primary_error_code="compose_phase_failed",
+                cleanup_step="remove_resource",
+                cleanup_error_code="unclassified",
+                resource_kind="container",
+            )
+            report_file.write_text(json.dumps(cleanup_report), encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+            github_output = tmp_path / "github_output"
+
+            res = self._run_smoke_failure_validator(
+                report_file, staging_file, env_vars={"GITHUB_OUTPUT": str(github_output)}
+            )
+            self.assertEqual(res.returncode, 0, f"Validator failed on cleanup report: {res.stderr}")
+            self.assertIn("Smoke failure diagnostic validated successfully", res.stdout)
+            self.assertTrue(staging_file.is_file())
+            staged_data = json.loads(staging_file.read_text(encoding="utf-8"))
+            self.assertEqual(staged_data, cleanup_report)
+            self.assertEqual(len(staged_data), 12)
+            self.assertEqual(staged_data["primary_phase"], "preflight")
+            self.assertEqual(staged_data["primary_error_code"], "compose_phase_failed")
+            self.assertEqual(staged_data["cleanup_step"], "remove_resource")
+            self.assertEqual(staged_data["cleanup_error_code"], "unclassified")
+            self.assertEqual(staged_data["resource_kind"], "container")
+
+    def test_smoke_failure_validator_retains_primary_absent_cleanup_report(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            report_file = tmp_path / "artifacts" / "smoke-failure.json"
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            cleanup_report = self._valid_cleanup_smoke_failure_report(
+                primary_phase=None,
+                primary_error_code=None,
+                cleanup_step="check_deadline",
+                cleanup_error_code="startup_cleanup_deadline",
+                resource_kind=None,
+            )
+            report_file.write_text(json.dumps(cleanup_report), encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(report_file, staging_file)
+            self.assertEqual(res.returncode, 0, f"Validator failed on primary absent cleanup report: {res.stderr}")
+            staged_data = json.loads(staging_file.read_text(encoding="utf-8"))
+            self.assertEqual(staged_data, cleanup_report)
+            self.assertEqual(len(staged_data), 12)
+            self.assertIsNone(staged_data["primary_phase"])
+            self.assertIsNone(staged_data["primary_error_code"])
+            self.assertEqual(staged_data["cleanup_step"], "check_deadline")
+            self.assertEqual(staged_data["cleanup_error_code"], "startup_cleanup_deadline")
+            self.assertIsNone(staged_data["resource_kind"])
+            raw_text = staging_file.read_text(encoding="utf-8")
+            self.assertIn('"primary_phase": null', raw_text)
+            self.assertIn('"primary_error_code": null', raw_text)
+            self.assertIn('"resource_kind": null', raw_text)
+            self.assertNotIn('"None"', raw_text)
+
+    def test_smoke_failure_validator_null_semantics_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            report_file = tmp_path / "artifacts" / "smoke-failure.json"
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_file.write_text(json.dumps(self._valid_smoke_failure_report()), encoding="utf-8")
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            res = self._run_smoke_failure_validator(report_file, staging_file)
+            self.assertEqual(res.returncode, 0, f"Validator failed: {res.stderr}")
+            raw_text = staging_file.read_text(encoding="utf-8")
+            for field in ("primary_phase", "primary_error_code", "cleanup_step", "cleanup_error_code", "resource_kind"):
+                self.assertIn(f'"{field}": null', raw_text)
+                self.assertNotIn(f'"{field}": "None"', raw_text)
+                self.assertNotIn(f'"{field}": false', raw_text)
+                self.assertNotIn(f'"{field}": "null"', raw_text)
+
+    def test_smoke_failure_validator_rejects_missing_required_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            # Check deletion of each of 12 fields from non-cleanup report
+            base_non_cleanup = self._valid_smoke_failure_report()
+            for key in list(base_non_cleanup.keys()):
+                incomplete = dict(base_non_cleanup)
+                del incomplete[key]
+                inc_file = tmp_path / f"missing_non_cl_{key}.json"
+                inc_file.write_text(json.dumps(incomplete), encoding="utf-8")
+                res = self._run_smoke_failure_validator(inc_file, staging_file)
+                self.assertNotEqual(res.returncode, 0, f"Validator unexpectedly accepted missing key {key}")
+                self.assertIn("failure report validation failed", res.stderr)
+                self.assertFalse(staging_file.exists())
+
+            # Check deletion of each of 12 fields from cleanup report
+            base_cleanup = self._valid_cleanup_smoke_failure_report()
+            for key in list(base_cleanup.keys()):
+                incomplete = dict(base_cleanup)
+                del incomplete[key]
+                inc_file = tmp_path / f"missing_cl_{key}.json"
+                inc_file.write_text(json.dumps(incomplete), encoding="utf-8")
+                res = self._run_smoke_failure_validator(inc_file, staging_file)
+                self.assertNotEqual(res.returncode, 0, f"Validator unexpectedly accepted missing cleanup key {key}")
+                self.assertIn("failure report validation failed", res.stderr)
+                self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_wrong_types_for_new_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            base_cleanup = self._valid_cleanup_smoke_failure_report()
+            for field in ("primary_phase", "primary_error_code", "cleanup_step", "cleanup_error_code", "resource_kind"):
+                for bad_val in (["container"], {"val": "container"}, True, False, 123):
+                    payload = dict(base_cleanup)
+                    payload[field] = bad_val
+                    t_file = tmp_path / f"bad_type_{field}_{type(bad_val).__name__}.json"
+                    t_file.write_text(json.dumps(payload), encoding="utf-8")
+                    res = self._run_smoke_failure_validator(t_file, staging_file)
+                    self.assertNotEqual(res.returncode, 0, f"Validator accepted wrong type for {field}={bad_val}")
+                    self.assertIn("failure report validation failed", res.stderr)
+                    self.assertFalse(staging_file.exists())
+
+    def test_smoke_failure_validator_rejects_contradictory_cleanup_context(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
+
+            # 1. Non-cleanup report with non-null cleanup fields
+            non_cl_base = self._valid_smoke_failure_report()
+            for field, bad_val in (
+                ("cleanup_step", "remove_resource"),
+                ("cleanup_error_code", "unclassified"),
+                ("resource_kind", "container"),
+                ("primary_phase", "preflight"),
+                ("primary_error_code", "compose_phase_failed"),
+            ):
+                payload = dict(non_cl_base)
+                payload[field] = bad_val
+                bad_file = tmp_path / f"non_cl_contradict_{field}.json"
+                bad_file.write_text(json.dumps(payload), encoding="utf-8")
+                res = self._run_smoke_failure_validator(bad_file, staging_file)
+                self.assertNotEqual(res.returncode, 0, f"Validator accepted non-cleanup with {field}={bad_val}")
+                self.assertIn("failure report validation failed", res.stderr)
+                self.assertFalse(staging_file.exists())
+
+            # 2. Cleanup report with contradictory context
+            cl_base = self._valid_cleanup_smoke_failure_report()
+            for desc, overrides in (
+                ("cleanup_verified_true", {"cleanup_verified": True}),
+                ("cleanup_step_null", {"cleanup_step": None}),
+                ("cleanup_step_unknown", {"cleanup_step": "arbitrary_step"}),
+                ("cleanup_error_code_null", {"cleanup_error_code": None}),
+                ("cleanup_error_code_unknown", {"cleanup_error_code": "unallowlisted_code"}),
+                ("resource_kind_unknown", {"resource_kind": "invalid_kind"}),
+                ("resource_kind_nonnull_on_check_deadline", {"cleanup_step": "check_deadline", "resource_kind": "container"}),
+                ("resource_kind_nonnull_on_reconcile", {"cleanup_step": "reconcile_child_receipts", "resource_kind": "container"}),
+                ("unpaired_primary_missing_code", {"primary_phase": "preflight", "primary_error_code": None}),
+                ("unpaired_primary_missing_phase", {"primary_phase": None, "primary_error_code": "compose_phase_failed"}),
+                ("invalid_primary_phase", {"primary_phase": "invalid_phase", "primary_error_code": "compose_phase_failed"}),
+                ("invalid_primary_error_code", {"primary_phase": "preflight", "primary_error_code": "invalid_code"}),
+            ):
+                payload = dict(cl_base)
+                payload.update(overrides)
+                bad_file = tmp_path / f"cl_contradict_{desc}.json"
+                bad_file.write_text(json.dumps(payload), encoding="utf-8")
+                res = self._run_smoke_failure_validator(bad_file, staging_file)
+                self.assertNotEqual(res.returncode, 0, f"Validator accepted contradictory cleanup: {desc}")
+                self.assertIn("failure report validation failed", res.stderr)
+                self.assertFalse(staging_file.exists())
 
     def test_smoke_failure_validator_handles_missing_report(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -359,18 +657,33 @@ class TestCISmokeJobs(unittest.TestCase):
     def test_smoke_failure_validator_rejects_secret_bearing_content(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
+            staging_file = tmp_path / "staging" / "smoke-failure.json"
             secret = "ghp_VERYSECRET_BEARER_TOKEN_9999"
+
+            # Secret in extra field
             secret_payload = self._valid_smoke_failure_report()
             secret_payload["token"] = secret
             sec_file = tmp_path / "secret.json"
             sec_file.write_text(json.dumps(secret_payload), encoding="utf-8")
-            staging_file = tmp_path / "staging" / "smoke-failure.json"
 
             res = self._run_smoke_failure_validator(sec_file, staging_file)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("failure report validation failed", res.stderr)
             self.assertNotIn(secret, res.stderr)
             self.assertNotIn(secret, res.stdout)
+            self.assertFalse(staging_file.exists())
+
+            # Secret in new field
+            cl_secret = self._valid_cleanup_smoke_failure_report()
+            cl_secret["primary_error_code"] = secret
+            cl_sec_file = tmp_path / "secret_field.json"
+            cl_sec_file.write_text(json.dumps(cl_secret), encoding="utf-8")
+
+            res_cl = self._run_smoke_failure_validator(cl_sec_file, staging_file)
+            self.assertNotEqual(res_cl.returncode, 0)
+            self.assertIn("failure report validation failed", res_cl.stderr)
+            self.assertNotIn(secret, res_cl.stderr)
+            self.assertNotIn(secret, res_cl.stdout)
             self.assertFalse(staging_file.exists())
 
     def test_smoke_failure_validator_rejects_invalid_values_and_types(self):

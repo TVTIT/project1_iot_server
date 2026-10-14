@@ -948,6 +948,11 @@ class AllocationTests(unittest.TestCase):
                 "error_code": "local_image_unavailable",
                 "http_accepted": False,
                 "cleanup_verified": False,
+                "primary_phase": None,
+                "primary_error_code": None,
+                "cleanup_step": None,
+                "cleanup_error_code": None,
+                "resource_kind": None,
             }
             smoke.validate_failure_report(valid_report)
             smoke.record_failure_report(f, phase="preflight", exc=ValueError("local_image_unavailable"), cleanup_verified=False)
@@ -958,6 +963,70 @@ class AllocationTests(unittest.TestCase):
             self.assertEqual(loaded["error_code"], "local_image_unavailable")
             self.assertFalse(loaded["http_accepted"])
             self.assertFalse(loaded["cleanup_verified"])
+
+            # Null semantics: when phase is not cleanup, all 5 new fields must be None
+            for key in ("primary_phase", "primary_error_code", "cleanup_step", "cleanup_error_code", "resource_kind"):
+                with self.assertRaises(ValueError):
+                    smoke.validate_failure_report(dict(valid_report, **{key: "not_none"}))
+
+            # When phase is cleanup:
+            cleanup_report = {
+                "schema_version": 1,
+                "status": "STARTUP_FAILED",
+                "phase": "cleanup",
+                "error_type": "ValueError",
+                "error_code": "startup_cleanup_unresolved_evidence_retained",
+                "http_accepted": False,
+                "cleanup_verified": False,
+                "primary_phase": "bootstrap",
+                "primary_error_code": "bootstrap_contract_rejected",
+                "cleanup_step": "remove_resource",
+                "cleanup_error_code": "resource_cleanup_unresolved",
+                "resource_kind": "container",
+            }
+            smoke.validate_failure_report(cleanup_report)
+
+            # cleanup_verified must be False for cleanup phase
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_verified=True))
+
+            # cleanup_step must be in ALLOWED_CLEANUP_STEPS
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_step="unauthorized_step"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_step=None))
+
+            # cleanup_error_code must be in ALLOWED_FAILURE_ERROR_CODES
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_error_code="evil_code"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_error_code=None))
+
+            # resource_kind must be in ALLOWED_RESOURCE_KINDS or None
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, resource_kind="unknown_kind"))
+            smoke.validate_failure_report(dict(cleanup_report, resource_kind=None))
+
+            # primary_phase and primary_error_code must either both be set or both be None
+            smoke.validate_failure_report(dict(cleanup_report, primary_phase=None, primary_error_code=None))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, primary_phase="bootstrap", primary_error_code=None))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, primary_phase=None, primary_error_code="bootstrap_contract_rejected"))
+
+            # resource_kind may be non-null only when cleanup_step is remove_resource
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_step="check_deadline", resource_kind="container"))
+            with self.assertRaises(ValueError):
+                smoke.validate_failure_report(dict(cleanup_report, cleanup_step="reconcile_child_receipts", resource_kind="container"))
+            smoke.validate_failure_report(dict(cleanup_report, cleanup_step="check_deadline", resource_kind=None))
+            smoke.validate_failure_report(dict(cleanup_report, cleanup_step="reconcile_child_receipts", resource_kind=None))
+
+            # Each nullable string field rejects wrong types (list, dict, bool, int, etc.) with safe ValueError
+            for field in ("cleanup_step", "cleanup_error_code", "resource_kind", "primary_phase", "primary_error_code"):
+                for bad_val in ([1, 2], {"bad": "type"}, True, False, 123, 1.5):
+                    with self.assertRaises(ValueError):
+                        smoke.validate_failure_report(dict(cleanup_report, **{field: bad_val}))
 
             # Test invalid schemas: extra field, wrong types, unknown values, bool-as-int
             with self.assertRaises(ValueError):
@@ -1300,6 +1369,327 @@ class AllocationTests(unittest.TestCase):
             self.assertFalse(rep["cleanup_verified"])
             art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
             self.assertEqual(rep, art)
+            self.assertEqual(rep["primary_phase"], "bootstrap")
+            self.assertEqual(rep["primary_error_code"], "bootstrap_contract_rejected")
+            self.assertEqual(rep["cleanup_step"], "reconcile_child_receipts")
+            self.assertEqual(rep["cleanup_error_code"], "unclassified")
+            self.assertIsNone(rep["resource_kind"])
+
+    def test_cleanup_failure_reconcile_child_receipts_with_incomplete_cleanup(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                registry.allocating(item)
+                raise ValueError("bootstrap_contract_rejected")
+
+            stdout_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]))
+                stack.enter_context(patch.object(smoke, "dry_effective_config", return_value=mock_model))
+                stack.enter_context(patch.object(smoke, "build_native_image"))
+                stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()))
+                stack.enter_context(patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc))
+                stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts", side_effect=mock_lifecycle.IncompleteCleanup("invalid recovery receipt")))
+                stack.enter_context(patch("sys.stdout", stdout_buf))
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "cleanup")
+            self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+            self.assertFalse(rep["cleanup_verified"])
+            self.assertEqual(rep["primary_phase"], "bootstrap")
+            self.assertEqual(rep["primary_error_code"], "bootstrap_contract_rejected")
+            self.assertEqual(rep["cleanup_step"], "reconcile_child_receipts")
+            self.assertEqual(rep["cleanup_error_code"], "child_cleanup_unresolved")
+            self.assertIsNone(rep["resource_kind"])
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_cleanup_failure_resource_removal_container_and_kinds(self):
+        import io, contextlib
+        for target_kind in ("container", "network", "volume"):
+            with tempfile.TemporaryDirectory() as directory:
+                prep_dir = Path(directory) / "fixture"
+                def fake_dry(fixture, **kwargs):
+                    return {
+                        "networks": {"iot_net": {"name": fixture.project + "_iot_net", "labels": {}}},
+                        "volumes": {},
+                        "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+                    }
+                img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+                mock_lifecycle = smoke.bootstrap_lifecycle()
+                def fake_alloc(fixture, registry, lifecycle):
+                    item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                    registry.allocating(item)
+                    return item
+
+                running_obj = {
+                    "Image": "img", "Id": "cid", "State": {"Status": "running", "Running": True, "ExitCode": 0},
+                    "receipt": {"id": "cid"},
+                    "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+                }
+                def fake_resolve(item):
+                    if not item.get("allocation_attempted"):
+                        return None
+                    item["receipt"] = {"id": "cid"}
+                    return running_obj
+
+                expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                            for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+                def fake_cmd(cmd):
+                    if "psql" in cmd:
+                        if "SELECT string_agg" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
+                        if "profiles_id_fkey" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
+                    return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
+
+                def fake_remove(self, item):
+                    if item.get("kind") == target_kind:
+                        raise ValueError("resource_cleanup_unresolved")
+                    item["removed"] = True
+
+                stdout_buf = io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]))
+                    stack.enter_context(patch.object(smoke, "dry_effective_config", side_effect=fake_dry))
+                    stack.enter_context(patch.object(smoke, "build_native_image"))
+                    stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                    stack.enter_context(patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc))
+                    stack.enter_context(patch.object(smoke, "allocation_readback", return_value=True))
+                    stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                    stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts"))
+                    stack.enter_context(patch.object(smoke, "BUDGETS", dict(smoke.BUDGETS, up=0.01)))
+                    stack.enter_context(patch.object(smoke, "startup_state", return_value=True))
+                    stack.enter_context(patch.object(smoke, "probe_startup", side_effect=lambda reg, name, obj: False if name == "supabase-envoy" else True))
+                    stack.enter_context(patch("subprocess.run", return_value=type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()))
+                    stack.enter_context(patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve))
+                    stack.enter_context(patch.object(smoke.ResourceRegistry, "remove", fake_remove))
+                    stack.enter_context(patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd))
+                    stack.enter_context(patch("sys.stdout", stdout_buf))
+                    ret = smoke.main()
+                self.assertEqual(ret, 1)
+                rep = json.loads(stdout_buf.getvalue().strip())
+                smoke.validate_failure_report(rep)
+                self.assertEqual(rep["phase"], "cleanup")
+                self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+                self.assertFalse(rep["cleanup_verified"])
+                self.assertEqual(rep["primary_phase"], "supabase-envoy")
+                self.assertEqual(rep["primary_error_code"], "phase_health_timeout")
+                self.assertEqual(rep["cleanup_step"], "remove_resource")
+                self.assertEqual(rep["cleanup_error_code"], "resource_cleanup_unresolved")
+                self.assertEqual(rep["resource_kind"], target_kind)
+                art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+                self.assertEqual(rep, art)
+
+    def test_cleanup_failure_resource_ownership_refusal_network(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            def fake_dry(fixture, **kwargs):
+                return {
+                    "networks": {"iot_net": {"name": fixture.project + "_iot_net", "labels": {}}},
+                    "volumes": {},
+                    "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+                }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                registry.allocating(item)
+                return item
+
+            running_obj = {
+                "Image": "img", "Id": "cid", "State": {"Status": "running", "Running": True, "ExitCode": 0},
+                "receipt": {"id": "cid"},
+                "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+            }
+            def fake_resolve(item):
+                if not item.get("allocation_attempted"):
+                    return None
+                item["receipt"] = {"id": "cid"}
+                return running_obj
+
+            expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                        for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+            def fake_cmd(cmd):
+                if "psql" in cmd:
+                    if "SELECT string_agg" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
+                return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
+
+            def fake_remove(self, item):
+                if item.get("kind") == "network":
+                    raise ValueError("resource_ownership_refused")
+                item["removed"] = True
+
+            stdout_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]))
+                stack.enter_context(patch.object(smoke, "dry_effective_config", side_effect=fake_dry))
+                stack.enter_context(patch.object(smoke, "build_native_image"))
+                stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                stack.enter_context(patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc))
+                stack.enter_context(patch.object(smoke, "allocation_readback", return_value=True))
+                stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts"))
+                stack.enter_context(patch.object(smoke, "BUDGETS", dict(smoke.BUDGETS, up=0.01)))
+                stack.enter_context(patch.object(smoke, "startup_state", return_value=True))
+                stack.enter_context(patch.object(smoke, "probe_startup", return_value=True))
+                stack.enter_context(patch("subprocess.run", return_value=type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "remove", fake_remove))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd))
+                stack.enter_context(patch("sys.stdout", stdout_buf))
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "cleanup")
+            self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+            self.assertFalse(rep["cleanup_verified"])
+            self.assertIsNone(rep["primary_phase"])
+            self.assertIsNone(rep["primary_error_code"])
+            self.assertEqual(rep["cleanup_step"], "remove_resource")
+            self.assertEqual(rep["cleanup_error_code"], "resource_ownership_refused")
+            self.assertEqual(rep["resource_kind"], "network")
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_cleanup_failure_deadline_with_preceding_http_failure(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            def fake_dry(fixture, **kwargs):
+                return {
+                    "networks": {"iot_net": {"name": fixture.project + "_iot_net", "labels": {}}},
+                    "volumes": {},
+                    "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+                }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                registry.allocating(item)
+                return item
+
+            running_obj = {
+                "Image": "img", "Id": "cid", "State": {"Status": "running", "Running": True, "ExitCode": 0},
+                "receipt": {"id": "cid"},
+                "NetworkSettings": {"Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}}
+            }
+            def fake_resolve(item):
+                if not item.get("allocation_attempted"):
+                    return None
+                item["receipt"] = {"id": "cid"}
+                return running_obj
+
+            expected_schema = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql')
+                                        for p in sorted((smoke.ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
+            def fake_cmd(cmd):
+                if "psql" in cmd:
+                    if "SELECT string_agg" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
+                return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
+
+            real_monotonic = time.monotonic
+            call_count = [0]
+            def fake_monotonic():
+                call_count[0] += 1
+                if call_count[0] > 10:
+                    return real_monotonic() + 100000.0
+                return real_monotonic()
+
+            stdout_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--positive-http-only"]))
+                stack.enter_context(patch.object(smoke, "dry_effective_config", side_effect=fake_dry))
+                stack.enter_context(patch.object(smoke, "build_native_image"))
+                stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                stack.enter_context(patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc))
+                stack.enter_context(patch.object(smoke, "allocation_readback", return_value=True))
+                stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts"))
+                stack.enter_context(patch.object(smoke, "BUDGETS", dict(smoke.BUDGETS, up=0.01)))
+                stack.enter_context(patch.object(smoke, "startup_state", return_value=True))
+                stack.enter_context(patch.object(smoke, "probe_startup", return_value=True))
+                stack.enter_context(patch("subprocess.run", return_value=type("Proc", (), {"returncode": 0, "stdout": b"", "stderr": b""})()))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "resolve", side_effect=fake_resolve))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "command", side_effect=fake_cmd))
+                stack.enter_context(patch.object(smoke, "run_positive_http_slice", side_effect=ValueError("response_contract_failed")))
+                stack.enter_context(patch("time.monotonic", side_effect=fake_monotonic))
+                stack.enter_context(patch("sys.stdout", stdout_buf))
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "cleanup")
+            self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+            self.assertFalse(rep["cleanup_verified"])
+            self.assertEqual(rep["primary_phase"], "positive_http")
+            self.assertEqual(rep["primary_error_code"], "response_contract_failed")
+            self.assertEqual(rep["cleanup_step"], "check_deadline")
+            self.assertEqual(rep["cleanup_error_code"], "startup_cleanup_deadline")
+            self.assertIsNone(rep["resource_kind"])
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+
+    def test_cleanup_failure_unknown_secret_bearing_exception_redacted(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            mock_model = {
+                "networks": {"iot_net": {"name": "ncs_test_iot_net", "labels": {}}},
+                "volumes": {},
+                "services": {name: {"image": "img:" + name, "labels": {}, "volumes": []} for name in smoke.SERVICES}
+            }
+            img_out = json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"User": "1000", "Volumes": None}}]).encode()
+            mock_lifecycle = smoke.bootstrap_lifecycle()
+            def fake_alloc(fixture, registry, lifecycle):
+                item = registry.intent("volume", fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"], "sha256:" + "a" * 64, {"test.task": "native-compose-allocation", "test.run": fixture.project})
+                registry.allocating(item)
+                return item
+
+            stdout_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", ["native_compose_smoke.py", "--prepare", str(prep_dir), "--startup-only"]))
+                stack.enter_context(patch.object(smoke, "dry_effective_config", return_value=mock_model))
+                stack.enter_context(patch.object(smoke, "build_native_image"))
+                stack.enter_context(patch.object(smoke, "generate_fixture_tls"))
+                stack.enter_context(patch.object(smoke.ResourceRegistry, "command", return_value=type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()))
+                stack.enter_context(patch.object(smoke, "allocate_bootstrap_store", side_effect=fake_alloc))
+                stack.enter_context(patch.object(smoke, "bootstrap_lifecycle", return_value=mock_lifecycle))
+                stack.enter_context(patch.object(mock_lifecycle, "reconcile_child_receipts", side_effect=RuntimeError("leak_secret_key_abcdef12345")))
+                stack.enter_context(patch("sys.stdout", stdout_buf))
+                ret = smoke.main()
+            self.assertEqual(ret, 1)
+            rep = json.loads(stdout_buf.getvalue().strip())
+            smoke.validate_failure_report(rep)
+            self.assertEqual(rep["phase"], "cleanup")
+            self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
+            self.assertFalse(rep["cleanup_verified"])
+            self.assertEqual(rep["cleanup_step"], "reconcile_child_receipts")
+            self.assertEqual(rep["cleanup_error_code"], "unclassified")
+            self.assertNotIn("leak_secret_key_abcdef12345", json.dumps(rep))
+            art = json.loads((prep_dir / "artifacts" / "smoke-failure.json").read_text())
+            self.assertEqual(rep, art)
+            self.assertNotIn("leak_secret_key_abcdef12345", json.dumps(art))
 
     def test_main_report_validation_failure_preserves_its_own_phase(self):
         import io
@@ -1451,7 +1841,24 @@ class AllocationTests(unittest.TestCase):
             # Secret-bearing values
             {"schema_version": 1, "status": "STARTUP_FAILED", "phase": "preflight",
              "error_type": "RuntimeError", "error_code": secret_text,
-             "http_accepted": False, "cleanup_verified": False},
+             "http_accepted": False, "cleanup_verified": False,
+             "primary_phase": None, "primary_error_code": None,
+             "cleanup_step": None, "cleanup_error_code": None,
+             "resource_kind": None},
+            # Malformed new fields with wrong types / secret payload
+            {"schema_version": 1, "status": "STARTUP_FAILED", "phase": "cleanup",
+             "error_type": "RuntimeError", "error_code": "unclassified",
+             "http_accepted": False, "cleanup_verified": False,
+             "primary_phase": [secret_text], "primary_error_code": None,
+             "cleanup_step": {"bad": secret_text}, "cleanup_error_code": [1, 2],
+             "resource_kind": 123},
+            # Context contradiction carrying secret in resource_kind
+            {"schema_version": 1, "status": "STARTUP_FAILED", "phase": "cleanup",
+             "error_type": "RuntimeError", "error_code": "unclassified",
+             "http_accepted": False, "cleanup_verified": False,
+             "primary_phase": None, "primary_error_code": None,
+             "cleanup_step": "check_deadline", "cleanup_error_code": "resource_cleanup_unresolved",
+             "resource_kind": "container"},
             # False success
             {"schema_version": 1, "status": "RBAC_JWT_HTTP_ACCEPTED", "phase": "preflight",
              "error_type": "RuntimeError", "error_code": "unclassified",

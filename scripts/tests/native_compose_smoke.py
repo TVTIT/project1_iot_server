@@ -766,8 +766,16 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     pass
             finally:
                 state.unwinding = True
+                primary_failure = failure
+                primary_phase_saved = phase if primary_failure is not None else None
+                primary_code_saved = sanitize_failure_code(primary_failure) if primary_failure is not None else None
+                cleanup_step = None
+                cleanup_target_kind = None
+                cleanup_err_code = "unclassified"
                 try:
+                    cleanup_step = "reconcile_child_receipts"
                     if isinstance(failure, lifecycle.IncompleteCleanup):
+                        cleanup_err_code = "child_cleanup_unresolved"
                         raise ValueError('child_cleanup_unresolved')
                     if registry.items:
                         lifecycle.reconcile_child_receipts(fixture.private, registry.items[0]['name'], registry.items[0]['labels'])
@@ -775,9 +783,14 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     ordered = sorted(reversed(registry.items), key=lambda i: {'container': 0, 'network': 1, 'volume': 2}[i['kind']])
                     cleanup_deadline = time.monotonic() + BUDGETS['cleanup'] * 2
                     for item in ordered:
+                        cleanup_step = "check_deadline"
+                        cleanup_target_kind = None
                         if time.monotonic() >= cleanup_deadline:
+                            cleanup_err_code = "startup_cleanup_deadline"
                             raise ValueError('startup_cleanup_deadline')
                         if item['allocation_attempted']:
+                            cleanup_step = "remove_resource"
+                            cleanup_target_kind = item['kind']
                             registry.remove(item)
                     cleanup_verified = True
                 except Exception as cl_exc:
@@ -786,8 +799,21 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         durable_json(fixture.artifacts / 'startup-summary.json', {'status': 'CLEANUP_UNRESOLVED', 'phase': phase, 'http_accepted': False})
                     except Exception:
                         pass
+                    raw_cl_code = sanitize_failure_code(cl_exc)
+                    if raw_cl_code in ALLOWED_FAILURE_ERROR_CODES and raw_cl_code != "unclassified":
+                        cleanup_err_code = raw_cl_code
                     cleanup_failure = ValueError('startup_cleanup_unresolved_evidence_retained')
-                    fail_report = record_failure_report(fixture, phase="cleanup", exc=cleanup_failure, cleanup_verified=False)
+                    fail_report = record_failure_report(
+                        fixture,
+                        phase="cleanup",
+                        exc=cleanup_failure,
+                        cleanup_verified=False,
+                        primary_phase=primary_phase_saved,
+                        primary_error_code=primary_code_saved,
+                        cleanup_step=cleanup_step or "reconcile_child_receipts",
+                        cleanup_error_code=cleanup_err_code,
+                        resource_kind=cleanup_target_kind,
+                    )
                     raise FailureDiagnostic(fail_report, cause=cleanup_failure) from cl_exc
                 if state.signum is not None:
                     failure = lifecycle.RunnerInterrupted(state.signum)
@@ -1097,6 +1123,18 @@ ALLOWED_FAILURE_ERROR_CODES = {
     "http_body_too_large", "unsafe_summary", "unsafe_failure_report", "unclassified"
 }
 
+ALLOWED_CLEANUP_STEPS = {
+    "reconcile_child_receipts",
+    "remove_resource",
+    "check_deadline",
+}
+
+ALLOWED_RESOURCE_KINDS = {
+    "container",
+    "network",
+    "volume",
+}
+
 FALLBACK_FAILURE_DIAGNOSTIC = {
     "schema_version": 1,
     "status": "STARTUP_FAILED",
@@ -1105,6 +1143,11 @@ FALLBACK_FAILURE_DIAGNOSTIC = {
     "error_code": "unsafe_failure_report",
     "http_accepted": False,
     "cleanup_verified": False,
+    "primary_phase": None,
+    "primary_error_code": None,
+    "cleanup_step": None,
+    "cleanup_error_code": None,
+    "resource_kind": None,
 }
 
 
@@ -1194,8 +1237,12 @@ def is_fixture_verified(fixture) -> bool:
 def validate_failure_report(report: dict) -> None:
     if type(report) is not dict:
         raise ValueError("unsafe_failure_report")
-    required_keys = {"schema_version", "status", "phase", "error_type", "error_code",
-                     "http_accepted", "cleanup_verified"}
+    required_keys = {
+        "schema_version", "status", "phase", "error_type", "error_code",
+        "http_accepted", "cleanup_verified",
+        "primary_phase", "primary_error_code",
+        "cleanup_step", "cleanup_error_code", "resource_kind",
+    }
     if set(report.keys()) != required_keys:
         raise ValueError("unsafe_failure_report")
     schema_ver = report.get("schema_version")
@@ -1207,7 +1254,8 @@ def validate_failure_report(report: dict) -> None:
             raise ValueError("unsafe_failure_report")
     if report.get("status") not in ALLOWED_FAILURE_STATUSES:
         raise ValueError("unsafe_failure_report")
-    if report.get("phase") not in ALLOWED_FAILURE_PHASES:
+    phase = report.get("phase")
+    if phase not in ALLOWED_FAILURE_PHASES:
         raise ValueError("unsafe_failure_report")
     if report.get("error_type") not in ALLOWED_FAILURE_ERROR_TYPES:
         raise ValueError("unsafe_failure_report")
@@ -1217,6 +1265,50 @@ def validate_failure_report(report: dict) -> None:
         raise ValueError("unsafe_failure_report")
     if type(report.get("cleanup_verified")) is not bool:
         raise ValueError("unsafe_failure_report")
+
+    primary_phase = report.get("primary_phase")
+    primary_error_code = report.get("primary_error_code")
+    cleanup_step = report.get("cleanup_step")
+    cleanup_error_code = report.get("cleanup_error_code")
+    resource_kind = report.get("resource_kind")
+
+    for key, val in (
+        ("primary_phase", primary_phase),
+        ("primary_error_code", primary_error_code),
+        ("cleanup_step", cleanup_step),
+        ("cleanup_error_code", cleanup_error_code),
+        ("resource_kind", resource_kind),
+    ):
+        if val is not None and type(val) is not str:
+            raise ValueError("unsafe_failure_report")
+
+    if phase == "cleanup":
+        if report.get("cleanup_verified") is not False:
+            raise ValueError("unsafe_failure_report")
+        if cleanup_step is None or cleanup_step not in ALLOWED_CLEANUP_STEPS:
+            raise ValueError("unsafe_failure_report")
+        if cleanup_error_code is None or cleanup_error_code not in ALLOWED_FAILURE_ERROR_CODES:
+            raise ValueError("unsafe_failure_report")
+        if resource_kind is not None and resource_kind not in ALLOWED_RESOURCE_KINDS:
+            raise ValueError("unsafe_failure_report")
+        if resource_kind is not None and cleanup_step != "remove_resource":
+            raise ValueError("unsafe_failure_report")
+        if (primary_phase is None) != (primary_error_code is None):
+            raise ValueError("unsafe_failure_report")
+        if primary_phase is not None and primary_phase not in ALLOWED_FAILURE_PHASES:
+            raise ValueError("unsafe_failure_report")
+        if primary_error_code is not None and primary_error_code not in ALLOWED_FAILURE_ERROR_CODES:
+            raise ValueError("unsafe_failure_report")
+    else:
+        if (
+            primary_phase is not None
+            or primary_error_code is not None
+            or cleanup_step is not None
+            or cleanup_error_code is not None
+            or resource_kind is not None
+        ):
+            raise ValueError("unsafe_failure_report")
+
     assert_safe_data(report)
 
 
@@ -1226,10 +1318,40 @@ def sanitize_failure_phase(phase: str, code: str = "") -> str:
     return "preflight"
 
 
-def record_failure_report(fixture, phase: str, exc: BaseException, cleanup_verified: bool = False) -> dict:
+def record_failure_report(
+    fixture,
+    phase: str,
+    exc: BaseException,
+    cleanup_verified: bool = False,
+    primary_phase: str | None = None,
+    primary_error_code: str | None = None,
+    cleanup_step: str | None = None,
+    cleanup_error_code: str | None = None,
+    resource_kind: str | None = None,
+) -> dict:
     safe_code = sanitize_failure_code(exc)
     safe_phase = sanitize_failure_phase(phase, safe_code)
     safe_type = sanitize_failure_type(exc)
+
+    if safe_phase == "cleanup":
+        safe_cleanup_step = cleanup_step if cleanup_step in ALLOWED_CLEANUP_STEPS else "reconcile_child_receipts"
+        safe_cleanup_code = cleanup_error_code if cleanup_error_code in ALLOWED_FAILURE_ERROR_CODES else "unclassified"
+        safe_resource_kind = resource_kind if resource_kind in ALLOWED_RESOURCE_KINDS else None
+        if primary_phase and primary_phase in ALLOWED_FAILURE_PHASES:
+            safe_primary_phase = primary_phase
+            safe_primary_code = primary_error_code if primary_error_code in ALLOWED_FAILURE_ERROR_CODES else "unclassified"
+        else:
+            safe_primary_phase = None
+            safe_primary_code = None
+        safe_cleanup_verified = False
+    else:
+        safe_primary_phase = None
+        safe_primary_code = None
+        safe_cleanup_step = None
+        safe_cleanup_code = None
+        safe_resource_kind = None
+        safe_cleanup_verified = True if cleanup_verified is True else False
+
     report = {
         "schema_version": 1,
         "status": "STARTUP_FAILED",
@@ -1237,7 +1359,12 @@ def record_failure_report(fixture, phase: str, exc: BaseException, cleanup_verif
         "error_type": safe_type,
         "error_code": safe_code,
         "http_accepted": False,
-        "cleanup_verified": True if cleanup_verified is True else False,
+        "cleanup_verified": safe_cleanup_verified,
+        "primary_phase": safe_primary_phase,
+        "primary_error_code": safe_primary_code,
+        "cleanup_step": safe_cleanup_step,
+        "cleanup_error_code": safe_cleanup_code,
+        "resource_kind": safe_resource_kind,
     }
     validate_failure_report(report)
     if is_fixture_verified(fixture):
@@ -1773,6 +1900,11 @@ def main():
             "error_code": sanitize_failure_code(exc),
             "http_accepted": False,
             "cleanup_verified": False,
+            "primary_phase": None,
+            "primary_error_code": None,
+            "cleanup_step": None,
+            "cleanup_error_code": None,
+            "resource_kind": None,
         }
         try:
             validate_failure_report(report)

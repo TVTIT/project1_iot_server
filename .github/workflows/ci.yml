@@ -590,7 +590,18 @@ jobs:
               "error_code": str(report["error_code"]),
               "http_accepted": bool(report["http_accepted"]),
               "cleanup_verified": bool(report["cleanup_verified"]),
+              "primary_phase": str(report["primary_phase"]) if report["primary_phase"] is not None else None,
+              "primary_error_code": str(report["primary_error_code"]) if report["primary_error_code"] is not None else None,
+              "cleanup_step": str(report["cleanup_step"]) if report["cleanup_step"] is not None else None,
+              "cleanup_error_code": str(report["cleanup_error_code"]) if report["cleanup_error_code"] is not None else None,
+              "resource_kind": str(report["resource_kind"]) if report["resource_kind"] is not None else None,
           }
+
+          try:
+              validate_failure_report(validated_fields)
+          except Exception:
+              sys.exit("failure report validation failed")
+
           staging_path.write_text(json.dumps(validated_fields, indent=2) + "\n", encoding="utf-8")
 
           github_output = os.getenv("GITHUB_OUTPUT")
