@@ -28,6 +28,7 @@ Bộ tài liệu kỹ thuật DynSec được phân chia thành các chuyên đ�
    - Phân tích chi tiết các giới hạn kỹ thuật: Rủi ro lưu trữ mật khẩu sau rotate (ROT1 vs ROT2), giới hạn mất điện (`fsync`), reset ở trạng thái chỉ từ chối (`deny-only`), thiếu hàng rào phân tán (`distributed fencing`).
    - Phân định ranh giới giữa kiểm thử diễn tập (rehearsal container) và tính tương đương bản build Dockerfile gốc (`root build parity`).
    - Danh mục công việc tồn đọng (Backlog) được phân cấp theo thứ tự ưu tiên rõ ràng.
+   - Bảng đối chiếu ma trận nghiệm thu có giới hạn T01–T12 và các ngoại lệ đóng Giai đoạn 2.
 
 ---
 
