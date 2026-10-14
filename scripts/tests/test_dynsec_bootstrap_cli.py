@@ -31,6 +31,7 @@ Tests mock all Docker interactions and bootstrap runs to verify:
 """
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import signal
@@ -41,6 +42,15 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+BOOTSTRAP_MODULE_PATH = Path(__file__).parents[1] / 'mqtt-bootstrap.py'
+
+
+def load_bootstrap_module():
+    spec = importlib.util.spec_from_file_location('mqtt_bootstrap_read_only', BOOTSTRAP_MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 try:
     from . import dynsec_bootstrap_cli as cli
@@ -114,15 +124,117 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
     def setUp(self):
         self.pinned_image = cli.PINNED_IMAGE
-        self.pinned_digest = cli.PINNED_DIGEST
+        self.pinned_config_id = cli.PINNED_CONFIG_ID
         self.fake_image_inspect = [{
             'Architecture': 'amd64',
             'Os': 'linux',
             'RepoDigests': [self.pinned_image],
-            'Id': 'sha256:' + self.pinned_digest
+            'Id': cli.PINNED_CONFIG_ID
         }]
         self.fake_store = create_fake_store()
         self.fake_store_raw = json.dumps(self.fake_store).encode('utf-8')
+
+    def test_verify_pinned_image_literal_verified_tuple(self):
+        # Literal independently verified valid inspect tuple:
+        # RepoDigests with root OCI index reference/pin, Architecture amd64, Os linux, Id with verified config ID
+        literal_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': ['eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'],
+            'Id': 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4'
+        }]
+        runner = mock.Mock(return_value=mock.Mock(
+            returncode=0,
+            stdout=json.dumps(literal_inspect).encode('utf-8')
+        ))
+        img_id = cli.verify_pinned_image(self.pinned_image, runner=runner)
+        self.assertEqual(img_id, 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4')
+
+    def test_cli_and_bootstrap_identity_constants_match(self):
+        production = load_bootstrap_module()
+        self.assertEqual(cli.PINNED_IMAGE, production.PINNED_IMAGE)
+        self.assertEqual(cli.PINNED_DIGEST, production.PINNED_DIGEST)
+        self.assertEqual(cli.PINNED_CONFIG_ID, production.PINNED_CONFIG_ID)
+        self.assertEqual(cli.PINNED_PLATFORM_MANIFEST_DIGEST, production.PINNED_PLATFORM_MANIFEST_DIGEST)
+        self.assertEqual(cli.PINNED_CONFIG_ID,
+                         'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4')
+
+    def test_verify_pinned_image_index_digest_without_descriptor_rejected(self):
+        # A root Id is acceptable only with the required root descriptor and secondary inspect.
+        index_as_id_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.pinned_image],
+            'Id': 'sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
+        }]
+        runner = mock.Mock(return_value=mock.Mock(
+            returncode=0,
+            stdout=json.dumps(index_as_id_inspect).encode('utf-8')
+        ))
+        with self.assertRaisesRegex(cli.RunnerError, 'missing or malformed root index descriptor metadata'):
+            cli.verify_pinned_image(self.pinned_image, runner=runner)
+
+    def test_containerd_image_inspect_requires_verified_platform_evidence(self):
+        root = [{**self.fake_image_inspect[0], 'Id': 'sha256:' + cli.PINNED_DIGEST,
+                 'Descriptor': {'digest': 'sha256:' + cli.PINNED_DIGEST,
+                                'mediaType': 'application/vnd.oci.image.index.v1+json'}}]
+        platform = [{'Architecture': 'amd64', 'Os': 'linux',
+                     'Id': cli.PINNED_PLATFORM_MANIFEST_DIGEST,
+                     'Descriptor': {'digest': cli.PINNED_PLATFORM_MANIFEST_DIGEST,
+                                    'mediaType': 'application/vnd.oci.image.manifest.v1+json'}}]
+        runner = mock.Mock(side_effect=[
+            mock.Mock(returncode=0, stdout=json.dumps(root).encode()),
+            mock.Mock(returncode=0, stdout=json.dumps(platform).encode())])
+        self.assertEqual(cli.verify_pinned_image(self.pinned_image, runner=runner),
+                         'sha256:' + cli.PINNED_DIGEST)
+        self.assertEqual(runner.call_args_list[1].args[0],
+                         ['docker', 'image', 'inspect', '--platform', 'linux/amd64', self.pinned_image])
+        self.assertEqual(runner.call_args_list[1].kwargs['timeout'], 10)
+
+        for bad_root, bad_platform in (
+                ({**root[0], 'Descriptor': {'digest': cli.PINNED_PLATFORM_MANIFEST_DIGEST,
+                                           'mediaType': 'application/vnd.oci.image.manifest.v1+json'}}, platform[0]),
+                (root[0], {**platform[0], 'Descriptor': {'digest': 'sha256:' + cli.PINNED_DIGEST,
+                                                        'mediaType': 'application/vnd.oci.image.index.v1+json'}}),
+                (root[0], {**platform[0], 'Architecture': 'arm64'}),
+                (root[0], {**platform[0], 'Id': cli.PINNED_CONFIG_ID}),
+        ):
+            with self.subTest(root=bad_root, platform=bad_platform):
+                runner = mock.Mock(side_effect=[
+                    mock.Mock(returncode=0, stdout=json.dumps([bad_root]).encode()),
+                    mock.Mock(returncode=0, stdout=json.dumps([bad_platform]).encode())])
+                with self.assertRaises(cli.RunnerError):
+                    cli.verify_pinned_image(self.pinned_image, runner=runner)
+
+    def test_containerd_secondary_inspect_failure_timeout_and_malformed_output_rejected(self):
+        root = [{**self.fake_image_inspect[0], 'Id': 'sha256:' + cli.PINNED_DIGEST,
+                 'Descriptor': {'digest': 'sha256:' + cli.PINNED_DIGEST,
+                                'mediaType': 'application/vnd.oci.image.index.v1+json'}}]
+        for secondary in (mock.Mock(returncode=1, stdout=b'', stderr=b'private marker'),
+                          subprocess.TimeoutExpired('inspect', 10),
+                          mock.Mock(returncode=0, stdout=b'{"secret-marker"')):
+            runner = mock.Mock(side_effect=[mock.Mock(returncode=0, stdout=json.dumps(root).encode()), secondary])
+            with self.assertRaises(cli.RunnerError) as caught:
+                cli.verify_pinned_image(self.pinned_image, runner=runner)
+            self.assertNotIn('marker', str(caught.exception))
+
+    def test_classic_descriptor_pairs_are_bound_and_unknown_or_swapped_rejected(self):
+        accepted = [
+            {'digest': cli.PINNED_CONFIG_ID, 'mediaType': 'application/vnd.oci.image.config.v1+json'},
+            {'digest': 'sha256:' + cli.PINNED_DIGEST, 'mediaType': 'application/vnd.oci.image.index.v1+json'},
+            {'digest': cli.PINNED_PLATFORM_MANIFEST_DIGEST, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'},
+        ]
+        for descriptor in accepted:
+            data = [{**self.fake_image_inspect[0], 'Descriptor': descriptor}]
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=json.dumps(data).encode()))
+            self.assertEqual(cli.verify_pinned_image(self.pinned_image, runner=runner), cli.PINNED_CONFIG_ID)
+        for descriptor in ({'digest': cli.PINNED_CONFIG_ID, 'mediaType': 'application/vnd.oci.image.index.v1+json'},
+                           {'digest': 'sha256:' + '0' * 64, 'mediaType': 'application/vnd.oci.image.config.v1+json'},
+                           'malformed'):
+            data = [{**self.fake_image_inspect[0], 'Descriptor': descriptor}]
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=json.dumps(data).encode()))
+            with self.assertRaises(cli.RunnerError):
+                cli.verify_pinned_image(self.pinned_image, runner=runner)
 
     def test_verify_pinned_image_success(self):
         runner = mock.Mock()
@@ -131,7 +243,54 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             stdout=json.dumps(self.fake_image_inspect).encode('utf-8')
         )
         img_id = cli.verify_pinned_image(self.pinned_image, runner=runner)
-        self.assertEqual(img_id, 'sha256:' + self.pinned_digest)
+        self.assertEqual(img_id, cli.PINNED_CONFIG_ID)
+
+    def test_verify_pinned_image_rejects_wrong_registry_pin(self):
+        bad = copy.deepcopy(self.fake_image_inspect)
+        bad[0]['RepoDigests'] = ['eclipse-mosquitto@sha256:' + '0' * 64]
+        self.assert_image_rejected(bad, 'RepoDigests exact pin mismatch')
+
+    def test_verify_pinned_image_rejects_missing_or_malformed_metadata(self):
+        marker = 'do-not-leak-metadata'
+        for value in ([], [{}], [{'Architecture': 'amd64', 'Os': 'linux', 'RepoDigests': [self.pinned_image]}],
+                      [{'Architecture': 'amd64', 'Os': 'linux', 'RepoDigests': 'invalid', 'Id': cli.PINNED_CONFIG_ID}],
+                      [None], {'Architecture': 'amd64'},
+                      [{**self.fake_image_inspect[0], 'Id': None}],
+                      [{**self.fake_image_inspect[0], 'Id': 123}],
+                      [{**self.fake_image_inspect[0], 'Id': ''}],
+                      [{**self.fake_image_inspect[0], 'Id': 'malformed'}],
+                      [{**self.fake_image_inspect[0], 'Id': marker}],
+                      [{'Architecture': 'amd64', 'Os': 'linux', 'Id': cli.PINNED_CONFIG_ID}],
+                      [{**self.fake_image_inspect[0], 'RepoDigests': ['wrong']}],
+                      [{**self.fake_image_inspect[0], 'Architecture': 'arm64'}]):
+            with self.subTest(value=value):
+                runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=json.dumps(value).encode()))
+                with self.assertRaises(cli.RunnerError) as caught:
+                    cli.verify_pinned_image(self.pinned_image, runner=runner)
+                self.assertNotIn(marker, str(caught.exception))
+
+    def test_verify_pinned_image_malformed_json_has_fixed_error(self):
+        runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=b'{"Id":"secret-marker"'))
+        with self.assertRaisesRegex(cli.RunnerError, '^failed to parse image inspect output$') as caught:
+            cli.verify_pinned_image(self.pinned_image, runner=runner)
+        self.assertNotIn('secret-marker', str(caught.exception))
+
+    def test_verify_pinned_image_rejects_duplicate_keys_and_multiple_objects(self):
+        for raw in (b'[{"Id":"sha256:one","Id":"sha256:two"}]',
+                    json.dumps(self.fake_image_inspect * 2).encode()):
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=raw))
+            with self.assertRaises(cli.RunnerError):
+                cli.verify_pinned_image(self.pinned_image, runner=runner)
+
+    def test_verify_pinned_image_rejects_wrong_os(self):
+        bad = copy.deepcopy(self.fake_image_inspect)
+        bad[0]['Os'] = 'windows'
+        self.assert_image_rejected(bad, 'linux/amd64 required')
+
+    def assert_image_rejected(self, data, message):
+        runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=json.dumps(data).encode()))
+        with self.assertRaisesRegex(cli.RunnerError, message):
+            cli.verify_pinned_image(self.pinned_image, runner=runner)
 
     def test_verify_pinned_image_missing_fails(self):
         runner = mock.Mock(return_value=mock.Mock(returncode=1, stderr=b'Error: No such image'))
@@ -208,7 +367,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
         helper_inspect = [{
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'HostConfig': {'Tmpfs': cli.READBACK_TMPFS},
             'Mounts': [{'Type': 'volume', 'Name': 'test_vol', 'Destination': '/mosquitto/dynsec', 'RW': False}],
             'Config': {
@@ -245,10 +404,48 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         digest = cli.readback_and_verify_store(
-            'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+            'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
             run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
         )
         self.assertEqual(digest, hashlib.sha256(self.fake_store_raw).hexdigest())
+
+    def test_root_index_helper_receipt_requires_platform_manifest_descriptor(self):
+        cid = 'b' * 64
+        root_image = 'sha256:' + cli.PINNED_DIGEST
+        removed = []
+        inspected = {'Id': cid, 'Name': '/dynsec-readback-helper-test', 'Image': root_image,
+                     'HostConfig': {'Tmpfs': cli.READBACK_TMPFS},
+                     'Mounts': [{'Type': 'volume', 'Name': 'test_vol',
+                                 'Destination': '/mosquitto/dynsec', 'RW': False}],
+                     'Config': {'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}},
+                     'State': {'ExitCode': 0, 'Status': 'exited'}}
+
+        def fake_runner(cmd, **kwargs):
+            if cmd[:2] == ['docker', 'create']:
+                return mock.Mock(returncode=0, stdout=cid.encode())
+            if cmd[:2] == ['docker', 'start']:
+                return mock.Mock(returncode=0, stdout=b'1883:1883:700\n1883:1883:600\n' + self.fake_store_raw)
+            if cmd[:3] == ['docker', 'container', 'inspect']:
+                if removed:
+                    return mock.Mock(returncode=1, stderr=b'no such container')
+                return mock.Mock(returncode=0, stdout=json.dumps([inspected]).encode())
+            if cmd[:3] == ['docker', 'rm', '-f']:
+                removed.append(cmd[-1])
+                return mock.Mock(returncode=0)
+            raise AssertionError(cmd)
+
+        with self.assertRaisesRegex(cli.RunnerError, 'manifest descriptor mismatch'):
+            cli.readback_and_verify_store('test_vol', root_image, 'mgr_user', 'be_user',
+                                          run_nonce='run123', task_label='dynsec-readback-helper',
+                                          runner=fake_runner)
+        self.assertEqual(removed, [])
+        inspected['ImageManifestDescriptor'] = {
+            'digest': cli.PINNED_PLATFORM_MANIFEST_DIGEST,
+            'mediaType': 'application/vnd.oci.image.manifest.v1+json'}
+        self.assertEqual(cli.readback_and_verify_store('test_vol', root_image, 'mgr_user', 'be_user',
+                                                       run_nonce='run123', task_label='dynsec-readback-helper',
+                                                       runner=fake_runner), hashlib.sha256(self.fake_store_raw).hexdigest())
+        self.assertTrue(removed)
 
     # --- DEFECT 1: Authoritative Absence & Helper State ---
     def test_helper_inspect_exit_code_failure(self):
@@ -259,7 +456,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             'Mounts': [{'Type': 'volume', 'Name': 'test_vol', 'Destination': '/mosquitto/dynsec', 'RW': False}],
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}},
             'State': {'ExitCode': 137, 'Status': 'exited'}
         }]
@@ -280,7 +477,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.RunnerError, 'helper container execution failed with non-zero exit code'):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
             )
 
@@ -290,7 +487,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
         helper_inspect = [{
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}},
             'State': {'ExitCode': 0, 'Status': 'exited'}
         }]
@@ -312,7 +509,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.RunnerError, 'helper container absence verification failed'):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
             )
 
@@ -323,7 +520,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
         foreign_helper_inspect = [{
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {'Labels': {'test.run': 'other_run', 'test.task': 'other_task'}},
             'State': {'ExitCode': 0, 'Status': 'exited'}
         }]
@@ -342,7 +539,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.RunnerError, 'helper container receipt ownership mismatch'):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
             )
         self.assertEqual(removed, [])
@@ -357,7 +554,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             'Mounts': [{'Type': 'volume', 'Name': 'test_vol', 'Destination': '/mosquitto/dynsec', 'RW': False}],
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}},
             'State': {'ExitCode': 0, 'Status': 'exited'}
         }]
@@ -378,7 +575,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.RunnerError, 'manager client role mismatch'):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
             )
 
@@ -392,7 +589,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             'Mounts': [{'Type': 'volume', 'Name': 'test_vol', 'Destination': '/mosquitto/dynsec', 'RW': False}],
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}},
             'State': {'ExitCode': 0, 'Status': 'exited'}
         }]
@@ -413,7 +610,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.RunnerError, 'client disabled flag must be absent or False'):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
             )
 
@@ -427,7 +624,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             'Mounts': [{'Type': 'volume', 'Name': 'test_vol', 'Destination': '/mosquitto/dynsec', 'RW': False}],
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}},
             'State': {'ExitCode': 0, 'Status': 'exited'}
         }]
@@ -448,7 +645,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.RunnerError, 'client native hash schema invalid'):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=fake_runner
             )
 
@@ -791,7 +988,7 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
         helper_inspect = [{
             'Id': cid,
             'Name': '/dynsec-readback-helper-123',
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {
                 'Labels': {'test.run': '11223344556677889900aabbccddeeff', 'test.task': 'dynsec-bootstrap-test'}
             },
@@ -889,7 +1086,10 @@ class TestDynsecBootstrapCliRunner(unittest.TestCase):
             self.assertTrue(report['collision_rejected'])
             self.assertEqual(report['ownership'], '1883:1883')
             self.assertEqual(report['runtime_status'], 'NOT_READY')
-            self.assertTrue(set(report.keys()).issubset(cli.SAFE_REPORT_KEYS))
+            self.assertEqual(set(report.keys()), cli.SAFE_REPORT_KEYS)
+            self.assertEqual(report['image_ref'], 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9')
+            self.assertEqual(report['image_digest'], 'sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9')
+            self.assertNotEqual(report['image_digest'], cli.PINNED_CONFIG_ID)
 
             with open(rep_path) as rf:
                 saved = json.load(rf)
@@ -1100,12 +1300,12 @@ class TestDynsecBootstrapCliCancellation(unittest.TestCase):
 
     def setUp(self):
         self.pinned_image = cli.PINNED_IMAGE
-        self.pinned_digest = cli.PINNED_DIGEST
+        self.pinned_config_id = cli.PINNED_CONFIG_ID
         self.fake_image_inspect = [{
             'Architecture': 'amd64',
             'Os': 'linux',
             'RepoDigests': [self.pinned_image],
-            'Id': 'sha256:' + self.pinned_digest
+            'Id': cli.PINNED_CONFIG_ID
         }]
         self.fake_store = create_fake_store('mgr_1111', 'be_2222')
         self.fake_store_raw = json.dumps(self.fake_store).encode('utf-8')
@@ -1242,7 +1442,7 @@ class TestDynsecBootstrapCliCancellation(unittest.TestCase):
             'Name': '/dynsec-readback-helper-interrupted',
             'HostConfig': {'Tmpfs': cli.READBACK_TMPFS},
             'Mounts': [{'Type': 'volume', 'Name': 'test_vol', 'Destination': '/mosquitto/dynsec', 'RW': False}],
-            'Image': 'sha256:' + self.pinned_digest,
+            'Image': self.pinned_config_id,
             'Config': {
                 'Labels': {'test.run': 'run123', 'test.task': 'dynsec-readback-helper'}
             },
@@ -1269,7 +1469,7 @@ class TestDynsecBootstrapCliCancellation(unittest.TestCase):
 
         with self.assertRaises(cli.RunnerInterrupted):
             cli.readback_and_verify_store(
-                'test_vol', 'sha256:' + self.pinned_digest, 'mgr_user', 'be_user',
+                'test_vol', self.pinned_config_id, 'mgr_user', 'be_user',
                 run_nonce='run123', task_label='dynsec-readback-helper', runner=mock_runner
             )
         self.assertTrue(helper_cleaned, "Helper container must be force-removed when interrupted during execution")

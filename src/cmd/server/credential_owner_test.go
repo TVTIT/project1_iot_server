@@ -40,7 +40,7 @@ func (c *fakeConn) QueryRow(ctx context.Context, sql string, args ...any) pgx.Ro
 	return fakeRow{}
 }
 
-func (c *fakeConn) Close(ctx context.Context) error {
+func (c *fakeConn) Close(_ context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
@@ -56,7 +56,7 @@ func (c *fakeConn) IsClosed() bool {
 
 func TestCredentialOwner_AcquireSuccess(t *testing.T) {
 	conn := &fakeConn{
-		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFunc: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			if sql == "SELECT pg_try_advisory_lock($1)" {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = true
@@ -67,7 +67,7 @@ func TestCredentialOwner_AcquireSuccess(t *testing.T) {
 		},
 	}
 
-	acquirer := func(ctx context.Context) (ownerDBConn, error) {
+	acquirer := func(_ context.Context) (ownerDBConn, error) {
 		return conn, nil
 	}
 
@@ -83,14 +83,12 @@ func TestCredentialOwner_AcquireSuccess(t *testing.T) {
 	}
 
 	// Clean up
-	if err := owner.Close(context.Background(), time.Second); err != nil {
-		// unlock might return nil if we mock it or unlockErr
-	}
+	_ = owner.Close(context.Background(), time.Second)
 }
 
 func TestCredentialOwner_AcquireDenied(t *testing.T) {
 	conn := &fakeConn{
-		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFunc: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			if sql == "SELECT pg_try_advisory_lock($1)" {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = false // Already locked by another owner
@@ -101,7 +99,7 @@ func TestCredentialOwner_AcquireDenied(t *testing.T) {
 		},
 	}
 
-	acquirer := func(ctx context.Context) (ownerDBConn, error) {
+	acquirer := func(_ context.Context) (ownerDBConn, error) {
 		return conn, nil
 	}
 
@@ -120,7 +118,7 @@ func TestCredentialOwner_AcquireDenied(t *testing.T) {
 func TestCredentialOwner_AcquireFailuresCloseResource(t *testing.T) {
 	// Subtest 1: acquirer fails or returns nil conn
 	t.Run("AcquirerFailsOrReturnsNil", func(t *testing.T) {
-		acquirer := func(ctx context.Context) (ownerDBConn, error) {
+		acquirer := func(_ context.Context) (ownerDBConn, error) {
 			return nil, errors.New("underlying network down")
 		}
 		owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
@@ -141,7 +139,7 @@ func TestCredentialOwner_AcquireFailuresCloseResource(t *testing.T) {
 		}
 
 		// Acquirer returns nil conn with nil error defensively handled
-		acquirerNilConn := func(ctx context.Context) (ownerDBConn, error) {
+		acquirerNilConn := func(_ context.Context) (ownerDBConn, error) {
 			return nil, nil
 		}
 		ownerNilConn, errNilConn := acquireCredentialOwnerWithAcquirer(context.Background(), acquirerNilConn, credentialOwnerLockKey, time.Second)
@@ -156,13 +154,13 @@ func TestCredentialOwner_AcquireFailuresCloseResource(t *testing.T) {
 	// Subtest 2: query row / lock fails during acquire
 	t.Run("LockQueryFails", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
-				return fakeRow{scanFunc: func(dest ...any) error {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return fakeRow{scanFunc: func(_ ...any) error {
 					return errors.New("db syntax error or conn abort")
 				}}
 			},
 		}
-		acquirer := func(ctx context.Context) (ownerDBConn, error) {
+		acquirer := func(_ context.Context) (ownerDBConn, error) {
 			return conn, nil
 		}
 		owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
@@ -183,13 +181,13 @@ func TestCredentialOwner_AcquireFailuresCloseResource(t *testing.T) {
 		cancel()
 
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
-				return fakeRow{scanFunc: func(dest ...any) error {
+			queryRowFunc: func(ctx context.Context, _ string, _ ...any) pgx.Row {
+				return fakeRow{scanFunc: func(_ ...any) error {
 					return ctx.Err()
 				}}
 			},
 		}
-		acquirer := func(ctx context.Context) (ownerDBConn, error) {
+		acquirer := func(_ context.Context) (ownerDBConn, error) {
 			return conn, nil
 		}
 		owner, err := acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, time.Second)
@@ -221,7 +219,7 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 		var capturedSQL string
 		var capturedArgs []any
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, sql string, args ...any) pgx.Row {
 				capturedSQL = sql
 				capturedArgs = args
 				return fakeRow{scanFunc: func(dest ...any) error {
@@ -272,7 +270,7 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 	t.Run("PermanentlyLatchedUnavailableAfterFailure", func(t *testing.T) {
 		var queryCount int32
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				atomic.AddInt32(&queryCount, 1)
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = false // Missing lock
@@ -309,7 +307,7 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 	t.Run("CancellationBeforeQueryDoesNotPoison", func(t *testing.T) {
 		var queryCount int32
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				atomic.AddInt32(&queryCount, 1)
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = true
@@ -346,7 +344,7 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 
 	t.Run("HeldExactSession", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = true
 					return nil
@@ -365,7 +363,7 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 
 	t.Run("NotHeldOrWrongSession", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = false // Missing or owned by another PID
 					return nil
@@ -400,8 +398,8 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 
 	t.Run("QueryErrorDuringCheck", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
-				return fakeRow{scanFunc: func(dest ...any) error {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return fakeRow{scanFunc: func(_ ...any) error {
 					return errors.New("read tcp: connection reset by peer")
 				}}
 			},
@@ -429,14 +427,14 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 
 	t.Run("DefaultTimeoutBranch", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = true
 					return nil
 				}}
 			},
 		}
-		acquirer := func(ctx context.Context) (ownerDBConn, error) {
+		acquirer := func(_ context.Context) (ownerDBConn, error) {
 			return conn, nil
 		}
 		// timeout <= 0 triggers default timeout branch (5s)
@@ -459,8 +457,8 @@ func TestCredentialOwner_CheckOwnership(t *testing.T) {
 		cancel()
 
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
-				return fakeRow{scanFunc: func(dest ...any) error {
+			queryRowFunc: func(ctx context.Context, _ string, _ ...any) pgx.Row {
+				return fakeRow{scanFunc: func(_ ...any) error {
 					return ctx.Err()
 				}}
 			},
@@ -480,7 +478,7 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 	t.Run("CloseReturnsSafeCloseError", func(t *testing.T) {
 		conn := &fakeConn{
 			closeErr: errors.New("raw network error with secret sensitive-conn-info"),
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = true // Unlock succeeded
 					return nil
@@ -508,8 +506,8 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 	t.Run("ClosePreservesPrimaryUnlockErrorWhenBothFail", func(t *testing.T) {
 		conn := &fakeConn{
 			closeErr: errors.New("underlying close failed"),
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
-				return fakeRow{scanFunc: func(dest ...any) error {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return fakeRow{scanFunc: func(_ ...any) error {
 					return errors.New("unlock execution failure")
 				}}
 			},
@@ -530,7 +528,7 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 
 	t.Run("CloseAfterPoisonStillClosesOnce", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = false // Missing lock poisons owner
 					return nil
@@ -567,7 +565,7 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 
 	t.Run("UnlockSuccess", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = true
 					return nil
@@ -600,8 +598,8 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 
 	t.Run("UnlockFailsStillClosesConn", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
-				return fakeRow{scanFunc: func(dest ...any) error {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return fakeRow{scanFunc: func(_ ...any) error {
 					return errors.New("unlock execution failure")
 				}}
 			},
@@ -622,7 +620,7 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 
 	t.Run("UnlockFalseStillClosesConn", func(t *testing.T) {
 		conn := &fakeConn{
-			queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return fakeRow{scanFunc: func(dest ...any) error {
 					*(dest[0].(*bool)) = false // not held
 					return nil
@@ -646,7 +644,7 @@ func TestCredentialOwner_CloseIdempotentAndReleases(t *testing.T) {
 
 func TestCredentialOwner_ConcurrencySafety(t *testing.T) {
 	conn := &fakeConn{
-		queryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return fakeRow{scanFunc: func(dest ...any) error {
 				*(dest[0].(*bool)) = true
 				return nil

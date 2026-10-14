@@ -86,5 +86,39 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(calls[1][0], ['docker', 'rm', '-f', 'backend-readiness'])
 
 
+class StartupEnvironmentTests(unittest.TestCase):
+    def test_environment_contains_required_qualification_and_store_contract(self):
+        spike = MagicMock()
+        spike.passwords = {'admin': 'admin_pass', 'backend': 'backend_pass'}
+        payload = {'AppDSN': 'postgres://user:pass@db:5432/app', 'AdminDSN': 'postgres://admin:pass@db:5432/admin'}
+        env = harness.build_standalone_environment(payload, 'test_jwt_secret', spike)
+
+        # Qualification inputs required by src/internal/config/credential.go
+        self.assertEqual(env['MQTT_CREDENTIAL_API_ENABLED'], 'true')
+        self.assertEqual(env['MQTT_DYNSEC_WRITER_UID'], '1883')
+        self.assertEqual(env['MQTT_DYNSEC_IMAGE_REFERENCE'], harness.IMAGE)
+        self.assertEqual(env['MQTT_DYNSEC_IMAGE_CONFIG_ID'], harness.CONFIG_ID)
+        self.assertEqual(env['MQTT_DYNSEC_PLATFORM'], harness.PLATFORM)
+        self.assertEqual(env['MQTT_DYNSEC_JSON_PATH'], '/security/dynsec.json')
+
+        # Pinned qualification constants must match verified release identity
+        self.assertEqual(env['MQTT_DYNSEC_IMAGE_REFERENCE'],
+                         'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9')
+        self.assertEqual(env['MQTT_DYNSEC_IMAGE_CONFIG_ID'],
+                         'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4')
+        self.assertEqual(env['MQTT_DYNSEC_PLATFORM'], 'linux/amd64')
+
+    def test_disabled_environment_omits_all_mqtt_credential_variables(self):
+        spike = MagicMock()
+        spike.passwords = {'admin': 'admin_pass', 'backend': 'backend_pass'}
+        payload = {'AppDSN': 'postgres://user:pass@db:5432/app', 'AdminDSN': 'postgres://admin:pass@db:5432/admin'}
+        env = harness.build_standalone_environment(payload, 'test_jwt_secret', spike, enabled=False)
+
+        mqtt_keys = [k for k in env if k.startswith('MQTT_')]
+        self.assertEqual(mqtt_keys, [], f"Disabled environment must omit all MQTT_ variables, got {mqtt_keys}")
+        self.assertEqual(env['DATABASE_URL'], payload['AppDSN'])
+        self.assertEqual(env['SUPABASE_JWT_SECRET'], 'test_jwt_secret')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -290,7 +290,7 @@ type fakeConn struct {
 	closeErr error
 }
 
-func (f *fakeConn) Read(b []byte) (n int, err error) {
+func (f *fakeConn) Read(_ []byte) (n int, err error) {
 	return 0, f.readErr
 }
 

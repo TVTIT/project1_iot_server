@@ -618,6 +618,10 @@ class IsolatedE2EStack:
                 f"MQTT_INTERNAL_MANAGEMENT_URL=ssl://localhost:18884\n"
                 f"MQTT_TLS_CA_FILE=/ca.crt\n"
                 f"MQTT_DYNSEC_JSON_PATH=/security/dynsec.json\n"
+                f"MQTT_DYNSEC_WRITER_UID=1883\n"
+                f"MQTT_DYNSEC_IMAGE_REFERENCE=eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9\n"
+                f"MQTT_DYNSEC_IMAGE_CONFIG_ID=sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4\n"
+                f"MQTT_DYNSEC_PLATFORM=linux/amd64\n"
                 f"MQTT_CONTROLLER_DIR=/control\n"
                 f"MQTT_CREDENTIAL_RECONCILE_TIMEOUT=30s\n"
             )

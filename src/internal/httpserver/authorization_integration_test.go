@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"iot-platform/internal/auth"
@@ -249,6 +251,10 @@ func TestAdminGatewayInventoryHTTPAuthorizationIntegration(t *testing.T) {
 	}
 	defer pool.Close()
 
+	t.Run("fixture teardown order regression", func(t *testing.T) {
+		testAdminGatewayInventoryTeardownOrderRegression(ctx, t, setup)
+	})
+
 	testAdminGatewayInventoryHTTP(ctx, t, setup, pool)
 }
 
@@ -270,13 +276,13 @@ func testAdminGatewayInventoryHTTP(ctx context.Context, t *testing.T, setup *pgx
 	}
 
 	exec("INSERT INTO profiles(id) VALUES ($1),($2)", admin, nonAdmin)
-	defer func() {
-		c, stop := context.WithTimeout(context.Background(), 5*time.Second)
-		defer stop()
-		_, _ = setup.Exec(c, "DELETE FROM gateways WHERE gateway_id IN ($1,$2,$3,$4,$5)", g0, g1, gA, gZ, ga)
-		_, _ = setup.Exec(c, "DELETE FROM platform_admins WHERE user_id=$1", admin)
-		_, _ = setup.Exec(c, "DELETE FROM profiles WHERE id IN ($1,$2)", admin, nonAdmin)
-	}()
+	defer cleanupOwnedAdminInventoryFixtures(
+		t, setup,
+		[]string{"urn:ngsi-ld:Sensor:" + g0 + ":temp_http", "urn:ngsi-ld:Gateway:" + g0},
+		[]string{g0, g1, gA, gZ, ga},
+		[]uuid.UUID{admin},
+		[]uuid.UUID{admin, nonAdmin},
+	)
 
 	exec("INSERT INTO platform_admins(user_id) VALUES ($1)", admin)
 	exec("INSERT INTO gateways(gateway_id, name, description, created_at) VALUES ($1,'Gate 0',NULL,NULL),($2,'Gate 1','desc1',now()),($3,'Gate A','descA',now()),($4,'Gate Z','descZ',now()),($5,'Gate a','desca',now())", g0, g1, gA, gZ, ga)
@@ -582,5 +588,141 @@ func testAdminGatewayInventoryHTTP(ctx context.Context, t *testing.T, setup *pgx
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("admin without owner membership expected 404 on owner route, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func cleanupOwnedAdminInventoryFixtures(t *testing.T, setup *pgxpool.Pool, entityURNs []string, gatewayIDs []string, adminIDs []uuid.UUID, profileIDs []uuid.UUID) {
+	t.Helper()
+	c, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+
+	for _, urn := range entityURNs {
+		if _, err := setup.Exec(c, "DELETE FROM twin_entities WHERE entity_id=$1", urn); err != nil {
+			t.Errorf("cleanup twin_entities (%s) failed: %v", urn, err)
+		}
+	}
+	for _, gid := range gatewayIDs {
+		if _, err := setup.Exec(c, "DELETE FROM gateways WHERE gateway_id=$1", gid); err != nil {
+			t.Errorf("cleanup gateways (%s) failed: %v", gid, err)
+		}
+	}
+	for _, aid := range adminIDs {
+		if _, err := setup.Exec(c, "DELETE FROM platform_admins WHERE user_id=$1", aid); err != nil {
+			t.Errorf("cleanup platform_admins (%s) failed: %v", aid, err)
+		}
+	}
+	for _, pid := range profileIDs {
+		if _, err := setup.Exec(c, "DELETE FROM profiles WHERE id=$1", pid); err != nil {
+			t.Errorf("cleanup profiles (%s) failed: %v", pid, err)
+		}
+	}
+}
+
+func testAdminGatewayInventoryTeardownOrderRegression(ctx context.Context, t *testing.T, setup *pgxpool.Pool) {
+	t.Helper()
+
+	// 1. Create a sentinel gateway that must survive teardown of the test fixtures.
+	sentinelPrefix := "z_sentinel_" + uuid.NewString()[:8]
+	sentinelGID := sentinelPrefix + "_keep"
+	if _, err := setup.Exec(ctx, "INSERT INTO gateways(gateway_id, name) VALUES ($1, 'Sentinel Gateway')", sentinelGID); err != nil {
+		t.Fatalf("failed to insert sentinel gateway: %v", err)
+	}
+	defer func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if _, err := setup.Exec(cleanupCtx, "DELETE FROM gateways WHERE gateway_id=$1", sentinelGID); err != nil {
+			t.Errorf("cleanup of sentinel gateway failed: %v", err)
+		}
+	}()
+
+	// 2. Set up target owned fixtures: admin profile, nonAdmin profile, gateway, membership, twin_entity, twin_state.
+	adminID, nonAdminID := uuid.New(), uuid.New()
+	targetPrefix := "z_regtest_" + uuid.NewString()[:8]
+	targetGID := targetPrefix + "_gw"
+	targetEntityURN := "urn:ngsi-ld:Gateway:" + targetGID
+
+	// Register deferred fallback cleanup early so partial setup failure cannot leak target rows.
+	defer cleanupOwnedAdminInventoryFixtures(
+		t, setup,
+		[]string{targetEntityURN},
+		[]string{targetGID},
+		[]uuid.UUID{adminID},
+		[]uuid.UUID{adminID, nonAdminID},
+	)
+
+	if _, err := setup.Exec(ctx, "INSERT INTO profiles(id) VALUES ($1), ($2)", adminID, nonAdminID); err != nil {
+		t.Fatalf("setup profiles failed: %v", err)
+	}
+	if _, err := setup.Exec(ctx, "INSERT INTO platform_admins(user_id) VALUES ($1)", adminID); err != nil {
+		t.Fatalf("setup platform_admins failed: %v", err)
+	}
+	if _, err := setup.Exec(ctx, "INSERT INTO gateways(gateway_id, name) VALUES ($1, 'Reg Target')", targetGID); err != nil {
+		t.Fatalf("setup gateway failed: %v", err)
+	}
+	if _, err := setup.Exec(ctx, "INSERT INTO user_gateways(user_id, gateway_id, role) VALUES ($1, $2, 'owner')", nonAdminID, targetGID); err != nil {
+		t.Fatalf("setup user_gateways failed: %v", err)
+	}
+	if _, err := setup.Exec(ctx, "INSERT INTO twin_entities(entity_id, entity_type, name, gateway_id) VALUES ($1, 'Gateway', 'Reg Target', $2)", targetEntityURN, targetGID); err != nil {
+		t.Fatalf("setup twin_entities failed: %v", err)
+	}
+	var targetTwinUUID uuid.UUID
+	if err := setup.QueryRow(ctx, "SELECT id FROM twin_entities WHERE entity_id=$1", targetEntityURN).Scan(&targetTwinUUID); err != nil {
+		t.Fatalf("query twin_entities UUID failed: %v", err)
+	}
+	if _, err := setup.Exec(ctx, "INSERT INTO twin_states(entity_id) VALUES ($1)", targetTwinUUID); err != nil {
+		t.Fatalf("setup twin_states failed: %v", err)
+	}
+
+	// 3. Regression assertion: Attempting to delete the gateway BEFORE deleting the referencing twin_entities
+	// MUST fail specifically with Postgres error 23503 (foreign_key_violation) on fk_twin_entities_gateway.
+	_, deleteGWFirstErr := setup.Exec(ctx, "DELETE FROM gateways WHERE gateway_id=$1", targetGID)
+	if deleteGWFirstErr == nil {
+		t.Fatal("expected foreign key violation when deleting gateway before twin_entities, but error was nil")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(deleteGWFirstErr, &pgErr) {
+		t.Fatalf("expected pgconn.PgError on wrong-order delete, got: %T (%v)", deleteGWFirstErr, deleteGWFirstErr)
+	}
+	if pgErr.Code != "23503" {
+		t.Fatalf("expected Postgres error code 23503 (foreign_key_violation), got: %s", pgErr.Code)
+	}
+	if pgErr.ConstraintName != "fk_twin_entities_gateway" {
+		t.Fatalf("expected constraint fk_twin_entities_gateway, got: %s", pgErr.ConstraintName)
+	}
+
+	// 4. Correct teardown execution: invoke the shared cleanup helper.
+	cleanupOwnedAdminInventoryFixtures(
+		t, setup,
+		[]string{targetEntityURN},
+		[]string{targetGID},
+		[]uuid.UUID{adminID},
+		[]uuid.UUID{adminID, nonAdminID},
+	)
+
+	// 5. Verification: All owned rows are gone.
+	var count int
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_entities WHERE entity_id=$1", targetEntityURN).Scan(&count); err != nil || count != 0 {
+		t.Errorf("expected 0 twin_entities, got count=%d, err=%v", count, err)
+	}
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM twin_states WHERE entity_id=$1", targetTwinUUID).Scan(&count); err != nil || count != 0 {
+		t.Errorf("expected 0 twin_states, got count=%d, err=%v", count, err)
+	}
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM gateways WHERE gateway_id=$1", targetGID).Scan(&count); err != nil || count != 0 {
+		t.Errorf("expected 0 gateways, got count=%d, err=%v", count, err)
+	}
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM user_gateways WHERE gateway_id=$1", targetGID).Scan(&count); err != nil || count != 0 {
+		t.Errorf("expected 0 user_gateways, got count=%d, err=%v", count, err)
+	}
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM platform_admins WHERE user_id=$1", adminID).Scan(&count); err != nil || count != 0 {
+		t.Errorf("expected 0 platform_admins, got count=%d, err=%v", count, err)
+	}
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM profiles WHERE id IN ($1, $2)", adminID, nonAdminID).Scan(&count); err != nil || count != 0 {
+		t.Errorf("expected 0 profiles, got count=%d, err=%v", count, err)
+	}
+
+	// 6. Verification: Sentinel gateway is untouched.
+	var sentinelCount int
+	if err := setup.QueryRow(ctx, "SELECT count(*) FROM gateways WHERE gateway_id=$1", sentinelGID).Scan(&sentinelCount); err != nil || sentinelCount != 1 {
+		t.Errorf("expected sentinel gateway to exist, got count=%d, err=%v", sentinelCount, err)
 	}
 }

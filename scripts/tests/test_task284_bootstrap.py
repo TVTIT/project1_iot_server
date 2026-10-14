@@ -77,14 +77,20 @@ def with_allocation_receipts(runner):
             mount = cmd[cmd.index('--mount') + 1]
             fields = dict(p.split('=', 1) for p in mount.split(',') if '=' in p)
             labels = dict(cmd[i + 1].split('=', 1) for i, v in enumerate(cmd) if v == '--label')
+            img = cmd[cmd.index('--entrypoint') + 2]
             rec = {'Id': cid, 'Name': '/' + cmd[cmd.index('--name') + 1],
-                   'Image': cmd[cmd.index('--entrypoint') + 2],
+                   'Image': img,
                    'Config': {'User': cmd[cmd.index('--user') + 1], 'Labels': labels},
                    'Mounts': [{'Type': fields['type'], 'Name': fields['src'], 'Source': fields['src'],
                                'Destination': fields['dst'], 'RW': 'readonly' not in mount.split(',')}],
                    'HostConfig': {'Tmpfs': dict(cmd[i + 1].split(':', 1) for i, v in enumerate(cmd) if v == '--tmpfs'),
                        'Mounts': [{'Type': fields['type'], 'Source': fields['src'],
                        'Target': fields['dst'], 'ReadOnly': 'readonly' in mount.split(',')}]}}
+            if img.lower() == ('sha256:' + load().PINNED_DIGEST).lower():
+                rec['ImageManifestDescriptor'] = {
+                    'digest': load().PINNED_PLATFORM_MANIFEST_DIGEST,
+                    'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+                }
             receipts[cid] = rec
             receipts[rec['Name'][1:]] = rec
         if cmd[:3] == ['docker', 'container', 'inspect'] and result.returncode == 0:
@@ -148,6 +154,10 @@ class CancellationOwnershipBoundaryTests(unittest.TestCase):
                     return mock.Mock(returncode=1, stderr=b'no such container')
                 rec = {'Id': cid, 'Name': '/' + item['name'], 'Image': item['image'],
                        'Config': {'Labels': {'bootstrap.nonce': item['nonce']}, 'User': item['user']},
+                       'ImageManifestDescriptor': {
+                           'digest': module.PINNED_PLATFORM_MANIFEST_DIGEST,
+                           'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+                       },
                        'Mounts': [{'Type': m['Type'], 'Name': m['Source'], 'Source': m['Source'], 'Destination': m['Target'], 'RW': not m['ReadOnly']} for m in item['mounts']],
                        'HostConfig': {'Mounts': item['mounts'], 'Tmpfs': item['tmpfs']}}
                 return mock.Mock(returncode=0, stdout=json.dumps([rec]).encode())
@@ -192,6 +202,10 @@ class CancellationOwnershipBoundaryTests(unittest.TestCase):
             item = tracker[0]
             rec = {'Id': item['id'], 'Name': '/' + item['name'], 'Image': item['image'],
                    'Config': {'Labels': {'bootstrap.nonce': item['nonce']}, 'User': item['user']},
+                   'ImageManifestDescriptor': {
+                       'digest': module.PINNED_PLATFORM_MANIFEST_DIGEST,
+                       'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+                   },
                    'HostConfig': {'Mounts': []}}
             return mock.Mock(returncode=0, stdout=json.dumps([rec]).encode())
         self.assertEqual(module.cleanup_containers(tracker, runner=runner), ['a' * 64])
@@ -203,7 +217,7 @@ class CancellationOwnershipBoundaryTests(unittest.TestCase):
         def runner(cmd, **kwargs):
             calls.append(cmd)
             rec = {'Architecture': 'amd64', 'Os': 'linux',
-                   'RepoDigests': [module.PINNED_IMAGE], 'Id': 'sha256:' + module.PINNED_DIGEST}
+                   'RepoDigests': [module.PINNED_IMAGE], 'Id': module.PINNED_CONFIG_ID}
             return mock.Mock(returncode=0, stdout=json.dumps([rec]).encode())
         module.verify_image(module.PINNED_IMAGE, runner=runner)
         self.assertEqual(len(calls), 1)
@@ -221,6 +235,10 @@ class CancellationOwnershipBoundaryTests(unittest.TestCase):
             item = tracker[0]
             rec = {'Id': 'a' * 64, 'Name': '/' + item['name'], 'Image': item['image'],
                    'Config': {'Labels': {'bootstrap.nonce': item['nonce']}, 'User': item['user']},
+                   'ImageManifestDescriptor': {
+                       'digest': module.PINNED_PLATFORM_MANIFEST_DIGEST,
+                       'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+                   },
                     'Mounts': [{'Type': m['Type'], 'Name': m['Source'], 'Source': m['Source'], 'Destination': m['Target'], 'RW': not m['ReadOnly']} for m in item['mounts']],
                     'HostConfig': {'Mounts': item['mounts'], 'Tmpfs': item['tmpfs']}}
             return mock.Mock(returncode=0, stdout=json.dumps([rec]).encode())
@@ -511,7 +529,7 @@ class BootstrapTests(unittest.TestCase):
                     'Architecture': 'amd64',
                     'Os': 'linux',
                     'RepoDigests': [self.m.PINNED_IMAGE],
-                    'Id': 'sha256:' + self.m.PINNED_DIGEST
+                    'Id': self.m.PINNED_CONFIG_ID
                 }]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif cmd[:3] == ['docker', 'run', '--rm']:
@@ -523,22 +541,68 @@ class BootstrapTests(unittest.TestCase):
         # Failure: Wrong architecture
         def bad_arch(cmd, **kwargs):
             if cmd[:3] == ['docker', 'image', 'inspect']:
-                data = [{'Architecture': 'arm64', 'Os': 'linux', 'RepoDigests': [self.m.PINNED_IMAGE]}]
+                data = [{'Architecture': 'arm64', 'Os': 'linux', 'RepoDigests': [self.m.PINNED_IMAGE],
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             return mock.Mock(returncode=0)
 
         with self.assertRaisesRegex(self.m.BootstrapError, 'linux/amd64 required'):
             self.m.verify_image(self.m.PINNED_IMAGE, runner=bad_arch)
 
-        # Failure: Missing digest
+        # Failure: Wrong OS
+        def bad_os(cmd, **kwargs):
+            if cmd[:3] == ['docker', 'image', 'inspect']:
+                data = [{'Architecture': 'amd64', 'Os': 'windows', 'RepoDigests': [self.m.PINNED_IMAGE],
+                         'Id': self.m.PINNED_CONFIG_ID}]
+                return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
+            return mock.Mock(returncode=0)
+
+        with self.assertRaisesRegex(self.m.BootstrapError, 'linux/amd64 required'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=bad_os)
+
+        # Failure: Missing / wrong RepoDigests with correct config ID
         def bad_digest(cmd, **kwargs):
             if cmd[:3] == ['docker', 'image', 'inspect']:
-                data = [{'Architecture': 'amd64', 'Os': 'linux', 'RepoDigests': ['eclipse-mosquitto@sha256:000000']}]
+                data = [{'Architecture': 'amd64', 'Os': 'linux',
+                         'RepoDigests': ['eclipse-mosquitto@sha256:000000'],
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             return mock.Mock(returncode=0)
 
         with self.assertRaisesRegex(self.m.BootstrapError, 'image RepoDigests exact pin mismatch'):
             self.m.verify_image(self.m.PINNED_IMAGE, runner=bad_digest)
+
+        # Failure: RepoDigests is not a list (dict, str, null, int)
+        for bad_rd in ({self.m.PINNED_IMAGE: 'value'}, self.m.PINNED_IMAGE, None, 12345):
+            with self.subTest(repodigests=bad_rd):
+                def non_list_rd(cmd, **kwargs):
+                    if cmd[:3] == ['docker', 'image', 'inspect']:
+                        data = [{'Architecture': 'amd64', 'Os': 'linux',
+                                 'RepoDigests': bad_rd,
+                                 'Id': self.m.PINNED_CONFIG_ID}]
+                        return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
+                    return mock.Mock(returncode=0)
+                with self.assertRaisesRegex(self.m.BootstrapError, 'image RepoDigests exact pin mismatch'):
+                    self.m.verify_image(self.m.PINNED_IMAGE, runner=non_list_rd)
+
+        # Failure: Missing / malformed inspect metadata
+        def empty_inspect(cmd, **kwargs):
+            if cmd[:3] == ['docker', 'image', 'inspect']:
+                return mock.Mock(returncode=0, stdout=b'[]', stderr=b'')
+            return mock.Mock(returncode=0)
+
+        with self.assertRaisesRegex(self.m.BootstrapError, 'invalid image inspect metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=empty_inspect)
+
+        def malformed_id_inspect(cmd, **kwargs):
+            if cmd[:3] == ['docker', 'image', 'inspect']:
+                data = [{'Architecture': 'amd64', 'Os': 'linux', 'RepoDigests': [self.m.PINNED_IMAGE],
+                         'Id': 'not-a-valid-sha256'}]
+                return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
+            return mock.Mock(returncode=0)
+
+        with self.assertRaisesRegex(self.m.BootstrapError, 'image Id immutable digest mismatch'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=malformed_id_inspect)
 
     def test_container_bootstrap_partial_failure_teardown(self):
         created_vol = []
@@ -552,7 +616,7 @@ class BootstrapTests(unittest.TestCase):
             if c0 == 'docker' and c1 == 'image':
                 data = [{'Architecture': 'amd64', 'Os': 'linux',
                          'RepoDigests': [self.m.PINNED_IMAGE],
-                         'Id': 'sha256:' + self.m.PINNED_DIGEST}]
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif c0 == 'docker' and c1 == 'run' and '--entrypoint' in cmd:
                 return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
@@ -608,7 +672,7 @@ class BootstrapTests(unittest.TestCase):
             if c0 == 'docker' and c1 == 'image':
                 data = [{'Architecture': 'amd64', 'Os': 'linux',
                          'RepoDigests': [self.m.PINNED_IMAGE],
-                         'Id': 'sha256:' + self.m.PINNED_DIGEST}]
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif c0 == 'docker' and c1 == 'run' and '--entrypoint' in cmd:
                 return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
@@ -671,7 +735,7 @@ class BootstrapTests(unittest.TestCase):
             if c0 == 'docker' and c1 == 'image':
                 data = [{'Architecture': 'amd64', 'Os': 'linux',
                          'RepoDigests': [self.m.PINNED_IMAGE],
-                         'Id': 'sha256:' + self.m.PINNED_DIGEST}]
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif c0 == 'docker' and c1 == 'run' and '--entrypoint' in cmd:
                 return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
@@ -777,6 +841,40 @@ class BootstrapTests(unittest.TestCase):
                 with self.assertRaises(self.m.BootstrapError):
                     self.m.parse_config(io.StringIO(json.dumps(bad_cfg)), container_mode=True)
 
+    def test_verify_image_accepts_verified_tuple_and_rejects_index_as_config(self):
+        # Independently verified literal inspect metadata
+        verified_tuple_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4'
+        }]
+
+        def mock_verified_tuple(cmd, **kw):
+            if cmd[1] == 'image':
+                return mock.Mock(returncode=0, stdout=json.dumps(verified_tuple_inspect).encode(), stderr=b'')
+            return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
+
+        # Real verified inspect tuple accepted
+        res = self.m.verify_image(self.m.PINNED_IMAGE, runner=mock_verified_tuple)
+        self.assertEqual(res, 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4')
+
+        # Rejects root index digest as Id when Descriptor metadata is missing
+        index_as_config_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': 'sha256:' + self.m.PINNED_DIGEST
+        }]
+
+        def mock_index_as_config(cmd, **kw):
+            if cmd[1] == 'image':
+                return mock.Mock(returncode=0, stdout=json.dumps(index_as_config_inspect).encode(), stderr=b'')
+            return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
+
+        with self.assertRaisesRegex(self.m.BootstrapError, 'missing or malformed root index descriptor metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=mock_index_as_config)
+
     def test_verify_image_exact_repodigests_pin_and_immutable_id(self):
         # Exact match succeeds
         def mock_ok(cmd, **kw):
@@ -785,12 +883,12 @@ class BootstrapTests(unittest.TestCase):
                     'Architecture': 'amd64',
                     'Os': 'linux',
                     'RepoDigests': [self.m.PINNED_IMAGE],
-                    'Id': 'sha256:' + self.m.PINNED_DIGEST
+                    'Id': self.m.PINNED_CONFIG_ID
                 }]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
         img_id = self.m.verify_image(self.m.PINNED_IMAGE, runner=mock_ok)
-        self.assertEqual(img_id, 'sha256:' + self.m.PINNED_DIGEST)
+        self.assertEqual(img_id, self.m.PINNED_CONFIG_ID)
 
         # Substring digest spoof in RepoDigests is rejected
         def mock_spoof_repo(cmd, **kw):
@@ -799,7 +897,7 @@ class BootstrapTests(unittest.TestCase):
                     'Architecture': 'amd64',
                     'Os': 'linux',
                     'RepoDigests': ['attacker/' + self.m.PINNED_IMAGE],
-                    'Id': 'sha256:' + self.m.PINNED_DIGEST
+                    'Id': self.m.PINNED_CONFIG_ID
                 }]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
@@ -820,6 +918,389 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(self.m.BootstrapError, 'Id immutable digest mismatch'):
             self.m.verify_image(self.m.PINNED_IMAGE, runner=mock_bad_id)
 
+    def test_verify_image_containerd_root_index_store_accepted(self):
+        root_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': 'sha256:' + self.m.PINNED_DIGEST,
+            'Descriptor': {
+                'digest': 'sha256:' + self.m.PINNED_DIGEST,
+                'mediaType': 'application/vnd.oci.image.index.v1+json'
+            }
+        }]
+        platform_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'Id': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+            'Descriptor': {
+                'digest': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+                'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+            }
+        }]
+
+        def mock_containerd(cmd, **kw):
+            if cmd[:3] == ['docker', 'image', 'inspect']:
+                if '--platform' in cmd:
+                    self.assertEqual(cmd, ['docker', 'image', 'inspect', '--platform', 'linux/amd64', self.m.PINNED_IMAGE])
+                    return mock.Mock(returncode=0, stdout=json.dumps(platform_inspect).encode(), stderr=b'')
+                return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+            return mock.Mock(returncode=1)
+
+        res = self.m.verify_image(self.m.PINNED_IMAGE, runner=mock_containerd)
+        self.assertEqual(res, 'sha256:' + self.m.PINNED_DIGEST)
+
+    def test_verify_image_classic_store_with_valid_and_invalid_descriptor(self):
+        # Valid classic descriptor with exact supported pair (config digest with OCI image config mediaType)
+        valid_desc_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': {
+                'digest': self.m.PINNED_CONFIG_ID,
+                'mediaType': 'application/vnd.oci.image.config.v1+json'
+            }
+        }]
+        res = self.m.verify_image(self.m.PINNED_IMAGE,
+                                  runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(valid_desc_inspect).encode()))
+        self.assertEqual(res, self.m.PINNED_CONFIG_ID)
+
+        # Valid classic inspect with NO Descriptor present (descriptor is None / omitted)
+        no_desc_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID
+        }]
+        res_no_desc = self.m.verify_image(self.m.PINNED_IMAGE,
+                                          runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(no_desc_inspect).encode()))
+        self.assertEqual(res_no_desc, self.m.PINNED_CONFIG_ID)
+
+        # Rejection: config d259 with unknown mediaType
+        unknown_mt_desc = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': {
+                'digest': self.m.PINNED_CONFIG_ID,
+                'mediaType': 'application/vnd.unknown.custom.type.v1+json'
+            }
+        }]
+        with self.assertRaisesRegex(self.m.BootstrapError, 'unsupported image descriptor metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(unknown_mt_desc).encode()))
+
+        # Rejection: valid manifest f438 digest with swapped mediaType (e.g. index mediaType)
+        swapped_mt_desc = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': {
+                'digest': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+                'mediaType': 'application/vnd.oci.image.index.v1+json'
+            }
+        }]
+        with self.assertRaisesRegex(self.m.BootstrapError, 'unsupported image descriptor metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(swapped_mt_desc).encode()))
+
+        # Rejection: valid root d12c digest with config mediaType (swapped)
+        swapped_root_desc = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': {
+                'digest': 'sha256:' + self.m.PINNED_DIGEST,
+                'mediaType': 'application/vnd.oci.image.config.v1+json'
+            }
+        }]
+        with self.assertRaisesRegex(self.m.BootstrapError, 'unsupported image descriptor metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(swapped_root_desc).encode()))
+
+        # Malformed descriptor (not a dict: string, int, empty dict)
+        bad_desc1 = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': 'not-a-dict'
+        }]
+        with self.assertRaisesRegex(self.m.BootstrapError, 'malformed image descriptor metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(bad_desc1).encode()))
+
+        # Empty dict descriptor
+        empty_desc = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': {}
+        }]
+        with self.assertRaisesRegex(self.m.BootstrapError, 'malformed image descriptor metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(empty_desc).encode()))
+
+        # Contradictory descriptor digest
+        bad_desc2 = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': self.m.PINNED_CONFIG_ID,
+            'Descriptor': {
+                'digest': 'sha256:' + 'e'*64,
+                'mediaType': 'application/vnd.oci.image.config.v1+json'
+            }
+        }]
+        with self.assertRaisesRegex(self.m.BootstrapError, 'contradictory image descriptor digest'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps(bad_desc2).encode()))
+
+    def test_verify_image_containerd_rejects_spoofed_or_mismatched_descriptor(self):
+        base_root = {
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': 'sha256:' + self.m.PINNED_DIGEST,
+            'Descriptor': {
+                'digest': 'sha256:' + self.m.PINNED_DIGEST,
+                'mediaType': 'application/vnd.oci.image.index.v1+json'
+            }
+        }
+        # Wrong root descriptor digest
+        wrong_root_digest = dict(base_root, Descriptor={'digest': 'sha256:' + 'a'*64, 'mediaType': 'application/vnd.oci.image.index.v1+json'})
+        with self.assertRaisesRegex(self.m.BootstrapError, 'root index descriptor mismatch'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps([wrong_root_digest]).encode()))
+
+        # Wrong root descriptor mediaType
+        wrong_root_mt = dict(base_root, Descriptor={'digest': 'sha256:' + self.m.PINNED_DIGEST, 'mediaType': 'application/vnd.docker.distribution.manifest.v2+json'})
+        with self.assertRaisesRegex(self.m.BootstrapError, 'root index descriptor mismatch'):
+            self.m.verify_image(self.m.PINNED_IMAGE,
+                                runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps([wrong_root_mt]).encode()))
+
+    def test_verify_image_containerd_second_inspect_failure_and_mismatches(self):
+        root_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': 'sha256:' + self.m.PINNED_DIGEST,
+            'Descriptor': {
+                'digest': 'sha256:' + self.m.PINNED_DIGEST,
+                'mediaType': 'application/vnd.oci.image.index.v1+json'
+            }
+        }]
+
+        # 1. Platform inspect command failure
+        def fail_platform(cmd, **kw):
+            if '--platform' in cmd:
+                return mock.Mock(returncode=1, stdout=b'', stderr=b'unsupported platform')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'platform-specific image inspect failed'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=fail_platform)
+
+        # 2. Platform inspect timeout
+        def timeout_platform(cmd, **kw):
+            if '--platform' in cmd:
+                raise self.m.subprocess.TimeoutExpired(cmd, 10)
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'platform-specific image inspect failed or timed out'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=timeout_platform)
+
+        # 3. Platform inspect returns multiple records
+        def multi_platform(cmd, **kw):
+            if '--platform' in cmd:
+                return mock.Mock(returncode=0, stdout=json.dumps([{}, {}]).encode(), stderr=b'')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'invalid platform-specific image inspect metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=multi_platform)
+
+        # 3b. Platform inspect returns malformed JSON or duplicate keys
+        def malformed_json_platform(cmd, **kw):
+            if '--platform' in cmd:
+                return mock.Mock(returncode=0, stdout=b'{"not_a_list": true}', stderr=b'')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'invalid platform-specific image inspect metadata'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=malformed_json_platform)
+
+        def dup_keys_platform(cmd, **kw):
+            if '--platform' in cmd:
+                return mock.Mock(returncode=0, stdout=b'[{"Id": "sha256:1", "Id": "sha256:2"}]', stderr=b'')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'duplicate JSON field'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=dup_keys_platform)
+
+        # 4. Platform inspect Os / Architecture mismatch
+        def arch_mismatch(cmd, **kw):
+            if '--platform' in cmd:
+                return mock.Mock(returncode=0, stdout=json.dumps([{'Architecture': 'arm64', 'Os': 'linux'}]).encode(), stderr=b'')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'platform-specific image inspect os/architecture mismatch'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=arch_mismatch)
+
+        # 5. Platform inspect Descriptor digest mismatch
+        def desc_mismatch(cmd, **kw):
+            if '--platform' in cmd:
+                plat_rec = {
+                    'Architecture': 'amd64', 'Os': 'linux',
+                    'Id': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+                    'Descriptor': {'digest': 'sha256:' + 'b'*64, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}
+                }
+                return mock.Mock(returncode=0, stdout=json.dumps([plat_rec]).encode(), stderr=b'')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'platform-specific image descriptor mismatch'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=desc_mismatch)
+
+        # 6. Platform inspect Id mismatch
+        def id_mismatch(cmd, **kw):
+            if '--platform' in cmd:
+                plat_rec = {
+                    'Architecture': 'amd64', 'Os': 'linux',
+                    'Id': 'sha256:' + 'c'*64,
+                    'Descriptor': {'digest': self.m.PINNED_PLATFORM_MANIFEST_DIGEST, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}
+                }
+                return mock.Mock(returncode=0, stdout=json.dumps([plat_rec]).encode(), stderr=b'')
+            return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+        with self.assertRaisesRegex(self.m.BootstrapError, 'platform-specific image Id mismatch'):
+            self.m.verify_image(self.m.PINNED_IMAGE, runner=id_mismatch)
+
+    def test_helper_receipt_root_index_image_manifest_descriptor(self):
+        # Container inspect receipt checking under root-index execution
+        root_img = 'sha256:' + self.m.PINNED_DIGEST
+        item = {'name': 'test-helper', 'image': root_img, 'nonce': 'nonce123',
+                'user': '1883:1883', 'mounts': []}
+        base_rec = {
+            'Id': 'd' * 64,
+            'Name': '/test-helper',
+            'Image': root_img,
+            'Config': {'Labels': {'bootstrap.nonce': 'nonce123'}, 'User': '1883:1883'},
+            'HostConfig': {'Mounts': []}
+        }
+
+        # 1. Accepted when ImageManifestDescriptor matches pinned platform manifest
+        valid_rec = dict(base_rec, ImageManifestDescriptor={
+            'digest': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+            'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+        })
+        cid = self.m.resolve_helper(item, runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps([valid_rec]).encode()))
+        self.assertEqual(cid, 'd' * 64)
+
+        # 2. Rejected when ImageManifestDescriptor is missing
+        with self.assertRaisesRegex(self.m.BootstrapError, 'missing container image manifest descriptor'):
+            self.m.resolve_helper(item, runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps([base_rec]).encode()))
+
+        # 3. Rejected when ImageManifestDescriptor has mismatched digest
+        bad_digest_rec = dict(base_rec, ImageManifestDescriptor={
+            'digest': 'sha256:' + 'e' * 64,
+            'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+        })
+        with self.assertRaisesRegex(self.m.BootstrapError, 'container image manifest descriptor mismatch'):
+            self.m.resolve_helper(item, runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps([bad_digest_rec]).encode()))
+
+        # 4. Rejected when ImageManifestDescriptor has wrong mediaType
+        bad_mt_rec = dict(base_rec, ImageManifestDescriptor={
+            'digest': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+            'mediaType': 'application/vnd.docker.distribution.manifest.v2+json'
+        })
+        with self.assertRaisesRegex(self.m.BootstrapError, 'container image manifest descriptor mismatch'):
+            self.m.resolve_helper(item, runner=lambda cmd, **kw: mock.Mock(returncode=0, stdout=json.dumps([bad_mt_rec]).encode()))
+
+    def test_container_bootstrap_containerd_lifecycle_success(self):
+        created_cmds = []
+        started_cmds = []
+        rm_cmds = []
+        rm_cids = set()
+        vol_created = False
+        saved_labels = {}
+
+        root_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'RepoDigests': [self.m.PINNED_IMAGE],
+            'Id': 'sha256:' + self.m.PINNED_DIGEST,
+            'Descriptor': {
+                'digest': 'sha256:' + self.m.PINNED_DIGEST,
+                'mediaType': 'application/vnd.oci.image.index.v1+json'
+            }
+        }]
+        platform_inspect = [{
+            'Architecture': 'amd64',
+            'Os': 'linux',
+            'Id': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+            'Descriptor': {
+                'digest': self.m.PINNED_PLATFORM_MANIFEST_DIGEST,
+                'mediaType': 'application/vnd.oci.image.manifest.v1+json'
+            }
+        }]
+
+        def mock_runner(cmd, input=None, **kwargs):
+            c0, c1 = cmd[0], cmd[1]
+            nonlocal vol_created, saved_labels
+            if c0 == 'docker' and c1 == 'image':
+                if '--platform' in cmd:
+                    return mock.Mock(returncode=0, stdout=json.dumps(platform_inspect).encode(), stderr=b'')
+                return mock.Mock(returncode=0, stdout=json.dumps(root_inspect).encode(), stderr=b'')
+            elif c0 == 'docker' and c1 == 'volume':
+                sub = cmd[2]
+                if sub == 'inspect':
+                    if vol_created:
+                        rec = [{'Name': self.container_config['volume_name'], 'Labels': saved_labels}]
+                        return mock.Mock(returncode=0, stdout=json.dumps(rec).encode(), stderr=b'')
+                    return mock.Mock(returncode=1, stdout=b'', stderr=b'no such volume')
+                elif sub == 'create':
+                    vol_created = True
+                    for i, a in enumerate(cmd):
+                        if a == '--label' and i + 1 < len(cmd):
+                            k, v = cmd[i+1].split('=', 1)
+                            saved_labels[k] = v
+                    return mock.Mock(returncode=0, stdout=self.container_config['volume_name'].encode(), stderr=b'')
+            elif c0 == 'docker' and c1 == 'create':
+                cid = f'{len(created_cmds):064x}'
+                created_cmds.append(cid)
+                return mock.Mock(returncode=0, stdout=cid.encode(), stderr=b'')
+            elif c0 == 'docker' and c1 == 'container' and cmd[2] == 'inspect':
+                cid = cmd[3]
+                if cid in rm_cids:
+                    return mock.Mock(returncode=1, stdout=b'[]', stderr=b'Error: No such container')
+                return mock.Mock(returncode=0, stdout=b'[{"State": {"ExitCode": 0}}]', stderr=b'')
+            elif c0 == 'docker' and c1 == 'start':
+                started_cmds.append(cmd)
+                if len(started_cmds) >= 3:
+                    full_store = self.m.compose_store(
+                        {'clients': [{'username': self.container_config['manager'],
+                                      'password': base64.b64encode(b'A'*64).decode(),
+                                      'salt': base64.b64encode(b'B'*12).decode(),
+                                      'iterations': 101, 'roles': []}]},
+                        {'clients': [{'username': self.container_config['backend'],
+                                      'password': base64.b64encode(b'A'*64).decode(),
+                                      'salt': base64.b64encode(b'B'*12).decode(),
+                                      'iterations': 101, 'roles': []}]}
+                    )
+                    store_bytes = json.dumps(full_store).encode()
+                    out = b'1883:1883:700\n1883:1883:600\n' + store_bytes
+                    return mock.Mock(returncode=0, stdout=out, stderr=b'')
+                return mock.Mock(returncode=0, stdout=b'', stderr=b'')
+            elif c0 == 'docker' and c1 == 'rm':
+                rm_cmds.append(cmd)
+                rm_cids.add(cmd[-1])
+                return mock.Mock(returncode=0, stdout=b'', stderr=b'')
+            return mock.Mock(returncode=0, stdout=b'', stderr=b'')
+
+        with mock.patch.object(self.m, 'container_native_init') as mock_cinit:
+            def fake_cinit(image, path, user, pwd, tracker, runner):
+                c = {'username': user, 'password': base64.b64encode(b'A'*64).decode(),
+                     'salt': base64.b64encode(b'B'*12).decode(), 'iterations': 101, 'roles': []}
+                path.write_text(json.dumps({'clients': [c]}))
+            mock_cinit.side_effect = fake_cinit
+
+            vol = self.m.bootstrap_container(self.container_config, image_ref=self.m.PINNED_IMAGE, runner=with_allocation_receipts(mock_runner))
+            self.assertEqual(vol, self.container_config['volume_name'])
+
     def test_root_helper_enforces_user_0_0_and_pull_never(self):
         created_cmds = []
         vol_created = False
@@ -834,7 +1315,7 @@ class BootstrapTests(unittest.TestCase):
             elif c0 == 'docker' and c1 == 'image':
                 data = [{'Architecture': 'amd64', 'Os': 'linux',
                          'RepoDigests': [self.m.PINNED_IMAGE],
-                         'Id': 'sha256:' + self.m.PINNED_DIGEST}]
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif c0 == 'docker' and c1 == 'run':
                 return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
@@ -869,7 +1350,7 @@ class BootstrapTests(unittest.TestCase):
         user_idx = root_cmd.index('--user')
         self.assertEqual(root_cmd[user_idx + 1], '0:0')
         # Ensure image passed was immutable ID
-        self.assertIn('sha256:' + self.m.PINNED_DIGEST, root_cmd)
+        self.assertIn(self.m.PINNED_CONFIG_ID, root_cmd)
 
     def test_inspect_exit_code_detects_container_failure_despite_start_rc_zero(self):
         vol_created = False
@@ -881,7 +1362,7 @@ class BootstrapTests(unittest.TestCase):
             if c0 == 'docker' and c1 == 'image':
                 data = [{'Architecture': 'amd64', 'Os': 'linux',
                          'RepoDigests': [self.m.PINNED_IMAGE],
-                         'Id': 'sha256:' + self.m.PINNED_DIGEST}]
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif c0 == 'docker' and c1 == 'run':
                 return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')
@@ -934,7 +1415,7 @@ class BootstrapTests(unittest.TestCase):
             if c0 == 'docker' and c1 == 'image':
                 data = [{'Architecture': 'amd64', 'Os': 'linux',
                          'RepoDigests': [self.m.PINNED_IMAGE],
-                         'Id': 'sha256:' + self.m.PINNED_DIGEST}]
+                         'Id': self.m.PINNED_CONFIG_ID}]
                 return mock.Mock(returncode=0, stdout=json.dumps(data).encode(), stderr=b'')
             elif c0 == 'docker' and c1 == 'run':
                 return mock.Mock(returncode=1, stdout=self.m.EXPECTED_VERSION_BANNER, stderr=b'')

@@ -140,7 +140,7 @@ func baseValidConfig() config.CredentialConfig {
 func TestActiveComposition_PrerequisitesValidation(t *testing.T) {
 	pool := &pgxpool.Pool{}
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+		acquireOwner: func(_ context.Context, _ *pgxpool.Pool, _ time.Duration) (*credentialOwner, error) {
 			t.Fatal("acquireOwner must not be called when prerequisites are invalid")
 			return nil, nil
 		},
@@ -207,18 +207,18 @@ func TestActiveComposition_OwnerAcquiredBeforeClassifierAndBroker(t *testing.T) 
 	pool := &pgxpool.Pool{}
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
 			order = append(order, "acquire_owner")
-			acquirer := func(ctx context.Context) (ownerDBConn, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) {
 				return conn, nil
 			}
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) {
+		readCA: func(_ string) ([]byte, error) {
 			order = append(order, "read_ca")
 			return validTestCA(t), nil
 		},
-		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+		newRepo: func(_ *pgxpool.Pool, _, _ time.Duration, _ ...int) (*mqttcredential.PostgresRepository, error) {
 			order = append(order, "new_repo")
 			return nil, errors.New("stop_after_owner")
 		},
@@ -242,14 +242,14 @@ func TestActiveComposition_SecondOwnerDenial_NoBrokerAccess(t *testing.T) {
 	brokerTouched := false
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+		acquireOwner: func(_ context.Context, _ *pgxpool.Pool, _ time.Duration) (*credentialOwner, error) {
 			return nil, errOwnerLockDenied
 		},
-		readCA: func(path string) ([]byte, error) {
+		readCA: func(_ string) ([]byte, error) {
 			brokerTouched = true
 			return validTestCA(t), nil
 		},
-		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+		probeAuth: func(_ context.Context, _ *tls.Config, _ string, _ time.Duration, _, _ string, _ bool) error {
 			brokerTouched = true
 			return nil
 		},
@@ -270,11 +270,11 @@ func TestActiveComposition_ManagementURLSemantics(t *testing.T) {
 	conn := &fakeTestOwnerConn{}
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
-			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
+		readCA: func(_ string) ([]byte, error) { return validTestCA(t), nil },
 	}
 
 	invalidURLs := []string{
@@ -302,19 +302,19 @@ func TestActiveComposition_ManagementURLSemantics(t *testing.T) {
 
 func TestActiveComposition_OwnershipGatedExecutor_LossBeforeExecute(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
 
-	acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+	acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 	owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Now make check fail
-	conn.queryRowFn = func(ctx context.Context, sql string, args ...any) pgx.Row {
+	conn.queryRowFn = func(_ context.Context, _ string, _ ...any) pgx.Row {
 		return boolRow(false) // Lock lost
 	}
 
@@ -361,7 +361,7 @@ func TestActiveComposition_OwnershipGatedExecutor_LossBeforeExecute(t *testing.T
 func TestActiveComposition_OwnershipGatedExecutor_LossAfterExecute(t *testing.T) {
 	callCount := 0
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			callCount++
 			if callCount == 1 {
 				// 1. acquire lock
@@ -376,14 +376,14 @@ func TestActiveComposition_OwnershipGatedExecutor_LossAfterExecute(t *testing.T)
 		},
 	}
 
-	acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+	acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 	owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	inner := &fakeSimplifiedExecutor{
-		executeFn: func(ctx context.Context, o mqttcredential.Operation, generate func(context.Context) (string, error)) (mqttcredential.SimplifiedExecutionResult, error) {
+		executeFn: func(_ context.Context, o mqttcredential.Operation, _ func(context.Context) (string, error)) (mqttcredential.SimplifiedExecutionResult, error) {
 			return mqttcredential.SimplifiedExecutionResult{
 				OperationID: o.OperationID,
 				Outcome:     mqttcredential.ExecutionVerifiedSuccess,
@@ -429,11 +429,11 @@ func TestActiveComposition_OwnershipGatedExecutor_LossAfterExecute(t *testing.T)
 
 func TestActiveComposition_CheckRevoked_RequiresLiveOwnership(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
-	acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+	acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 	owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -457,7 +457,7 @@ func TestActiveComposition_CheckRevoked_RequiresLiveOwnership(t *testing.T) {
 	}
 
 	// 2. Lost ownership -> fails closed
-	conn.queryRowFn = func(ctx context.Context, sql string, args ...any) pgx.Row {
+	conn.queryRowFn = func(_ context.Context, _ string, _ ...any) pgx.Row {
 		return boolRow(false)
 	}
 	if err := gated.CheckRevoked(context.Background(), "gw_1"); err == nil {
@@ -485,11 +485,11 @@ func TestActiveComposition_DenyOnlyResetPrerequisite(t *testing.T) {
 
 func TestActiveComposition_ReadinessThreadSafetyAndOwnerLoss(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
-	acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+	acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 	owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -526,11 +526,11 @@ func TestActiveComposition_ReadinessThreadSafetyAndOwnerLoss(t *testing.T) {
 
 func TestActiveComposition_ShutdownLocksAndReleasesOwner(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
-	acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+	acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 	owner, err := acquireCredentialOwnerWithAcquirer(context.Background(), acquirer, credentialOwnerLockKey, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -553,7 +553,7 @@ func TestActiveComposition_ShutdownLocksAndReleasesOwner(t *testing.T) {
 
 func TestActiveComposition_ClassifierIncomplete_SafeUnavailableService(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
@@ -571,28 +571,28 @@ func TestActiveComposition_ClassifierIncomplete_SafeUnavailableService(t *testin
 	sensitiveErrMsg := "sensitive-driver-error-raw-dsn-postgres://user:secret@db:5432"
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
-			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
-		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+		readCA: func(_ string) ([]byte, error) { return validTestCA(t), nil },
+		newRepo: func(_ *pgxpool.Pool, _, _ time.Duration, _ ...int) (*mqttcredential.PostgresRepository, error) {
 			return &mqttcredential.PostgresRepository{}, nil
 		},
-		newClassifier: func(r mqttcredential.SimplifiedStartupRepository, opts mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
+		newClassifier: func(_ mqttcredential.SimplifiedStartupRepository, _ mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
 			return &mqttcredential.SimplifiedStartupClassifier{}, nil
 		},
-		classifyTarget: func(ctx context.Context, c *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
+		classifyTarget: func(_ context.Context, _ *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
 			// Incomplete classification scan with raw sensitive error
 			return mqttcredential.ClassificationResult{
 				Status: mqttcredential.ClassificationIncomplete,
 			}, errors.New(sensitiveErrMsg)
 		},
-		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+		probeAuth: func(_ context.Context, _ *tls.Config, _ string, _ time.Duration, _, _ string, _ bool) error {
 			probeCalls++
 			return nil
 		},
-		newClient: func(ctx context.Context, cfg mqttcredential.DynSecConfig) (*mqttcredential.DynSecClient, error) {
+		newClient: func(_ context.Context, _ mqttcredential.DynSecConfig) (*mqttcredential.DynSecClient, error) {
 			clientCalls++
 			return &mqttcredential.DynSecClient{}, nil
 		},
@@ -654,7 +654,7 @@ func TestActiveComposition_ClassifierIncomplete_SafeUnavailableService(t *testin
 // Note: This unit test verifies the composition wireup; it does NOT claim to be actual SQL-to-broker end-to-end proof.
 func TestActiveComposition_ClassifierIncompleteLegacyBlocker_GuaranteesNotReadyZeroProbesAndZeroClient(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
@@ -665,28 +665,28 @@ func TestActiveComposition_ClassifierIncompleteLegacyBlocker_GuaranteesNotReadyZ
 	executorCalls := 0
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
-			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
-		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+		readCA: func(_ string) ([]byte, error) { return validTestCA(t), nil },
+		newRepo: func(_ *pgxpool.Pool, _, _ time.Duration, _ ...int) (*mqttcredential.PostgresRepository, error) {
 			return &mqttcredential.PostgresRepository{}, nil
 		},
-		newClassifier: func(r mqttcredential.SimplifiedStartupRepository, opts mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
+		newClassifier: func(_ mqttcredential.SimplifiedStartupRepository, _ mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
 			return &mqttcredential.SimplifiedStartupClassifier{}, nil
 		},
-		classifyTarget: func(ctx context.Context, c *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
+		classifyTarget: func(_ context.Context, _ *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
 			// Incomplete classifier result with legacy contract blocker error
 			return mqttcredential.ClassificationResult{
 				Status: mqttcredential.ClassificationIncomplete,
 			}, mqttcredential.ErrLegacyContractBlocked
 		},
-		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+		probeAuth: func(_ context.Context, _ *tls.Config, _ string, _ time.Duration, _, _ string, _ bool) error {
 			probeCalls++
 			return nil
 		},
-		newClient: func(ctx context.Context, cfg mqttcredential.DynSecConfig) (*mqttcredential.DynSecClient, error) {
+		newClient: func(_ context.Context, _ mqttcredential.DynSecConfig) (*mqttcredential.DynSecClient, error) {
 			clientCalls++
 			return &mqttcredential.DynSecClient{}, nil
 		},
@@ -742,7 +742,7 @@ func TestActiveComposition_ClassifierIncompleteLegacyBlocker_GuaranteesNotReadyZ
 
 func TestActiveComposition_CompleteClassificationWithRecoveryTargets_ConstructsService(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
@@ -750,18 +750,18 @@ func TestActiveComposition_CompleteClassificationWithRecoveryTargets_ConstructsS
 	targetOpID := uuid.New()
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
-			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
-		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+		readCA: func(_ string) ([]byte, error) { return validTestCA(t), nil },
+		newRepo: func(_ *pgxpool.Pool, _, _ time.Duration, _ ...int) (*mqttcredential.PostgresRepository, error) {
 			return &mqttcredential.PostgresRepository{}, nil
 		},
-		newClassifier: func(r mqttcredential.SimplifiedStartupRepository, opts mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
+		newClassifier: func(_ mqttcredential.SimplifiedStartupRepository, _ mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
 			return &mqttcredential.SimplifiedStartupClassifier{}, nil
 		},
-		classifyTarget: func(ctx context.Context, c *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
+		classifyTarget: func(_ context.Context, _ *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
 			// Completed with recovery target
 			return mqttcredential.ClassificationResult{
 				Status: mqttcredential.ClassificationCompleted,
@@ -775,7 +775,7 @@ func TestActiveComposition_CompleteClassificationWithRecoveryTargets_ConstructsS
 				},
 			}, nil
 		},
-		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+		probeAuth: func(_ context.Context, _ *tls.Config, _ string, _ time.Duration, _, _ string, _ bool) error {
 			// Auth checks succeed
 			return nil
 		},
@@ -799,28 +799,28 @@ func TestActiveComposition_CompleteClassificationWithRecoveryTargets_ConstructsS
 
 func TestActiveComposition_BrokerAuthFailure_ReadinessFalse(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
 	pool := &pgxpool.Pool{}
 
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
-			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
-		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+		readCA: func(_ string) ([]byte, error) { return validTestCA(t), nil },
+		newRepo: func(_ *pgxpool.Pool, _, _ time.Duration, _ ...int) (*mqttcredential.PostgresRepository, error) {
 			return &mqttcredential.PostgresRepository{}, nil
 		},
-		newClassifier: func(r mqttcredential.SimplifiedStartupRepository, opts mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
+		newClassifier: func(_ mqttcredential.SimplifiedStartupRepository, _ mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
 			return &mqttcredential.SimplifiedStartupClassifier{}, nil
 		},
-		classifyTarget: func(ctx context.Context, c *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
+		classifyTarget: func(_ context.Context, _ *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
 			return mqttcredential.ClassificationResult{Status: mqttcredential.ClassificationCompleted}, nil
 		},
-		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+		probeAuth: func(_ context.Context, _ *tls.Config, _ string, _ time.Duration, _, _ string, _ bool) error {
 			// Broker auth fails!
 			return mqttcredential.ErrVerificationFailed
 		},
@@ -844,7 +844,7 @@ func TestActiveComposition_BrokerAuthFailure_ReadinessFalse(t *testing.T) {
 
 func TestActiveComposition_WiredQualificationAndSnapshotVerifier(t *testing.T) {
 	conn := &fakeTestOwnerConn{
-		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			return boolRow(true)
 		},
 	}
@@ -895,21 +895,21 @@ func TestActiveComposition_WiredQualificationAndSnapshotVerifier(t *testing.T) {
 
 	var capturedCfg mqttcredential.SimplifiedDynSecConfig
 	seam := compositionSeam{
-		acquireOwner: func(ctx context.Context, p *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
-			acquirer := func(ctx context.Context) (ownerDBConn, error) { return conn, nil }
+		acquireOwner: func(ctx context.Context, _ *pgxpool.Pool, timeout time.Duration) (*credentialOwner, error) {
+			acquirer := func(_ context.Context) (ownerDBConn, error) { return conn, nil }
 			return acquireCredentialOwnerWithAcquirer(ctx, acquirer, credentialOwnerLockKey, timeout)
 		},
-		readCA: func(path string) ([]byte, error) { return validTestCA(t), nil },
-		newRepo: func(pool *pgxpool.Pool, timeout, finalizeTimeout time.Duration, scanLimit ...int) (*mqttcredential.PostgresRepository, error) {
+		readCA: func(_ string) ([]byte, error) { return validTestCA(t), nil },
+		newRepo: func(_ *pgxpool.Pool, _, _ time.Duration, _ ...int) (*mqttcredential.PostgresRepository, error) {
 			return &mqttcredential.PostgresRepository{}, nil
 		},
-		newClassifier: func(r mqttcredential.SimplifiedStartupRepository, opts mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
+		newClassifier: func(_ mqttcredential.SimplifiedStartupRepository, _ mqttcredential.SimplifiedStartupClassifierOptions) (*mqttcredential.SimplifiedStartupClassifier, error) {
 			return &mqttcredential.SimplifiedStartupClassifier{}, nil
 		},
-		classifyTarget: func(ctx context.Context, c *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
+		classifyTarget: func(_ context.Context, _ *mqttcredential.SimplifiedStartupClassifier) (mqttcredential.ClassificationResult, error) {
 			return mqttcredential.ClassificationResult{Status: mqttcredential.ClassificationCompleted}, nil
 		},
-		probeAuth: func(ctx context.Context, tlsConfig *tls.Config, target string, timeout time.Duration, user, password string, negative bool) error {
+		probeAuth: func(_ context.Context, _ *tls.Config, _ string, _ time.Duration, _, _ string, _ bool) error {
 			return nil
 		},
 		newExecutor: func(cfg mqttcredential.SimplifiedDynSecConfig) (mqttcredential.SimplifiedExecutor, error) {
@@ -982,7 +982,7 @@ func TestLegacyLifecycleStandaloneHelpers(t *testing.T) {
 				return errors.New("err")
 			}
 			return nil
-		}, func(clean context.Context) error {
+		}, func(_ context.Context) error {
 			calls = append(calls, "drain")
 			return nil
 		}, time.Second)

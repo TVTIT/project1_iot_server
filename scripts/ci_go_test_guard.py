@@ -5,13 +5,15 @@ Validates `go test -json` JSONL output against mandatory required tests.
 
 Requirements & Rules:
 - Receives input JSONL file path and one or more --require 'package:TestName'.
+- Optional --allow-no-test-package 'package' for exact packages with no test files.
 - Empty requires list is rejected.
 - Tracks events per (Package, Test).
 - Must fail (exit non-zero) if:
   * A required test did not have both 'run' and 'pass' events, or had 'skip'/'fail'.
   * A required test or any of its descendant subtests has a 'skip' or 'fail' action, or ran without terminal pass.
   * Malformed/truncated JSON, invalid event types, or unknown actions exist.
-  * ANY package appearing in the run fails or is missing a terminal 'pass' action.
+  * ANY package appearing in the run fails or is missing a terminal 'pass' action,
+    unless explicitly opted-in with verified no-test-files evidence.
   * Only test list or package cached output is present (cached pass without explicit test 'run' is rejected).
 - Diagnostics do not print raw Output or unvalidated file paths/specs that may leak secrets or control chars.
 - Validates identifiers without arbitrary control characters; supports Unicode subtest identifiers.
@@ -38,6 +40,8 @@ VALID_GO_TEST_ACTIONS = {
     "skip",
 }
 
+DISALLOWED_PKG_NAME_CHARS = set("*?[]()^$+{}\\|~`!@#%&=:;'\",<> ")
+
 
 def is_safe_identifier(val: str) -> bool:
     """Check if identifier contains no control characters or newlines."""
@@ -49,6 +53,44 @@ def is_safe_identifier(val: str) -> bool:
         if o < 32 or (127 <= o <= 159):
             return False
     return True
+
+
+def is_safe_package_name(val: str) -> bool:
+    """Validate that val is an exact, non-wildcard, safe Go package name.
+
+    Rejects wildcards, regex characters, control characters, path traversals,
+    and leading/trailing slashes.
+    """
+    if not isinstance(val, str) or not val:
+        return False
+    if not is_safe_identifier(val):
+        return False
+    if any(ch in DISALLOWED_PKG_NAME_CHARS for ch in val):
+        return False
+    if ".." in val:
+        return False
+    if val.startswith("/") or val.endswith("/"):
+        return False
+    return True
+
+
+def is_standard_no_test_files_output(output_str: str, pkg: str) -> bool:
+    """Validate standard Go '[no test files]' package output format for pkg.
+
+    Standard Go output line: `?   \t<package>\t[no test files]\n`.
+    Must start with `?`, reference exact package `pkg`, and end with `[no test files]`.
+    """
+    if not isinstance(output_str, str):
+        return False
+    s = output_str.strip()
+    if not s.startswith("?"):
+        return False
+    rest = s[1:].strip()
+    marker = "[no test files]"
+    if not rest.endswith(marker):
+        return False
+    middle = rest[:-len(marker)].strip()
+    return middle == pkg
 
 
 def parse_require_spec(spec: str) -> Tuple[str, str]:
@@ -67,7 +109,11 @@ def parse_require_spec(spec: str) -> Tuple[str, str]:
     return pkg, test_name
 
 
-def verify_test_log(input_path: str, requires: List[str]) -> Tuple[bool, List[str]]:
+def verify_test_log(
+    input_path: str,
+    requires: List[str],
+    allow_no_test_packages: Optional[List[str]] = None,
+) -> Tuple[bool, List[str]]:
     """Parse and verify go test -json output.
 
     Returns (success: bool, diagnostics: List[str]).
@@ -90,6 +136,15 @@ def verify_test_log(input_path: str, requires: List[str]) -> Tuple[bool, List[st
             # Fixed message without echoing raw spec
             diagnostics.append(f"Invalid requirement specification at index {idx}")
 
+    # Parse allowed no-test packages (exact match only, no wildcards/regex)
+    allowed_no_test_set: Set[str] = set()
+    if allow_no_test_packages is not None:
+        for idx, p_spec in enumerate(allow_no_test_packages):
+            if not is_safe_package_name(p_spec):
+                diagnostics.append(f"Invalid allowed no-test package specification at index {idx}")
+            else:
+                allowed_no_test_set.add(p_spec)
+
     if diagnostics:
         return False, diagnostics
 
@@ -100,6 +155,8 @@ def verify_test_log(input_path: str, requires: List[str]) -> Tuple[bool, List[st
 
     # Tracking data structures:
     all_seen_packages: Set[str] = set()
+    pkg_started: Set[str] = set()
+    pkg_saw_no_test_marker: Set[str] = set()
     pkg_terminal_actions: Dict[str, List[str]] = defaultdict(list)
     test_actions: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     pkg_tests: Dict[str, Set[str]] = defaultdict(set)
@@ -146,8 +203,14 @@ def verify_test_log(input_path: str, requires: List[str]) -> Tuple[bool, List[st
                 all_seen_packages.add(pkg)
 
                 if test is None:
-                    # Package-level terminal event
-                    if action in ("pass", "fail", "skip"):
+                    # Package-level event
+                    if action == "start":
+                        pkg_started.add(pkg)
+                    elif action == "output":
+                        raw_out = event.get("Output")
+                        if isinstance(raw_out, str) and is_standard_no_test_files_output(raw_out, pkg):
+                            pkg_saw_no_test_marker.add(pkg)
+                    elif action in ("pass", "fail", "skip"):
                         pkg_terminal_actions[pkg].append(action)
                 else:
                     # Test-level event
@@ -162,15 +225,26 @@ def verify_test_log(input_path: str, requires: List[str]) -> Tuple[bool, List[st
     if invalid_event_count > 0:
         diagnostics.append(f"Found {invalid_event_count} invalid event records (type error or unknown action)")
 
-    # (3) ALL packages that appeared in the log must have terminal pass
+    # (3) ALL packages that appeared in the log must have terminal pass (or verified no-test exemption)
     for pkg in sorted(all_seen_packages):
         terminals = pkg_terminal_actions.get(pkg, [])
         if not terminals:
             diagnostics.append(f"Package missing terminal pass event: {pkg}")
         elif "fail" in terminals:
             diagnostics.append(f"Package failed: {pkg}")
+        elif len(terminals) > 1:
+            diagnostics.append(f"Package contradictory terminal status: {pkg}")
         elif "pass" not in terminals:
-            diagnostics.append(f"Package incomplete terminal status: {pkg}")
+            is_exempt = (
+                pkg in allowed_no_test_set
+                and pkg not in req_packages
+                and len(pkg_tests.get(pkg, set())) == 0
+                and pkg in pkg_started
+                and pkg in pkg_saw_no_test_marker
+                and terminals == ["skip"]
+            )
+            if not is_exempt:
+                diagnostics.append(f"Package incomplete terminal status: {pkg}")
 
     # (1) Check each required test target
     for pkg, test_name in sorted(req_targets):
@@ -222,6 +296,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=[],
         help="Required test spec in 'package:TestName' format. Can be specified multiple times.",
     )
+    parser.add_argument(
+        "--allow-no-test-package",
+        action="append",
+        default=[],
+        help="Exact package name allowed to have no test files (e.g. 'iot-platform/cmd/gateway'). Can be specified multiple times.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -229,7 +309,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Error: At least one --require 'package:TestName' must be specified.", file=sys.stderr)
         return 2
 
-    success, diagnostics = verify_test_log(args.input, args.require)
+    success, diagnostics = verify_test_log(
+        args.input,
+        args.require,
+        allow_no_test_packages=args.allow_no_test_package,
+    )
     if not success:
         print("ci_go_test_guard verification FAILED:", file=sys.stderr)
         for diag in diagnostics:

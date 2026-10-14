@@ -76,7 +76,7 @@ func (r *simplifiedStartupReadiness) markOwnerLost() {
 // This is intentionally disabled production reset until a full operator-supervised reset workflow is built.
 type denyOnlyResetPrerequisite struct{}
 
-func (denyOnlyResetPrerequisite) SupervisedQuiescencePrerequisite(ctx context.Context, gatewayID string) error {
+func (denyOnlyResetPrerequisite) SupervisedQuiescencePrerequisite(_ context.Context, _ string) error {
 	return &mqttcredential.DomainError{Code: mqttcredential.CodeServiceUnavailable}
 }
 
@@ -425,12 +425,4 @@ func runCredentialBarrier(ctx context.Context, run, drain func(context.Context) 
 		return fmt.Errorf("credential startup reconciliation unavailable")
 	}
 	return nil
-}
-
-func privateCredentialLogin(ctx context.Context, ctrl mqttcredential.ControllerClient, tlsConfig *tls.Config, timeout time.Duration, user, password string) error {
-	return privateCredentialCheck(ctx, ctrl, tlsConfig, timeout, user, password, false)
-}
-
-func privateCredentialCheck(ctx context.Context, ctrl mqttcredential.ControllerClient, tlsConfig *tls.Config, timeout time.Duration, user, password string, negative bool) error {
-	return probePrivateCredential(ctx, tlsConfig, ctrl.ControlDir, timeout, user, password, negative)
 }

@@ -13,7 +13,6 @@ import (
 
 // spyDynSecClient implements SimplifiedDynSecClient for tests.
 type spyDynSecClient struct {
-	mu            syncMutexSpy
 	clients       map[string]DynSecClientMetadata
 	roles         map[string][]adapterACL
 	calls         []string
@@ -26,8 +25,6 @@ type spyDynSecClient struct {
 	onDisableHook func(u string)
 }
 
-type syncMutexSpy struct{}
-
 type spyDynSecClientWithAfterDisableRoleFailure struct {
 	*spyDynSecClient
 }
@@ -35,7 +32,7 @@ type spyDynSecClientWithAfterDisableRoleFailure struct {
 func (s *spyDynSecClientWithAfterDisableRoleFailure) DisableClient(ctx context.Context, u string) error {
 	err := s.spyDynSecClient.DisableClient(ctx, u)
 	if err == nil {
-		delete(s.spyDynSecClient.roles, "gateway_"+u)
+		delete(s.roles, "gateway_"+u)
 	}
 	return err
 }
@@ -46,7 +43,7 @@ func (s *spyDynSecClient) Close() {
 	s.calls = append(s.calls, "close")
 }
 
-func (s *spyDynSecClient) CreateClient(ctx context.Context, u string) error {
+func (s *spyDynSecClient) CreateClient(_ context.Context, u string) error {
 	s.calls = append(s.calls, "createClient:"+u)
 	if err, ok := s.failOnCmd["createClient"]; ok {
 		return err
@@ -62,7 +59,7 @@ func (s *spyDynSecClient) CreateClient(ctx context.Context, u string) error {
 	return nil
 }
 
-func (s *spyDynSecClient) DisableClient(ctx context.Context, u string) error {
+func (s *spyDynSecClient) DisableClient(_ context.Context, u string) error {
 	s.calls = append(s.calls, "disableClient:"+u)
 	if err, ok := s.failOnCmd["disableClient"]; ok {
 		return err
@@ -79,7 +76,7 @@ func (s *spyDynSecClient) DisableClient(ctx context.Context, u string) error {
 	return nil
 }
 
-func (s *spyDynSecClient) EnableClient(ctx context.Context, u string) error {
+func (s *spyDynSecClient) EnableClient(_ context.Context, u string) error {
 	s.calls = append(s.calls, "enableClient:"+u)
 	if err, ok := s.failOnCmd["enableClient"]; ok {
 		return err
@@ -93,7 +90,7 @@ func (s *spyDynSecClient) EnableClient(ctx context.Context, u string) error {
 	return nil
 }
 
-func (s *spyDynSecClient) SetClientPassword(ctx context.Context, u, password string) error {
+func (s *spyDynSecClient) SetClientPassword(_ context.Context, u, _ string) error {
 	s.calls = append(s.calls, "setClientPassword:"+u)
 	if err, ok := s.failOnCmd["setClientPassword"]; ok {
 		return err
@@ -104,7 +101,7 @@ func (s *spyDynSecClient) SetClientPassword(ctx context.Context, u, password str
 	return nil
 }
 
-func (s *spyDynSecClient) AddClientRole(ctx context.Context, u, role string) error {
+func (s *spyDynSecClient) AddClientRole(_ context.Context, u, role string) error {
 	s.calls = append(s.calls, "addClientRole:"+u+":"+role)
 	if err, ok := s.failOnCmd["addClientRole"]; ok {
 		return err
@@ -118,7 +115,7 @@ func (s *spyDynSecClient) AddClientRole(ctx context.Context, u, role string) err
 	return nil
 }
 
-func (s *spyDynSecClient) GetClient(ctx context.Context, u string) (DynSecClientMetadata, error) {
+func (s *spyDynSecClient) GetClient(_ context.Context, u string) (DynSecClientMetadata, error) {
 	s.calls = append(s.calls, "getClient:"+u)
 	s.getCount++
 	if s.failAfterNGet > 0 && s.getCount > s.failAfterNGet {
@@ -134,7 +131,7 @@ func (s *spyDynSecClient) GetClient(ctx context.Context, u string) (DynSecClient
 	return meta, nil
 }
 
-func (s *spyDynSecClient) adapterRequest(ctx context.Context, command string, fields map[string]any) (json.RawMessage, error) {
+func (s *spyDynSecClient) adapterRequest(_ context.Context, command string, fields map[string]any) (json.RawMessage, error) {
 	s.calls = append(s.calls, command)
 	if err, ok := s.failOnCmd[command]; ok {
 		return nil, err
@@ -182,13 +179,13 @@ func newSpyClient() *spyDynSecClient {
 
 func defaultTestConfig(spy *spyDynSecClient) SimplifiedDynSecConfig {
 	return SimplifiedDynSecConfig{
-		NewClient: func(ctx context.Context) (SimplifiedDynSecClient, error) {
+		NewClient: func(_ context.Context) (SimplifiedDynSecClient, error) {
 			return spy, nil
 		},
-		Login: func(ctx context.Context, username, password string) error {
+		Login: func(_ context.Context, _, _ string) error {
 			return nil
 		},
-		Rejected: func(ctx context.Context, username, password string) error {
+		Rejected: func(_ context.Context, _, _ string) error {
 			return nil
 		},
 		ProtectedUsernames: []string{BackendUsername, "manager_user"},
@@ -337,42 +334,42 @@ func TestSimplifiedDynSecExecutor_TargetGuards(t *testing.T) {
 	// Non-simplified contract rejected
 	op := baseOp
 	op.ExecutionContract = ContractLifecycle
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for non-simplified contract, got %v", err)
 	}
 
 	// Protected username as target rejected
 	op = baseOp
 	op.GatewayID = BackendUsername
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for protected target, got %v", err)
 	}
 
 	// Other protected username as target rejected
 	op = baseOp
 	op.GatewayID = "manager_user"
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for manager target, got %v", err)
 	}
 
 	// Non-pending status rejected
 	op = baseOp
 	op.Status = OperationSucceeded
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for non-pending status, got %v", err)
 	}
 
 	// Non-intent phase rejected
 	op = baseOp
 	op.Phase = PhaseFinalize
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for non-intent phase, got %v", err)
 	}
 
 	// Non-empty initial evidence rejected
 	op = baseOp
 	op.Evidence = VerificationEvidence{RAMApplied: true}
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for non-empty evidence, got %v", err)
 	}
 
@@ -381,7 +378,7 @@ func TestSimplifiedDynSecExecutor_TargetGuards(t *testing.T) {
 	op.Action = ActionRotate
 	op.Previous = &CredentialSnapshot{Status: CredentialActive, CredentialVersion: 5}
 	op.CredentialVersion = 5
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for non-monotonic rotate version, got %v", err)
 	}
 
@@ -403,14 +400,14 @@ func TestSimplifiedDynSecExecutor_TargetGuards(t *testing.T) {
 	op.ResetReason = &reason
 	op.Previous = &CredentialSnapshot{Status: CredentialRecoveryNeeded, CredentialVersion: 5}
 	op.CredentialVersion = 5
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for non-monotonic reset version, got %v", err)
 	}
 
 	// Reset with invalid reason rejected
 	badReason := ResetReason("invalid_reason")
 	op.ResetReason = &badReason
-	if _, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
+	if _, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) { return "pw1234567890123456", nil }); err != ErrInvalidInput {
 		t.Fatalf("expected ErrInvalidInput for invalid reset reason, got %v", err)
 	}
 }
@@ -422,7 +419,7 @@ func TestSimplifiedDynSecExecutor_Provision_Success(t *testing.T) {
 
 	loginCalled := false
 	cfg := defaultTestConfig(spy)
-	cfg.Login = func(ctx context.Context, u, pw string) error {
+	cfg.Login = func(_ context.Context, u, pw string) error {
 		loginCalled = true
 		if u != "gateway_001" || pw != "secret123456789012" {
 			t.Fatalf("unexpected login args: %s / %s", u, pw)
@@ -450,7 +447,7 @@ func TestSimplifiedDynSecExecutor_Provision_Success(t *testing.T) {
 		UpdatedAt:         time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err != nil {
@@ -524,7 +521,7 @@ func TestSimplifiedDynSecExecutor_Provision_UnknownExistingClientRejected(t *tes
 		UpdatedAt:         time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err != ErrRecoveryRequired {
@@ -576,7 +573,7 @@ func TestSimplifiedDynSecExecutor_Reprovision_RevokedPredecessor(t *testing.T) {
 		UpdatedAt: time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err != nil {
@@ -595,7 +592,7 @@ func TestSimplifiedDynSecExecutor_Reprovision_RevokedPredecessor(t *testing.T) {
 		Disabled: false, // invalid for revoked predecessor!
 		Roles:    []string{"gateway_gateway_001"},
 	}
-	res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err != ErrRecoveryRequired {
@@ -637,7 +634,7 @@ func TestSimplifiedDynSecExecutor_Rotate_Success(t *testing.T) {
 		UpdatedAt: time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "newsecret1234567890", nil
 	})
 	if err != nil {
@@ -688,7 +685,7 @@ func TestSimplifiedDynSecExecutor_Rotate_IntermediateReadbackFaults(t *testing.T
 	}{
 		{
 			name: "disabled_get_error",
-			setup: func(spy *spyDynSecClient, op *Operation) (context.Context, context.CancelFunc) {
+			setup: func(spy *spyDynSecClient, _ *Operation) (context.Context, context.CancelFunc) {
 				// baseline get is call 1; disabled get is call 2
 				spy.failAfterNGet = 1
 				return context.Background(), func() {}
@@ -696,7 +693,7 @@ func TestSimplifiedDynSecExecutor_Rotate_IntermediateReadbackFaults(t *testing.T
 		},
 		{
 			name: "still_enabled_after_disable",
-			setup: func(spy *spyDynSecClient, op *Operation) (context.Context, context.CancelFunc) {
+			setup: func(spy *spyDynSecClient, _ *Operation) (context.Context, context.CancelFunc) {
 				spy.onDisableHook = func(u string) {
 					// Client remains enabled despite DisableClient call
 					m := spy.clients[u]
@@ -708,7 +705,7 @@ func TestSimplifiedDynSecExecutor_Rotate_IntermediateReadbackFaults(t *testing.T
 		},
 		{
 			name: "wrong_role_on_disabled_readback",
-			setup: func(spy *spyDynSecClient, op *Operation) (context.Context, context.CancelFunc) {
+			setup: func(spy *spyDynSecClient, _ *Operation) (context.Context, context.CancelFunc) {
 				spy.onDisableHook = func(u string) {
 					// Corrupt role on disabled readback
 					m := spy.clients[u]
@@ -720,7 +717,7 @@ func TestSimplifiedDynSecExecutor_Rotate_IntermediateReadbackFaults(t *testing.T
 		},
 		{
 			name: "acl_readback_error",
-			setup: func(spy *spyDynSecClient, op *Operation) (context.Context, context.CancelFunc) {
+			setup: func(spy *spyDynSecClient, _ *Operation) (context.Context, context.CancelFunc) {
 				spy.onDisableHook = func(u string) {
 					// Corrupt ACL role so ensureRole(create=false) readback fails
 					delete(spy.roles, "gateway_"+u)
@@ -730,9 +727,9 @@ func TestSimplifiedDynSecExecutor_Rotate_IntermediateReadbackFaults(t *testing.T
 		},
 		{
 			name: "context_cancelled_before_password",
-			setup: func(spy *spyDynSecClient, op *Operation) (context.Context, context.CancelFunc) {
+			setup: func(spy *spyDynSecClient, _ *Operation) (context.Context, context.CancelFunc) {
 				ctx, cancel := context.WithCancel(context.Background())
-				spy.onDisableHook = func(u string) {
+				spy.onDisableHook = func(_ string) {
 					// Cancel context after disable call before password mutation
 					cancel()
 				}
@@ -778,7 +775,7 @@ func TestSimplifiedDynSecExecutor_Rotate_IntermediateReadbackFaults(t *testing.T
 			ctx, cancel := tt.setup(spy, &op)
 			defer cancel()
 
-			res, err := exec.Execute(ctx, op, func(ctx context.Context) (string, error) {
+			res, err := exec.Execute(ctx, op, func(_ context.Context) (string, error) {
 				return "newsecret1234567890", nil
 			})
 
@@ -837,7 +834,7 @@ func TestSimplifiedDynSecExecutor_Rotate_RequiresActiveBaseline(t *testing.T) {
 		UpdatedAt: time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "newsecret1234567890", nil
 	})
 	if err != ErrRecoveryRequired {
@@ -855,7 +852,7 @@ func TestSimplifiedDynSecExecutor_Rotate_RequiresActiveBaseline(t *testing.T) {
 	}
 	spy.roles["gateway_gateway_001"] = adapterGatewayACLs("gateway_001")
 
-	res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "newsecret1234567890", nil
 	})
 	if err != ErrRecoveryRequired {
@@ -869,7 +866,7 @@ func TestSimplifiedDynSecExecutor_Rotate_RequiresActiveBaseline(t *testing.T) {
 		Roles:    []string{"gateway_gateway_001"},
 	}
 	delete(spy.roles, "gateway_gateway_001")
-	res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "newsecret1234567890", nil
 	})
 	if err != ErrRecoveryRequired {
@@ -896,7 +893,7 @@ func TestSimplifiedDynSecExecutor_Revoke_UnsupportedSafetyGuard(t *testing.T) {
 	}
 
 	rejectedCalls := 0
-	cfg.Rejected = func(ctx context.Context, u, pw string) error {
+	cfg.Rejected = func(_ context.Context, _, _ string) error {
 		rejectedCalls++
 		return nil
 	}
@@ -926,7 +923,7 @@ func TestSimplifiedDynSecExecutor_Revoke_UnsupportedSafetyGuard(t *testing.T) {
 	}
 
 	generatorCalls := 0
-	gen := func(ctx context.Context) (string, error) {
+	gen := func(_ context.Context) (string, error) {
 		generatorCalls++
 		return "should_never_be_called", nil
 	}
@@ -983,11 +980,11 @@ func TestSimplifiedDynSecExecutor_Revoke_MissingPrerequisitesGuarded(t *testing.
 		newClientCalled++
 		return origNewClient(ctx)
 	}
-	cfg.Rejected = func(ctx context.Context, u, pw string) error {
+	cfg.Rejected = func(_ context.Context, _, _ string) error {
 		rejectedCalled = true
 		return nil
 	}
-	cfg.Login = func(ctx context.Context, u, pw string) error {
+	cfg.Login = func(_ context.Context, _, _ string) error {
 		loginCalled = true
 		return nil
 	}
@@ -1017,7 +1014,7 @@ func TestSimplifiedDynSecExecutor_Revoke_MissingPrerequisitesGuarded(t *testing.
 	}
 
 	generatorInvoked := false
-	res, err := exec.Execute(context.Background(), validOp, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), validOp, func(_ context.Context) (string, error) {
 		generatorInvoked = true
 		return "should_never_be_called", nil
 	})
@@ -1090,7 +1087,7 @@ func TestSimplifiedDynSecExecutor_Revoke_MissingPrerequisitesGuarded(t *testing.
 	// 8e: Expired context does NOT mutate
 	expiredCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	res, err = exec.Execute(expiredCtx, validOp, nil)
+	res, _ = exec.Execute(expiredCtx, validOp, nil)
 	if res.Mutated {
 		t.Fatal("expired context must NOT mutate")
 	}
@@ -1191,7 +1188,7 @@ func TestSimplifiedDynSecExecutor_PublicRevoke_QualifiedSuccess(t *testing.T) {
 		cfg := defaultTestConfig(spy)
 		cfg.Qualification = qual
 		verifierCalled := false
-		cfg.VerifyRevoked = func(ctx context.Context, target string) error {
+		cfg.VerifyRevoked = func(_ context.Context, target string) error {
 			if target != "gateway_001" {
 				t.Fatalf("expected target gateway_001, got %s", target)
 			}
@@ -1200,12 +1197,12 @@ func TestSimplifiedDynSecExecutor_PublicRevoke_QualifiedSuccess(t *testing.T) {
 		}
 
 		loginCalls := 0
-		cfg.Login = func(ctx context.Context, u, pw string) error {
+		cfg.Login = func(_ context.Context, _, _ string) error {
 			loginCalls++
 			return nil
 		}
 		rejectedCalls := 0
-		cfg.Rejected = func(ctx context.Context, u, pw string) error {
+		cfg.Rejected = func(_ context.Context, _, _ string) error {
 			rejectedCalls++
 			return nil
 		}
@@ -1279,7 +1276,7 @@ func TestSimplifiedDynSecExecutor_PublicRevoke_QualifiedSuccess(t *testing.T) {
 
 		cfg := defaultTestConfig(spy)
 		cfg.Qualification = qual
-		cfg.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfg.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 
 		exec, err := NewSimplifiedDynSecExecutor(cfg)
 		if err != nil {
@@ -1287,7 +1284,7 @@ func TestSimplifiedDynSecExecutor_PublicRevoke_QualifiedSuccess(t *testing.T) {
 		}
 
 		generatorCalls := 0
-		gen := func(ctx context.Context) (string, error) {
+		gen := func(_ context.Context) (string, error) {
 			generatorCalls++
 			return "nonnil_generator_secret", nil
 		}
@@ -1347,7 +1344,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		cfg := defaultTestConfig(spy)
 		cfg.Qualification = qual
 		verifierCalled := false
-		cfg.VerifyRevoked = func(ctx context.Context, target string) error {
+		cfg.VerifyRevoked = func(_ context.Context, target string) error {
 			if target != "gateway_001" {
 				t.Fatalf("expected target gateway_001, got %s", target)
 			}
@@ -1421,7 +1418,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 
 		// 1. Missing qualification
 		cfgNoQual := defaultTestConfig(spy)
-		cfgNoQual.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfgNoQual.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		execNoQual, err := NewSimplifiedDynSecExecutor(cfgNoQual)
 		if err != nil {
 			t.Fatal(err)
@@ -1458,7 +1455,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		// 3. Invalid target: protected user
 		cfgValid := defaultTestConfig(spy)
 		cfgValid.Qualification = qual
-		cfgValid.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfgValid.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		execValid, err := NewSimplifiedDynSecExecutor(cfgValid)
 		if err != nil {
 			t.Fatal(err)
@@ -1510,7 +1507,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		spyA := newSpyClient()
 		cfgA := defaultTestConfig(spyA)
 		cfgA.Qualification = qual
-		cfgA.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfgA.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		execA, _ := NewSimplifiedDynSecExecutor(cfgA)
 		resA, errA := execA.executeRevoke(context.Background(), validOp)
 		if !errors.Is(errA, ErrRecoveryRequired) {
@@ -1530,7 +1527,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		spyB.roles["gateway_gateway_001"] = adapterGatewayACLs("gateway_001")
 		cfgB := defaultTestConfig(spyB)
 		cfgB.Qualification = qual
-		cfgB.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfgB.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		execB, _ := NewSimplifiedDynSecExecutor(cfgB)
 		resB, errB := execB.executeRevoke(context.Background(), validOp)
 		if !errors.Is(errB, ErrRecoveryRequired) {
@@ -1550,7 +1547,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		// missing or corrupted role
 		cfgC := defaultTestConfig(spyC)
 		cfgC.Qualification = qual
-		cfgC.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfgC.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		execC, _ := NewSimplifiedDynSecExecutor(cfgC)
 		resC, errC := execC.executeRevoke(context.Background(), validOp)
 		if !errors.Is(errC, ErrRecoveryRequired) {
@@ -1574,7 +1571,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 
 		cfg1 := defaultTestConfig(spy1)
 		cfg1.Qualification = qual
-		cfg1.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfg1.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		exec1, _ := NewSimplifiedDynSecExecutor(cfg1)
 
 		res1, err1 := exec1.executeRevoke(context.Background(), validOp)
@@ -1603,7 +1600,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 
 		cfg2 := defaultTestConfig(spy2)
 		cfg2.Qualification = qual
-		cfg2.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+		cfg2.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		exec2, _ := NewSimplifiedDynSecExecutor(cfg2)
 
 		res2, err2 := exec2.executeRevoke(context.Background(), validOp)
@@ -1628,9 +1625,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 
 		cfg3 := defaultTestConfig(spy3)
 		cfg3.Qualification = qual
-		cfg3.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
-		exec3, _ := NewSimplifiedDynSecExecutor(cfg3)
-
+		cfg3.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 		// Cause getRole to fail on the second call (after disableClient)
 		origDisable := spy3.DisableClient
 		_ = origDisable
@@ -1642,10 +1637,10 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		clientWithRoleFailure := &spyDynSecClientWithAfterDisableRoleFailure{
 			spyDynSecClient: spy3,
 		}
-		cfg3.NewClient = func(ctx context.Context) (SimplifiedDynSecClient, error) {
+		cfg3.NewClient = func(_ context.Context) (SimplifiedDynSecClient, error) {
 			return clientWithRoleFailure, nil
 		}
-		exec3, _ = NewSimplifiedDynSecExecutor(cfg3)
+		exec3, _ := NewSimplifiedDynSecExecutor(cfg3)
 		res3, err3 := exec3.executeRevoke(context.Background(), validOp)
 		if !errors.Is(err3, ErrRecoveryRequired) {
 			t.Fatalf("expected ErrRecoveryRequired on role failure after disable, got %v", err3)
@@ -1668,7 +1663,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 
 		cfg4 := defaultTestConfig(spy4)
 		cfg4.Qualification = qual
-		cfg4.VerifyRevoked = func(ctx context.Context, target string) error {
+		cfg4.VerifyRevoked = func(_ context.Context, _ string) error {
 			return errors.New("snapshot verification failed")
 		}
 		exec4, _ := NewSimplifiedDynSecExecutor(cfg4)
@@ -1700,7 +1695,7 @@ func TestSimplifiedDynSecExecutor_PrivateRevoke(t *testing.T) {
 		cfg5 := defaultTestConfig(spy5)
 		cfg5.Qualification = qual
 		cancelCtx, cancelFn := context.WithCancel(context.Background())
-		cfg5.VerifyRevoked = func(ctx context.Context, target string) error {
+		cfg5.VerifyRevoked = func(_ context.Context, _ string) error {
 			cancelFn()
 			return nil
 		}
@@ -1805,7 +1800,7 @@ func TestNativeDisableQualification(t *testing.T) {
 	// Config validation: malformed nonzero qualification descriptor rejected before callbacks
 	cfgMalformed := defaultTestConfig(spy)
 	newClientCalled := false
-	cfgMalformed.NewClient = func(ctx context.Context) (SimplifiedDynSecClient, error) {
+	cfgMalformed.NewClient = func(_ context.Context) (SimplifiedDynSecClient, error) {
 		newClientCalled = true
 		return spy, nil
 	}
@@ -1865,7 +1860,7 @@ func TestSimplifiedDynSecExecutor_Reset_Success(t *testing.T) {
 			UpdatedAt: time.Now(),
 		}
 
-		res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+		res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 			return "resetpw1234567890", nil
 		})
 		if err != nil {
@@ -1880,7 +1875,7 @@ func TestSimplifiedDynSecExecutor_Reset_Success(t *testing.T) {
 
 		// LostSecretRecovery when client absent -> must fail
 		delete(spy.clients, "gateway_001")
-		res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+		res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 			return "resetpw1234567890", nil
 		})
 		if err != ErrRecoveryRequired {
@@ -1921,7 +1916,7 @@ func TestSimplifiedDynSecExecutor_Reset_Success(t *testing.T) {
 			UpdatedAt: time.Now(),
 		}
 
-		res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+		res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 			return "resetpw1234567890", nil
 		})
 		if err != nil {
@@ -1941,7 +1936,7 @@ func TestSimplifiedDynSecExecutor_Reset_Success(t *testing.T) {
 		spy.clients["gateway_001"] = DynSecClientMetadata{
 			Username: "foreign_user",
 		}
-		res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+		res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 			return "resetpw1234567890", nil
 		})
 		if err != ErrRecoveryRequired {
@@ -1985,7 +1980,7 @@ func TestSimplifiedDynSecExecutor_PartialFailure_MarksMutatedAndRecoveryRequired
 			case "ensureRoleVerify":
 				spy.failOnCmd["getRole"] = dynSecError("transport_error")
 			case "freshAuthLogin":
-				cfg.Login = func(ctx context.Context, u, pw string) error {
+				cfg.Login = func(_ context.Context, _, _ string) error {
 					return errors.New("auth_rejected")
 				}
 			}
@@ -2032,7 +2027,7 @@ func TestSimplifiedDynSecExecutor_PartialFailure_MarksMutatedAndRecoveryRequired
 				spy.roleAbsentOn = ""
 			}
 
-			gen := func(ctx context.Context) (string, error) {
+			gen := func(_ context.Context) (string, error) {
 				return "secret123456789012", nil
 			}
 
@@ -2080,7 +2075,7 @@ func TestSimplifiedDynSecExecutor_ContextCancelled_ClosesClient(t *testing.T) {
 		UpdatedAt:         time.Now(),
 	}
 
-	res, err := exec.Execute(ctx, op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(ctx, op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err == nil {
@@ -2124,7 +2119,7 @@ func TestSimplifiedDynSecExecutor_GeneratorErrors(t *testing.T) {
 	}
 
 	// Generator returns error
-	res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "", errors.New("entropy_depleted")
 	})
 	if err != ErrVerificationFailed {
@@ -2132,7 +2127,7 @@ func TestSimplifiedDynSecExecutor_GeneratorErrors(t *testing.T) {
 	}
 
 	// Generator returns invalid password (contains newline/null or exceeds 4096)
-	res, err = exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err = exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "invalid\npassword", nil
 	})
 	if err != ErrVerificationFailed {
@@ -2143,7 +2138,7 @@ func TestSimplifiedDynSecExecutor_GeneratorErrors(t *testing.T) {
 // 13. Client factory error
 func TestSimplifiedDynSecExecutor_ClientFactoryError(t *testing.T) {
 	cfg := defaultTestConfig(newSpyClient())
-	cfg.NewClient = func(ctx context.Context) (SimplifiedDynSecClient, error) {
+	cfg.NewClient = func(_ context.Context) (SimplifiedDynSecClient, error) {
 		return nil, errors.New("tls_handshake_failed")
 	}
 
@@ -2167,7 +2162,7 @@ func TestSimplifiedDynSecExecutor_ClientFactoryError(t *testing.T) {
 		UpdatedAt:         time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err != ErrVerificationFailed {
@@ -2203,7 +2198,7 @@ func TestSimplifiedDynSecExecutor_InitialQueryError(t *testing.T) {
 		UpdatedAt:         time.Now(),
 	}
 
-	res, err := exec.Execute(context.Background(), op, func(ctx context.Context) (string, error) {
+	res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 		return "secret123456789012", nil
 	})
 	if err != ErrVerificationFailed {
@@ -2285,7 +2280,7 @@ func TestSimplifiedDynSecExecutor_EnsureRoleEdgeCases(t *testing.T) {
 	cfgCheck.Qualification = qualCheck
 	verifierCheckCalls := 0
 	var verifierCheckErr error
-	cfgCheck.VerifyRevoked = func(ctx context.Context, target string) error {
+	cfgCheck.VerifyRevoked = func(_ context.Context, _ string) error {
 		verifierCheckCalls++
 		return verifierCheckErr
 	}
@@ -2297,7 +2292,7 @@ func TestSimplifiedDynSecExecutor_EnsureRoleEdgeCases(t *testing.T) {
 	// Missing dependency zero client allocation test:
 	// Verify that if qualification is zero, NewClient is never called.
 	cfgZeroQual := defaultTestConfig(spy)
-	cfgZeroQual.VerifyRevoked = func(ctx context.Context, target string) error { return nil }
+	cfgZeroQual.VerifyRevoked = func(_ context.Context, _ string) error { return nil }
 	newClientCallsZero := 0
 	origNewClientZero := cfgZeroQual.NewClient
 	cfgZeroQual.NewClient = func(ctx context.Context) (SimplifiedDynSecClient, error) {

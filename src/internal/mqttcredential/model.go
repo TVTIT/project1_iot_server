@@ -24,8 +24,11 @@ const (
 // ExecutionContract discriminates legacy/complex lifecycle operations from simplified journal operations.
 type ExecutionContract string
 
+// Supported execution contracts for credential operations.
 const (
-	ContractLifecycle  ExecutionContract = "lifecycle"
+	// ContractLifecycle identifies operations handled under the legacy lifecycle state machine.
+	ContractLifecycle ExecutionContract = "lifecycle"
+	// ContractSimplified identifies operations handled under the simplified single-flight journal engine.
 	ContractSimplified ExecutionContract = "simplified"
 )
 

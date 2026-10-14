@@ -14,8 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/eclipse/paho.mqtt.golang/packets"
 	"iot-platform/internal/mqttcredential"
+
+	"github.com/eclipse/paho.mqtt.golang/packets"
 )
 
 func generateTestCA(t *testing.T) ([]byte, *x509.Certificate, *rsa.PrivateKey) {
@@ -203,10 +204,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("positive probe: accepted CONNACK", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -239,10 +240,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("positive probe: rejected CONNACK return code", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -267,10 +268,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("negative probe: ErrRefusedBadUsernameOrPassword returns nil", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -295,10 +296,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("negative probe: ErrRefusedNotAuthorised returns nil", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -323,10 +324,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("negative probe: accepted return code 0 fails negative check", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -351,9 +352,9 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("EOF / disconnect is failure", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
+		defer func() { _ = clientConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -370,10 +371,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("unexpected packet type is failure", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -397,10 +398,10 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("cancelled context fails safely", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 
@@ -418,7 +419,7 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 	})
 
 	t.Run("dial failure fails safely", func(t *testing.T) {
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return nil, errors.New("dial failed")
 		}
 
@@ -431,9 +432,9 @@ func TestProbePrivateCredentialWithDialer(t *testing.T) {
 
 	t.Run("connection closed on all exits", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer serverConn.Close()
+		defer func() { _ = serverConn.Close() }()
 
-		dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return clientConn, nil
 		}
 

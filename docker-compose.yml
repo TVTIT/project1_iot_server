@@ -94,7 +94,7 @@ services:
     networks:
       - iot_net
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-iot_platform}" ]
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-iot_platform}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -315,7 +315,7 @@ services:
       MQTT_DYNSEC_JSON_PATH: ${MQTT_DYNSEC_JSON_PATH:-/mosquitto/dynsec/dynamic-security.json}
       MQTT_DYNSEC_WRITER_UID: ${MQTT_DYNSEC_WRITER_UID:-}
       MQTT_DYNSEC_IMAGE_REFERENCE: ${MQTT_DYNSEC_IMAGE_REFERENCE:-eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9}
-      MQTT_DYNSEC_IMAGE_CONFIG_ID: ${MQTT_DYNSEC_IMAGE_CONFIG_ID:-sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9}
+      MQTT_DYNSEC_IMAGE_CONFIG_ID: ${MQTT_DYNSEC_IMAGE_CONFIG_ID:-sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4}
       MQTT_DYNSEC_PLATFORM: ${MQTT_DYNSEC_PLATFORM:-linux/amd64}
       MQTT_DYNSEC_TIMEOUT: ${MQTT_DYNSEC_TIMEOUT:-3s}
       MQTT_DYNSEC_QUEUE_SIZE: ${MQTT_DYNSEC_QUEUE_SIZE:-16}

@@ -41,7 +41,10 @@ from pathlib import Path
 from contextlib import contextmanager
 
 PINNED_IMAGE = 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
+# The registry pin is the OCI index; Docker inspect Id depends on the image store.
 PINNED_DIGEST = 'd12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
+PINNED_CONFIG_ID = 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4'
+PINNED_PLATFORM_MANIFEST_DIGEST = 'sha256:f43889926d948c1146751bce701373b71c16a81e5de9b2986b7589221fa4d9e9'
 BOOTSTRAP_SCRIPT = Path(__file__).resolve().parents[1] / 'mqtt-bootstrap.py'
 CHILD_EXECUTION_SECONDS = 45
 CHILD_GRACE_SECONDS = 120
@@ -236,29 +239,31 @@ def scan_output_for_secrets(stdout_bytes, stderr_bytes, secrets_to_scan):
 
 
 def verify_pinned_image(image_ref=PINNED_IMAGE, runner=subprocess.run):
-    res = run_cmd(['docker', 'image', 'inspect', image_ref], timeout=10, runner=runner)
-    if res.returncode != 0:
-        raise RunnerError('pinned image not found locally; pulling is forbidden')
+    # Keep the CLI aligned with the production bootstrap's offline descriptor verifier.
     try:
-        data = json.loads(res.stdout.decode('utf-8'))
-        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-            raise RunnerError('invalid image inspect metadata')
-        inspect = data[0]
-        arch = inspect.get('Architecture')
-        os_name = inspect.get('Os')
-        if arch != 'amd64' or os_name != 'linux':
-            raise RunnerError('image architecture or OS mismatch; linux/amd64 required')
-        digests = inspect.get('RepoDigests', [])
-        if not any(d == PINNED_IMAGE for d in digests):
-            raise RunnerError('image RepoDigests exact pin mismatch')
-        raw_id = inspect.get('Id', '')
-        if raw_id.startswith('sha256:'):
-            raw_id = raw_id[7:]
-        if raw_id.lower() != PINNED_DIGEST.lower():
-            raise RunnerError('image Id immutable digest mismatch')
-        return 'sha256:' + raw_id
-    except json.JSONDecodeError:
-        raise RunnerError('failed to parse image inspect output') from None
+        spec = importlib.util.spec_from_file_location('mqtt_bootstrap_image_verifier', BOOTSTRAP_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify_image(image_ref, runner=runner)
+    except Exception as exc:
+        # Bootstrap verifier exceptions contain fixed diagnostics only; do not expose runner output.
+        message = str(exc)
+        safe_messages = {
+            'pinned image not found locally; pulling is forbidden', 'invalid image inspect metadata',
+            'image architecture or OS mismatch; linux/amd64 required', 'image RepoDigests exact pin mismatch',
+            'image Id immutable digest mismatch', 'malformed image descriptor metadata',
+            'contradictory image descriptor digest', 'unsupported image descriptor metadata',
+            'missing or malformed root index descriptor metadata', 'root index descriptor mismatch',
+            'platform-specific image inspect failed or timed out', 'platform-specific image inspect failed',
+            'invalid platform-specific image inspect metadata', 'platform-specific image inspect os/architecture mismatch',
+            'missing or malformed platform image descriptor metadata', 'platform-specific image descriptor mismatch',
+            'platform-specific image Id mismatch', 'image verification failed or timed out', 'invalid JSON',
+        }
+        if message == 'invalid JSON':
+            raise RunnerError('failed to parse image inspect output') from None
+        if message not in safe_messages:
+            message = 'image verification failed'
+        raise RunnerError(message) from None
 
 
 def check_volume_absent(volume_name, runner=subprocess.run):
@@ -411,6 +416,13 @@ def readback_and_verify_store(volume_name, image_id, expected_manager, expected_
                     or cfg_labels.get('test.run') != run_lbl):
                 helper_foreign = True
                 raise RunnerError('helper container receipt ownership mismatch')
+            if image_id == 'sha256:' + PINNED_DIGEST:
+                descriptor = insp_data.get('ImageManifestDescriptor')
+                if (not isinstance(descriptor, dict)
+                        or descriptor.get('digest') != PINNED_PLATFORM_MANIFEST_DIGEST
+                        or descriptor.get('mediaType') != 'application/vnd.oci.image.manifest.v1+json'):
+                    helper_foreign = True
+                    raise RunnerError('helper container image manifest descriptor mismatch')
             helper_verified = True
             verify_readback_masks(insp_data, volume_name)
             if exit_code != 0:
@@ -441,6 +453,11 @@ def readback_and_verify_store(volume_name, image_id, expected_manager, expected_
                                        and obj.get('Id') == cid and obj.get('Image') == image_id
                                        and cfg_labels.get('test.task') == task_lbl
                                        and cfg_labels.get('test.run') == run_lbl)
+                    if helper_verified and image_id == 'sha256:' + PINNED_DIGEST:
+                        descriptor = obj.get('ImageManifestDescriptor')
+                        helper_verified = (isinstance(descriptor, dict)
+                                           and descriptor.get('digest') == PINNED_PLATFORM_MANIFEST_DIGEST
+                                           and descriptor.get('mediaType') == 'application/vnd.oci.image.manifest.v1+json')
                 except Exception:
                     raise RunnerError('helper container cleanup receipt failed') from None
                 if not helper_verified:
@@ -857,7 +874,7 @@ def _run_pipeline(report_path=None, runner=subprocess.run):
         'ownership': '1883:1883',
         'mode': 'container',
         'image_ref': PINNED_IMAGE,
-        'image_digest': image_id,
+        'image_digest': 'sha256:' + PINNED_DIGEST,
         'run_nonce': run_nonce,
         'assertions_checked': assertions_checked,
         'cleaned_up': cleaned_up,
