@@ -132,6 +132,72 @@ def generate_fixture_tls(fixture):
     return True
 
 
+def canonicalize_helper_mounts(target):
+    if type(target) is not dict:
+        raise ValueError("helper_mount_receipt_invalid")
+    if "mounts" in target or "tmpfs" in target:
+        if "mounts" not in target or "tmpfs" not in target:
+            raise ValueError("helper_mount_receipt_invalid")
+        raw_mounts = target["mounts"]
+        raw_tmpfs = target["tmpfs"]
+    elif "Mounts" in target or "HostConfig" in target:
+        if "Mounts" not in target or "HostConfig" not in target:
+            raise ValueError("helper_mount_receipt_invalid")
+        raw_mounts = target["Mounts"]
+        host_config = target["HostConfig"]
+        if type(host_config) is not dict or "Tmpfs" not in host_config:
+            raise ValueError("helper_mount_receipt_invalid")
+        raw_tmpfs = host_config["Tmpfs"]
+    else:
+        raise ValueError("helper_mount_receipt_invalid")
+
+    if type(raw_mounts) is not list:
+        raise ValueError("helper_mount_receipt_invalid")
+    if type(raw_tmpfs) is not dict:
+        raise ValueError("helper_mount_receipt_invalid")
+
+    seen_destinations = set()
+    normalized_mounts = []
+    for m in raw_mounts:
+        if type(m) is not dict:
+            raise ValueError("helper_mount_receipt_invalid")
+        dest = m.get("Destination")
+        if type(dest) is not str or not dest:
+            raise ValueError("helper_mount_receipt_invalid")
+        rw = m.get("RW")
+        if type(rw) is not bool:
+            raise ValueError("helper_mount_receipt_invalid")
+        if dest in seen_destinations:
+            raise ValueError("helper_mount_receipt_invalid")
+        seen_destinations.add(dest)
+        normalized_mounts.append(dict(m))
+
+    for k, v in raw_tmpfs.items():
+        if type(k) is not str or type(v) is not str:
+            raise ValueError("helper_mount_receipt_invalid")
+
+    sorted_mounts = sorted(normalized_mounts, key=lambda x: x["Destination"])
+    return {"mounts": sorted_mounts, "tmpfs": dict(raw_tmpfs)}
+
+
+def check_helper_mount_receipt(stored_receipt, current_obj):
+    expected = canonicalize_helper_mounts(stored_receipt)
+    current = canonicalize_helper_mounts(current_obj)
+    if current == expected:
+        return
+    expected_mounts = expected["mounts"]
+    current_mounts = current["mounts"]
+    if len(current_mounts) != len(expected_mounts):
+        raise ValueError("helper_mount_count_mismatch")
+    if [m["Destination"] for m in current_mounts] != [m["Destination"] for m in expected_mounts]:
+        raise ValueError("helper_mount_destinations_mismatch")
+    if current_mounts != expected_mounts:
+        raise ValueError("helper_mount_attributes_mismatch")
+    if current["tmpfs"] != expected["tmpfs"]:
+        raise ValueError("helper_tmpfs_mismatch")
+    raise ValueError("helper_mount_replacement_refused")
+
+
 class ResourceRegistry:
     """Exact-name intent before allocation; immutable receipt before use/delete."""
     def __init__(self, fixture, runner=subprocess.run):
@@ -189,9 +255,8 @@ class ResourceRegistry:
         except (ValueError, KeyError, TypeError):
             raise ValueError("resource_ownership_refused") from None
         rec = {"id": identity, "created": created, "labels": labels}
-        if item.get('helper_mount_receipt') is not None:
-            if {'mounts': obj.get('Mounts'), 'tmpfs': obj.get('HostConfig', {}).get('Tmpfs')} != item['helper_mount_receipt']:
-                raise ValueError('helper_mount_replacement_refused')
+        if item.get("helper_mount_receipt") is not None:
+            check_helper_mount_receipt(item["helper_mount_receipt"], obj)
         if item["receipt"] is not None and item["receipt"] != rec:
             raise ValueError("resource_replacement_refused")
         item["receipt"] = rec
@@ -273,7 +338,7 @@ def allocation_readback(fixture, registry, volume):
     if obj is None or obj["Id"] != cid:
         raise ValueError("helper_receipt_rejected")
     verify_readback_mounts(fixture, volume, obj)
-    item['helper_mount_receipt'] = {'mounts': obj['Mounts'], 'tmpfs': obj['HostConfig']['Tmpfs']}
+    item["helper_mount_receipt"] = canonicalize_helper_mounts(obj)
     registry.save(item)
     private_write(fixture.private / "readback-mounts.json", json.dumps({
         "id": cid, "mounts": obj["Mounts"], "tmpfs": obj["HostConfig"]["Tmpfs"]}))
@@ -1079,6 +1144,9 @@ ALLOWED_FAILURE_ERROR_CODES = {
     "resource_collision", "resource_intent_rejected",
     "resource_inspect_unresolved", "resource_ownership_refused",
     "resource_replacement_refused", "helper_mount_replacement_refused",
+    "helper_mount_count_mismatch", "helper_mount_destinations_mismatch",
+    "helper_mount_attributes_mismatch", "helper_tmpfs_mismatch",
+    "helper_mount_receipt_invalid",
     "resource_cleanup_unresolved", "anonymous_volume_prevention_failed",
     "compose_phase_unresolved", "compose_phase_failed",
     "phase_container_absent", "phase_health_timeout",

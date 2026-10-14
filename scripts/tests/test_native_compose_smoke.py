@@ -162,6 +162,75 @@ class PreparationTests(unittest.TestCase):
             cli_spec.loader.exec_module(cli_mod)
             self.assertEqual(fixture.values["MQTT_DYNSEC_IMAGE_CONFIG_ID"], getattr(cli_mod, "PINNED_CONFIG_ID"))
 
+    def _verify_root_postgres_healthcheck(self, compose_text):
+        pg_match = re.search(r"(?ms)^  postgres:\n(.*?)(?=\n  [a-z0-9_-]+:|\Z)", compose_text)
+        self.assertIsNotNone(pg_match, "postgres service definition missing in root compose")
+        pg_block = pg_match.group(1)
+
+        hc_match = re.search(r"(?ms)^\s+healthcheck:\n(.*?)(?=\n    [a-z_]+:|\n  #|\Z)", pg_block)
+        self.assertIsNotNone(hc_match, "healthcheck missing from postgres service in root compose")
+        hc_block = hc_match.group(1)
+
+        tm = re.search(r'test:\s*\[\s*"CMD-SHELL",\s*"([^"]+)"\s*\]', hc_block)
+        self.assertIsNotNone(tm, "CMD-SHELL test command missing from postgres healthcheck")
+        cmd_str = tm.group(1)
+
+        # Validate explicit TCP host 127.0.0.1 and port 5432 transport
+        tokens = cmd_str.split()
+        self.assertEqual(tokens[0], "pg_isready", "healthcheck must execute pg_isready")
+        self.assertIn("-h", tokens, "healthcheck command missing explicit -h flag")
+        self.assertEqual(tokens[tokens.index("-h") + 1], "127.0.0.1", "healthcheck must target 127.0.0.1")
+        self.assertIn("-p", tokens, "healthcheck command missing explicit -p flag")
+        self.assertEqual(tokens[tokens.index("-p") + 1], "5432", "healthcheck must target port 5432")
+
+        # Validate preserved user and db interpolation and safe defaults
+        self.assertIn("-U ${POSTGRES_USER:-postgres}", cmd_str)
+        self.assertIn("-d ${POSTGRES_DB:-iot_platform}", cmd_str)
+
+        # Validate preserved healthcheck budgets and invariants
+        self.assertRegex(hc_block, r"(?m)^\s+interval:\s*10s$")
+        self.assertRegex(hc_block, r"(?m)^\s+timeout:\s*5s$")
+        self.assertRegex(hc_block, r"(?m)^\s+retries:\s*5$")
+        self.assertNotIn("start_period", hc_block)
+        self.assertNotIn("sleep", cmd_str)
+
+        # Validate localhost-only port mapping and service isolation preserved
+        self.assertRegex(pg_block, r'(?m)^\s+-\s*"127\.0\.0\.1:5432:5432"$')
+        return cmd_str
+
+    def test_root_compose_postgres_healthcheck_explicit_tcp_transport_and_budgets(self):
+        compose_text = smoke.ROOT_COMPOSE.read_text()
+        self._verify_root_postgres_healthcheck(compose_text)
+
+    def test_root_compose_postgres_healthcheck_regression_rejects_socket_only(self):
+        real_text = smoke.ROOT_COMPOSE.read_text()
+        socket_only_text = real_text.replace(
+            "pg_isready -h 127.0.0.1 -p 5432 -U",
+            "pg_isready -U",
+        )
+        self.assertNotEqual(real_text, socket_only_text)
+        with self.assertRaises(AssertionError):
+            self._verify_root_postgres_healthcheck(socket_only_text)
+        mock_compose = Mock()
+        mock_compose.read_text.return_value = socket_only_text
+        with patch.object(smoke, "ROOT_COMPOSE", mock_compose):
+            with self.assertRaises(AssertionError):
+                self._verify_root_postgres_healthcheck(smoke.ROOT_COMPOSE.read_text())
+
+    def test_smoke_override_inherits_root_postgres_healthcheck(self):
+        """Verify smoke override template does not redefine or remove postgres healthcheck.
+
+        Note: This asserts source template inheritance intent only (the override file does not
+        touch healthcheck, intending Compose to inherit root compose definition).
+        Actual effective configuration merge must be verified in the pending native run.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            override_text = fixture.override.read_text()
+            pg_match = re.search(r"(?ms)^  postgres:\n(.*?)(?=\n  [a-z0-9_-]+:|\Z)", override_text)
+            self.assertIsNotNone(pg_match, "postgres service missing in generated override")
+            self.assertNotIn("healthcheck", pg_match.group(1), "smoke override must not replace root healthcheck")
+
 
     def test_compose_command_is_explicit_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -667,6 +736,377 @@ class AllocationTests(unittest.TestCase):
             runner.return_value.stdout = json.dumps([obj]).encode()
             with self.assertRaisesRegex(ValueError, "resource_replacement_refused"):
                 registry.remove(item)
+
+    def _create_helper_container_obj(self, f):
+        return {
+            "Id": "b" * 64,
+            "Name": "/" + f.project + "-reader",
+            "Created": "2026-10-13T01:00:00Z",
+            "Image": "sha256:" + "a" * 64,
+            "Config": {"Labels": {"test.run": f.project}},
+            "HostConfig": {
+                "Tmpfs": {
+                    "/mosquitto/data": "rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=1883,gid=1883",
+                    "/mosquitto/log": "rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=1883,gid=1883",
+                }
+            },
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": str(f.private / "certs"),
+                    "Destination": "/certs",
+                    "Mode": "ro",
+                    "RW": False,
+                    "Propagation": "rprivate",
+                },
+                {
+                    "Type": "volume",
+                    "Name": "test_volume",
+                    "Source": "/var/lib/docker/volumes/test_volume/_data",
+                    "Destination": "/store",
+                    "Driver": "local",
+                    "Mode": "ro",
+                    "RW": False,
+                    "Propagation": "",
+                },
+            ],
+        }
+
+    def test_helper_mount_canonicalization_and_reorder_acceptance(self):
+        import copy
+        import subprocess
+        with ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            runner = Mock()
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([obj]).encode(), b"")
+            registry = smoke.ResourceRegistry(f, runner)
+            item = registry.intent("container", obj["Name"][1:], obj["Image"], obj["Config"]["Labels"])
+
+            # Initial resolve
+            registry.resolve(item)
+            item["helper_mount_receipt"] = smoke.canonicalize_helper_mounts(obj)
+
+            # Reordered inspect Mounts: volume first, then bind
+            reordered_obj = copy.deepcopy(obj)
+            reordered_obj["Mounts"] = list(reversed(obj["Mounts"]))
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([reordered_obj]).encode(), b"")
+
+            resolved = registry.resolve(item)
+            self.assertEqual(resolved["Id"], obj["Id"])
+
+            # Resolve / remove symmetry after reorder
+            removed_state = {"removed": False}
+            def fake_runner(args, **kwargs):
+                if "rm" in args:
+                    removed_state["removed"] = True
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                if "inspect" in args:
+                    if removed_state["removed"]:
+                        return subprocess.CompletedProcess(args, 1, b"", b"Error: No such container")
+                    return subprocess.CompletedProcess(args, 0, json.dumps([reordered_obj]).encode(), b"")
+                return subprocess.CompletedProcess(args, 0, json.dumps([reordered_obj]).encode(), b"")
+
+            runner.side_effect = fake_runner
+            registry.remove(item)
+            self.assertTrue(item.get("removed", False))
+
+    def test_helper_mount_attribute_mutations_rejected(self):
+        import copy
+        import subprocess
+        with ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps([obj]).encode(), b""))
+            registry = smoke.ResourceRegistry(f, runner)
+            item = registry.intent("container", obj["Name"][1:], obj["Image"], obj["Config"]["Labels"])
+            registry.resolve(item)
+            item["helper_mount_receipt"] = smoke.canonicalize_helper_mounts(obj)
+
+            # 1. Volume Name mutation
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][1]["Name"] = "mutated_volume_name"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 2. Volume Source path mutation
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][1]["Source"] = "/var/lib/docker/volumes/other_volume/_data"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 3. Bind Source path mutation
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][0]["Source"] = str(f.private / "other_certs")
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 4. Driver mutation
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][1]["Driver"] = "nfs"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 5. Mode mutation
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][0]["Mode"] = "rw"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 6. Propagation mutation
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][0]["Propagation"] = "rshared"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 7. Type mutation (volume -> bind)
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][1]["Type"] = "bind"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+            # 8. RW flip (False -> True)
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][0]["RW"] = True
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_attributes_mismatch"):
+                registry.resolve(item)
+
+    def test_helper_mount_destinations_and_counts_rejected(self):
+        import copy
+        import subprocess
+        with ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps([obj]).encode(), b""))
+            registry = smoke.ResourceRegistry(f, runner)
+            item = registry.intent("container", obj["Name"][1:], obj["Image"], obj["Config"]["Labels"])
+            registry.resolve(item)
+            item["helper_mount_receipt"] = smoke.canonicalize_helper_mounts(obj)
+
+            # Destination mutated (/store -> /other_store)
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"][1]["Destination"] = "/other_store"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_destinations_mismatch"):
+                registry.resolve(item)
+
+            # Extra mount added
+            mut_obj = copy.deepcopy(obj)
+            extra = copy.deepcopy(obj["Mounts"][0])
+            extra["Destination"] = "/extra"
+            mut_obj["Mounts"].append(extra)
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_count_mismatch"):
+                registry.resolve(item)
+
+            # Missing mount
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"] = mut_obj["Mounts"][:1]
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_count_mismatch"):
+                registry.resolve(item)
+
+    def test_helper_mount_malformed_and_duplicate_rejected(self):
+        import copy
+        import subprocess
+        with ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps([obj]).encode(), b""))
+            registry = smoke.ResourceRegistry(f, runner)
+            item = registry.intent("container", obj["Name"][1:], obj["Image"], obj["Config"]["Labels"])
+            registry.resolve(item)
+            item["helper_mount_receipt"] = smoke.canonicalize_helper_mounts(obj)
+
+            # Duplicate destination
+            mut_obj = copy.deepcopy(obj)
+            dup = copy.deepcopy(obj["Mounts"][0])
+            mut_obj["Mounts"] = [obj["Mounts"][0], dup]
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                registry.resolve(item)
+
+            # Wrong-type RW: string "false", int 0, int 1, None
+            for bad_rw in ("false", 0, 1, None, []):
+                mut_obj = copy.deepcopy(obj)
+                mut_obj["Mounts"][0]["RW"] = bad_rw
+                runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+                with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                    registry.resolve(item)
+
+            # Mounts not a list
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"] = {"Destination": "/certs"}
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                registry.resolve(item)
+
+            # Mount element not a dict
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Mounts"] = ["/certs", "/store"]
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                registry.resolve(item)
+
+            # Destination missing or not a string
+            for bad_dest in (123, None, "", ["/certs"]):
+                mut_obj = copy.deepcopy(obj)
+                mut_obj["Mounts"][0]["Destination"] = bad_dest
+                runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+                with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                    registry.resolve(item)
+
+            # Tmpfs not a dict
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["HostConfig"]["Tmpfs"] = ["/mosquitto/data"]
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                registry.resolve(item)
+
+            # Tmpfs options not a string
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["HostConfig"]["Tmpfs"]["/mosquitto/data"] = 123
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_mount_receipt_invalid"):
+                registry.resolve(item)
+
+    def test_helper_tmpfs_options_and_entries_rejected(self):
+        import copy
+        import subprocess
+        with ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps([obj]).encode(), b""))
+            registry = smoke.ResourceRegistry(f, runner)
+            item = registry.intent("container", obj["Name"][1:], obj["Image"], obj["Config"]["Labels"])
+            registry.resolve(item)
+            item["helper_mount_receipt"] = smoke.canonicalize_helper_mounts(obj)
+
+            # Tmpfs options changed
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["HostConfig"]["Tmpfs"]["/mosquitto/data"] = "rw,size=2m"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_tmpfs_mismatch"):
+                registry.resolve(item)
+
+            # Tmpfs entry added
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["HostConfig"]["Tmpfs"]["/mosquitto/extra"] = "rw,size=1m"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_tmpfs_mismatch"):
+                registry.resolve(item)
+
+            # Tmpfs entry removed
+            mut_obj = copy.deepcopy(obj)
+            del mut_obj["HostConfig"]["Tmpfs"]["/mosquitto/data"]
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "helper_tmpfs_mismatch"):
+                registry.resolve(item)
+
+    def test_helper_identity_protection_retained(self):
+        import copy
+        import subprocess
+        with ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps([obj]).encode(), b""))
+            registry = smoke.ResourceRegistry(f, runner)
+            item = registry.intent("container", obj["Name"][1:], obj["Image"], obj["Config"]["Labels"])
+            registry.resolve(item)
+            item["helper_mount_receipt"] = smoke.canonicalize_helper_mounts(obj)
+
+            # Container Id mutated
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Id"] = "f" * 64
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "resource_replacement_refused"):
+                registry.resolve(item)
+
+            # Container Created mutated
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Created"] = "2026-10-14T12:00:00Z"
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "resource_replacement_refused"):
+                registry.resolve(item)
+
+            # Container Labels mutated
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Config"]["Labels"] = {"test.run": "wrong_project"}
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "resource_ownership_refused"):
+                registry.resolve(item)
+
+            # Container Image mutated
+            mut_obj = copy.deepcopy(obj)
+            mut_obj["Image"] = "sha256:" + "9" * 64
+            runner.return_value = subprocess.CompletedProcess([], 0, json.dumps([mut_obj]).encode(), b"")
+            with self.assertRaisesRegex(ValueError, "resource_ownership_refused"):
+                registry.resolve(item)
+
+    def test_helper_receipt_json_roundtrip_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = smoke.prepare(Path(directory) / "fixture")
+            obj = self._create_helper_container_obj(f)
+            receipt = smoke.canonicalize_helper_mounts(obj)
+
+            # Must contain only JSON-native lists, dicts, primitives (no tuples)
+            self.assertIsInstance(receipt["mounts"], list)
+            self.assertIsInstance(receipt["tmpfs"], dict)
+            for m in receipt["mounts"]:
+                self.assertIsInstance(m, dict)
+                self.assertIsInstance(m["RW"], bool)
+                self.assertIsInstance(m["Destination"], str)
+            for k, v in receipt["tmpfs"].items():
+                self.assertIsInstance(k, str)
+                self.assertIsInstance(v, str)
+
+            # JSON roundtrip stability
+            dumped = json.dumps(receipt)
+            loaded = json.loads(dumped)
+            self.assertEqual(loaded, receipt)
+
+            # Re-canonicalization produces identical receipt
+            re_canonical = smoke.canonicalize_helper_mounts(loaded)
+            self.assertEqual(re_canonical, receipt)
+
+    def test_helper_mount_mismatch_codes_survive_safe_report_and_diagnostic(self):
+        new_codes = [
+            "helper_mount_count_mismatch",
+            "helper_mount_destinations_mismatch",
+            "helper_mount_attributes_mismatch",
+            "helper_tmpfs_mismatch",
+            "helper_mount_receipt_invalid",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            f = smoke.prepare(Path(directory) / "fixture")
+            for code in new_codes:
+                self.assertIn(code, smoke.ALLOWED_FAILURE_ERROR_CODES)
+                rep = smoke.record_failure_report(f, phase="bootstrap", exc=ValueError(code), cleanup_verified=True)
+                self.assertEqual(rep["error_code"], code)
+                smoke.validate_failure_report(rep)
+
+                diag = smoke.FailureDiagnostic(rep, cause=ValueError(code))
+                self.assertEqual(str(diag), code)
+
+            # Verify secrets do not leak into error_code
+            secret = f.values["MQTT_PASSWORD"]
+            leak_rep = smoke.record_failure_report(f, phase="bootstrap", exc=ValueError(f"leak_{secret}"), cleanup_verified=True)
+            self.assertEqual(leak_rep["error_code"], "unclassified")
+            self.assertNotIn(secret, json.dumps(leak_rep))
 
 
     def test_probe_startup_envoy_and_nginx_contracts(self):
