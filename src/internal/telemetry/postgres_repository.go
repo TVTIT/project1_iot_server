@@ -96,6 +96,15 @@ func (r *postgresRepository) Persist(ctx context.Context, message *Message) (Per
 	if copyCount != int64(metadata.sampleCount) {
 		return PersistResult{}, fmt.Errorf("telemetry sample copy count mismatch: %w", &ReasonError{Code: ReasonDependencyUnavailable})
 	}
+	// Sensor current state and its temporal observation advance in the same
+	// transaction as the ledger and raw samples. Any failure here rolls back all
+	// of them and no commit outcome is reported.
+	if _, err := applySensorReportedState(operationCtx, tx, resource, message); err != nil {
+		return PersistResult{}, err
+	}
+	if err := appendSensorSampleIntervalTemporal(operationCtx, tx, resource, message); err != nil {
+		return PersistResult{}, err
+	}
 	if err := tx.Commit(operationCtx); err != nil {
 		return PersistResult{}, commitUnconfirmedError(err)
 	}

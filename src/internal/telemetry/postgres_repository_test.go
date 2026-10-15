@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -44,6 +46,36 @@ type telemetryFakeTx struct {
 	rollbackValid bool
 	queryCalls    int
 	cancelQuery   context.CancelFunc
+
+	sensorState        []byte
+	sensorVersion      int64
+	sensorLastReported *time.Time
+	sensorReadErr      error
+	execCalls          int
+	execQuery          string
+	execArgs           []any
+	execRows           int64
+	execErr            error
+
+	// execs records every Exec in call order so tests can assert the
+	// reported-state/temporal ordering. sensorExec and temporalExec override the
+	// default execRows/execErr for that specific statement when set.
+	execs        []telemetryFakeExec
+	sensorExec   *telemetryFakeExecConfig
+	temporalExec *telemetryFakeExecConfig
+}
+
+// telemetryFakeExec records one Exec call for order assertions.
+type telemetryFakeExec struct {
+	query string
+	args  []any
+}
+
+// telemetryFakeExecConfig overrides the fake's default Exec result for one
+// statement.
+type telemetryFakeExecConfig struct {
+	rows int64
+	err  error
 }
 
 func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, _ ...any) pgx.Row {
@@ -61,6 +93,11 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, _ ...any)
 		return telemetryFakeRow{values: []any{&unit}}
 	case strings.Contains(query, "gateway_entity.id"):
 		return telemetryFakeRow{values: []any{uuid.New(), uuid.New(), true}}
+	case strings.Contains(query, "FROM public.twin_states"):
+		if tx.sensorReadErr != nil {
+			return telemetryFakeRow{err: tx.sensorReadErr}
+		}
+		return telemetryFakeRow{values: []any{tx.sensorState, tx.sensorVersion, tx.sensorLastReported}}
 	case strings.Contains(query, "INSERT INTO public.processed_messages"):
 		if tx.duplicate {
 			return telemetryFakeRow{err: pgx.ErrNoRows}
@@ -85,6 +122,24 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, _ ...any)
 	default:
 		return telemetryFakeRow{err: errors.New("unexpected query")}
 	}
+}
+
+func (tx *telemetryFakeTx) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	rows, execErr := tx.execRows, tx.execErr
+	switch {
+	case query == sensorReportedStateAdvanceSQL && tx.sensorExec != nil:
+		rows, execErr = tx.sensorExec.rows, tx.sensorExec.err
+	case query == sensorSampleIntervalTemporalInsertSQL && tx.temporalExec != nil:
+		rows, execErr = tx.temporalExec.rows, tx.temporalExec.err
+	}
+	tx.execCalls++
+	tx.execQuery = query
+	tx.execArgs = args
+	tx.execs = append(tx.execs, telemetryFakeExec{query: query, args: args})
+	if execErr != nil {
+		return pgconn.CommandTag{}, execErr
+	}
+	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", rows)), nil
 }
 
 func (tx *telemetryFakeTx) CopyFrom(_ context.Context, table pgx.Identifier, columns []string, source pgx.CopyFromSource) (int64, error) {
@@ -232,7 +287,7 @@ func TestPersistCommitFailuresRemainUnconfirmedForNewAndDuplicate(t *testing.T) 
 			name = "duplicate message"
 		}
 		t.Run(name, func(t *testing.T) {
-			tx := &telemetryFakeTx{message: telemetryRepositoryTestMessage(t), duplicate: duplicate, commitErr: errors.New("commit response lost"), copyCount: 3}
+			tx := &telemetryFakeTx{message: telemetryRepositoryTestMessage(t), duplicate: duplicate, commitErr: errors.New("commit response lost"), copyCount: 3, execRows: 1}
 			repository, _ := newTelemetryFakeRepository(t, tx)
 			result, err := repository.Persist(context.Background(), tx.message)
 			if reasonCode(err) != ReasonCommitUnconfirmed || result != (PersistResult{}) || !strings.Contains(err.Error(), "commit response lost") {
@@ -282,7 +337,7 @@ func TestPersistCanceledOperationUsesIndependentRollbackContext(t *testing.T) {
 }
 
 func TestPersistSuccessReturnsCommittedSampleCount(t *testing.T) {
-	tx := &telemetryFakeTx{message: telemetryRepositoryTestMessage(t), copyCount: 3}
+	tx := &telemetryFakeTx{message: telemetryRepositoryTestMessage(t), copyCount: 3, execRows: 1}
 	repository, database := newTelemetryFakeRepository(t, tx)
 	result, err := repository.Persist(context.Background(), tx.message)
 	if err != nil {
