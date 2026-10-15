@@ -14,7 +14,15 @@ type validatedRange struct {
 	Interval        time.Duration
 }
 
+// maxInt64 bounds signed 64-bit integer arithmetic.
 const maxInt64 = int64(math.MaxInt64)
+
+// maxExactFloat64Integer is 2^53, the largest integer magnitude a float64 (and
+// therefore PostgreSQL DOUBLE PRECISION) can represent exactly. sample_interval_us
+// is persisted in the temporal value_number column, so a larger-but-valid int64
+// would be silently rounded on write; bound the accepted domain to keep every
+// stored interval exact.
+const maxExactFloat64Integer = int64(1) << 53
 
 // validateRange checks batch sequence and time arithmetic before any samples
 // are expanded. receivedAt is supplied by the caller to keep clock use explicit.
@@ -38,7 +46,13 @@ func validateRange(batch BatchDTO, limits Limits, receivedAt time.Time) (validat
 	}
 	lastSequence := batch.FirstSequence + steps
 
-	if batch.SampleIntervalUS <= 0 || batch.SampleIntervalUS > maxInt64/int64(time.Microsecond) {
+	// sample_interval_us is written to the temporal value_number column as
+	// DOUBLE PRECISION, so it must stay within the exact float64 integer range.
+	// This bound is tighter than the duration conversion bound and therefore
+	// also protects it.
+	if batch.SampleIntervalUS <= 0 ||
+		batch.SampleIntervalUS > maxExactFloat64Integer ||
+		batch.SampleIntervalUS > maxInt64/int64(time.Microsecond) {
 		return invalidSequence("sample_interval_us")
 	}
 	interval := time.Duration(batch.SampleIntervalUS) * time.Microsecond

@@ -85,7 +85,7 @@ not fractional values or strings. Reject the whole message on any invalid field.
 | `first_sequence` | Integer >= 0; last sequence `first_sequence + sample_count - 1` must fit signed BIGINT. |
 | `sample_count` | Positive integer equal to `len(samples)`, within configured maximum. |
 | `measured_at` | RFC3339 with timezone, normalized to UTC, precision no finer than microseconds; reject finer precision rather than rounding. Must be representable by the selected Go/PostgreSQL timestamp path (calendar years 0001–9999). |
-| `sample_interval_us` | Positive integer microseconds, within signed BIGINT and safe timestamp/duration arithmetic. |
+| `sample_interval_us` | Positive integer microseconds, within signed BIGINT and safe timestamp/duration arithmetic, and at most 2^53 (9007199254740992) so temporal `value_number` (DOUBLE PRECISION) stores it exactly. |
 | `samples` | Nonempty array of finite float64 numbers, no null, NaN, Infinity or overflow. |
 
 For zero-based sample index i, `sequence_num = first_sequence + i` and
@@ -93,7 +93,9 @@ For zero-based sample index i, `sequence_num = first_sequence + i` and
 before expansion, including overflow and the last timestamp. Batch duration
 means the sample span `(sample_count - 1) * sample_interval_us`, not elapsed
 MQTT transmission time. Even a one-sample batch must have a positive interval
-representable by Go's duration arithmetic.
+representable by Go's duration arithmetic and no larger than 2^53, the largest
+integer an IEEE-754 double (the temporal `sample_interval_us` value column)
+represents exactly.
 
 Task 3.0 demo profile: 65,536 payload bytes, at most 1,000 samples/message,
 60s sample span and 2m future skew relative to backend receipt time, checked

@@ -71,6 +71,40 @@ func TestValidateRangeSequenceAndIntervals(t *testing.T) {
 	}
 }
 
+// TestValidateRangeSampleIntervalFloat64Exactness pins the sample_interval_us
+// upper bound to the largest integer a float64 (PostgreSQL DOUBLE PRECISION)
+// represents exactly. The interval is persisted in the temporal value_number
+// column, so a larger-but-valid int64 would be silently rounded. A one-sample
+// batch is used to isolate the bound from the batch span/duration checks.
+func TestValidateRangeSampleIntervalFloat64Exactness(t *testing.T) {
+	const twoTo53 = int64(1) << 53
+	if maxExactFloat64Integer != twoTo53 {
+		t.Fatalf("maxExactFloat64Integer = %d, want %d", maxExactFloat64Integer, twoTo53)
+	}
+
+	accepted := rangeTestBatch()
+	accepted.SampleCount = 1
+	accepted.SampleIntervalUS = twoTo53
+	got, err := validateRange(accepted, rangeTestLimits(), rangeTestReceivedAt())
+	if err != nil {
+		t.Fatalf("interval at exactly 2^53 rejected: %v", err)
+	}
+	wantInterval := time.Duration(twoTo53) * time.Microsecond
+	if got.LastSequence != accepted.FirstSequence || got.Interval != wantInterval {
+		t.Fatalf("range = %#v, want last sequence %d and interval %s", got, accepted.FirstSequence, wantInterval)
+	}
+
+	rejected := rangeTestBatch()
+	rejected.SampleCount = 1
+	rejected.SampleIntervalUS = twoTo53 + 1
+	gotRejected, err := validateRange(rejected, rangeTestLimits(), rangeTestReceivedAt())
+	requireRangeError(t, gotRejected, err, ReasonInvalidSequenceRange)
+	var reason *ReasonError
+	if !errors.As(err, &reason) || reason.Field != "sample_interval_us" {
+		t.Fatalf("validateRange() error = %v, want field sample_interval_us", err)
+	}
+}
+
 func TestValidateRangeTimestampParsing(t *testing.T) {
 	validOffset := rangeTestBatch()
 	validOffset.MeasuredAt = "2026-08-21T12:15:00.123456+02:00"
