@@ -244,7 +244,8 @@ Compose yêu cầu `JWT_SECRET`, `GOTRUE_JWT_ISSUER` và
   - `DATABASE_URL`: URI kết nối PostgreSQL bắt buộc có scheme `postgres://` hoặc `postgresql://`.
   - `DATABASE_MAX_CONNS` (10), `DATABASE_MIN_CONNS` (1), `DATABASE_CONNECT_TIMEOUT` (10s).
   - Timeouts HTTP: `READINESS_TIMEOUT` (2s), `HTTP_READ_HEADER_TIMEOUT` (5s), `HTTP_READ_TIMEOUT` (15s), `HTTP_WRITE_TIMEOUT` (30s), `HTTP_IDLE_TIMEOUT` (60s), `SHUTDOWN_TIMEOUT` (10s).
-  - Giới hạn MQTT: `MQTT_QUEUE_CAPACITY` (256), `MQTT_WORKER_COUNT` (4), `MQTT_MAX_PAYLOAD_BYTES` (1MB).
+  - MQTT ingress (tắt mặc định): `MQTT_INGRESS_ENABLED` (false), độc lập với credential API và legacy runtime; khi bật yêu cầu `MQTT_BROKER_URL` (`ssl://`, không userinfo/query/fragment), `MQTT_CLIENT_ID`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS_CA_FILE`.
+  - Giới hạn MQTT: `MQTT_QUEUE_CAPACITY` (256), `MQTT_WORKER_COUNT` (4), `MQTT_MAX_PAYLOAD_BYTES` (mặc định 64KB, tối đa 1MB).
 
 ```bash
 docker compose up -d backend
