@@ -68,7 +68,10 @@ class Fixture:
     def wait_ready(self, attempts=90):
         for _ in range(attempts):
             try:
-                if self.sql("SELECT count(*) FROM schema_migrations WHERE version = 19 AND name = 'mqtt_simplified_journal';") == '1':
+                if self.sql(
+                    "SELECT count(*) FROM schema_migrations WHERE version = 20 AND name = 'stage3_telemetry_ingestion';",
+                    password=self.passwords['POSTGRES_PASSWORD'],
+                ) == '1':
                     return
             except Failure:
                 pass
@@ -123,7 +126,7 @@ def main():
     try:
         fixture.start()
         fixture.wait_ready()
-        print('Fresh compatibility schema 19 ready.', flush=True)
+        print('Fresh compatibility schema 20 ready.', flush=True)
         fixture.verify()
     except Failure as error:
         print(str(error), file=sys.stderr)

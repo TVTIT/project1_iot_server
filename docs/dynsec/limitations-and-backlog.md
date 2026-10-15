@@ -11,10 +11,21 @@ theo `AGENTS.md` mục 0/16. Task 3.0 chỉ thử schema/driver, không đóng T
 
 | Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
 | --- | --- | --- | --- |
-| Đổi telemetry PK/provenance khi columnstore bật không thực hiện trực tiếp với nonconstant default | Cần maintenance và dung lượng decompress; spike 3 rows không ước lượng được thời gian/disk trên dữ liệu thật | Candidate đã PASS decompress → tắt compression → DDL → bật/recompress; dừng writers, chờ compression job đang chạy kết thúc và preflight dung lượng trước migration | Task 3.2 khi viết migration chính thức; xem [báo cáo Task 3.0](../backend/stage-3-task-3.0-baseline-and-contract.md) |
-| Provenance lịch sử không có boot/message/topic/range | Không thể suy đoán dedup/ACK cho legacy marker; CHECK provenance chưa thể VALIDATE toàn dữ liệu | Giữ NULL lịch sử, CHECK NOT VALID kiểm new writes, supervised disposition cho legacy marker; không bịa ID hoặc xóa ledger | Task 3.2 và khi có dữ liệu legacy cần replay |
-| Compression cảnh báo segment/order cho các cột khóa mới | Hiệu năng trên tập lớn/chunks compressed chưa đo | Giữ warning và layout hiện có trong spike; đánh giá khi migration/query/workload thực sự dùng khóa mới, không gọi warning là correctness PASS trên mọi trường hợp | Task 3.2/3.7 nếu số đo cho thấy cần điều chỉnh |
+| Đổi telemetry PK/provenance khi columnstore bật không thực hiện trực tiếp với nonconstant default | Cần maintenance và dung lượng decompress; fixture nhỏ không ước lượng được thời gian/disk trên dữ liệu thật | Migration 20 và rehearsal đã PASS decompress → DDL → recompress; trước DB thật vẫn phải dừng writers, chờ compression job và preflight dung lượng | Trước production migration; xem [báo cáo Task 3.0](../backend/stage-3-task-3.0-baseline-and-contract.md) và báo cáo Task 3.2 |
+| Provenance lịch sử không có boot/message/topic/range | Không thể suy đoán dedup/ACK cho legacy marker; CHECK provenance chưa thể VALIDATE toàn dữ liệu | Giữ NULL lịch sử, CHECK NOT VALID kiểm new writes; legacy replay trả `legacy_provenance_unknown`, không bịa ID hoặc xóa ledger | Khi có legacy marker cần replay hoặc thiết kế disposition có giám sát |
+| Compression cảnh báo segment/order cho các cột khóa mới | Hiệu năng trên tập lớn/chunks compressed chưa đo; fixture ghim đã xác nhận đường late write đúng | Giữ warning và layout hiện có; đánh giá bằng workload thực tế, không coi integration nhỏ là benchmark | Task 3.7 hoặc khi số đo cho thấy cần điều chỉnh |
 | SQLite driver mới được chạy amd64, ARMv7 chỉ cross-build | Chưa chứng minh runtime trên board ARM | Giữ exact driver/libc pin, thử SQLite trên board ở checkpoint tích hợp thiết bị; simulator amd64 đã có smoke driver | Task 3.5/tích hợp board |
+
+### Cập nhật Task 3.2 — persistence telemetry (15/10/2026)
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| Provenance legacy không có đủ dữ liệu để replay idempotent | Replay cùng key legacy trả `legacy_provenance_unknown`; chưa có API disposition | Giữ nguyên marker/raw; xử lý có giám sát, không tự sinh provenance hoặc xóa ledger | Khi vận hành gặp legacy retry hoặc thiết kế công cụ disposition |
+| DDL migration lỗi sau khi pause compression job ngoài transaction | Schema/data/tracking rollback nhưng job vẫn paused do pause autocommit | Dùng snapshot job trong output để khôi phục lịch; rehearsal lỗi DDL và restore job đã PASS | Trước lần chạy migration thật và sau bất kỳ lỗi DDL nào |
+| Thời gian/dung lượng migration trên dữ liệu sản xuất chưa đo | Fixture nhỏ không dự báo chi phí decompress/recompress hay downtime thực | Chạy preflight, dừng writer, xác nhận dung lượng trống và thời gian maintenance trên database đích | Trước deployment migration vào database có dữ liệu thật |
+| Hiệu năng layout compression và workload ingest lớn chưa đo | Native fixture chứng minh correctness, không chứng minh throughput dài hạn | Giữ layout cảnh báo hiện tại; đo theo workload demo trước khi tối ưu | Task 3.7 hoặc khi có số đo/triệu chứng cụ thể |
+
+Task 3.2 native verification đã xác nhận `CopyFrom` late-data vào compressed chunk trên PostgreSQL 16.15 / TimescaleDB 2.29.2. Điều này chỉ xác nhận đường ghi đúng với phiên bản ghim, không thay thế benchmark hay đổi các giới hạn trên. Các mục Stage 2 bên dưới vẫn giữ nguyên trạng thái lịch sử.
 
 ---
 
