@@ -1,6 +1,6 @@
 # Tài liệu Client — 04: Quy chuẩn Hợp đồng REST API (REST API Client Contract) trên Flutter Web
 
-**Cập nhật:** 2026-10-05
+**Cập nhật:** 2026-10-14
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:**
 - `AGENTS.md` (Mục 5, 6, 6.5, 10, 16, 18)
@@ -13,6 +13,8 @@
 - `src/internal/httpserver/router.go`
 - `src/internal/httpserver/gateway_handlers.go`
 - `src/internal/httpserver/sensor_handlers.go`
+- `src/internal/httpserver/owner_sensor_handlers.go`
+- `src/internal/httpserver/admin_gateway_handlers.go`
 - `src/internal/httpapi/error.go`
 - `src/internal/httpapi/request_id.go`
 
@@ -39,12 +41,15 @@ Căn cứ hiện thực mã nguồn định tuyến tại `src/internal/httpserv
 | **Public Health** | `GET` | `/v1/health` | Công khai (Không auth) | `200 OK` (JSON) | Versioned service health (`{"status": "running", "service": "iot-backend", "version": "v1"}`). |
 | **Authenticated Read** | `GET` | `/v1/gateways` | Bearer JWT (`authenticated`) | `200 OK` | Lấy danh sách Gateway người dùng có quyền trong `user_gateways` kèm vai trò (`owner`, `operator`, `viewer`). |
 | **Authenticated Read** | `GET` | `/v1/gateways/{gateway_id}/sensors` | Bearer JWT (`authenticated`) | `200 OK` / `404 Not Found` | Lấy danh sách Sensor thuộc một Gateway được phân quyền. Trả về 404 nếu không có quyền hoặc trạm không tồn tại. |
-| **Admin Provisioning** | `PUT` | `/v1/admin/gateways/{gateway_id}` | Bearer JWT + `platform_admins` | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo mới hoặc phát lại chính xác Gateway (create-or-exact-replay), không phải chỉnh sửa/edit: trả về `201` nếu mới tạo, `200` nếu phát lại đúng cấu hình cũ, `409 Conflict` nếu đã tồn tại nhưng gửi cấu hình khác (tuyệt đối không có cơ chế upsert ghi đè trạng thái đã có). Xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
-| **Admin Provisioning** | `PUT` | `/v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` | Bearer JWT + `platform_admins` | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo mới hoặc phát lại chính xác Sensor (create-or-exact-replay), không phải chỉnh sửa/edit: trả về `201` nếu mới tạo, `200` nếu phát lại đúng cấu hình cũ; `404` nếu trạm cha không tồn tại; `409 Conflict` nếu đã tồn tại nhưng gửi cấu hình khác (không upsert ghi đè). Xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
-| **Admin Credentials** | `GET` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` | `200 OK` / `403` / `404` / `503` | Truy vấn metadata chứng chỉ MQTT của Gateway (Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)). |
-| **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` | `200 OK` / `400` / `409` / `503` | Cấp phát chứng chỉ MQTT lần đầu (Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)). |
-| **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/rotate` | Bearer JWT + `platform_admins` | `200 OK` / `400` / `409` / `503` | Xoay vòng (rotate) chứng chỉ MQTT (Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)). |
-| **Admin Credentials** | `DELETE` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` | `200 OK` / `400` / `409` / `503` | Thu hồi (revoke) chứng chỉ MQTT (Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)). |
+| **Authenticated Provisioning** | `PUT` | `/v1/gateways/{gateway_id}/sensors/{sensor_id}` | Bearer JWT (`authenticated`, vai trò `owner` của Gateway cha) | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo mới hoặc phát lại chính xác Sensor bởi Chủ sở hữu trạm (create-or-exact-replay). `201` tạo mới, `200` phát lại trùng khớp `name` và `unit`; `409 Conflict` nếu payload khác (không hỗ trợ cập nhật/upsert); `403` cho `operator`/`viewer`; `404` cho non-member/foreign hoặc Gateway không tồn tại; Platform Admin không bypass quyền sở hữu. Xem chi tiết tại [Mục 5.3](#53-api-3-khởi-tạo-cảm-biến-cho-chủ-sở-hữu-gateway-put-v1gatewaysgateway_idsensorssensor_id). |
+| **Admin Inventory** | `GET` | `/v1/admin/gateways` | Bearer JWT + `platform_admins` | `200 OK` / `400` / `401` / `403` / `500` / `503` | Lấy danh mục kiểm kê toàn bộ Gateway trên hệ thống độc lập với tư cách thành viên, có phân trang keyset cursor (`limit`, `after`). Không trả về vai trò hay thông tin xác thực. Xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Provisioning** | `PUT` | `/v1/admin/gateways/{gateway_id}` | Bearer JWT + `platform_admins` | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo mới hoặc phát lại chính xác Gateway bởi Platform Admin (create-or-exact-replay), gán `owner_user_id` ban đầu và tạo thực thể Digital Twin: `201` nếu mới tạo, `200` nếu phát lại đúng cấu hình cũ, `409 Conflict` nếu đã tồn tại nhưng gửi cấu hình khác (không upsert). Xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Provisioning** | `PUT` | `/v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` | Bearer JWT + `platform_admins` | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo mới hoặc phát lại chính xác Sensor bởi Platform Admin (create-or-exact-replay), tạo thực thể Digital Twin và quan hệ `hasSensor`: `201` nếu mới tạo, `200` nếu phát lại đúng cấu hình cũ; `404` nếu trạm cha không tồn tại; `409 Conflict` nếu cấu hình khác (không upsert). Xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Credentials** | `GET` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` | `200 OK` / `400` / `401` / `403` / `404` / `503` | Truy vấn metadata chứng chỉ MQTT của Gateway (không chứa mật khẩu). Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `201 Created` / `400` / `401` / `403` / `409` / `503` | Cấp phát chứng chỉ MQTT lần đầu; `201` kèm password 1 lần duy nhất; replay cùng key trả về `201` metadata-only (lược bỏ trường password). Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/rotate` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `200 OK` / `400` / `401` / `403` / `409` / `503` | Xoay vòng mật khẩu MQTT; `200` kèm password mới 1 lần duy nhất; replay cùng key trả về `200` metadata-only. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Credentials** | `DELETE` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `200 OK` / `400` / `401` / `403` / `503` | Vô hiệu hóa và thu hồi (disable/revoke) chứng chỉ MQTT của Gateway, ngắt kết nối socket hiện hành; không có cơ chế tự động khôi phục bí mật (cho phép re-provision với Idempotency-Key mới khi cần cấp phát lại); `200` metadata-only. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/reset` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `503 Service Unavailable` / `400` / `401` / `403` / `413` / `415` | Đã đăng ký route và parser payload `reason`, nhưng runtime prerequisite `denyOnlyResetPrerequisite{}` luôn fail-closed với `503` (`service_unavailable`). Chưa phải quy trình phục hồi khả dụng. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | **Authenticated Stub** | `GET` | `/v1/telemetry/history` | Bearer JWT (`authenticated`) | `501 Not Implemented` | Khung định tuyến chuỗi thời gian TimescaleDB (Chưa khả dụng). |
 | **Authenticated Stub** | `GET` | `/v1/ws` | Bearer JWT (`authenticated`) | `501 Not Implemented` | Khung định tuyến WebSocket thời gian thực (Chưa khả dụng). |
 | **Authenticated Stub** | `GET` | `/v1/digital-twins` | Bearer JWT (`authenticated`) | `501 Not Implemented` | Khung định tuyến mô hình Digital Twin (Chưa khả dụng). |
@@ -55,7 +60,8 @@ Căn cứ hiện thực mã nguồn định tuyến tại `src/internal/httpserv
 1. **Tuyệt đối KHÔNG CÓ route đọc lẻ 1 Gateway (`GET /v1/gateways/{gateway_id}`):** Go router không cung cấp endpoint này. Ứng dụng Client lấy thông tin chi tiết của trạm thông qua danh sách trả về từ `GET /v1/gateways`.
 2. **Tuyệt đối KHÔNG CÓ route đọc lẻ 1 Sensor (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`):** Go router không cung cấp endpoint này. Thông tin toàn bộ cảm biến của trạm được trả về đầy đủ qua `GET /v1/gateways/{gateway_id}/sensors`.
 3. **Tuyệt đối KHÔNG CÓ route CRUD người dùng hay quản lý thành viên `user_gateways` trên Go API:** Theo chính sách quản trị tập trung (`AGENTS.md` mục 6.5), việc tạo tài khoản người dùng và gán phân quyền thành viên trạm do Platform Admin thực hiện trực tiếp thông qua công cụ quản trị Supabase / SQL, không qua Go REST API.
-4. **Các tính năng tương lai chưa khả dụng (Unavailable in Current Stage):** Toàn bộ các tính năng truy vấn lịch sử telemetry, kênh truyền thời gian thực WebSocket, tải lên/đọc tập tin media qua Supabase Storage, và điều khiển trạm / Digital Twin hiện chưa khả dụng và sẽ trả về `501 Not Implemented`.
+4. **Ranh giới endpoint cấu hình cảm biến của Gateway Owner (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`):** Đây là thao tác tạo mới hoặc phát lại chính xác (create-or-exact-replay) dành riêng cho vai trò `owner` của trạm cha. Tuyệt đối **KHÔNG PHẢI** là API cập nhật cấu hình cảm biến (không hỗ trợ thay đổi `name` hay `unit` đã tạo, vi phạm sẽ nhận `409 Conflict`), **KHÔNG PHẢI** API cấu hình thiết bị lâu bền (`desired_state`), và **KHÔNG PHẢI** lệnh điều khiển thiết bị (device commands).
+5. **Các tính năng tương lai chưa khả dụng (Unavailable in Current Stage):** Toàn bộ các tính năng truy vấn lịch sử telemetry, kênh truyền thời gian thực WebSocket, tải lên/đọc tập tin media qua Supabase Storage, và điều khiển trạm / Digital Twin (`desired_state`, downlink commands) hiện chưa khả dụng và sẽ trả về `501 Not Implemented`.
 
 ---
 
@@ -135,12 +141,19 @@ Căn cứ rà soát mã nguồn thực tế tại các handler và middleware:
   - `GET /v1/gateways/{gateway_id}/sensors` (`listSensors`)
   - `PUT /v1/admin/gateways/{gateway_id}` (`provisionGateway`)
   - `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` (`provisionSensor`)
-- **Phạm vi gắn thêm `Pragma: no-cache`:** Middleware `credentialCacheMiddleware` trong `src/internal/httpserver/admin_mqtt_credential_handlers.go` chạy trước xác thực và thiết lập cả hai header:
-  ```http
-  Cache-Control: no-store
-  Pragma: no-cache
-  ```
-  áp dụng **riêng biệt** cho các tuyến đường quản trị chứng chỉ MQTT khớp tiền tố `/v1/admin/gateways/*/mqtt-credential`.
+- **Phạm vi gắn thêm `Pragma: no-cache`:**
+  - Tuyến đường khởi tạo cảm biến cho chủ sở hữu `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` qua `ownerSensorCacheMiddleware` (`src/internal/httpserver/owner_sensor_handlers.go`) luôn thiết lập:
+    ```http
+    Cache-Control: no-store
+    Pragma: no-cache
+    ```
+  - Tuyến đường danh mục kiểm kê quản trị `GET /v1/admin/gateways` (`src/internal/httpserver/admin_gateway_handlers.go`) thiết lập `Cache-Control: no-store` và `Pragma: no-cache`.
+  - Middleware `credentialCacheMiddleware` trong `src/internal/httpserver/admin_mqtt_credential_handlers.go` chạy trước xác thực và thiết lập cả hai header:
+    ```http
+    Cache-Control: no-store
+    Pragma: no-cache
+    ```
+    áp dụng cho các tuyến đường quản trị chứng chỉ MQTT khớp tiền tố `/v1/admin/gateways/*/mqtt-credential`.
 - **Phạm vi không áp dụng (Không quy nạp toàn bộ):** Các endpoint public health (`/healthz`, `/readyz`, `/v1/health`) và các stub `501 Not Implemented` (`/v1/telemetry/history`, `/v1/ws`, `/v1/digital-twins`) **không** thiết lập header `no-store` hay `Pragma`.
 - **Không tự suy diễn header cache không hỗ trợ:** Go Backend hiện tại **không** triển khai cơ chế conditional cache (như `ETag`, `If-None-Match`, `Last-Modified` hay `stale-while-revalidate`). Client không gửi các conditional header này để tránh logic dư thừa.
 - **Yêu cầu đối với Client:** Không được lưu cache vĩnh viễn danh sách Gateway hay Sensor vào bộ nhớ đệm HTTP tầng trình duyệt hoặc persistent local storage. Quyền của người dùng trên trạm có thể bị Quản trị viên thay đổi hoặc thu hồi bất kỳ lúc nào trên cơ sở dữ liệu. Mọi lần mở lại màn hình Dashboard cần đọc dữ liệu mới nhất.
@@ -383,6 +396,110 @@ Endpoint này trả về danh sách các cảm biến thuộc về một trạm 
 8. **Phân biệt rạch ròi giữa 200 OK và 404 Not Found:**
    - Trả về `200 OK` (với `items: []`): Khi người dùng **CÓ QUYỀN** trên Gateway, và Gateway đó hiện chưa có cảm biến nào.
    - Trả về `404 Not Found`: Khi `gateway_id` không tồn tại trên hệ thống HOẶC người dùng **KHÔNG CÓ QUYỀN** truy cập Gateway đó.
+
+---
+
+### 5.3. API 3: Khởi tạo Cảm biến cho Chủ sở hữu Gateway (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`)
+
+Endpoint này cho phép **Chủ sở hữu Gateway (`owner`)** tự cấp phát hoặc phát lại chính xác cấu hình cảm biến (create-or-exact-replay) thuộc trạm mà mình quản lý trong `user_gateways`.
+
+- **HTTP Method:** `PUT`
+- **Đường dẫn:** `/v1/gateways/{gateway_id}/sensors/{sensor_id}`
+- **Yêu cầu xác thực & Quyền hạn:**
+  - Bắt buộc Bearer JWT của người dùng đã xác thực (`Principal.UserID` hợp lệ, `role == "authenticated"`).
+  - Phải có vai trò `owner` trên trạm `gateway_id` cha trong bảng `public.user_gateways`.
+  - **Phân định vai trò thành viên:**
+    - `owner`: Được phép tạo mới hoặc phát lại chính xác.
+    - `operator` và `viewer`: Bị từ chối với mã **`403 Forbidden`** (`code: "forbidden"`, `message: "access denied"`).
+    - Người dùng không có liên kết với trạm (`non-member`), trạm của người khác (`foreign gateway`), hoặc `gateway_id` không tồn tại trong hệ thống: Nhận mã **`404 Not Found`** (`code: "not_found"`, `message: "resource not found"`). Cơ chế này ngăn chặn dò quét sự tồn tại của trạm (Anti-Enumeration).
+    - **Platform Admin không bypass tư cách thành viên:** Nếu tài khoản là Platform Admin nhưng không có vai trò `owner` trong `user_gateways` cho Gateway này, endpoint vẫn phản hồi `404 Not Found`. Platform Admin muốn khởi tạo Sensor toàn cục độc lập với quyền thành viên sử dụng endpoint riêng [`PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`](07_ADMIN_API_CLIENT_CONTRACT.md).
+- **Ràng buộc định danh (Path Parameters):**
+  - `gateway_id` (string, bắt buộc): Khớp regex `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, không được là `backend_service`.
+  - `sensor_id` (string, bắt buộc): Khớp regex `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
+- **Query Parameters:** **Tuyệt đối không có**. (Gửi query string hoặc `?` sẽ nhận mã `400 Bad Request` với `code: "invalid_request"`).
+- **Request Headers:**
+  - `Authorization: Bearer <access_token>`
+  - `Content-Type: application/json` (tùy chọn tham số `charset=utf-8` không phân biệt hoa thường). Nếu thiếu hoặc sai Content-Type, server trả về **`415 Unsupported Media Type`** (`code: "unsupported_media_type"`, `message: "unsupported media type"`).
+  - `X-Request-ID: <id>` (khuyến nghị, phục vụ truy vết).
+  - **LƯU Ý:** Endpoint này **KHÔNG DÙNG** header `Idempotency-Key`. Tính lũy đẳng được đảm bảo bởi định danh tài nguyên URL (`gateway_id`, `sensor_id`) và kiểm tra đối soát payload chính xác.
+- **Giới hạn kích thước Body:**
+  - Body bị giới hạn bởi cấu hình `ADMIN_MAX_BODY_BYTES` trên server (mặc định là 16384 bytes = 16 KiB; dải giá trị hợp lệ 1..1048576 bytes = 1 MiB theo `src/internal/config/config.go`, không phải hằng số cứng bất biến trên mọi deployment). Nếu kích thước body gửi lên vượt quá hạn mức cấu hình này, server từ chối với mã lỗi **`413 Request Entity Too Large`** (`code: "payload_too_large"`, `message: "payload too large"`).
+- **Định dạng Request Body JSON:**
+  ```json
+  {
+    "name": "Nhiệt độ môi trường",
+    "unit": "°C"
+  }
+  ```
+  - `name` (string, bắt buộc): Tên cảm biến, độ dài 1–256 bytes UTF-8 hợp lệ, không chứa ký tự null `\x00`, không được để trống hoặc chỉ chứa khoảng trắng (`strings.TrimSpace(name) != ""`). Server giữ nguyên chuỗi gốc, không tự ý cắt xén khoảng trắng.
+  - `unit` (string | null, tùy chọn): Đơn vị đo lường, tối đa 64 bytes UTF-8 hợp lệ, không chứa `\x00`. Có thể truyền chuỗi đo lường (ví dụ `"°C"`), chuỗi rỗng `""` (được lưu trữ là đơn vị hợp lệ và phân biệt rạch ròi với null), giá trị `null`, hoặc lược bỏ hoàn toàn trường này khỏi JSON.
+  - **Quy tắc JSON khắt khe (Strict JSON Parsing):**
+    - Cấm tuyệt đối trường lạ: Bất kỳ trường nào ngoài `name` và `unit` (ví dụ `sensor_type`, `description`...) đều bị server từ chối ngay với mã `400 Bad Request` (`code: "invalid_request"`).
+    - Cấm trùng lặp khóa (duplicate keys) trong JSON.
+    - Cấm surrogate không hợp lệ (`\uDC00` đơn lẻ) hoặc ký tự null được escape (`\u0000`).
+    - Cấm ký tự thừa sau dấu ngoặc nhọn kết thúc `}`.
+
+#### Phản hồi thành công:
+
+1. **Tạo mới cảm biến thành công (HTTP 201 Created):**
+   - Áp dụng khi `sensor_id` chưa từng tồn tại trên Gateway này.
+   - Trong cùng một transaction CSDL PostgreSQL nguyên tử: bản ghi cảm biến được chèn vào bảng `sensors`, thực thể Digital Twin được tạo trong `twin_entities` với `entity_id` dạng `urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>`, trạng thái ban đầu được tạo trong `twin_states`, và quan hệ `hasSensor` được tạo trong `twin_relationships` nối từ Gateway cha sang Sensor.
+   - Response Headers:
+     ```http
+     HTTP/1.1 201 Created
+     Content-Type: application/json; charset=utf-8
+     Cache-Control: no-store
+     Pragma: no-cache
+     X-Request-ID: e12b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d
+     ```
+   - Response Body (kèm `unit`):
+     ```json
+     {
+       "gateway_id": "gateway_001",
+       "sensor_id": "sensor_001",
+       "name": "Nhiệt độ môi trường",
+       "unit": "°C",
+       "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+       "created_at": "2026-10-14T08:30:00Z"
+     }
+     ```
+   - Response Body (khi `unit` là null hoặc bị lược bỏ trong request):
+     ```json
+     {
+       "gateway_id": "gateway_001",
+       "sensor_id": "sensor_002",
+       "name": "Cảm biến rung chấn",
+       "unit": null,
+       "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_002",
+       "created_at": "2026-10-14T08:31:00Z"
+     }
+     ```
+
+2. **Phát lại chính xác — Exact Replay (HTTP 200 OK):**
+   - Áp dụng khi `sensor_id` đã tồn tại trên Gateway và request gửi lên có `name` cùng `unit` hoàn toàn khớp với bản ghi hiện hữu (bao gồm so sánh chuỗi rỗng với rỗng, null với null).
+   - Server phản hồi mã **`200 OK`** với nội dung JSON phản ánh bản ghi hiện tại, giữ nguyên mốc thời gian `created_at` ban đầu.
+
+#### Phản hồi lỗi xung đột cấu hình (HTTP 409 Conflict):
+- Nếu `sensor_id` đã tồn tại nhưng request gửi lên chứa `name` hoặc `unit` khác so với bản ghi hiện có trong CSDL:
+  - Server trả về mã **`409 Conflict`** (`code: "conflict"`, `message: "resource conflict"`).
+  - **LƯU Ý:** Endpoint này **KHÔNG PHẢI là API cập nhật cấu hình hay upsert**. Server bảo toàn tính toàn vẹn của cảm biến ban đầu và tuyệt đối không ghi đè dữ liệu. Để đổi cấu hình cảm biến hiện có, hệ thống yêu cầu quy trình quản trị chuyên dụng trong các giai đoạn sau.
+
+#### Bảng tổng hợp mã lỗi của `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`:
+
+| HTTP Status | Error `code` | Error `message` | Tình huống kích hoạt |
+|---|---|---|---|
+| **400 Bad Request** | `invalid_request` | `invalid request` | - URL chứa query string (`?`).<br>- Định dạng `gateway_id` hoặc `sensor_id` sai regex, hoặc `gateway_id` là `backend_service`.<br>- Body JSON sai cú pháp, duplicate key, surrogate lỗi.<br>- Thiếu trường `name`, hoặc `name` để trống / chỉ có khoảng trắng.<br>- `unit` vượt quá 64 bytes.<br>- Chứa trường lạ không hỗ trợ (ví dụ `sensor_type`). |
+| **401 Unauthorized** | `unauthorized` | `authentication required` | Thiếu token, token hết hạn, hoặc token không hợp lệ. |
+| **403 Forbidden** | `forbidden` | `access denied` | Người dùng đã xác thực nhưng có vai trò `operator` hoặc `viewer` trên Gateway cha. |
+| **404 Not Found** | `not_found` | `resource not found` | - `gateway_id` cha không tồn tại.<br>- Người dùng không có liên kết quyền trong `user_gateways` (non-member / foreign read protection).<br>- Platform Admin không có vai trò `owner` trong `user_gateways` cho trạm này. |
+| **409 Conflict** | `conflict` | `resource conflict` | Sensor đã tồn tại nhưng gửi cấu hình `name` hoặc `unit` khác. |
+| **413 Payload Too Large** | `payload_too_large` | `payload too large` | Kích thước body vượt quá giới hạn đọc tối đa `AdminMaxBodyBytes`. |
+| **415 Unsupported Media Type** | `unsupported_media_type` | `unsupported media type` | Header `Content-Type` bị thiếu hoặc khác `application/json`. |
+| **500 Internal Server Error** | `internal_error` | `internal server error` | Lỗi CSDL nội bộ không xác định hoặc đồ thị Digital Twin bị bất nhất. |
+| **503 Service Unavailable** | `service_unavailable` | `service unavailable` | Quá thời hạn xử lý cơ sở dữ liệu (`context.DeadlineExceeded`) hoặc CSDL tạm thời gián đoạn. |
+
+> **Ghi chú về định danh URN Digital Twin:**
+> Việc gán URN `urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>` và tạo thực thể twin cùng quan hệ `hasSensor` trong transaction CSDL đảm bảo tính sẵn sàng cho mô hình dữ liệu NGSI-LD tương thích. Việc này **không đồng nghĩa** toàn bộ phân hệ điều khiển thiết bị, hàng đợi lệnh downlink, hay bản sao số thời gian thực đã được kích hoạt hoàn chỉnh trong giai đoạn này.
 
 ---
 
@@ -937,13 +1054,19 @@ Lập trình viên Client cần đối soát kỹ các trường hợp kiểm th
 | **11** | Nhấn F5 / Ctrl+R làm mới trang trên trình duyệt Web. | Phiên đăng nhập được phục hồi từ Web Storage, gửi request với token mới. | Dữ liệu danh sách trạm được nạp lại bình thường, không bị văng đăng nhập hay lỗi routing. |
 | **12** | Gọi vào các endpoint stub chưa mở nghiệp vụ (`GET /v1/telemetry/history`, `/v1/ws`, `/v1/digital-twins`). | `HTTP 501 Not Implemented`, code `not_implemented`, message `endpoint not implemented`. | Không crash ứng dụng, hiển thị thông báo tính năng đang phát triển theo lộ trình. |
 | **13** | Người dùng thông thường cố truy cập endpoint quản trị (`/v1/admin/*`). | `HTTP 403 Forbidden`, code `forbidden`, message `insufficient permissions`. | Bắt `ForbiddenException`, thông báo không đủ quyền quản trị viên nền tảng và điều hướng về trang chủ. |
+| **14** | Chủ sở hữu (`owner`) khởi tạo Sensor mới hợp lệ (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`). | `HTTP 201 Created`, trả về thông tin Sensor kèm `entity_id` dạng `urn:ngsi-ld:Sensor:<gw>:<sensor>` và `created_at`. Header `Cache-Control: no-store`, `Pragma: no-cache`. | Cập nhật danh sách cảm biến hiển thị trên giao diện, hiển thị thông báo tạo thành công. |
+| **15** | Chủ sở hữu phát lại chính xác Sensor đã tồn tại với cùng `name` và `unit` (Exact Replay). | `HTTP 200 OK`, trả về thông tin Sensor nguyên bản, giữ nguyên `created_at` ban đầu. | Xử lý idempotent an toàn, coi như thao tác thành công mà không báo lỗi xung đột. |
+| **16** | Chủ sở hữu gửi cấu hình `name` hoặc `unit` khác lên Sensor đã tồn tại. | `HTTP 409 Conflict`, code `conflict`, message `resource conflict`. | Bắt lỗi xung đột cấu hình, thông báo: *"Cảm biến đã tồn tại với thông tin khác. Hệ thống không hỗ trợ cập nhật cảm biến qua endpoint này"*. |
+| **17** | Người vận hành (`operator`) hoặc Người xem (`viewer`) gọi khởi tạo Sensor (`PUT /v1/gateways/{id}/sensors/{id}`). | `HTTP 403 Forbidden`, code `forbidden`, message `access denied`. | Bắt `ForbiddenException`, ẩn hoặc vô hiệu hóa nút/giao diện tạo cảm biến đối với vai trò không phải `owner`. |
+| **18** | Khởi tạo Sensor nhưng gửi body chứa trường lạ không hỗ trợ (ví dụ `sensor_type`). | `HTTP 400 Bad Request`, code `invalid_request`. | Client kiểm soát form nhập liệu chặt chẽ, chỉ gửi `name` và `unit`. |
+| **19** | Khởi tạo Sensor nhưng thiếu hoặc sai header `Content-Type`. | `HTTP 415 Unsupported Media Type`, code `unsupported_media_type`. | Đảm bảo HTTP Client luôn đính kèm header `Content-Type: application/json`. |
 
 ---
 
 ## 9. Tài liệu liên quan và Bước tiếp theo
 
 1. **Hợp đồng API Quản trị nền tảng (Admin API Contract):**
-   Đặc tả chi tiết 6 endpoint dành cho Platform Admin (khởi tạo Gateway/Sensor và quản lý vòng đời chứng chỉ MQTT), cấu trúc header `Idempotency-Key`, hạn mức body (`AdminMaxBodyBytes`), và danh mục mã lỗi chuyên sâu (400, 403, 409, 413, 415, 503):
+   Đặc tả chi tiết 7 endpoint dành cho Platform Admin (danh mục kiểm kê Gateway, khởi tạo Gateway/Sensor và quản lý vòng đời chứng chỉ MQTT, kèm ngoại lệ rào chắn reset fail-closed), cấu trúc header `Idempotency-Key`, hạn mức body (`AdminMaxBodyBytes`), và danh mục mã lỗi chuyên sâu (400, 401, 403, 409, 413, 415, 500, 503):
    -> Xem [`docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md).
 
 2. **Quy chuẩn Tích hợp và Quản lý trạng thái giao diện (UI State Handling):**

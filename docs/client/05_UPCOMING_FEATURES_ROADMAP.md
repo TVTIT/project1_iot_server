@@ -1,6 +1,6 @@
 # Tài liệu Client — 05: Lộ trình và Thiết kế Định hướng Tính năng Mới trên Client Dashboard (Upcoming Features Roadmap)
 
-**Cập nhật:** 2026-10-05
+**Cập nhật:** 2026-10-14
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
 **Tài liệu tham chiếu:** `AGENTS.md` (Mục 2, 4, 5.6, 6, 7, 10, 12, 13, 15, 17), `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md`, `docs/client/03_USER_GATEWAY_AUTHORIZATION.md`, `docs/client/04_REST_API_CLIENT_CONTRACT.md`, `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`, `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md`.
 
@@ -13,8 +13,8 @@
 Tại thời điểm hiện tại, hệ thống IoT Gateway–Server đã hoàn thiện tầng nền tảng định danh và ủy quyền:
 - Quản lý định danh người dùng tập trung thông qua Supabase Auth (chính sách quản trị tập trung, không mở tự đăng ký công khai).
 - Xác thực và ủy quyền đa tầng: Local JWT verification kết hợp kiểm tra quyền truy cập theo bảng quan hệ `user_gateways` và quyền quản trị nền tảng `platform_admins` trong PostgreSQL.
-- Hai REST API danh mục đã hoạt động đầy đủ: `GET /v1/gateways` và `GET /v1/gateways/{gateway_id}/sensors`.
-- Sáu endpoint quản trị nền tảng (`/v1/admin/*`) phục vụ khởi tạo trạm, cảm biến và quản lý chứng thực MQTT đã được triển khai (xem `07_ADMIN_API_CLIENT_CONTRACT.md`). Vòng đời credential mới dùng native DynSec/controller/Ingress Gate; không dùng `mosquitto_passwd` của runtime legacy Task 2.5. Credential API vẫn tắt trong deployment mặc định. Đây là quản trị hạ tầng, không phải lệnh điều khiển thiết bị vật lý.
+- Hai REST API danh mục đã hoạt động đầy đủ (`GET /v1/gateways` và `GET /v1/gateways/{gateway_id}/sensors`), cùng ngoại lệ khởi tạo hoặc replay đồng nhất cảm biến của Gateway Owner (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`, chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md)), trong khi vai trò `operator` và `viewer` tuân thủ nghiêm ngặt nguyên tắc chỉ đọc fail-closed, và các thao tác cập nhật cấu hình thiết bị (`desired_state`), sửa/xóa, hay lệnh điều khiển trong tương lai vẫn chưa khả dụng.
+- Bảy (07) endpoint quản trị nền tảng khả dụng (danh mục kiểm kê Gateway độc lập với tư cách thành viên, khởi tạo Gateway/Sensor, và quản lý thông tin xác thực MQTT) cùng một (01) endpoint reset có giám sát đã đăng ký rào chắn an toàn fail-closed (xem [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)). Vòng đời credential mới dùng native DynSec/controller/Ingress Gate; không dùng `mosquitto_passwd` của runtime legacy Task 2.5. Credential API vẫn tắt trong deployment mặc định. Đây là quản trị hạ tầng, không phải lệnh điều khiển thiết bị vật lý.
 
 **Hiện trạng thực tế các endpoint tính năng tương lai tại Go Backend (`src/internal/httpserver/router.go`):**
 1. **Endpoint đăng ký dạng giữ chỗ (`501 Not Implemented`):** Chỉ có đúng ba route sau được đăng ký trong nhóm route yêu cầu xác thực (`authenticated`):

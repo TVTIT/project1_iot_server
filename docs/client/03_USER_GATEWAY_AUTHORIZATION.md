@@ -1,6 +1,6 @@
 # Tài liệu Client — 03: Cơ chế Phân quyền Người dùng và Trạm Gateway (User–Gateway Authorization) trên Flutter Web
 
-**Cập nhật:** 2026-10-05
+**Cập nhật:** 2026-10-14
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:**
 - `AGENTS.md` (Mục 6, 6.4, 6.5, 10, 16, 18)
@@ -99,26 +99,29 @@ CHECK (role IN ('owner', 'operator', 'viewer'))
 ### 3.1. Thực tế API Giai đoạn 2 (Stage 2 Reality Check)
 
 > **CẢNH BÁO QUAN TRỌNG VỀ PHẠM VI API HIỆN TẠI (STAGE 2):**
-> Trong Giai đoạn 2 (Stage 2), Go Backend **CHỈ TRIỂN KHAI VÀ ĐĂNG KÝ DUY NHẤT 2 ENDPOINT ĐỌC DÀNH CHO NGƯỜI DÙNG CÓ XÁC THỰC**:
+> Trong Giai đoạn 2 (Stage 2), Go Backend **ĐÃ TRIỂN KHAI VÀ ĐĂNG KÝ 2 ENDPOINT ĐỌC DÀNH CHO NGƯỜI DÙNG CÓ XÁC THỰC CÙNG 1 NGOẠI LỆ GHI CẢM BIẾN DÀNH CHO OWNER**:
 > 1. `GET /v1/gateways`: Lấy danh sách các trạm mà người dùng được gán quyền trong `user_gateways`.
 > 2. `GET /v1/gateways/{gateway_id}/sensors`: Lấy danh sách cảm biến trực thuộc trạm mà người dùng có quyền.
+> 3. `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`: **Ngoại lệ khởi tạo hoặc phát lại chính xác cảm biến (create-or-exact-replay) dành riêng cho vai trò `owner` của trạm** (xem chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md)).
 >
 > Tất cả các tài nguyên dữ liệu khác (Telemetry, Lịch sử số đo, WebSocket stream, Digital Twin) hiện chỉ là **stub trả về HTTP `501 Not Implemented`** hoặc **chưa đăng ký route** ở Stage 2:
 > - `GET /v1/telemetry/history`: Stub trả về HTTP `501 Not Implemented` (`{"code": "not_implemented", "message": "endpoint not implemented"}`).
 > - `GET /v1/ws`: Stub trả về HTTP `501 Not Implemented` (`{"code": "not_implemented", "message": "endpoint not implemented"}`).
 > - `GET /v1/digital-twins`: Stub trả về HTTP `501 Not Implemented` (`{"code": "not_implemented", "message": "endpoint not implemented"}`).
 > - Media upload / read: Chưa đăng ký HTTP route trong router ở Stage 2.
-> - Desired state / Downlink commands: Chưa có endpoint ở Stage 2, hoàn toàn fail-closed.
+> - Cấu hình thiết bị (`desired_state`) / Lệnh điều khiển downlink (`commands`): Chưa có endpoint ở Stage 2, hoàn toàn fail-closed.
 >
-> Do đó, trong Giai đoạn 2 hiện tại, **cả 3 vai trò `owner`, `operator`, và `viewer` ĐỀU CHỈ ĐỌC ĐƯỢC DANH SÁCH TRẠM VÀ DANH SÁCH CẢM BIẾN TỪ 2 ENDPOINT NÊU TRÊN**. Mọi mô tả về đọc telemetry, history, media hay digital twin trong tài liệu trước đây là mục tiêu kiến trúc dài hạn cho các giai đoạn sau, KHÔNG PHẢI là chức năng khả dụng ở Stage 2.
+> Do đó, trong Giai đoạn 2 hiện tại:
+> - Cả hai vai trò **`operator` và `viewer` ĐỀU HOÀN TOÀN CHỈ ĐỌC** trên 2 endpoint danh mục `GET /v1/gateways` và `GET /v1/gateways/{gateway_id}/sensors` (mọi yêu cầu gọi `PUT /v1/gateways/{id}/sensors/{id}` đều bị từ chối với `403 Forbidden`).
+> - Vai trò **`owner`** có quyền đọc 2 endpoint trên kèm **ngoại lệ duy nhất** là khởi tạo mới hoặc replay chính xác cảm biến thuộc trạm mình sở hữu qua `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`. Các thao tác cập nhật cấu hình thiết bị (`desired_state`), sửa đổi/xóa cảm biến hiện hữu, hay lệnh điều khiển trong tương lai vẫn **hoàn toàn chưa khả dụng (fail-closed)**. Mọi mô tả về đọc telemetry, history, media hay digital twin trong tài liệu trước đây là mục tiêu kiến trúc dài hạn cho các giai đoạn sau, KHÔNG PHẢI là chức năng khả dụng ở Stage 2.
 
 ### 3.2. Bảng phân định quyền hạn thực tế và định hướng tương lai
 
 | Vai trò (`role`) | Tên hiển thị (VN) | Quyền hạn dữ liệu thực tế (Stage 2) | Kế hoạch Giai đoạn sau (Downlink/Control/Twin/Telemetry) | Hiển thị Client (Role Badge) |
 |---|---|---|---|---|
-| `owner` | **Chủ sở hữu** | **Chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán. | Cấu hình trạm (`desired_state`), quản lý metadata cảm biến, ra lệnh vận hành an toàn trong server allowlist. | `Badge(Color: Amber, Label: "Chủ sở hữu", Icon: admin_panel_settings)` |
-| `operator` | **Người vận hành** | **Chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán (fail-closed). | Được thực thi các lệnh vận hành an toàn trong server allowlist (ví dụ: `capture-image`). **Không** được sửa `desired_state`, **không** được sửa metadata cảm biến. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
-| `viewer` | **Người xem** | **Chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán. | Hoàn toàn chỉ đọc (Read-only) telemetry, history, media, digital twin khi các API này sẵn sàng. Vĩnh viễn **không** có quyền ghi, không điều khiển thiết bị, không sửa cấu hình. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
+| `owner` | **Chủ sở hữu** | Đọc danh sách trạm (`GET /v1/gateways`), danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán, và **ngoại lệ khởi tạo/replay chính xác cảm biến** (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`, xem [`04`](04_REST_API_CLIENT_CONTRACT.md)). Chưa có quyền sửa/xóa cảm biến hay cấu hình thiết bị. | Cấu hình trạm (`desired_state`), quản lý metadata cảm biến toàn diện, ra lệnh vận hành an toàn trong server allowlist. | `Badge(Color: Amber, Label: "Chủ sở hữu", Icon: admin_panel_settings)` |
+| `operator` | **Người vận hành** | **Hoàn toàn chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán (fail-closed; mọi yêu cầu ghi nhận `403 Forbidden`). | Được thực thi các lệnh vận hành an toàn trong server allowlist (ví dụ: `capture-image`). **Không** được sửa `desired_state`, **không** được sửa metadata cảm biến. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
+| `viewer` | **Người xem** | **Hoàn toàn chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán. | Hoàn toàn chỉ đọc (Read-only) telemetry, history, media, digital twin khi các API này sẵn sàng. Vĩnh viễn **không** có quyền ghi, không điều khiển thiết bị, không sửa cấu hình. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
 
 ### 3.3. Trải nghiệm phân quyền trên Web Dashboard (Desktop / Tablet / Responsive)
 Khác với giao diện màn hình hẹp của thiết bị di động vốn chỉ hiển thị danh sách cuộn dọc đơn giản, nền tảng **Flutter Web Dashboard** sở hữu không gian hiển thị rộng rãi, cho phép tối ưu hóa trải nghiệm giám sát thông qua bố cục linh hoạt:
@@ -164,27 +167,32 @@ Một trong những nhầm lẫn phổ biến là đồng nhất quyền Quản 
 ```
 
 ### 4.1. Các HTTP Route Quản trị Thực tế Hiện Có (Real HTTP Admin Routes)
-Khác với các tài nguyên nghiệp vụ thông thường, Go Backend đã triển khai và đăng ký các route quản trị thực tế dưới tiền tố `/v1/admin` được bảo vệ độc quyền bởi `PlatformAdminMiddleware`:
+Khác với các tài nguyên nghiệp vụ thông thường, Go Backend đã triển khai và đăng ký 7 endpoint quản trị khả dụng cùng 1 tuyến đường reset có rào chắn an toàn dưới tiền tố `/v1/admin` được bảo vệ độc quyền bởi `PlatformAdminMiddleware`:
 
-1. **Khởi tạo hoặc Replay Đồng nhất Trạm Gateway (Create or Identical Replay):**
+1. **Danh mục Kiểm kê Gateway Toàn hệ thống (Admin Gateway Inventory):**
+   `GET /v1/admin/gateways`
+   Endpoint này cho phép Platform Admin truy vấn toàn bộ Gateway trên hệ thống hoàn toàn độc lập với tư cách thành viên `user_gateways`, hỗ trợ phân trang keyset cursor (`limit`, `after`). Không bao giờ lộ bí mật MQTT hay thông tin quyền thành viên. Non-admin luôn nhận mã lỗi `403 Forbidden` (xem chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)).
+2. **Khởi tạo hoặc Replay Đồng nhất Trạm Gateway (Create or Identical Replay):**
    `PUT /v1/admin/gateways/{gateway_id}`
    Endpoint này áp dụng cơ chế idempotent create-or-identical-replay, **không phải là API cập nhật (update) Gateway đã có**:
    - **Tạo mới trạm (HTTP `201 Created`):** Khi mã `gateway_id` chưa tồn tại trong cơ sở dữ liệu, backend tạo mới Gateway, khởi tạo Digital Twin entity tương ứng, và gán tài khoản chủ sở hữu ban đầu vào `user_gateways` với vai trò `owner` theo trường `owner_user_id` trong body.
    - **Replay đồng nhất (HTTP `200 OK`):** Khi `gateway_id` đã tồn tại và payload gửi lên hoàn toàn trùng khớp với biểu diễn hiện hữu (cùng `name`, `description`, và cùng `owner_user_id`), backend ghi nhận đây là lượt gọi lặp lại an toàn (no-op identical replay) và trả về `200 OK`.
    - **Xung đột biểu diễn (HTTP `409 Conflict`):** Khi `gateway_id` đã tồn tại nhưng payload có bất kỳ thông tin nào sai khác với dữ liệu hiện có (ví dụ khác tên, khác mô tả hoặc khác chủ sở hữu), backend từ chối với mã lỗi `409 Conflict` (`{"code": "conflict", "message": "resource conflict"}`).
-2. **Khởi tạo hoặc Replay Đồng nhất Cảm biến trực thuộc Trạm (Create or Identical Replay):**
+3. **Khởi tạo hoặc Replay Đồng nhất Cảm biến trực thuộc Trạm (Create or Identical Replay):**
    `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`
-   Tương tự như trạm, endpoint này thực hiện khởi tạo hoặc replay đồng nhất cho cảm biến:
+   Tương tự như trạm, endpoint này thực hiện khởi tạo hoặc replay đồng nhất cho cảm biến bởi Platform Admin độc lập với quyền sở hữu:
    - **Tạo mới cảm biến (HTTP `201 Created`):** Khi `sensor_id` chưa tồn tại dưới Gateway cha, backend tạo mới bản ghi sensor và Digital Twin entity.
    - **Replay đồng nhất (HTTP `200 OK`):** Nếu `sensor_id` đã tồn tại với các trường thông tin hoàn toàn trùng khớp (`name`, `unit`), backend trả về `200 OK`.
    - **Xung đột biểu diễn (HTTP `409 Conflict`):** Nếu `sensor_id` đã tồn tại nhưng payload chứa dữ liệu khác biệt so với hiện trạng, backend trả về `409 Conflict`.
-3. **Bộ 4 Endpoint Quản lý Chứng chỉ MQTT (MQTT Credentials):**
-   - `GET /v1/admin/gateways/{gateway_id}/mqtt-credential`: Truy vấn metadata chứng chỉ MQTT của trạm (không bao giờ lộ mật khẩu thô).
-   - `POST /v1/admin/gateways/{gateway_id}/mqtt-credential`: Cấp phát ban đầu thông tin xác thực MQTT cho trạm.
-   - `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/rotate`: Thu hồi chứng chỉ cũ và cấp phát thông tin xác thực MQTT mới.
-   - `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`: Thu hồi chứng chỉ MQTT của trạm.
+4. **Bộ 4 Endpoint Quản lý Thông tin Xác thực MQTT (MQTT Credentials):**
+   - `GET /v1/admin/gateways/{gateway_id}/mqtt-credential`: Truy vấn metadata thông tin xác thực MQTT của trạm (không bao giờ lộ mật khẩu thô).
+   - `POST /v1/admin/gateways/{gateway_id}/mqtt-credential`: Cấp phát ban đầu thông tin xác thực MQTT cho trạm (`201 Created` trả password một lần duy nhất).
+   - `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/rotate`: Xoay vòng mật khẩu MQTT mới (`200 OK` trả password mới một lần duy nhất).
+   - `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`: Vô hiệu hóa và thu hồi thông tin xác thực MQTT của trạm (`200 OK` metadata-only; ngắt socket kết nối, không có cơ chế khôi phục secret tự động nhưng cho phép cấp mới lại với key mới).
+5. **Ngoại lệ Tuyến đường Đặt lại Credential Có giám sát (Registered Fail-Closed Reset Route):**
+   - `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/reset`: Tuyến đường đã được đăng ký và kiểm tra cú pháp payload lý do (`reason`), nhưng luôn fail-closed với HTTP `503 Service Unavailable` (`service_unavailable` khi API bật, hoặc `credential_runtime_disabled` khi API tắt). Chưa phải quy trình phục hồi khả dụng.
 
-*(Chi tiết đầy đủ về schema, headers và mã lỗi của các endpoint quản trị được quy định tại `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`)*.
+*(Chi tiết đầy đủ về schema, headers và mã lỗi của 7 endpoint khả dụng và 1 endpoint reset được quy định tại [`docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md))*.
 
 ### 4.2. Các Nguyên tắc Phân quyền Cốt tử giữa Admin và User
 

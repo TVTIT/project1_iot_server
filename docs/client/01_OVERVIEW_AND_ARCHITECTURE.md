@@ -1,6 +1,6 @@
 # Tài liệu Client — 01: Tổng quan và Kiến trúc ứng dụng Client (Flutter)
 
-**Cập nhật:** 2026-10-05
+**Cập nhật:** 2026-10-14
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:** `AGENTS.md`, `docs/backend/stage-2-task-2.2-authentication.md`, `docs/backend/stage-2-task-2.3-authorization.md`, `docs/backend/stage-2-task-2.4-provisioning.md`, `docs/backend/stage-2-task-2.6-acceptance.md`, `docs/backend/stage-2-task-2.7-acceptance.md`, `config/nginx/nginx.conf.template`, `docker-compose.yml`.
 **Bộ tài liệu Client liên quan:**
@@ -9,7 +9,7 @@
 - [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md): Hợp đồng REST API người dùng hiện hữu.
 - [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md): Lộ trình tính năng Giai đoạn 3 (Telemetry, History, WebSocket, Digital Twin).
 - [`06_PROJECT_SETUP_AND_ENV.md`](06_PROJECT_SETUP_AND_ENV.md): Hướng dẫn thiết lập môi trường và cấu hình Client.
-- [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md): Hợp đồng REST API quản trị nền tảng (Platform Admin) và chính sách công cụ quản trị.
+- [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md): Hợp đồng REST API quản trị nền tảng (Platform Admin) với 7 endpoint khả dụng và 1 tuyến đường reset fail-closed.
 - [`08_API_INTEGRATION_AND_STATE_HANDLING.md`](08_API_INTEGRATION_AND_STATE_HANDLING.md): Hướng dẫn tích hợp API, mô hình dữ liệu và quản lý trạng thái Client.
 
 ---
@@ -19,10 +19,10 @@
 Ứng dụng **Flutter Client** đóng vai trò là giao diện giám sát và vận hành cho hệ thống IoT Gateway–Server:
 
 - **Đối tượng người dùng ứng dụng:**
-  - **Chủ sở hữu trạm (`owner`):** Theo dõi trạng thái hoạt động, thông số cảm biến và cấu hình thiết bị thuộc quyền quản lý của mình trên trạm được gán.
-  - **Người vận hành kỹ thuật (`operator`):** Giám sát trạng thái hoạt động tức thời trên trạm được giao. (Trong Giai đoạn 2, vai trò này tuân thủ nguyên tắc *fail-closed* chỉ đọc; các lệnh vận hành one-shot an toàn theo allowlist của máy chủ sẽ được triển khai ở giai đoạn sau).
-  - **Người xem (`viewer`):** Giám sát dữ liệu đo và trạng thái trạm ở chế độ chỉ đọc (Read-only).
-  - *(Lưu ý về Platform Admin):* Quản trị viên nền tảng (`platform_admins`) chịu trách nhiệm cấp phát Gateway/Sensor, gán quyền thành viên và quản lý chứng thực. Thao tác quản trị chủ yếu sử dụng công cụ dòng lệnh được bảo vệ hoặc Supabase Studio; hệ thống **không yêu cầu** xây dựng ứng dụng Web Admin riêng biệt (xem [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)).
+  - **Chủ sở hữu trạm (`owner`):** Theo dõi danh sách trạm và danh sách cảm biến thuộc quyền quản lý của mình trên trạm được gán. Có ngoại lệ duy nhất được phép khởi tạo mới hoặc replay đồng nhất cảm biến qua `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` (xem [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md)). Các thao tác cập nhật cấu hình thiết bị (`desired_state`), sửa/xóa cảm biến, hay lệnh điều khiển thiết bị trong tương lai vẫn chưa khả dụng trong giai đoạn này.
+  - **Người vận hành kỹ thuật (`operator`):** Giám sát danh sách trạm và danh sách cảm biến trên trạm được giao ở chế độ hoàn toàn chỉ đọc (fail-closed; mọi yêu cầu ghi hoặc khởi tạo cảm biến đều bị từ chối với `403 Forbidden`). Các lệnh vận hành one-shot an toàn theo allowlist của máy chủ sẽ được triển khai ở giai đoạn sau.
+  - **Người xem (`viewer`):** Giám sát danh sách trạm và danh sách cảm biến ở chế độ hoàn toàn chỉ đọc (Read-only); vĩnh viễn không có quyền ghi.
+  - *(Lưu ý về Platform Admin):* Quản trị viên nền tảng (`platform_admins`) chịu trách nhiệm kiểm kê Gateway toàn hệ thống độc lập với quyền thành viên, cấp phát Gateway/Sensor, gán quyền thành viên và quản lý chứng thực MQTT thông qua 7 endpoint quản trị khả dụng và 1 endpoint reset fail-closed (xem [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md)). Thao tác quản trị chủ yếu sử dụng công cụ dòng lệnh được bảo vệ hoặc Supabase Studio; hệ thống **không yêu cầu** xây dựng ứng dụng Web Admin riêng biệt.
 - **Định hướng nền tảng:**
   - **Nền tảng mục tiêu chuẩn theo `AGENTS.md`:** Căn cứ `AGENTS.md` (Mục 3 và Mục 17), nền tảng mục tiêu mặc định cho ứng dụng MVP là **di động (ưu tiên Android)** nhằm phục vụ mục đích kiểm thử và demo đồ án gọn nhẹ, tin cậy.
   - **Vai trò của Web trong quá trình phát triển:** Việc chạy thử nghiệm trên trình duyệt Web (Flutter Web) trong môi trường phát triển cục bộ là giải pháp hỗ trợ sinh viên kiểm thử nhanh giao diện và theo dõi network qua Developer Tools. Thiết kế kiến trúc phân tầng (Clean Architecture) bảo đảm mã nguồn dùng chung không bị phụ thuộc vào môi trường Web và sẵn sàng đóng gói trực tiếp sang ứng dụng di động Android mà không phải sửa đổi tầng logic cốt lõi.
@@ -114,12 +114,15 @@ Dưới đây là ma trận phân định chính xác giữa các endpoint **đ�
 | | `GET /v1/health` | Public (Không cần Auth) | **Đã triển khai** | Trả về `200 {"status": "running", "service": "iot-backend", "version": "v1"}`. |
 | **User Gateway & Sensor** | `GET /v1/gateways` | Authenticated (JWT) | **Đã triển khai** | Trả danh sách Gateway mà user có quyền (`user_gateways`). Nếu chưa được gán trạm nào: trả `200 {"items": []}`. Chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md). |
 | | `GET /v1/gateways/:gateway_id/sensors` | Authenticated (JWT) | **Đã triển khai** | Trả danh sách sensor của trạm. Trả `404 Not Found` nếu trạm không tồn tại hoặc user không thuộc trạm đó. Chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md). |
+| | `PUT /v1/gateways/:gateway_id/sensors/:sensor_id` | Gateway Owner | **Đã triển khai** | Khởi tạo mới hoặc replay đồng nhất Sensor (`201`/`200`); payload khác trả `409 Conflict`. Ngoại lệ duy nhất cho phép quyền `owner` tạo/replay cảm biến; `operator` và `viewer` nhận `403 Forbidden` (hoàn toàn chỉ đọc). Chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md). |
+| **Admin Inventory** | `GET /v1/admin/gateways` | Platform Admin | **Đã triển khai** | Danh mục kiểm kê Gateway toàn hệ thống độc lập với tư cách thành viên `user_gateways`, hỗ trợ phân trang keyset cursor (`limit`, `after`). Non-admin nhận `403`. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | **Admin Provisioning** | `PUT /v1/admin/gateways/:gateway_id` | Platform Admin | **Đã triển khai** | Tạo Gateway (`201`) hoặc replay payload trùng khớp (`200`); thay đổi bản ghi hiện hữu trả `409`, không phải API cập nhật. Non-admin nhận `403`. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | | `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Platform Admin | **Đã triển khai** | Tạo Sensor (`201`) hoặc replay trùng khớp (`200`); payload khác trả `409`. Non-admin nhận `403`. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | **Admin MQTT Credential** | `GET /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Lấy metadata chứng thực MQTT. Trả về `503 credential_runtime_disabled` khi tắt cờ triển khai (`MQTT_CREDENTIAL_API_ENABLED=false`). Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | | `POST /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Cấp mới chứng thực MQTT (trả secret 1 lần duy nhất). Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | | `POST /v1/admin/gateways/:gateway_id/mqtt-credential/rotate` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Xoay vòng chứng thực MQTT (trả secret mới 1 lần). Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
-| | `DELETE /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Thu hồi chứng thực MQTT của trạm. Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| | `DELETE /v1/admin/gateways/:gateway_id/mqtt-credential` | Platform Admin | **Đã triển khai trong code** *(Mặc định TẮT)* | Vô hiệu hóa/thu hồi chứng thực MQTT của trạm (ngắt kết nối socket, không cấp lại secret tự động). Trả về `503 credential_runtime_disabled` khi tắt cờ. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
+| | `POST /v1/admin/gateways/:gateway_id/mqtt-credential/reset` | Platform Admin | **Đã đăng ký route (Fail-closed)** | Tiếp nhận yêu cầu reset có giám sát kèm lý do (`reason`), nhưng runtime prerequisite `denyOnlyResetPrerequisite{}` luôn fail-closed trả `503` (`service_unavailable` hoặc `credential_runtime_disabled`). Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | **Authenticated Stubs** | `GET /v1/telemetry/history` | Authenticated (JWT) | **Stub 501** | Trả về `501 Not Implemented` (`{"error": "not_implemented", "message": "endpoint not implemented"}`). Lộ trình tại [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md). |
 | | `GET /v1/ws` | Authenticated (JWT) | **Stub 501** | Trả về `501 Not Implemented` (`{"error": "not_implemented", "message": "endpoint not implemented"}`). Lộ trình tại [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md). |
 | | `GET /v1/digital-twins` | Authenticated (JWT) | **Stub 501** | Trả về `501 Not Implemented` (`{"error": "not_implemented", "message": "endpoint not implemented"}`). Lộ trình tại [`05_UPCOMING_FEATURES_ROADMAP.md`](05_UPCOMING_FEATURES_ROADMAP.md). |
