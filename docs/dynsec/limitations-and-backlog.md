@@ -4,6 +4,20 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
+## Cập nhật Task 3.0 — giới hạn chuyển đổi schema telemetry (15/10/2026)
+
+Các kết quả và ưu tiên DynSec lịch sử bên dưới được giữ nguyên; policy hiện hành
+theo `AGENTS.md` mục 0/16. Task 3.0 chỉ thử schema/driver, không đóng T01–T12.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| Đổi telemetry PK/provenance khi columnstore bật không thực hiện trực tiếp với nonconstant default | Cần maintenance và dung lượng decompress; spike 3 rows không ước lượng được thời gian/disk trên dữ liệu thật | Candidate đã PASS decompress → tắt compression → DDL → bật/recompress; dừng writers, chờ compression job đang chạy kết thúc và preflight dung lượng trước migration | Task 3.2 khi viết migration chính thức; xem [báo cáo Task 3.0](../backend/stage-3-task-3.0-baseline-and-contract.md) |
+| Provenance lịch sử không có boot/message/topic/range | Không thể suy đoán dedup/ACK cho legacy marker; CHECK provenance chưa thể VALIDATE toàn dữ liệu | Giữ NULL lịch sử, CHECK NOT VALID kiểm new writes, supervised disposition cho legacy marker; không bịa ID hoặc xóa ledger | Task 3.2 và khi có dữ liệu legacy cần replay |
+| Compression cảnh báo segment/order cho các cột khóa mới | Hiệu năng trên tập lớn/chunks compressed chưa đo | Giữ warning và layout hiện có trong spike; đánh giá khi migration/query/workload thực sự dùng khóa mới, không gọi warning là correctness PASS trên mọi trường hợp | Task 3.2/3.7 nếu số đo cho thấy cần điều chỉnh |
+| SQLite driver mới được chạy amd64, ARMv7 chỉ cross-build | Chưa chứng minh runtime trên board ARM | Giữ exact driver/libc pin, thử SQLite trên board ở checkpoint tích hợp thiết bị; simulator amd64 đã có smoke driver | Task 3.5/tích hợp board |
+
+---
+
 ## 1. Phân Tích Chuyên Sâu Các Giới Hạn Kỹ Thuật (Detailed Technical Limitations)
 
 ### 1.1 Rủi ro lưu trữ mật khẩu sau Rotate (ROT1 vs ROT2) và Nghiệm thu Độ bền sau Khởi động lại (Restart Persistence Acceptance) — ƯU TIÊN 1
