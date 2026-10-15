@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/gin-gonic/gin"
@@ -54,11 +55,65 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// One shutdown path, one SHUTDOWN_TIMEOUT budget, shared by HTTP, the
+	// telemetry ingress drain and the credential close. It is registered before
+	// any component below starts so a startup failure after the ingress starts
+	// still tears it down. A sync.Once keeps it idempotent, and components that
+	// never came online stay inert.
+	var (
+		shutdownOnce sync.Once
+		shutdownErr  error
+		server       *http.Server
+		serverReady  bool
+		ingress      ingressRuntime
+	)
+	shutdown := func() error {
+		shutdownOnce.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+
+			// Stop admission and readiness first, then stop the reconnect loop
+			// while holding the current connection open so workers can still
+			// publish post-commit ACKs during the drain.
+			ingress.stopIntake()
+
+			httpErrors := make(chan error, 1)
+			if serverReady {
+				go func() { httpErrors <- server.Shutdown(ctx) }()
+			}
+
+			// Drain admitted work within the same budget, then close MQTT. The
+			// shared pool is closed by the deferred pool.Close after this returns,
+			// so it is never closed while workers are still running.
+			if err := ingress.drainAndClose(ctx); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("telemetry ingress shutdown: %w", err))
+			}
+			if serverReady {
+				if err := <-httpErrors; err != nil {
+					_ = server.Close()
+					shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown HTTP server: %w", err))
+				}
+			}
+			if err := credentials.closeContext(ctx); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("credential shutdown close unconfirmed: %w", err))
+			}
+		})
+		return shutdownErr
+	}
 	defer func() {
-		if err := credentials.close(); err != nil {
-			slog.Error("credential shutdown close unconfirmed")
+		if err := shutdown(); err != nil {
+			slog.Error("backend shutdown incomplete", "error", err)
+			return
+		}
+		if serverReady {
+			slog.Info("backend shutdown complete")
 		}
 	}()
+
+	if ingress, err = composeIngress(cfg, pool); err != nil {
+		return err
+	}
 
 	if _, err := cfg.MQTTCredentialRuntime.Start(rootCtx); err != nil {
 		return fmt.Errorf("check MQTT credential runtime: %w", err)
@@ -115,6 +170,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create admin gateway service: %w", err)
 	}
+	readiness := ingressReadinessChecker(pool, cfg.ReadinessTimeout, ingress)
 	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
 		CredentialAPIEnabled:       cfg.Credential.Enabled,
 		CredentialRequestTimeout:   cfg.Credential.RequestTimeout,
@@ -129,7 +185,7 @@ func run() error {
 		AdminMaxBodyBytes:          int64(cfg.AdminMaxBodyBytes),
 		GatewayReader:              gatewayService,
 		SensorReader:               gatewayService,
-		ReadinessChecker:           pool,
+		ReadinessChecker:           readiness,
 		ReadinessTimeout:           cfg.ReadinessTimeout,
 		AuthorizationTimeout:       cfg.AuthorizationTimeout,
 		TokenVerifier:              tokenVerifier,
@@ -140,7 +196,7 @@ func run() error {
 		return fmt.Errorf("create HTTP router: %w", err)
 	}
 
-	server := &http.Server{
+	server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.ServerPort),
 		Handler:           router,
 		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
@@ -149,7 +205,12 @@ func run() error {
 		IdleTimeout:       cfg.HTTPIdleTimeout,
 	}
 
+	if err := ingress.start(); err != nil {
+		return fmt.Errorf("start MQTT telemetry ingress: %w", err)
+	}
+
 	serverErrors := make(chan error, 1)
+	serverReady = true
 	go func() {
 		slog.Info("backend listening", "port", cfg.ServerPort, "environment", cfg.ServerEnv)
 		serverErrors <- server.ListenAndServe()
@@ -162,14 +223,6 @@ func run() error {
 		}
 		return nil
 	case <-rootCtx.Done():
+		return nil
 	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		_ = server.Close()
-		return fmt.Errorf("shutdown HTTP server: %w", err)
-	}
-	slog.Info("backend shutdown complete")
-	return nil
 }
