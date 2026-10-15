@@ -27,6 +27,21 @@ theo `AGENTS.md` mục 0/16. Task 3.0 chỉ thử schema/driver, không đóng T
 
 Task 3.2 native verification đã xác nhận `CopyFrom` late-data vào compressed chunk trên PostgreSQL 16.15 / TimescaleDB 2.29.2. Điều này chỉ xác nhận đường ghi đúng với phiên bản ghim, không thay thế benchmark hay đổi các giới hạn trên. Các mục Stage 2 bên dưới vẫn giữ nguyên trạng thái lịch sử.
 
+### Cập nhật Task 3.4 — MQTT ingress/queue/worker/ACK (16/10/2026)
+
+Task 3.4 đã nối data client MQTT (backend principal), queue + worker pool cố định
+và application ACK sau commit; một smoke thật qua broker + TimescaleDB đã PASS cho
+một Gateway/Sensor. Bảng dưới ghi các giới hạn còn lại của lát cắt này. U01–U15 và
+ma trận denial/restart/pressure đầy đủ vẫn chưa nghiệm thu.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| Publish ACK treo fail-closed cần restart có giám sát | Nếu một lời gọi Paho `Publish` vẫn kẹt sau khi đóng socket trong budget teardown, transport đánh dấu stuck và giữ readiness false; không tự phục hồi trong process | Khởi động lại backend có giám sát (supervised restart); đây là thay thế an toàn cho việc thay lifetime trong vòng lặp gây rò waiter/reconnect | Khi có bằng chứng tái hiện hoặc thiết kế lại teardown |
+| Queue đầy bỏ delivery trong RAM, không application ACK | Không ACK nghĩa là Gateway phải tự retry từ outbox bền vững của mình | Phục hồi phụ thuộc outbox SQLite của Gateway; producer bền vững hoàn chỉnh thuộc Task 3.5 | Task 3.5 (simulator/durable outbox) và Task 3.6 |
+| Mới có positive path; chưa có ma trận denial TLS/credential, cross-Gateway, ACK spoof, control-topic, broker cold restart hay queue-full E2E | Chưa chứng minh các đường từ chối/áp lực của ingress | Mở rộng smoke/helpers hiện có (`scripts/test-stage3-mqtt-ingress.sh`, runner) sang denial/restart/pressure | Task 3.6 |
+| Chưa có deployment migration, board runtime hay build parity `src/Dockerfile` cho slice này | Smoke mount nhị phân host read-only; chưa tương đương bản build gốc | Chạy migration/board/parity ở checkpoint tích hợp thích hợp | Task 3.7/checkpoint triển khai |
+| Counters trong process (`Snapshot`) không phơi qua endpoint metrics | Chưa có observability ngoài structured log | Thu thập qua log/Snapshot; chưa cần metrics stack | Task 3.7 hoặc khi cần đo workload |
+
 ---
 
 ## 1. Phân Tích Chuyên Sâu Các Giới Hạn Kỹ Thuật (Detailed Technical Limitations)
