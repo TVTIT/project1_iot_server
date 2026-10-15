@@ -332,7 +332,7 @@ Xem thêm quy trình Task 2.1, backend role và bootstrap platform admin tại [
 
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
-Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.1**, hiện bao gồm **10 jobs CI độc lập**:
+Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.2**, hiện bao gồm **10 jobs CI độc lập**:
 
 1. **`lint-and-test`**:
    - Kiểm tra định dạng code Go với `gofmt`.

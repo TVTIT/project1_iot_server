@@ -174,7 +174,7 @@ class TestCIFeatureJobs(unittest.TestCase):
         job = self._extract_job_section('dynsec-native-integration')
         self.assertIn('timeout-minutes: 20', job)
         self.assertIn('working-directory: .', job)
-        self.assertIn("go-version: '1.27.1'", job)
+        self.assertIn("go-version: '1.27.2'", job)
         self.assertIn('cache-dependency-path: src/go.sum', job)
         for image in (
             'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a',
