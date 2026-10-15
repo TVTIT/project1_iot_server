@@ -30,11 +30,16 @@ type RouterDependencies struct {
 	SensorReader               SensorReader
 	GatewayProvisioner         GatewayProvisioner
 	SensorProvisioner          SensorProvisioner
+	OwnerSensorProvisioner     OwnerSensorProvisioner
+	AdminGatewayLister         AdminGatewayInventoryLister
+	AdminInventoryDefaultLimit int
+	AdminInventoryMaxLimit     int
 	AdminMaxBodyBytes          int64
 	CredentialAPIEnabled       bool
 	CredentialRequestTimeout   time.Duration
 	CredentialManager          CredentialManager
 	CredentialStartupReadiness CredentialStartupReadiness
+	CORSAllowedOrigins         []string
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -68,6 +73,27 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	if auth.IsNilDependency(deps.SensorProvisioner) {
 		return nil, fmt.Errorf("sensor provisioner is required")
 	}
+	if auth.IsNilDependency(deps.OwnerSensorProvisioner) {
+		return nil, fmt.Errorf("owner sensor provisioner is required")
+	}
+	if auth.IsNilDependency(deps.AdminGatewayLister) {
+		return nil, fmt.Errorf("admin gateway lister is required")
+	}
+	if deps.AdminInventoryDefaultLimit < 0 {
+		return nil, fmt.Errorf("admin inventory default limit must be positive")
+	}
+	if deps.AdminInventoryDefaultLimit == 0 {
+		deps.AdminInventoryDefaultLimit = 100
+	}
+	if deps.AdminInventoryMaxLimit < 0 {
+		return nil, fmt.Errorf("admin inventory max limit must be positive")
+	}
+	if deps.AdminInventoryMaxLimit == 0 {
+		deps.AdminInventoryMaxLimit = 200
+	}
+	if deps.AdminInventoryDefaultLimit > deps.AdminInventoryMaxLimit {
+		return nil, fmt.Errorf("admin inventory max limit must be at least default limit")
+	}
 	if deps.AdminMaxBodyBytes < 1 || deps.AdminMaxBodyBytes > 1048576 {
 		return nil, fmt.Errorf("admin body limit must be between 1 and 1048576")
 	}
@@ -76,8 +102,16 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
-	router.Use(httpapi.RequestIDMiddleware(), httpapi.RecoveryMiddleware(slog.Default()))
+	router.Use(
+		httpapi.RequestIDMiddleware(),
+		adminGatewayCacheMiddleware(),
+		adminGatewayAuditMiddleware(),
+		ownerSensorCacheMiddleware(),
+		corsMiddleware(deps.CORSAllowedOrigins),
+		httpapi.RecoveryMiddleware(slog.Default()),
+	)
 	router.Use(credentialCacheMiddleware())
+	router.Use(permissionCacheMiddleware())
 	router.NoRoute(func(c *gin.Context) {
 		httpapi.WriteError(c, http.StatusNotFound, "not_found", "resource not found")
 	})
@@ -113,11 +147,14 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	groups := newRouteGroups(router, deps)
 	registerCredentialRoutes(groups.admin, deps)
+	groups.admin.GET("/gateways", listAdminGateways(deps.AdminGatewayLister, deps.AdminInventoryDefaultLimit, deps.AdminInventoryMaxLimit))
 	groups.admin.PUT("/gateways/:gateway_id", provisionGateway(deps.GatewayProvisioner, deps.AdminMaxBodyBytes))
 	groups.admin.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensor(deps.SensorProvisioner, deps.AdminMaxBodyBytes))
 	authenticated := groups.authenticated
+	authenticated.GET("/me/permissions", getMyPermissions(deps.PlatformAdminChecker, deps.AuthorizationTimeout))
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
+	authenticated.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensorForOwner(deps.OwnerSensorProvisioner, deps.AdminMaxBodyBytes))
 	authenticated.GET("/telemetry/history", notImplemented)
 	authenticated.GET("/ws", notImplemented)
 	authenticated.GET("/digital-twins", notImplemented)

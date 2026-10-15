@@ -12,6 +12,126 @@ from unittest import mock
 import stage2_auth
 
 
+# Shared Go JSON test event payload fulfilling required tests and packages for both harnesses.
+_STAGE2_MOCK_GO_EVENTS = """\
+{"Action":"run","Package":"iot-platform/internal/gateway","Test":"TestPostgresAuthorizationIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/gateway","Test":"TestPostgresAuthorizationIntegration"}
+{"Action":"run","Package":"iot-platform/internal/gateway","Test":"TestPostgresAdminGatewayInventoryIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/gateway","Test":"TestPostgresAdminGatewayInventoryIntegration"}
+{"Action":"run","Package":"iot-platform/internal/gateway","Test":"TestPostgresProvisioningIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/gateway","Test":"TestPostgresProvisioningIntegration"}
+{"Action":"run","Package":"iot-platform/internal/gateway","Test":"TestPersistedOwnerWinnerCounterexamples"}
+{"Action":"pass","Package":"iot-platform/internal/gateway","Test":"TestPersistedOwnerWinnerCounterexamples"}
+{"Action":"run","Package":"iot-platform/internal/gateway","Test":"TestOwnerGraphSnapshotCounterexamples"}
+{"Action":"pass","Package":"iot-platform/internal/gateway","Test":"TestOwnerGraphSnapshotCounterexamples"}
+{"Action":"run","Package":"iot-platform/internal/gateway","Test":"TestProvisioningLockOracle"}
+{"Action":"pass","Package":"iot-platform/internal/gateway","Test":"TestProvisioningLockOracle"}
+{"Action":"pass","Package":"iot-platform/internal/gateway"}
+{"Action":"run","Package":"iot-platform/internal/httpserver","Test":"TestGatewayHTTPAuthorizationIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/httpserver","Test":"TestGatewayHTTPAuthorizationIntegration"}
+{"Action":"run","Package":"iot-platform/internal/httpserver","Test":"TestAdminGatewayInventoryHTTPAuthorizationIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/httpserver","Test":"TestAdminGatewayInventoryHTTPAuthorizationIntegration"}
+{"Action":"run","Package":"iot-platform/internal/httpserver","Test":"TestGatewayProvisioningHTTPIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/httpserver","Test":"TestGatewayProvisioningHTTPIntegration"}
+{"Action":"pass","Package":"iot-platform/internal/httpserver"}
+"""
+
+
+def _setup_stage2_mock_tools(path: Path) -> None:
+    # Mock go binary that emits required JSON events on success or exits with TEST_EXIT / responds to signals.
+    go = path / "go"
+    go.write_text(f"""#!/bin/sh
+if [ -n "${{GO_EXEC_RECORD:-}}" ]; then
+  printf '%s\\n' "$*" >> "${{GO_EXEC_RECORD}}"
+fi
+if [ -n "${{RECORD_MODES_OUT:-}}" ]; then
+  # Inspect stdin or parent directory of report
+  # In shell: go test ... > "$JSON_LOG"
+  # Let's inspect directory and report file via RECORD_MODES_DIR if provided or by checking open fds / paths
+  if [ -n "${{STAGE2_TEST_TMPDIR:-}}" ] && [ -d "${{STAGE2_TEST_TMPDIR}}" ]; then
+    python3 -c "
+import os, sys, glob
+root = sys.argv[1]
+subdirs = glob.glob(os.path.join(root, '*-test.*'))
+for d in subdirs:
+    report = os.path.join(d, 'test-report.json')
+    d_mode = oct(os.stat(d).st_mode & 0o777)
+    r_mode = oct(os.stat(report).st_mode & 0o777) if os.path.exists(report) else 'none'
+    print(f'dir={{d_mode}} report={{r_mode}}')
+" "${{STAGE2_TEST_TMPDIR}}" >> "${{RECORD_MODES_OUT}}"
+  fi
+fi
+if [ -n "${{TEST_SIGNAL:-}}" ]; then
+  kill -"${{TEST_SIGNAL}}" $PPID
+  sleep 1
+  exit 0
+fi
+if [ "${{TEST_EXIT:-0}}" -ne 0 ]; then
+  exit "${{TEST_EXIT:-0}}"
+fi
+if [ "${{GUARD_FAIL:-0}}" -ne 0 ]; then
+  exit 0
+fi
+cat <<'EOF'
+{_STAGE2_MOCK_GO_EVENTS}EOF
+exit 0
+""")
+    go.chmod(0o700)
+
+    # Mock mktemp binary that records generated temp directory for lifecycle and leakage tracking.
+    mktemp_bin = path / "mktemp"
+    mktemp_bin.write_text("""#!/bin/sh
+if [ "${MKTEMP_FAIL:-0}" -ne 0 ]; then
+  exit "${MKTEMP_FAIL}"
+fi
+out=$(command -p mktemp "$@")
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+if [ -n "${TEMP_RECORD:-}" ]; then
+  printf '%s\\n' "$out" >> "$TEMP_RECORD"
+fi
+printf '%s\\n' "$out"
+""")
+    mktemp_bin.chmod(0o700)
+
+    # Mock rm binary that allows simulating temporary report removal failure.
+    rm_bin = path / "rm"
+    rm_bin.write_text("""#!/bin/sh
+if [ "${TEMP_RM_EXIT:-0}" -ne 0 ]; then
+  exit "${TEMP_RM_EXIT}"
+fi
+command -p rm "$@"
+""")
+    rm_bin.chmod(0o700)
+
+    # Mock rmdir binary that allows simulating temporary directory cleanup failure.
+    rmdir_bin = path / "rmdir"
+    rmdir_bin.write_text("""#!/bin/sh
+if [ "${TEMP_CLEANUP_EXIT:-0}" -ne 0 ]; then
+  exit "${TEMP_CLEANUP_EXIT}"
+fi
+command -p rmdir "$@"
+""")
+    rmdir_bin.chmod(0o700)
+
+
+def _setup_stage2_mock_docker(path: Path) -> Path:
+    docker = path / "docker"
+    docker.write_text("""#!/bin/sh
+case "$1" in
+  run) exit "${RUN_EXIT:-0}" ;;
+  logs) echo 'PostgreSQL init process complete; ready for start up' ;;
+  port) echo '127.0.0.1:12345' ;;
+  rm) printf '%s\\n' "$*" > "$CLEANUP_RECORD"; exit "${CLEANUP_EXIT:-0}" ;;
+esac
+""")
+    docker.chmod(0o700)
+    return docker
+
+
+
 class AuthHarnessTests(unittest.TestCase):
     def test_provision_response_strict_schema_metadata_and_utc(self):
         expected = {"gateway_id": "fixture", "name": " Name ", "description": None,
@@ -82,24 +202,16 @@ class AuthHarnessTests(unittest.TestCase):
                 tempfile.TemporaryDirectory(prefix="provisioning-cleanup-") as directory,
             ):
                 path = Path(directory)
-                docker = path / "docker"
-                docker.write_text("""#!/bin/sh
-case "$1" in
-  run) exit "$RUN_EXIT" ;;
-  logs) echo 'PostgreSQL init process complete; ready for start up' ;;
-  port) echo '127.0.0.1:12345' ;;
-  rm) printf '%s\\n' "$*" > "$CLEANUP_RECORD"; exit "$CLEANUP_EXIT" ;;
-esac
-""")
-                go = path / "go"
-                go.write_text('#!/bin/sh\nexit "$TEST_EXIT"\n')
-                docker.chmod(0o700)
-                go.chmod(0o700)
+                _setup_stage2_mock_docker(path)
+                _setup_stage2_mock_tools(path)
+                temp_record = path / "temp_record"
                 result = subprocess.run(
                     ["sh", str(stage2_auth.ROOT / "scripts/test-stage2-provisioning.sh")],
                     env={**os.environ, "PATH": f"{path}:{os.environ['PATH']}",
                          "CLEANUP_RECORD": str(path / "record"), "CLEANUP_EXIT": str(cleanup_exit),
-                         "TEST_EXIT": str(test_exit), "RUN_EXIT": str(run_exit)},
+                         "TEST_EXIT": str(test_exit), "RUN_EXIT": str(run_exit),
+                         "TEMP_RECORD": str(temp_record),
+                         "STAGE2_TEST_TMPDIR": str(path / "stage2-root")},
                     capture_output=True, text=True, timeout=10, check=False,
                 )
                 self.assertEqual(result.returncode, expected)
@@ -108,6 +220,9 @@ esac
                 else:
                     self.assertRegex((path / "record").read_text(), r"^rm -f -v stage2-provisioning-[0-9]+\n$")
                 self.assertEqual("Failed to remove" in result.stderr, cleanup_exit != 0)
+                if temp_record.exists():
+                    for tdir in [line.strip() for line in temp_record.read_text().splitlines() if line.strip()]:
+                        self.assertFalse(Path(tdir).exists(), "temporary directory must not leak")
 
     def test_authorization_cleanup_removes_owned_volumes_and_propagates_failure(self):
         for test_exit, cleanup_exit, expected_exit in [
@@ -119,18 +234,9 @@ esac
             with self.subTest(test_exit=test_exit, cleanup_exit=cleanup_exit):
                 with tempfile.TemporaryDirectory(prefix="auth-cleanup-") as directory:
                     path = Path(directory)
-                    docker = path / "docker"
-                    docker.write_text("""#!/bin/sh
-case "$1" in
-  logs) echo 'PostgreSQL init process complete; ready for start up' ;;
-  port) echo '127.0.0.1:12345' ;;
-  rm) printf '%s\\n' "$*" > "$CLEANUP_RECORD"; exit "$CLEANUP_EXIT" ;;
-esac
-""")
-                    go = path / "go"
-                    go.write_text('#!/bin/sh\nexit "$TEST_EXIT"\n')
-                    docker.chmod(0o700)
-                    go.chmod(0o700)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    temp_record = path / "temp_record"
                     result = subprocess.run(
                         [
                             "sh",
@@ -145,6 +251,8 @@ esac
                             "CLEANUP_RECORD": str(path / "record"),
                             "CLEANUP_EXIT": str(cleanup_exit),
                             "TEST_EXIT": str(test_exit),
+                            "TEMP_RECORD": str(temp_record),
+                            "STAGE2_TEST_TMPDIR": str(path / "stage2-root"),
                         },
                         capture_output=True,
                         text=True,
@@ -158,6 +266,322 @@ esac
                     self.assertEqual(
                         "Failed to clean up" in result.stderr, cleanup_exit != 0
                     )
+                    if temp_record.exists():
+                        for tdir in [line.strip() for line in temp_record.read_text().splitlines() if line.strip()]:
+                            self.assertFalse(Path(tdir).exists(), "temporary directory must not leak")
+
+    def test_stage2_harness_guard_temp_lifecycle_and_failure_veto(self):
+        # Explicitly verify positive test execution + guard + temp cleanup all pass,
+        # and any individual failure veto (guard, container cleanup, temp cleanup, go error)
+        # preserves or yields non-zero exit codes without leaking temporary resources.
+        scripts = [
+            (
+                stage2_auth.ROOT / "scripts/test-stage2-authorization.sh",
+                r"^rm -f -v stage2-authorization-[0-9a-f]{16}\n$",
+                "Isolated Gateway authorization integration tests passed.",
+                "Failed to clean up isolated authorization container and volumes.",
+            ),
+            (
+                stage2_auth.ROOT / "scripts/test-stage2-provisioning.sh",
+                r"^rm -f -v stage2-provisioning-[0-9]+\n$",
+                "Isolated Gateway provisioning integration tests passed.",
+                "Failed to remove isolated provisioning container/volumes.",
+            ),
+        ]
+        scenarios = [
+            # (test_exit, cleanup_exit, temp_cleanup_exit, temp_rm_exit, guard_fail, sig, expected)
+            (0, 0, 0, 0, 0, None, 0),
+            (7, 0, 0, 0, 0, None, 7),
+            (0, 0, 0, 0, 1, None, 1),
+            (0, 1, 0, 0, 0, None, 1),
+            (0, 0, 1, 0, 0, None, 1),
+            (0, 0, 0, 1, 0, None, 1),
+            (7, 1, 1, 1, 1, None, 7),
+            (0, 0, 0, 0, 0, "INT", 130),
+            (0, 0, 0, 0, 0, "TERM", 143),
+        ]
+        for script_path, container_pattern, success_msg, cleanup_err_msg in scripts:
+            for test_exit, cleanup_exit, temp_cleanup_exit, temp_rm_exit, guard_fail, sig, expected in scenarios:
+                with (
+                    self.subTest(
+                        script=script_path.name,
+                        test_exit=test_exit,
+                        cleanup_exit=cleanup_exit,
+                        temp_cleanup_exit=temp_cleanup_exit,
+                        temp_rm_exit=temp_rm_exit,
+                        guard_fail=guard_fail,
+                        sig=sig,
+                    ),
+                    tempfile.TemporaryDirectory(prefix="stage2-harness-veto-") as directory,
+                ):
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    temp_rec = path / "temp_record"
+                    env = {
+                        **os.environ,
+                        "PATH": f"{path}:{os.environ['PATH']}",
+                        "CLEANUP_RECORD": str(rec),
+                        "TEMP_RECORD": str(temp_rec),
+                        "CLEANUP_EXIT": str(cleanup_exit),
+                        "TEMP_CLEANUP_EXIT": str(temp_cleanup_exit),
+                        "TEMP_RM_EXIT": str(temp_rm_exit),
+                        "TEST_EXIT": str(test_exit),
+                        "GUARD_FAIL": str(guard_fail),
+                        "STAGE2_TEST_TMPDIR": str(path / "stage2-root"),
+                    }
+                    if sig:
+                        env["TEST_SIGNAL"] = sig
+
+                    result = subprocess.run(
+                        ["sh", str(script_path)],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, expected)
+                    self.assertTrue(rec.exists(), "owned container removal must be invoked")
+                    self.assertRegex(rec.read_text(), container_pattern)
+
+                    if expected == 0:
+                        self.assertIn(success_msg, result.stdout)
+                        self.assertEqual(result.stderr.strip(), "")
+                    if cleanup_exit != 0:
+                        self.assertIn(cleanup_err_msg, result.stderr)
+                    if temp_rm_exit != 0:
+                        self.assertIn("Failed to remove temporary test report.", result.stderr)
+                    if temp_cleanup_exit != 0:
+                        self.assertIn("Failed to remove temporary directory.", result.stderr)
+                    if guard_fail != 0 and test_exit == 0:
+                        self.assertIn("CI test guard verification failed", result.stderr)
+
+                    if temp_rec.exists():
+                        for tdir in [line.strip() for line in temp_rec.read_text().splitlines() if line.strip()]:
+                            tpath = Path(tdir)
+                            if temp_cleanup_exit == 0 and temp_rm_exit == 0:
+                                self.assertFalse(tpath.exists(), f"temporary directory {tdir} must be removed")
+                                self.assertFalse((tpath / "test-report.json").exists())
+                            else:
+                                # Clean up unremoved temp directory to prevent leakage from forced mock failure.
+                                if tpath.exists():
+                                    report_file = tpath / "test-report.json"
+                                    if report_file.exists():
+                                        try:
+                                            report_file.unlink()
+                                        except Exception:
+                                            pass
+                                    try:
+                                        tpath.rmdir()
+                                    except Exception:
+                                        pass
+
+    def test_stage2_harness_temp_root_and_mktemp_failure_handling(self):
+        scripts = [
+            stage2_auth.ROOT / "scripts/test-stage2-authorization.sh",
+            stage2_auth.ROOT / "scripts/test-stage2-provisioning.sh",
+        ]
+        for script_path in scripts:
+            with self.subTest(script=script_path.name, case="missing_tmpdir_prepared"):
+                with tempfile.TemporaryDirectory(prefix="stage2-missing-root-") as directory:
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    temp_rec = path / "temp_record"
+                    absent_root = path / "nonexistent-root"
+                    self.assertFalse(absent_root.exists())
+                    env = {
+                        **os.environ,
+                        "PATH": f"{path}:{os.environ['PATH']}",
+                        "CLEANUP_RECORD": str(rec),
+                        "TEMP_RECORD": str(temp_rec),
+                        "STAGE2_TEST_TMPDIR": str(absent_root),
+                    }
+                    result = subprocess.run(
+                        ["sh", str(script_path)],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(absent_root.exists())
+                    # Newly prepared root contains no leaked per-run directories
+                    self.assertEqual(list(absent_root.iterdir()), [])
+
+            with self.subTest(script=script_path.name, case="existing_root_permissions_and_no_leakage"):
+                with tempfile.TemporaryDirectory(prefix="stage2-existing-root-") as directory:
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    temp_rec = path / "temp_record"
+                    existing_root = path / "shared-root"
+                    existing_root.mkdir(mode=0o750)
+                    orig_stat = os.stat(existing_root)
+                    orig_mode = orig_stat.st_mode & 0o777
+                    env = {
+                        **os.environ,
+                        "PATH": f"{path}:{os.environ['PATH']}",
+                        "CLEANUP_RECORD": str(rec),
+                        "TEMP_RECORD": str(temp_rec),
+                        "STAGE2_TEST_TMPDIR": str(existing_root),
+                    }
+                    result = subprocess.run(
+                        ["sh", str(script_path)],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(existing_root.exists())
+                    new_mode = os.stat(existing_root).st_mode & 0o777
+                    self.assertEqual(new_mode, orig_mode, "existing root permissions must not be changed")
+                    self.assertEqual(list(existing_root.iterdir()), [], "root must have no leaked directories")
+
+            with self.subTest(script=script_path.name, case="mktemp_failure_preserves_exit_code"):
+                with tempfile.TemporaryDirectory(prefix="stage2-mktemp-fail-") as directory:
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    temp_rec = path / "temp_record"
+                    go_exec_rec = path / "go_exec_record"
+                    root_dir = path / "stage2-root"
+                    env = {
+                        **os.environ,
+                        "PATH": f"{path}:{os.environ['PATH']}",
+                        "CLEANUP_RECORD": str(rec),
+                        "TEMP_RECORD": str(temp_rec),
+                        "GO_EXEC_RECORD": str(go_exec_rec),
+                        "MKTEMP_FAIL": "2",
+                        "STAGE2_TEST_TMPDIR": str(root_dir),
+                    }
+                    result = subprocess.run(
+                        ["sh", str(script_path)],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 2, "mktemp failure status 2 must be preserved")
+                    self.assertTrue(rec.exists(), "owned container removal must still be invoked")
+                    self.assertFalse(go_exec_rec.exists(), "Go must not be invoked on allocation failure")
+                    if temp_rec.exists():
+                        self.assertEqual(temp_rec.read_text().strip(), "")
+                    if root_dir.exists():
+                        self.assertEqual(list(root_dir.glob("**/test-report.json")), [])
+
+            with self.subTest(script=script_path.name, case="mktemp_failure_and_cleanup_failure"):
+                with tempfile.TemporaryDirectory(prefix="stage2-mktemp-cleanup-fail-") as directory:
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    temp_rec = path / "temp_record"
+                    go_exec_rec = path / "go_exec_record"
+                    root_dir = path / "stage2-root"
+                    env = {
+                        **os.environ,
+                        "PATH": f"{path}:{os.environ['PATH']}",
+                        "CLEANUP_RECORD": str(rec),
+                        "CLEANUP_EXIT": "1",
+                        "TEMP_RECORD": str(temp_rec),
+                        "GO_EXEC_RECORD": str(go_exec_rec),
+                        "MKTEMP_FAIL": "2",
+                        "STAGE2_TEST_TMPDIR": str(root_dir),
+                    }
+                    result = subprocess.run(
+                        ["sh", str(script_path)],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 2, "allocation failure status 2 must be preserved even if cleanup fails")
+                    self.assertTrue(rec.exists(), "owned container removal must still be invoked")
+                    self.assertFalse(go_exec_rec.exists(), "Go must not be invoked on allocation failure")
+
+            with self.subTest(script=script_path.name, case="unusable_root_failure"):
+                with tempfile.TemporaryDirectory(prefix="stage2-unusable-root-") as directory:
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    go_exec_rec = path / "go_exec_record"
+                    file_as_root = path / "file-root"
+                    file_as_root.write_text("not a directory")
+                    env = {
+                        **os.environ,
+                        "PATH": f"{path}:{os.environ['PATH']}",
+                        "CLEANUP_RECORD": str(rec),
+                        "GO_EXEC_RECORD": str(go_exec_rec),
+                        "STAGE2_TEST_TMPDIR": str(file_as_root),
+                    }
+                    result = subprocess.run(
+                        ["sh", str(script_path)],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(rec.exists(), "owned container removal must still be invoked")
+                    self.assertFalse(go_exec_rec.exists(), "Go must not be invoked on root failure")
+
+    def test_stage2_harness_privacy_modes_and_caller_umask(self):
+        scripts = [
+            stage2_auth.ROOT / "scripts/test-stage2-authorization.sh",
+            stage2_auth.ROOT / "scripts/test-stage2-provisioning.sh",
+        ]
+        for script_path in scripts:
+            with self.subTest(script=script_path.name):
+                with tempfile.TemporaryDirectory(prefix="stage2-privacy-modes-") as directory:
+                    path = Path(directory)
+                    _setup_stage2_mock_docker(path)
+                    _setup_stage2_mock_tools(path)
+                    rec = path / "record"
+                    modes_out = path / "modes_out"
+                    root_dir = path / "stage2-root"
+                    # Run with caller umask 022 explicitly
+                    result = subprocess.run(
+                        ["sh", "-c", f"umask 022; exec sh {script_path}"],
+                        env={
+                            **os.environ,
+                            "PATH": f"{path}:{os.environ['PATH']}",
+                            "CLEANUP_RECORD": str(rec),
+                            "RECORD_MODES_OUT": str(modes_out),
+                            "STAGE2_TEST_TMPDIR": str(root_dir),
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(modes_out.exists())
+                    recorded = modes_out.read_text().strip()
+                    self.assertIn("dir=0o700", recorded)
+                    self.assertIn("report=0o600", recorded)
+                    # Verify clean directory afterwards
+                    if root_dir.exists():
+                        self.assertEqual(list(root_dir.iterdir()), [])
+
+    def test_mock_mktemp_propagates_real_mktemp_failure(self):
+        with tempfile.TemporaryDirectory(prefix="stage2-mock-mktemp-") as directory:
+            path = Path(directory)
+            _setup_stage2_mock_tools(path)
+            # Invoke mock mktemp with invalid flag to force command -p mktemp failure without MKTEMP_FAIL env
+            res = subprocess.run(
+                [str(path / "mktemp"), "--invalid-flag-xyz"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertEqual(res.stdout, "")
 
     def test_sensor_metadata_rejects_wrong_values(self):
         expected = [

@@ -100,7 +100,8 @@ func (e *CommitOutcomeUnknown) Unwrap() error { return &DomainError{Code: CodeFi
 const operationColumns = `operation_id, actor_user_id, gateway_id, idempotency_key, action,
 credential_version, status, phase, ram_applied, snapshot_observed, fresh_positive_verified,
 delivery_status, created_at, updated_at, completed_at, previous_status,
-previous_credential_version, previous_activated_at, previous_revoked_at, error_code, legacy_projection, recovery_id`
+previous_credential_version, previous_activated_at, previous_revoked_at, error_code, legacy_projection, recovery_id, replacement_predecessor_id,
+execution_contract, reset_predecessor_id, reset_reason`
 
 // operationProjection preserves legacy recover, NULL actors/versions and missing
 // proof verbatim. Legacy is not a modern operation and must never enter replay.
@@ -117,11 +118,14 @@ func scanOperation(row pgx.Row) (operationProjection, error) {
 	var updated *time.Time
 	var previousStatus *CredentialStatus
 	var previous CredentialSnapshot
+	var contract *string
+	var resetReason *string
 	err := row.Scan(&p.OperationID, &actor, &p.GatewayID, &key, &p.Action, &version,
 		&p.Status, &phase, &p.Evidence.RAMApplied, &p.Evidence.SnapshotObserved,
 		&p.Evidence.FreshPositiveVerified, &p.DeliveryStatus, &p.CreatedAt, &updated,
 		&p.CompletedAt, &previousStatus, &previousVersion, &previous.ActivatedAt,
-		&previous.RevokedAt, &p.ErrorCode, &p.legacy, &p.RecoveryID)
+		&previous.RevokedAt, &p.ErrorCode, &p.legacy, &p.RecoveryID, &p.ReplacementPredecessorID,
+		&contract, &p.ResetPredecessorID, &resetReason)
 	if err != nil {
 		return p, safeReadError(err)
 	}
@@ -143,6 +147,13 @@ func scanOperation(row pgx.Row) (operationProjection, error) {
 	if previousStatus != nil && previousVersion != nil {
 		previous.Status, previous.CredentialVersion = *previousStatus, *previousVersion
 		p.Previous = &previous
+	}
+	if contract != nil {
+		p.ExecutionContract = ExecutionContract(*contract)
+	}
+	if resetReason != nil {
+		reason := ResetReason(*resetReason)
+		p.ResetReason = &reason
 	}
 	if !p.legacy && p.ValidateHistorical() != nil {
 		return p, &DomainError{Code: CodeInternalError}

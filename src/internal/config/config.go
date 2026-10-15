@@ -17,29 +17,32 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
-	Credential             CredentialConfig
-	MQTTCredentialRuntime  mqttcredential.StartupConfig
-	ServerPort             int
-	ServerEnv              string
-	DatabaseURL            string
-	DatabaseMaxConns       int32
-	DatabaseMinConns       int32
-	DatabaseConnectTimeout time.Duration
-	ReadinessTimeout       time.Duration
-	AuthorizationTimeout   time.Duration
-	AdminMaxBodyBytes      int
-	HTTPReadHeaderTimeout  time.Duration
-	HTTPReadTimeout        time.Duration
-	HTTPWriteTimeout       time.Duration
-	HTTPIdleTimeout        time.Duration
-	ShutdownTimeout        time.Duration
-	MQTTQueueCapacity      int
-	MQTTWorkerCount        int
-	MQTTMaxPayloadBytes    int
-	SupabaseJWTSecret      string
-	SupabaseJWTIssuer      string
-	SupabaseJWTAudience    string
-	SupabaseJWTClockSkew   time.Duration
+	Credential                 CredentialConfig
+	MQTTCredentialRuntime      mqttcredential.StartupConfig
+	CORSAllowedOrigins         []string
+	ServerPort                 int
+	ServerEnv                  string
+	DatabaseURL                string
+	DatabaseMaxConns           int32
+	DatabaseMinConns           int32
+	DatabaseConnectTimeout     time.Duration
+	ReadinessTimeout           time.Duration
+	AuthorizationTimeout       time.Duration
+	AdminMaxBodyBytes          int
+	AdminInventoryDefaultLimit int
+	AdminInventoryMaxLimit     int
+	HTTPReadHeaderTimeout      time.Duration
+	HTTPReadTimeout            time.Duration
+	HTTPWriteTimeout           time.Duration
+	HTTPIdleTimeout            time.Duration
+	ShutdownTimeout            time.Duration
+	MQTTQueueCapacity          int
+	MQTTWorkerCount            int
+	MQTTMaxPayloadBytes        int
+	SupabaseJWTSecret          string
+	SupabaseJWTIssuer          string
+	SupabaseJWTAudience        string
+	SupabaseJWTClockSkew       time.Duration
 }
 
 // LoadFromEnvironment loads configuration from the process environment.
@@ -98,6 +101,10 @@ func Load(lookup LookupFunc) (Config, error) {
 	if cfg.ServerPort, err = integer(lookup, "SERVER_PORT", 8080, 1, 65535); err != nil {
 		return Config{}, err
 	}
+	corsRaw, _ := lookup("CORS_ALLOWED_ORIGINS")
+	if cfg.CORSAllowedOrigins, err = parseCORSAllowedOrigins(corsRaw); err != nil {
+		return Config{}, err
+	}
 	maxConns, err := integer(lookup, "DATABASE_MAX_CONNS", 10, 1, 1000)
 	if err != nil {
 		return Config{}, err
@@ -120,6 +127,15 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if cfg.AdminMaxBodyBytes, err = integer(lookup, "ADMIN_MAX_BODY_BYTES", 16384, 1, 1048576); err != nil {
 		return Config{}, err
+	}
+	if cfg.AdminInventoryDefaultLimit, err = integer(lookup, "ADMIN_INVENTORY_DEFAULT_LIMIT", 100, 1, 1000); err != nil {
+		return Config{}, err
+	}
+	if cfg.AdminInventoryMaxLimit, err = integer(lookup, "ADMIN_INVENTORY_MAX_LIMIT", 200, 1, 1000); err != nil {
+		return Config{}, err
+	}
+	if cfg.AdminInventoryDefaultLimit > cfg.AdminInventoryMaxLimit {
+		return Config{}, fmt.Errorf("ADMIN_INVENTORY_DEFAULT_LIMIT must be less than or equal to ADMIN_INVENTORY_MAX_LIMIT")
 	}
 	if cfg.HTTPReadHeaderTimeout, err = duration(lookup, "HTTP_READ_HEADER_TIMEOUT", 5*time.Second); err != nil {
 		return Config{}, err

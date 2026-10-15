@@ -126,14 +126,17 @@ func (r *PostgresRepository) complete(ctx context.Context, u OperationUpdate, ou
 	}
 	// The operation may become terminal while maintenance remains unresolved.
 	// Never erase or complete that checkpoint as a side effect of finalization.
-	// Lock it in this same transaction so a missing/corrupt checkpoint cannot
-	// authorize a successful business finalization.
-	var maintenanceStatus MaintenanceStatus
-	if err = tx.QueryRow(ctx, `SELECT status FROM public.mqtt_credential_maintenance WHERE operation_id=$1 AND gateway_id=$2 FOR UPDATE`, p.OperationID, parent).Scan(&maintenanceStatus); err != nil {
-		return Metadata{}, safeReadError(err)
-	}
-	if maintenanceStatus == MaintenanceCompleted {
-		return Metadata{}, &DomainError{Code: CodeCredentialConflict}
+	// For lifecycle operations, lock it in this same transaction so a missing/corrupt
+	// checkpoint cannot authorize a successful business finalization.
+	// Simplified operations have ZERO maintenance rows; do not query maintenance.
+	if p.ExecutionContract != ContractSimplified {
+		var maintenanceStatus MaintenanceStatus
+		if err = tx.QueryRow(ctx, `SELECT status FROM public.mqtt_credential_maintenance WHERE operation_id=$1 AND gateway_id=$2 FOR UPDATE`, p.OperationID, parent).Scan(&maintenanceStatus); err != nil {
+			return Metadata{}, safeReadError(err)
+		}
+		if maintenanceStatus == MaintenanceCompleted {
+			return Metadata{}, &DomainError{Code: CodeCredentialConflict}
+		}
 	}
 	// A caller cannot legitimize corrupt/current foreign generation metadata by
 	// merely echoing its status and version in the guard.
@@ -142,7 +145,7 @@ func (r *PostgresRepository) complete(ctx context.Context, u OperationUpdate, ou
 		switch p.Action {
 		case ActionProvision:
 			status = CredentialProvisioning
-		case ActionRotate:
+		case ActionRotate, ActionReset:
 			status = CredentialRotating
 		case ActionRevoke:
 			status = CredentialRevoking
@@ -191,6 +194,24 @@ func (r *PostgresRepository) complete(ctx context.Context, u OperationUpdate, ou
 	return m, nil
 }
 
+// HasUnfinishedLifecycleAuthority checks if any effective maintenance is not completed or any effective recovery is pending.
+func (r *PostgresRepository) HasUnfinishedLifecycleAuthority(ctx context.Context) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	var exists bool
+	err := r.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM public.mqtt_credential_maintenance
+		WHERE status <> 'completed' AND public.mqtt_operation_effective(operation_id)
+		UNION ALL
+		SELECT 1 FROM public.mqtt_credential_recovery
+		WHERE status = 'pending' AND public.mqtt_operation_effective(operation_id)
+	)`).Scan(&exists)
+	if err != nil {
+		return false, safeReadError(err)
+	}
+	return exists, nil
+}
+
 // Bound may be reduced by the caller; it can never be disabled by a large limit.
 const maxRepositoryScanLimit = 1000
 
@@ -201,7 +222,7 @@ func (r *PostgresRepository) ListUnresolved(ctx context.Context, cursor uuid.UUI
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	rows, err := r.pool.Query(ctx, `SELECT `+operationColumns+` FROM public.gateway_mqtt_credential_events WHERE status IN ('pending','recovery_needed') AND recovery_id IS NULL AND operation_id>$1 ORDER BY operation_id LIMIT $2`, cursor, limit)
+	rows, err := r.pool.Query(ctx, `SELECT `+operationColumns+` FROM public.gateway_mqtt_credential_events WHERE status IN ('pending','recovery_needed') AND recovery_id IS NULL AND public.mqtt_operation_effective(operation_id) AND operation_id>$1 ORDER BY operation_id LIMIT $2`, cursor, limit)
 	if err != nil {
 		return nil, safeReadError(err)
 	}

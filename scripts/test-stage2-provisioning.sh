@@ -5,12 +5,23 @@ PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 IMAGE="timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a"
 CONTAINER="stage2-provisioning-$$"
 created=false
+TEMP_DIR=""
 cleanup() {
     status=$?
     trap - EXIT
     if [ "$created" = true ]; then
         if ! docker rm -f -v "$CONTAINER" >/dev/null 2>&1; then
             echo 'Failed to remove isolated provisioning container/volumes.' >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+    fi
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        if ! rm -f "$TEMP_DIR/test-report.json" 2>/dev/null; then
+            echo 'Failed to remove temporary test report.' >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+        if ! rmdir "$TEMP_DIR" 2>/dev/null; then
+            echo 'Failed to remove temporary directory.' >&2
             [ "$status" -ne 0 ] || status=1
         fi
     fi
@@ -53,7 +64,43 @@ PROVISIONING_TEST_BACKEND_URL="postgres://iot_backend_app:$BACKEND_DB_PASSWORD@1
 PROVISIONING_TEST_ISOLATED=1
 export PROVISIONING_TEST_SETUP_URL PROVISIONING_TEST_BACKEND_URL PROVISIONING_TEST_ISOLATED
 cd "$PROJECT_ROOT/src"
+STAGE2_TMP_ROOT="${STAGE2_TEST_TMPDIR:-/tmp/opencode}"
+if [ ! -d "$STAGE2_TMP_ROOT" ]; then
+    if ! mkdir -p "$STAGE2_TMP_ROOT" 2>/dev/null; then
+        echo 'Failed to prepare temporary root directory.' >&2
+        exit 1
+    fi
+fi
+umask 077
+TEMP_DIR="$(mktemp -d "$STAGE2_TMP_ROOT/prov-test.XXXXXX")"
+JSON_LOG="$TEMP_DIR/test-report.json"
+
 # Fixtures share this isolated database; run packages serially so repository
 # cleanup/fault injection cannot race HTTP fixtures.
-go test -p 1 -v -race -count=1 ${PROVISIONING_TEST_COVERAGE:+-coverprofile="$PROVISIONING_TEST_COVERAGE"} ./internal/gateway ./internal/httpserver -run '^(TestPostgresProvisioningIntegration|TestGatewayProvisioningHTTPIntegration)$'
+test_exit=0
+go test -p 1 -json -race -count=1 \
+    ${PROVISIONING_TEST_COVERAGE:+-coverprofile="$PROVISIONING_TEST_COVERAGE"} \
+    ./internal/gateway ./internal/httpserver \
+    -run '^(TestPostgresProvisioningIntegration|TestGatewayProvisioningHTTPIntegration|TestPersistedOwnerWinnerCounterexamples|TestOwnerGraphSnapshotCounterexamples|TestProvisioningLockOracle)$' \
+    >"$JSON_LOG" || test_exit=$?
+
+guard_exit=0
+python3 "$PROJECT_ROOT/scripts/ci_go_test_guard.py" \
+    --input "$JSON_LOG" \
+    --require 'iot-platform/internal/gateway:TestPostgresProvisioningIntegration' \
+    --require 'iot-platform/internal/gateway:TestPersistedOwnerWinnerCounterexamples' \
+    --require 'iot-platform/internal/gateway:TestOwnerGraphSnapshotCounterexamples' \
+    --require 'iot-platform/internal/gateway:TestProvisioningLockOracle' \
+    --require 'iot-platform/internal/httpserver:TestGatewayProvisioningHTTPIntegration' || guard_exit=$?
+
+if [ "$test_exit" -ne 0 ]; then
+    echo "Go test execution failed with exit code $test_exit." >&2
+    exit "$test_exit"
+fi
+
+if [ "$guard_exit" -ne 0 ]; then
+    echo "CI test guard verification failed with exit code $guard_exit." >&2
+    exit "$guard_exit"
+fi
+
 echo 'Isolated Gateway provisioning integration tests passed.'

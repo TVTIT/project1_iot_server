@@ -25,20 +25,49 @@ Schedule:
   tasks in those months may be scheduled more aggressively.
 - Build and verify a local proof of concept before expanding to the main MVP.
 
-Current progress snapshot supplied by the user on 2026-09-16:
+Historical progress snapshot supplied by the user on 2026-09-16:
 
-- A local proof of concept has demonstrated
-  `Gateway -> MQTT -> Go -> PostgreSQL`.
-- Mosquitto, a Rathole reverse TCP tunnel, MQTT TLS/CA, per-Gateway
-  credentials, and ACLs have been implemented at prototype level.
-- Supabase Auth and Supabase Storage have been completed at prototype level.
-- Digital Twin, TimescaleDB temporal history, the complete business API,
-  realtime client delivery, and end-to-end command reconciliation remain to be
-  implemented and verified.
+- A local proof of concept demonstrated `Gateway -> MQTT -> Go -> PostgreSQL`.
+- Mosquitto, a Rathole reverse TCP tunnel, MQTT TLS/CA, per-Gateway credentials, and ACLs were implemented at prototype level.
+- Supabase Auth and Supabase Storage were completed at prototype level.
+- Digital Twin, TimescaleDB temporal history, the complete business API, realtime client delivery, and end-to-end command reconciliation remained to be implemented and verified.
 
-Treat this snapshot as planning context, not proof that a repository feature is
-correct. Inspect the code, migrations, configuration, and tests before claiming
-that a feature is complete.
+Treat this historical snapshot as initial planning context. It has been superseded by the subsequent Stage 2 implementation and the dated closeout status below.
+
+Stage 2 Bounded Closeout & Reconciliation Status (Dated 2026-10-14):
+
+Due to schedule delays in this solo university project, the user explicitly directed closing Stage 2 under a pragmatic, bounded scope to advance to subsequent project stages. This bounded closeout represents a pragmatic development checkpoint recorded under user intent; it is NOT a full acceptance sign-off, has NOT received third-party or independent reviewer approval, and does NOT certify the system as production-ready.
+
+1. Proven Implementation & Evidence Scope:
+- Core Go modular monolith architecture, configuration, structured logging, and migration framework through schema version 19.
+- Centralized human authentication via Supabase Auth (GoTrue v2.196.0 + Envoy API Gateway): public signup disabled and administrative user creation verified in isolated local fixtures, Go JWT verification enforcing role "authenticated", and database-level `platform_admins` authorization. This does not certify the current deployed Auth configuration.
+- Platform Admin inventory endpoint (`GET /v1/admin/gateways`) and Gateway Owner sensor provisioning endpoint (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`) implemented with transactional consistency, URN mapping (`urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>`), and fail-closed RBAC (`owner`, `operator`, `viewer`).
+- Supervised MQTT Dynamic Security (DynSec 2.0.18) management via protected Admin REST APIs:
+  * Provisioning (`POST /v1/admin/gateways/{id}/mqtt-credential`): single-use CSPRNG secret returned only once, DB intent journal, client/role creation, verified fresh TLS authentication (`FreshPositiveVerified`), and idempotent metadata-only replay.
+  * Rotate ROT1 (`POST /v1/admin/gateways/{id}/mqtt-credential/rotate`): verified sequence (`disableClient` -> disabled readback -> role readback -> `setClientPassword` -> `enableClient` -> fresh TLS login with new password and denial of old password).
+  * Revoke (`DELETE /v1/admin/gateways/{id}/mqtt-credential`): verified target session disconnection (EOF), fresh connection denial, and OS-level filesystem snapshot verification (`VerifyRevoked` on `dynamic-security.json`).
+  * Backend startup protection: `SimplifiedStartupClassifier` scans unfinished intents (`PhaseIntent`, mutation, readback) upon backend restart and transitions them to `recovery_needed`; unit tests verify that the startup classifier does not auto-replay unfinished mutations.
+  * Local concurrency control: PostgreSQL session advisory lock (`0x494f545f43524544`) enforces single active mutation owner per database.
+- Verification and CI improvements:
+  * Local fresh-volume full-HTTP Compose smoke (`native-compose-smoke --full-http`) passed on frozen candidate (commit `b681401` mount receipt ordering + PostgreSQL explicit TCP healthcheck): verified 14 role denials, 9 JWT denials, 16 unchanged denied-write snapshots, and clean resource teardown (10 containers, 1 network, 3 volumes).
+  * The full-HTTP smoke verified the multi-stage build path of `src/Dockerfile` (`target: backend`) for that slice. Remote CI on GitHub Actions has not been freshly verified in this review pass.
+
+2. Explicit Outstanding Exceptions (Carried Forward to Subsequent Stages):
+The following gaps are explicitly deferred and MUST NOT be treated as satisfied or silently deleted:
+- Group 1: Usable Supervised Reset & Recovery (T07). The reset route (`POST /v1/admin/gateways/{id}/mqtt-credential/reset`) remains wired to `denyOnlyResetPrerequisite{}`, which fails closed with HTTP 503 for all admissible reset requests. A usable supervised reset procedure—requiring proven control path quiescence, no stale mutation overwrites, intact audit retention in `gateway_mqtt_credential_events`, and CSPRNG-generated secret renewal without secret replay—remains unimplemented. Fail-closed or UNKNOWN status is an operational safety boundary, not recovery completion.
+- Group 2: Broker Persistence After Cold Restart & E2E Verification (T10 & ROT2). The exact persisted-new-password verifier on disk (`ROT2`) remains deferred. While `SimplifiedStartupClassifier` prevents auto-replay at the Go unit test level, native E2E cold-restart acceptance for Mosquitto is unverified: confirming that upon broker restart, rotated credentials authenticate, old passwords are rejected, revoked status (`disabled=true`) is preserved, and ACL structures remain intact. Furthermore, Mosquitto DynSec disk persistence timing is unverified in code, presenting cold-crash rollback risks without fsync/hardware durability guarantees. Session advisory lock provides local backend mutual exclusion, not distributed fencing or broker quiescence.
+- Group 3: Bounded Acceptance Closeout (T01–T12). In T01, telemetry ingestion through Go to TimescaleDB with an application-level DB-commit ACK published on `gateways/<id>/acks/#` remains unverified in the DynSec acceptance slice (MQTT QoS 1 ACK is not application persistence proof). In T02, observer session survival does NOT prove cross-gateway ACL rejection; protocol/receiver denial evidence remains incomplete. The backend principal (`bootstrap_backend`) lacks `commands/#`, `responses/#`, and `status` permissions, leaving Digital Twin downlink control unproven. Secret-isolation evidence (T08) is limited to the inspected implementation and existing tests, not a comprehensive certification of all Go/proxy logs, audit tables, or artifacts. Mutations require JSON bodies and reject query parameters. Remaining native failure-injection, lost-response, and journal/commit-ambiguity proofs must be tracked against the existing T01–T12 matrix, not an unbounded new matrix.
+
+The broader MVP is not complete at this checkpoint: production deployment enforcement, full telemetry persistence/deduplication/DB-commit ACK acceptance, historical queries, authorized realtime delivery, private media integration, and Digital Twin desired-state/outbox/result reconciliation still require their own implementation or integration verification. Entity/URN creation in the sensor slice is not completion of the Digital Twin control module. Stage 2 plans contain historical and superseded scope statements; consult the current bounded CI plan and implementation evidence before reviving deferred legacy jobs. Advancing stages does not waive the mandatory MVP security and reliability requirements below.
+
+3. Canonical Cross-References:
+- Detailed Stage 2 plan: `../docs/backend_plan/stage2_backend_detailed_plan.md`
+- Task 2.8 DynSec plan & T01–T12 acceptance criteria: `../docs/backend_plan/task_2.8_plan.md` (specifically Section 0.8)
+- Task 2.8a supervised rotate/revoke implementation plan: `../docs/backend_plan/task_2.8a_plan.md`
+- Task 2.8 CI fixes: `../docs/backend_plan/task_2.8_ci_fix.md`
+- Local technical limitations and backlog: `docs/dynsec/limitations-and-backlog.md`
+- DynSec bootstrap runbook: `docs/runbooks/mqtt-dynsec-bootstrap.md`
+- DynSec index: `docs/dynsec/INDEX.md`
 
 Unless the user requests otherwise, explain decisions and write report-ready
 text in Vietnamese. Keep code, identifiers, protocol fields, and technical

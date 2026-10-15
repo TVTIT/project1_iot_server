@@ -1,16 +1,16 @@
 # Tài liệu Client — 08: Tích hợp API và Quản lý Trạng thái Giao diện (API Integration and State Handling)
 
-**Cập nhật:** 2026-10-05  
-**Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
-**Tài liệu tham chiếu:**  
-- `AGENTS.md` (Mục 2, 5, 6, 6.5, 10, 16, 18)  
-- `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)  
-- `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)  
-- `docs/client/03_USER_GATEWAY_AUTHORIZATION.md` (Phân quyền người dùng và trạm)  
-- `docs/client/04_REST_API_CLIENT_CONTRACT.md` (Hợp đồng REST API chuẩn)  
-- `docs/client/06_PROJECT_SETUP_AND_ENV.md` (Cấu hình môi trường và biến bảo mật)  
-- `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md` (Hợp đồng API Quản trị nền tảng)  
-- `docs/backend/stage-2-e2e-testing-guide.md` (Hướng dẫn kiểm thử E2E Giai đoạn 2)  
+**Cập nhật:** 2026-10-14
+**Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
+**Tài liệu tham chiếu:**
+- `AGENTS.md` (Mục 1, 2, 5, 6, 6.5, 10, 16, 18)
+- `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
+- `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
+- `docs/client/03_USER_GATEWAY_AUTHORIZATION.md` (Phân quyền người dùng và trạm)
+- `docs/client/04_REST_API_CLIENT_CONTRACT.md` (Hợp đồng REST API chuẩn)
+- `docs/client/06_PROJECT_SETUP_AND_ENV.md` (Cấu hình môi trường và biến bảo mật)
+- `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md` (Hợp đồng API Quản trị nền tảng)
+- `docs/dynsec/limitations-and-backlog.md` (Hạn chế kỹ thuật và tồn đọng DynSec)
 
 ---
 
@@ -24,10 +24,10 @@ Tài liệu này cung cấp **danh mục quy chuẩn (checklist) thực tiễn, 
 - Giao diện người dùng phải tuân thủ nghiêm ngặt các endpoint đã thực sự tồn tại trong Go Backend và GoTrue Auth; tuyệt đối không giả định hoặc tự sáng tác các endpoint chưa có.
 
 ### 1.3 Phân định bằng chứng kiểm thử (Evidence Status)
-- **Bằng chứng kiểm chứng cục bộ (Local Evidence):** Bộ kiểm thử E2E cô lập đã hoàn tất thực nghiệm 27/27 kịch bản (E01–E27) đạt `PASS` trên hạ tầng kiểm thử cục bộ (`scripts/test-stage2-e2e.sh`).
-- **Thẩm duyệt CI nội bộ (CI Review):** Cấu hình và quy trình supervisor đã được thẩm định.
-- **Nghiệm thu CI từ xa (Remote SHA Acceptance):** Trạng thái `PENDING` (chờ hoàn tất xác nhận gắn với commit SHA cuối cùng trên hệ thống CI từ xa).  
-*Lưu ý an toàn:* Không tuyên bố hệ thống sẵn sàng vận hành sản xuất (production-ready) khi các cổng nghiệm thu từ xa chưa khép lại.
+- **Bằng chứng kiểm chứng lịch sử (Historical Test Snapshot):** Bộ kiểm thử E2E cô lập đã từng hoàn tất thực nghiệm 27/27 kịch bản (E01–E27) đạt `PASS` trên hạ tầng kiểm thử cục bộ (`scripts/test-stage2-e2e.sh`, ảnh chụp lịch sử ngày 2026-10-05). Do kế hoạch CI hiện tại đã điều chỉnh thu gọn và hoãn lại các job legacy, tài liệu ghi nhận đây là ảnh chụp lịch sử, **không tuyên bố đã chạy mới toàn bộ bộ test E2E này**.
+- **Đóng cửa có giới hạn Giai đoạn 2 (Stage 2 Bounded Closeout ngày 2026-10-14):** Kiểm thử smoke full-HTTP Compose (`native-compose-smoke --full-http`) trên ứng viên commit `b681401` đã xác thực đường dẫn build đa tầng của `src/Dockerfile` (`target: backend`), ghi nhận 14 role denials, 9 JWT denials, 16 unchanged denied-write snapshots.
+- **Nghiệm thu CI từ xa và Ngoại lệ Tồn đọng (Remote Acceptance & Deferred Exceptions):** Theo `AGENTS.md`, hệ thống chưa nghiệm thu trọn vẹn CI từ xa và tiếp tục mang theo các ngoại lệ kỹ thuật chuyển tiếp: Nhóm 1 (T07 Reset fail-closed 503 `denyOnlyResetPrerequisite{}`, chưa có quy trình phục hồi khả dụng), Nhóm 2 (T10 & ROT2 kiểm chứng broker cold-restart và độ bền bỉ đĩa chưa được kiểm chứng trong code), Nhóm 3 (T01 DB-commit ACK chưa kiểm chứng trong slice DynSec).
+*Lưu ý an toàn:* Tuyệt đối không tuyên bố hệ thống sẵn sàng vận hành sản xuất (production-ready) khi các cổng nghiệm thu từ xa và ngoại lệ kỹ thuật chưa khép lại.
 
 ---
 
@@ -97,6 +97,28 @@ Client bắt buộc phải gọi API theo đúng trình tự phân cấp:
 >   2. Danh sách cảm biến thuộc trạm: Lấy từ lệnh gọi `GET /v1/gateways/{gateway_id}/sensors`.
 > - Tuyệt đối không tự ý phát minh hoặc gọi vào các endpoint đơn lẻ không tồn tại trên server để tránh phát sinh lỗi `404 Not Found` hoặc `405 Method Not Allowed`.
 
+### 3.3 Luồng Khởi tạo Cảm biến cho Chủ sở hữu Trạm (Owner Sensor Provisioning Flow)
+Khi người dùng đăng nhập có vai trò `owner` trên trạm Gateway được chọn:
+1. Giao diện hiển thị nút "Thêm Cảm biến" (đối với `operator` và `viewer`, nút này bắt buộc phải bị ẩn hoặc vô hiệu hóa).
+2. Người dùng nhập `sensor_id` (hợp lệ theo regex `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`), `name` (bắt buộc, 1..256 bytes), và `unit` (tùy chọn, 0..64 bytes).
+3. Client gửi request:
+   - `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`
+   - Header: `Authorization: Bearer <access_token>`, `Content-Type: application/json`
+   - Body: `{"name": "...", "unit": "..."}`
+4. Xử lý phản hồi:
+   - **`201 Created`**: Cảm biến được tạo mới thành công. Cập nhật danh sách cảm biến hiển thị trên giao diện.
+   - **`200 OK`**: Phát lại chính xác (Exact Replay trùng khớp `name` và `unit`). Cập nhật giao diện coi như thành công.
+   - **`409 Conflict`**: Cảm biến đã tồn tại với `name` hoặc `unit` khác. Giao diện hiển thị thông báo lỗi: *"Cảm biến đã tồn tại với thông tin khác. Hệ thống không hỗ trợ cập nhật cấu hình cảm biến qua endpoint này"*.
+   - **`403 Forbidden`**: Người dùng có vai trò `operator` hoặc `viewer`. Hiển thị: *"Chỉ Chủ sở hữu trạm (Owner) mới có quyền khởi tạo cảm biến"*.
+   - **`404 Not Found`**: Trạm không tồn tại hoặc người dùng không có quyền truy cập trạm.
+
+### 3.4 Luồng Kiểm kê Toàn cầu của Platform Admin (Admin Gateway Inventory Flow)
+Khi tài khoản được xác định là Platform Admin truy cập trang quản trị:
+1. Client gửi `GET /v1/admin/gateways?limit=100` (kèm `after=<cursor>` nếu tải trang tiếp theo). Tham số `limit` mặc định là 100 và tối đa là 200 trên môi trường chuẩn (được cấu hình qua biến môi trường `ADMIN_INVENTORY_DEFAULT_LIMIT` và `ADMIN_INVENTORY_MAX_LIMIT` trong dải 1..1000).
+2. Backend kiểm tra quyền trong `public.platform_admins` và phản hồi danh mục kiểm kê toàn cầu độc lập với bảng `user_gateways`:
+   - `items`: Danh sách Gateway (`gateway_id`, `name`, `description`, `created_at`). Không có `role`, không có `owner_user_id`, không có bí mật MQTT.
+   - `next_cursor`: Con trỏ phân trang, dùng cho request kế tiếp (`?after=<next_cursor>`). Khi `next_cursor == null`, danh sách đã duyệt hết.
+
 ---
 
 ## 4. Ma trận Trạng thái Giao diện Stage 2 (Stage 2 UI States Checklist)
@@ -107,12 +129,13 @@ Mọi màn hình trên Client phải xử lý đầy đủ các trạng thái sa
 |---|---|---|
 | **`initial`** | Chưa có tương tác tải dữ liệu. | Hiển thị khung chờ, chuẩn bị tải hoặc trạng thái ban đầu của trang. |
 | **`loading`** | Đang thực thi request hoặc làm mới dữ liệu. | Hiển thị hiệu ứng tải (progress indicator/shimmer), khóa tạm thời các thao tác trùng lặp. |
-| **`success`** | Nhận `200 OK` với mảng `items` có dữ liệu. | Hiển thị danh sách Gateway hoặc danh sách Sensor. |
+| **`success`** | Nhận `200 OK` (hoặc `201 Created` khi tạo mới Sensor) với mảng `items` có dữ liệu. | Hiển thị danh sách Gateway, danh sách Sensor, hoặc thông báo khởi tạo cảm biến thành công. |
 | **`empty`** | Nhận `200 OK` nhưng mảng `items: []`. | Hiển thị thông báo rỗng thân thiện (ví dụ: *"Bạn chưa được phân quyền trên trạm nào"* hoặc *"Trạm chưa có cảm biến"*). Không coi đây là lỗi. |
-| **`no-privacy 404`** | Nhận `404 Not Found` (`code: "not_found"`). | Xảy ra khi truy cập `gateway_id` lạ hoặc trạm mà người dùng không có quyền trong `user_gateways`. **Nguyên tắc bảo vệ quyền riêng tư (Anti-Enumeration):** Giao diện chỉ hiển thị *"Không tìm thấy tài nguyên"*, tuyệt đối không suy đoán trạm có tồn tại hay không. |
+| **`no-privacy 404`** | Nhận `404 Not Found` (`code: "not_found"`). | Xảy ra khi truy cập `gateway_id` lạ hoặc trạm mà người dùng không có quyền trong `user_gateways` (kể cả khi gọi đọc trạm, đọc cảm biến, hoặc gọi tạo cảm biến owner). **Nguyên tắc bảo vệ quyền riêng tư (Anti-Enumeration):** Giao diện chỉ hiển thị *"Không tìm thấy tài nguyên"*, tuyệt đối không suy đoán trạm có tồn tại hay không. |
 | **`401 refresh limited`** | Nhận `401 Unauthorized` (`code: "unauthorized"`). | Phiên làm việc hết hạn hoặc token lỗi. Client kích hoạt luồng Refresh Token **giới hạn duy nhất 1 lần (bounded retry)**. Nếu thất bại, xóa session cục bộ và chuyển hướng về màn hình Đăng nhập. Tránh tạo vòng lặp vô hạn. |
-| **`403 admin forbidden`** | Nhận `403 Forbidden` (`code: "forbidden"`). | Tài khoản thông thường cố tình gọi API Quản trị `/v1/admin/*`. Hiển thị thông báo: *"Thao tác yêu cầu quyền Quản trị viên hệ thống"*. |
-| **`503 dependency retry`** | Nhận `503 Service Unavailable` (`code: "service_unavailable"`). | Quá thời hạn xử lý cơ sở dữ liệu (`AUTHORIZATION_TIMEOUT`) hoặc database tạm thời gián đoạn. Hiển thị *"Hệ thống bận, vui lòng thử lại"*, cung cấp nút Thử lại (Retry) kèm giãn cách số mũ (exponential backoff). |
+| **`403 forbidden`** | Nhận `403 Forbidden` (`code: "forbidden"`). | - Tài khoản thông thường cố gọi API Quản trị `/v1/admin/*`: *"Thao tác yêu cầu quyền Quản trị viên hệ thống"*.<br>- `operator` hoặc `viewer` gọi khởi tạo Sensor (`PUT /v1/gateways/{id}/sensors/{id}`): *"Chỉ Chủ sở hữu trạm (Owner) mới có quyền khởi tạo cảm biến"*. |
+| **`409 conflict`** | Nhận `409 Conflict` (`code: "conflict"`). | Khi gọi `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` nhưng cảm biến đã tồn tại với `name` hoặc `unit` khác: Hiển thị thông báo *"Cảm biến đã tồn tại với thông tin khác. Hệ thống không hỗ trợ cập nhật/ghi đè cấu hình cảm biến qua endpoint này"*. |
+| **`503 dependency retry`** | Nhận `503 Service Unavailable` (`code: "service_unavailable"` hoặc `code: "credential_runtime_disabled"`). | Quá thời hạn xử lý cơ sở dữ liệu (`AUTHORIZATION_TIMEOUT`), database tạm thời gián đoạn, rào chắn khởi động chưa xong, hoặc tính năng credential bị tắt. Hiển thị *"Hệ thống bận hoặc dịch vụ tạm thời gián đoạn, vui lòng thử lại sau"*, cung cấp nút Thử lại (Retry) kèm giãn cách số mũ. |
 | **`500 safe / support request_id`** | Nhận `500 Internal Server Error` (`code: "internal_error"`). | Lỗi máy chủ nội bộ. Server không trả về stack trace. Client **bắt buộc đọc `request_id`** (từ `X-Request-ID` header hoặc payload `error.request_id`) để hiển thị thông báo: *"Đã xảy ra sự cố hệ thống. Mã tra cứu hỗ trợ: `<request_id>`"*. |
 | **`501 feature unavailable`** | Nhận `501 Not Implemented` (`code: "not_implemented"`). | Người dùng gọi vào các tính năng chưa triển khai ở Stage 2 (`/telemetry/history`, `/ws`, `/digital-twins`). Hiển thị thông báo tính năng chưa khả dụng. |
 | **`405 developer error`** | Nhận `405 Method Not Allowed` (`code: "method_not_allowed"`). | Lỗi logic từ phía lập trình viên (ví dụ: gửi `POST` vào endpoint chỉ hỗ trợ `GET`). Ghi log lỗi phát triển, không cho phép kích hoạt thao tác sai. |
@@ -140,16 +163,23 @@ Mọi màn hình trên Client phải xử lý đầy đủ các trạng thái sa
 
 ## 6. Phân cấp Vai trò Người dùng và Ranh giới Nút Bấm Giao diện (Role Enforcement & UI Boundaries)
 
-### 6.1 Đồng nhất quyền đọc trong Stage 2 (Read-Only Baseline)
+### 6.1 Đồng nhất quyền đọc và Ranh giới Khởi tạo Cảm biến của Owner
 Căn cứ theo hiện thực CSDL và mã nguồn nghiệp vụ:
 - Ba vai trò thành viên trạm gồm `owner`, `operator`, và `viewer` **đều sử dụng chung cùng một tập hợp Read API**:
   - `GET /v1/gateways`
   - `GET /v1/gateways/{gateway_id}/sensors`
-- Cả ba vai trò đều đọc được danh sách trạm và danh sách cảm biến thuộc trạm mà mình được gán quyền.
+- Cả ba vai trò đều đọc được danh sách trạm và danh sách cảm biến thuộc trạm mà mình được gán quyền trong `user_gateways`.
+- **Phân định quyền khởi tạo cảm biến (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`):**
+  - Duy nhất vai trò **`owner`** của trạm cha được cấp quyền gọi endpoint khởi tạo cảm biến tạo-mới-hoặc-phát-lại-chính-xác.
+  - Hai vai trò **`operator`** và **`viewer`** tuyệt đối không có quyền này và sẽ nhận mã lỗi `403 Forbidden` (`code: "forbidden"`, `message: "access denied"`). Giao diện Client bắt buộc phải ẩn hoặc vô hiệu hóa nút "Thêm Cảm biến" đối với hai vai trò này.
 
-### 6.2 CẤM BẬT NÚT CẤU HÌNH VÀ ĐIỀU KHIỂN SỚM (No Prematurely Enabled Buttons)
-- Trong phạm vi Stage 2, các chức năng ghi cấu hình thiết bị (`desired_state`), thao tác cảm biến, hoặc gửi lệnh điều khiển (downlink commands) **CHƯA ĐƯỢC KÍCH HOẠT** trên Go Backend.
-- **Quy tắc giao diện:** Giao diện Client **tuyệt đối không hiển thị hoặc không bật kích hoạt (enable)** các nút bấm cấu hình, nút khởi động lại, nút chụp ảnh, hoặc nút gửi lệnh cho bất kỳ vai trò nào (kể cả `owner` hay `operator`). Tránh gây hiểu nhầm cho người dùng khi backend chưa hỗ trợ.
+### 6.2 Ranh giới Khởi tạo Cảm biến và CẤM BẬT NÚT CẤU HÌNH/ĐIỀU KHIỂN SỚM
+- **Ranh giới endpoint khởi tạo cảm biến của Owner:**
+  - Endpoint `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` chỉ là cơ chế tạo mới hoặc phát lại chính xác (create-or-exact-replay) siêu dữ liệu (`name`, `unit`) của Sensor.
+  - Endpoint này **tuyệt đối KHÔNG PHẢI** là API cập nhật/chỉnh sửa thông tin cảm biến (không hỗ trợ thay đổi `name` hay `unit` đã tạo, gửi payload khác sẽ nhận `409 Conflict`), và **KHÔNG PHẢI** API xóa cảm biến.
+- **Cấm bật nút điều khiển và cấu hình thiết bị lâu bền:**
+  - Trong phạm vi Giai đoạn 2, các chức năng ghi cấu hình thiết bị lâu bền (`desired_state`), gửi lệnh điều khiển (downlink commands như reboot, capture-image), hoặc phân hệ Digital Twin runtime **CHƯA ĐƯỢC KÍCH HOẠT** trên Go Backend.
+  - **Quy tắc giao diện:** Giao diện Client chỉ hiển thị form/nút "Thêm cảm biến" cho người dùng mang vai trò `owner` trên trạm được chọn. **Tuyệt đối không hiển thị hoặc không bật kích hoạt (enable)** các nút bấm cấu hình thiết bị lâu bền, nút gửi lệnh điều khiển, nút khởi động lại hay nút chụp ảnh cho bất kỳ vai trò nào (kể cả `owner` hay `operator`). Tránh gây hiểu nhầm khi backend chưa hỗ trợ.
 
 ### 6.3 Phân định Quyền Quản trị Nền tảng (Platform Admin Authority)
 - Quyền quản trị nền tảng được kiểm tra độc lập tại bảng `public.platform_admins` trong PostgreSQL.
@@ -158,6 +188,7 @@ Căn cứ theo hiện thực CSDL và mã nguồn nghiệp vụ:
   2. Không được suy diễn từ JWT claim `role: "authenticated"`.
   3. Client không bao giờ sở hữu `service_role` key của Supabase.
   4. Hệ thống **không có API tự phong quyền Admin** (No platformAdmin self-API).
+- **Platform Admin không bypass quyền thành viên:** Nếu Platform Admin gọi `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` trên trạm mà mình không có quyền `owner` trong `user_gateways`, backend sẽ phản hồi `404 Not Found`. Platform Admin khởi tạo cảm biến độc lập với quyền sở hữu qua endpoint riêng `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`.
 - Không cho phép bất kỳ cơ chế vượt quyền nào thông qua cờ giao diện phía Client (No UI flag permission bypass).
 
 ---
@@ -166,29 +197,35 @@ Căn cứ theo hiện thực CSDL và mã nguồn nghiệp vụ:
 
 *Xem chi tiết toàn bộ hợp đồng API Quản trị tại:* `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`.
 
-Khi tích hợp các chức năng quản trị dành cho Platform Admin (cấp phát trạm, cấp cảm biến, quản lý MQTT credentials), Client cần tuân thủ các quy chuẩn an toàn:
+Khi tích hợp các chức năng quản trị dành cho Platform Admin (danh mục kiểm kê trạm, cấp phát trạm, cấp cảm biến, quản lý MQTT credentials), Client cần tuân thủ các quy chuẩn an toàn:
 
 ### 7.1 Xác nhận tường minh và cấm tự động thử lại khi Timeout
 - **Xác nhận tường minh (Explicit Confirmation):** Các thao tác tạo trạm, xoay vòng mật khẩu hoặc thu hồi quyền truy cập của Gateway phải luôn có hộp thoại xác nhận từ người vận hành trước khi gửi đi.
 - **Cấm tự động thử lại lệnh đột biến (No Auto-Mutating Retry):** Nếu request cấp phát hoặc xoay vòng credential gặp sự cố quá thời gian (timeout) hoặc mất kết nối mạng, Client **tuyệt đối không tự động gửi lại request ngầm**. Việc gửi lại chỉ được thực hiện khi người vận hành xác nhận và phải dùng cùng một khóa định danh/idempotency key để tránh xung đột dữ liệu.
 
 ### 7.2 Xử lý Mật khẩu MQTT dùng một lần (One-Time Secret Lifecycle)
-- Mật khẩu MQTT được sinh ngẫu nhiên từ server và **chỉ trả về DUY NHẤT MỘT LẦN** trong payload phản hồi của API cấp phát hoặc xoay vòng:
+- Mật khẩu MQTT được sinh ngẫu nhiên từ server và **chỉ trả về DUY NHẤT MỘT LẦN** trong payload phản hồi đầu tiên của API cấp phát (`POST`, HTTP 201) hoặc xoay vòng (`POST /rotate`, HTTP 200):
   ```json
   {
     "gateway_id": "gw-01",
     "username": "gw-01",
-    "password": "<plain_text_secret>",
+    "password": "<one_time_generated_secure_password_string>",
+    "secret_returned": true,
     "status": "active"
   }
   ```
 - **Hiển thị tạm thời (Transient Display):** Giao diện chỉ hiển thị mật khẩu này một lần trên màn hình (kèm nút sao chép an toàn) và cảnh báo người vận hành lưu trữ ngay.
 - **CẤM lưu trữ lâu dài:** Client **tuyệt đối không lưu mật khẩu này vào LocalStorage, cơ sở dữ liệu Client, hay state vĩnh viễn**.
-- **Không có API đọc lại mật khẩu:** Không tồn tại bất kỳ endpoint nào cho phép đọc lại mật khẩu đã cấp. Nếu làm mất mật khẩu, bắt buộc phải thực hiện quy trình xoay vòng mật khẩu mới (`POST /v1/admin/gateways/{gateway_id}/mqtt-credentials/rotate`).
+- **Không có API đọc lại mật khẩu:** Không tồn tại bất kỳ endpoint nào cho phép đọc lại mật khẩu đã cấp. Replay cùng key chỉ trả về `MutationResult` với `secret_returned: false` (trường password bị lược bỏ hoàn toàn). Nếu làm mất mật khẩu, bắt buộc phải thực hiện quy trình xoay vòng mật khẩu mới (`POST /v1/admin/gateways/{gateway_id}/mqtt-credential/rotate`).
 
-### 7.3 Phân biệt lỗi 503 `credential_runtime_disabled`
-- Nếu gọi các API MQTT credentials nhận về `HTTP 503` kèm mã lỗi `credential_runtime_disabled`, máy chủ đang tắt API quản trị credential bằng `MQTT_CREDENTIAL_API_ENABLED=false`. Đây không phải cờ runtime legacy `MQTT_CREDENTIAL_RUNTIME_ENABLED`.
-- Đây là trạng thái cấu hình hệ thống của hạ tầng, **hoàn toàn không phải lỗi đăng nhập hay lỗi quyền hạn tài khoản**. Giao diện cần thông báo đúng bản chất hạ tầng cho Quản trị viên.
+### 7.3 Phân biệt lỗi 503 Credential và Ngoại lệ Reset
+- Nếu gọi các API MQTT credentials nhận về `HTTP 503` kèm mã lỗi `credential_runtime_disabled`, máy chủ đang tắt API quản trị credential bằng `MQTT_CREDENTIAL_API_ENABLED=false`. Đây không phải lỗi đăng nhập hay lỗi quyền hạn tài khoản.
+- Nếu nhận `HTTP 503` kèm `credential_runtime_busy`, hệ thống đang có thao tác credential khác chiếm giữ khóa advisory lock `0x494f545f43524544` hoặc runtime đang bận; chỉ thử lại có giãn cách (exponential backoff) và không thử lại vô hạn.
+- **Endpoint Reset và Rào chắn An toàn Fail-closed:** Tuyến đường `POST /v1/admin/gateways/{id}/mqtt-credential/reset` đã được đăng ký và áp dụng bộ phân tích cú pháp nghiêm ngặt (`Idempotency-Key` đúng 1 non-nil UUID, `Content-Type: application/json`, body mang duy nhất trường `reason` hợp lệ, kích thước trong hạn mức `ADMIN_MAX_BODY_BYTES`, không query string). Lưu ý về mã lỗi và điều kiện tiên quyết:
+  - Nếu tính năng credential bị tắt (`MQTT_CREDENTIAL_API_ENABLED=false`), server phản hồi `503 Service Unavailable` với mã miền đặc thù `code: "credential_runtime_disabled"` (chứ không phải `service_unavailable`).
+  - Nếu vi phạm xác thực, phân quyền hoặc cú pháp request (body sai/rỗng, vượt hạn mức, thiếu `Idempotency-Key`...), server phản hồi các mã lỗi parser chuẩn tương ứng (`401`, `403`, `400`, `413`, `415`).
+  - Chỉ khi request hoàn toàn hợp lệ và tính năng credential được kích hoạt, thành phần runtime `denyOnlyResetPrerequisite{}` (hoặc rào chắn khởi động chưa sẵn sàng) mới chặn an toàn với `HTTP 503 Service Unavailable` (`code: "service_unavailable"`, `message: "credential request failed"`).
+  - Tuyệt đối không tự động thử lại vào endpoint reset này; các sự cố bất định hoặc mất secret phải được xử lý có giám sát theo runbook hạ tầng.
 
 ---
 
@@ -239,6 +276,14 @@ Một ứng dụng HTTP Client thông thường (như trình duyệt Web hoặc 
 | **TC-11: Gọi endpoint chưa triển khai** | Có JWT hợp lệ bất kỳ | `GET /v1/telemetry/history` | `501` | `code: "not_implemented"` |
 | **TC-12: Gọi sai phương thức (Method)** | Có JWT hợp lệ bất kỳ | `POST /v1/gateways` | `405` | `code: "method_not_allowed"` |
 | **TC-13: Gọi đường dẫn không tồn tại** | Có JWT hợp lệ bất kỳ | `GET /v1/unknown-path` | `404` | `code: "not_found"` |
+| **TC-14: Owner khởi tạo Sensor mới** | `Owner A` | `PUT /v1/gateways/gw-a/sensors/s1` | `201` | `{ "gateway_id": "gw-a", "sensor_id": "s1", "name": "...", "unit": "...", "entity_id": "urn:ngsi-ld:Sensor:gw-a:s1", ... }` |
+| **TC-15: Owner phát lại chính xác Sensor (Exact Replay)** | `Owner A` | `PUT /v1/gateways/gw-a/sensors/s1` | `200` | Trả về thông tin cảm biến trùng khớp, giữ nguyên `created_at` ban đầu |
+| **TC-16: Owner gửi cấu hình khác lên Sensor cũ** | `Owner A` | `PUT /v1/gateways/gw-a/sensors/s1` (khác name/unit) | `409` | `code: "conflict"`, `message: "resource conflict"` |
+| **TC-17: Operator / Viewer cố tạo Sensor** | `Operator` / `Viewer` | `PUT /v1/gateways/gw-a/sensors/s2` | `403` | `code: "forbidden"`, `message: "access denied"` |
+| **TC-18: Non-member gọi tạo Sensor** | `Non-member` hoặc `Owner B` gọi trạm A | `PUT /v1/gateways/gw-a/sensors/s2` | `404` | `code: "not_found"`, `message: "resource not found"` (Anti-Enumeration) |
+| **TC-19: Platform Admin duyệt danh mục kiểm kê toàn cầu** | `Platform Admin` | `GET /v1/admin/gateways?limit=100` | `200` | `{ "items": [ ... ], "next_cursor": ... }` |
+| **TC-20: Người dùng thường gọi danh mục kiểm kê** | `Owner A` / `Operator` / `Viewer` / `Non-member` | `GET /v1/admin/gateways` | `403` | `code: "forbidden"`, `message: "insufficient permissions"` |
+| **TC-21: Gọi endpoint Reset có giám sát** | `Platform Admin` | `POST /v1/admin/gateways/gw-a/mqtt-credential/reset` (kèm body reason và Idempotency-Key hợp lệ khi Credential API được bật) | `503` | `code: "service_unavailable"`, `message: "credential request failed"` (denyOnlyResetPrerequisite fail-closed; nếu API tắt sẽ nhận `credential_runtime_disabled`) |
 
 ---
 

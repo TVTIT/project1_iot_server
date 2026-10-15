@@ -25,6 +25,14 @@ func NewPostgresRepository(database Database) (Repository, error) {
 	return &postgresRepository{database: database}, nil
 }
 
+// NewPostgresAdminGatewayRepository creates a dedicated admin inventory repository.
+func NewPostgresAdminGatewayRepository(database Database) (AdminGatewayRepository, error) {
+	if isNilDependency(database) {
+		return nil, fmt.Errorf("gateway database is required")
+	}
+	return &postgresRepository{database: database}, nil
+}
+
 const listGatewaysQuery = `SELECT g.gateway_id, g.name, g.description, ug.role, g.created_at
 FROM public.gateways AS g
 JOIN public.user_gateways AS ug ON ug.gateway_id = g.gateway_id
@@ -42,6 +50,23 @@ const gatewayRoleQuery = `SELECT ug.role
 FROM public.user_gateways AS ug
 JOIN public.gateways AS g ON g.gateway_id = ug.gateway_id
 WHERE ug.user_id = $1 AND g.gateway_id = $2`
+
+const checkPlatformAdminQuery = `SELECT EXISTS (
+    SELECT 1
+    FROM public.platform_admins
+    WHERE user_id = $1
+)`
+
+const listAdminGatewaysFirstPageQuery = `SELECT gateway_id, name, description, created_at
+FROM public.gateways
+ORDER BY gateway_id COLLATE "C" ASC
+LIMIT $1`
+
+const listAdminGatewaysAfterQuery = `SELECT gateway_id, name, description, created_at
+FROM public.gateways
+WHERE gateway_id COLLATE "C" > $1 COLLATE "C"
+ORDER BY gateway_id COLLATE "C" ASC
+LIMIT $2`
 
 func (r *postgresRepository) ListGatewaysForUser(ctx context.Context, userID uuid.UUID) ([]Gateway, error) {
 	rows, err := r.database.Query(ctx, listGatewaysQuery, userID)
@@ -106,4 +131,53 @@ func (r *postgresRepository) GetGatewayRole(ctx context.Context, userID uuid.UUI
 		return "", fmt.Errorf("query gateway role: %w", err)
 	}
 	return role, nil
+}
+
+func (r *postgresRepository) ListAdminGateways(ctx context.Context, actor uuid.UUID, query AdminGatewayInventoryQuery) (AdminGatewayInventoryPage, error) {
+	if actor == uuid.Nil {
+		return AdminGatewayInventoryPage{}, ErrInvalidUser
+	}
+	var isAdmin bool
+	if err := r.database.QueryRow(ctx, checkPlatformAdminQuery, actor).Scan(&isAdmin); err != nil {
+		return AdminGatewayInventoryPage{}, fmt.Errorf("%w: %w", ErrAdminLookupFailed, err)
+	}
+	if !isAdmin {
+		return AdminGatewayInventoryPage{}, ErrAdminForbidden
+	}
+
+	fetchLimit := query.Limit + 1
+	var rows pgx.Rows
+	var err error
+	if query.After == "" {
+		rows, err = r.database.Query(ctx, listAdminGatewaysFirstPageQuery, fetchLimit)
+	} else {
+		rows, err = r.database.Query(ctx, listAdminGatewaysAfterQuery, query.After, fetchLimit)
+	}
+	if err != nil {
+		return AdminGatewayInventoryPage{}, fmt.Errorf("query admin gateways: %w", classifyInventoryReadError(err))
+	}
+	defer rows.Close()
+
+	items := make([]AdminGateway, 0)
+	for rows.Next() {
+		var item AdminGateway
+		if err := rows.Scan(&item.GatewayID, &item.Name, &item.Description, &item.CreatedAt); err != nil {
+			return AdminGatewayInventoryPage{}, fmt.Errorf("scan admin gateway: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return AdminGatewayInventoryPage{}, fmt.Errorf("iterate admin gateways: %w", classifyInventoryReadError(err))
+	}
+
+	var nextCursor *string
+	if len(items) > query.Limit {
+		items = items[:query.Limit]
+		lastID := items[query.Limit-1].GatewayID
+		nextCursor = &lastID
+	}
+	return AdminGatewayInventoryPage{
+		Items:      items,
+		NextCursor: nextCursor,
+	}, nil
 }

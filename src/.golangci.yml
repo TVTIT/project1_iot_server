@@ -16,6 +16,11 @@ linters:
     - revive
     - misspell
   settings:
+    misspell:
+      # Mosquitto is the proper brand and project name of the MQTT broker;
+      # ignore-rules prevents misspell from treating Mosquitto/mosquitto as a typo of mosquito.
+      ignore-rules:
+        - mosquitto
     revive:
       rules:
         - name: exported

@@ -100,7 +100,11 @@ func TestCredentialHTTPIsolated(t *testing.T) {
 	gs, _ := gateway.NewService(gr, 2*time.Second)
 	pr, _ := gateway.NewPostgresProvisioningRepository(app)
 	ps, _ := gateway.NewProvisioningService(pr, 2*time.Second)
-	deps := httpserver.RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: gs, SensorReader: gs, GatewayProvisioner: ps, SensorProvisioner: ps, AdminMaxBodyBytes: 128, CredentialAPIEnabled: true, CredentialRequestTimeout: cfg.RequestTimeout, CredentialManager: composition.manager, CredentialStartupReadiness: composition.ready}
+	osr, _ := gateway.NewPostgresOwnerSensorProvisioningRepository(app)
+	oss, _ := gateway.NewOwnerSensorProvisioningService(osr, 2*time.Second)
+	agr, _ := gateway.NewPostgresAdminGatewayRepository(app)
+	as, _ := gateway.NewAdminGatewayService(agr, 2*time.Second, 100, 200)
+	deps := httpserver.RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: gs, SensorReader: gs, GatewayProvisioner: ps, SensorProvisioner: ps, OwnerSensorProvisioner: oss, AdminGatewayLister: as, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 128, CredentialAPIEnabled: true, CredentialRequestTimeout: cfg.RequestTimeout, CredentialManager: composition.manager, CredentialStartupReadiness: composition.ready}
 	var mu sync.RWMutex
 	var handler http.Handler
 	install := func() {

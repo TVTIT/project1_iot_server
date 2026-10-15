@@ -18,7 +18,6 @@ import (
 	"iot-platform/internal/database"
 	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpserver"
-	"iot-platform/internal/mqttcredential"
 )
 
 func main() {
@@ -39,14 +38,7 @@ func run() error {
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	// Fence a prior backend lifetime before any database connection attempt.
-	if cfg.Credential.Enabled {
-		ctrl := mqttcredential.ControllerClient{ControlDir: cfg.Credential.ControlDir, Timeout: cfg.Credential.ClientTimeout, MaxFrameBytes: 4096}
-		if ctrl.CloseDrain(rootCtx) != nil {
-			return fmt.Errorf("credential startup controller unavailable")
-		}
-	}
-
+	// Open database connection
 	pool, err := database.Open(
 		rootCtx,
 		cfg.DatabaseURL,
@@ -102,6 +94,27 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create provisioning service: %w", err)
 	}
+	ownerSensorRepo, err := gateway.NewPostgresOwnerSensorProvisioningRepository(pool)
+	if err != nil {
+		return fmt.Errorf("create owner sensor provisioning repository: %w", err)
+	}
+	ownerSensorService, err := gateway.NewOwnerSensorProvisioningService(ownerSensorRepo, cfg.AuthorizationTimeout)
+	if err != nil {
+		return fmt.Errorf("create owner sensor provisioning service: %w", err)
+	}
+	adminGatewayRepository, err := gateway.NewPostgresAdminGatewayRepository(pool)
+	if err != nil {
+		return fmt.Errorf("create admin gateway repository: %w", err)
+	}
+	adminGatewayService, err := gateway.NewAdminGatewayService(
+		adminGatewayRepository,
+		cfg.AuthorizationTimeout,
+		cfg.AdminInventoryDefaultLimit,
+		cfg.AdminInventoryMaxLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("create admin gateway service: %w", err)
+	}
 	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
 		CredentialAPIEnabled:       cfg.Credential.Enabled,
 		CredentialRequestTimeout:   cfg.Credential.RequestTimeout,
@@ -109,6 +122,10 @@ func run() error {
 		CredentialStartupReadiness: credentials.ready,
 		GatewayProvisioner:         provisioningService,
 		SensorProvisioner:          provisioningService,
+		OwnerSensorProvisioner:     ownerSensorService,
+		AdminGatewayLister:         adminGatewayService,
+		AdminInventoryDefaultLimit: cfg.AdminInventoryDefaultLimit,
+		AdminInventoryMaxLimit:     cfg.AdminInventoryMaxLimit,
 		AdminMaxBodyBytes:          int64(cfg.AdminMaxBodyBytes),
 		GatewayReader:              gatewayService,
 		SensorReader:               gatewayService,
@@ -117,6 +134,7 @@ func run() error {
 		AuthorizationTimeout:       cfg.AuthorizationTimeout,
 		TokenVerifier:              tokenVerifier,
 		PlatformAdminChecker:       adminChecker,
+		CORSAllowedOrigins:         cfg.CORSAllowedOrigins,
 	})
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)

@@ -105,7 +105,7 @@ func TestStartupRecoveryFaultClassification(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			f := &recoveryFaultFixture{fault: fault, o: Operation{OperationID: id, GatewayID: "fixture_recovery"}, m: Metadata{LastOperationID: id}, cp: MaintenanceCheckpoint{Status: MaintenanceInProgress}, r: RecoveryRecord{OperationID: id, GatewayID: "fixture_recovery", Status: RecoveryPending}}
+			f := &recoveryFaultFixture{fault: fault, o: Operation{OperationID: id, GatewayID: "fixture_recovery", Action: ActionProvision}, m: Metadata{LastOperationID: id}, cp: MaintenanceCheckpoint{Status: MaintenanceInProgress}, r: RecoveryRecord{OperationID: id, GatewayID: "fixture_recovery", Status: RecoveryPending}}
 			a := &recoveryProofRuntime{bad: fault == "invalid-proof"}
 			a.failDisable = fault == "disable"
 			s := &StartupReconciler{repo: f, maintenance: f, recovery: f, runtime: a}

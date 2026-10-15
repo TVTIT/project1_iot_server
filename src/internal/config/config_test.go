@@ -89,6 +89,12 @@ func TestLoadUsesSafeOperationalDefaults(t *testing.T) {
 	if cfg.SupabaseJWTAudience != "authenticated" {
 		t.Errorf("SupabaseJWTAudience = %q, want authenticated", cfg.SupabaseJWTAudience)
 	}
+	if cfg.AdminInventoryDefaultLimit != 100 {
+		t.Errorf("AdminInventoryDefaultLimit = %d, want 100", cfg.AdminInventoryDefaultLimit)
+	}
+	if cfg.AdminInventoryMaxLimit != 200 {
+		t.Errorf("AdminInventoryMaxLimit = %d, want 200", cfg.AdminInventoryMaxLimit)
+	}
 }
 
 func TestLoadRejectsInvalidValues(t *testing.T) {
@@ -105,6 +111,11 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{name: "min conns greater than max conns", key: "DATABASE_MIN_CONNS", value: "20"},
 		{name: "zero queue capacity", key: "MQTT_QUEUE_CAPACITY", value: "0"},
 		{name: "negative worker count", key: "MQTT_WORKER_COUNT", value: "-1"},
+		{name: "zero admin inventory default limit", key: "ADMIN_INVENTORY_DEFAULT_LIMIT", value: "0"},
+		{name: "admin inventory default limit above max allowed", key: "ADMIN_INVENTORY_DEFAULT_LIMIT", value: "1001"},
+		{name: "zero admin inventory max limit", key: "ADMIN_INVENTORY_MAX_LIMIT", value: "0"},
+		{name: "admin inventory max limit above max allowed", key: "ADMIN_INVENTORY_MAX_LIMIT", value: "1001"},
+		{name: "admin inventory default limit greater than max limit", key: "ADMIN_INVENTORY_DEFAULT_LIMIT", value: "250"},
 	}
 
 	for _, tt := range tests {

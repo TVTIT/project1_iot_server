@@ -1,8 +1,12 @@
 package httpserver
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -10,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"iot-platform/internal/auth"
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpapi"
 	"iot-platform/internal/mqttcredential"
 )
@@ -20,6 +25,11 @@ type CredentialManager interface {
 	Provision(context.Context, uuid.UUID, mqttcredential.MutationInput) (mqttcredential.ProvisionResponse, error)
 	Rotate(context.Context, uuid.UUID, mqttcredential.MutationInput) (mqttcredential.ProvisionResponse, error)
 	Revoke(context.Context, uuid.UUID, mqttcredential.MutationInput) (mqttcredential.MutationResult, error)
+}
+
+// credentialResetter is a narrow internal capability for manual supervised reset.
+type credentialResetter interface {
+	Reset(context.Context, uuid.UUID, mqttcredential.ResetInput) (mqttcredential.ProvisionResponse, error)
 }
 
 // CredentialStartupReadiness proves the completed startup barrier only. It does
@@ -44,6 +54,7 @@ func registerCredentialRoutes(admin *gin.RouterGroup, deps RouterDependencies) {
 	admin.POST(path, credentialHandler(deps, mqttcredential.ActionProvision))
 	admin.POST(path+"/rotate", credentialHandler(deps, mqttcredential.ActionRotate))
 	admin.DELETE(path, credentialHandler(deps, mqttcredential.ActionRevoke))
+	admin.POST(path+"/reset", credentialResetHandler(deps))
 }
 
 func credentialHandler(deps RouterDependencies, action mqttcredential.Action) gin.HandlerFunc {
@@ -158,4 +169,136 @@ func writeCredentialError(c *gin.Context, err error) {
 	// DomainError carries no committed intent identity. Never invent operation_id
 	// from a request or from possibly partial/unconfirmed service output.
 	httpapi.WriteError(c, status, string(code), "credential request failed")
+}
+
+func credentialResetHandler(deps RouterDependencies) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := auth.PrincipalFrom(c)
+		if !ok || principal.UserID == uuid.Nil || principal.Role != "authenticated" {
+			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if !deps.CredentialAPIEnabled {
+			writeCredentialError(c, &mqttcredential.DomainError{Code: mqttcredential.CodeRuntimeDisabled})
+			return
+		}
+		if auth.IsNilDependency(deps.CredentialManager) || auth.IsNilDependency(deps.CredentialStartupReadiness) || !deps.CredentialStartupReadiness.Ready() {
+			writeCredentialError(c, &mqttcredential.DomainError{Code: mqttcredential.CodeServiceUnavailable})
+			return
+		}
+		resetter, ok := deps.CredentialManager.(credentialResetter)
+		if !ok || auth.IsNilDependency(resetter) {
+			writeCredentialError(c, &mqttcredential.DomainError{Code: mqttcredential.CodeServiceUnavailable})
+			return
+		}
+		id := c.Param("gateway_id")
+		key, reason, status := parseCredentialResetRequest(c.Request, id, deps.AdminMaxBodyBytes)
+		if status != 0 {
+			if status == http.StatusRequestEntityTooLarge {
+				httpapi.WriteError(c, status, "request_too_large", "request body too large")
+			} else {
+				httpapi.WriteError(c, status, "invalid_request", "invalid request")
+			}
+			return
+		}
+		input := mqttcredential.ResetInput{
+			GatewayID:      id,
+			IdempotencyKey: key,
+			Reason:         reason,
+		}
+		if err := mqttcredential.ValidateResetInput(principal.UserID, input); err != nil {
+			writeCredentialError(c, err)
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), deps.CredentialRequestTimeout)
+		defer cancel()
+		result, err := resetter.Reset(ctx, principal.UserID, input)
+		if result.Secret != nil {
+			defer result.Secret.ClearSecret()
+		}
+		if err != nil {
+			writeCredentialError(c, err)
+			return
+		}
+		if result.Secret != nil {
+			c.JSON(http.StatusOK, result.Secret)
+			return
+		}
+		writeCredentialMutation(c, result.MutationResult, http.StatusOK)
+	}
+}
+
+func parseCredentialResetRequest(r *http.Request, id string, limit int64) (uuid.UUID, mqttcredential.ResetReason, int) {
+	if gateway.ValidateGatewayID(id) != nil || r.URL.RawQuery != "" || r.URL.ForceQuery {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	values := r.Header.Values("Idempotency-Key")
+	if len(values) != 1 {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	key, err := uuid.Parse(values[0])
+	if err != nil || key == uuid.Nil {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	media, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || media != "application/json" {
+		return uuid.Nil, "", http.StatusUnsupportedMediaType
+	}
+	for k, v := range params {
+		if k != "charset" || !strings.EqualFold(v, "utf-8") {
+			return uuid.Nil, "", http.StatusUnsupportedMediaType
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(data)) > limit {
+		return uuid.Nil, "", http.StatusRequestEntityTooLarge
+	}
+	if err != nil || len(data) == 0 || !validJSONUnicode(data) {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	seen := map[string]bool{}
+	var reasonVal string
+	for dec.More() {
+		token, err = dec.Token()
+		if err != nil {
+			return uuid.Nil, "", http.StatusBadRequest
+		}
+		fieldName, ok := token.(string)
+		if !ok || seen[fieldName] {
+			return uuid.Nil, "", http.StatusBadRequest
+		}
+		seen[fieldName] = true
+		if fieldName != "reason" {
+			return uuid.Nil, "", http.StatusBadRequest
+		}
+		var raw json.RawMessage
+		if dec.Decode(&raw) != nil {
+			return uuid.Nil, "", http.StatusBadRequest
+		}
+		if bytes.Equal(raw, []byte("null")) {
+			return uuid.Nil, "", http.StatusBadRequest
+		}
+		if json.Unmarshal(raw, &reasonVal) != nil {
+			return uuid.Nil, "", http.StatusBadRequest
+		}
+	}
+	if token, err = dec.Token(); err != nil || token != json.Delim('}') {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	if _, err = dec.Token(); err != io.EOF {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	if !seen["reason"] {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	reason := mqttcredential.ResetReason(reasonVal)
+	if reason != mqttcredential.ResetReasonRecoveryAfterUnknown && reason != mqttcredential.ResetReasonLostSecretRecovery {
+		return uuid.Nil, "", http.StatusBadRequest
+	}
+	return key, reason, 0
 }

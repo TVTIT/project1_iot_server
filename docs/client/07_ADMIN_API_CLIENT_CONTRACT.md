@@ -1,6 +1,6 @@
 # Tài liệu Client — 07: Quy chuẩn Hợp đồng Admin API (Platform Admin API Client Contract)
 
-**Cập nhật:** 2026-10-05  
+**Cập nhật:** 2026-10-14
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
 **Tài liệu tham chiếu:**  
 - `AGENTS.md` (Mục 5, 6, 6.5, 7, 10, 15, 16, 18)  
@@ -11,24 +11,33 @@
 - `docs/client/05_UPCOMING_FEATURES_ROADMAP.md` (Lộ trình phát triển tính năng các giai đoạn)  
 - `docs/client/06_PROJECT_SETUP_AND_ENV.md` (Cấu hình môi trường và biến bảo mật)  
 - `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md` (Tích hợp API và Quản lý trạng thái Client)  
-- `docs/backend/stage-2-task-2.4-provisioning.md` (Chi tiết kỹ thuật Admin Provisioning)  
-- `docs/backend/stage-2-task-2.6-acceptance.md` (Báo cáo nghiệm thu và kiến trúc Mosquitto DynSec Ingress Gate)  
-- `docs/backend/platform-admin-account-management-goals.md` (Mục tiêu và ranh giới quản lý tài khoản)  
+- `src/internal/httpserver/admin_gateway_handlers.go` (Mã nguồn Admin Gateway Inventory & Provisioning)
+- `src/internal/httpserver/admin_sensor_handlers.go` (Mã nguồn Admin Sensor Provisioning)
+- `src/internal/httpserver/admin_mqtt_credential_handlers.go` (Mã nguồn Admin MQTT Credential Handlers)
+- `src/cmd/server/credential.go` (Tầng composition Credential & denyOnlyResetPrerequisite)
+- [docs/dynsec/INDEX.md](../dynsec/INDEX.md) (Tổng quan kiến trúc và ma trận bằng chứng DynSec)
+- [docs/dynsec/flows-and-api.md](../dynsec/flows-and-api.md) (Chi tiết các luồng vận hành và hợp đồng HTTP API DynSec)
+- [docs/dynsec/limitations-and-backlog.md](../dynsec/limitations-and-backlog.md) (Hạn chế kỹ thuật và tồn đọng DynSec)
 
 ---
 
 ## 1. Mục tiêu và Ranh giới Phạm vi (Scope & Architectural Boundaries)
 
-Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản trị nền tảng (Platform Admin API Client Contract)** chính thức cho 6 endpoint quản trị đã được hiện thực trong mã nguồn Go backend (`src/cmd/server`, `src/internal/httpserver`).
+Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản trị nền tảng (Platform Admin API Client Contract)** chính thức cho 7 endpoint quản trị khả dụng đã được hiện thực trong mã nguồn Go backend (`src/cmd/server`, `src/internal/httpserver`), cùng 1 tuyến đường reset có giám sát đã đăng ký cú pháp nhưng áp dụng rào chắn an toàn fail-closed.
 
-### 1.1 Sáu (06) Endpoint Quản trị Đã Được Hiện Thực
+### 1.1 Bảy (07) Endpoint Quản trị Khả dụng và Một (01) Tuyến đường Reset Đã đăng ký Rào chắn An toàn
 
-1. `PUT /v1/admin/gateways/{gateway_id}`: Khởi tạo mới hoặc kiểm tra lũy quyền thực thể Gateway, gán người sở hữu (`owner`) ban đầu, và tự động tạo đồ thị Digital Twin (`twin_entities`, `twin_states`).
-2. `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`: Khởi tạo mới hoặc kiểm tra lũy quyền Sensor thuộc Gateway cha, tự động tạo đồ thị Digital Twin và thiết lập quan hệ phân cấp `twin_relationships` (`hasSensor`).
-3. `GET /v1/admin/gateways/{gateway_id}/mqtt-credential`: Truy vấn metadata trạng thái thông tin xác thực MQTT của Gateway (không chứa mật khẩu).
-4. `POST /v1/admin/gateways/{gateway_id}/mqtt-credential`: Cấp phát ban đầu thông tin xác thực MQTT (DynSec username/password) cho Gateway; trả về mật khẩu plaintext một lần duy nhất.
-5. `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/rotate`: Xoay vòng mật khẩu MQTT cho Gateway đang hoạt động (`active`); trả về mật khẩu mới một lần duy nhất.
-6. `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`: Thu hồi thông tin xác thực MQTT của Gateway, ngắt kết nối socket hiện tại và vô hiệu hóa quyền truy cập broker.
+1. `GET /v1/admin/gateways`: Danh mục kiểm kê Gateway toàn hệ thống (Admin Gateway Inventory) cho Platform Admin, độc lập với tư cách thành viên, hỗ trợ phân trang keyset cursor (`limit`, `after`).
+2. `PUT /v1/admin/gateways/{gateway_id}`: Khởi tạo mới hoặc kiểm tra lũy quyền thực thể Gateway, gán người sở hữu (`owner`) ban đầu, và tự động tạo đồ thị Digital Twin (`twin_entities`, `twin_states`).
+3. `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`: Khởi tạo mới hoặc kiểm tra lũy quyền Sensor thuộc Gateway cha bởi Platform Admin, tự động tạo đồ thị Digital Twin và thiết lập quan hệ phân cấp `twin_relationships` (`hasSensor`).
+4. `GET /v1/admin/gateways/{gateway_id}/mqtt-credential`: Truy vấn metadata trạng thái thông tin xác thực MQTT của Gateway (không chứa mật khẩu).
+5. `POST /v1/admin/gateways/{gateway_id}/mqtt-credential`: Cấp phát ban đầu thông tin xác thực MQTT (DynSec username/password) cho Gateway; trả về mật khẩu plaintext một lần duy nhất (`secret_returned: true`); replay cùng key trả về `201 Created` metadata-only (lược bỏ trường password).
+6. `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/rotate`: Xoay vòng mật khẩu MQTT cho Gateway đang hoạt động (`active`); trả về mật khẩu mới một lần duy nhất; replay cùng key trả về `200 OK` metadata-only.
+7. `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`: Vô hiệu hóa và thu hồi thông tin xác thực MQTT của Gateway, ngắt kết nối session active và vô hiệu hóa quyền truy cập broker (`200 OK` metadata-only; không có cơ chế tự động khôi phục bí mật, nhưng cho phép re-provision với key mới).
+
+- **Ngoại lệ Tuyến đường Reset Đã đăng ký Rào chắn An toàn (Registered Deny-Only Reset Route):**
+  - Tuyến đường `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/reset` đã được đăng ký trong router (`router.go`) và bộ phân tích cú pháp `parseCredentialResetRequest` kiểm tra nghiêm ngặt payload lý do (`reason`), nhưng tại tầng composition runtime (`src/cmd/server/credential.go`), thành phần phụ thuộc được gắn kiểu `denyOnlyResetPrerequisite{}`.
+  - Khi tính năng credential được kích hoạt (`MQTT_CREDENTIAL_API_ENABLED=true`), runtime này **LUÔN LUÔN từ chối (fail-closed)** mọi yêu cầu hợp lệ vượt qua parser với mã lỗi HTTP **`503 Service Unavailable`** (`code: "service_unavailable"`, `message: "credential request failed"`). Nếu tính năng credential bị tắt (`MQTT_CREDENTIAL_API_ENABLED=false`), server phản hồi HTTP **`503 Service Unavailable`** với mã lỗi `code: "credential_runtime_disabled"` (chứ không phải `service_unavailable`). Nếu vi phạm xác thực, phân quyền hoặc cú pháp request, server phản hồi các mã lỗi parser tương ứng (`401`, `403`, `400`, `413`, `415`). Đây là rào chắn an toàn kỹ thuật, **CHƯA PHẢI là quy trình phục hồi khả dụng** (xem chi tiết tại [Mục 4.7](#47-ngoại-lệ-đặt-lại-credential-có-giám-sát-post-v1admingatewaysgateway_idmqtt-credentialreset)).
 
 ### 1.2 Ranh giới Kiến trúc và Mô hình Quản trị Tập trung
 
@@ -37,7 +46,12 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
   - Quyền quản trị tối cao của Platform Admin được định đoạt duy nhất bằng sự tồn tại của `user_id` trong bảng cơ sở dữ liệu `public.platform_admins` tại PostgreSQL.
   - Tư cách thành viên trong `user_gateways` (`owner`, `operator`, `viewer`) **đứng riêng lẻ hoàn toàn không cấp quyền Platform Admin**; người dùng chỉ có vai trò trong `user_gateways` mà không có bản ghi trong `platform_admins` sẽ nhận mã lỗi `403 Forbidden` khi truy cập `/v1/admin/*`.
   - **Tài khoản có thể mang đồng thời cả hai vai trò độc lập (Legitimate Dual-Role):** Một người dùng hoàn toàn có thể vừa là thành viên (ví dụ: `owner` của một Gateway) vừa độc lập là một Platform Admin trong `platform_admins`. Hệ thống thẩm định từng ranh giới độc lập, không cấm tài khoản mang hai vai trò song song.
-  - Platform Admin **không tự động bypass** quyền đọc nghiệp vụ: Nếu một Admin chưa được phân quyền thành viên trong `user_gateways` cho một Gateway cụ thể, khi gọi API đọc nghiệp vụ `GET /v1/gateways` sẽ nhận về danh sách rỗng (`{"items":[]}`), và gọi `GET /v1/gateways/{gateway_id}/sensors` sẽ nhận `404 Not Found` (xem [Tài liệu 03](03_USER_GATEWAY_AUTHORIZATION.md)).
+  - **Đối chiếu giữa API Kiểm kê Quản trị và API Đọc nghiệp vụ:**
+    - `GET /v1/admin/gateways` là danh mục kiểm kê toàn cầu độc lập với quyền sở hữu, chỉ dành cho Platform Admin (`platform_admins`). Trả về danh sách Gateway kèm phân trang keyset cursor (`limit`, `after`), không chứa thông tin vai trò hay bí mật.
+    - `GET /v1/gateways` là API đọc nghiệp vụ người dùng, chỉ trả về các trạm mà người dùng hiện tại có liên kết quyền trong `user_gateways` kèm vai trò (`role`). Một Platform Admin nếu chưa được gán quyền trong `user_gateways` cho trạm nào thì khi gọi `GET /v1/gateways` vẫn nhận mảng rỗng `{"items":[]}` (Admin không tự động bypass CSDL nghiệp vụ).
+  - **Phân định hai endpoint khởi tạo Sensor:**
+    - `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}` (tại tài liệu này) là thẩm quyền của Platform Admin, cho phép khởi tạo Sensor trên bất kỳ Gateway nào mà không phụ thuộc vào `user_gateways`.
+    - `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}` (tại [Tài liệu 04](04_REST_API_CLIENT_CONTRACT.md)) là thẩm quyền của Gateway `owner` trên trạm được giao quyền; Platform Admin không thể gọi endpoint owner này nếu không có vai trò `owner` trong `user_gateways`.
 - **Không sáng tác endpoint tự kiểm tra quyền Admin (No Admin Self-Query Endpoint):** Go backend hiện tại không cung cấp endpoint kiểu `/v1/admin/me` hay `/v1/admin/whoami`. Phía client không được sáng tác hoặc gọi các endpoint giả định này.
 - **Không có API CRUD người dùng hoặc quản lý thành viên qua Go Backend:** Việc tạo tài khoản người dùng và gán phân quyền thành viên `user_gateways` hiện vẫn được thực thi thông qua công cụ quản trị hạ tầng của Supabase Auth (Admin API / Studio) và script nội bộ an toàn (xem [Tài liệu 03](03_USER_GATEWAY_AUTHORIZATION.md)). Khóa hạ tầng đặc quyền `service_role` tuyệt đối không bao giờ được cấu hình hay chia sẻ cho client.
 - **Trạng thái cấu hình Root Docker Compose: Tính năng Credential API mặc định TẮT:**
@@ -52,7 +66,7 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
 
 ## 2. Thứ tự Ưu tiên Ủy quyền và Xử lý Lỗi Toàn cục (Authorization Precedence & Global Error Handling)
 
-Mọi request gửi tới 6 endpoint quản trị đều phải trải qua chuỗi middleware bảo mật nghiêm ngặt theo đúng thứ tự ưu tiên sau:
+Mọi request gửi tới các endpoint quản trị đều phải trải qua chuỗi middleware bảo mật nghiêm ngặt theo đúng thứ tự ưu tiên sau:
 
 ```text
 [HTTP Request]
@@ -60,7 +74,8 @@ Mọi request gửi tới 6 endpoint quản trị đều phải trải qua chu�
        v
 1. Request ID & Cache Gate Middleware
    - Sinh hoặc xác thực X-Request-ID (1..128 ký tự an toàn)
-   - Route credential tự động gán: Cache-Control: no-store, Pragma: no-cache
+   - Tuyến đường admin inventory (GET /v1/admin/gateways) và credential gán: Cache-Control: no-store, Pragma: no-cache
+   - Tuyến đường provisioning (PUT) gán: Cache-Control: no-store
        |
        v
 2. Authentication Middleware (/v1/*)
@@ -76,7 +91,7 @@ Mọi request gửi tới 6 endpoint quản trị đều phải trải qua chu�
    -> Không tồn tại trong platform_admins: HTTP 403 Forbidden (code: "forbidden", message: "insufficient permissions")
        |
        v
-4. Endpoint Feature Gate & Startup Barrier (Dành riêng cho 4 route Credential)
+4. Endpoint Feature Gate & Startup Barrier (Dành riêng cho nhóm route Credential)
    - Kiểm tra cờ cấu hình CredentialAPIEnabled:
      -> Nếu false: HTTP 503 Service Unavailable (code: "credential_runtime_disabled")
    - Kiểm tra rào chắn khởi động CredentialStartupReadiness.Ready():
@@ -85,7 +100,7 @@ Mọi request gửi tới 6 endpoint quản trị đều phải trải qua chu�
        v
 5. Request Parser & Input Validation
    - Kiểm tra Query Parameters, Content-Type, Kích thước Body, Cú pháp JSON khắt khe
-   -> Vi phạm: HTTP 400 Bad Request, HTTP 413 Payload Too Large, hoặc HTTP 415 Unsupported Media Type
+   -> Vi phạm: HTTP 400 Bad Request, HTTP 413 Payload/Request Too Large, hoặc HTTP 415 Unsupported Media Type
        |
        v
 6. Transactional Business Logic & Database Invariant Verification
@@ -116,16 +131,102 @@ X-Request-ID: 00000000-0000-0000-0000-000000000001
 
 ---
 
-## 3. Chi tiết 02 Endpoint Quản trị Khởi tạo Gateway và Sensor (Provisioning APIs)
+## 3. Chi tiết Các Endpoint Quản trị Danh mục và Khởi tạo Gateway/Sensor (Admin Inventory & Provisioning APIs)
 
-Cả hai endpoint khởi tạo này đều áp dụng phương thức `PUT`, cho phép tạo mới hoặc thực hiện lại yêu cầu (retry lũy quyền - idempotent) một cách an toàn.
+### 3.1 Danh mục Kiểm kê Gateway Toàn hệ thống: `GET /v1/admin/gateways`
 
-### 3.1 Quy chuẩn Phân tích Cú pháp Nghiêm ngặt (Strict Parser Rules)
+Endpoint này cho phép Platform Admin truy vấn danh mục toàn bộ các trạm Gateway hiện có trong hệ thống, độc lập hoàn toàn với việc Admin có được phân quyền thành viên trong `user_gateways` hay không.
+
+- **HTTP Method:** `GET`
+- **Đường dẫn:** `/v1/admin/gateways`
+- **Yêu cầu xác thực & Thẩm quyền:**
+  - Bearer JWT của người dùng đã xác thực (`role == "authenticated"`).
+  - Bắt buộc phải có quyền Platform Admin trong bảng `public.platform_admins`.
+  - Không yêu cầu tư cách thành viên trong `user_gateways`.
+- **Query Parameters (Hỗ trợ phân trang keyset cursor):**
+  - `limit` (tùy chọn, integer): Số lượng Gateway tối đa trong một trang.
+    - Giá trị mặc định: `100` (được cấu hình qua biến môi trường `ADMIN_INVENTORY_DEFAULT_LIMIT`, dải hợp lệ 1..1000 theo `src/internal/config/config.go`).
+    - Giá trị tối đa: `200` (được cấu hình qua biến môi trường `ADMIN_INVENTORY_MAX_LIMIT`, dải hợp lệ 1..1000 và bắt buộc $\ge$ default limit).
+    - Dải hợp lệ trên môi trường mặc định: `1` đến `200` (dải này co giãn theo giá trị cấu hình server thực tế, không phải hằng số cứng bất biến).
+    - Bộ phân tích cú pháp (`listAdminGateways`) chỉ chấp nhận chuỗi chứa toàn bộ chữ số nguyên dương `[0-9]+`. Nếu truyền số âm, chữ cái, chuỗi rỗng (`limit=`), hoặc vượt quá giá trị max limit cấu hình -> nhận ngay **`400 Bad Request`** (`code: "invalid_request"`).
+  - `after` (tùy chọn, string): Con trỏ phân trang, là `gateway_id` của bản ghi cuối cùng của trang trước. Phải thỏa mãn biểu thức regex của Gateway ID (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, khác `backend_service`). Nếu truyền `after=` rỗng hoặc sai regex -> nhận **`400 Bad Request`** (`code: "invalid_request"`).
+  - **Quy tắc Query nghiêm ngặt:**
+    - Cấm tuyệt đối tham số lạ: Bất kỳ query parameter nào ngoài `limit` và `after` đều bị từ chối với **`400 Bad Request`** (`code: "invalid_request"`).
+    - Cấm tham số trùng lặp (ví dụ `?limit=50&limit=100` hoặc `?after=gw1&after=gw2`) -> **`400 Bad Request`**.
+    - Cấm dấu chấm phẩy `;` trong query string -> **`400 Bad Request`**.
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+  - `Accept: application/json` (khuyến nghị)
+  - `X-Request-ID: <id>` (khuyến nghị)
+- **Response Headers:**
+  ```http
+  HTTP/1.1 200 OK
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+  Pragma: no-cache
+  X-Request-ID: 00000000-0000-0000-0000-000000000005
+  ```
+
+#### Cấu trúc Response Body (JSON):
+
+- **Trường hợp có dữ liệu (Populated Response):**
+  ```json
+  {
+    "items": [
+      {
+        "gateway_id": "gw-station-alpha",
+        "name": "AM5728 Gateway 001",
+        "description": "Tram quan trac nha kinh so 1",
+        "created_at": "2026-10-14T08:00:00Z"
+      },
+      {
+        "gateway_id": "gw-station-beta",
+        "name": "ESP32 Gateway 002",
+        "description": null,
+        "created_at": "2026-10-14T08:15:00Z"
+      }
+    ],
+    "next_cursor": "gw-station-beta"
+  }
+  ```
+
+- **Trường hợp danh mục rỗng hoặc trang cuối cùng (Empty / End-of-List Response):**
+  ```json
+  {
+    "items": [],
+    "next_cursor": null
+  }
+  ```
+
+#### Quy tắc dữ liệu (DTO Specification):
+1. **`items` (mảng đối tượng):** Luôn là một mảng JSON, không bao giờ `null`. Mỗi phần tử bao gồm:
+   - `gateway_id` (string): Khóa định danh của Gateway.
+   - `name` (string): Tên hiển thị nguyên bản của Gateway.
+   - `description` (string | null): Mô tả Gateway, có thể là chuỗi hoặc `null`.
+   - `created_at` (string | null): Mốc thời gian tạo bản ghi định dạng RFC3339 UTC kết thúc bằng `Z`, hoặc `null`.
+   - **Ranh giới bảo mật thông tin:** DTO này **KHÔNG BAO GỒM** vai trò người dùng (`role`), **KHÔNG BAO GỒM** thông tin chủ sở hữu (`owner_user_id`), và **TUYỆT ĐỐI KHÔNG TIẾT LỘ** bất kỳ bí mật xác thực hay mật khẩu MQTT nào.
+2. **`next_cursor` (string | null):** Chuỗi `gateway_id` của phần tử cuối cùng trong trang hiện tại nếu còn dữ liệu tiếp theo trong cơ sở dữ liệu. Mang giá trị `null` khi đã duyệt hết trang cuối cùng. Client truyền giá trị này vào query `?after=<next_cursor>` để tải trang kế tiếp.
+3. **Không sáng tác các trường không có trong code:** DTO phản hồi **KHÔNG CÓ** trường `total`, **KHÔNG CÓ** trường `count`, **KHÔNG CÓ** `page`, `page_size`. Phân trang thuần túy dựa trên keyset cursor.
+4. **Thứ tự sắp xếp (Sorting):** Danh sách được sắp xếp tăng dần theo mã `gateway_id` theo bảng mã ASCII trong SQL (`ORDER BY gateway_id COLLATE "C" ASC`).
+
+#### Bảng mã trạng thái HTTP của `GET /v1/admin/gateways`:
+
+| HTTP Status | Error `code` | Error `message` | Tình huống kích hoạt |
+|---|---|---|---|
+| **400 Bad Request** | `invalid_request` | `invalid request` | Tham số query lạ, trùng lặp tham số, chứa dấu `;`, `limit` không phải chữ số, `limit` ngoài dải hợp lệ [1..max_limit] (mặc định [1..200]), hoặc con trỏ `after` sai regex. |
+| **401 Unauthorized** | `unauthorized` | `authentication required` | Thiếu hoặc sai token JWT. |
+| **403 Forbidden** | `forbidden` | `insufficient permissions` *(middleware)* hoặc `access denied` *(service)* | Người dùng đã xác thực nhưng không có quyền trong `public.platform_admins`. |
+| **500 Internal Server Error** | `internal_error` | `internal server error` | Lỗi truy vấn hoặc scan dữ liệu SQL không lường trước. |
+| **503 Service Unavailable** | `service_unavailable` | `service unavailable` | Quá thời hạn kiểm tra quyền admin hoặc gián đoạn kết nối CSDL PostgreSQL. |
+
+---
+
+### 3.2 Quy chuẩn Phân tích Cú pháp Nghiêm ngặt của Nhóm Khởi tạo (Strict Parser Rules)
 
 Theo hiện thực tại `src/internal/httpserver/provisioning_request.go`:
 1. **Cấm tuyệt đối Query Parameters:** Mọi URL chứa query string (kể cả dấu hỏi chấm rỗng `?`) đều lập tức nhận mã lỗi HTTP `400 Bad Request` (`code: "invalid_request"`).
 2. **Kiểm tra Media Type (`Content-Type`):** Bắt buộc phải là `application/json`. Tham số duy nhất được phép đi kèm là `charset=utf-8` (không phân biệt hoa thường). Bất kỳ media type hoặc tham số nào khác đều trả về HTTP `415 Unsupported Media Type` (`code: "unsupported_media_type"`).
-3. **Giới hạn kích thước Body (`ADMIN_MAX_BODY_BYTES`):** Giới hạn tối đa được cấu hình trên server (mặc định 16384 bytes = 16 KiB; dải hợp lệ 1..1048576 bytes = 1 MiB). Nếu body vượt quá giới hạn, server trả về HTTP `413 Payload Too Large` (`code: "payload_too_large"`).
+3. **Giới hạn kích thước Body (`ADMIN_MAX_BODY_BYTES`):** Giới hạn tối đa được cấu hình trên server (mặc định 16384 bytes = 16 KiB; dải hợp lệ 1..1048576 bytes = 1 MiB theo `src/internal/config/config.go`, không phải hằng số cứng bất biến). Nếu body vượt quá giới hạn, server trả về HTTP `413 Request Entity Too Large` (`code: "payload_too_large"`, `message: "payload too large"`).
 4. **Cú pháp JSON nghiêm ngặt:**
    - Chỉ chấp nhận duy nhất một đối tượng JSON `{ ... }`.
    - **Cấm trường lạ (unknown fields):** Bất kỳ trường nào ngoài danh sách cho phép đều bị từ chối với HTTP `400 Bad Request`.
@@ -135,7 +236,7 @@ Theo hiện thực tại `src/internal/httpserver/provisioning_request.go`:
 
 ---
 
-### 3.2 Khởi tạo Trạm Gateway: `PUT /v1/admin/gateways/{gateway_id}`
+### 3.3 Khởi tạo Trạm Gateway: `PUT /v1/admin/gateways/{gateway_id}`
 
 Khởi tạo thực thể Gateway mới, gán người sở hữu ban đầu, và tự động khởi tạo thực thể Digital Twin trong một giao dịch cơ sở dữ liệu nguyên tử (`READ COMMITTED`).
 
@@ -189,15 +290,15 @@ Accept: application/json
 - **HTTP 400 Bad Request (`code: "invalid_request"`):** Vi phạm định dạng `gateway_id` (chứa ký tự lạ, quá 64 bytes, hoặc là `backend_service`), `name` rỗng, vượt quá giới hạn độ dài bytes, `owner_user_id` không phải UUID hợp lệ hoặc nil UUID, chứa trường lạ, hoặc chứa URL query.
 - **HTTP 404 Not Found (`code: "not_found"`):** Không tìm thấy `owner_user_id` trong bảng `public.profiles`.
 - **HTTP 409 Conflict (`code: "conflict"`):** Gateway đã tồn tại nhưng request PUT mới có thông tin thay đổi (thay đổi `name`, `description`, hoặc cố tình thay đổi `owner_user_id`). API PUT này là cơ chế khởi tạo và retry lũy quyền, không hỗ trợ đổi chủ sở hữu hoặc cập nhật metadata khác biệt.
-- **HTTP 413 Payload Too Large (`code: "payload_too_large"`):** Kích thước body vượt quá `ADMIN_MAX_BODY_BYTES`.
-- **HTTP 415 Unsupported Media Type (`code: "unsupported_media_type"`):** `Content-Type` không phải `application/json`.
+- **HTTP 413 Request Entity Too Large (`code: "payload_too_large"`, `message: "payload too large"`):** Kích thước body vượt quá giới hạn cấu hình `ADMIN_MAX_BODY_BYTES`.
+- **HTTP 415 Unsupported Media Type (`code: "unsupported_media_type"`, `message: "unsupported media type"`):** `Content-Type` không phải `application/json` (cho phép `charset=utf-8`).
 - **HTTP 503 Service Unavailable (`code: "service_unavailable"`):** Gián đoạn kết nối database khi kiểm tra quyền Platform Admin trong giao dịch hoặc timeout.
 
 ---
 
-### 3.3 Khởi tạo Sensor: `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`
+### 3.4 Khởi tạo Sensor bởi Platform Admin: `PUT /v1/admin/gateways/{gateway_id}/sensors/{sensor_id}`
 
-Khởi tạo thực thể Sensor mới trực thuộc Gateway cha, tự động khởi tạo thực thể Digital Twin (`twin_entities`, `twin_states`) và thiết lập mối quan hệ phân cấp `twin_relationships` (`hasSensor`) trong cùng một giao dịch.
+Khởi tạo thực thể Sensor mới trực thuộc Gateway cha bởi Platform Admin, tự động khởi tạo thực thể Digital Twin (`twin_entities`, `twin_states`) và thiết lập mối quan hệ phân cấp `twin_relationships` (`hasSensor`) trong cùng một giao dịch.
 
 #### A. Tham số Đường dẫn (Path Parameters)
 - `gateway_id` (string, bắt buộc): Định danh của Gateway cha. Phải tuân thủ biểu thức regex và **bắt buộc phải tồn tại từ trước**.
@@ -250,28 +351,28 @@ Accept: application/json
 - **HTTP 400 Bad Request (`code: "invalid_request"`):** Vi phạm định dạng `gateway_id` hoặc `sensor_id`, `name` rỗng, vượt quá giới hạn bytes, chứa trường lạ (như `sensor_type`), chứa duplicate keys, hoặc có query string.
 - **HTTP 404 Not Found (`code: "not_found"`):** Gateway cha `gateway_id` không tồn tại trong cơ sở dữ liệu.
 - **HTTP 409 Conflict (`code: "conflict"`):** Sensor đã tồn tại nhưng payload PUT mới có thông tin khác biệt (`name` hoặc `unit` bị sửa đổi).
-- **HTTP 413 Payload Too Large / HTTP 415 Unsupported Media Type:** Vi phạm kích thước body hoặc media type.
+- **HTTP 413 Request Entity Too Large (`code: "payload_too_large"`, `message: "payload too large"`):** Kích thước body vượt quá giới hạn cấu hình `ADMIN_MAX_BODY_BYTES`.
+- **HTTP 415 Unsupported Media Type (`code: "unsupported_media_type"`, `message: "unsupported media type"`):** Header `Content-Type` bị thiếu hoặc khác `application/json` (cho phép `charset=utf-8`).
 - **HTTP 503 Service Unavailable (`code: "service_unavailable"`):** Gián đoạn kết nối database khi kiểm tra quyền trong giao dịch.
 
 ---
 
-## 4. Chi tiết 04 Endpoint Quản trị Thông tin Xác thực MQTT (MQTT Credential APIs)
+## 4. Chi tiết Các Endpoint Quản trị Thông tin Xác thực MQTT (MQTT Credential APIs)
 
-Nhóm endpoint này kiểm soát vòng đời thông tin xác thực trên Mosquitto Dynamic Security (DynSec) và quản lý cổng Ingress Gate của broker.
+Nhóm endpoint này kiểm soát vòng đời thông tin xác thực trên Mosquitto Dynamic Security (DynSec) theo kiến trúc nhật ký đơn chuyến (single-flight journal engine) với khóa đồng thời PostgreSQL session advisory lock (`0x494f545f43524544`).
 
 ### 4.1 Quy chuẩn Bắt buộc đối với Request Quản trị Credential
 
-Căn cứ hiện thực tại `src/internal/httpserver/admin_mqtt_credential_request.go`:
-1. **Cấm hoàn toàn Request Body (BodyNone):**
-   - Cả 4 phương thức `GET`, `POST`, `POST /rotate`, và `DELETE` **bắt buộc phải có body rỗng (`len(body) == 0`)**.
-   - Nếu Client gửi kèm bất kỳ nội dung nào trong body (dù chỉ là chuỗi rỗng có độ dài > 0), server sẽ lập tức từ chối với mã lỗi HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`).
-   - Nếu kích thước body gửi lên vượt quá giới hạn đọc tối đa (`limit`), server trả về HTTP `413 Request Entity Too Large` (`code: "request_too_large"`, `message: "request body too large"`).
-   - *Lưu ý về Content-Type và HTTP 415:* Do các endpoint Credential yêu cầu body rỗng hoàn toàn, parser không đọc `Content-Type`. Mã lỗi HTTP `415 Unsupported Media Type` **chỉ áp dụng riêng cho 2 endpoint Provisioning PUT**, tuyệt đối không phát sinh trên các endpoint Credential.
+Căn cứ hiện thực tại `src/internal/httpserver/admin_mqtt_credential_request.go` và `admin_mqtt_credential_handlers.go`:
+1. **Yêu cầu Body đối với từng Endpoint:**
+   - Các phương thức `GET`, `POST` (provision), `POST /rotate`, và `DELETE` (revoke) **bắt buộc phải có body rỗng (`len(body) == 0`)**. Nếu gửi kèm bất kỳ nội dung nào trong body, server sẽ từ chối ngay với mã lỗi HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`). Nếu kích thước vượt quá giới hạn đọc (`limit` được cấu hình bởi `ADMIN_MAX_BODY_BYTES`, mặc định 16384 bytes = 16 KiB), server trả về HTTP `413 Request Entity Too Large` (`code: "request_too_large"`, `message: "request body too large"`).
+   - **Ngoại lệ Reset (`POST /reset`):** Bắt buộc phải có body JSON mang trường `reason` (xem [Mục 4.7](#47-ngoại-lệ-đặt-lại-credential-có-giám-sát-post-v1admingatewaysgateway_idmqtt-credentialreset)) và header `Content-Type: application/json`.
+   - *Lưu ý về Content-Type và HTTP 415:* Các endpoint Credential yêu cầu body rỗng không kiểm tra `Content-Type`. Mã lỗi HTTP `415 Unsupported Media Type` chỉ áp dụng cho endpoint `POST /reset` và 2 endpoint Provisioning PUT.
 2. **Cấm hoàn toàn Query Parameters:**
    - URL tuyệt đối không được chứa query string hoặc ký tự `?` (cả `RawQuery != ""` và `ForceQuery`). Vi phạm sẽ nhận HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`).
 3. **Bắt buộc Header `Idempotency-Key` đối với các thao tác biến đổi trạng thái (Mutations):**
-   - Áp dụng cho: `POST` (provision), `POST /rotate`, và `DELETE` (revoke).
-   - **Quy chuẩn UUID:** Parser sử dụng `uuid.Parse(values[0])` và kiểm tra `key != uuid.Nil`. Yêu cầu đúng **một header `Idempotency-Key` chứa giá trị UUID hợp lệ khác nil UUID** (server không hạn chế riêng version 4, tuy nhiên khuyến nghị client sinh UUIDv4 hoặc UUIDv7 ngẫu nhiên, ví dụ: `Idempotency-Key: c4b1e6e0-2495-4e3a-97a6-6f8d38e21a41`).
+   - Áp dụng cho: `POST` (provision), `POST /rotate`, `DELETE` (revoke), và `POST /reset`.
+   - **Quy chuẩn UUID:** Parser sử dụng `uuid.Parse(values[0])` và kiểm tra `key != uuid.Nil`. Yêu cầu đúng **một header `Idempotency-Key` chứa giá trị UUID hợp lệ khác nil UUID** (khuyến nghị client sinh UUIDv4 hoặc UUIDv7 ngẫu nhiên, ví dụ: `Idempotency-Key: c4b1e6e0-2495-4e3a-97a6-6f8d38e21a41`).
    - Nếu thiếu header này, gửi nhiều hơn một header, hoặc UUID không hợp lệ/nil UUID -> Server trả về HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`).
    - Đối với phương thức `GET` (truy vấn metadata): Header `Idempotency-Key` không bắt buộc và sẽ bị bỏ qua nếu có.
 4. **Header điều khiển bộ nhớ đệm (Cache-Control):**
@@ -298,15 +399,19 @@ Căn cứ hiện thực tại `src/internal/httpserver/admin_mqtt_credential_req
        - Nếu thao tác trước đó vẫn đang xử lý (`pending`): Server trả về mã lỗi HTTP `409 Conflict` (`code: "operation_in_progress"`).
        - Nếu thao tác trước đó đang ở trạng thái cần phục hồi (`recovery_needed`): Server trả về mã lỗi HTTP `503 Service Unavailable` (`code: "credential_recovery_required"`).
        - Nếu thao tác trước đó đã thất bại (`failed`): Hàm `writeCredentialMutation` ánh xạ sang phản hồi lỗi (mã HTTP 500 hoặc mã lỗi cụ thể từ `ErrorCode`) với thông báo `"credential request failed"`, **tuyệt đối không trả về mã 200/201 thành công**.
-       - Nếu thao tác trước đó đã hoàn tất thành công (`succeeded`): Server phản hồi bản ghi **metadata-only** với HTTP 201 (đối với provision) hoặc HTTP 200 (đối với rotate/revoke); trường `secret_returned` mang giá trị `false`, tuyệt đối không có trường `password`, trường `replayed_status` mang giá trị `"succeeded"`, và trường `next_action` hướng dẫn bước thao tác tiếp theo.
+       - Nếu thao tác trước đó đã hoàn tất thành công (`succeeded`): Server phản hồi bản ghi **metadata-only** với HTTP 201 (đối với provision) hoặc HTTP 200 (đối với rotate/revoke); trường `secret_returned` mang giá trị `false`, trường `password` **bị lược bỏ hoàn toàn khỏi JSON** (omitted, không phải `password: null`), trường `replayed_status` mang giá trị `"succeeded"`, và trường `next_action` hướng dẫn bước thao tác tiếp theo.
      - *Lưu ý về bằng chứng runtime:* Cờ bằng chứng `snapshot_observed` ghi nhận việc tệp snapshot native đã được quan sát, **không phải là bằng chứng fsync hay bằng chứng chống mất điện (power-loss proof)**.
-3. **Quy trình Khôi phục khi Mất Mát Phản hồi trên Mạng (Lost Secret Recovery - Kịch bản E22):**
+3. **Quy trình Khôi phục khi Mất Mát Phản hồi trên Mạng (Lost Secret Recovery) và Cảnh báo Bất định:**
    - Trường hợp Client gửi request thành công, cơ sở dữ liệu đã commit giao dịch, Mosquitto đã nạp mật khẩu mới, nhưng phản hồi HTTP bị đứt gãy trên đường truyền (network drop / client crash) khiến Admin không nhận được mật khẩu:
      - **Không thể lấy lại mật khẩu cũ:** Gửi lại request với `Idempotency-Key` cũ chỉ nhận về bản ghi metadata (`secret_returned: false`), không bao giờ nhận lại mật khẩu.
      - **Biện pháp khôi phục chuẩn:**
+       - Kiểm tra lại trạng thái hiện tại bằng lệnh `GET /v1/admin/gateways/{gateway_id}/mqtt-credential` để xem `credential_version`, `status` và `last_operation_id`.
        - Nếu trạng thái hiện tại là `active`: Kiểm tra xác thực quyền và thực hiện gọi endpoint xoay vòng mật khẩu (`POST /rotate`) với một **`Idempotency-Key` mới** để cấp phát một cặp mật khẩu mới thay thế.
-       - Nếu trạng thái hiện tại là `revoked`: Chỉ thực hiện cấp mới (`POST`) với một **`Idempotency-Key` mới** sau khi các tiến trình đối soát (reconciliation) và rào chắn bảo dưỡng (maintenance fences) đã được giải quyết sạch sẽ.
-       - *Cảnh báo rào chắn kiểm toán:* Trường hợp `status == "active"` trong metadata đơn thuần **chưa chứng minh tất cả các checkpoint chưa hoàn tất đã sạch**. Nếu vừa xảy ra tình huống bất định trong commit hoặc hoàn tất (finalization ambiguity), Platform Admin tuyệt đối không được blind-rotate mù quáng; phải kiểm tra kỹ trạng thái kiểm toán và đảm bảo runtime không ở trạng thái recovery trước khi xoay vòng.
+       - Nếu trạng thái hiện tại là `revoked`: Chỉ thực hiện cấp mới (`POST`) với một **`Idempotency-Key` mới** sau khi các tiến trình đối soát (reconciliation) đã được giải quyết sạch sẽ.
+       - **CẢNH BÁO BẢO MẬT & VẬN HÀNH (Operational Warning):**
+         * Trường hợp `status == "active"` trong metadata đơn thuần **chưa chứng minh tất cả các checkpoint chưa hoàn tất đã sạch**. Nếu vừa xảy ra tình huống bất định trong commit hoặc hoàn tất (finalization ambiguity), Platform Admin **tuyệt đối không được blind-rotate mù quáng hoặc tự động thử lại vô hạn**.
+         * Mã lỗi `credential_runtime_busy` có thể phản ánh runtime đang bị khóa hoặc bị nghi ngờ (poisoned state do thao tác trước chưa giải phóng lock `0x494f545f43524544`), **không đơn thuần là tình trạng quá tải tạm thời**. Chỉ retry khi đã xác định an toàn theo tài liệu vận hành; khi cần thiết phải leo thang cho kỹ sư vận hành hạ tầng kiểm tra nhật ký CSDL.
+         * Tuyệt đối không tự động gọi vào endpoint `POST /reset` vì endpoint này đang bị khóa fail-closed 503 (`denyOnlyResetPrerequisite{}`).
 
 ---
 
@@ -323,7 +428,7 @@ Truy vấn thông tin kiểm toán và trạng thái kích hoạt thông tin xá
 | Trường | Kiểu dữ liệu | Ý nghĩa & Quy tắc JSON |
 |---|---|---|
 | `gateway_id` | string | Khóa định danh của Gateway. |
-| `username` | string | Tên đăng nhập MQTT của Gateway (thường trùng với `gateway_id`). |
+| `username` | string | Tên đăng nhập MQTT của Gateway (do Go backend thiết lập đồng nhất bằng chính `gateway_id` của trạm). |
 | `credential_version` | integer | Phiên bản credential hiện tại (tăng đơn điệu sau mỗi lần cấp mới/xoay vòng). |
 | `status` | string | Trạng thái nghiệp vụ: `"provisioning"`, `"active"`, `"rotating"`, `"revoking"`, `"revoked"`, `"failed"`, `"recovery_needed"`. |
 | `last_operation_id` | string (UUID) | Định danh của thao tác kiểm toán gần nhất trên CSDL. |
@@ -450,9 +555,9 @@ Trả về HTTP `200 OK` với DTO `MutationResult`, không có mật khẩu, `s
 
 ---
 
-### 4.6 Thu hồi Credential: `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`
+### 4.6 Vô hiệu hóa và Thu hồi Credential: `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`
 
-Thu hồi toàn bộ quyền truy cập MQTT của Gateway, vô hiệu hóa tài khoản trên DynSec và ngắt socket kết nối.
+Vô hiệu hóa và thu hồi (disable/revoke) toàn bộ quyền truy cập MQTT của Gateway, vô hiệu hóa tài khoản trên Mosquitto DynSec (`disabled=true`) và ngắt socket kết nối hiện hành. Thao tác này không có cơ chế tự động khôi phục bí mật (no automatic secret recovery); tuy nhiên, đây không phải là trạng thái khóa vĩnh viễn không thể khôi phục: khi Gateway đã ở trạng thái `revoked`, Platform Admin hoàn toàn có thể cấp mới credential (`POST /v1/admin/gateways/{gateway_id}/mqtt-credential`) bằng một `Idempotency-Key` mới độc lập.
 
 #### A. Tham số Request
 - Method: `DELETE`.
@@ -486,10 +591,85 @@ Server luôn trả về mã HTTP `200 OK` (không có mật khẩu) với cấu 
 *Lưu ý về Replay và No-op của Revoke:*
 - Nếu gọi lại `DELETE` với **cùng `Idempotency-Key`**: Trả về `200 OK` với `replayed_status: "succeeded"`.
 - Nếu gọi `DELETE` với một **`Idempotency-Key` mới** trên một Gateway đã bị thu hồi (`revoked`):
-  - Theo đúng hiện thực tại `postgres_operation.go`, CSDL nhận diện đây là thao tác không phát sinh mutation mới và trả về bản ghi no-op replay mang `OperationID: uuid.Nil` và `next_action: "provision_with_new_idempotency_key"`.
-  - Dịch vụ Go backend (`service.go`) **chủ động gọi hàm kiểm tra native trên broker runtime (`runtime.CheckRevoked(ctx, in.GatewayID)`)** để xác minh độc lập rằng Mosquitto DynSec thực sự không còn tài khoản client nào của Gateway này.
-  - Nếu xác minh thành công và metadata CSDL không bị thay đổi đồng thời: Server trả về `200 OK` với `operation_id: "00000000-0000-0000-0000-000000000000"`, `secret_returned: false`, `next_action: "provision_with_new_idempotency_key"`.
-  - Nếu kiểm tra native thất bại hoặc metadata không nhất quán: Server lập tức kích hoạt quy trình thoát an toàn (CloseDrain), đánh dấu trạng thái poisoned để phong tỏa runtime, và trả về mã lỗi HTTP `503 Service Unavailable` (`code: "credential_recovery_required"`, `message: "credential request failed"`).
+  - CSDL nhận diện đây là thao tác không phát sinh mutation mới và trả về bản ghi no-op replay mang `OperationID: uuid.Nil` và `next_action: "provision_with_new_idempotency_key"`.
+  - Dịch vụ Go backend (`service.go`) chủ động kiểm tra native trên broker runtime (`runtime.CheckRevoked(ctx, in.GatewayID)`) để xác minh Mosquitto DynSec thực sự không còn tài khoản client nào của Gateway này (`disabled=true` hoặc đã bị xóa).
+  - Nếu xác minh thành công: Server trả về `200 OK` với `operation_id: "00000000-0000-0000-0000-000000000000"`, `secret_returned: false`, `next_action: "provision_with_new_idempotency_key"`.
+  - Nếu kiểm tra native thất bại hoặc metadata không nhất quán: Server chuyển thao tác sang trạng thái cần phục hồi và trả về mã lỗi HTTP `503 Service Unavailable` (`code: "credential_recovery_required"`, `message: "credential request failed"`).
+
+---
+
+### 4.7 Ngoại lệ Đặt lại Credential Có giám sát: `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/reset`
+
+Tuyến đường này đã được định tuyến tại `src/internal/httpserver/admin_mqtt_credential_handlers.go`, tiếp nhận body JSON chỉ định lý do đặt lại (`reason`). Tuy nhiên, tại tầng composition runtime (`src/cmd/server/credential.go`), thành phần phụ thuộc được gắn kiểu `denyOnlyResetPrerequisite{}`.
+
+#### A. Tham số Request và Quy chuẩn Phân tích Cú pháp (`parseCredentialResetRequest`)
+- Method: `POST`
+- Đường dẫn: `/v1/admin/gateways/{gateway_id}/mqtt-credential/reset`
+- Ràng buộc tham số và headers:
+  - `gateway_id` (string, bắt buộc): Phải đúng regex gateway ID (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`), không được là `backend_service`. Tuyệt đối không chứa query string hoặc ký tự `?` (`r.URL.RawQuery != ""` hoặc `r.URL.ForceQuery`). Nếu sai -> HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`).
+  - `Authorization: Bearer <token>`: Bắt buộc xác thực hợp lệ với claim `role == "authenticated"`. Nếu thiếu hoặc sai token -> HTTP `401 Unauthorized` (`code: "unauthorized"`, `message: "authentication required"`).
+  - Phân quyền Admin: Người dùng bắt buộc phải tồn tại trong bảng `public.platform_admins`. Nếu là người dùng thường -> HTTP `403 Forbidden` (`code: "forbidden"`, `message: "insufficient permissions"`).
+  - `Idempotency-Key: <unique_non_nil_uuid>`: Bắt buộc đúng 1 header chứa chuỗi UUID hợp lệ khác nil UUID (phân tích qua `uuid.Parse(values[0])`). Nếu thiếu, trùng lặp header, hoặc UUID không hợp lệ/nil -> HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`).
+  - `Content-Type`: Bắt buộc là `application/json` (tùy chọn tham số `charset=utf-8` không phân biệt hoa thường). Bất kỳ media type hoặc tham số nào khác -> HTTP `415 Unsupported Media Type` (`code: "unsupported_media_type"`, `message: "unsupported media type"`).
+  - Giới hạn body: Giới hạn bởi `ADMIN_MAX_BODY_BYTES` (mặc định 16384 bytes = 16 KiB). Nếu kích thước vượt quá giới hạn đọc -> HTTP `413 Request Entity Too Large` (`code: "request_too_large"`, `message: "request body too large"`).
+- Request Body (JSON bắt buộc, không được để trống `len(body) == 0`):
+  ```json
+  {
+    "reason": "recovery_after_unknown"
+  }
+  ```
+  hoặc:
+  ```json
+  {
+    "reason": "lost_secret_recovery"
+  }
+  ```
+- **Quy tắc phân tích cú pháp nghiêm ngặt:**
+  - Trường `reason` bắt buộc phải là một trong hai giá trị định trước: `"recovery_after_unknown"` hoặc `"lost_secret_recovery"`.
+  - Cấm tuyệt đối các trường lạ (bất kỳ trường nào ngoài `reason` đều bị từ chối), cấm giá trị `null`, cấm duplicate keys, cấm ký tự thừa sau dấu ngoặc nhọn kết thúc `}`. Vi phạm -> HTTP `400 Bad Request` (`code: "invalid_request"`, `message: "invalid request"`).
+
+#### B. Hành vi Phản hồi Runtime và Các Điều kiện Tiên quyết (Prerequisites & Fail-Closed Behavior)
+1. **Trường hợp Tính năng Credential bị Tắt (`MQTT_CREDENTIAL_API_ENABLED=false`):**
+   - Handler kiểm tra cờ `deps.CredentialAPIEnabled` trước khi kiểm tra tầng readiness/resetter.
+   - Nếu cờ này tắt, server phản hồi HTTP **`503 Service Unavailable`** với mã lỗi đặc thù:
+     ```json
+     {
+       "error": {
+         "code": "credential_runtime_disabled",
+         "message": "credential request failed",
+         "request_id": "<request_id>"
+       }
+     }
+     ```
+   - *Lưu ý quan trọng:* Không phải mọi request gọi vào endpoint reset đều trả về `service_unavailable`; nếu tính năng bị tắt thì mã lỗi trả về là `credential_runtime_disabled`.
+2. **Trường hợp Tính năng Credential được Bật nhưng Rào chắn Khởi động chưa Sẵn sàng:**
+   - Nếu `CredentialStartupReadiness.Ready() == false`, server phản hồi HTTP **`503 Service Unavailable`** (`code: "service_unavailable"`, `message: "credential request failed"`).
+3. **Trường hợp Vượt qua Parser nhưng Thành phần Phụ thuộc là `denyOnlyResetPrerequisite{}`:**
+   - Khi một request hợp lệ vượt qua toàn bộ tầng middleware (401, 403), cờ tính năng (bật), và request parser (400, 413, 415), thành phần `denyOnlyResetPrerequisite{}` tại tầng composition luôn chặn đứng việc thực thi và trả về lỗi:
+     ```http
+     HTTP/1.1 503 Service Unavailable
+     Content-Type: application/json; charset=utf-8
+     Cache-Control: no-store
+     Pragma: no-cache
+     X-Request-ID: 00000000-0000-0000-0000-000000000040
+     ```
+     ```json
+     {
+       "error": {
+         "code": "service_unavailable",
+         "message": "credential request failed",
+         "request_id": "00000000-0000-0000-0000-000000000040"
+       }
+     }
+     ```
+
+#### C. Tuyên bố Ranh giới An toàn Vận hành (Operational Safety Boundary):
+- **CHƯA PHẢI LÀ QUY TRÌNH PHỤC HỒI KHẢ DỤNG:** Trạng thái fail-closed HTTP 503 này là một rào chắn an toàn kỹ thuật nhằm ngăn ngừa rủi ro sai lệch dữ liệu trong Giai đoạn 2 (được ghi nhận theo ngoại lệ T07 hoãn lại tại `AGENTS.md`).
+- **Các thành phần chưa được hiện thực:**
+  - Chưa có cơ chế chứng minh đường truyền điều khiển đã hoàn toàn tĩnh lặng (proven control path quiescence).
+  - Chưa có hàng rào bảo vệ ngăn chặn việc ghi đè các mutation cũ chưa dứt điểm (stale mutation overwrites).
+  - Chưa kiểm chứng khôi phục bí mật thất lạc (lost secret recovery) trong điều kiện vận hành thực tế.
+- **Khuyến nghị Client/Admin:** Tuyệt đối không lập trình tự động thử lại (no automated retry loop) vào endpoint reset này. Mọi tình huống cần can thiệp phục hồi phải tuân thủ runbook vận hành hạ tầng có sự giám sát trực tiếp của kỹ sư hệ thống.
 
 ---
 
@@ -499,19 +679,20 @@ Theo hiện thực tại `writeCredentialError` (`src/internal/httpserver/admin_
 
 | Mã lỗi HTTP | Mã lỗi nghiệp vụ (`code`) | Thông báo lỗi (`message`) | Nguyên nhân kích hoạt trong hệ thống | Hướng xử lý phía Client / Administrator |
 |---|---|---|---|---|
-| **400 Bad Request** | `invalid_request` | `invalid request` *(parser)* hoặc `credential request failed` *(domain)* | Vi phạm cú pháp: Body không rỗng (`len(body) > 0`), URL chứa query string (`?`), `gateway_id` sai regex, hoặc thiếu/sai `Idempotency-Key`. | Kiểm tra lại request: xóa body, xóa query string, truyền đúng 1 UUID hợp lệ khác nil cho `Idempotency-Key`. |
+| **400 Bad Request** | `invalid_request` | `invalid request` *(parser)* hoặc `credential request failed` *(domain)* | Vi phạm cú pháp: Body không rỗng đối với GET/POST/DELETE thông thường, URL chứa query string (`?`), `gateway_id` sai regex, thiếu/sai `Idempotency-Key`, hoặc body reset sai trường `reason`. | Kiểm tra lại request: xóa body (hoặc gửi đúng body reason cho reset), xóa query string, truyền đúng 1 UUID hợp lệ khác nil cho `Idempotency-Key`. |
 | **401 Unauthorized** | `unauthorized` | `authentication required` | Thiếu token JWT, token hết hạn, sai chữ ký HS256, hoặc claim `role != "authenticated"`. | Đăng nhập lại qua Supabase Auth để lấy access token mới. |
 | **403 Forbidden** | `forbidden` | `insufficient permissions` *(middleware)* hoặc `credential request failed` *(domain)* | Người dùng đã xác thực nhưng `user_id` không tồn tại trong bảng `public.platform_admins`. | Chỉ Platform Admin mới có quyền thực thi. Quyền `owner` Gateway đơn thuần không cấp quyền admin. |
 | **404 Not Found** | `not_found` | `credential request failed` | Gateway không tồn tại trong bảng `public.gateways` hoặc chưa từng được cấp phát credential khi gọi GET. | Kiểm tra lại `gateway_id` hoặc gọi API khởi tạo Gateway trước. |
 | **409 Conflict** | `credential_conflict` | `credential request failed` | Xung đột trạng thái credential: Cố tình gọi `POST` (provision) khi đang `active`, hoặc gọi `POST /rotate` khi đang `revoked`/chưa cấp phát. | Kiểm tra lại trạng thái hiện tại qua `GET` để gọi đúng endpoint (xoay vòng hay cấp mới). |
 | **409 Conflict** | `operation_in_progress` | `credential request failed` | Tái sử dụng `Idempotency-Key` trong khi thao tác trước đó vẫn đang trong trạng thái xử lý (`pending`). | Chờ thao tác trước đó hoàn tất trước khi thử lại với cùng key. |
 | **409 Conflict** | `idempotency_conflict` | `credential request failed` | Tái sử dụng `Idempotency-Key` nhưng gửi khác Actor, khác `gateway_id`, hoặc khác Action (`provision` vs `rotate` vs `revoke`). | Mỗi thao tác hoặc tài nguyên khác nhau bắt buộc phải dùng một `Idempotency-Key` độc lập. |
-| **413 Request Entity Too Large** | `request_too_large` | `request body too large` | Kích thước body gửi lên vượt quá giới hạn đọc tối đa của server (khác với mã `payload_too_large` của Provisioning). | Đảm bảo body hoàn toàn rỗng đối với các API Credential. |
+| **413 Request Entity Too Large** | `request_too_large` | `request body too large` | Kích thước body gửi lên vượt quá giới hạn đọc tối đa của server. | Đảm bảo body rỗng (hoặc body reset tối giản) đối với các API Credential. |
+| **415 Unsupported Media Type** | `unsupported_media_type` | `unsupported media type` | Header `Content-Type` bị thiếu hoặc khác `application/json` trên endpoint tiếp nhận body (`POST /reset`). | Đính kèm `Content-Type: application/json` khi gửi request có body. |
 | **503 Service Unavailable** | `credential_runtime_disabled` | `credential request failed` | Cấu hình server đang tắt API Credential (`MQTT_CREDENTIAL_API_ENABLED=false`). | Cần rollout gate từ kỹ sư hạ tầng; client không thể tự bật qua cờ hay header HTTP. |
-| **503 Service Unavailable** | `service_unavailable` | `service unavailable` *(middleware/readiness)* hoặc `credential request failed` *(domain)* | Rào chắn khởi động chưa hoàn tất (`CredentialStartupReadiness.Ready() == false`) hoặc lỗi kết nối tra cứu admin CSDL. | Tạm dừng thao tác và thử lại sau ít phút khi dịch vụ hoàn tất chu trình khởi động. |
-| **503 Service Unavailable** | `credential_runtime_busy` | `credential request failed` | Hệ thống đang trong cửa sổ bảo dưỡng hoặc xử lý một thao tác credential khác (hạn mức tiếp nhận đồng thời bị chiếm dụng). | Áp dụng cơ chế Exponential Backoff kèm Jitter và thử lại sau. |
+| **503 Service Unavailable** | `service_unavailable` | `service unavailable` *(middleware/readiness)* hoặc `credential request failed` *(domain)* | Rào chắn khởi động chưa hoàn tất (`CredentialStartupReadiness.Ready() == false`), lỗi kết nối tra cứu admin CSDL, hoặc gọi vào `POST /reset` bị chặn an toàn bởi `denyOnlyResetPrerequisite{}`. | Tạm dừng thao tác; kiểm tra trạng thái khởi động dịch vụ hoặc tham chiếu runbook phục hồi có giám sát. |
+| **503 Service Unavailable** | `credential_runtime_busy` | `credential request failed` | Đang có thao tác credential khác nắm giữ khóa session advisory lock (`0x494f545f43524544`) hoặc runtime đang bận xử lý. Có thể phản ánh runtime bị nghi ngờ/khóa (poisoned state do thao tác trước chưa dứt điểm). | Áp dụng Exponential Backoff có giới hạn; nếu kéo dài cần kiểm tra nhật ký CSDL, không thử lại vô hạn. |
 | **503 Service Unavailable** | `credential_verification_unavailable` | `credential request failed` | Không thể kiểm chứng tính hợp lệ của credential mới trên broker Mosquitto. | Kiểm tra tình trạng hoạt động của Mosquitto broker native. |
-| **503 Service Unavailable** | `credential_recovery_required` | `credential request failed` | Hệ thống rơi vào trạng thái bất định sau sự cố mạng hoặc lỗi ghi snapshot native; Ingress Gate có thể bị đóng (`CLOSED`). | Đòi hỏi Platform Admin can thiệp xử lý phục hồi hệ thống (Recovery checkpoint). |
+| **503 Service Unavailable** | `credential_recovery_required` | `credential request failed` | Thao tác rơi vào trạng thái bất định hoặc CSDL ghi nhận trạng thái `recovery_needed` (ví dụ: phát hiện intent chưa hoàn tất khi backend khởi động lại). | Đòi hỏi Platform Admin can thiệp xử lý theo quy trình phục hồi có giám sát. |
 | **503 Service Unavailable** | `credential_finalization_pending` | `credential request failed` | Thao tác trên Mosquitto đã thực hiện nhưng giao dịch ghi nhận kết quả cuối cùng trên PostgreSQL chưa hoàn tất. | Kiểm tra lại trạng thái qua `GET` metadata trước khi thực hiện bước tiếp theo. |
 | **500 Internal Server Error** | `internal_error` | `credential request failed` | Lỗi nội bộ không xác định trong tiến trình Go backend. | Kiểm tra nhật ký hệ thống (log) của backend theo `request_id`. |
 
@@ -519,19 +700,23 @@ Theo hiện thực tại `writeCredentialError` (`src/internal/httpserver/admin_
 
 ## 6. Ảnh hưởng Tác vụ Vận hành tới Kết nối Mạng và Trạng thái Broker (Broker Runtime & Network Impacts)
 
-### 6.1 Ảnh hưởng Kết nối Mạng khi Xoay vòng và Cấp mới (Rotate / Provision)
-- **Cửa sổ bảo dưỡng toàn cục (Global Maintenance Window) và Khởi động lạnh (Cold Restart):**
-  - Khi thực thi xoay vòng hoặc cấp mới, phân hệ controller kích hoạt cửa sổ bảo dưỡng độc quyền, cập nhật cấu hình DynSec và thực hiện **khởi động lạnh có kiểm soát (Cold Restart)** tiến trình broker Mosquitto để đảm bảo tính bất biến của tệp snapshot lưu trữ.
-  - **Hiện tượng phía Client/Gateway:** Trong thời gian diễn ra thao tác, toàn bộ các Gateway khác (ví dụ: Gateway B) đang kết nối tới broker sẽ bị ngắt kết nối socket tạm thời và tự động kết nối lại (reconnect) ngay sau khi Ingress Gate chuyển sang trạng thái `OPEN`.
+### 6.1 Cơ chế Khóa Đồng thời và Trật tự Thực thi (Local Concurrency Control)
+- **PostgreSQL Session Advisory Lock (`0x494f545f43524544`):**
+  - Mọi thao tác biến đổi credential (`POST`, `POST /rotate`, `DELETE`, `POST /reset`) đều phải chiếm giữ khóa session advisory lock trên CSDL PostgreSQL trước khi thực thi lệnh native trên broker.
+  - Cơ chế này đảm bảo tại một thời điểm chỉ có duy nhất một tiến trình backend được phép thực hiện mutation trên broker (single active mutation owner per database).
+  - *Lưu ý về ranh giới:* Advisory lock cung cấp cơ chế loại trừ tương hỗ (mutual exclusion) cục bộ trong phạm vi Go backend, **không phải là distributed fencing hay chứng minh tĩnh lặng (quiescence) trên toàn bộ broker**.
 
-### 6.2 Ảnh hưởng Kết nối Mạng khi Thu hồi (Revoke)
-- **Thu hồi có mục tiêu (Targeted Revocation):**
-  - Khác với Rotate, thao tác Thu hồi (`DELETE`) sử dụng cơ chế DynSec Dynamic Revoke.
-  - Chỉ có kết nối socket của Gateway bị thu hồi (Gateway A) bị chấm dứt và từ chối xác thực vĩnh viễn. Các Gateway khác đang hoạt động bình thường (Gateway B) **vẫn giữ nguyên kết nối TCP socket gốc**, không bị ngắt quãng.
+### 6.2 Bảo vệ Khởi động lại Backend (`SimplifiedStartupClassifier`)
+- Khi tiến trình Go backend khởi động lại, thành phần `SimplifiedStartupClassifier` sẽ tự động rà quét các thao tác kiểm toán chưa kết thúc (ở các phase `intent`, `dynsec_mutation`, hoặc `snapshot_readback`) trong bảng `gateway_mqtt_credential_events`.
+- Các thao tác dở dang này được chuyển trạng thái an toàn sang `recovery_needed`.
+- Hệ thống **tuyệt đối KHÔNG tự ý tự động phát lại (no auto-replay)** các mutation chưa hoàn tất khi khởi động lại, nhằm bảo vệ tính toàn vẹn của broker.
 
-### 6.3 Trạng thái Bất định và Đóng Cổng Toàn cục (Uncertainty & Fail-Closed Gate)
-- Nếu xảy ra sự cố nghiêm trọng (mất điện, lỗi ghi đĩa snapshot, hoặc crash tiến trình giữa chừng), cổng Ingress Gate của Mosquitto sẽ lập tức chuyển sang chế độ **Đóng an toàn (Fail-Closed / `CLOSED`)**, từ chối mọi kết nối MQTT mới cho đến khi tiến trình phục hồi (`recovery`) được thực thi.
-- **Lưu ý đặc biệt về mã trạng thái:** 6 endpoint quản trị này **chỉ phản hồi các mã trạng thái HTTP 200, 201 hoặc 4xx/5xx; TUYỆT ĐỐI KHÔNG BAO GIỜ trả về mã HTTP `202 Accepted`**. Mã `202 Accepted` là mã dành riêng cho các lệnh điều khiển thiết bị (Downlink Commands) thuộc phân hệ Digital Twin trong các giai đoạn sau.
+### 6.3 Hạn chế Kỹ thuật Tồn đọng và Ranh giới Nghiệm thu (Technical Limitations & Backlog)
+Căn cứ tài liệu kỹ thuật chuẩn hóa [`docs/dynsec/limitations-and-backlog.md`](../dynsec/limitations-and-backlog.md):
+1. **Kiểm chứng đĩa sau khởi động lạnh (Cold Restart Acceptance - T10 & ROT2):** Kiểm chứng kiểm tra mật khẩu mới đã ghi bền vững xuống tệp cấu hình trên đĩa (`ROT2`) và kiểm chứng khởi động lạnh E2E cho broker Mosquitto hiện vẫn đang ở phạm vi hoãn lại (deferred).
+2. **Thời điểm bền bỉ đĩa DynSec (Persistence Timing):** Thời điểm plugin Mosquitto DynSec thực hiện flush/fsync dữ liệu xuống đĩa chưa được đo đạc trong mã nguồn, tiềm ẩn nguy cơ rollback cấu hình nếu broker gặp sự cố mất điện đột ngột trước khi ghi đĩa.
+3. **Thu hồi có mục tiêu (Targeted Revocation):** Thao tác `DELETE` ngắt kết nối session active của trạm bị thu hồi và từ chối kết nối mới của trạm đó, trong khi các session của Gateway khác vẫn duy trì kết nối TCP socket.
+4. **Mã phản hồi HTTP:** Nhóm endpoint quản trị chỉ phản hồi các mã HTTP 200, 201 hoặc 4xx/5xx; **tuyệt đối không bao giờ trả về mã HTTP `202 Accepted`**.
 
 ---
 
@@ -545,10 +730,10 @@ Theo hiện thực tại `writeCredentialError` (`src/internal/httpserver/admin_
 2. **Xử lý sự cố Timeout khi kết quả không rõ ràng (Handling Timeout / Unknown Outcome):**
    - Khi gọi một mutation (`POST`, `POST /rotate`, `DELETE`) mà gặp lỗi timeout kết nối mạng (Socket Timeout / Network Drop), **tuyệt đối không tự ý sinh một `Idempotency-Key` mới và gửi lại ngay lập tức**. Việc tự ý sinh key mới sẽ gây xung đột trạng thái (`409 Conflict`) hoặc dẫn tới rủi ro tạo ra các bản ghi mồ côi.
    - **Quy trình chuẩn:**
-     - Bước 1: Giữ nguyên `Idempotency-Key` vừa sử dụng và gọi lại request mutation đó. Nếu server đã xử lý xong trước đó, phản hồi replay sẽ trả về mã `200 OK` hoặc `201 Created` kèm metadata hiện tại (`secret_returned: false`).
+     - Bước 1: Giữ nguyên `Idempotency-Key` vừa sử dụng và gọi lại request mutation đó. Nếu server đã xử lý xong trước đó, phản hồi replay sẽ trả về mã `200 OK` hoặc `201 Created` kèm metadata hiện tại (`secret_returned: false`, trường password bị lược bỏ hoàn toàn).
      - Bước 2: Gọi `GET /v1/admin/gateways/{gateway_id}/mqtt-credential` để kiểm tra `credential_version`, `status` và `last_operation_id`.
      - Bước 3: Nếu xác định mật khẩu mới đã kích hoạt thành công trên server (`status == "active"`) nhưng Client bị mất phản hồi (không nhận được mật khẩu), tạo một `Idempotency-Key` mới và thực hiện lệnh `POST /rotate` để cấp mật khẩu mới có kiểm soát. Tuyệt đối không blind-rotate nếu metadata chưa rõ ràng hoặc CSDL còn checkpoint bảo dưỡng chưa hoàn tất.
 3. **Tuân thủ ranh giới đọc dữ liệu:**
    - Để hiển thị danh mục Gateway và Sensor cho người dùng thông thường trên bảng điều khiển Dashboard, luôn sử dụng các API đọc nghiệp vụ chuẩn đã được kiểm thử phân quyền chặt chẽ tại [Tài liệu 04](04_REST_API_CLIENT_CONTRACT.md) (`GET /v1/gateways` và `GET /v1/gateways/{gateway_id}/sensors`). Không sử dụng các API quản trị `/v1/admin/*` cho luồng người dùng cuối.
-4. **Tham chiếu trạng thái kiểm thử đầu-cuối:**
-   - Toàn bộ hành vi xử lý mất mát phản hồi mạng (`E22`), cô lập socket khi thu hồi (`E20`), và xoay vòng mật khẩu đã được kiểm chứng độc lập trên test harness cô lập tại `docs/backend/stage-2-task-2.7-acceptance.md` và hướng dẫn kiểm thử [Tài liệu 08](08_API_INTEGRATION_AND_STATE_HANDLING.md).
+4. **Tham chiếu tài liệu hạn chế kỹ thuật:**
+   - Chi tiết các giới hạn vận hành, tồn đọng và ma trận nghiệm thu được duy trì chuẩn hóa tại [`docs/dynsec/limitations-and-backlog.md`](../dynsec/limitations-and-backlog.md) và [`docs/dynsec/flows-and-api.md`](../dynsec/flows-and-api.md).
