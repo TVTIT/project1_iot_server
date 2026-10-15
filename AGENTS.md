@@ -1,5 +1,85 @@
 # AGENTS.md
 
+## 0. Delivery objective and quality policy (updated 2026-10-15)
+
+The primary objective is to deliver a complete, understandable IoT server with
+the MVP features in section 2 working correctly together. Prioritize useful
+functionality, correct business logic, and expected results under normal
+operating conditions. This is a solo university project, not a production
+reliability certification or a security research project.
+
+### 0.1 Operating assumptions
+
+The MVP targets one server deployment with one active Go backend, a Mosquitto
+broker, PostgreSQL/TimescaleDB, and self-hosted Supabase services. Assume valid
+configuration and certificates, trusted host administrators, writable persistent
+storage with available space, and traffic within the configured capacity.
+Document the workload used for the demonstration; do not claim unlimited scale.
+
+Normal-operation correctness includes rejecting invalid input and unauthorized
+requests, handling duplicate MQTT delivery, and responding predictably to an
+ordinary disconnect, timeout, or unavailable dependency. A clear error or
+documented supervised recovery may be sufficient; automatic recovery from every
+failure is not required. Never return success for a failed or uncertain action.
+
+### 0.2 Priority order
+
+1. Complete the currently requested end-to-end feature and its business rules.
+2. Verify its expected result and the relevant security/data-integrity checks.
+3. Integrate it with the existing server and client-facing API.
+4. Improve performance and resilience when a measurement or reproducible issue
+   demonstrates a need. Keep fixed bounds on queues, workers, connections, and
+   request sizes from the start.
+
+A feature is ready to hand over when its normal path works, representative
+negative cases pass, relevant existing regressions pass, and known limitations
+are recorded. It does not require exhaustive fault injection, a complete state
+space proof, independent review of every edit, or a particular coverage number.
+Apply the concrete checks in section 16, then continue to the next feature.
+
+### 0.3 Security and correctness that remain required
+
+- Verify JWTs, resource ownership/roles, and per-Gateway MQTT ACLs on the server.
+- Keep TLS verification, strong unique credentials, private media storage, and
+  protected administrative operations. Do not expose secrets in Git or logs.
+- Validate inputs and command allowlists; use parameterized SQL, bounded input
+  sizes, and object-path restrictions. Reject unauthorized writes without side
+  effects; do not trust a client-supplied identity or role.
+- Preserve transactional writes, telemetry deduplication, commit-before-ACK,
+  and the Digital Twin command outbox. Keep desired state distinct from reported
+  state and command publication distinct from confirmed device execution.
+
+Known defects that break the intended result, corrupt data during ordinary use,
+or allow common authentication/authorization bypasses are blockers. Fix them
+with a focused regression test. Do not classify these as acceptable limitations.
+
+### 0.4 Accepted limits and scope control
+
+Rare crash windows, abrupt power loss, disk/controller failures, hostile
+same-UID/root filesystem mutation, distributed failover, and exhaustive
+concurrency/fault combinations are not general MVP acceptance gates. Record
+relevant limitations and a practical recovery approach instead of building
+custom verification infrastructure for every hypothetical scenario.
+
+Prefer existing libraries and small integration tests. Do not introduce custom
+credential-store composers, cryptographic verifiers, filesystem race-proof
+frameworks, or large evidence/fixture systems solely to certify edge cases.
+Existing working helpers may remain; do not rewrite or remove them merely to
+reduce line count. Reuse them when they serve a current feature.
+
+Maintain one concise limitations/backlog list: limitation, user impact,
+workaround, and when it should be revisited. An unimplemented feature remains
+unimplemented; a test not run remains unverified. A documented limitation is
+not proof that a feature works.
+
+This policy governs new implementation and acceptance work. It supersedes older
+project-plan demands for exhaustive proof or review gates, including historical
+DynSec acceptance matrices, where they conflict with this bounded MVP policy.
+Preserve historical results and outstanding issues; do not relabel them PASS.
+Do not reopen completed work solely to satisfy an old proof matrix. Revisit it
+when a current feature depends on it, a relevant change invalidates a check, or
+a concrete defect is found. Explicit newer user requirements take precedence.
+
 ## 1. Project identity
 
 This repository contains the main implementation of a university IoT
@@ -15,7 +95,7 @@ The project is implemented by one student. This is the student's first large
 university project, and the student has limited experience with Go, Mosquitto,
 and MQTT. Prefer the smallest complete and explainable solution over
 microservices, premature optimization, or infrastructure that is not required
-by the MVP.
+by the MVP. Feature delivery and proportionate verification follow section 0.
 
 Schedule:
 
@@ -35,6 +115,10 @@ Historical progress snapshot supplied by the user on 2026-09-16:
 Treat this historical snapshot as initial planning context. It has been superseded by the subsequent Stage 2 implementation and the dated closeout status below.
 
 Stage 2 Bounded Closeout & Reconciliation Status (Dated 2026-10-14):
+
+This is a historical status record, not a new checklist to complete before any
+further feature work. Its unverified items remain unverified. Apply the current
+priority and verification policy in sections 0 and 16 when scheduling them.
 
 Due to schedule delays in this solo university project, the user explicitly directed closing Stage 2 under a pragmatic, bounded scope to advance to subsequent project stages. This bounded closeout represents a pragmatic development checkpoint recorded under user intent; it is NOT a full acceptance sign-off, has NOT received third-party or independent reviewer approval, and does NOT certify the system as production-ready.
 
@@ -56,9 +140,9 @@ Due to schedule delays in this solo university project, the user explicitly dire
 The following gaps are explicitly deferred and MUST NOT be treated as satisfied or silently deleted:
 - Group 1: Usable Supervised Reset & Recovery (T07). The reset route (`POST /v1/admin/gateways/{id}/mqtt-credential/reset`) remains wired to `denyOnlyResetPrerequisite{}`, which fails closed with HTTP 503 for all admissible reset requests. A usable supervised reset procedure—requiring proven control path quiescence, no stale mutation overwrites, intact audit retention in `gateway_mqtt_credential_events`, and CSPRNG-generated secret renewal without secret replay—remains unimplemented. Fail-closed or UNKNOWN status is an operational safety boundary, not recovery completion.
 - Group 2: Broker Persistence After Cold Restart & E2E Verification (T10 & ROT2). The exact persisted-new-password verifier on disk (`ROT2`) remains deferred. While `SimplifiedStartupClassifier` prevents auto-replay at the Go unit test level, native E2E cold-restart acceptance for Mosquitto is unverified: confirming that upon broker restart, rotated credentials authenticate, old passwords are rejected, revoked status (`disabled=true`) is preserved, and ACL structures remain intact. Furthermore, Mosquitto DynSec disk persistence timing is unverified in code, presenting cold-crash rollback risks without fsync/hardware durability guarantees. Session advisory lock provides local backend mutual exclusion, not distributed fencing or broker quiescence.
-- Group 3: Bounded Acceptance Closeout (T01–T12). In T01, telemetry ingestion through Go to TimescaleDB with an application-level DB-commit ACK published on `gateways/<id>/acks/#` remains unverified in the DynSec acceptance slice (MQTT QoS 1 ACK is not application persistence proof). In T02, observer session survival does NOT prove cross-gateway ACL rejection; protocol/receiver denial evidence remains incomplete. The backend principal (`bootstrap_backend`) lacks `commands/#`, `responses/#`, and `status` permissions, leaving Digital Twin downlink control unproven. Secret-isolation evidence (T08) is limited to the inspected implementation and existing tests, not a comprehensive certification of all Go/proxy logs, audit tables, or artifacts. Mutations require JSON bodies and reject query parameters. Remaining native failure-injection, lost-response, and journal/commit-ambiguity proofs must be tracked against the existing T01–T12 matrix, not an unbounded new matrix.
+- Group 3: Bounded Acceptance Closeout (T01–T12). In T01, telemetry ingestion through Go to TimescaleDB with an application-level DB-commit ACK published on `gateways/<id>/acks/#` remains unverified in the DynSec acceptance slice (MQTT QoS 1 ACK is not application persistence proof). In T02, observer session survival does NOT prove cross-gateway ACL rejection; protocol/receiver denial evidence remains incomplete. The backend principal (`bootstrap_backend`) lacks `commands/#`, `responses/#`, and `status` permissions, leaving Digital Twin downlink control unproven. Secret-isolation evidence (T08) is limited to the inspected implementation and existing tests, not a comprehensive certification of all Go/proxy logs, audit tables, or artifacts. Mutations require JSON bodies and reject query parameters. At this checkpoint, remaining native failure-injection, lost-response, and journal/commit-ambiguity proofs were tracked against the existing T01–T12 matrix. Under the updated policy in section 0, these remain recorded limitations rather than automatic gates for unrelated feature delivery.
 
-The broader MVP is not complete at this checkpoint: production deployment enforcement, full telemetry persistence/deduplication/DB-commit ACK acceptance, historical queries, authorized realtime delivery, private media integration, and Digital Twin desired-state/outbox/result reconciliation still require their own implementation or integration verification. Entity/URN creation in the sensor slice is not completion of the Digital Twin control module. Stage 2 plans contain historical and superseded scope statements; consult the current bounded CI plan and implementation evidence before reviving deferred legacy jobs. Advancing stages does not waive the mandatory MVP security and reliability requirements below.
+The broader MVP is not complete at this checkpoint: production deployment enforcement, full telemetry persistence/deduplication/DB-commit ACK acceptance, historical queries, authorized realtime delivery, private media integration, and Digital Twin desired-state/outbox/result reconciliation still require their own implementation or integration verification. Entity/URN creation in the sensor slice is not completion of the Digital Twin control module. Stage 2 plans contain historical and superseded scope statements; consult implementation evidence and the current policy in sections 0 and 16 before reviving deferred legacy jobs. Advancing stages does not waive the security and data-correctness baseline in section 0.3.
 
 3. Canonical Cross-References:
 - Detailed Stage 2 plan: `../docs/backend_plan/stage2_backend_detailed_plan.md`
@@ -127,7 +211,8 @@ Treat these as selected decisions, not alternatives to compare again:
 - Mosquitto as the MQTT broker.
 - PostgreSQL with the TimescaleDB extension.
 - Self-hosted Supabase Auth, Storage, Studio, and the Supabase API Gateway.
-- Flutter for a simple MVP client; prefer one platform, normally Android.
+- Flutter web for the MVP client; mobile applications are outside this thesis
+  scope. Keep APIs reusable for a possible later mobile client.
 - Nginx as the public HTTP reverse proxy.
 - Cloudflare Tunnel for public HTTP/HTTPS access.
 - Rathole reverse TCP tunneling for public MQTT TCP reachability when direct
@@ -555,12 +640,13 @@ centralized administrative model for both human users and Gateways:
 Mosquitto configuration must include:
 
 - `allow_anonymous false`.
-- A `password_file` managed by `mosquitto_passwd`; never plaintext passwords.
-- The strongest password derivation supported by the pinned Mosquitto version.
-  If the report needs the previously selected term, document
-  `sha512-pbkdf2` accurately for that version.
+- The existing Dynamic Security plugin for credential and ACL management.
+  Keep its persistent store private and let Mosquitto manage credential hashing
+  and supported updates. Do not add a parallel static password store or custom
+  password-hash implementation for the MVP.
 - MQTT over TLS so usernames and passwords are not exposed in transit.
-- `acl_file` or the Dynamic Security plugin for per-Gateway topic isolation.
+- Explicit DynSec roles/ACLs for per-Gateway topic isolation and a least-
+  privilege backend principal.
 
 Minimum topic namespace:
 
@@ -584,6 +670,23 @@ restricted to platform administrators (see section 6.5). Generate secrets
 server-side using a cryptographically secure random generator and transfer the
 plaintext secret once through USB, SSH on a trusted local network, or an
 explicitly designed one-time enrollment flow.
+
+Keep credential management bounded: provision, rotate, and revoke through the
+existing supervised admin flow. Validate the actual broker result, including
+fresh login with the new password and rejection of the old password after a
+successful rotation. For revoke, verify fresh-login rejection and disconnection
+of an already active target session in a focused integration scenario. A control
+command response alone is not proof of either result.
+
+Use the broker's supported persistence mechanism and check retained credential
+and ACL behavior after one controlled restart when qualifying this slice or
+changing broker persistence configuration. Do not require a new on-disk password
+verifier, power-loss durability proof, or per-operation restart. Until checked,
+restart persistence is unverified; do not claim crash durability. Preserve
+existing recovery-needed handling for ambiguous mutations and provide a short
+supervised recovery runbook. A manual recovery procedure can satisfy MVP recovery
+needs; an automated reset API is optional unless explicitly requested. The
+current deny-only reset endpoint must not be reported as implemented recovery.
 
 ## 8. TLS and CA lifecycle
 
@@ -1090,70 +1193,77 @@ computed from every raw sample, not only chart-downsampled data.
 - Protect Studio using Cloudflare Access, VPN, or a trusted management network.
 - Use migrations instead of manual production schema edits.
 - Add structured logs without passwords, JWTs, private keys, or signed URLs.
-- Provide backup and verified restore procedures for PostgreSQL and relevant
-  Storage data.
+- Provide a practical backup/restore procedure for PostgreSQL and relevant
+  Storage data, with one restore rehearsal before final handover. This is not
+  a gate for every intermediate feature.
 - Basic CI should run Go formatting/linting/tests, migration checks, and
   container builds.
 - Keep deployment reversible with versioned images and configuration backups.
 
-## 16. Minimum verification
+## 16. Proportionate verification and definition of done
 
-At minimum, test:
+Testing supports feature delivery. Keep the checks small enough to maintain and
+strong enough to catch incorrect results and common security mistakes. There is
+no mandatory coverage percentage, test count, exhaustive T01–T12 matrix, or
+independent-review gate for every task.
 
-- Fake Gateway -> Mosquitto -> Go -> TimescaleDB end to end.
-- One 100 Hz sensor sending one 100-sample message per second.
-- Invalid payloads, duplicate delivery, reconnect, retry, lost application ACK,
-  and out-of-order messages.
-- Queue saturation and temporary database slowdown without unbounded memory use.
-- Gateway offline outbox and resend behavior.
-- Per-Gateway MQTT ACL isolation and credential revocation.
-- Invalid/expired TLS certificates, hostname mismatch, and incorrect time.
-- Supabase login/refresh and Go JWT validation.
-- Direct public signup calls to Supabase Auth / API Gateway are rejected when
-  self-service registration is disabled.
-- Non-admin user cannot provision Gateways, rotate/revoke MQTT credentials, or
-  grant/modify `user_gateways` memberships.
-- Non-member user cannot claim or access a Gateway merely by supplying its
-  `gateway_id`.
-- User A cannot access User B's Gateway history, WebSocket stream, or media.
-- Gateway `owner` can manage only sensors belonging to their assigned Gateway;
-  sensor access to another Gateway is denied.
-- Gateway `viewer` write, sensor configuration, desired-state update, and
-  device control requests are rejected.
-- Once the command slice is implemented, Gateway `operator` is permitted to issue
-  only explicitly server-allowlisted safe operational commands (e.g. `capture-image`)
-  on their assigned Gateway; cross-Gateway commands, arbitrary actions, and unsafe
-  commands are denied.
-- Gateway `operator` attempts to write durable `desired_state`, modify sensor
-  metadata, grant/modify memberships, or manage Gateway credentials are rejected.
-- Telemetry from unknown sensors or Gateways is rejected without creating
-  unauthorized database entities.
-- WebSocket authentication, reconnect, disconnect cleanup, and slow-client
-  behavior.
-- Signed upload/read URL expiry, object-path restriction, size/type rejection,
-  and private-bucket denial.
-- Telemetry updates the correct Digital Twin reported state and temporal rows in
-  the same successful processing path.
-- A client cannot write `reported_state` and a Gateway cannot write
-  `desired_state`.
-- User A cannot read or control User B's Digital Twin.
-- A desired-state update creates one command and one outbox item in the same
-  transaction.
-- Database commit succeeds while MQTT is unavailable; the outbox later
-  publishes without losing the command.
-- Duplicate command publication does not execute the physical action twice.
-- Command acknowledgement, success, failure, expiry, timeout, retry, and late
-  result behavior.
-- Desired-versus-reported reconciliation after Gateway reconnect.
-- Optimistic concurrency rejects a stale desired-state version.
-- NGSI-LD entity serialization preserves identifiers, property types,
-  relationships, observed timestamps, and the selected context.
-- Service restart, persistent data, clean-environment Compose deployment,
-  backup, and restore.
+### 16.1 Checks for each implemented feature
 
-Run focused tests while implementing each module. The final integration period
-is for acceptance and regression testing, not the first time components are
-tested together.
+1. Verify the normal input -> operation -> expected output/state path. Assert
+   meaningful results, including database state when the feature writes data.
+2. Add focused automated tests for nontrivial business rules and a small set of
+   relevant negatives: invalid input, unauthorized access, or a duplicate/stale
+   request. Use table-driven tests for roles and inputs where useful. Do not test
+   every possible combination or write tests that merely repeat the code.
+3. For a new cross-service path, run one representative integration scenario
+   against the actual relevant services in a disposable environment. A simulator
+   may stand in for the Gateway. Mock-only tests do not establish broker, database,
+   or Storage compatibility.
+4. Run the affected regression tests and applicable formatting, lint, and build
+   checks. Retain the existing basic CI checks; do not require the entire native
+   test environment after every small edit.
+5. Report what works, what was checked, what was not checked, and any remaining
+   functional gap or limitation. Once these checks pass, continue feature work.
+
+No extra tests are required for documentation-only changes or trivial changes
+with no behavior impact; inspect the result. Repeat a passing integration check
+when behavior, dependencies, deployment configuration, or a relevant defect
+changes its validity. Reuse evidence otherwise. Run the full existing CI suite
+at integration/release checkpoints, not repeatedly without a reason.
+
+### 16.2 Minimum integration coverage across the MVP
+
+Complete these checks as the corresponding features are implemented. They are
+feature-level acceptance checks, not a prerequisite to starting every stage.
+
+| Feature | Representative acceptance checks |
+| --- | --- |
+| Startup and database | Valid configuration starts the server and `/readyz` succeeds; invalid required configuration fails clearly. Verify graceful stop, migration on a clean database, and the supported upgrade from an existing schema. |
+| Auth and permissions | Valid login/JWT grants the intended access; expired/invalid token, non-admin admin operation, cross-Gateway access, and forbidden role writes are rejected without side effects. Check public signup remains disabled. Cover owner/operator/viewer rules for implemented endpoints. |
+| MQTT and DynSec | Valid TLS login and own-topic access work; an untrusted server certificate, wrong credentials, and cross-Gateway/control-topic access are rejected. Check provision, rotate, active-session revoke, and controlled-restart persistence as scoped in section 7. |
+| Telemetry | Simulator -> broker -> Go -> TimescaleDB stores the expected samples and sends an application ACK only after commit. One duplicate/retry does not add duplicate rows; malformed or unknown-sensor input is rejected. Check one ordinary reconnect/resend and timestamp ordering case. |
+| History and load | A requested interval returns the expected authorized data and chart aggregation. Run a short documented 100 Hz/batched-sample workload to check sample counts and observe processing time/memory. Record observed capacity; a full stress/soak campaign is deferred. |
+| Digital Twin | Telemetry updates the correct reported state/history. An authorized desired-state write persists a command/outbox and reaches confirmed Gateway feedback. Check a forbidden write, duplicate command, stale desired version, timeout, and one offline/reconnect retry. No success before confirmation; no blind retry of one-shot actions. |
+| Realtime delivery | An authorized client receives committed updates; another user's Gateway stream is denied. Verify normal reconnect/disconnect cleanup and a bounded slow-client policy. |
+| Media | Authorized upload and read work through private Storage; unauthorized access, wrong object path, expired URL, and excessive size are rejected. |
+| Deployment and recovery | Compose starts the integrated server with persistent volumes; a controlled restart retains the expected data. Document backup/restore and perform one restore rehearsal before final handover. |
+
+Keep the relevant unit/regression tests for contract details not exercised by
+these integration scenarios, such as command result correlation and state
+transitions. A single large smoke test is not a replacement for testing business
+logic. Conversely, do not reproduce the same acceptance check in several custom
+harnesses without a concrete need.
+
+### 16.3 Deferred assurance work
+
+Do not block unrelated features on exhaustive crash/fault injection, every
+filesystem permission/race permutation, forced power loss, full secret-leak
+certification, distributed fencing, long soak tests, or proof of every possible
+lost-response window. A reproducible failure in an ordinary supported workflow
+or a common security bypass still requires a fix. Keep existing useful
+regression tests; simplify obsolete tests only when their requirement has
+explicitly changed, with the reason documented. Never weaken an assertion or
+skip a failing test merely to obtain a green result.
 
 ## 17. Schedule and fallback rules
 
@@ -1172,13 +1282,15 @@ Preferred Digital Twin implementation order:
    result and reported-state convergence.
 5. Add command query, timeout/retry policy, WebSocket events, and authorization
    tests.
-6. Expand supported properties and commands only after the first vertical slice
-   passes end-to-end tests on the real AM5728 Gateway.
+6. Expand supported properties and commands after the first vertical slice
+   works with a Gateway simulator or the real AM5728. Reserve a real-board check
+   for final integration; hardware availability must not block unrelated server
+   features.
 
 If schedule slips, reduce scope in this order:
 
 1. Support images only; postpone video and resumable upload.
-2. Target one Flutter platform, preferably Android.
+2. Keep the Flutter web client minimal; defer mobile applications.
 3. Provide one historical chart and one realtime chart.
 4. Use Supabase Studio for administration instead of building an admin UI.
 5. Limit Digital Twin entity types to `Gateway` and `Sensor`, relationships to
@@ -1197,6 +1309,26 @@ and command status query once device control is presented as an MVP feature.
 
 ## 18. Instructions for coding agents
 
+- Start each task with the concrete user-visible result and a short list of
+  relevant checks. Follow sections 0 and 16 when deciding what is sufficient.
+- Classify findings: fix normal-path correctness, actual data corruption, and
+  common security failures now; record optional hardening and rare fault cases
+  for later. Explain impact rather than using severity labels alone.
+- Keep changes proportional to the feature. Prefer the existing implementation
+  and test tools; avoid unrelated refactors, generic frameworks, or a new
+  acceptance harness. Explain any necessary large expansion before doing it.
+- Do not start repeated reviewer/worker cycles or require independent approval
+  of each patch unless explicitly requested. Focus review on concrete defects.
+- Preserve useful existing tests and guards. When an old plan imposes a
+  superseded proof-only gate, document the policy change and adjust that gate
+  narrowly; do not remove an actual authorization or integrity boundary.
+- Summarize verification with the checked revision, commands/results, and
+  important limits. Do not create elaborate evidence manifests for routine work.
+- If a check fails, investigate the actual failure rather than repeatedly
+  broadening the test matrix. If the environment blocks verification, state
+  exactly what remains unverified and continue independent work where possible.
+- Stop expanding verification once the feature meets section 16. Hand it over
+  and proceed to the next planned feature; do not seek zero theoretical risk.
 - Implement the smallest complete vertical slice and verify it before adding
   another subsystem.
 - Follow the selected REST/WebSocket architecture; do not silently restore
@@ -1232,8 +1364,9 @@ and command status query once device control is presented as an MVP feature.
   only a sanitized `.example` or template. Never introduce a real domain,
   personal email, public IP, machine path, Gateway-specific deployment ID, or
   secret directly into source code, migrations, Compose, tests, or docs.
-- Prefer static Mosquitto `password_file` and `acl_file` for the first MVP; add
-  dynamic administration only if it is required and scheduled.
+- Reuse the existing Mosquitto DynSec implementation and supported broker
+  operations. Do not restart credential management from scratch or introduce a
+  parallel static password/ACL system. Apply section 7's bounded checks.
 - Treat retention periods, queue sizes, worker counts, packet limits, upload
   limits, token lifetimes, and timeouts as configurable values.
 - Keep all application-level device commands inside the Digital Twin module.
@@ -1253,7 +1386,9 @@ and command status query once device control is presented as an MVP feature.
 - Do not add an external Context Broker unless explicitly requested. If added
   later, define which component is authoritative before writing code; never
   allow Go and the broker to become two unsynchronized sources of truth.
-- Benchmark before choosing production defaults.
+- Use conservative configurable defaults initially. Measure the representative
+  workload once the relevant pipeline works, then tune observed bottlenecks.
+  Do not build a benchmarking framework before delivering the feature.
 - When the repository does not yet contain a convention, present the simplest
   viable option and its trade-off rather than inventing a permanent decision.
 - Explain important implementation choices in plain Vietnamese when handing
