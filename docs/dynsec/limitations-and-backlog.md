@@ -55,6 +55,23 @@ ghi các giới hạn còn lại, không tạo backlog cạnh tranh.
 | Chưa chạy SQLite trên board ARM; quota outbox là business bytes | Cross-build ARMv7 PASS nhưng chưa chứng minh runtime trên bo mạch; file SQLite có thể lớn hơn business bytes (page/journal) | Giữ pin driver pure-Go; chạy SQLite trên board ở checkpoint thiết bị; để disk headroom ≥ 2× `GATEWAY_OUTBOX_MAX_BYTES` và theo dõi `count` | Task 3.7 / tích hợp board |
 | Fail-closed khi commit outbox bất định | `ErrOutboxCommitUnknown`/`ErrSchedulerCommitUnknown` dừng CLI, yêu cầu khôi phục có giám sát; không tự sinh `message_id` mới hoặc retry mù | Khôi phục dựa trạng thái file + `pending`/`count`/`quarantine`; restart có giám sát | Khi có bằng chứng tái hiện hoặc vận hành board |
 
+### Cập nhật Task 3.6 — tích hợp TLS/ACL, disconnect, restart và áp lực hữu hạn (16/10/2026)
+
+Cả chín kịch bản bắt buộc của Task 3.6 (3.6.1–3.6.7) đã được hiện thực trong
+`scripts/tests/stage3_uplink_runner.py` và đều **PASS** trên fixture dịch vụ
+thật (Mosquitto 2.0.18 + TimescaleDB schema 20, Docker images thật) qua lệnh
+gọi `--scenario all` (và kiểm chứng lại `tls-credential` sau bản sửa logging an
+toàn). Kết quả này hoàn thành lát cắt tích hợp cross-service của Task 3.6; các
+mục dưới đây ghi nhận trạng thái giải quyết và các giới hạn kỹ thuật còn lại.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| 3.6.5–3.6.7 đã hoàn thành có giới hạn (16/10/2026) | Kịch bản `db-timeout`, `queue-full`, `gateway-reconnect`, `process-restart`, và `broker-controlled-restart` đã **PASS** trên runner thật. Khởi động lại broker có kiểm soát (controlled restart) xác minh credential hiện hành, rotated new password đăng nhập thành công, rotated old password bị từ chối, client mang cờ `disabled=true` bị từ chối và cấu trúc ACL được giữ nguyên qua restart trên persistent volume fixture | Bằng chứng chứng minh persistence qua restart có kiểm soát trong fixture này. **KHÔNG** viết lại mục ROT2 disk verifier hoặc chứng nhận T10 rộng hơn thành PASS; chưa chứng minh fsync phần cứng, power-loss durability hay distributed failover | Khi xem lại độ bền lưu trữ broker ngoài phạm vi MVP |
+| Broker triển khai chỉ ghi `Denied PUBLISH` ở mức `debug`, không phải `notice` | `config/mosquitto/mosquitto.conf` dừng ở `notice`, nên log vận hành mặc định **không** có audit cho publish bị từ chối ACL | Runner bật `log_type debug` **chỉ trên bản copy fixture dùng-một-lần** (`work/broker/mosquitto.conf`), không sửa config triển khai; muốn audit ACL trên production cần cân nhắc thêm mức `debug` có kiểm soát hoặc thu thập bằng cách khác | Khi cần audit/monitoring ACL trên môi trường thật |
+| Hook `run_ack_fault` gỡ vai trò deny qua `removeClientRole`; bằng chứng restore dùng **phiên kết nối mới** cho receiver/publisher và đọc lại `getClient` | DynSec không cập nhật danh sách ACL cho phiên đang mở khi gỡ client-role trong cùng khoảng chờ dài; dựa vào phiên cũ sẽ cho kết quả "chưa khôi phục" giả | Runner reconnect receiver/publisher và assert `getClient` không còn role trước khi kiểm tra restore; đây là hành vi của fixture, không phải ACL triển khai | Khi có tài liệu/phiên bản Mosquitto khác hoặc dùng hook này cho việc khác |
+| Probe MQTT test dùng `keepalive=0` | Phiên probe để yên > 7,5s (1,5× keepalive 5s mặc định) từng bị broker ngắt, làm hỏng bằng chứng dài hạn | `AclProbe` truyền `keepalive=0` qua `mqtt_connection` (mặc định 5s giữ nguyên cho mọi caller khác) | Khi thay đổi helper kết nối dùng chung |
+| Runner Task 3.6 mới chạy trên Linux amd64; chưa có runtime trên bo mạch ARM | Bằng chứng là chạy thật trên Docker host amd64, chưa chứng minh runtime trên bo mạch nhúng ARM | Chạy lại ở checkpoint tích hợp thiết bị; giữ nguyên cấu hình headless và network | Task 3.7 / checkpoint triển khai |
+
 ---
 
 ## 1. Phân Tích Chuyên Sâu Các Giới Hạn Kỹ Thuật (Detailed Technical Limitations)
