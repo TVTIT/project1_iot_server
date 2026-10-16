@@ -29,6 +29,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   [kiến trúc và hướng dẫn vận hành DynSec Task 2.8a](docs/dynsec/INDEX.md) và
   [nghiệm thu E2E Task 2.7](docs/backend/stage-2-task-2.7-acceptance.md)
   để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
+- **Gateway Simulator (Stage 3, Task 3.5)** — công cụ phát triển phát telemetry tổng hợp qua MQTT/TLS với outbox SQLite bền vững và lệnh `run`/`pending`/`count`/`quarantine`: xem [hướng dẫn Gateway Simulator](docs/backend/stage-3-task-3.5-gateway-simulator.md).
 
 ---
 
