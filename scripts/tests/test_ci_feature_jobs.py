@@ -26,9 +26,11 @@ Verifies the workflow structure, steps, commands, and options for:
   * Uploads distinct provisioning coverage artifact.
 """
 
+import re
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_TESTS_DIR = Path(__file__).resolve().parent
@@ -214,11 +216,10 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertIn('target: auth-init', legacy)
         self.assertIn('target: reloader', legacy)
         for old in ('stage2-e2e', 'mosquitto-credential-integration', 'mosquitto-runtime-integration'):
-            self.assertIn('Legacy', self._extract_job_section(old))
+            self.assertIn(f'legacy-execution-deferred: {old}', self._extract_job_section(old))
 
     def test_legacy_deferred_jobs_contracts_and_routing(self):
-        """Verifies deferred routing, exact labels, retained units/builds, and markers for legacy jobs."""
-        import re
+        """Verifies job IDs, deferred routing, retained units/builds, and markers."""
         from test_stage2_ci import assert_stage2_e2e_contract
         from test_stage2_mqtt_credentials import assert_credential_job_contract
         from test_stage2_mosquitto_runtime import assert_runtime_job_contract
@@ -227,10 +228,10 @@ class TestCIFeatureJobs(unittest.TestCase):
         cred_job = self._extract_job_section('mosquitto-credential-integration')
         runtime_job = self._extract_job_section('mosquitto-runtime-integration')
 
-        # Check explicit job display labels
-        self.assertIn("name: Legacy E2E contracts", stage2_job)
-        self.assertIn("name: Legacy credential checks", cred_job)
-        self.assertIn("name: Legacy runtime contracts", runtime_job)
+        # Job identity is the YAML key, not the optional display name.
+        self.assertTrue(stage2_job.startswith('  stage2-e2e:\n'))
+        self.assertTrue(cred_job.startswith('  mosquitto-credential-integration:\n'))
+        self.assertTrue(runtime_job.startswith('  mosquitto-runtime-integration:\n'))
 
         # Check explicit deferred markers in job definitions
         self.assertIn("legacy-execution-deferred: stage2-e2e", stage2_job)
@@ -243,7 +244,8 @@ class TestCIFeatureJobs(unittest.TestCase):
         assert_runtime_job_contract(runtime_job)
 
         # Verify all 15 job IDs remain defined
-        all_jobs = re.findall(r'^  ([a-z0-9-]+):\n(?:    name:.*\n)?    runs-on:', self.raw_content, re.MULTILINE)
+        jobs_content = self.raw_content.split('\njobs:\n', 1)[1]
+        all_jobs = re.findall(r'^  ([a-z0-9-]+):[ \t]*$', jobs_content, re.MULTILINE)
         self.assertEqual(len(all_jobs), 15, f"expected 15 jobs, found {len(all_jobs)}: {all_jobs}")
         expected_jobs = {
             'lint-and-test', 'cross-compile', 'migration-check',
@@ -289,7 +291,7 @@ class TestCIFeatureJobs(unittest.TestCase):
         """stage3-uplink-integration must run bounded timeout, from root, and verify all prerequisites."""
         job = self._extract_job_section("stage3-uplink-integration")
         self.assertTrue(job, "Job stage3-uplink-integration must exist in ci.yml")
-        self.assertIn("name: Stage 3 uplink integration", job)
+        self.assertTrue(job.startswith('  stage3-uplink-integration:\n'))
         self.assertIn("timeout-minutes: 60", job)
         self.assertIn("working-directory: .", job)
         self.assertIn("go-version: '1.27.2'", job)
@@ -355,14 +357,41 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertNotIn("ca.key", job)
         self.assertNotIn("dynamic-security.json", job)
 
-    def _extract_job_section(self, job_name: str) -> str:
+    def test_job_contracts_allow_missing_or_changed_display_names(self):
+        """Optional job labels must not determine job identity or routing."""
+        without_names = re.sub(r'^    name:.*\n', '', self.raw_content, flags=re.MULTILINE)
+        for display_names in (False, True):
+            content = without_names
+            if display_names:
+                prefix, jobs_content = content.split('\njobs:\n', 1)
+                jobs_content = re.sub(
+                    r'^(  ([a-z0-9-]+):)[ \t]*$',
+                    r'\1\n    name: Custom label for \2',
+                    jobs_content, flags=re.MULTILINE,
+                )
+                content = prefix + '\njobs:\n' + jobs_content
+            with self.subTest(display_names=display_names), patch.object(self, 'raw_content', content):
+                self.test_active_backend_build_keeps_legacy_builds_separate()
+                self.test_legacy_deferred_jobs_contracts_and_routing()
+                self.test_stage3_uplink_integration_job_structure_and_prerequisites()
+
+    def test_job_contracts_reject_missing_job_id_even_with_old_display_name(self):
+        content = self.raw_content.replace(
+            '  stage2-e2e:\n',
+            '  renamed-stage2-e2e:\n    name: Legacy E2E contracts\n', 1,
+        )
+        with patch.object(self, 'raw_content', content):
+            with self.assertRaises(AssertionError):
+                self.test_legacy_deferred_jobs_contracts_and_routing()
+
+    def _extract_job_section(self, job_id: str) -> str:
         lines = self.raw_content.splitlines()
         job_lines = []
         in_job = False
         job_indent = None
         for line in lines:
             if not in_job:
-                if line.strip().startswith(f"{job_name}:"):
+                if line == f"  {job_id}:":
                     in_job = True
                     job_indent = len(line) - len(line.lstrip())
                     job_lines.append(line)
