@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"iot-platform/internal/telemetry"
 )
 
@@ -138,5 +140,102 @@ func TestCountersSnapshot(t *testing.T) {
 	}
 	if snap.QueueCapacity != opts.QueueCapacity {
 		t.Fatalf("QueueCapacity = %d, want %d", snap.QueueCapacity, opts.QueueCapacity)
+	}
+	if snap.QueueDepth != 0 {
+		t.Fatalf("QueueDepth after Drain = %d, want 0", snap.QueueDepth)
+	}
+	if snap.QueueHighWater < 0 || snap.QueueHighWater > opts.QueueCapacity {
+		t.Fatalf("QueueHighWater = %d, want within [0, %d]", snap.QueueHighWater, opts.QueueCapacity)
+	}
+}
+
+func TestQueueHighWaterBacklogAndDrain(t *testing.T) {
+	opts := defaultOptions()
+	opts.WorkerCount = 1
+	opts.QueueCapacity = 3
+
+	enter := make(chan *telemetry.Message, 16)
+	release := make(chan struct{})
+	repo := &fakeRepo{enter: enter, release: release}
+	pub := &fakePublisher{}
+
+	ing := newIngress(t, opts, newValidator(t), repo, pub)
+	mustStart(t, ing)
+
+	initSnap := ing.Snapshot()
+	if initSnap.QueueDepth != 0 || initSnap.QueueHighWater != 0 {
+		t.Fatalf("initial snapshot queue state = depth %d, high_water %d; want 0/0",
+			initSnap.QueueDepth, initSnap.QueueHighWater)
+	}
+
+	// Message 0: taken by the 1 active worker, which blocks in fakeRepo.Persist on release channel.
+	m0ID := uuid.New()
+	t0, p0, r0 := testPayloadFor(t, "gateway_001", "sensor_001", m0ID, testBootID, 1)
+	if got := ing.Admit(t0, p0, r0, false); got != AdmissionAccepted {
+		t.Fatalf("Admit message 0 = %v, want accepted", got)
+	}
+	waitMessage(t, enter) // worker has popped item 0 and is blocked in Persist
+
+	// At this point, the worker is occupied and queue channel is empty.
+	// Now admit items 1, 2, 3 into the queue channel (capacity = 3).
+	// Because the worker is blocked, items accumulate in the channel.
+	for i := 1; i <= 3; i++ {
+		miID := uuid.New()
+		ti, pi, ri := testPayloadFor(t, "gateway_001", "sensor_001", miID, testBootID, 1)
+		if got := ing.Admit(ti, pi, ri, false); got != AdmissionAccepted {
+			t.Fatalf("Admit message %d = %v, want accepted", i, got)
+		}
+		snap := ing.Snapshot()
+		if snap.QueueDepth != i {
+			t.Fatalf("after admitting %d queued items, QueueDepth = %d, want %d", i, snap.QueueDepth, i)
+		}
+		if snap.QueueHighWater < i {
+			t.Fatalf("after admitting %d queued items, QueueHighWater = %d, want >= %d", i, snap.QueueHighWater, i)
+		}
+		if snap.QueueHighWater > opts.QueueCapacity {
+			t.Fatalf("QueueHighWater = %d exceeded capacity %d", snap.QueueHighWater, opts.QueueCapacity)
+		}
+	}
+
+	snapFull := ing.Snapshot()
+	if snapFull.QueueDepth != opts.QueueCapacity {
+		t.Fatalf("QueueDepth at full capacity = %d, want %d", snapFull.QueueDepth, opts.QueueCapacity)
+	}
+	if snapFull.QueueHighWater != opts.QueueCapacity {
+		t.Fatalf("QueueHighWater at full capacity = %d, want %d", snapFull.QueueHighWater, opts.QueueCapacity)
+	}
+
+	// Message 4: queue is full; admission must be rejected and high-water must not exceed capacity.
+	m4ID := uuid.New()
+	t4, p4, r4 := testPayloadFor(t, "gateway_001", "sensor_001", m4ID, testBootID, 1)
+	if got := ing.Admit(t4, p4, r4, false); got != AdmissionRejectedQueueFull {
+		t.Fatalf("Admit on full queue = %v, want queue full", got)
+	}
+
+	snapOver := ing.Snapshot()
+	if snapOver.QueueFull != 1 {
+		t.Fatalf("QueueFull counter = %d, want 1", snapOver.QueueFull)
+	}
+	if snapOver.QueueHighWater != opts.QueueCapacity {
+		t.Fatalf("QueueHighWater after rejection = %d, want %d", snapOver.QueueHighWater, opts.QueueCapacity)
+	}
+
+	// Release worker and drain the backlog.
+	close(release)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain = %v", err)
+	}
+
+	// Post-drain: queue is empty, but QueueHighWater remains at peak (never decreases).
+	snapDrained := ing.Snapshot()
+	if snapDrained.QueueDepth != 0 {
+		t.Fatalf("post-drain QueueDepth = %d, want 0", snapDrained.QueueDepth)
+	}
+	if snapDrained.QueueHighWater != opts.QueueCapacity {
+		t.Fatalf("post-drain QueueHighWater = %d, want %d (must persist after drain)",
+			snapDrained.QueueHighWater, opts.QueueCapacity)
+	}
+	if snapDrained.Committed != 4 {
+		t.Fatalf("post-drain Committed = %d, want 4 (items 0,1,2,3)", snapDrained.Committed)
 	}
 }

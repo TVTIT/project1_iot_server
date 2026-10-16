@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -910,5 +912,191 @@ func TestSchedulerPublishDrainBudgetSharesDeadline(t *testing.T) {
 	s2.BeginShutdown(time.Time{})
 	if got := s2.publishDrainBudget(); got != 3*time.Second {
 		t.Fatalf("zero deadline changed the budget: %s", got)
+	}
+}
+
+func TestScheduler_LatencyTracking_EarlyAckAndFiniteCompletion(t *testing.T) {
+	cfg := baseSchedulerConfig()
+	cfg.MaxInflight = 4
+	clock := newFakeClock()
+	pub := newFakePublisher(clock)
+	path := filepath.Join(t.TempDir(), "outbox.db")
+
+	tracker, err := NewLatencyTracker(10, WithTrackerClock(clock))
+	if err != nil {
+		t.Fatalf("NewLatencyTracker: %v", err)
+	}
+
+	outbox := openTestOutbox(t, schedOutboxConfig(path, cfg))
+	proc, err := NewACKProcessor(outbox, 16, WithACKLatencyRecorder(tracker))
+	if err != nil {
+		t.Fatalf("NewACKProcessor: %v", err)
+	}
+	proc.Start()
+
+	// Early ACK: whenever publish runs, immediately admit ACK
+	pub.setPublishFn(func(_ string, payload []byte) error {
+		var batch struct {
+			MessageID string `json:"message_id"`
+		}
+		if err := json.Unmarshal(payload, &batch); err == nil && batch.MessageID != "" {
+			clock.Advance(50 * time.Millisecond)
+			ackMessage(proc, cfg.GatewayID, uuid.MustParse(batch.MessageID))
+		}
+		return nil
+	})
+
+	sched, err := NewScheduler(SchedulerOptions{
+		Outbox:           outbox,
+		Publisher:        pub,
+		Ack:              proc,
+		Config:           cfg,
+		FiniteBatch:      2,
+		CompletionBudget: time.Hour,
+		Latency:          tracker,
+		clock:            clock,
+		newUUID:          seqUUIDGen(0),
+		randFloat:        func() float64 { return 0.5 },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	run := &schedulerRun{outbox: outbox, proc: proc, pub: pub, sched: sched}
+	t.Cleanup(func() {
+		run.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = proc.Stop(ctx)
+	})
+
+	run.start(context.Background())
+	pub.setReady(true)
+
+	waitFor(t, "first batch", func() bool { return run.sched.Stats().UniqueEnqueued >= 1 })
+	advanceUntil(t, clock, 100*time.Millisecond, 50, func() bool { return run.sched.Stats().UniqueEnqueued == 2 })
+
+	if err := run.waitDone(t); err != nil {
+		t.Fatalf("finite run returned %v, want nil", err)
+	}
+
+	st := run.sched.Stats()
+	if !st.Completed {
+		t.Fatal("Completed = false, want true")
+	}
+
+	snap := tracker.Snapshot()
+	if snap.SampleCount != 2 {
+		t.Fatalf("expected 2 samples, got %d", snap.SampleCount)
+	}
+	if snap.FirstPublishes != 2 {
+		t.Fatalf("expected 2 first publishes, got %d", snap.FirstPublishes)
+	}
+	if snap.RetryAttempts != 0 {
+		t.Fatalf("expected 0 retry attempts, got %d", snap.RetryAttempts)
+	}
+	if snap.MissingOrigins != 0 {
+		t.Fatalf("expected 0 missing origins, got %d", snap.MissingOrigins)
+	}
+	if snap.P50 <= 0 || snap.P95 <= 0 {
+		t.Fatalf("expected positive latency percentiles, got p50=%v p95=%v", snap.P50, snap.P95)
+	}
+}
+
+func TestScheduler_LatencyTracking_RetryPreservesFirstPublish(t *testing.T) {
+	cfg := baseSchedulerConfig()
+	cfg.MaxInflight = 2
+	cfg.RetryMinDelay = 100 * time.Millisecond
+	cfg.RetryMaxDelay = 100 * time.Millisecond
+	clock := newFakeClock()
+	pub := newFakePublisher(clock)
+	path := filepath.Join(t.TempDir(), "outbox.db")
+
+	tracker, err := NewLatencyTracker(10, WithTrackerClock(clock))
+	if err != nil {
+		t.Fatalf("NewLatencyTracker: %v", err)
+	}
+
+	outbox := openTestOutbox(t, schedOutboxConfig(path, cfg))
+	proc, err := NewACKProcessor(outbox, 16, WithACKLatencyRecorder(tracker))
+	if err != nil {
+		t.Fatalf("NewACKProcessor: %v", err)
+	}
+	proc.Start()
+
+	var attempts atomic.Int64
+	pub.setPublishFn(func(_ string, payload []byte) error {
+		n := attempts.Add(1)
+		if n == 1 {
+			// First attempt fails immediately
+			return errors.New("simulated network failure")
+		}
+		// Second attempt (retry) advances clock by 10ms and admits ACK
+		clock.Advance(10 * time.Millisecond)
+		var batch struct {
+			MessageID string `json:"message_id"`
+		}
+		if err := json.Unmarshal(payload, &batch); err == nil && batch.MessageID != "" {
+			ackMessage(proc, cfg.GatewayID, uuid.MustParse(batch.MessageID))
+		}
+		return nil
+	})
+
+	sched, err := NewScheduler(SchedulerOptions{
+		Outbox:           outbox,
+		Publisher:        pub,
+		Ack:              proc,
+		Config:           cfg,
+		FiniteBatch:      1,
+		CompletionBudget: time.Hour,
+		Latency:          tracker,
+		clock:            clock,
+		newUUID:          seqUUIDGen(0),
+		randFloat:        func() float64 { return 0.5 },
+	})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	run := &schedulerRun{outbox: outbox, proc: proc, pub: pub, sched: sched}
+	t.Cleanup(func() {
+		run.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = proc.Stop(ctx)
+	})
+
+	run.start(context.Background())
+	pub.setReady(true)
+
+	// Wait for first attempt to run and fail
+	waitFor(t, "first attempt", func() bool { return attempts.Load() == 1 })
+
+	// Wait briefly for scheduler loop to process failure and arm backoff timer
+	time.Sleep(20 * time.Millisecond)
+
+	// Advance clock past retry delay (100ms)
+	clock.Advance(200 * time.Millisecond)
+
+	waitFor(t, "second attempt", func() bool { return attempts.Load() == 2 })
+
+	if err := run.waitDone(t); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	snap := tracker.Snapshot()
+	if snap.SampleCount != 1 {
+		t.Fatalf("expected 1 sample, got %d", snap.SampleCount)
+	}
+	if snap.FirstPublishes != 1 {
+		t.Fatalf("expected 1 first publish, got %d", snap.FirstPublishes)
+	}
+	if snap.RetryAttempts != 1 {
+		t.Fatalf("expected 1 retry attempt, got %d", snap.RetryAttempts)
+	}
+	// Latency must include the 200ms retry wait plus 10ms ACK delay = 210ms (from first publish call),
+	// NOT just 10ms (from retry call)!
+	if snap.P50 < 200*time.Millisecond {
+		t.Fatalf("expected latency >= 200ms from first publish call, got %v", snap.P50)
 	}
 }

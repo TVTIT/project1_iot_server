@@ -146,6 +146,10 @@ type SchedulerOptions struct {
 	// slog.Default().
 	Logger *slog.Logger
 
+	// Latency is the optional bounded latency and window tracker. Nil disables
+	// measurement with zero allocations.
+	Latency LatencyRecorder
+
 	// Test seams.
 	clock     Clock
 	randFloat func() float64
@@ -180,6 +184,7 @@ type Scheduler struct {
 	randFloat func() float64
 	newUUID   func() (uuid.UUID, error)
 	bootID    uuid.UUID
+	latency   LatencyRecorder
 
 	finiteTarget     int
 	completionBudget time.Duration
@@ -310,6 +315,7 @@ func NewScheduler(opts SchedulerOptions) (*Scheduler, error) {
 		randFloat:        randFloat,
 		newUUID:          newUUID,
 		bootID:           bootID,
+		latency:          opts.Latency,
 		finiteTarget:     opts.FiniteBatch,
 		completionBudget: opts.CompletionBudget,
 		done:             make(chan struct{}),
@@ -346,6 +352,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	defer s.cancel()
+
+	if s.latency != nil {
+		s.latency.RecordRunStart()
+		defer s.latency.RecordRunEnd()
+	}
 
 	s.timer = s.clock.NewTimer(parkDuration)
 	s.nextGenAt = s.clock.Now().UTC()
@@ -582,9 +593,15 @@ func (s *Scheduler) generate(now time.Time) error {
 	}
 
 	s.uniqueEnqueued.Add(1)
+	if s.uniqueEnqueued.Load() == 1 && s.latency != nil {
+		s.latency.RecordGenerationStart()
+	}
 	s.admit(item)
 	if s.finiteTarget > 0 && !s.genDone && int(s.uniqueEnqueued.Load()) >= s.finiteTarget {
 		s.genDone = true
+		if s.latency != nil {
+			s.latency.RecordGenerationEnd()
+		}
 		s.completionDeadline = s.clock.Now().UTC().Add(s.completionBudget)
 	}
 	return nil
@@ -599,6 +616,9 @@ func (s *Scheduler) startPublish(e *inflightEntry) {
 	topic := e.item.Topic
 	payload := e.item.Payload
 	go func() {
+		if s.latency != nil {
+			s.latency.RecordFirstPublish(id)
+		}
 		err := s.pub.Publish(s.ctx, topic, payload)
 		select {
 		case s.pubResults <- publishResult{messageID: id, err: err}:
@@ -732,6 +752,9 @@ func (s *Scheduler) checkCompletion() (bool, error) {
 		return true, fmt.Errorf("%w: %v", ErrSchedulerPending, err)
 	}
 	if counts.PendingRows == 0 {
+		if s.latency != nil {
+			s.latency.RecordDrainComplete()
+		}
 		return true, nil
 	}
 	if !s.completionDeadline.IsZero() && !s.clock.Now().Before(s.completionDeadline) {

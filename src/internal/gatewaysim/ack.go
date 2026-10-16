@@ -275,20 +275,32 @@ type ACKProcessor struct {
 	droppedOversize atomic.Int64
 	droppedFull     atomic.Int64
 	deleteFailed    atomic.Int64
+
+	latency LatencyRecorder
+}
+
+// ACKProcessorOption configures an optional ACKProcessor property.
+type ACKProcessorOption func(*ACKProcessor)
+
+// WithACKLatencyRecorder injects an optional latency recorder for application ACKs.
+func WithACKLatencyRecorder(rec LatencyRecorder) ACKProcessorOption {
+	return func(p *ACKProcessor) {
+		p.latency = rec
+	}
 }
 
 // NewACKProcessor builds the ACK processor for the gateway bound by outbox. The
 // configured gateway identity is taken from the outbox so a topic check can
 // never be satisfied with a different gateway. admissionCapacity sets the fixed
 // size of the callback queue and must be within the documented bounds.
-func NewACKProcessor(outbox *Outbox, admissionCapacity int) (*ACKProcessor, error) {
+func NewACKProcessor(outbox *Outbox, admissionCapacity int, opts ...ACKProcessorOption) (*ACKProcessor, error) {
 	if outbox == nil {
 		return nil, fmt.Errorf("gatewaysim: ACK processor requires an outbox")
 	}
 	if admissionCapacity < minACKAdmissionCapacity || admissionCapacity > maxACKAdmissionCapacity {
 		return nil, fmt.Errorf("gatewaysim: ACK admission capacity must be between %d and %d", minACKAdmissionCapacity, maxACKAdmissionCapacity)
 	}
-	return &ACKProcessor{
+	p := &ACKProcessor{
 		gatewayID:  outbox.gatewayID,
 		outbox:     outbox,
 		admissions: make(chan ackAdmission, admissionCapacity),
@@ -296,7 +308,16 @@ func NewACKProcessor(outbox *Outbox, admissionCapacity int) (*ACKProcessor, erro
 		done:       make(chan struct{}),
 		finished:   make(chan struct{}),
 		fatalCh:    make(chan struct{}),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p, nil
+}
+
+// SetLatencyRecorder sets or replaces the latency recorder on the processor.
+func (p *ACKProcessor) SetLatencyRecorder(rec LatencyRecorder) {
+	p.latency = rec
 }
 
 // Start launches the single ACK worker. A second call is a no-op.
@@ -423,6 +444,9 @@ func (p *ACKProcessor) handleAdmission(ctx context.Context, admission ackAdmissi
 	}
 
 	p.acknowledged.Add(1)
+	if p.latency != nil {
+		p.latency.RecordAckDeleted(ack.MessageID)
+	}
 	p.signalScheduler()
 	return nil
 }

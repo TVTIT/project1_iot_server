@@ -173,6 +173,7 @@ func (r ingressRuntime) logSummary() {
 		"ack_publish_failures", snap.ACKPublishFailures,
 		"queue_depth", snap.QueueDepth,
 		"queue_capacity", snap.QueueCapacity,
+		"queue_high_water", snap.QueueHighWater,
 	)
 }
 

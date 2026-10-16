@@ -205,6 +205,7 @@ func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, reta
 	select {
 	case i.queue <- it:
 		i.counters.accepted.Add(1)
+		i.recordQueueHighWater(len(i.queue))
 		return AdmissionAccepted
 	default:
 		// Queue full: drop the delivery from RAM. The library MQTT PUBACK (if
@@ -212,6 +213,34 @@ func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, reta
 		// outbox. No application ACK is emitted.
 		i.counters.queueFull.Add(1)
 		return AdmissionRejectedQueueFull
+	}
+}
+
+// recordQueueHighWater updates the admission-observed queue high-water mark.
+// Observation point: sampled via len(queue) immediately after a successful
+// non-blocking enqueue in Admit().
+// Limits: bounded within [0, QueueCapacity]; monotonically non-decreasing.
+//
+// Concurrent workers may consume items between the channel send and len()
+// observation, so this represents an admission-observed high-water mark rather
+// than an exact absolute instantaneous queue peak.
+func (i *Ingress) recordQueueHighWater(observed int) {
+	if observed <= 0 {
+		return
+	}
+	qCap := cap(i.queue)
+	if observed > qCap {
+		observed = qCap
+	}
+	obs64 := int64(observed)
+	for {
+		current := i.counters.queueHighWater.Load()
+		if obs64 <= current {
+			return
+		}
+		if i.counters.queueHighWater.CompareAndSwap(current, obs64) {
+			return
+		}
 	}
 }
 

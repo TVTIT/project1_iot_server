@@ -490,3 +490,102 @@ func TestRunStartupInvalidCAReleasesResources(t *testing.T) {
 	}
 	_ = reopened.Close()
 }
+
+func TestRun_MeasureFlagValidation(t *testing.T) {
+	var out, errBuf bytes.Buffer
+
+	// --measure without --batches
+	if code := run(context.Background(), []string{"run", "--measure"}, lookupFrom(nil), &out, &errBuf); code != 2 {
+		t.Fatalf("run --measure without --batches exit = %d, want 2", code)
+	}
+	if !strings.Contains(errBuf.String(), "--measure requires a finite run") {
+		t.Fatalf("stderr missing requirement message: %q", errBuf.String())
+	}
+
+	// --measure with --batches 0
+	out.Reset()
+	errBuf.Reset()
+	if code := run(context.Background(), []string{"run", "--batches", "0", "--measure"}, lookupFrom(nil), &out, &errBuf); code != 2 {
+		t.Fatalf("run --batches 0 --measure exit = %d, want 2", code)
+	}
+
+	// --measure-capacity without --measure
+	out.Reset()
+	errBuf.Reset()
+	if code := run(context.Background(), []string{"run", "--batches", "5", "--measure-capacity", "10"}, lookupFrom(nil), &out, &errBuf); code != 2 {
+		t.Fatalf("run --measure-capacity without --measure exit = %d, want 2", code)
+	}
+
+	// --measure-capacity exceeds maximum
+	out.Reset()
+	errBuf.Reset()
+	if code := run(context.Background(), []string{"run", "--batches", "5", "--measure", "--measure-capacity", "200000"}, lookupFrom(nil), &out, &errBuf); code != 2 {
+		t.Fatalf("run --measure-capacity 200000 exit = %d, want 2", code)
+	}
+	if !strings.Contains(errBuf.String(), "--measure-capacity must be between 1 and") {
+		t.Fatalf("stderr missing capacity bounds message: %q", errBuf.String())
+	}
+}
+
+func TestRun_FiniteBatch_WithMeasure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	fake := newFakeTransport(true)
+	installFakeTransport(t, fake)
+
+	var out, errBuf bytes.Buffer
+	code := run(context.Background(), []string{"run", "--batches", "2", "--completion-timeout", "5s", "--measure"},
+		lookupFrom(runEnv(path, nil)), &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("run exit = %d, stderr = %s", code, errBuf.String())
+	}
+
+	stdoutText := out.String()
+	// Both run summary and measurement summary must be printed
+	if !strings.Contains(stdoutText, "run summary: enqueued=2 publish_attempts=2 app_acknowledged=2 pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0 completed=true") {
+		t.Fatalf("unexpected or missing run summary: %q", stdoutText)
+	}
+
+	if !strings.Contains(stdoutText, "measurement summary:") {
+		t.Fatalf("missing measurement summary in output: %q", stdoutText)
+	}
+	if !strings.Contains(stdoutText, "samples=2") ||
+		!strings.Contains(stdoutText, "first_publishes=2") ||
+		!strings.Contains(stdoutText, "retry_attempts=0") ||
+		!strings.Contains(stdoutText, "missing_origins=0") ||
+		!strings.Contains(stdoutText, "overflow_samples=0") {
+		t.Fatalf("unexpected measurement summary values: %q", stdoutText)
+	}
+	if !strings.Contains(stdoutText, "total_duration_ms=") ||
+		!strings.Contains(stdoutText, "gen_duration_ms=") ||
+		!strings.Contains(stdoutText, "publish_drain_duration_ms=") {
+		t.Fatalf("missing window duration metrics in output: %q", stdoutText)
+	}
+
+	// Output must not contain secrets or payloads
+	if strings.Contains(stdoutText, "test-only-gateway-password") || strings.Contains(stdoutText, "payload") {
+		t.Fatalf("stdout leaked credential or payload: %q", stdoutText)
+	}
+}
+
+func TestRun_FiniteBatch_WithoutMeasure_BackwardCompatibility(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	fake := newFakeTransport(true)
+	installFakeTransport(t, fake)
+
+	var out, errBuf bytes.Buffer
+	code := run(context.Background(), []string{"run", "--batches", "2", "--completion-timeout", "5s"},
+		lookupFrom(runEnv(path, nil)), &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("run exit = %d, stderr = %s", code, errBuf.String())
+	}
+
+	stdoutText := out.String()
+	if !strings.Contains(stdoutText, "run summary: enqueued=2 publish_attempts=2 app_acknowledged=2 pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0 completed=true") {
+		t.Fatalf("unexpected or missing run summary: %q", stdoutText)
+	}
+
+	// Must NOT contain measurement summary when --measure is not set
+	if strings.Contains(stdoutText, "measurement summary:") {
+		t.Fatalf("disabled measurement mode must not print measurement summary: %q", stdoutText)
+	}
+}

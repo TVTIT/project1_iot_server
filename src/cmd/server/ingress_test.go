@@ -275,9 +275,15 @@ func TestLogSummaryEnabledEmitsStructuredSummary(t *testing.T) {
 		"persist_failures=0",
 		"committed=0",
 		"queue_capacity=256",
+		"queue_high_water=0",
 	} {
 		if !strings.Contains(out, expectedField) {
 			t.Fatalf("logSummary output missing field %q; full log:\n%s", expectedField, out)
+		}
+	}
+	for _, forbidden := range []string{"password", "secret", "token", "payload"} {
+		if strings.Contains(strings.ToLower(out), forbidden) {
+			t.Fatalf("logSummary output contains forbidden sensitive key %q; full log:\n%s", forbidden, out)
 		}
 	}
 }

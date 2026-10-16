@@ -579,3 +579,69 @@ func TestACKProcessorStopCooperativeWithSlowDelete(t *testing.T) {
 		t.Fatalf("acknowledged = %d, want 1", got)
 	}
 }
+
+func TestACKProcessor_LatencyTracker_DuplicateUnknownQuarantinedProducesNoSample(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	o := openTestOutbox(t, testOutboxConfig(path))
+	item := enqueueTestBatch(t, o, outboxBootID, uuid.New(), outboxBaseTime)
+	other := enqueueTestBatch(t, o, outboxBootID, uuid.New(), outboxBaseTime.Add(time.Second))
+	fc := newFakeClock()
+	tracker, err := NewLatencyTracker(10, WithTrackerClock(fc))
+	if err != nil {
+		t.Fatalf("NewLatencyTracker: %v", err)
+	}
+	p := newACKTestProcessor(t, o, 4)
+	p.SetLatencyRecorder(tracker)
+
+	// Pre-register item in tracker as published
+	tracker.RecordFirstPublish(item.MessageID)
+
+	// Valid first ACK: should record 1 sample
+	topic, payload := validACK(t, item.MessageID, outboxBaseTime)
+	fc.Advance(10 * time.Millisecond)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: topic, payload: payload}); err != nil {
+		t.Fatalf("first handleAdmission: %v", err)
+	}
+	if snap := tracker.Snapshot(); snap.SampleCount != 1 {
+		t.Fatalf("expected 1 sample after first valid ACK, got %d", snap.SampleCount)
+	}
+
+	// Duplicate ACK for the same item: must produce no new sample
+	fc.Advance(10 * time.Millisecond)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: topic, payload: payload}); err != nil {
+		t.Fatalf("duplicate handleAdmission: %v", err)
+	}
+	if snap := tracker.Snapshot(); snap.SampleCount != 1 {
+		t.Fatalf("expected sample count to remain 1 on duplicate ACK, got %d", snap.SampleCount)
+	}
+
+	// Unknown ACK
+	unknownTopic, unknownPayload := validACK(t, uuid.New(), outboxBaseTime)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: unknownTopic, payload: unknownPayload}); err != nil {
+		t.Fatalf("unknown handleAdmission: %v", err)
+	}
+	if snap := tracker.Snapshot(); snap.SampleCount != 1 {
+		t.Fatalf("expected sample count to remain 1 on unknown ACK, got %d", snap.SampleCount)
+	}
+
+	// Quarantined ACK
+	if ok, err := o.Quarantine(context.Background(), other.MessageID, "held"); err != nil || !ok {
+		t.Fatalf("Quarantine: %v/%v", ok, err)
+	}
+	tracker.RecordFirstPublish(other.MessageID)
+	qTopic, qPayload := validACK(t, other.MessageID, outboxBaseTime)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: qTopic, payload: qPayload}); err != nil {
+		t.Fatalf("quarantined handleAdmission: %v", err)
+	}
+	if snap := tracker.Snapshot(); snap.SampleCount != 1 {
+		t.Fatalf("expected sample count to remain 1 on quarantined ACK, got %d", snap.SampleCount)
+	}
+
+	// Malformed ACK
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: "gateways/gateway_001/acks/" + uuid.NewString(), payload: []byte("not-json")}); err != nil {
+		t.Fatalf("malformed handleAdmission: %v", err)
+	}
+	if snap := tracker.Snapshot(); snap.SampleCount != 1 {
+		t.Fatalf("expected sample count to remain 1 on malformed ACK, got %d", snap.SampleCount)
+	}
+}

@@ -61,6 +61,8 @@ commands:
 run flags:
   --batches N             stop after N unique batches (0 = until stopped)
   --completion-timeout D  time to wait for application ACKs after the target
+  --measure               enable bounded ACK latency measurement (requires --batches > 0)
+  --measure-capacity N    explicit measurement capacity (defaults to --batches)
 `
 
 // simTransport is the transport surface the run lifecycle composes. It is the
@@ -94,7 +96,7 @@ func run(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, stdou
 		ctx = context.Background()
 	}
 	if len(args) == 0 {
-		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout)
+		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0)
 	}
 	switch args[0] {
 	case "run":
@@ -119,6 +121,9 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 	fs.SetOutput(stderr)
 	batches := fs.Int("batches", 0, "stop after N unique batches (0 = until stopped)")
 	completion := fs.Duration("completion-timeout", defaultCompletionTimeout, "time to wait for application ACKs after the batch target")
+	measure := fs.Bool("measure", false, "record ACK latency and emit measurement summary for finite run (requires --batches > 0)")
+	measureLatency := fs.Bool("measure-latency", false, "alias for --measure")
+	measureCap := fs.Int("measure-capacity", 0, "explicit measurement capacity (defaults to --batches)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -137,18 +142,53 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 		writef(stderr, "--completion-timeout must be between %s and %s\n", minCompletionTimeout, maxCompletionTimeout)
 		return 2
 	}
-	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion)
+
+	capacity := 0
+	if *measure || *measureLatency {
+		if *batches <= 0 {
+			writef(stderr, "--measure requires a finite run (--batches > 0)\n")
+			return 2
+		}
+		if *measureCap > 0 {
+			if *measureCap > gatewaysim.MaxMeasurementCapacity {
+				writef(stderr, "--measure-capacity must be between 1 and %d\n", gatewaysim.MaxMeasurementCapacity)
+				return 2
+			}
+			capacity = *measureCap
+		} else {
+			if *batches > gatewaysim.MaxMeasurementCapacity {
+				writef(stderr, "--batches exceeds max measurement capacity %d; specify --measure-capacity explicitly\n", gatewaysim.MaxMeasurementCapacity)
+				return 2
+			}
+			capacity = *batches
+		}
+	} else if *measureCap > 0 {
+		writef(stderr, "--measure-capacity requires --measure\n")
+		return 2
+	}
+
+	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity)
 }
 
 // runSimulator composes the outbox, ACK processor, transport and scheduler and
 // runs until the context ends, a finite target completes, or a classified fatal
 // stop occurs. Every resource opened here is closed on every exit path, and
 // SQLite is closed only after the scheduler and ACK worker have stopped.
-func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration) int {
+func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity int) int {
 	cfg, err := gatewaysim.Load(lookup)
 	if err != nil {
 		writef(stderr, "configuration error: %s\n", err)
 		return 2
+	}
+
+	var tracker *gatewaysim.LatencyTracker
+	if measureCapacity > 0 {
+		t, err := gatewaysim.NewLatencyTracker(measureCapacity)
+		if err != nil {
+			writef(stderr, "error: %s\n", err)
+			return 2
+		}
+		tracker = t
 	}
 
 	outbox, err := gatewaysim.OpenOutbox(gatewaysim.OutboxConfig{
@@ -182,7 +222,7 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		_ = outbox.Close()
 	}
 
-	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight))
+	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight), gatewaysim.WithACKLatencyRecorder(tracker))
 	if err != nil {
 		writeln(stderr, "error: could not create the ACK processor")
 		closeAll()
@@ -205,6 +245,7 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		Config:           cfg,
 		FiniteBatch:      batches,
 		CompletionBudget: completionBudget,
+		Latency:          tracker,
 		Logger:           slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	})
 	if err != nil {
@@ -280,6 +321,11 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	writef(stdout, "run summary: enqueued=%d publish_attempts=%d app_acknowledged=%d pending_rows=%d pending_bytes=%d quarantined_rows=%d quarantined_bytes=%d completed=%t\n",
 		stats.UniqueEnqueued, stats.PublishAttempts, ackStats.Acknowledged,
 		counts.PendingRows, counts.PendingBytes, counts.QuarantinedRows, counts.QuarantinedBytes, stats.Completed)
+
+	if tracker != nil {
+		snap := tracker.Snapshot()
+		writef(stdout, "%s\n", gatewaysim.FormatMeasurementSummary(snap))
+	}
 
 	switch {
 	case stats.Completed:

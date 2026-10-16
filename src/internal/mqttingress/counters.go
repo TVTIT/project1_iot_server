@@ -16,6 +16,7 @@ type counters struct {
 	rejectedOversized  atomic.Int64
 	rejectedInvalidTpc atomic.Int64
 	queueFull          atomic.Int64
+	queueHighWater     atomic.Int64
 
 	processed          atomic.Int64
 	validationRejected atomic.Int64
@@ -70,6 +71,17 @@ type Snapshot struct {
 	// worker has already taken) and the fixed capacity.
 	QueueDepth    int
 	QueueCapacity int
+
+	// QueueHighWater is the highest admission-observed queue depth, sampled via
+	// len(queue) immediately following each successful non-blocking enqueue in
+	// Admit().
+	// Observation point: sampled in Admit() immediately after case i.queue <- it succeeds.
+	// Limits: bounded within [0, QueueCapacity]; monotonically non-decreasing.
+	// Note: Concurrent workers may consume items from the channel between the
+	// channel send and the len() observation, so this represents an
+	// admission-observed high-water mark rather than an absolute instantaneous
+	// queue peak.
+	QueueHighWater int
 }
 
 // Snapshot returns the current counters and queue state.
@@ -99,7 +111,8 @@ func (i *Ingress) Snapshot() Snapshot {
 		ProcessingLatencyTotal: time.Duration(i.counters.processingNanos.Load()),
 		ProcessingCount:        i.counters.processingCount.Load(),
 
-		QueueDepth:    len(i.queue),
-		QueueCapacity: cap(i.queue),
+		QueueDepth:     len(i.queue),
+		QueueCapacity:  cap(i.queue),
+		QueueHighWater: int(i.counters.queueHighWater.Load()),
 	}
 }
