@@ -15,7 +15,6 @@ defaults:
 
 jobs:
   stage2-e2e:
-    name: Legacy E2E contracts
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -314,7 +313,6 @@ jobs:
         run: sh scripts/test-stage2-admin.sh
 
   mosquitto-credential-integration:
-    name: Legacy credential checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -353,7 +351,6 @@ jobs:
           docker build --target credential-controller -t task2612-controller:ci src
 
   mosquitto-runtime-integration:
-    name: Legacy runtime contracts
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
