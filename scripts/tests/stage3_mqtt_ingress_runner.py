@@ -22,9 +22,21 @@ deduplicated and re-ACKed without new rows or version change.
 No deployment .env, deployment cert scripts, Auth/Storage stack, or SQLite
 simulator is used. Secrets travel only via env files and stdin; stdout/stderr
 are sanitized and raw payloads are never logged.
+
+Two modes share the same disposable fixture (broker + TimescaleDB + Go backend)
+so the Task 3.4 ingress slice stays selectable and is never bypassed:
+
+  * ``--mode ingress`` (default): the Task 3.4 bounded Python MQTT producer
+    publishes one hand-built 100-sample batch, then resends it byte-exact.
+  * ``--mode simulator``: the *actual* ``cmd/gateway`` CLI with the durable
+    SQLite outbox (``--batches 1``) publishes one synthetic 100-sample batch
+    against the broker, and independent SQL checks the known synthetic envelope
+    (sequence/sample_index/time/value/provenance) plus the reported state
+    advance and preserved desired/Gateway state.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import secrets
@@ -37,6 +49,7 @@ import tempfile
 import time
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -88,6 +101,64 @@ ACK_TIMEOUT = 20
 LOG_TIMEOUT = 30
 
 SECRETS: list[str] = []
+
+
+# --- Gateway simulator (Task 3.5) slice configuration -----------------------
+
+# The simulator connects to the host-published broker port via localhost so the
+# TLS server certificate SAN (DNS:localhost) is verified.
+SIM_BROKER_HOST = 'localhost'
+SIM_CLIENT_ID = 'gw_stage3_smoke_sim'
+SIM_COMPLETION_TIMEOUT = '30s'
+SIM_RUN_TIMEOUT = 120
+SIM_ADMIN_TIMEOUT = 30
+SIM_PROFILE = {
+    'GATEWAY_SAMPLE_RATE_HZ': '100',
+    'GATEWAY_SAMPLES_PER_BATCH': '100',
+    'GATEWAY_ACK_TIMEOUT': '5s',
+    'GATEWAY_RETRY_MIN_DELAY': '250ms',
+    'GATEWAY_RETRY_MAX_DELAY': '2s',
+    'GATEWAY_MQTT_CONNECT_TIMEOUT': '10s',
+    'GATEWAY_MQTT_SUBSCRIBE_TIMEOUT': '5s',
+    'GATEWAY_MQTT_PUBLISH_TIMEOUT': '5s',
+    'GATEWAY_SQLITE_TIMEOUT': '5s',
+    'GATEWAY_SHUTDOWN_TIMEOUT': '10s',
+    'GATEWAY_MAX_INFLIGHT': '8',
+}
+# The simulator emits syntheticValue(sequence) = 20 + clamped(sequence % 2000)/100
+# (a triangular wave between 20.00 and 30.00). These constants mirror
+# internal/gatewaysim/batch.go so the smoke checks the known synthetic output
+# independently of the Go code.
+SIM_PERIOD = 2000
+SIM_BASE = 20.0
+SIM_LAST_VALUE = SIM_BASE + (SAMPLE_COUNT - 1) / 100.0
+
+
+@dataclass(frozen=True)
+class Envelope:
+    """Parameters for the shared SQL state assertion.
+
+    message_id/boot_id are None when the assertion derives them from the
+    processed_messages ledger (simulator mode); when set they are the known
+    ingress values. last_observed_at is None when the assertion derives it from
+    the raw telemetry max(measured_at).
+    """
+
+    message_id: str | None
+    boot_id: str | None
+    sample_count: int
+    first_sequence: int
+    sample_interval_us: int
+    last_value: float
+    value_is_int: bool
+    last_observed_at: str | None
+    expected_reported_version: int
+    verify_rows: bool = False
+
+    @property
+    def last_sequence(self) -> int:
+        return self.first_sequence + self.sample_count - 1
+
 
 
 def sanitize(text: str) -> str:
@@ -207,21 +278,29 @@ def generate_certs(work: Path):
     (public / 'ca.crt').chmod(0o644)
 
 
-def build_server(work: Path) -> Path:
-    binary = work / 'server'
+def build_go_binary(work: Path, package: str, name: str) -> Path:
+    binary = work / name
     env = dict(ENV, CGO_ENABLED='0')
     for key in ('GOCACHE', 'GOMODCACHE', 'GOPROXY', 'GOPATH'):
         if key in os.environ:
             env[key] = os.environ[key]
     env.setdefault('GOCACHE', str(work / 'gocache'))
-    proc = subprocess.run(['go', 'build', '-o', str(binary), './cmd/server'],
+    proc = subprocess.run(['go', 'build', '-o', str(binary), package],
                           cwd=ROOT / 'src', env=env, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=300)
     if proc.returncode:
-        raise RuntimeError('server build failed: ' +
+        raise RuntimeError(f'{name} build failed: ' +
                            proc.stderr.decode('utf-8', errors='replace')[-4000:])
     binary.chmod(0o755)
     return binary
+
+
+def build_server(work: Path) -> Path:
+    return build_go_binary(work, './cmd/server', 'server')
+
+
+def build_gateway(work: Path) -> Path:
+    return build_go_binary(work, './cmd/gateway', 'gateway')
 
 
 def bootstrap_dynsec(work: Path, manager_password: str, backend_password: str) -> str:
@@ -428,52 +507,126 @@ def seed_graph(fixture: DatabaseFixture):
     """.encode())
 
 
-def assert_phase(fixture: DatabaseFixture, marker: str, message_id: str, boot_id: str):
+def assert_phase(fixture: DatabaseFixture, marker: str, env: Envelope):
+    """One shared, independent SQL state assertion for both modes.
+
+    It checks the ledger row, the raw telemetry rows, the single temporal
+    observation, the Sensor reported-state advance from the last sample and the
+    preserved desired/Gateway state. The expectation is supplied by ``env``: the
+    ingress slice keeps its fixed 1000..1099 envelope, while the simulator
+    validates its actual synthetic envelope and also checks per-row
+    sequence/sample_index/time/value consistency.
+    """
+    def q(value: str) -> str:
+        return "'" + value + "'"
+
+    if env.message_id is not None:
+        msg_known = (f"IF msg <> {q(env.message_id)}::uuid THEN "
+                     "RAISE EXCEPTION 'ledger message_id %', msg; END IF;")
+    else:
+        msg_known = ''
+    if env.boot_id is not None:
+        boot_known = (f"IF boot <> {q(env.boot_id)}::uuid THEN "
+                      "RAISE EXCEPTION 'ledger boot_id %', boot; END IF;")
+    else:
+        boot_known = ''
+    if env.last_observed_at is not None:
+        obs_sql = f"TIMESTAMPTZ {q(env.last_observed_at)}"
+    else:
+        obs_sql = ("(SELECT max(measured_at) FROM public.telemetry "
+                   f"WHERE gateway_id={q(GATEWAY_ID)} AND sensor_id={q(SENSOR_ID)} AND message_id = msg)")
+    if env.value_is_int:
+        value_check = (f"IF (rep->>'value')::bigint <> {int(env.last_value)} THEN "
+                       "RAISE EXCEPTION 'reported value %', rep->>'value'; END IF;")
+    else:
+        value_check = (f"IF abs((rep->>'value')::double precision - {env.last_value!r}) > 1e-9 THEN "
+                       "RAISE EXCEPTION 'reported value %', rep->>'value'; END IF;")
+
+    if env.verify_rows:
+        span_us = (env.sample_count - 1) * env.sample_interval_us
+        raw_filter = (f"t.gateway_id={q(GATEWAY_ID)} AND t.sensor_id={q(SENSOR_ID)} "
+                      "AND t.message_id = msg")
+        row_checks = f"""
+      IF EXISTS (
+        SELECT 1 FROM public.telemetry t
+        WHERE {raw_filter}
+          AND ( t.sequence_num < {env.first_sequence} OR t.sequence_num > {env.last_sequence}
+                OR t.sample_index <> t.sequence_num - {env.first_sequence}
+                OR t.boot_id <> boot
+                OR abs(t.value - ({SIM_BASE} + (CASE WHEN mod(t.sequence_num, {SIM_PERIOD}) > {SIM_PERIOD // 2}
+                     THEN {SIM_PERIOD} - mod(t.sequence_num, {SIM_PERIOD})
+                     ELSE mod(t.sequence_num, {SIM_PERIOD}) END)::double precision / 100.0)) > 1e-9 )
+      ) THEN RAISE EXCEPTION 'telemetry rows inconsistent with the synthetic envelope'; END IF;
+      IF (SELECT count(DISTINCT t.sequence_num) FROM public.telemetry t WHERE {raw_filter}) <> {env.sample_count}
+        THEN RAISE EXCEPTION 'telemetry distinct sequence count mismatch'; END IF;
+      IF (SELECT count(DISTINCT t.sample_index) FROM public.telemetry t WHERE {raw_filter}) <> {env.sample_count}
+        THEN RAISE EXCEPTION 'telemetry distinct sample_index count mismatch'; END IF;
+      IF (SELECT min(measured_at) FROM public.telemetry t WHERE {raw_filter})
+         + {span_us} * INTERVAL '1 microsecond'
+         <> (SELECT max(measured_at) FROM public.telemetry t WHERE {raw_filter})
+        THEN RAISE EXCEPTION 'telemetry time span does not match the sample interval'; END IF;
+"""
+    else:
+        row_checks = ''
+
     sql = f"""
     DO $$
     DECLARE
       raw_count int; ledger int; temporal int;
+      msg uuid; boot uuid;
+      l_first bigint; l_last bigint; l_count int; l_sensor text; l_topic text;
       t_val double precision; t_text text; t_bool boolean; t_meta jsonb; t_obs timestamptz;
       rep jsonb; des jsonb; rep_ver bigint; des_ver bigint;
       gw_rep jsonb; gw_des jsonb;
     BEGIN
-      SELECT count(*) INTO raw_count FROM public.telemetry
-        WHERE gateway_id='{GATEWAY_ID}' AND sensor_id='{SENSOR_ID}';
-      IF raw_count <> {SAMPLE_COUNT} THEN RAISE EXCEPTION 'raw count %', raw_count; END IF;
       SELECT count(*) INTO ledger FROM public.processed_messages
-        WHERE gateway_id='{GATEWAY_ID}' AND message_id='{message_id}';
+        WHERE gateway_id={q(GATEWAY_ID)} AND sensor_id={q(SENSOR_ID)};
       IF ledger <> 1 THEN RAISE EXCEPTION 'ledger rows %', ledger; END IF;
+      SELECT message_id, boot_id, first_sequence, last_sequence, sample_count, sensor_id, source_topic
+        INTO msg, boot, l_first, l_last, l_count, l_sensor, l_topic
+        FROM public.processed_messages
+        WHERE gateway_id={q(GATEWAY_ID)} AND sensor_id={q(SENSOR_ID)};
+      IF l_first <> {env.first_sequence} OR l_last <> {env.last_sequence} OR l_count <> {env.sample_count} THEN
+        RAISE EXCEPTION 'ledger envelope first/last/count % % %', l_first, l_last, l_count; END IF;
+      IF l_sensor <> {q(SENSOR_ID)} THEN RAISE EXCEPTION 'ledger sensor_id %', l_sensor; END IF;
+      IF l_topic <> {q(TELEMETRY_TOPIC)} THEN RAISE EXCEPTION 'ledger source_topic %', l_topic; END IF;
+      {msg_known}
+      {boot_known}
+      SELECT count(*) INTO raw_count FROM public.telemetry
+        WHERE gateway_id={q(GATEWAY_ID)} AND sensor_id={q(SENSOR_ID)} AND message_id = msg;
+      IF raw_count <> {env.sample_count} THEN RAISE EXCEPTION 'raw count %', raw_count; END IF;
       SELECT count(*) INTO temporal FROM public.twin_temporal_values
-        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id='{SENSOR_URN}')
-          AND property_name='sample_interval_us' AND message_id='{message_id}';
+        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id={q(SENSOR_URN)})
+          AND property_name='sample_interval_us' AND message_id = msg;
       IF temporal <> 1 THEN RAISE EXCEPTION 'temporal rows %', temporal; END IF;
       SELECT value_number, value_text, value_boolean, metadata, observed_at
         INTO t_val, t_text, t_bool, t_meta, t_obs
         FROM public.twin_temporal_values
-        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id='{SENSOR_URN}')
-          AND property_name='sample_interval_us' AND message_id='{message_id}';
-      IF t_val <> {SAMPLE_INTERVAL_US} THEN RAISE EXCEPTION 'temporal value_number %', t_val; END IF;
+        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id={q(SENSOR_URN)})
+          AND property_name='sample_interval_us' AND message_id = msg;
+      IF t_val <> {env.sample_interval_us} THEN RAISE EXCEPTION 'temporal value_number %', t_val; END IF;
       IF t_text IS NOT NULL OR t_bool IS NOT NULL THEN
         RAISE EXCEPTION 'temporal typed columns are not exclusive'; END IF;
-      IF t_meta->>'unit' <> 'us' OR t_meta->>'source' <> 'telemetry_batch' OR t_meta->>'boot_id' <> '{boot_id}' THEN
+      IF t_meta->>'unit' <> 'us' OR t_meta->>'source' <> 'telemetry_batch' OR t_meta->>'boot_id' <> boot::text THEN
         RAISE EXCEPTION 'temporal metadata %', t_meta; END IF;
-      IF t_obs <> TIMESTAMPTZ '{LAST_OBSERVED_AT}' THEN RAISE EXCEPTION 'temporal observed_at %', t_obs; END IF;
+      IF t_obs <> {obs_sql} THEN RAISE EXCEPTION 'temporal observed_at %', t_obs; END IF;
       SELECT reported_state, desired_state, reported_version, desired_version
         INTO rep, des, rep_ver, des_ver FROM public.twin_states
-        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id='{SENSOR_URN}');
-      IF rep_ver <> 1 THEN RAISE EXCEPTION 'sensor reported_version %', rep_ver; END IF;
-      IF (rep->>'value')::bigint <> {LAST_VALUE} THEN RAISE EXCEPTION 'reported value %', rep->>'value'; END IF;
-      IF (rep->>'sequence_num')::bigint <> {LAST_SEQUENCE} THEN RAISE EXCEPTION 'reported sequence %', rep->>'sequence_num'; END IF;
-      IF (rep->>'sample_interval_us')::bigint <> {SAMPLE_INTERVAL_US} THEN RAISE EXCEPTION 'reported interval %', rep->>'sample_interval_us'; END IF;
-      IF rep->>'unit' IS DISTINCT FROM '{SENSOR_UNIT}' THEN RAISE EXCEPTION 'reported unit %', rep->>'unit'; END IF;
-      IF rep->>'boot_id' <> '{boot_id}' THEN RAISE EXCEPTION 'reported boot_id %', rep->>'boot_id'; END IF;
-      IF (rep->>'observed_at')::timestamptz <> TIMESTAMPTZ '{LAST_OBSERVED_AT}' THEN
+        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id={q(SENSOR_URN)});
+      IF rep_ver <> {env.expected_reported_version} THEN RAISE EXCEPTION 'sensor reported_version %', rep_ver; END IF;
+      {value_check}
+      IF (rep->>'sequence_num')::bigint <> {env.last_sequence} THEN RAISE EXCEPTION 'reported sequence %', rep->>'sequence_num'; END IF;
+      IF (rep->>'sample_interval_us')::bigint <> {env.sample_interval_us} THEN RAISE EXCEPTION 'reported interval %', rep->>'sample_interval_us'; END IF;
+      IF rep->>'unit' IS DISTINCT FROM {q(SENSOR_UNIT)} THEN RAISE EXCEPTION 'reported unit %', rep->>'unit'; END IF;
+      IF rep->>'boot_id' <> boot::text THEN RAISE EXCEPTION 'reported boot_id %', rep->>'boot_id'; END IF;
+      IF (rep->>'observed_at')::timestamptz <> {obs_sql} THEN
         RAISE EXCEPTION 'reported observed_at %', rep->>'observed_at'; END IF;
-      IF des <> '{json.dumps(SENSOR_DESIRED)}'::jsonb OR des_ver <> {SENSOR_DESIRED_VERSION} THEN
+      {row_checks}
+      IF des <> {q(json.dumps(SENSOR_DESIRED))}::jsonb OR des_ver <> {SENSOR_DESIRED_VERSION} THEN
         RAISE EXCEPTION 'sensor desired state changed'; END IF;
       SELECT reported_state, desired_state INTO gw_rep, gw_des FROM public.twin_states
-        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id='{GATEWAY_URN}');
-      IF gw_rep <> '{json.dumps(GATEWAY_REPORTED)}'::jsonb OR gw_des <> '{json.dumps(GATEWAY_DESIRED)}'::jsonb THEN
+        WHERE entity_id=(SELECT id FROM public.twin_entities WHERE entity_id={q(GATEWAY_URN)});
+      IF gw_rep <> {q(json.dumps(GATEWAY_REPORTED))}::jsonb OR gw_des <> {q(json.dumps(GATEWAY_DESIRED))}::jsonb THEN
         RAISE EXCEPTION 'gateway state changed'; END IF;
       RAISE NOTICE '{marker}';
     END $$;
@@ -481,6 +634,98 @@ def assert_phase(fixture: DatabaseFixture, marker: str, message_id: str, boot_id
     _, out = fixture.sql(sql.encode())
     if marker.encode() not in out:
         raise RuntimeError(f'SQL assertions did not emit {marker}')
+
+
+def parse_run_summary(stdout: str) -> dict:
+    """Parse the CLI's single ``run summary:`` line into a key=value mapping."""
+    for line in stdout.splitlines():
+        if line.startswith('run summary:'):
+            summary = {}
+            for token in line[len('run summary:'):].split():
+                if '=' in token:
+                    key, value = token.split('=', 1)
+                    summary[key] = value
+            return summary
+    raise RuntimeError('gateway run did not print a run summary')
+
+
+def run_gateway(binary: Path, args, env, timeout: int, expect: bool = True) -> str:
+    """Run the CLI with a bounded subprocess timeout; never echo raw output."""
+    proc = subprocess.run([str(binary), *args], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout)
+    out = proc.stdout.decode('utf-8', errors='replace')
+    err = proc.stderr.decode('utf-8', errors='replace')
+    if (proc.returncode == 0) != expect:
+        raise RuntimeError(f'gateway {" ".join(args)} exit={proc.returncode}: ' +
+                           sanitize((out[-600:] + err[-600:])))
+    return out
+
+
+def run_simulator_producer(gateway_bin: Path, work: Path, broker_port: int, gateway_password: str):
+    """Run the actual cmd/gateway CLI through the broker for one finite batch.
+
+    The CLI subscribes to its own ACK filter before any publish (readiness gate)
+    and only deletes a row after the application ACK commits. The run must exit 0
+    with a truthful completed/counted summary, and the path-only count/pending
+    administrative reports must show an empty outbox.
+    """
+    outbox_path = work / 'gateway_outbox.db'
+    env = dict(ENV)
+    env.update(SIM_PROFILE)
+    env.update({
+        'GATEWAY_ID': GATEWAY_ID,
+        'SENSOR_ID': SENSOR_ID,
+        'GATEWAY_MQTT_BROKER_URL': f'ssl://{SIM_BROKER_HOST}:{broker_port}',
+        'GATEWAY_MQTT_CLIENT_ID': SIM_CLIENT_ID,
+        'GATEWAY_MQTT_USERNAME': GATEWAY_ID,
+        'GATEWAY_MQTT_PASSWORD': gateway_password,
+        'GATEWAY_MQTT_CA_FILE': str(work / 'ca.crt'),
+        'GATEWAY_OUTBOX_PATH': str(outbox_path),
+    })
+
+    stdout = run_gateway(gateway_bin, ['run', '--batches', '1', '--completion-timeout', SIM_COMPLETION_TIMEOUT],
+                         env, SIM_RUN_TIMEOUT)
+    summary = parse_run_summary(stdout)
+    truthful = (summary.get('completed') == 'true' and summary.get('enqueued') == '1'
+                and summary.get('app_acknowledged') == '1' and summary.get('pending_rows') == '0'
+                and summary.get('pending_bytes') == '0' and summary.get('quarantined_rows') == '0'
+                and summary.get('quarantined_bytes') == '0')
+    if not truthful:
+        raise RuntimeError('gateway run summary is not a truthful completed/0-pending report: ' +
+                           sanitize(stdout[-600:]))
+    print('PASS: gateway CLI run exit 0 with completed=true enqueued=%s app_acknowledged=%s '
+          'pending_rows=%s quarantined_rows=%s' % (summary.get('enqueued'), summary.get('app_acknowledged'),
+                                                   summary.get('pending_rows'), summary.get('quarantined_rows')),
+          flush=True)
+
+    # Path-only administrative reports: the outbox must be empty with no
+    # quarantined rows, and pending must list nothing.
+    admin_env = dict(ENV, GATEWAY_OUTBOX_PATH=str(outbox_path))
+    count_out = run_gateway(gateway_bin, ['count'], admin_env, SIM_ADMIN_TIMEOUT).strip()
+    if count_out != 'pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0':
+        raise RuntimeError('gateway count did not report an empty outbox: ' + sanitize(count_out))
+    pending_out = run_gateway(gateway_bin, ['pending', '--limit', '5'], admin_env, SIM_ADMIN_TIMEOUT)
+    if 'pending message_id=' in pending_out or 'pending_rows=0' not in pending_out:
+        raise RuntimeError('gateway pending did not report an empty outbox: ' + sanitize(pending_out.strip()))
+    print('PASS: gateway count/pending (path-only) report 0 pending and 0 quarantined', flush=True)
+
+
+def simulator_envelope() -> Envelope:
+    """Expectation for the simulator's one synthetic batch (known synthetic
+    output); the ledger message_id/boot_id and the observed_at are derived from
+    the committed rows by the shared SQL assertion."""
+    return Envelope(
+        message_id=None,
+        boot_id=None,
+        sample_count=SAMPLE_COUNT,
+        first_sequence=0,
+        sample_interval_us=SAMPLE_INTERVAL_US,
+        last_value=SIM_LAST_VALUE,
+        value_is_int=False,
+        last_observed_at=None,
+        expected_reported_version=1,
+        verify_rows=True,
+    )
 
 
 def docker_available() -> bool:
@@ -492,7 +737,13 @@ def docker_available() -> bool:
         return False
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description='Task 3.4/3.5 bounded real integration smoke')
+    parser.add_argument('--mode', choices=('ingress', 'simulator'), default='ingress',
+                        help='ingress: Task 3.4 Python producer; simulator: actual cmd/gateway CLI')
+    opts = parser.parse_args(argv)
+    mode = opts.mode
+
     if not docker_available():
         print('SKIP: docker daemon or CLI unavailable', flush=True)
         return 0
@@ -517,6 +768,10 @@ def main() -> int:
     try:
         print('stage=build-server', flush=True)
         server = build_server(work)
+        gateway_bin = None
+        if mode == 'simulator':
+            print('stage=build-gateway', flush=True)
+            gateway_bin = build_gateway(work)
         print('stage=generate-certs', flush=True)
         generate_certs(work)
 
@@ -623,44 +878,64 @@ def main() -> int:
         wait_http(backend_port, '/healthz', READY_TIMEOUT)
         print('PASS: backend /readyz and /healthz after positive ingress subscription', flush=True)
 
-        print('stage=producer', flush=True)
-        payload = build_payload()
-        batch = json.loads(payload.decode())
-        message_id = batch['message_id']
-        # The Dashboard-reported provenance (boot_id) and observed_at must be the
-        # exact values the payload carried, so capture the batch boot_id.
-        boot_id = batch['boot_id']
-        producer = GatewayProducer(broker_port, work / 'ca.crt', GATEWAY_ID, gateway_password)
-        try:
-            producer.subscribe(ACK_FILTER)   # SUBACK verified before any publish
-            producer.publish_qos1(TELEMETRY_TOPIC, payload)
-            ack_topic, ack_body = producer.read_publish()
-        finally:
-            producer.close()
-        expected_topic = f'gateways/{GATEWAY_ID}/acks/{message_id}'
-        if ack_topic != expected_topic:
-            raise RuntimeError(f'ACK topic mismatch: {ack_topic}')
-        verify_ack(message_id, ack_body)
-        print('PASS: post-commit application ACK received on exact topic/status/version/type/id', flush=True)
+        if mode == 'simulator':
+            print('stage=simulator', flush=True)
+            run_simulator_producer(gateway_bin, work, broker_port, gateway_password)
+            assert_phase(fixture, 'SIMULATOR_STATE_PASS', simulator_envelope())
+            print('PASS: independent SQL asserts 100 raw synthetic rows (sequence/sample_index/time/'
+                  'value formula) / 1 ledger / 1 temporal (value+metadata+observed_at) / reported last '
+                  'value from the synthetic envelope with unit+boot_id+observed_at+interval +1 / '
+                  'desired & gateway preserved', flush=True)
+        else:
+            print('stage=producer', flush=True)
+            payload = build_payload()
+            batch = json.loads(payload.decode())
+            message_id = batch['message_id']
+            # The Dashboard-reported provenance (boot_id) and observed_at must be the
+            # exact values the payload carried, so capture the batch boot_id.
+            boot_id = batch['boot_id']
+            producer = GatewayProducer(broker_port, work / 'ca.crt', GATEWAY_ID, gateway_password)
+            try:
+                producer.subscribe(ACK_FILTER)   # SUBACK verified before any publish
+                producer.publish_qos1(TELEMETRY_TOPIC, payload)
+                ack_topic, ack_body = producer.read_publish()
+            finally:
+                producer.close()
+            expected_topic = f'gateways/{GATEWAY_ID}/acks/{message_id}'
+            if ack_topic != expected_topic:
+                raise RuntimeError(f'ACK topic mismatch: {ack_topic}')
+            verify_ack(message_id, ack_body)
+            print('PASS: post-commit application ACK received on exact topic/status/version/type/id', flush=True)
 
-        assert_phase(fixture, 'PHASE1_STATE_PASS', message_id, boot_id)
-        print('PASS: SQL asserts 100 raw / 1 ledger / 1 temporal (value+metadata+observed_at) / '
-              'reported state from last sample with unit+boot_id+observed_at+interval +1 / desired & gateway preserved', flush=True)
+            ingress_env = Envelope(
+                message_id=message_id,
+                boot_id=boot_id,
+                sample_count=SAMPLE_COUNT,
+                first_sequence=FIRST_SEQUENCE,
+                sample_interval_us=SAMPLE_INTERVAL_US,
+                last_value=float(LAST_VALUE),
+                value_is_int=True,
+                last_observed_at=LAST_OBSERVED_AT,
+                expected_reported_version=1,
+            )
+            assert_phase(fixture, 'PHASE1_STATE_PASS', ingress_env)
+            print('PASS: SQL asserts 100 raw / 1 ledger / 1 temporal (value+metadata+observed_at) / '
+                  'reported state from last sample with unit+boot_id+observed_at+interval +1 / desired & gateway preserved', flush=True)
 
-        # Resend the exact topic/bytes/id: duplicate branch must re-ACK with no new rows.
-        print('stage=resend', flush=True)
-        producer = GatewayProducer(broker_port, work / 'ca.crt', GATEWAY_ID, gateway_password)
-        try:
-            producer.subscribe(ACK_FILTER)
-            producer.publish_qos1(TELEMETRY_TOPIC, payload)
-            ack_topic2, ack_body2 = producer.read_publish()
-        finally:
-            producer.close()
-        if ack_topic2 != expected_topic:
-            raise RuntimeError(f'resend ACK topic mismatch: {ack_topic2}')
-        verify_ack(message_id, ack_body2)
-        assert_phase(fixture, 'PHASE2_DUPLICATE_PASS', message_id, boot_id)
-        print('PASS: exact resend re-ACKed with unchanged counts and version', flush=True)
+            # Resend the exact topic/bytes/id: duplicate branch must re-ACK with no new rows.
+            print('stage=resend', flush=True)
+            producer = GatewayProducer(broker_port, work / 'ca.crt', GATEWAY_ID, gateway_password)
+            try:
+                producer.subscribe(ACK_FILTER)
+                producer.publish_qos1(TELEMETRY_TOPIC, payload)
+                ack_topic2, ack_body2 = producer.read_publish()
+            finally:
+                producer.close()
+            if ack_topic2 != expected_topic:
+                raise RuntimeError(f'resend ACK topic mismatch: {ack_topic2}')
+            verify_ack(message_id, ack_body2)
+            assert_phase(fixture, 'PHASE2_DUPLICATE_PASS', ingress_env)
+            print('PASS: exact resend re-ACKed with unchanged counts and version', flush=True)
 
         print('stage=shutdown', flush=True)
         run(['docker', 'stop', '-t', '30', backend_cid], timeout=60)
@@ -717,7 +992,11 @@ def main() -> int:
         else:
             print('Fixture cleanup verified: container/network/volume/workdir absent', flush=True)
 
-    print('PASS: stage3 mqtt ingress end-to-end smoke (broker -> backend -> DB -> ACK)', flush=True)
+    if mode == 'simulator':
+        print('PASS: stage3 gateway simulator end-to-end smoke '
+              '(cmd/gateway CLI + durable SQLite -> broker -> backend -> DB -> app ACK)', flush=True)
+    else:
+        print('PASS: stage3 mqtt ingress end-to-end smoke (broker -> backend -> DB -> ACK)', flush=True)
     return 0
 
 
