@@ -72,6 +72,19 @@ mục dưới đây ghi nhận trạng thái giải quyết và các giới hạ
 | Probe MQTT test dùng `keepalive=0` | Phiên probe để yên > 7,5s (1,5× keepalive 5s mặc định) từng bị broker ngắt, làm hỏng bằng chứng dài hạn | `AclProbe` truyền `keepalive=0` qua `mqtt_connection` (mặc định 5s giữ nguyên cho mọi caller khác) | Khi thay đổi helper kết nối dùng chung |
 | Runner Task 3.6 mới chạy trên Linux amd64; chưa có runtime trên bo mạch ARM | Bằng chứng là chạy thật trên Docker host amd64, chưa chứng minh runtime trên bo mạch nhúng ARM | Chạy lại ở checkpoint tích hợp thiết bị; giữ nguyên cấu hình headless và network | Task 3.7 / checkpoint triển khai |
 
+### Cập nhật Task 3.7 — đo workload 600 batches, CI và bàn giao Stage 4 (16/10/2026)
+
+Lượt đo workload 600 batches / 60.000 samples (U14) và lane CI tích hợp Stage 3 (`stage3-uplink-integration`) đã được xây dựng và kiểm chứng **PASS cục bộ (local PASS)** trên runner dịch vụ thật. Bảng dưới ghi nhận các giới hạn kỹ thuật và ranh giới kiểm chuẩn mới phát sinh từ Task 3.7.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| Workload 600 batches và remote CI chưa chạy trên GitHub Actions | U14 và CI lane mới kiểm chứng PASS trên máy cục bộ; GitHub Actions remote run chưa chạy (`remote CI NOT RUN`, `CI workload NOT RUN`) | Bằng chứng cục bộ là đủ cho ranh giới bàn giao Stage 3; remote CI sẽ được kích hoạt khi mã nguồn được push theo luồng của dự án | Khi có quyền push và chạy CI từ xa |
+| Tần suất lấy mẫu tài nguyên trung bình ~3.022s (không phải 1Hz tuyệt đối) | Không bắt trọn các biến động tức thời cực ngắn; các giá trị CPU/RAM đỉnh là giá trị quan sát tại chu kỳ lấy mẫu | Báo cáo trung thực số đo quan sát được từ 199 mẫu; không nội suy làm tròn thành 1Hz; số liệu phản ánh đúng tải trung bình và xu hướng | Khi cần nghiên cứu chi tiết profiling sâu hơn |
+| Thiếu số liệu in-flight và thời gian từ run start đến last enqueue | Báo cáo không có số đo in-flight liên tục và thời gian `run_start_to_last_enqueue` | Ghi nhận rõ ràng là `unavailable` trong summary; không tự suy đoán hay bịa giá trị | Khi nâng cấp bộ đo của simulator |
+| Container không đặt hạn ngạch CPU/RAM riêng biệt | Các container backend, gateway, broker, database dùng chung tài nguyên máy host (`cpu_quota=0`, `memory_bytes=0`) | Ghi nhận rõ ràng cấu hình container trong summary; không tuyên bố hệ thống chạy trong môi trường tài nguyên cô lập cứng | Khi cấu hình production deployment |
+| Tệp SQLite outbox còn ~36KB sau drain | Dung lượng tệp trên đĩa giữ nguyên cấu trúc trang/journal của SQLite sau khi xóa hết hàng | Để dung lượng đĩa trống dự phòng ≥ 2× `GATEWAY_OUTBOX_MAX_BYTES` trên thiết bị nhúng | Khi tích hợp trên bo mạch phần cứng |
+| Chưa có kiểm thử runtime trên bo mạch nhúng ARM | Chỉ mới xác nhận biên dịch chéo (cross-build) thành công cho kiến trúc ARMv7 | Chạy và đo đạc trên bo mạch phần cứng thực tế (TI AM5728 / Luckfox Pico) tại checkpoint tích hợp thiết bị | Checkpoint tích hợp thiết bị / Giai đoạn 9 |
+
 ---
 
 ## 1. Phân Tích Chuyên Sâu Các Giới Hạn Kỹ Thuật (Detailed Technical Limitations)
