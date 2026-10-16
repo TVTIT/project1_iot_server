@@ -15,7 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"io"
+
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 )
 
 // The transport is the Gateway-side mirror of internal/mqttingress: it keeps
@@ -660,7 +663,7 @@ func (t *Transport) supervise(ctx context.Context) {
 		lt, err := t.connectOnce(ctx)
 		if err != nil {
 			t.counters.connectFailures.Add(1)
-			t.log.Debug("gatewaysim transport connect failed", "event", "connect_failed")
+			t.log.Warn("gatewaysim transport connect failed", "event", "connect_failed", "reason", classifyConnectError(err))
 			if !t.waitBackoff(ctx, attempt) {
 				return
 			}
@@ -678,7 +681,7 @@ func (t *Transport) supervise(ctx context.Context) {
 			continue
 		}
 		t.counters.connected.Add(1)
-		t.log.Debug("gatewaysim transport connected", "event", "connected", "epoch", lt.epoch)
+		t.log.Info("gatewaysim transport connected", "event", "connected", "epoch", lt.epoch)
 		attempt = 0
 
 		select {
@@ -694,6 +697,7 @@ func (t *Transport) supervise(ctx context.Context) {
 		t.clearCurrent(lt)
 		clean := t.closeLifetime(lt, t.opts.CloseWaitTimeout)
 		t.counters.disconnected.Add(1)
+		t.log.Info("gatewaysim transport disconnected", "event", "disconnected", "epoch", lt.epoch)
 
 		if !clean {
 			// A tracked Publish invocation stayed wedged after its socket was
@@ -777,6 +781,7 @@ func (t *Transport) connectOnce(ctx context.Context) (*lifetime, error) {
 	}
 
 	lt.subscribed.Store(true)
+	t.log.Info("gatewaysim transport subscribed", "event", "subscribed", "epoch", lt.epoch, "filter", t.filter)
 	return lt, nil
 }
 
@@ -850,6 +855,7 @@ func (t *Transport) onLost(lt *lifetime) {
 	lt.signalWake()
 	t.clearCurrent(lt)
 	t.counters.connectionLost.Add(1)
+	t.log.Info("gatewaysim transport connection lost", "event", "connection_lost", "epoch", lt.epoch)
 }
 
 // closeLifetime interrupts a lifetime: it marks it failed, closes the tracked
@@ -1098,3 +1104,48 @@ func (t *Transport) Snapshot() TransportSnapshot {
 
 // *ACKProcessor is the production ACK admitter for the transport.
 var _ ACKAdmitter = (*ACKProcessor)(nil)
+
+// classifyConnectError maps a connection failure to a safe allowlisted reason code.
+// It never stringifies the underlying error or copies broker URLs, paths, usernames,
+// or secrets into log output.
+func classifyConnectError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var uae x509.UnknownAuthorityError
+	var puae *x509.UnknownAuthorityError
+	if errors.As(err, &uae) || errors.As(err, &puae) {
+		return "tls_unknown_authority"
+	}
+	var hne x509.HostnameError
+	var phne *x509.HostnameError
+	if errors.As(err, &hne) || errors.As(err, &phne) {
+		return "tls_hostname_mismatch"
+	}
+	var cie x509.CertificateInvalidError
+	var pcie *x509.CertificateInvalidError
+	if errors.As(err, &cie) || errors.As(err, &pcie) {
+		return "tls_certificate_invalid"
+	}
+	var cve *tls.CertificateVerificationError
+	if errors.As(err, &cve) {
+		return "tls_certificate_verification"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "deadline_exceeded"
+	}
+	if errors.Is(err, packets.ErrorRefusedBadUsernameOrPassword) || errors.Is(err, packets.ErrorRefusedNotAuthorised) {
+		return "authentication_rejected"
+	}
+	if errors.Is(err, errLifetimeClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "connection_closed"
+	}
+	return "connection_failed"
+}

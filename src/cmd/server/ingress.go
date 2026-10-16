@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -145,6 +146,34 @@ func (r ingressRuntime) drainAndClose(ctx context.Context) error {
 	drainErr := r.ingress.Drain(ctx)
 	closeErr := r.transport.Close(ctx)
 	return errors.Join(drainErr, closeErr)
+}
+
+// logSummary logs a payload-free, driver-error-free lifecycle summary of the
+// ingress counters using stable numeric fields so integration runners can verify
+// worker outcomes (such as persist failures or queue saturation) without metrics
+// endpoints or debug APIs.
+func (r ingressRuntime) logSummary() {
+	if !r.enabled || r.ingress == nil {
+		return
+	}
+	snap := r.ingress.Snapshot()
+	slog.Info("telemetry ingress summary",
+		"accepted", snap.Accepted,
+		"queue_full", snap.QueueFull,
+		"processed", snap.Processed,
+		"validation_rejected", snap.ValidationRejected,
+		"persist_failures", snap.PersistFailures,
+		"commit_unconfirmed", snap.CommitUnconfirmed,
+		"identity_mismatch", snap.IdentityMismatch,
+		"ack_build_failures", snap.ACKBuildFailures,
+		"committed", snap.Committed,
+		"duplicate_committed", snap.DuplicateCommitted,
+		"samples_new", snap.SamplesNew,
+		"ack_published", snap.ACKPublished,
+		"ack_publish_failures", snap.ACKPublishFailures,
+		"queue_depth", snap.QueueDepth,
+		"queue_capacity", snap.QueueCapacity,
+	)
 }
 
 // databasePinger, transportReadiness and admissionReadiness are the small

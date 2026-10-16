@@ -89,6 +89,7 @@ func run() error {
 			if err := ingress.drainAndClose(ctx); err != nil {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("telemetry ingress shutdown: %w", err))
 			}
+			ingress.logSummary()
 			if serverReady {
 				if err := <-httpErrors; err != nil {
 					_ = server.Close()

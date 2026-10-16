@@ -405,7 +405,11 @@ func (i *Ingress) logReject(stage string, err error) {
 	if errors.As(err, &reason) && reason != nil {
 		code = string(reason.Code)
 	}
-	i.logger.Debug("mqtt ingress item not acknowledged",
+	level := slog.LevelDebug
+	if stage == "persist" {
+		level = slog.LevelWarn
+	}
+	i.logger.Log(context.Background(), level, "mqtt ingress item not acknowledged",
 		"stage", stage,
 		"reason_code", code,
 		"failure_class", int(telemetry.ClassifyFailure(err)),

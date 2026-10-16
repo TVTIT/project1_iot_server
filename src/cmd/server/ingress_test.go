@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,9 +10,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -240,5 +243,41 @@ func TestIngressReadinessCheckerEnabledReturnsComposite(t *testing.T) {
 	}
 	if composite.transport == nil || composite.ingress == nil {
 		t.Fatal("composite readiness missing transport/ingress")
+	}
+}
+
+func TestLogSummaryDisabledIsInert(_ *testing.T) {
+	runtime := ingressRuntime{}
+	// Must not panic or log when disabled.
+	runtime.logSummary()
+}
+
+func TestLogSummaryEnabledEmitsStructuredSummary(t *testing.T) {
+	cfg := ingressTestConfig(writeIngressTestCA(t))
+	runtime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatalf("composeIngress = %v", err)
+	}
+
+	var buf bytes.Buffer
+	testLogger := slog.New(slog.NewTextHandler(&buf, nil))
+	oldLogger := slog.Default()
+	slog.SetDefault(testLogger)
+	defer slog.SetDefault(oldLogger)
+
+	runtime.logSummary()
+
+	out := buf.String()
+	for _, expectedField := range []string{
+		"msg=\"telemetry ingress summary\"",
+		"accepted=0",
+		"queue_full=0",
+		"persist_failures=0",
+		"committed=0",
+		"queue_capacity=256",
+	} {
+		if !strings.Contains(out, expectedField) {
+			t.Fatalf("logSummary output missing field %q; full log:\n%s", expectedField, out)
+		}
 	}
 }

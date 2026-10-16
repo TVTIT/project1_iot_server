@@ -1,10 +1,12 @@
 package gatewaysim
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -23,6 +25,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 
 	"iot-platform/internal/telemetry"
 )
@@ -1187,5 +1190,148 @@ func TestTransportSnapshotReportsReadyAndEpoch(t *testing.T) {
 	snap := tr.Snapshot()
 	if !snap.Ready || snap.Epoch != lt.epoch {
 		t.Fatalf("snapshot = %+v, want ready epoch %d", snap, lt.epoch)
+	}
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func TestTransportLogsConnectionAndSubscriptionEvents(t *testing.T) {
+	var logBuf safeBuffer
+	testLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{openOnConnect: true} }
+	tr := newTestTransport(t, &recordAdmitter{}, h, func(o *TransportOptions) {
+		o.Logger = testLogger
+	})
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start = %v", err)
+	}
+	defer func() { _ = tr.Stop(context.Background()) }()
+
+	first := <-h.created
+	waitReadyWithin(t, tr, time.Second)
+
+	// Cause connection loss to trigger reconnect and second epoch.
+	first.lose(errors.New("simulated disconnect"))
+	second := <-h.created
+	if second == first {
+		t.Fatal("replacement reused the old lifetime")
+	}
+	waitReadyWithin(t, tr, time.Second)
+
+	// Stop transport to quiesce supervisor before inspecting logs.
+	if err := tr.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+
+	logs := logBuf.String()
+	for _, needle := range []string{
+		`event=connected epoch=1`,
+		`event=subscribed epoch=1 filter=gateways/gateway_001/acks/#`,
+		`event=connection_lost epoch=1`,
+		`event=disconnected epoch=1`,
+		`event=connected epoch=2`,
+		`event=subscribed epoch=2 filter=gateways/gateway_001/acks/#`,
+	} {
+		if !bytes.Contains([]byte(logs), []byte(needle)) {
+			t.Errorf("missing log entry %q in logs:\n%s", needle, logs)
+		}
+	}
+	for _, forbidden := range []string{"password", "secret", "private"} {
+		if bytes.Contains([]byte(logs), []byte(forbidden)) {
+			t.Errorf("log contains forbidden credential substring %q:\n%s", forbidden, logs)
+		}
+	}
+}
+
+func TestTransportLogsConnectFailure(t *testing.T) {
+	var logBuf safeBuffer
+	testLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	h := newHarness()
+	secret := "LEAK_SECRET_CREDENTIAL_98765"
+	connectErr := fmt.Errorf("injected transport failure with secret %s: %w", secret, x509.UnknownAuthorityError{})
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient {
+		return &fakeClient{connectErr: connectErr}
+	}
+	tr := newTestTransport(t, &recordAdmitter{}, h, func(o *TransportOptions) {
+		o.Logger = testLogger
+		o.ReconnectMaxInterval = 20 * time.Millisecond
+	})
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start = %v", err)
+	}
+
+	// Wait briefly for at least one connect failure log.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if bytes.Contains([]byte(logBuf.String()), []byte("connect_failed")) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_ = tr.Stop(context.Background())
+
+	logs := logBuf.String()
+	if !bytes.Contains([]byte(logs), []byte("gatewaysim transport connect failed")) {
+		t.Fatalf("expected connect failure message in logs, got:\n%s", logs)
+	}
+	if !bytes.Contains([]byte(logs), []byte("event=connect_failed")) {
+		t.Fatalf("expected event=connect_failed in logs, got:\n%s", logs)
+	}
+	if !bytes.Contains([]byte(logs), []byte("reason=tls_unknown_authority")) {
+		t.Fatalf("expected stable TLS reason reason=tls_unknown_authority in logs, got:\n%s", logs)
+	}
+	if bytes.Contains([]byte(logs), []byte(secret)) {
+		t.Fatalf("log contains sensitive secret string %q:\n%s", secret, logs)
+	}
+	if bytes.Contains([]byte(logs), []byte("injected transport failure")) {
+		t.Fatalf("log contains raw error text:\n%s", logs)
+	}
+}
+
+func TestClassifyConnectError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"unknown_authority", x509.UnknownAuthorityError{}, "tls_unknown_authority"},
+		{"wrapped_unknown_authority", fmt.Errorf("wrapped: %w", x509.UnknownAuthorityError{}), "tls_unknown_authority"},
+		{"cert_verification_unknown_auth", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, "tls_unknown_authority"},
+		{"hostname_mismatch", x509.HostnameError{}, "tls_hostname_mismatch"},
+		{"cert_invalid", x509.CertificateInvalidError{}, "tls_certificate_invalid"},
+		{"cert_verification_generic", &tls.CertificateVerificationError{Err: errors.New("other")}, "tls_certificate_verification"},
+		{"context_canceled", context.Canceled, "context_canceled"},
+		{"deadline_exceeded", context.DeadlineExceeded, "deadline_exceeded"},
+		{"auth_bad_user_or_pass", packets.ErrorRefusedBadUsernameOrPassword, "authentication_rejected"},
+		{"auth_not_authorized", packets.ErrorRefusedNotAuthorised, "authentication_rejected"},
+		{"lifetime_closed", errLifetimeClosed, "connection_closed"},
+		{"generic_failure", errors.New("something went wrong"), "connection_failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyConnectError(tc.err); got != tc.want {
+				t.Fatalf("classifyConnectError(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
 	}
 }
