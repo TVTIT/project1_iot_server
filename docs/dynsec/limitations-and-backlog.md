@@ -42,6 +42,19 @@ ma trận denial/restart/pressure đầy đủ vẫn chưa nghiệm thu.
 | Chưa có deployment migration, board runtime hay build parity `src/Dockerfile` cho slice này | Smoke mount nhị phân host read-only; chưa tương đương bản build gốc | Chạy migration/board/parity ở checkpoint tích hợp thích hợp | Task 3.7/checkpoint triển khai |
 | Counters trong process (`Snapshot`) không phơi qua endpoint metrics | Chưa có observability ngoài structured log | Thu thập qua log/Snapshot; chưa cần metrics stack | Task 3.7 hoặc khi cần đo workload |
 
+### Cập nhật Task 3.5 — Gateway simulator và drift `native_compose_smoke` (16/10/2026)
+
+Task 3.5 (Gateway simulator `cmd/gateway`, SQLite durable outbox, named target
+`gateway`) **hoàn thành có giới hạn, chờ commit** (baseline `21447d8`); 9 default
+Task 3.4 đã được đồng bộ vào `DEFAULTS` của `native_compose_smoke.py`. Bảng dưới
+ghi các giới hạn còn lại, không tạo backlog cạnh tranh.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| 9 lỗi Python `native_compose_smoke` (`schema19_exact_rejected`) — **ĐÃ XỬ LÝ 16/10/2026** | `startup_only` từng ghim `expected.endswith('19:mqtt_simplified_journal')` trong khi `migrations/000020_stage3_telemetry_ingestion.up.sql` đã commit ở HEAD, nên lane native-compose báo FAIL **giả** (không phải hồi quy simulator Task 3.5; đã xác nhận chạy lại cho fail y hệt) | Ghim terminal schema hiện hành `20:stage3_telemetry_ingestion` qua hằng `EXPECTED_SCHEMA_TERMINAL` + helper `expected_schema_history`/`schema_history_verified` (giữ kiểm tra **chính xác** lịch sử/version/name; fail-closed khi thiếu/thừa/sai tên/lỗi migration), đổi mã lỗi `schema19_exact_rejected`→`schema_exact_rejected`, thêm 7 test hồi quy `SchemaHistoryTests`. Kết quả mới: `test_native_compose_smoke` 103/103 PASS; `unittest discover -s scripts/tests` 678/678 PASS (trước fix: 671 test, 8 fail + 1 error) | Đã xong |
+| Chưa chạy SQLite trên board ARM; quota outbox là business bytes | Cross-build ARMv7 PASS nhưng chưa chứng minh runtime trên bo mạch; file SQLite có thể lớn hơn business bytes (page/journal) | Giữ pin driver pure-Go; chạy SQLite trên board ở checkpoint thiết bị; để disk headroom ≥ 2× `GATEWAY_OUTBOX_MAX_BYTES` và theo dõi `count` | Task 3.7 / tích hợp board |
+| Fail-closed khi commit outbox bất định | `ErrOutboxCommitUnknown`/`ErrSchedulerCommitUnknown` dừng CLI, yêu cầu khôi phục có giám sát; không tự sinh `message_id` mới hoặc retry mù | Khôi phục dựa trạng thái file + `pending`/`count`/`quarantine`; restart có giám sát | Khi có bằng chứng tái hiện hoặc vận hành board |
+
 ---
 
 ## 1. Phân Tích Chuyên Sâu Các Giới Hạn Kỹ Thuật (Detailed Technical Limitations)

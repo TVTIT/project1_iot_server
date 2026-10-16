@@ -120,6 +120,26 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing_interpolation"):
                 smoke.require_inputs("${NEW_REQUIRED:-production}", fixture.values)
 
+    def test_task34_telemetry_ingress_defaults_explicit(self):
+        # Task 3.4 added telemetry/MQTT-ingress keys to the root compose; the
+        # fixture must carry explicit safe local defaults mirroring the compose
+        # `:-` fallbacks so prepare() never fails closed with a missing key.
+        expected = {
+            "MQTT_INGRESS_ENABLED": "false", "MQTT_CONNECT_TIMEOUT": "5s",
+            "MQTT_SUBSCRIBE_TIMEOUT": "3s", "MQTT_PUBLISH_TIMEOUT": "3s",
+            "MQTT_RECONNECT_MAX_INTERVAL": "30s",
+            "TELEMETRY_MAX_SAMPLES_PER_MESSAGE": "1000",
+            "TELEMETRY_MAX_BATCH_DURATION": "60s",
+            "TELEMETRY_MAX_FUTURE_SKEW": "2m", "TELEMETRY_DB_TIMEOUT": "5s",
+        }
+        for key, value in expected.items():
+            self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            for key, value in expected.items():
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", fixture.env_file.read_text())
+
     def test_dynsec_qualification_defaults_match_verified_config_identity(self):
         root = Path(__file__).resolve().parents[2]
         env_text = (root / ".env.example").read_text()
@@ -300,6 +320,51 @@ class PreparationTests(unittest.TestCase):
                     smoke.validate_summary(dict(report, **{extra: "secret"}))
             with self.assertRaises(ValueError):
                 smoke.validate_summary(dict(report, status="PASS"))
+
+
+class SchemaHistoryTests(unittest.TestCase):
+    """Focused regression: the smoke must accept only the exact supported schema.
+
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 20);
+    stale, missing, renamed, extra, or failed histories must all fail closed.
+    """
+
+    def test_current_schema_history_matches_pinned_terminal(self):
+        expected = smoke.expected_schema_history()
+        self.assertIn("20:stage3_telemetry_ingestion", expected)
+        self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
+        self.assertTrue(smoke.schema_history_verified(0, expected, expected))
+
+    def test_stale_schema19_history_rejected(self):
+        expected = smoke.expected_schema_history()
+        stale = expected.replace("20:stage3_telemetry_ingestion", "19:mqtt_simplified_journal")
+        self.assertFalse(smoke.schema_history_verified(0, stale, expected))
+
+    def test_missing_terminal_migration_rejected(self):
+        expected = smoke.expected_schema_history()
+        missing = ",".join(p for p in expected.split(",") if p != "20:stage3_telemetry_ingestion")
+        self.assertFalse(smoke.schema_history_verified(0, missing, expected))
+
+    def test_wrong_terminal_name_rejected(self):
+        expected = smoke.expected_schema_history()
+        wrong = expected.replace("20:stage3_telemetry_ingestion", "20:unexpected_name")
+        self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
+
+    def test_extra_migration_row_rejected(self):
+        expected = smoke.expected_schema_history()
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",21:future_migration", expected))
+
+    def test_failed_migration_returncode_rejected(self):
+        expected = smoke.expected_schema_history()
+        self.assertFalse(smoke.schema_history_verified(1, expected, expected))
+
+    def test_unpinned_future_terminal_rejected(self):
+        # Guards the pin itself: a history that matches its own files but no
+        # longer ends at the pinned terminal is rejected, so adding a supported
+        # migration forces an explicit terminal update instead of passing.
+        expected = smoke.expected_schema_history()
+        future = expected.replace("20:stage3_telemetry_ingestion", "21:future_migration")
+        self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 
 class ReceiptTests(unittest.TestCase):

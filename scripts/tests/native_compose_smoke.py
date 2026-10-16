@@ -30,6 +30,40 @@ TEMPLATE = Path(__file__).with_suffix(".override.yml")
 SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
             "supabase-auth", "supabase-compat-migration", "mosquitto",
             "backend", "supabase-envoy", "nginx")
+# Terminal state of the currently supported schema. The fixture records every
+# migration under migrations/ (versions 4 and 5 do not write history rows) and
+# must reach exactly this version:name pair last. Pinning the terminal instead
+# of accepting any suffix keeps a missing, extra, renamed, or wrong-version
+# history failing closed; a newly supported migration must update this pin
+# explicitly rather than being silently accepted.
+EXPECTED_SCHEMA_TERMINAL = "20:stage3_telemetry_ingestion"
+
+
+def expected_schema_history(directory=None):
+    """Exact ``version:name`` history the fixture must record, version-ordered.
+
+    Derived from the migration files so a supported migration is reflected
+    automatically; the pinned terminal in :data:`EXPECTED_SCHEMA_TERMINAL` is
+    enforced separately by :func:`schema_history_verified`.
+    """
+    migrations = ROOT / "migrations" if directory is None else Path(directory)
+    return ",".join(
+        str(int(p.name.split("_")[0])) + ":" + p.name.split("_", 1)[1].removesuffix(".up.sql")
+        for p in sorted(migrations.glob("0*.up.sql"))
+        if int(p.name.split("_")[0]) not in (4, 5)
+    )
+
+
+def schema_history_verified(returncode, stdout, expected, terminal=EXPECTED_SCHEMA_TERMINAL):
+    """True only when the recorded history is exact and reaches the pinned terminal.
+
+    A nonzero returncode, a history that differs from ``expected`` (missing,
+    extra, or renamed rows), or an ``expected`` that does not end at the pinned
+    terminal are all rejected.
+    """
+    return returncode == 0 and stdout == expected and expected.endswith(terminal)
+
+
 BUDGETS = {"config": 30, "build": 600, "up": 180, "bootstrap": 120,
            "inspect": 15, "cleanup": 60, "http": 10, "acceptance": 180}
 # Explicit reviewed values, including inputs from inactive root services. Never
@@ -49,6 +83,14 @@ DEFAULTS = dict(
     MQTT_MAX_PAYLOAD_BYTES="1048576", MQTT_CREDENTIAL_API_ENABLED="true",
     INGRESS_GATE_ENABLED="true", MQTT_TLS_CA_FILE="/mosquitto/config/certs/ca.crt",
     MQTT_INTERNAL_MANAGEMENT_URL="ssl://mosquitto:8883",
+    # Task 3.4 telemetry ingress keys referenced by the root compose. They are
+    # safe local defaults mirroring the compose `:-` fallbacks and .env.example;
+    # require_inputs fails closed unless every root interpolation key is explicit.
+    MQTT_INGRESS_ENABLED="false", MQTT_CONNECT_TIMEOUT="5s",
+    MQTT_SUBSCRIBE_TIMEOUT="3s", MQTT_PUBLISH_TIMEOUT="3s",
+    MQTT_RECONNECT_MAX_INTERVAL="30s", TELEMETRY_MAX_SAMPLES_PER_MESSAGE="1000",
+    TELEMETRY_MAX_BATCH_DURATION="60s", TELEMETRY_MAX_FUTURE_SKEW="2m",
+    TELEMETRY_DB_TIMEOUT="5s",
     MQTT_DYNSEC_MANAGER_USERNAME="credential_manager",
     MQTT_DYNSEC_JSON_PATH="/mosquitto/dynsec/dynamic-security.json",
     MQTT_DYNSEC_WRITER_UID="1883",
@@ -780,10 +822,10 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     if name == 'application-migrations':
                         sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations"
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
-                        expected = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql') for p in sorted((ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
-                        if result.returncode or result.stdout.decode().strip() != expected or not expected.endswith('19:mqtt_simplified_journal'):
-                            raise ValueError('schema19_exact_rejected')
-                        evidence['schema19'] = True
+                        expected = expected_schema_history()
+                        if not schema_history_verified(result.returncode, result.stdout.decode().strip(), expected):
+                            raise ValueError('schema_exact_rejected')
+                        evidence['schema_exact'] = True
                     if name == 'supabase-compat-migration':
                         # Root psql command lacks ON_ERROR_STOP; exit0 alone cannot
                         # prove that its FK statements actually took effect.
@@ -1067,7 +1109,7 @@ def cleanup_commands(receipts, inspect, veto=False):
 
 
 PENDING = ("effective_compose_isolation", "tls_uid1883", "bootstrap_cli_receipt",
-           "real_migrations_exit_zero_and_schema19", "dockerfile_backend_image",
+           "real_migrations_exit_zero_and_schema_exact", "dockerfile_backend_image",
            "nginx_envoy_password_login", "admin_inventory", "nonadmin_inventory_denials",
            "owner_sensor_create_retry", "operator_viewer_nonmember_sensor_denials",
            "cross_gateway_no_db_mutation", "missing_invalid_expired_jwt", "no_secret_fields",
@@ -1151,7 +1193,7 @@ ALLOWED_FAILURE_ERROR_CODES = {
     "compose_phase_unresolved", "compose_phase_failed",
     "phase_container_absent", "phase_health_timeout",
     "health_failed", "migration_nonzero",
-    "runtime_receipt_rejected", "schema19_exact_rejected",
+    "runtime_receipt_rejected", "schema_exact_rejected",
     "compat_constraints_rejected", "mapped_endpoint_rejected",
     "admin_user_creation_failed", "admin_user_uuid_invalid",
     "login_failed", "token_format_invalid",
