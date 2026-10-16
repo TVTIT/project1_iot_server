@@ -242,9 +242,9 @@ class TestCIFeatureJobs(unittest.TestCase):
         assert_credential_job_contract(cred_job)
         assert_runtime_job_contract(runtime_job)
 
-        # Verify all 14 job IDs remain defined
+        # Verify all 15 job IDs remain defined
         all_jobs = re.findall(r'^  ([a-z0-9-]+):\n(?:    name:.*\n)?    runs-on:', self.raw_content, re.MULTILINE)
-        self.assertEqual(len(all_jobs), 14, f"expected 14 jobs, found {len(all_jobs)}: {all_jobs}")
+        self.assertEqual(len(all_jobs), 15, f"expected 15 jobs, found {len(all_jobs)}: {all_jobs}")
         expected_jobs = {
             'lint-and-test', 'cross-compile', 'migration-check',
             'docker-build', 'authorization-integration',
@@ -252,13 +252,108 @@ class TestCIFeatureJobs(unittest.TestCase):
             'mosquitto-runtime-integration',
             'mosquitto-credential-integration', 'stage2-e2e',
             'legacy-runtime-image-build', 'dynsec-native-integration',
-            'dynsec-bootstrap-tests', 'native-compose-smoke',
+            'dynsec-bootstrap-tests', 'stage3-uplink-integration',
+            'native-compose-smoke',
         }
         self.assertEqual(set(all_jobs), expected_jobs)
 
         # Verify gates/needs remain intact
         smoke_job = self._extract_job_section('native-compose-smoke')
         self.assertIn('needs: [lint-and-test, migration-check, dynsec-native-integration, dynsec-bootstrap-tests]', smoke_job)
+
+    def test_lint_and_test_gateway_exception_removed(self):
+        """Allow-no-test-package exception for cmd/gateway must be removed since it now has tests."""
+        lint_job_section = self._extract_job_section("lint-and-test")
+        self.assertNotIn("--allow-no-test-package 'iot-platform/cmd/gateway'", lint_job_section)
+        self.assertNotIn("--allow-no-test-package", lint_job_section)
+
+    def test_lint_and_test_requires_stage3_telemetry_and_gateway_tests(self):
+        """Manifest must include real cmd/gateway, telemetry, ingress, and simulator unit tests."""
+        lint_job_section = self._extract_job_section("lint-and-test")
+        # cmd/gateway actual tests
+        self.assertIn("TestAdminCountAndPendingMetadataOnly", lint_job_section)
+        self.assertIn("TestRunRestartResendsPriorBootByteExact", lint_job_section)
+        # internal/telemetry actual tests
+        self.assertIn("TestValidatorExpandsEverySampleAndNormalizesTime", lint_job_section)
+        self.assertIn("TestDecodeBatchValidAndWhitespace", lint_job_section)
+        self.assertIn("TestNewCommitACKWireContract", lint_job_section)
+        self.assertIn("TestPersistNewMessageAppliesReportedStateThenTemporalBeforeCommit", lint_job_section)
+        # internal/mqttingress actual tests
+        self.assertIn("TestACKOnlyAfterConfirmedCommit", lint_job_section)
+        self.assertIn("TestFixedWorkerBound", lint_job_section)
+        # internal/gatewaysim actual tests
+        self.assertIn("TestOutboxEnqueueReopenByteExact", lint_job_section)
+        self.assertIn("TestACKProcessorDeletesOnlyExactPending", lint_job_section)
+
+    def test_stage3_uplink_integration_job_structure_and_prerequisites(self):
+        """stage3-uplink-integration must run bounded timeout, from root, and verify all prerequisites."""
+        job = self._extract_job_section("stage3-uplink-integration")
+        self.assertTrue(job, "Job stage3-uplink-integration must exist in ci.yml")
+        self.assertIn("name: Stage 3 uplink integration", job)
+        self.assertIn("timeout-minutes: 60", job)
+        self.assertIn("working-directory: .", job)
+        self.assertIn("go-version: '1.27.2'", job)
+        self.assertIn("cache-dependency-path: src/go.sum", job)
+
+        # Prerequisites checks
+        self.assertIn("mkdir -p /tmp/opencode", job)
+        self.assertIn("python3 --version", job)
+        self.assertIn("openssl version", job)
+        self.assertIn("which setfacl getfacl", job)
+        self.assertIn("docker version", job)
+        self.assertIn("docker compose version", job)
+        self.assertIn("go version", job)
+
+    def test_stage3_uplink_integration_pinned_images(self):
+        """stage3-uplink-integration must pull digest-pinned timescaledb and mosquitto images."""
+        job = self._extract_job_section("stage3-uplink-integration")
+        timescale_img = "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a"
+        mosquitto_img = "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
+        self.assertIn(f"docker pull --platform linux/amd64 {timescale_img}", job)
+        self.assertIn(f"docker pull --platform linux/amd64 {mosquitto_img}", job)
+        self.assertLess(job.index("docker pull"), job.index("sh scripts/test-stage3-persistence.sh"))
+        self.assertLess(job.index("docker pull"), job.index("sh scripts/test-stage3-uplink.sh"))
+
+    def test_stage3_uplink_integration_runs_harness_tests_before_native(self):
+        """stage3-uplink-integration must run runner harness unit tests before native scripts."""
+        job = self._extract_job_section("stage3-uplink-integration")
+        self.assertIn("test_stage3_uplink_runner.py", job)
+        self.assertLess(job.index("test_stage3_uplink_runner.py"), job.index("sh scripts/test-stage3-persistence.sh"))
+        self.assertLess(job.index("test_stage3_uplink_runner.py"), job.index("sh scripts/test-stage3-uplink.sh"))
+
+    def test_stage3_uplink_integration_strict_persistence_markers(self):
+        """Persistence rehearsals step must require pipefail, command timeout, PASS markers, and cleanup."""
+        job = self._extract_job_section("stage3-uplink-integration")
+        self.assertIn("set -euo pipefail", job)
+        self.assertIn("timeout --signal=TERM --kill-after=90s 600s sh scripts/test-stage3-persistence.sh", job)
+        self.assertIn("tee ", job)
+        self.assertIn("PASS: isolated database-only migration 000020 rehearsals", job)
+        self.assertIn("FRESH FIXTURE: .* PASS", job)
+        self.assertIn("UPGRADE FIXTURE: .* PASS", job)
+        self.assertIn("ROLLBACK FIXTURE: .* PASS", job)
+        self.assertIn("Fixture cleanup verified: True", job)
+
+    def test_stage3_uplink_integration_strict_uplink_markers_and_skip_rejection(self):
+        """Uplink integration step must require pipefail, command timeout, skip rejection, and cleanup markers."""
+        job = self._extract_job_section("stage3-uplink-integration")
+        self.assertIn("timeout --signal=TERM --kill-after=90s 1800s sh scripts/test-stage3-uplink.sh --scenario all", job)
+        self.assertIn("Stage 3 uplink integration skipped unexpectedly", job)
+        self.assertIn("PASS: stage3 uplink integration (all scenarios passed: normal, tls-credential, acl-control, ack-fault, db-timeout, queue-full, gateway-reconnect, process-restart, broker-controlled-restart)", job)
+        self.assertIn("Suite image cleanup verified: shared images removed", job)
+        self.assertIn("Fixture cleanup verified: containers/network/volumes/workdir absent", job)
+
+    def test_stage3_uplink_integration_no_default_workload(self):
+        """The 600-batch 10-minute workload must remain opt-in and NOT run in default CI workflow."""
+        self.assertNotIn("test-stage3-workload.sh", self.raw_content)
+        self.assertNotIn("stage3_workload_runner.py", self.raw_content)
+
+    def test_stage3_uplink_integration_safe_artifacts_and_no_leakage(self):
+        """stage3-uplink-integration must not upload raw logs, certs, DB fixtures, or leak env files."""
+        job = self._extract_job_section("stage3-uplink-integration")
+        self.assertNotIn("upload-artifact", job)
+        self.assertNotIn(".env", job)
+        self.assertNotIn("ca.key", job)
+        self.assertNotIn("dynamic-security.json", job)
 
     def _extract_job_section(self, job_name: str) -> str:
         lines = self.raw_content.splitlines()
