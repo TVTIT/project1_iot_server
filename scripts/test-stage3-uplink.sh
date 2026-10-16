@@ -45,7 +45,7 @@ if printf '%s\n' "$output" | grep -q '^SKIP: docker daemon or CLI unavailable$';
     exit 0
 fi
 
-if printf '%s\n' "$output" | grep -q '^PASS: stage3 uplink integration (all scenarios passed: .*)$'; then
+if printf '%s\n' "$output" | grep -q '^PASS: stage3 uplink integration (all scenarios passed: normal, tls-credential, acl-control, ack-fault, db-timeout, queue-full, gateway-reconnect, process-restart, broker-controlled-restart)$'; then
     echo "PASS: stage3 uplink integration (all)"
     exit 0
 fi

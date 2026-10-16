@@ -609,6 +609,17 @@ class DbTimeoutHelperTests(unittest.TestCase):
     def test_parse_ingress_summary_absent(self):
         self.assertEqual(R.parse_ingress_summary("no summary here"), {})
 
+    def test_parse_ingress_summary_with_queue_high_water(self):
+        log_sample = (
+            "2026/10/16 03:57:40 INFO telemetry ingress summary accepted=10 queue_full=1 "
+            "queue_depth=0 queue_capacity=16 queue_high_water=16\n"
+        )
+        res = R.parse_ingress_summary(log_sample)
+        self.assertEqual(res['queue_capacity'], 16)
+        self.assertEqual(res['queue_high_water'], 16)
+        self.assertEqual(res['queue_full'], 1)
+        self.assertEqual(res['accepted'], 10)
+
     def test_sql_scalar_int_parses_table_output(self):
         class FakeFixture:
             def sql(self, data):
