@@ -50,4 +50,10 @@ const (
 
 	// ContractMaxLimit is the contract hard cap for Twin list and relationship queries (200).
 	ContractMaxLimit = 200
+
+	// ContractDefaultRelationshipLimit is the contract default limit for relationship queries (50).
+	ContractDefaultRelationshipLimit = ContractDefaultLimit
+
+	// ContractMaxRelationshipLimit is the contract hard cap for relationship queries (200).
+	ContractMaxRelationshipLimit = ContractMaxLimit
 )
