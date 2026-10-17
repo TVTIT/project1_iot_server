@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/telemetry"
 )
 
@@ -54,4 +55,40 @@ type ReadService interface {
 	GetTwinDetail(ctx context.Context, actor uuid.UUID, q TwinDetailQuery) (*TwinDetailResult, error)
 	GetTwinState(ctx context.Context, actor uuid.UUID, q TwinStateQuery) (*TwinStateResult, error)
 	GetTwinHistory(ctx context.Context, actor uuid.UUID, q TwinHistoryQuery) (*TwinHistoryResult, error)
+}
+
+// GatewayProvisioner defines the gateway provisioning dependency needed by Digital Twin creation.
+type GatewayProvisioner interface {
+	ProvisionGateway(ctx context.Context, actor uuid.UUID, input gateway.ProvisionGatewayInput) (gateway.ProvisionGatewayResult, error)
+}
+
+// SensorProvisioner defines the admin-or-owner sensor provisioning dependency needed by Digital Twin creation.
+type SensorProvisioner interface {
+	ProvisionSensorForAdminOrOwner(ctx context.Context, actor uuid.UUID, input gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error)
+}
+
+// EntityCreateService defines the application use-case boundary for Digital Twin entity creation.
+// It delegates to transactional Gateway and Sensor provisioners without out-of-transaction role prechecks.
+type EntityCreateService interface {
+	CreateEntity(ctx context.Context, actor uuid.UUID, input CreateEntityInput) (CreateEntityResult, error)
+}
+
+// GatewayMetadataPatcher defines the persistence boundary for patching Gateway metadata in a single transaction.
+type GatewayMetadataPatcher interface {
+	PatchGatewayMetadata(ctx context.Context, actor uuid.UUID, gatewayID string, input PatchGatewayInput) (PatchGatewayResult, error)
+}
+
+// GatewayPatchService defines the application use-case boundary for Gateway metadata PATCH.
+type GatewayPatchService interface {
+	PatchGateway(ctx context.Context, actor uuid.UUID, gatewayID string, input PatchGatewayInput) (PatchGatewayResult, error)
+}
+
+// SensorMetadataPatcher defines the persistence boundary for patching Sensor metadata in a single transaction.
+type SensorMetadataPatcher interface {
+	PatchSensorMetadata(ctx context.Context, actor uuid.UUID, gatewayID string, sensorID string, input PatchSensorInput) (PatchSensorResult, error)
+}
+
+// SensorPatchService defines the application use-case boundary for Sensor metadata PATCH.
+type SensorPatchService interface {
+	PatchSensor(ctx context.Context, actor uuid.UUID, gatewayID string, sensorID string, input PatchSensorInput) (PatchSensorResult, error)
 }

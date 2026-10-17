@@ -2,7 +2,9 @@ package digitaltwin
 
 import (
 	"errors"
+	"fmt"
 
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/telemetry"
 )
 
@@ -23,4 +25,17 @@ var (
 	ErrInvalidResolution = telemetry.ErrHistoryInvalidResolution
 	ErrRawLimitExceeded  = telemetry.ErrHistoryRawLimitExceeded
 	ErrResolutionTooFine = telemetry.ErrHistoryResolutionTooFine
+
+	// Delegated provisioning error sentinels from gateway
+	ErrProvisioningForbidden               = gateway.ErrProvisioningForbidden
+	ErrProvisioningConflict                = gateway.ErrProvisioningConflict
+	ErrProvisioningInconsistent            = gateway.ErrProvisioningInconsistent
+	ErrProvisioningNotFound                = gateway.ErrProvisioningNotFound
+	ErrGatewayProvisioningUnavailable      = gateway.ErrGatewayProvisioningUnavailable
+	ErrAdminOrOwnerProvisioningUnavailable = gateway.ErrAdminOrOwnerProvisioningUnavailable
+
+	// Metadata patch sentinels
+	ErrForbidden                = gateway.ErrProvisioningForbidden
+	ErrInconsistentGraph        = gateway.ErrProvisioningInconsistent
+	ErrMetadataPatchUnavailable = fmt.Errorf("metadata patch unavailable: %w", ErrDependencyUnavailable)
 )
