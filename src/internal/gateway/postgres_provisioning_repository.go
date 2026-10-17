@@ -36,6 +36,14 @@ func NewPostgresOwnerSensorProvisioningRepository(database ProvisioningDatabase)
 	return &postgresProvisioningRepository{database: database}, nil
 }
 
+// NewPostgresAdminOrOwnerSensorProvisioningRepository creates an adapter for admin-or-owner sensor provisioning.
+func NewPostgresAdminOrOwnerSensorProvisioningRepository(database ProvisioningDatabase) (AdminOrOwnerSensorProvisioningRepository, error) {
+	if isNilDependency(database) {
+		return nil, fmt.Errorf("provisioning database is required")
+	}
+	return &postgresProvisioningRepository{database: database}, nil
+}
+
 // A cancelled caller must not prevent rollback and return of the pool connection.
 func rollbackProvisioning(tx pgx.Tx) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -99,6 +99,70 @@ func (r *postgresProvisioningRepository) ProvisionSensorForOwner(ctx context.Con
 	return result, nil
 }
 
+func (r *postgresProvisioningRepository) ProvisionSensorForAdminOrOwner(ctx context.Context, actor uuid.UUID, input ProvisionSensorInput) (ProvisionSensorResult, error) {
+	if err := ValidateProvisionSensorInput(actor, input); err != nil {
+		return ProvisionSensorResult{}, err
+	}
+	tx, err := r.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("begin admin or owner Sensor provisioning: %w", classifyAdminOrOwnerProvisioningError(err))
+	}
+	defer rollbackProvisioning(tx)
+
+	checker, err := auth.NewPostgresPlatformAdminChecker(tx)
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("%w: %w", ErrProvisioningAdminLookup, err)
+	}
+	admin, err := checker.IsPlatformAdmin(ctx, actor)
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("%w: %w", ErrProvisioningAdminLookup, err)
+	}
+
+	// Same-parent provisioning still takes this parent lock first so a competing
+	// operation must finish before the following statements observe a fresh
+	// READ COMMITTED snapshot. The mode is FOR SHARE rather than FOR UPDATE so it
+	// stays compatible with telemetry Persist, which holds the Sensor row and then
+	// takes a foreign-key KEY SHARE lock on the parent Gateway through its
+	// processed_messages and telemetry inserts. FOR SHARE still conflicts with a
+	// Gateway metadata FOR UPDATE, so the parent name/graph read stays protected,
+	// while the Sensor row lock and its INSERT ... ON CONFLICT serialise create
+	// versus exact replay.
+	var parentName string
+	err = tx.QueryRow(ctx, `SELECT name FROM public.gateways WHERE gateway_id=$1 FOR SHARE`, input.GatewayID).Scan(&parentName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProvisionSensorResult{}, ErrProvisioningNotFound
+	}
+	if err != nil {
+		return ProvisionSensorResult{}, fmt.Errorf("lock Sensor parent: %w", classifyAdminOrOwnerProvisioningError(err))
+	}
+
+	if !admin {
+		// Verify and lock membership with FOR SHARE to prevent concurrent role mutation / revocation.
+		var role Role
+		err = tx.QueryRow(ctx, `SELECT role FROM public.user_gateways WHERE user_id=$1 AND gateway_id=$2 FOR SHARE`, actor, input.GatewayID).Scan(&role)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ProvisionSensorResult{}, ErrProvisioningNotFound
+		}
+		if err != nil {
+			return ProvisionSensorResult{}, fmt.Errorf("lookup membership: %w", classifyAdminOrOwnerProvisioningError(err))
+		}
+		if role != RoleOwner {
+			return ProvisionSensorResult{}, ErrProvisioningForbidden
+		}
+	}
+
+	result, err := executeSensorGraphProvisioning(ctx, tx, input, parentName)
+	if err != nil {
+		return ProvisionSensorResult{}, classifyAdminOrOwnerProvisioningError(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		// A lost confirmation is unavailable, not evidence that writes rolled back.
+		return ProvisionSensorResult{}, fmt.Errorf("commit admin or owner Sensor provisioning: %w", classifyAdminOrOwnerProvisioningError(err))
+	}
+	return result, nil
+}
+
 func executeSensorGraphProvisioning(ctx context.Context, tx pgx.Tx, input ProvisionSensorInput, parentName string) (ProvisionSensorResult, error) {
 	var parent uuid.UUID
 	err := tx.QueryRow(ctx, `SELECT e.id FROM public.twin_entities e JOIN public.twin_states s ON s.entity_id=e.id
