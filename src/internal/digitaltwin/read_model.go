@@ -56,6 +56,11 @@ type TwinHistoryQuery struct {
 	Range      telemetry.TimeRange
 	Resolution telemetry.Resolution
 	MaxPoints  int
+
+	// EffectiveRawWindow is an internal server-propagated effective raw window bound (<= ContractMaxRawWindow).
+	// It is populated by ReadPreparation from validated server configuration and governs raw/auto branching.
+	// Callers must not set this to enlarge configured limits beyond ContractMaxRawWindow.
+	EffectiveRawWindow time.Duration
 }
 
 // TwinSummary represents an entity in list projection.
@@ -128,9 +133,14 @@ type TemporalSamplePoint struct {
 	MessageID    *uuid.UUID
 }
 
+// TemporalBucketPoint represents one bucket aggregation in downsampled temporal series.
+// Semantics match telemetry.BucketSamplePoint (BucketStart, Avg, Min, Max, Count).
+type TemporalBucketPoint = telemetry.BucketSamplePoint
+
 // TwinHistoryResult represents the data returned by Twin history queries.
-// If Property is SelectorValue, TelemetryPoints carries the delegated telemetry result.
-// If Property is SelectorSampleIntervalUS, TemporalPoints carries the typed temporal rows.
+// If Property is SelectorValue, TelemetryResult carries the delegated telemetry result.
+// If Property is SelectorSampleIntervalUS and Mode is raw, TemporalPoints carries the typed temporal rows.
+// If Property is SelectorSampleIntervalUS and Mode is bucket, TemporalBuckets carries numeric bucket aggregations.
 type TwinHistoryResult struct {
 	EntityID        string
 	Property        HistorySelector
@@ -142,4 +152,5 @@ type TwinHistoryResult struct {
 	PointCount      int
 	TelemetryResult *telemetry.TelemetryHistoryResult
 	TemporalPoints  []TemporalSamplePoint
+	TemporalBuckets []TemporalBucketPoint
 }

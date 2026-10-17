@@ -365,6 +365,40 @@ func TestPrepareHistory_ValidScope(t *testing.T) {
 	}
 }
 
+func TestPrepareHistory_EffectiveRawWindowPropagation(t *testing.T) {
+	entity := validSensorEntity()
+	res := &mockEntityResolver{entity: entity}
+	cfg := digitaltwin.DefaultReadPreparationConfig()
+	cfg.HistoryRawWindow = 1 * time.Second
+	prep, err := digitaltwin.NewReadPreparation(res, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	actor := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	q := digitaltwin.TwinHistoryQuery{
+		EntityID:           "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+		Property:           digitaltwin.SelectorSampleIntervalUS,
+		Range:              telemetry.TimeRange{From: now.Add(-500 * time.Millisecond), To: now},
+		Resolution:         telemetry.ResolutionAuto,
+		MaxPoints:          1000,
+		EffectiveRawWindow: 20 * time.Second, // caller attempts to enlarge
+	}
+
+	var callbackQuery digitaltwin.TwinHistoryQuery
+	err = prep.PrepareHistory(context.Background(), actor, q, func(_ context.Context, _ digitaltwin.ResolvedEntity, query digitaltwin.TwinHistoryQuery) error {
+		callbackQuery = query
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if callbackQuery.EffectiveRawWindow != 1*time.Second {
+		t.Fatalf("EffectiveRawWindow = %v, want configured 1s (caller attempt to enlarge must be overridden)", callbackQuery.EffectiveRawWindow)
+	}
+}
+
 func TestPrepareTwin_InvalidNoCalls(t *testing.T) {
 	res := &mockEntityResolver{entity: validSensorEntity()}
 	prep, err := digitaltwin.NewReadPreparation(res, digitaltwin.DefaultReadPreparationConfig())

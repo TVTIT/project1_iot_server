@@ -41,6 +41,12 @@ type TwinReader interface {
 	ReadTemporalHistory(ctx context.Context, actor uuid.UUID, entity ResolvedEntity, q TwinHistoryQuery) (*TwinHistoryResult, error)
 }
 
+// TelemetryHistoryDelegator executes delegated history queries within an existing scoped context.
+// Reused by Digital Twin history service when delegating property=value to the telemetry history engine.
+type TelemetryHistoryDelegator interface {
+	ExecuteEffectiveHistoryQuery(ctx context.Context, actor uuid.UUID, q telemetry.TelemetryHistoryQuery) (*telemetry.TelemetryHistoryResult, error)
+}
+
 // ReadService defines the application use-case boundary for Digital Twin read operations.
 // Actor identity is passed explicitly and must not be uuid.Nil.
 type ReadService interface {

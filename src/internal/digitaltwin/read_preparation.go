@@ -329,7 +329,11 @@ func (p *ReadPreparation) PrepareHistory(
 	if q.MaxPoints < p.cfg.HistoryMinPoints || q.MaxPoints > p.cfg.HistoryMaxPoints {
 		return ErrInvalidInput
 	}
-	if err := telemetry.ValidateHistoryTimeRange(q.Range, q.Resolution, p.cfg.HistoryMaxRange, p.cfg.HistoryRawWindow, q.MaxPoints); err != nil {
+	effectiveRawWindow := p.cfg.HistoryRawWindow
+	if effectiveRawWindow <= 0 || effectiveRawWindow > ContractMaxRawWindow {
+		effectiveRawWindow = ContractMaxRawWindow
+	}
+	if err := telemetry.ValidateHistoryTimeRange(q.Range, q.Resolution, p.cfg.HistoryMaxRange, effectiveRawWindow, q.MaxPoints); err != nil {
 		return mapTelemetryHistoryError(err)
 	}
 
@@ -355,7 +359,10 @@ func (p *ReadPreparation) PrepareHistory(
 		return fmt.Errorf("%w: %w", ErrDependencyUnavailable, ctx.Err())
 	}
 
-	err = fn(ctx, *entity, q)
+	effectiveQ := q
+	effectiveQ.EffectiveRawWindow = effectiveRawWindow
+
+	err = fn(ctx, *entity, effectiveQ)
 	if ctx.Err() != nil {
 		if err != nil && !errors.Is(err, ctx.Err()) {
 			return fmt.Errorf("%w: %w: %w", ErrDependencyUnavailable, ctx.Err(), err)
