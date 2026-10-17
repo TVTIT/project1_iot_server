@@ -42,6 +42,7 @@ func resolveTestDatabaseURLs(t *testing.T) (string, string) {
 	// simply because a local .env exists. An explicit opt-in variable is required.
 	if os.Getenv("TWIN_READ_TEST_NATIVE") != "1" &&
 		os.Getenv("TWIN_TEMPORAL_TEST_NATIVE") != "1" &&
+		os.Getenv("TWIN_METADATA_TEST_NATIVE") != "1" &&
 		os.Getenv("TELEMETRY_TEST_NATIVE") != "1" &&
 		os.Getenv("TELEMETRY_TEST_ISOLATED") != "1" {
 		return "", ""
