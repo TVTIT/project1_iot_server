@@ -87,45 +87,11 @@ func parseSensorProvisioning(r *http.Request, limit int64) (gateway.ProvisionSen
 }
 
 func parseProvisioningObject(r *http.Request, limit int64, fields map[string]any, required []string) int {
-	if r.URL.RawQuery != "" || r.URL.ForceQuery {
-		return 400
+	entries, status := readStrictJSONObject(r, limit)
+	if status != 0 {
+		return status
 	}
-	media, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || media != "application/json" {
-		return 415
-	}
-	for key, value := range params {
-		if key != "charset" || !strings.EqualFold(value, "utf-8") {
-			return 415
-		}
-	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	if int64(len(data)) > limit {
-		return 413
-	}
-	if err != nil || !validJSONUnicode(data) {
-		return 400
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	token, err := dec.Token()
-	if err != nil || token != json.Delim('{') {
-		return 400
-	}
-	seen := map[string]bool{}
-	for dec.More() {
-		token, err = dec.Token()
-		if err != nil {
-			return 400
-		}
-		key, ok := token.(string)
-		if !ok || seen[key] {
-			return 400
-		}
-		seen[key] = true
-		var raw json.RawMessage
-		if dec.Decode(&raw) != nil {
-			return 400
-		}
+	for key, raw := range entries {
 		target, allowed := fields[key]
 		if !allowed {
 			return 400
@@ -137,16 +103,62 @@ func parseProvisioningObject(r *http.Request, limit int64, fields map[string]any
 			return 400
 		}
 	}
-	if token, err = dec.Token(); err != nil || token != json.Delim('}') {
-		return 400
-	}
-	if _, err = dec.Token(); err != io.EOF {
-		return 400
-	}
 	for _, key := range required {
-		if !seen[key] {
+		if _, ok := entries[key]; !ok {
 			return 400
 		}
 	}
 	return 0
+}
+
+func readStrictJSONObject(r *http.Request, limit int64) (map[string]json.RawMessage, int) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		return nil, 400
+	}
+	media, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || media != "application/json" {
+		return nil, 415
+	}
+	for key, value := range params {
+		if key != "charset" || !strings.EqualFold(value, "utf-8") {
+			return nil, 415
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(data)) > limit {
+		return nil, 413
+	}
+	if err != nil || !validJSONUnicode(data) {
+		return nil, 400
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, 400
+	}
+	entries := make(map[string]json.RawMessage)
+	seen := make(map[string]bool)
+	for dec.More() {
+		token, err = dec.Token()
+		if err != nil {
+			return nil, 400
+		}
+		key, ok := token.(string)
+		if !ok || seen[key] {
+			return nil, 400
+		}
+		seen[key] = true
+		var raw json.RawMessage
+		if dec.Decode(&raw) != nil {
+			return nil, 400
+		}
+		entries[key] = raw
+	}
+	if token, err = dec.Token(); err != nil || token != json.Delim('}') {
+		return nil, 400
+	}
+	if _, err = dec.Token(); err != io.EOF {
+		return nil, 400
+	}
+	return entries, 0
 }
