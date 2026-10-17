@@ -17,6 +17,7 @@ import (
 
 	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/httpserver"
+	"iot-platform/internal/telemetry"
 )
 
 // resolveTestDatabaseURLs determines the connection strings for setup (admin) and application (iot_backend_app).
@@ -40,6 +41,7 @@ func resolveTestDatabaseURLs(t *testing.T) (string, string) {
 	// Explicit integration opt-in check: prevent routine `go test ./...` from connecting to the shared database
 	// simply because a local .env exists. An explicit opt-in variable is required.
 	if os.Getenv("TWIN_READ_TEST_NATIVE") != "1" &&
+		os.Getenv("TWIN_TEMPORAL_TEST_NATIVE") != "1" &&
 		os.Getenv("TELEMETRY_TEST_NATIVE") != "1" &&
 		os.Getenv("TELEMETRY_TEST_ISOLATED") != "1" {
 		return "", ""
@@ -705,7 +707,7 @@ func TestNativeTwinRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create PostgresTwinReader: %v", err)
 	}
-	service, err := digitaltwin.NewReadService(prep, reader)
+	service, err := digitaltwin.NewReadService(prep, reader, &stubTelemetryHistoryDelegator{})
 	if err != nil {
 		t.Fatalf("failed to create ReadService: %v", err)
 	}
@@ -1566,4 +1568,10 @@ func TestCompareTwinFixtureMetadata(t *testing.T) {
 			t.Fatal("removed sensor entry was not detected")
 		}
 	})
+}
+
+type stubTelemetryHistoryDelegator struct{}
+
+func (s *stubTelemetryHistoryDelegator) ExecuteEffectiveHistoryQuery(_ context.Context, _ uuid.UUID, _ telemetry.TelemetryHistoryQuery) (*telemetry.TelemetryHistoryResult, error) {
+	return nil, nil
 }
