@@ -14,12 +14,12 @@ import (
 // malformed stored values and programming errors must remain unexpected failures.
 // Preserve the original cause for errors.Is/As; HTTP and audit expose only safe codes.
 func classifyInventoryReadError(err error) error {
-	return classifyPostgresAvailabilityError(err, ErrInventoryUnavailable)
+	return ClassifyPostgresAvailabilityError(err, ErrInventoryUnavailable)
 }
 
-// classifyPostgresAvailabilityError tags only typed transport/server availability
+// ClassifyPostgresAvailabilityError tags only typed transport/server availability
 // failures. Callers choose their own domain sentinel; SQL/scan faults stay intact.
-func classifyPostgresAvailabilityError(err, unavailable error) error {
+func ClassifyPostgresAvailabilityError(err, unavailable error) error {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}

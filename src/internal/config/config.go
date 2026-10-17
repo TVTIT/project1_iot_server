@@ -20,6 +20,8 @@ type Config struct {
 	Credential                 CredentialConfig
 	Ingress                    IngressConfig
 	MQTTCredentialRuntime      mqttcredential.StartupConfig
+	History                    HistoryConfig
+	Twin                       TwinConfig
 	CORSAllowedOrigins         []string
 	ServerPort                 int
 	ServerEnv                  string
@@ -158,6 +160,12 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Ingress, err = loadIngress(lookup, cfg.DatabaseMaxConns, cfg.Credential.Enabled, cfg.ShutdownTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.History, err = loadHistory(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.Twin, err = loadTwin(lookup); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

@@ -15,5 +15,5 @@ func classifyOwnerProvisioningError(err error) error {
 	if errors.As(err, &scan) || errors.As(err, &scanPointer) {
 		return err
 	}
-	return classifyPostgresAvailabilityError(err, ErrOwnerProvisioningUnavailable)
+	return ClassifyPostgresAvailabilityError(err, ErrOwnerProvisioningUnavailable)
 }
