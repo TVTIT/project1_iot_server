@@ -578,11 +578,6 @@ func scanStateRow(rows pgx.Rows, entity ResolvedEntity) (*TwinStateResult, error
 	}, nil
 }
 
-// ReadTemporalHistory is deferred to Task 4.4.
-func (r *PostgresTwinReader) ReadTemporalHistory(_ context.Context, _ uuid.UUID, _ ResolvedEntity, _ TwinHistoryQuery) (*TwinHistoryResult, error) {
-	return nil, ErrUnexpected
-}
-
 func classifyReaderError(err error) error {
 	if err == nil {
 		return nil

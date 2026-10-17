@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/puddle/v2"
+
+	"iot-platform/internal/telemetry"
 )
 
 // fakeTwinRows implements pgx.Rows for testing row scanning and lifecycle.
@@ -611,18 +613,72 @@ func TestListEntitiesErrorClassifications(t *testing.T) {
 	}
 }
 
-func TestPostgresTwinReaderUnimplementedMethods(t *testing.T) {
-	db := &fakeTwinDatabase{}
-	reader, err := NewPostgresTwinReader(db)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestPostgresTwinReaderBucketMethods(t *testing.T) {
 	actor := uuid.New()
-	entity := ResolvedEntity{}
-
-	if _, err := reader.ReadTemporalHistory(context.Background(), actor, entity, TwinHistoryQuery{}); !errors.Is(err, ErrUnexpected) {
-		t.Errorf("expected ErrUnexpected from ReadTemporalHistory, got: %v", err)
+	entity := ResolvedEntity{
+		InternalID: uuid.New(),
+		PublicURN:  "urn:ngsi-ld:Sensor:gw_01:sensor_01",
+		Type:       EntityTypeSensor,
+		GatewayID:  "gw_01",
+		SensorID:   "sensor_01",
 	}
+	now := time.Date(2026, 8, 21, 10, 15, 0, 0, time.UTC)
+	q := TwinHistoryQuery{
+		EntityID: entity.PublicURN,
+		Property: SelectorSampleIntervalUS,
+		Range: telemetry.TimeRange{
+			From: now.Add(-5 * time.Second),
+			To:   now,
+		},
+		Resolution: "1s",
+		MaxPoints:  1000,
+	}
+
+	t.Run("missing source returns ErrNotFound", func(t *testing.T) {
+		db := &fakeTwinDatabase{}
+		reader, err := NewPostgresTwinReader(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reader.ReadTemporalHistory(context.Background(), actor, entity, q); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for missing source, got: %v", err)
+		}
+	})
+
+	t.Run("authorized empty returns valid bucket series", func(t *testing.T) {
+		sentinelRec := func(dest ...any) error {
+			*dest[0].(*uuid.UUID) = entity.InternalID
+			*dest[1].(*string) = entity.PublicURN
+			*dest[2].(**time.Time) = nil // sentinel
+			*dest[3].(**float64) = nil
+			*dest[4].(**float64) = nil
+			*dest[5].(**float64) = nil
+			*dest[6].(**int64) = nil
+			*dest[7].(*int64) = 0
+			*dest[8].(*int64) = 0
+			*dest[9].(*int64) = 0
+			*dest[10].(*int64) = 0
+			*dest[11].(*int64) = 0
+			*dest[12].(*int64) = 0
+			*dest[13].(*int64) = 0
+			*dest[14].(*int64) = 0
+			*dest[15].(*int64) = 0
+			*dest[16].(**string) = nil
+			return nil
+		}
+		db := &fakeTwinDatabase{rows: &fakeTwinRows{records: []func(dest ...any) error{sentinelRec}}}
+		reader, err := NewPostgresTwinReader(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := reader.ReadTemporalHistory(context.Background(), actor, entity, q)
+		if err != nil {
+			t.Fatalf("unexpected error for authorized empty bucket series: %v", err)
+		}
+		if res.Mode != "bucket" || res.Resolution != "1s" || res.PointCount != 0 {
+			t.Errorf("unexpected empty bucket result: %+v", res)
+		}
+	})
 }
 
 func TestGetDetailRejectsInvalidInputs(t *testing.T) {
