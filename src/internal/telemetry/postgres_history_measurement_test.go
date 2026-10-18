@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -226,7 +227,15 @@ func TestNativeTelemetryHistoryQueryPlanMeasurement(t *testing.T) {
 
 	// 2. Fixture setup with unique identities
 	runID := uuid.New().String()[:8]
+	if envRunID := os.Getenv("STAGE4_MEASUREMENT_RUN_ID"); envRunID != "" {
+		runID = envRunID
+	}
 	testUserUID := uuid.New()
+	if envUser := os.Getenv("STAGE4_MEASUREMENT_USER_ID"); envUser != "" {
+		if parsed, err := uuid.Parse(envUser); err == nil {
+			testUserUID = parsed
+		}
+	}
 	targetGW := fmt.Sprintf("gw_meas_%s", runID)
 	targetSensor := fmt.Sprintf("sens_meas_%s", runID)
 	targetUnit := "degC"
@@ -237,8 +246,12 @@ func TestNativeTelemetryHistoryQueryPlanMeasurement(t *testing.T) {
 	distractUnit := "ppm"
 	distractBootID := uuid.New()
 
-	// Fixture cleanup defer hook: strictly deletes only fixture-created resources
+	// Fixture cleanup defer hook: strictly deletes only fixture-created resources unless preserved for cross-test/compression
 	defer func() {
+		if os.Getenv("STAGE4_PRESERVE_FIXTURE") == "1" {
+			t.Logf("STAGE4_PRESERVE_FIXTURE=1: retaining seeded telemetry fixture rows for cross-test/compression verification")
+			return
+		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cleanupCancel()
 
@@ -265,61 +278,10 @@ func TestNativeTelemetryHistoryQueryPlanMeasurement(t *testing.T) {
 		verifyCleanupCount(cleanupCtx, t, setupPool, "telemetry fixture gateways", "SELECT COUNT(*) FROM public.telemetry WHERE gateway_id IN ($1, $2)", targetGW, distractGW)
 	}()
 
-	// Seed auth.users if table exists
-	var hasAuthUsers bool
-	if err := setupPool.QueryRow(ctx, "SELECT to_regclass('auth.users') IS NOT NULL").Scan(&hasAuthUsers); err == nil && hasAuthUsers {
-		_, err = setupPool.Exec(ctx, `
-			INSERT INTO auth.users (id, aud, role, email)
-			VALUES ($1, 'authenticated', 'authenticated', $2)
-			ON CONFLICT (id) DO NOTHING`,
-			testUserUID, fmt.Sprintf("meas-%s@example.com", runID),
-		)
-		if err != nil {
-			t.Fatalf("failed to seed auth.users: %v", err)
-		}
-	}
-
-	// Seed profile
-	if _, err := setupPool.Exec(ctx, `
-		INSERT INTO public.profiles (id, full_name)
-		VALUES ($1, $2)
-		ON CONFLICT (id) DO NOTHING`,
-		testUserUID, fmt.Sprintf("Measurement User %s", runID),
-	); err != nil {
-		t.Fatalf("failed to seed profile: %v", err)
-	}
-
-	// Seed gateways
-	if _, err := setupPool.Exec(ctx, `
-		INSERT INTO public.gateways (gateway_id, name)
-		VALUES ($1, 'Target Measurement Gateway'), ($2, 'Distractor Gateway')`,
-		targetGW, distractGW,
-	); err != nil {
-		t.Fatalf("failed to seed gateways: %v", err)
-	}
-
-	// Seed sensors
-	if _, err := setupPool.Exec(ctx, `
-		INSERT INTO public.sensors (gateway_id, sensor_id, name, unit)
-		VALUES ($1, $2, 'Target Measurement Sensor', $3), ($4, $5, 'Distractor Sensor', $6)`,
-		targetGW, targetSensor, targetUnit, distractGW, distractSensor, distractUnit,
-	); err != nil {
-		t.Fatalf("failed to seed sensors: %v", err)
-	}
-
-	// Seed user_gateways: test user is 'owner' of targetGW only (demonstrating selectivity against distractGW)
-	if _, err := setupPool.Exec(ctx, `
-		INSERT INTO public.user_gateways (user_id, gateway_id, role)
-		VALUES ($1, $2, 'owner')`,
-		testUserUID, targetGW,
-	); err != nil {
-		t.Fatalf("failed to seed user_gateways: %v", err)
-	}
-
-	// 3. Seed dataset:
+	// 3. Dataset specification:
 	// Target dataset: 60,000 samples @ 100 Hz (10 ms interval) over 10 minutes (600 seconds)
 	// Distractor dataset: 6,000 samples @ 10 Hz (100 ms interval) over same 10 minutes
-	baseTime := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	baseTime := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	span := 10 * time.Minute
 	targetCount := 60000
 	targetIntervalUs := int64(10000) // 100 Hz
@@ -328,36 +290,109 @@ func TestNativeTelemetryHistoryQueryPlanMeasurement(t *testing.T) {
 	distractCount := 6000
 	distractIntervalUs := int64(100000) // 10 Hz
 
-	t.Logf("=== SEEDING REPRESENTATIVE DATASET ===")
-	t.Logf("Target Dataset: %d samples, 100 Hz (10ms), span %v [%v to %v], batchSize=%d (600 messages)",
-		targetCount, span, baseTime.Format(time.RFC3339), baseTime.Add(span).Format(time.RFC3339), batchSize)
-	t.Logf("Distractor Dataset: %d samples, 10 Hz (100ms), span %v", distractCount, span)
+	// Seed auth.users if table exists
+	if os.Getenv("STAGE4_MEASUREMENT_RERUN_ONLY") == "1" {
+		t.Logf("STAGE4_MEASUREMENT_RERUN_ONLY=1: verifying existing target telemetry rows without reseeding")
+		var actualTargetCount, actualDistractCount int
+		err := setupPool.QueryRow(ctx, `
+			SELECT
+				COALESCE(SUM(CASE WHEN gateway_id = $1 THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN gateway_id = $2 THEN 1 ELSE 0 END), 0)
+			FROM public.telemetry`, targetGW, distractGW).Scan(&actualTargetCount, &actualDistractCount)
+		if err != nil {
+			t.Fatalf("failed to query existing telemetry rows for rerun: %v", err)
+		}
+		if actualTargetCount != targetCount {
+			t.Fatalf("expected %d target rows for rerun, got %d", targetCount, actualTargetCount)
+		}
+		if actualDistractCount != distractCount {
+			t.Fatalf("expected %d distractor rows for rerun, got %d", distractCount, actualDistractCount)
+		}
+	} else {
+		var hasAuthUsers bool
+		if err := setupPool.QueryRow(ctx, "SELECT to_regclass('auth.users') IS NOT NULL").Scan(&hasAuthUsers); err == nil && hasAuthUsers {
+			_, err = setupPool.Exec(ctx, `
+				INSERT INTO auth.users (id, aud, role, email)
+				VALUES ($1, 'authenticated', 'authenticated', $2)
+				ON CONFLICT (id) DO NOTHING`,
+				testUserUID, fmt.Sprintf("meas-%s@example.com", runID),
+			)
+			if err != nil {
+				t.Fatalf("failed to seed auth.users: %v", err)
+			}
+		}
 
-	telemetryColumns := []string{
-		"measured_at", "gateway_id", "sensor_id", "sequence_num",
-		"value", "boot_id", "message_id", "sample_index",
-	}
+		// Seed profile
+		if _, err := setupPool.Exec(ctx, `
+			INSERT INTO public.profiles (id, full_name)
+			VALUES ($1, $2)
+			ON CONFLICT (id) DO NOTHING`,
+			testUserUID, fmt.Sprintf("Measurement User %s", runID),
+		); err != nil {
+			t.Fatalf("failed to seed profile: %v", err)
+		}
 
-	targetSrc := newTelemetryGeneratorSource(targetCount, baseTime, targetIntervalUs, targetGW, targetSensor, targetBootID, batchSize)
-	seedStart := time.Now()
-	rowsInserted, err := setupPool.CopyFrom(ctx, pgx.Identifier{"public", "telemetry"}, telemetryColumns, targetSrc)
-	if err != nil {
-		t.Fatalf("failed to copy target telemetry rows: %v", err)
-	}
-	if rowsInserted != int64(targetCount) {
-		t.Fatalf("expected %d target rows inserted, got %d", targetCount, rowsInserted)
-	}
+		// Seed gateways
+		if _, err := setupPool.Exec(ctx, `
+			INSERT INTO public.gateways (gateway_id, name)
+			VALUES ($1, 'Target Measurement Gateway'), ($2, 'Distractor Gateway')`,
+			targetGW, distractGW,
+		); err != nil {
+			t.Fatalf("failed to seed gateways: %v", err)
+		}
 
-	distractSrc := newTelemetryGeneratorSource(distractCount, baseTime, distractIntervalUs, distractGW, distractSensor, distractBootID, batchSize)
-	rowsDistract, err := setupPool.CopyFrom(ctx, pgx.Identifier{"public", "telemetry"}, telemetryColumns, distractSrc)
-	if err != nil {
-		t.Fatalf("failed to copy distractor telemetry rows: %v", err)
+		// Seed sensors
+		if _, err := setupPool.Exec(ctx, `
+			INSERT INTO public.sensors (gateway_id, sensor_id, name, unit)
+			VALUES ($1, $2, 'Target Measurement Sensor', $3), ($4, $5, 'Distractor Sensor', $6)`,
+			targetGW, targetSensor, targetUnit, distractGW, distractSensor, distractUnit,
+		); err != nil {
+			t.Fatalf("failed to seed sensors: %v", err)
+		}
+
+		// Seed user_gateways: test user is 'owner' of targetGW only (demonstrating selectivity against distractGW)
+		if _, err := setupPool.Exec(ctx, `
+			INSERT INTO public.user_gateways (user_id, gateway_id, role)
+			VALUES ($1, $2, 'owner')`,
+			testUserUID, targetGW,
+		); err != nil {
+			t.Fatalf("failed to seed user_gateways: %v", err)
+		}
+
+		// 3. Seed dataset:
+		// Target dataset: 60,000 samples @ 100 Hz (10 ms interval) over 10 minutes (600 seconds)
+		// Distractor dataset: 6,000 samples @ 10 Hz (100 ms interval) over same 10 minutes
+		t.Logf("=== SEEDING REPRESENTATIVE DATASET ===")
+		t.Logf("Target Dataset: %d samples, 100 Hz (10ms), span %v [%v to %v], batchSize=%d (600 messages)",
+			targetCount, span, baseTime.Format(time.RFC3339), baseTime.Add(span).Format(time.RFC3339), batchSize)
+		t.Logf("Distractor Dataset: %d samples, 10 Hz (100ms), span %v", distractCount, span)
+
+		telemetryColumns := []string{
+			"measured_at", "gateway_id", "sensor_id", "sequence_num",
+			"value", "boot_id", "message_id", "sample_index",
+		}
+
+		targetSrc := newTelemetryGeneratorSource(targetCount, baseTime, targetIntervalUs, targetGW, targetSensor, targetBootID, batchSize)
+		seedStart := time.Now()
+		rowsInserted, err := setupPool.CopyFrom(ctx, pgx.Identifier{"public", "telemetry"}, telemetryColumns, targetSrc)
+		if err != nil {
+			t.Fatalf("failed to copy target telemetry rows: %v", err)
+		}
+		if rowsInserted != int64(targetCount) {
+			t.Fatalf("expected %d target rows inserted, got %d", targetCount, rowsInserted)
+		}
+
+		distractSrc := newTelemetryGeneratorSource(distractCount, baseTime, distractIntervalUs, distractGW, distractSensor, distractBootID, batchSize)
+		rowsDistract, err := setupPool.CopyFrom(ctx, pgx.Identifier{"public", "telemetry"}, telemetryColumns, distractSrc)
+		if err != nil {
+			t.Fatalf("failed to copy distractor telemetry rows: %v", err)
+		}
+		if rowsDistract != int64(distractCount) {
+			t.Fatalf("expected %d distractor rows inserted, got %d", distractCount, rowsDistract)
+		}
+		t.Logf("Seeding Complete in %v: %d target rows + %d distractor rows = %d total raw rows",
+			time.Since(seedStart), rowsInserted, rowsDistract, rowsInserted+rowsDistract)
 	}
-	if rowsDistract != int64(distractCount) {
-		t.Fatalf("expected %d distractor rows inserted, got %d", distractCount, rowsDistract)
-	}
-	t.Logf("Seeding Complete in %v: %d target rows + %d distractor rows = %d total raw rows",
-		time.Since(seedStart), rowsInserted, rowsDistract, rowsInserted+rowsDistract)
 
 	// Build application service components
 	cfg := telemetry.DefaultHistoryPreparationConfig()
@@ -666,6 +701,53 @@ func TestNativeTelemetryHistoryQueryPlanMeasurement(t *testing.T) {
 		rep3a.ExecutionTime, rep3b.ExecutionTime, totalM3TimeMs)
 	t.Logf("Decision: All observed queries comfortably fit within the 5.0-second budget (actual execution times comfortably below 75 ms, far below the 5,000 ms budget).")
 	t.Logf("No bottlenecks observed. Retain Schema 20 and existing indexes without speculative indexes or migrations.")
+
+	summary := map[string]any{
+		"scenario":               "telemetry",
+		"run_id":                 runID,
+		"target_gateway_id":      targetGW,
+		"target_sensor_id":       targetSensor,
+		"distract_gateway_id":    distractGW,
+		"distract_sensor_id":     distractSensor,
+		"target_raw_count":       targetCount,
+		"distract_raw_count":     distractCount,
+		"m1_planning_time_ms":    rep1.PlanningTime,
+		"m1_execution_time_ms":   rep1.ExecutionTime,
+		"m1_actual_rows":         rep1.Plan.ActualRows,
+		"m1_shared_hit_blocks":   hits1,
+		"m1_shared_read_blocks":  reads1,
+		"m1_plan_nodes":          nodes1,
+		"m1_service_elapsed_ms":  float64(m1Duration.Microseconds()) / 1000.0,
+		"m2_planning_time_ms":    rep2.PlanningTime,
+		"m2_execution_time_ms":   rep2.ExecutionTime,
+		"m2_actual_rows":         rep2.Plan.ActualRows,
+		"m2_shared_hit_blocks":   hits2,
+		"m2_shared_read_blocks":  reads2,
+		"m2_plan_nodes":          nodes2,
+		"m2_service_elapsed_ms":  float64(m2Duration.Microseconds()) / 1000.0,
+		"m3a_planning_time_ms":   rep3a.PlanningTime,
+		"m3a_execution_time_ms":  rep3a.ExecutionTime,
+		"m3a_actual_rows":        rep3a.Plan.ActualRows,
+		"m3a_shared_hit_blocks":  hits3a,
+		"m3a_shared_read_blocks": reads3a,
+		"m3b_planning_time_ms":   rep3b.PlanningTime,
+		"m3b_execution_time_ms":  rep3b.ExecutionTime,
+		"m3b_actual_rows":        rep3b.Plan.ActualRows,
+		"m3b_shared_hit_blocks":  hits3b,
+		"m3b_shared_read_blocks": reads3b,
+		"m3b_plan_nodes":         nodes3b,
+		"m3_total_execution_ms":  totalM3TimeMs,
+		"m3_service_elapsed_ms":  float64(m3Duration.Microseconds()) / 1000.0,
+		"selectivity_verified":   true,
+		"is_compressed":          isCompressed,
+	}
+	outJSON, err := json.Marshal(summary)
+	if err == nil {
+		fmt.Printf("TELEMETRY_MEASUREMENT_JSON: %s\n", string(outJSON))
+		if outPath := os.Getenv("STAGE4_MEASUREMENT_JSON_OUTPUT"); outPath != "" {
+			_ = os.WriteFile(outPath, outJSON, 0o600)
+		}
+	}
 }
 
 func TestCollectPlanSummary_RootBufferCountersIncludeSubtree(t *testing.T) {
