@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"iot-platform/internal/auth"
+	"iot-platform/internal/config"
 	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpapi"
 )
@@ -128,19 +129,35 @@ func TestUnknownRouteAndMethodUseSafeErrorContract(t *testing.T) {
 func TestPlannedBusinessRoutesRequireAuthenticationBeforeStub(t *testing.T) {
 	router := mustRouter(t, readinessCheckerFunc(func(context.Context) error { return nil }))
 
-	for _, path := range []string{"/v1/telemetry/history", "/v1/ws", "/v1/digital-twins"} {
-		unauthorized := httptest.NewRecorder()
-		router.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, path, nil))
-		if unauthorized.Code != http.StatusUnauthorized {
-			t.Errorf("GET %s without token status = %d, want %d", path, unauthorized.Code, http.StatusUnauthorized)
+	// Only /v1/ws remains an unauthenticated-first stub returning 501 when authorized.
+	unauthorized := httptest.NewRecorder()
+	router.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/v1/ws", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Errorf("GET /v1/ws without token status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/ws", nil)
+	request.Header.Set("Authorization", "Bearer valid-token")
+	authorized := httptest.NewRecorder()
+	router.ServeHTTP(authorized, request)
+	if authorized.Code != http.StatusNotImplemented {
+		t.Errorf("GET /v1/ws with token status = %d, want %d", authorized.Code, http.StatusNotImplemented)
+	}
+
+	// Replaced routes /v1/telemetry/history and /v1/digital-twins require auth and dispatch to handlers (not 501).
+	for _, path := range []string{"/v1/telemetry/history", "/v1/digital-twins"} {
+		unauth := httptest.NewRecorder()
+		router.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, path, nil))
+		if unauth.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s without token status = %d, want %d", path, unauth.Code, http.StatusUnauthorized)
 		}
 
-		request := httptest.NewRequest(http.MethodGet, path, nil)
-		request.Header.Set("Authorization", "Bearer valid-token")
-		authorized := httptest.NewRecorder()
-		router.ServeHTTP(authorized, request)
-		if authorized.Code != http.StatusNotImplemented {
-			t.Errorf("GET %s with token status = %d, want %d", path, authorized.Code, http.StatusNotImplemented)
+		authReq := httptest.NewRequest(http.MethodGet, path, nil)
+		authReq.Header.Set("Authorization", "Bearer valid-token")
+		authRec := httptest.NewRecorder()
+		router.ServeHTTP(authRec, authReq)
+		if authRec.Code == http.StatusNotImplemented {
+			t.Errorf("GET %s with token unexpectedly returned 501", path)
 		}
 	}
 }
@@ -169,6 +186,49 @@ func TestNewRouterRejectsMissingSecurityDependencies(t *testing.T) {
 		{name: "readiness timeout", mutate: func(deps *RouterDependencies) { deps.ReadinessTimeout = 0 }},
 		{name: "token verifier", mutate: func(deps *RouterDependencies) { deps.TokenVerifier = nil }},
 		{name: "admin checker", mutate: func(deps *RouterDependencies) { deps.PlatformAdminChecker = nil }},
+		{name: "telemetry history reader", mutate: func(deps *RouterDependencies) { deps.TelemetryHistoryReader = nil }},
+		{name: "twin list reader", mutate: func(deps *RouterDependencies) { deps.TwinListReader = nil }},
+		{name: "twin detail reader", mutate: func(deps *RouterDependencies) { deps.TwinDetailReader = nil }},
+		{name: "twin state reader", mutate: func(deps *RouterDependencies) { deps.TwinStateReader = nil }},
+		{name: "twin history reader", mutate: func(deps *RouterDependencies) { deps.TwinHistoryReader = nil }},
+		{name: "entity creator", mutate: func(deps *RouterDependencies) { deps.EntityCreator = nil }},
+		{name: "gateway patcher", mutate: func(deps *RouterDependencies) { deps.GatewayPatcher = nil }},
+		{name: "sensor patcher", mutate: func(deps *RouterDependencies) { deps.SensorPatcher = nil }},
+		{name: "history query parser", mutate: func(deps *RouterDependencies) { deps.HistoryQueryParser = nil }},
+		{name: "invalid history parser bounds", mutate: func(deps *RouterDependencies) {
+			deps.HistoryQueryParser = &HistoryQueryParser{cfg: config.HistoryConfig{QueryTimeout: -1}}
+		}},
+		{name: "twin query parser", mutate: func(deps *RouterDependencies) { deps.TwinQueryParser = nil }},
+		{name: "invalid twin parser bounds", mutate: func(deps *RouterDependencies) {
+			deps.TwinQueryParser = &TwinQueryParser{cfg: config.TwinConfig{ListDefaultLimit: -1}}
+		}},
+		{name: "twin max body bytes zero", mutate: func(deps *RouterDependencies) { deps.TwinMaxBodyBytes = 0 }},
+		{name: "twin max body bytes negative", mutate: func(deps *RouterDependencies) { deps.TwinMaxBodyBytes = -1 }},
+		{name: "twin max body bytes excessive", mutate: func(deps *RouterDependencies) { deps.TwinMaxBodyBytes = 2000000 }},
+		{name: "typed nil telemetry history reader", mutate: func(deps *RouterDependencies) {
+			var nilReader *mockTelemetryHistoryReader
+			deps.TelemetryHistoryReader = nilReader
+		}},
+		{name: "typed nil history query parser", mutate: func(deps *RouterDependencies) {
+			var nilParser *HistoryQueryParser
+			deps.HistoryQueryParser = nilParser
+		}},
+		{name: "typed nil twin query parser", mutate: func(deps *RouterDependencies) {
+			var nilParser *TwinQueryParser
+			deps.TwinQueryParser = nilParser
+		}},
+		{name: "typed nil entity creator", mutate: func(deps *RouterDependencies) {
+			var nilCreator *mockEntityCreator
+			deps.EntityCreator = nilCreator
+		}},
+		{name: "typed nil gateway patcher", mutate: func(deps *RouterDependencies) {
+			var nilPatcher *mockGatewayPatcher
+			deps.GatewayPatcher = nilPatcher
+		}},
+		{name: "typed nil sensor patcher", mutate: func(deps *RouterDependencies) {
+			var nilPatcher *mockSensorPatcher
+			deps.SensorPatcher = nilPatcher
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -191,7 +251,7 @@ func mustRouter(t *testing.T, readiness ReadinessChecker) http.Handler {
 }
 
 func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
-	return RouterDependencies{
+	deps := RouterDependencies{
 		SensorProvisioner: sensorProvisionerFunc(func(context.Context, uuid.UUID, gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error) {
 			return gateway.ProvisionSensorResult{}, gateway.ErrProvisioningInconsistent
 		}),
@@ -219,4 +279,5 @@ func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
 			return true, nil
 		}),
 	}
+	return AttachTestStage4Dependencies(deps)
 }

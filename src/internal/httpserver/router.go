@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"iot-platform/internal/auth"
+	"iot-platform/internal/config"
 	"iot-platform/internal/httpapi"
 )
 
@@ -40,6 +41,17 @@ type RouterDependencies struct {
 	CredentialManager          CredentialManager
 	CredentialStartupReadiness CredentialStartupReadiness
 	CORSAllowedOrigins         []string
+	TelemetryHistoryReader     TelemetryHistoryReader
+	TwinListReader             TwinListReader
+	TwinDetailReader           TwinDetailReader
+	TwinStateReader            TwinStateReader
+	TwinHistoryReader          TwinHistoryReader
+	HistoryQueryParser         *HistoryQueryParser
+	TwinQueryParser            *TwinQueryParser
+	EntityCreator              EntityCreator
+	GatewayPatcher             GatewayPatcher
+	SensorPatcher              SensorPatcher
+	TwinMaxBodyBytes           int64
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -100,6 +112,47 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	if deps.CredentialAPIEnabled && (auth.IsNilDependency(deps.CredentialManager) || auth.IsNilDependency(deps.CredentialStartupReadiness) || deps.CredentialRequestTimeout <= 0 || deps.CredentialRequestTimeout > 5*time.Minute) {
 		return nil, fmt.Errorf("enabled credential API requires manager, startup barrier and bounded request timeout")
 	}
+
+	if auth.IsNilDependency(deps.TelemetryHistoryReader) {
+		return nil, fmt.Errorf("telemetry history reader is required")
+	}
+	if auth.IsNilDependency(deps.TwinListReader) {
+		return nil, fmt.Errorf("twin list reader is required")
+	}
+	if auth.IsNilDependency(deps.TwinDetailReader) {
+		return nil, fmt.Errorf("twin detail reader is required")
+	}
+	if auth.IsNilDependency(deps.TwinStateReader) {
+		return nil, fmt.Errorf("twin state reader is required")
+	}
+	if auth.IsNilDependency(deps.TwinHistoryReader) {
+		return nil, fmt.Errorf("twin history reader is required")
+	}
+	if auth.IsNilDependency(deps.EntityCreator) {
+		return nil, fmt.Errorf("entity creator is required")
+	}
+	if auth.IsNilDependency(deps.GatewayPatcher) {
+		return nil, fmt.Errorf("gateway patcher is required")
+	}
+	if auth.IsNilDependency(deps.SensorPatcher) {
+		return nil, fmt.Errorf("sensor patcher is required")
+	}
+	if auth.IsNilDependency(deps.HistoryQueryParser) {
+		return nil, fmt.Errorf("history query parser is required")
+	}
+	if err := config.ValidateHistoryConfig(deps.HistoryQueryParser.cfg); err != nil {
+		return nil, fmt.Errorf("invalid history query parser config: %w", err)
+	}
+	if auth.IsNilDependency(deps.TwinQueryParser) {
+		return nil, fmt.Errorf("twin query parser is required")
+	}
+	if err := config.ValidateTwinConfig(deps.TwinQueryParser.cfg); err != nil {
+		return nil, fmt.Errorf("invalid twin query parser config: %w", err)
+	}
+	if deps.TwinMaxBodyBytes < 1 || deps.TwinMaxBodyBytes > 1048576 {
+		return nil, fmt.Errorf("twin body limit must be between 1 and 1048576")
+	}
+
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
 	router.Use(
@@ -107,6 +160,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		adminGatewayCacheMiddleware(),
 		adminGatewayAuditMiddleware(),
 		ownerSensorCacheMiddleware(),
+		stage4CacheMiddleware(),
 		corsMiddleware(deps.CORSAllowedOrigins),
 		httpapi.RecoveryMiddleware(slog.Default()),
 	)
@@ -155,9 +209,14 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
 	authenticated.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensorForOwner(deps.OwnerSensorProvisioner, deps.AdminMaxBodyBytes))
-	authenticated.GET("/telemetry/history", notImplemented)
+	authenticated.GET("/telemetry/history", getTelemetryHistory(deps.TelemetryHistoryReader, deps.HistoryQueryParser))
 	authenticated.GET("/ws", notImplemented)
-	authenticated.GET("/digital-twins", notImplemented)
+	authenticated.GET("/digital-twins", listDigitalTwins(deps.TwinListReader, deps.TwinQueryParser))
+	authenticated.POST("/digital-twins", postDigitalTwin(deps.EntityCreator, deps.TwinMaxBodyBytes))
+	authenticated.GET("/digital-twins/:entity_id", getDigitalTwinDetail(deps.TwinDetailReader, deps.TwinQueryParser))
+	authenticated.PATCH("/digital-twins/:entity_id", patchDigitalTwin(deps.GatewayPatcher, deps.SensorPatcher, deps.TwinMaxBodyBytes))
+	authenticated.GET("/digital-twins/:entity_id/state", getDigitalTwinState(deps.TwinStateReader))
+	authenticated.GET("/digital-twins/:entity_id/history", getDigitalTwinHistory(deps.TwinHistoryReader, deps.HistoryQueryParser))
 
 	return router, nil
 }

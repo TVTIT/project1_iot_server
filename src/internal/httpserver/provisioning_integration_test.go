@@ -111,7 +111,7 @@ func TestGatewayProvisioningHTTPIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := NewRouter(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: writer, SensorProvisioner: writer, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384})
+	router, err := NewRouter(AttachTestStage4Dependencies(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: writer, SensorProvisioner: writer, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestGatewayProvisioningHTTPIntegration(t *testing.T) {
 		for _, sensor := range []bool{false, true} {
 			exec("INSERT INTO platform_admins(user_id) VALUES ($1) ON CONFLICT DO NOTHING", admin)
 			wrapper := &revokeBeforeProvisioning{delegate: writer, before: func() { exec("DELETE FROM platform_admins WHERE user_id=$1", admin) }}
-			r, err := NewRouter(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: wrapper, SensorProvisioner: wrapper, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384})
+			r, err := NewRouter(AttachTestStage4Dependencies(RouterDependencies{ReadinessChecker: app, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: reader, SensorReader: reader, GatewayProvisioner: wrapper, SensorProvisioner: wrapper, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384}))
 			if err != nil {
 				t.Fatal(err)
 			}

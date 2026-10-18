@@ -110,7 +110,7 @@ func TestGatewayHTTPAuthorizationIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := NewRouter(RouterDependencies{SensorProvisioner: provisionService, GatewayProvisioner: provisionService, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384, ReadinessChecker: pool, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: service, SensorReader: service})
+	router, err := NewRouter(AttachTestStage4Dependencies(RouterDependencies{SensorProvisioner: provisionService, GatewayProvisioner: provisionService, OwnerSensorProvisioner: ownerSensorService, AdminGatewayLister: adminService, AdminInventoryDefaultLimit: 100, AdminInventoryMaxLimit: 200, AdminMaxBodyBytes: 16384, ReadinessChecker: pool, ReadinessTimeout: time.Second, AuthorizationTimeout: time.Second, TokenVerifier: verifier, PlatformAdminChecker: checker, GatewayReader: service, SensorReader: service}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func testAdminGatewayInventoryHTTP(ctx context.Context, t *testing.T, setup *pgx
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := NewRouter(RouterDependencies{
+	router, err := NewRouter(AttachTestStage4Dependencies(RouterDependencies{
 		SensorProvisioner:          provisionService,
 		GatewayProvisioner:         provisionService,
 		OwnerSensorProvisioner:     ownerSensorService,
@@ -354,7 +354,7 @@ func testAdminGatewayInventoryHTTP(ctx context.Context, t *testing.T, setup *pgx
 		PlatformAdminChecker:       checker,
 		GatewayReader:              service,
 		SensorReader:               service,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

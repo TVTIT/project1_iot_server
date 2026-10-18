@@ -944,6 +944,27 @@ func TestClassifyMutationError(t *testing.T) {
 			wantCode:    "service_unavailable",
 			wantMessage: "service unavailable",
 		},
+		{
+			name:        "wrapped 503 over 409 conflict precedence",
+			err:         errors.Join(digitaltwin.ErrProvisioningConflict, digitaltwin.ErrMetadataPatchUnavailable),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantCode:    "service_unavailable",
+			wantMessage: "service unavailable",
+		},
+		{
+			name:        "wrapped 503 over 404 not found precedence",
+			err:         errors.Join(digitaltwin.ErrNotFound, gateway.ErrAdminOrOwnerProvisioningUnavailable),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantCode:    "service_unavailable",
+			wantMessage: "service unavailable",
+		},
+		{
+			name:        "wrapped 503 over 400 invalid input precedence",
+			err:         errors.Join(digitaltwin.ErrInvalidInput, gateway.ErrGatewayProvisioningUnavailable),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantCode:    "service_unavailable",
+			wantMessage: "service unavailable",
+		},
 		// 400 Bad Request family
 		{
 			name:        "digitaltwin.ErrInvalidInput",
