@@ -1240,7 +1240,7 @@ def generate_untrusted_ca(work: Path, name: str) -> Path:
 
 def run_gateway_container(image: str, net_name: str, outbox_volume: str, ca_file: Path,
                           env_file: Path, args: list, timeout: int, *,
-                          outbox_dir: Path | None = None):
+                          outbox_dir: Path | None = None, container_name: str | None = None):
     """Run the real gateway image, masking every image-declared volume path.
 
     When ``outbox_dir`` is set the outbox is a host bind-mount so a host-side
@@ -1252,7 +1252,7 @@ def run_gateway_container(image: str, net_name: str, outbox_volume: str, ca_file
     else:
         outbox_mount = f'type=volume,src={outbox_volume},dst=/data/outbox'
     return subprocess.run(
-        ['docker', 'run', '--rm',
+        ['docker', 'run', '--rm', *(['--name', container_name] if container_name else []),
          '--cap-drop', 'ALL',
          '--security-opt', 'no-new-privileges:true',
          '--read-only',
