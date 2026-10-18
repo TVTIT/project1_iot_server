@@ -1,15 +1,26 @@
 # Báo cáo Kỹ thuật Task 4.7 — Tích hợp API Stage 4, Đo lường Truy vấn và CI Pipeline
 
 **Ngày thực hiện:** 18/10/2026  
-**Trạng thái:** Follow-up `go-reviewer` (`openai/gpt-6.1-sol#high`) trả **APPROVE**, xác nhận 1 HIGH và 5 MEDIUM đều CLOSED. Native `all` sau sửa **PASS**; remote CI **NOT RUN**. Hai ghi chú LOW về prose được chỉnh sau review, không đổi code.  
-**Baseline Git:** Commit `e6e304d41b3915b2be51e27fee6bf100b04e60ea` + diff Task 4.7 chưa commit.  
-**Tài liệu thẩm quyền căn cứ:** Assertions thực tế và artifact `docs/backend/stage-4-task-4.7-summary.json`, cập nhật từ native rerun `/tmp/opencode/stage4-api-six-fixes.json`. Bảng số đo mục 4 giữ checkpoint trước review để không trộn hai run.
+**Trạng thái Đối soát (Reconciliation 18/10/2026):**
+- **Follow-up review:** `go-reviewer` (`openai/gpt-6.1-sol#high`) trả **APPROVE**, đóng cả 6 findings (1 HIGH và 5 MEDIUM). Hai ghi chú LOW về văn phong (prose) đã được chỉnh sau review, không làm thay đổi code logic.
+- **Native tests:** Toàn bộ test suite native `all` sau sửa **PASS** cục bộ (summary artifact `stage-4-task-4.7-summary.json`).
+- **Commit & Remote CI:**
+  * Toàn bộ mã nguồn Task 4.7 đã được commit vào nhánh `develop` qua chuỗi commits `aa2922a` đến `6257f80` (`aa2922a`, `39b6b99`, `a526981`, `f3edc3d`, `6257f80`).
+  * Lần chạy remote CI ban đầu ([run 39100732763](https://github.com/TVTIT/project1_iot_server/actions/runs/39100732763) tại commit `6257f80`) gặp lỗi (FAIL) tại bước kiểm tra guard môi trường test.
+  * Hai commit khắc phục CI đã được bổ sung: `65d727b` (trả về public service interfaces từ constructors) và `aa7436d` (cô lập biến môi trường execution policy trong harness test).
+  * Lần chạy CI xác nhận ([run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379) tại đúng commit `aa7436d8838a6580c21b30930e2eed992999b11c`) đã hoàn thành **SUCCESS 16/16 jobs**, bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`.
+  * Các ghi chú lịch sử ghi `NOT RUN` hoặc `uncommitted dirty worktree` trước đây trong tài liệu này phản ánh đúng trạng thái tại checkpoint kiểm thử và review ban đầu; không relabel các số đo hoặc image ID cục bộ thành remote CI.
+**Baseline Git:**
+- Checkpoint đo lường ban đầu (Mục 4): Commit `e6e304d41b3915b2be51e27fee6bf100b04e60ea` + diff Task 4.7 chưa commit.
+- Checkpoint native rerun sau review (Mục 8 & JSON summary): Diff sau khi sửa 6 findings trên baseline `e6e304d`.
+- Checkpoint remote CI hiện hành: Commit `aa7436d8838a6580c21b30930e2eed992999b11c` (HEAD nhánh `develop`, worktree sạch).
+**Tài liệu thẩm quyền căn cứ:** Assertions thực tế và artifact `docs/backend/stage-4-task-4.7-summary.json` (cập nhật từ native rerun `/tmp/opencode/stage4-api-six-fixes.json`). Bảng số đo Mục 4 giữ nguyên checkpoint trước review để bảo đảm tính trung thực kỹ thuật và không trộn lẫn dữ liệu giữa hai lần chạy.
 
 ---
 
 ## 1. Mục tiêu và Ranh giới Kỹ thuật
 
-Task 4.7 hoàn thành lát cắt tích hợp cuối cùng của Giai đoạn 4 theo [Kế hoạch chi tiết Task 4.7](../../docs/backend_plan/task_4.7_detail_plan.md) và [AGENTS.md](../../AGENTS.md) (Mục 0 & 16):
+Task 4.7 hoàn thành lát cắt tích hợp cuối cùng của Giai đoạn 4 theo [Kế hoạch chi tiết Task 4.7](../../../docs/backend_plan/task_4.7_detail_plan.md) và [AGENTS.md](../../AGENTS.md) (Mục 0 & 16):
 1. **Runner tích hợp đa dịch vụ thực:** Xây dựng `scripts/test-stage4-api.sh` và runner `scripts/tests/stage4_api_runner.py` chạy trên container dịch vụ thật (Mosquitto 2.0.18 TLS, TimescaleDB PG16, Go backend, Gateway simulator).
 2. **Vertical Slice End-to-End:** Kiểm chứng chu trình khép kín: HTTP Provisioning $\rightarrow$ MQTT TLS Ingress $\rightarrow$ Bounded Queue/Worker $\rightarrow$ PostgreSQL Commit $\rightarrow$ Application ACK $\rightarrow$ HTTP Reads (History, Detail, State) $\rightarrow$ Metadata PATCH $\rightarrow$ Ingest tiếp tục $\rightarrow$ Deduplication byte-exact.
 3. **HTTP Contract & Phân quyền RBAC:** Bao phủ toàn bộ 7 endpoints, xác thực JWT, phân quyền theo role (`owner`, `operator`, `viewer`, `user_b` non-member), cursor pagination, boundary validation, error envelopes, và snapshot bất biến sau khi từ chối ghi.
@@ -33,9 +44,11 @@ Task 4.7 hoàn thành lát cắt tích hợp cuối cùng của Giai đoạn 4 t
 
 | Thành phần | Định danh / Phiên bản | Ghi chú |
 |---|---|---|
-| **Git Revision** | `e6e304d41b3915b2be51e27fee6bf100b04e60ea` | Baseline HEAD + diff Task 4.7 |
-| **Go Backend Image** | `sha256:1a45b6b087384fa5e96f9dd7346f444684d08fb7541a5e1c10456d1c686831f9` | Build đa tầng từ `src/Dockerfile` (`target: backend`) |
-| **Gateway Image** | `sha256:84c588f374532b4595a4cc6e6be12c90cbf6c5cdcf5e89aea31aef63e204fb1e` | Build đa tầng từ `src/Dockerfile` (`target: gateway`) |
+| **Git Revision (Đo lường Mục 4)** | `e6e304d41b3915b2be51e27fee6bf100b04e60ea` | Baseline HEAD + diff Task 4.7 ban đầu (checkpoint đo uncompressed/compressed) |
+| **Git Revision (Remote CI)** | `aa7436d8838a6580c21b30930e2eed992999b11c` | Commit HEAD `develop` sau chuỗi `aa2922a`..`6257f80` và các CI fixes `65d727b`/`aa7436d` |
+| **Go Backend Image (Đo Mục 4)** | `sha256:1a45b6b087384fa5e96f9dd7346f444684d08fb7541a5e1c10456d1c686831f9` | Build đa tầng từ `src/Dockerfile` (`target: backend`) tại lần đo Mục 4 |
+| **Gateway Image (Đo Mục 4)** | `sha256:84c588f374532b4595a4cc6e6be12c90cbf6c5cdcf5e89aea31aef63e204fb1e` | Build đa tầng từ `src/Dockerfile` (`target: gateway`) tại lần đo Mục 4 |
+| **Backend / Gateway Image (Rerun sau sửa)** | Backend: `sha256:9e6acf90...`, Gateway: `sha256:58fe698a...` | Artifacts sinh ra từ lần chạy native rerun ghi nhận trong `stage-4-task-4.7-summary.json` |
 | **TimescaleDB** | `timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a` | PostgreSQL 16.15 + TimescaleDB 2.29.2; metadata lấy từ cùng constant của DatabaseFixture |
 | **Mosquitto** | `eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9` | Mosquitto 2.0.18 với DynSec plugin |
 | **Schema Version** | `20` (terminal: `stage3_telemetry_ingestion`) | Giữ nguyên Schema 20, không thêm migration |
@@ -144,7 +157,7 @@ Bảng dưới phân định nguồn gốc bằng chứng: **ACTUAL / NEW** (k�
 | **H12** | PATCH metadata/rollback/invariants, ingest tiếp | NEW HTTP vertical PATCH/ingest; INHERITED `TestNativeEntityMetadata_MutationSlice` SQL rollback/concurrency | Mixed evidence | Full-content preservation native rerun PASS; SQL rollback/concurrency native vẫn là lịch sử Task4.5 |
 | **H13** | DB timeout/cancel/release và query/body/cursor bounds | NEW HTTP contract bounds; INHERITED `TestPrepareTelemetryHistory_CanceledOrExpiredNilSuccessRejected`, `TestNativeTemporalHistory_NumericSlice` acquire-pool case | Mixed evidence | Không mới chạy native acquire-pool; executing-query cancellation **NOT RUN** |
 | **H14** | MQTT commit ACK → HTTP data đúng quyền | NEW `run_vertical_scenario`, independent SQL + outbox drain + resend | Native rerun sau sửa PASS | A300 raw/3ledger/3temporal, version3, dedup không thêm rows |
-| **H15** | Native/cleanup/regressions/CI và contract client | Native rerun PASS; CI wired; follow-up review APPROVE cho sáu findings | Chưa close toàn Stage4 | Remote CI **NOT RUN**, client/docs closeout thuộc Task4.8 |
+| **H15** | Native/cleanup/regressions/CI và contract client | Native rerun PASS; CI wired; follow-up review APPROVE (6 findings CLOSED); Remote CI [run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379) PASS 16/16 tại `aa7436d` | Stage 4 API & CI hoàn thành; chưa close toàn Stage 4 | Remote CI đã PASS (run 39103564379 tại `aa7436d`); H15 chưa đóng hoàn toàn Stage 4 vì tài liệu tổng kết và client contract closeout thuộc về Task 4.8. Ghi chú NOT RUN cũ thuộc checkpoint lịch sử trước push. |
 
 ---
 
@@ -159,23 +172,31 @@ Bảng dưới phân định nguồn gốc bằng chứng: **ACTUAL / NEW** (k�
    - Format, Lint, Build & Race: `gofmt`, `go vet ./...`, `golangci-lint run ./...` (**0 issues**), `go build ./...`, `go test -race ./...` **PASS**.
    - Python Test Suite: Toàn bộ **852 tests PASS** (`unittest discover -s scripts/tests`).
    - CSDL & Migrations: `stage3-persistence` (kiểm tra upgrade legacy schema) **PASS**; Stage 2 suites (`test-stage2-authorization.sh`, `test-stage2-provisioning.sh`, `stage2_auth.py`, `backend_smoke`) **PASS**.
-3. **Phân định rõ các kiểm thử KHÔNG THỰC HIỆN (NOT RUN):**
-   - **Remote CI trên GitHub Actions:** **NOT RUN** (chờ push commit lên remote repository theo phân quyền dự án).
+3. **Phân định rõ các kiểm thử KHÔNG THỰC HIỆN (NOT RUN) và Đối soát Remote CI:**
+   - **Remote CI trên GitHub Actions:** Tại checkpoint review cục bộ ban đầu, remote CI ghi nhận là **NOT RUN** (chờ push theo phân quyền dự án). Đến ngày 18/10/2026, sau khi commit chuỗi `aa2922a`..`6257f80`, run CI đầu tiên `39100732763` tại `6257f80` gặp lỗi; sau hai commit sửa CI `65d727b` và `aa7436d`, remote CI xác nhận [run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379) tại commit `aa7436d8838a6580c21b30930e2eed992999b11c` đã hoàn thành **SUCCESS với 16/16 jobs** (bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`).
    - **Không đo lại Workload 600 batches Stage 3:** Không chạy lại vì đường dẫn thu thập dữ liệu (ingestion core) không bị thay đổi trong Task 4.7.
-   - **Hủy bỏ truy vấn đang thực thi (Executing Query Cancellation):** Chưa kiểm chứng ngắt câu lệnh đang chạy ở máy chủ CSDL (bằng chứng hiện có chỉ kiểm chứng việc hết timeout khi chờ mượn connection từ pool).
-   - **Triển khai Production / Bo mạch ARM / Soak Testing:** Không thuộc phạm vi MVP Stage 4.
+   - **Hủy bỏ truy vấn đang thực thi (Executing Query Cancellation):** Chưa kiểm chứng ngắt câu lệnh đang chạy ở máy chủ CSDL (bằng chứng hiện có chỉ kiểm chứng việc hết timeout khi chờ mượn connection từ pool); vẫn duy trì trạng thái **NOT RUN**.
+   - **Kiểm thử trực tiếp Legacy NULL provenance qua HTTP Delegation:** Duy trì trạng thái **NOT RUN** trên schema 20 hiện tại (schema 20 bắt buộc NOT NULL; kịch bản legacy NULL đã được kiểm chứng riêng ở tầng native migration test).
+   - **Triển khai Production / Bo mạch ARM / Soak Testing:** Không thuộc phạm vi MVP Stage 4; vẫn duy trì trạng thái **NOT RUN**.
 
 ---
 
 ## 7. Ranh giới Tồn đọng và Bàn giao Task 4.8
 
-1. **Reconciliation Task 4.6:** Báo cáo Task 4.6 có đoạn văn ghi nhận giao CI và nén hypertable cho Task 4.8. Đính chính chính thức: **Hai hạng mục này thuộc phạm vi Task 4.7 và đã được hoàn thành đầy đủ trong Task 4.7**. Task 4.8 chỉ đảm nhận việc lập tài liệu tổng kết Stage 4 (`docs/backend/stage-4-history-and-twin-api.md`), cập nhật tài liệu hợp đồng client (contracts 04, 05, 07, 08), và chuẩn bị bàn giao Giai đoạn 5 (WebSocket & Realtime).
-2. **Review Status:** Review trước BLOCK (1 HIGH + 5 MEDIUM); follow-up reviewer đã trả APPROVE và đóng cả sáu findings. Hai LOW về prose đã chỉnh sau review; không suy thành nghiệm thu toàn Stage4 hay production.
+1. **Reconciliation Task 4.6 & Hướng Bàn giao Chuẩn:**
+   - Báo cáo Task 4.6 có đoạn văn ghi nhận giao CI và nén hypertable cho Task 4.8. Đính chính chính thức: **Hai hạng mục này thuộc phạm vi Task 4.7 và đã được hoàn thành đầy đủ trong Task 4.7**.
+   - **Đính chính lộ trình giai đoạn:** Sửa đoạn văn cũ ghi nhầm "chuẩn bị bàn giao Giai đoạn 5 (WebSocket & Realtime)". Theo đúng kế hoạch tổng thể [Backend_summary_plan.md](../../../docs/backend_plan/Backend_summary_plan.md) và [task_4.8_detail_plan.md](../../../docs/backend_plan/task_4.8_detail_plan.md):
+     * **Giai đoạn 5 (Stage 5):** Lát cắt điều khiển Digital Twin Downlink (Desired state, Command outbox, MQTT dispatch & feedback).
+     * **Giai đoạn 6 (Stage 6):** Đối soát và hội tụ trạng thái (Reconciliation worker).
+     * **Giai đoạn 7 (Stage 7):** WebSocket & Realtime Delivery cho client.
+     * **Giai đoạn 8 (Stage 8):** Quản lý tệp đa phương tiện riêng tư (Private Media Storage).
+   - Task 4.8 chỉ đảm nhận việc lập tài liệu tổng kết Stage 4 (`docs/backend/stage-4-history-and-twin-api.md`), cập nhật tài liệu hợp đồng client (contracts 04, 05, 07, 08), và thực hiện thủ tục đóng Stage 4.
+2. **Review Status:** Review trước BLOCK (1 HIGH + 5 MEDIUM); follow-up reviewer đã trả APPROVE và đóng cả sáu findings. Hai ghi chú LOW về văn phong đã chỉnh sau review, không làm thay đổi mã nguồn. Không suy diễn kết quả review thành nghiệm thu sản xuất (production acceptance) hay hoàn tất ứng dụng client.
 3. **Bàn giao cho Task 4.8:**
    - 7 HTTP endpoints đã sẵn sàng và được kiểm chứng tích hợp hoàn chỉnh.
    - CSDL Schema 20 giữ nguyên không đổi.
    - Bảng số đo truy vấn và kết quả nén làm căn cứ tham chiếu cho tài liệu tổng kết.
-    - Artifact tóm tắt non-secret lưu tại `docs/backend/stage-4-task-4.7-summary.json`.
+   - Artifact tóm tắt non-secret lưu tại `docs/backend/stage-4-task-4.7-summary.json`.
 
 ## 8. Kiểm chứng sau sửa sáu findings
 
@@ -188,4 +209,7 @@ Bảng dưới phân định nguồn gốc bằng chứng: **ACTUAL / NEW** (k�
 
 **Native mới chạy:** `sh scripts/test-stage4-api.sh --scenario all --require-run --report /tmp/opencode/stage4-api-six-fixes.json` **PASS**, cả vertical/contract/queries, hai chunks compressed, database query-fixture rows về0 và toàn fixture cleanup verified. Backend `sha256:9e6acf90d81657c3d76c7740cd35140f9c8f1e96896249478154225db92cf99a`; Gateway `sha256:58fe698a9e5e6586dd8c2b7c8017e2095e270be2e728ad4c3356edad44a48d09`. Bảng môi trường và mục4 phía trên là checkpoint cũ, summary JSON hiện là run sau sửa.
 
-**Hồi quy mới chạy:** Python `unittest discover -s scripts/tests` **860 tests PASS**; `go test -race -count=1 ./internal/httpserver ./cmd/server ./internal/telemetry ./internal/digitaltwin` **PASS**; `git diff --check` **PASS**. Full Go/static và Stage2/3 native checkpoint mục6 là kế thừa, không báo chạy lại trong lượt sửa Python/docs này. Reviewer tự chạy 119 targeted Python tests, vet/build-race/lint và root-buffer tests PASS; native rerun do parent chạy, reviewer không chạy lại DB. Chưa commit/push, remote CI NOT RUN.
+**Hồi quy mới chạy:** Python `unittest discover -s scripts/tests` **860 tests PASS**; `go test -race -count=1 ./internal/httpserver ./cmd/server ./internal/telemetry ./internal/digitaltwin` **PASS**; `git diff --check` **PASS**. Full Go/static và Stage2/3 native checkpoint mục6 là kế thừa, không báo chạy lại trong lượt sửa Python/docs này. Reviewer tự chạy 119 targeted Python tests, vet/build-race/lint và root-buffer tests PASS; native rerun do parent chạy, reviewer không chạy lại DB. Checkpoint lịch sử tại thời điểm review cục bộ ghi nhận chưa commit/push và remote CI NOT RUN.
+
+**Mốc đối soát tích hợp hoàn tất (18/10/2026):**
+Toàn bộ mã nguồn Task 4.7 đã được commit vào nhánh `develop` (`aa2922a`..`6257f80`), tiếp nối bằng 2 commit sửa CI `65d727b` và `aa7436d`. Lần chạy remote CI xác nhận [run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379) tại exact commit `aa7436d8838a6580c21b30930e2eed992999b11c` hoàn thành **SUCCESS với 16/16 jobs** (gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`). Mọi checkpoint lịch sử về trạng thái dirty local hoặc NOT RUN trước đây được bảo toàn nguyên vẹn ngữ cảnh thời điểm ghi nhận.

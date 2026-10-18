@@ -1,30 +1,31 @@
 # Contract đọc lịch sử và quản lý entity Stage 4
 
-> **Trạng thái: Task 4.0 COMPLETE / Stage 4 API DESIGN ONLY — các endpoint Stage 4 CHƯA được triển khai.**
-> Tài liệu này đã hoàn thành toàn bộ **Task 4.0** (bao gồm **Task 4.0.1** baseline/đối
-> chiếu nguồn, **Task 4.0.2** danh sách endpoint/identity/quyền — mục 7, **Task 4.0.3**
-> telemetry/temporal history — mục 8, **Task 4.0.4** Twin list/detail/state + cursor
-> keyset — mục 9, **Task 4.0.5** DTO POST/PATCH metadata — mục 10, **Task 4.0.6**
-> mapper representation/context versioned/HTTP error dùng chung — mục 11, và
-> **Task 4.0.7** rà soát tính đầy đủ, sửa đổi selector theo kế hoạch và bàn giao — mục 11.8).
-> Đây **không** phải bằng chứng rằng bất kỳ endpoint nào trong bảy endpoint
-> (`GET /v1/telemetry/history`, `GET /v1/digital-twins`,
-> `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}/state`,
-> `GET /v1/digital-twins/{entity_id}/history`, `POST /v1/digital-twins`,
-> `PATCH /v1/digital-twins/{entity_id}`) đã hoạt động trên runtime. Hai route
-> `GET /v1/telemetry/history` và `GET /v1/digital-twins` hiện vẫn là stub
-> `501 not_implemented` trong `router.go`; năm route còn lại chưa được đăng ký.
-> CI xanh của Stage 3 (`2ce3a89`, run 38891798340) **không** phải chứng nhận cho
-> API Stage 4. Mục 7–11 là contract **đã hoàn tất chốt thiết kế để implement**;
-> Task 4.1–4.8 chưa được triển khai.
+> **Trạng thái: Stage 4 API IMPLEMENTED & TESTED; Task 4.8 tài liệu đã đối soát ngày 18/10/2026 (chưa commit). CI tại `aa7436d` áp dụng cho code đã chạy, không phải diff tài liệu mới.**
+> Toàn bộ bảy endpoint Stage 4 (`GET /v1/telemetry/history`, `GET /v1/digital-twins`,
+> `GET /v1/digital-twins/:entity_id`, `GET /v1/digital-twins/:entity_id/state`,
+> `GET /v1/digital-twins/:entity_id/history`, `POST /v1/digital-twins`,
+> `PATCH /v1/digital-twins/:entity_id`) đã được **triển khai đầy đủ trên runtime**
+> (Tasks 4.1–4.6) và **kiểm thử tích hợp, đo lường query, CI thành công** (Task 4.7).
+> Toàn bộ 7 route này đã được đăng ký và mount thực tế trong `src/internal/httpserver/router.go`
+> dưới nhóm xác thực `/v1` (thay thế các stub cũ; chỉ có `GET /v1/ws` giữ stub `501 not_implemented` thuộc Stage 7 WebSocket).
+> Remote CI GitHub Actions [run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379)
+> tại commit `aa7436d8838a6580c21b30930e2eed992999b11c` đã **thành công 16/16 jobs**, bao gồm
+> `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`.
+> Tài liệu tổng kết và bàn giao Stage 4 xem tại [docs/backend/stage-4-history-and-twin-api.md](../backend/stage-4-history-and-twin-api.md);
+> báo cáo tích hợp xem tại [docs/backend/stage-4-task-4.7-integration-and-ci.md](../backend/stage-4-task-4.7-integration-and-ci.md);
+> kết quả đo lường query local xem tại [docs/backend/stage-4-task-4.7-summary.json](../backend/stage-4-task-4.7-summary.json).
+>
+> *Ghi chú bảo lưu mốc lịch sử Task 4.0:* Các khối ghi nhận "DESIGN ONLY", "chưa triển khai"
+> hoặc "stub 501" trong các mục kế tiếp phản ánh **checkpoint thiết kế ban đầu tại Task 4.0**
+> (ngày 16–17/10/2026, commit `2ce3a89`) và được giữ lại làm hồ sơ kỹ thuật lịch sử,
+> không phản ánh trạng thái mã nguồn và runtime sau khi Tasks 4.1–4.7 hoàn tất.
 
-**Ngày lập:** 16/10/2026 (hoàn tất Task 4.0: 17/10/2026).
+**Ngày lập:** 16/10/2026 (hoàn tất Task 4.0: 17/10/2026; cập nhật implementation Task 4.8: 18/10/2026).
 
-**Phạm vi đã hoàn tất:** Toàn bộ Task 4.0.1 – 4.0.7 theo đúng kế hoạch chi tiết.
-Đã phục hồi selector API HTTP `value` và `sample_interval_us` cho Twin history
-theo đúng Stage 4 plan; mapper representation JSON-LD giữ public terms `measurement`
-và `sampleIntervalUs` với bảng ánh xạ tường minh; đã kiểm tra và xác thực toàn bộ
-JSON fences, cursor schemas, bounds, links và whitespace.
+**Phạm vi:** Đặc tả contract kỹ thuật cho 7 endpoints đọc lịch sử, truy vấn Digital Twin và mutation metadata Stage 4.
+Đã phục hồi selector API HTTP `value` và `sample_interval_us` cho Twin history theo đúng Stage 4 plan;
+mapper representation JSON-LD giữ public terms `measurement` và `sampleIntervalUs` với bảng ánh xạ tường minh;
+đã kiểm tra và xác thực toàn bộ JSON fences, cursor schemas, bounds, links và whitespace.
 
 Các đường dẫn source trong dấu backtick tính từ gốc `main_src/`. Liên kết Markdown
 tính từ vị trí tài liệu này.
@@ -33,34 +34,44 @@ tính từ vị trí tài liệu này.
 
 ## 1. Baseline
 
-### 1.1. Git revision và worktree tại thời điểm khảo sát
+### 1.1. Git revision và worktree tại các mốc checkpoint
 
-Ghi nhận thực tế lúc bắt đầu (lệnh `git rev-parse`/`git status`):
+- **Mốc lịch sử khảo sát Task 4.0 (16/10/2026):**
+  ```text
+  branch:  develop
+  HEAD:    2ce3a89ebd6b95f46e17cd535c5400f2ba5ca6bd
+  worktree: clean (không có thay đổi chưa commit, không file untracked)
+  upstream: up to date with 'origin/develop'
+  HEAD subject: test(ci): định danh job bằng yaml id thay vì tên hiển thị name
+  ```
+  Revision này trùng mốc khảo sát ban đầu của [Task 4.0 detail plan](../../../docs/backend_plan/task_4.0_detail_plan.md)
+  và [Stage 4 plan](../../../docs/backend_plan/stage4_backend_detailed_plan.md).
 
-```text
-branch:  develop
-HEAD:    2ce3a89ebd6b95f46e17cd535c5400f2ba5ca6bd
-worktree: clean (không có thay đổi chưa commit, không file untracked)
-upstream: up to date with 'origin/develop'
-HEAD subject: test(ci): định danh job bằng yaml id thay vì tên hiển thị name
-```
+- **Mốc hoàn thành triển khai & kiểm thử Stage 4 (Task 4.7 / Task 4.8, 18/10/2026):**
+  ```text
+  branch:  develop
+  HEAD:    aa7436d8838a6580c21b30930e2eed992999b11c
+  worktree: clean (tại thời điểm bắt đầu Task 4.8)
+  HEAD subject: ci: cấp quyền actions read cho job stage4-api-integration
+  ```
+  Chuỗi commit hoàn thành Stage 4 trên `develop`: Task 4.4 (`42dda31`), Task 4.5 (`f7a51bb`),
+  Task 4.6 (`e6e304d`), Task 4.7 (`6257f80`), và các bản sửa CI (`65d727b`, `aa7436d`).
 
-Revision này **trùng** mốc khảo sát của [Task 4.0 detail plan](../../../docs/backend_plan/task_4.0_detail_plan.md)
-và [Stage 4 plan](../../../docs/backend_plan/stage4_backend_detailed_plan.md). Đây là
-điểm khởi đầu; khi triển khai Task 4.1+ phải ghi lại revision/worktree thực tế, không
-giả định HEAD giữ nguyên.
+### 1.2. Bằng chứng CI (lịch sử Stage 3 và nghiệm thu Stage 4)
 
-### 1.2. Bằng chứng CI (lịch sử, không phải Stage 4)
-
-- Ghi từ [AGENTS.md](../../AGENTS.md): GitHub Actions run **38891798340** tại commit
-  `2ce3a89ebd6b95f46e17cd535c5400f2ba5ca6bd` (viết ngắn `2ce3a89`), cả **15 jobs** hoàn thành thành công, bao gồm
-  `stage3-uplink-integration` và `native-compose-smoke`.
+- **Mốc lịch sử Stage 3 (tại thời điểm Task 4.0 bắt đầu):**
+  GitHub Actions run **38891798340** tại commit `2ce3a89ebd6b95f46e17cd535c5400f2ba5ca6bd` (viết ngắn `2ce3a89`),
+  cả **15 jobs** hoàn thành thành công, bao gồm `stage3-uplink-integration` và `native-compose-smoke`.
   Run URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/38891798340>.
-- Run trước đó `38890958598` từng fail do workflow contract test phụ thuộc tên hiển
-  thị job đã bị xoá; commit `2ce3a89` sửa cách định danh theo job id và run sau pass.
-- Đây là **baseline lịch sử của Stage 3**. Tài liệu này **không** tự truy vấn lại
-  GitHub và **không** gán PASS cho revision Stage 4. Nếu HEAD đổi, giữ run này làm mốc
-  lịch sử, không suy diễn API Stage 4 đã được test.
+- **Nghiệm thu remote CI Stage 4 (Tasks 4.1–4.7 hoàn tất):**
+  GitHub Actions run **39103564379** tại commit `aa7436d8838a6580c21b30930e2eed992999b11c`, cả **16/16 jobs**
+  hoàn thành thành công, bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`.
+  Run URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379>.
+  Các ghi chú "NOT RUN" trước đây phản ánh checkpoint trước khi push/dispatch CI; hiện remote CI Stage 4 đã được xác minh PASS.
+- **Lưu ý về nguồn số đo local:** Báo cáo tóm tắt đo lường local trong [docs/backend/stage-4-task-4.7-summary.json](../backend/stage-4-task-4.7-summary.json)
+  ghi nhận revision dirty baseline và Docker image IDs của lần đo gốc (`sha256:9e6acf90d81657c3d76c7740cd35140f9c8f1e96896249478154225db92cf99a`
+  cho backend và `sha256:58fe698a9e5e6586dd8c2b7c8017e2095e270be2e728ad4c3356edad44a48d09` cho gateway);
+  không bị ghi đè hay gán sang commit CI mới.
 
 ### 1.3. Schema, DB role, RLS và retention
 
@@ -113,23 +124,29 @@ giả định HEAD giữ nguyên.
   `sensor_handlers.go`): trả `{"items":[...]}`, luôn `Cache-Control: no-store`, và
   **từ chối** query param `user_id` (`400`) — không nhận identity từ query.
 
-### 1.5. Route hiện có (đọc trực tiếp từ router, không sao chép ví dụ)
+### 1.5. Trạng thái route (đối chiếu lịch sử Task 4.0 và runtime hiện hành)
 
-| Method / route | Trạng thái hiện tại | Ghi chú |
-| --- | --- | --- |
-| `GET /v1/admin/gateways` | Đã có | Platform admin inventory, keyset `after`/`limit` (default 100, max 200). |
-| `PUT /v1/admin/gateways/:gateway_id` | Đã có | Admin provision Gateway (create-or-exact-replay). |
-| `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Admin provision Sensor. |
-| `PUT /v1/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Owner provision Sensor. |
-| `GET /v1/me/permissions` | Đã có | Trả quyền của principal. |
-| `GET /v1/gateways` | Đã có | List Gateway theo membership của user. |
-| `GET /v1/gateways/:gateway_id/sensors` | Đã có | List Sensor theo gateway + membership. |
-| `GET /v1/telemetry/history` | **501 stub** | `notImplemented`. |
-| `GET /v1/ws` | **501 stub** | WebSocket chưa triển khai. |
-| `GET /v1/digital-twins` | **501 stub** | Twin list chưa triển khai. |
+Bảng dưới đây ghi nhận trạng thái route trong `src/internal/httpserver/router.go`:
 
-Các route Stage 4 (`/v1/digital-twins/{entity_id}`, `/state`, `/history`, `POST`, `PATCH`)
-**chưa được đăng ký** trong `router.go`.
+| Method / route | Trạng thái tại Task 4.0 (Lịch sử) | Trạng thái Runtime hiện tại (Tasks 4.1–4.7 hoàn tất) | Ghi chú |
+| --- | --- | --- | --- |
+| `GET /v1/admin/gateways` | Đã có | Đã có | Platform admin inventory, keyset `after`/`limit` (default 100, max 200). |
+| `PUT /v1/admin/gateways/:gateway_id` | Đã có | Đã có | Admin provision Gateway (create-or-exact-replay). |
+| `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Đã có | Admin provision Sensor. |
+| `PUT /v1/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Đã có | Owner provision Sensor. |
+| `GET /v1/me/permissions` | Đã có | Đã có | Trả quyền của principal. |
+| `GET /v1/gateways` | Đã có | Đã có | List Gateway theo membership của user. |
+| `GET /v1/gateways/:gateway_id/sensors` | Đã có | Đã có | List Sensor theo gateway + membership. |
+| `GET /v1/telemetry/history` | **501 stub** | **Đã triển khai** | Handler `getTelemetryHistory`, query telemetry raw/bucket theo membership (Task 4.2, 4.6). |
+| `GET /v1/digital-twins` | **501 stub** | **Đã triển khai** | Handler `listDigitalTwins`, keyset pagination `v1.` theo membership (Task 4.3, 4.6). |
+| `POST /v1/digital-twins` | Chưa đăng ký | **Đã triển khai** | Handler `postDigitalTwin`, admin/owner metadata creation/replay (Task 4.5, 4.6). |
+| `GET /v1/digital-twins/:entity_id` | Chưa đăng ký | **Đã triển khai** | Handler `getDigitalTwinDetail`, JSON-LD entity + phân trang quan hệ (Task 4.3, 4.6). |
+| `PATCH /v1/digital-twins/:entity_id` | Chưa đăng ký | **Đã triển khai** | Handler `patchDigitalTwin`, admin/owner metadata mutation allowlist (Task 4.5, 4.6). |
+| `GET /v1/digital-twins/:entity_id/state` | Chưa đăng ký | **Đã triển khai** | Handler `getDigitalTwinState`, JSONB state view snapshot 9 cột `twin_states` (Task 4.3, 4.6). |
+| `GET /v1/digital-twins/:entity_id/history` | Chưa đăng ký | **Đã triển khai** | Handler `getDigitalTwinHistory`, selector `value`/`sample_interval_us` (Task 4.4, 4.6). |
+| `GET /v1/ws` | **501 stub** | **501 stub** | WebSocket realtime streaming chưa triển khai (thuộc Stage 7). |
+
+Toàn bộ bảy route nghiệp vụ Stage 4 đã được đăng ký và hoạt động đầy đủ trong `router.go`. Chỉ duy nhất `/v1/ws` giữ stub `501 not_implemented` cho Stage 7.
 
 ---
 
@@ -395,16 +412,21 @@ kiểm chứng Stage 2/3 chỉ để sửa lỗi diễn đạt.
 3. **Temporal hiện chỉ có `sample_interval_us`** được ghi; **chưa có inference ingress**.
    Payload telemetry v1 không có field inference. Không seed một dòng SQL rồi tuyên bố
    inference đã hoàn thành, không quảng bá writer chưa tồn tại.
-4. **Chưa có Stage 4 query measurements:** chưa chạy `EXPLAIN`/đo query; các bound
+4. **Đo lường truy vấn Stage 4 (Task 4.0 vs Task 4.7):** Tại mốc khảo sát Task 4.0, các bound
    (timeout 5s, range 744h, raw window 10s, `max_points` 1000/100–2000) chỉ là thiết kế
-   config cho task sau, chưa phải giới hạn đã kiểm.
+   config. Đến Task 4.2 và Task 4.7, các phép đo query thực tế đã được thực hiện trên dataset chuẩn
+   60.000 raw samples @ 100 Hz và 580 temporal observations, kiểm chứng cả hai trạng thái uncompressed
+   và compressed chunks (`compress_chunk`). Mọi truy vấn M1–M5 đều hoàn thành trong < 60ms thời gian
+   thực thi DB và < 55ms HTTP elapsed, nằm an toàn bên trong ngân sách 5,0s mà không cần thay đổi schema hay
+   thêm index suy đoán (giữ nguyên Schema 20). Xem [docs/backend/stage-4-task-4.7-integration-and-ci.md](../backend/stage-4-task-4.7-integration-and-ci.md).
 5. **Số đo ACK Stage 3 không phải SLA history:** p50 43,63ms / p95 47,86ms là số đo
    fixture (1 Gateway × 1 Sensor × 100 Hz), không phải cam kết cho truy vấn history.
 6. **RLS bị app role bypass:** mọi quyền người dùng phải do Go/SQL scope theo
    `user_gateways`; platform admin read không tự bypass membership.
-7. **Ba route còn là stub/chưa có:** `GET /v1/telemetry/history` và
-   `GET /v1/digital-twins` là `501`; `/v1/ws` là `501`; detail/state/history/POST/PATCH
-   chưa đăng ký.
+7. **Trạng thái route stub (lịch sử Task 4.0 vs runtime hiện tại):** Tại mốc Task 4.0, hai route
+   `GET /v1/telemetry/history` và `GET /v1/digital-twins` là stub `501`, và năm route còn lại chưa đăng ký.
+   Hiện tại, cả bảy route Stage 4 đều đã được triển khai và đăng ký hoàn tất (Task 4.6); chỉ duy nhất `/v1/ws`
+   tiếp tục là stub `501 not_implemented` chờ Stage 7 (WebSocket realtime streaming).
 8. **`twin_temporal_values` không có PK/unique:** read phải tự đảm bảo sắp xếp ổn định
    (ví dụ theo `observed_at`) và không giả định unique.
 
@@ -480,17 +502,24 @@ state). Sai graph → `ReasonResourceGraphIncomplete`; Gateway/Sensor không t�
 
 ---
 
-## 6. Chưa kiểm chứng (NOT CHECKED)
+## 6. Chưa kiểm chứng (NOT CHECKED) và ranh giới kiểm tra
 
-- **Catalog runtime CHƯA được kiểm.** Toàn bộ bảng cột/index/RLS ở mục 2 lấy từ migration
-  files trong Git, **không** query `information_schema`/`pg_indexes` trên DB thật. Nếu cần
-  xác nhận catalog, chỉ đọc schema/index/version trên DB test đã xác định đúng đích và ghi
-  rõ nguồn; không seed/reset dữ liệu để lấy baseline.
-- Không chạy `EXPLAIN`/đo query, không chạy suite Go, không chạy native integration, không
-  re-run CI.
-- Không kiểm quyền thực tế của `iot_backend_app`/`iot_backend` bằng `has_*_privilege` trên
-  runtime (chỉ đọc từ migration/script).
-- Không kiểm secret; tài liệu không ghi credential nào (kể cả `DATABASE_URL` thật).
+- **Mốc lịch sử Task 4.0:** Tại thời điểm chốt contract Task 4.0, toàn bộ bảng/cột/index/RLS ở mục 2
+  được khảo sát từ migration files trong Git, chưa chạy `EXPLAIN`/đo query, chưa chạy native integration
+  và chưa re-run CI cho Stage 4.
+- **Tiến trình đã kiểm chứng (Tasks 4.1–4.7):**
+  - Đã chạy đầy đủ các bộ kiểm thử unit, race (`go test -race ./...`), vet, lint (0 issues), build.
+  - Đã kiểm chứng native authorization và query isolation trên database test thật (PostgreSQL 16.15 / TimescaleDB 2.29.2, role `iot_backend_app` có `BYPASSRLS`).
+  - Đã thực thi kịch bản tích hợp liên dịch vụ đầy đủ (`scripts/test-stage4-api.sh --scenario all`) trên các Docker container thực (backend, gateway, mosquitto TLS, postgres).
+  - Đã đo lường query M1–M5 trên cả uncompressed và compressed TimescaleDB chunks.
+  - Remote CI GitHub Actions run `39103564379` đã PASS toàn bộ 16/16 jobs tại commit `aa7436d`.
+- **Các giới hạn kỹ thuật tiếp tục bảo lưu (chưa kiểm / ngoài phạm vi Stage 4):**
+  - Không kiểm tra trực tiếp qua mạng Internet công cộng hoặc môi trường production.
+  - Không kiểm tra hủy query đang thực thi trên server database (cancellation chỉ bao gồm acquire pool timeout).
+  - Không chạy kiểm tra live cho legacy NULL provenance qua HTTP delegator (do Schema 20 ép NOT NULL trên dữ liệu mới; kiểm thử cô lập trong upgrade fixture).
+  - Không có bằng chứng về độ bền phần cứng chống mất điện đột ngột (power-loss durability) hay fsync phần cứng.
+  - Không suy diễn sang client Flutter UI hay thiết bị nhúng ARM thực tế.
+  - Không kiểm tra secret; tài liệu giữ bí mật thông tin xác thực (kể cả `DATABASE_URL` thật).
 
 ---
 
@@ -499,26 +528,26 @@ state). Sai graph → `ReasonResourceGraphIncomplete`; Gateway/Sensor không t�
 Bước **4.0.2** chốt **đúng bảy** endpoint, cách resolve identity công khai và hai ma
 trận quyền. DTO chi tiết, examples, time range `[from,to)`, raw/bucket,
 cursor/pagination, representation/context và bảng error đầy đủ thuộc Task
-4.0.4–4.0.6 và **chưa** được chốt ở đây. Toàn bộ mục này là **thiết kế**; không
-endpoint nào trong số này đang hoạt động (xem khối trạng thái đầu tài liệu).
+4.0.4–4.0.6.
+*Lưu ý mốc checkpoint:* Các ghi chú "thiết kế ban đầu" phản ánh mốc Task 4.0 (16/10/2026).
+Hiện tại, cả bảy endpoint đã được triển khai đầy đủ (Tasks 4.1–4.6) và kiểm chứng tích hợp (Task 4.7).
 
 ### 7.1. Bảy endpoint
 
-| # | Method / path | Trạng thái hiện tại | Input chính (tóm tắt) | Output chính (tóm tắt) |
-| --- | --- | --- | --- | --- |
-| 1 | `GET /v1/telemetry/history` | stub `501 not_implemented` (đã đăng ký) | `gateway_id`, `sensor_id`, `from`, `to`; optional `resolution`, `max_points` | một series raw hoặc bucket đã scope membership + metadata range/unit/mode/số điểm |
-| 2 | `GET /v1/digital-twins` | stub `501 not_implemented` (đã đăng ký) | optional `gateway_id`, `entity_type=Gateway\|Sensor`, `limit`, `after` | `items` (summary) + `next_cursor`; chỉ entity thuộc membership |
-| 3 | `GET /v1/digital-twins/{entity_id}` | chưa đăng ký | `entity_id` URN URL-encoded; tham số phân trang quan hệ | entity view NGSI-LD-compatible + trang quan hệ bounded + `next_cursor` |
-| 4 | `GET /v1/digital-twins/{entity_id}/state` | chưa đăng ký | `entity_id` URN URL-encoded | reported/desired JSONB, versions, `last_*_at`, audit được phép đọc |
-| 5 | `GET /v1/digital-twins/{entity_id}/history` | chưa đăng ký | `entity_id`; `property`, `from`, `to`; optional `resolution`, `max_points` | series temporal (`property=value` ánh xạ raw telemetry; `property=sample_interval_us` đọc typed temporal) |
-| 6 | `POST /v1/digital-twins` | chưa đăng ký | DTO admin: `entity_type` + identifier + name/metadata allowlist (Gateway cần owner profile) | `201` mới / `200` exact replay / `409` conflict |
-| 7 | `PATCH /v1/digital-twins/{entity_id}` | chưa đăng ký | `entity_id` + allowlist `name`/`description` có presence/null semantics | `200` sau transaction metadata (không side effect state/command) |
+| # | Method / path | Trạng thái tại Task 4.0 (Lịch sử) | Trạng thái Runtime hiện tại | Input chính (tóm tắt) | Output chính (tóm tắt) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `GET /v1/telemetry/history` | stub `501 not_implemented` | **Đã triển khai & kiểm thử** (Task 4.2, 4.6, 4.7) | `gateway_id`, `sensor_id`, `from`, `to`; optional `resolution`, `max_points` | một series raw hoặc bucket đã scope membership + metadata range/unit/mode/số điểm |
+| 2 | `GET /v1/digital-twins` | stub `501 not_implemented` | **Đã triển khai & kiểm thử** (Task 4.3, 4.6, 4.7) | optional `gateway_id`, `entity_type=Gateway\|Sensor`, `limit`, `after` | `items` (summary) + `next_cursor`; chỉ entity thuộc membership |
+| 3 | `GET /v1/digital-twins/{entity_id}` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.3, 4.6, 4.7) | `entity_id` URN URL-encoded; tham số phân trang quan hệ | entity view NGSI-LD-compatible + trang quan hệ bounded + `next_cursor` |
+| 4 | `GET /v1/digital-twins/{entity_id}/state` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.3, 4.6, 4.7) | `entity_id` URN URL-encoded | reported/desired JSONB, versions, `last_*_at`, audit được phép đọc |
+| 5 | `GET /v1/digital-twins/{entity_id}/history` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.4, 4.6, 4.7) | `entity_id`; `property`, `from`, `to`; optional `resolution`, `max_points` | series temporal (`property=value` ánh xạ raw telemetry; `property=sample_interval_us` đọc typed temporal) |
+| 6 | `POST /v1/digital-twins` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.5, 4.6, 4.7) | DTO admin: `entity_type` + identifier + name/metadata allowlist (Gateway cần owner profile) | `201` mới / `200` exact replay / `409` conflict |
+| 7 | `PATCH /v1/digital-twins/{entity_id}` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.5, 4.6, 4.7) | `entity_id` + allowlist `name`/`description` có presence/null semantics | `200` sau transaction metadata (không side effect state/command) |
 
-Chỉ #1 và #2 đã có route và vẫn là stub `501` (chưa hoạt động); #3–#7 **chưa** tồn
-tại trong `router.go` và không được coi là khả dụng. Field/defaults/bounds, ví dụ và
-cursor chi tiết do Task 4.0.3–4.0.6 chốt (history/raw/bucket/temporal đã chốt ở mục 8;
-list/detail/state/POST/PATCH còn ở 4.0.4–4.0.6); 4.0.2 chỉ cố định method/path + input/output
-tóm tắt + identity + quyền.
+Tại mốc thiết kế Task 4.0, chỉ #1 và #2 có route stub `501` và #3–#7 chưa được đăng ký.
+Sau khi Tasks 4.1–4.6 hoàn tất, cả 7 route đã được mount đầy đủ trong `router.go`, nối các
+service/repository/parser tương ứng và được xác minh qua kịch bản tích hợp cùng CI (Task 4.7).
+Field/defaults/bounds, ví dụ và cursor chi tiết do Task 4.0.3–4.0.6 chốt ở các mục sau.
 
 ### 7.2. Public URN, encode URL và resolve identity
 
@@ -620,7 +649,7 @@ tóm tắt + identity + quyền.
 - `/state` **đọc** cả reported và desired, nhưng API metadata (`POST`/`PATCH`)
   **không** ghi reported/desired/versions và không đụng `sample_interval_us`.
 - Các endpoint này **không** phát MQTT và **không** tạo command/outbox/credential/human
-  account; không cấp quyền ghi `desired_state` (thuộc Stage 5).
+  account; không cấp quyền ghi `desired_state` (thuộc Stage 5 — điều khiển Digital Twin downlink; Stage 7 mới là WebSocket realtime).
 - Stage 2 `PUT` giữ nguyên semantics create-or-exact-replay và inventory:
   `PUT /v1/admin/gateways/:gateway_id`,
   `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id`,
@@ -631,13 +660,13 @@ tóm tắt + identity + quyền.
 
 ## 8. Contract Task 4.0.3 — telemetry và temporal history
 
-Bước **4.0.3** chốt request/response, thời gian, raw/bucket, temporal typed history,
+Bước **4.0.3** đã chốt request/response, thời gian, raw/bucket, temporal typed history,
 safe BIGINT/NULL và error cho hai endpoint history (**#1** `GET /v1/telemetry/history`
-và **#5** `GET /v1/digital-twins/{entity_id}/history`, đánh số theo mục 7.1). Toàn bộ
-mục này là **thiết kế**: `#1` vẫn là stub `501 not_implemented`, `#5` chưa đăng ký.
-Không thêm config/`.env`/migration/code ở Task 4.0.3; các bounds dưới đây là thiết kế
-config cho Task 4.1–4.2. Mã lỗi ở đây là đề xuất khớp style hiện có; bảng error đầy đủ
-thuộc 4.0.6.
+và **#5** `GET /v1/digital-twins/{entity_id}/history`, đánh số theo mục 7.1).
+*Lưu ý mốc checkpoint:* Ghi nhận "thiết kế", "stub 501", "chưa đăng ký" là mốc lịch sử Task 4.0.
+Hiện tại, cả hai endpoint này đã được triển khai (Task 4.2, Task 4.4), đăng ký trong `router.go`
+(Task 4.6), và kiểm chứng tích hợp thành công trên CI (Task 4.7). Các bounds dưới đây được cấu hình
+trong `config.HistoryConfig` và `config.TwinConfig`. Bảng error đầy đủ thống nhất tại 4.0.6 (mục 11.5).
 
 ### 8.1. Endpoint #1 request
 
@@ -969,14 +998,15 @@ và nullable metadata nếu sau này có pipeline ingestion tương ứng, hoàn
 
 ## 9. Contract Task 4.0.4 — Twin list/detail/state và phân trang quan hệ
 
-Bước **4.0.4** chốt ba endpoint **#2** `GET /v1/digital-twins`, **#3**
+Bước **4.0.4** đã chốt ba endpoint **#2** `GET /v1/digital-twins`, **#3**
 `GET /v1/digital-twins/{entity_id}` và **#4** `GET /v1/digital-twins/{entity_id}/state`
 (đánh số theo mục 7.1), gồm filter/summary, cursor list, projection detail, phân trang
-quan hệ `hasSensor` và state field. Toàn bộ mục này là **thiết kế**: `#2` vẫn là stub
-`501 not_implemented`; `#3`/`#4` **chưa** đăng ký. Không thêm code/DTO/migration/config ở
-bước này. Protected response dùng `Cache-Control: no-store` theo middleware hiện có
-(mục 1.4), không lặp lại. BIGINT/NULL/JSON-number dùng chung **8.7**; time range
-`[from,to)` (8.2) thuộc history, **không** áp cho list/detail/state.
+quan hệ `hasSensor` và state field.
+*Lưu ý mốc checkpoint:* Ghi nhận "thiết kế", "stub 501", "chưa đăng ký" phản ánh mốc lịch sử Task 4.0.
+Cả ba endpoint này hiện đã được triển khai (Task 4.3), tích hợp vào router (Task 4.6),
+và kiểm thử thành công trong kịch bản tích hợp cùng remote CI (Task 4.7). Protected response dùng
+`Cache-Control: no-store` theo middleware hiện có (mục 1.4), không lặp lại. BIGINT/NULL/JSON-number dùng chung **8.7**;
+time range `[from,to)` (8.2) thuộc history, **không** áp cho list/detail/state.
 
 ### 9.1. List `GET /v1/digital-twins`
 
@@ -1435,15 +1465,14 @@ measurement time:
 
 ## 10. Contract Task 4.0.5 — DTO POST/PATCH metadata
 
-Bước **4.0.5** chốt DTO mutation metadata cho hai endpoint **#6** `POST /v1/digital-twins`
-và **#7** `PATCH /v1/digital-twins/{entity_id}` (đánh số theo mục 7.1). Toàn bộ mục này
-là **thiết kế**: cả hai route **chưa** được đăng ký trong `router.go` (mục 1.5) và không
-được coi là khả dụng; Task 4.0 **không** sửa provisioning, không thêm code/migration và
-không thực thi HTTP write nào. Field/type/length dưới đây **lấy từ validator provisioning
+Bước **4.0.5** đã chốt DTO mutation metadata cho hai endpoint **#6** `POST /v1/digital-twins`
+và **#7** `PATCH /v1/digital-twins/{entity_id}` (đánh số theo mục 7.1).
+*Lưu ý mốc checkpoint:* Ghi nhận "thiết kế", "chưa đăng ký" là mốc lịch sử Task 4.0.
+Hiện tại, cả hai endpoint này đã được triển khai đầy đủ (Task 4.5), đăng ký trong `router.go` (Task 4.6),
+và kiểm chứng tích hợp thành công trên CI (Task 4.7). Field/type/length dưới đây **lấy từ validator provisioning
 hiện có** (mục 5.2–5.4, mục 10.8), không tự đặt lại. Quyền dùng lại ma trận 7.4; identity
 URN dùng lại 7.2; status/error dùng lại 7.5; BIGINT/NULL dùng lại 8.7. Phần **#6** tái
-dùng **đúng** transaction provisioning Stage 2 (`PUT`
-admin/owner) chứ không tạo một pipeline ghi thứ hai.
+dùng **đúng** transaction provisioning Stage 2 (`PUT` admin/owner) chứ không tạo một pipeline ghi thứ hai.
 
 ### 10.1. Field POST theo entity type
 
@@ -1786,11 +1815,12 @@ membership nhưng role không đủ; non-member Sensor → `404` (theo 7.4):
 
 ## 11. Contract Task 4.0.6 — representation mapper, context và HTTP/error dùng chung
 
-Bước **4.0.6** chốt bảng mapping tập trung, một context dự án versioned inline, quy ước
-`Content-Type`/header/request ID/CORS/bounds và bảng error status/code dùng chung. Toàn bộ là
-**thiết kế**: không endpoint Stage 4 nào hoạt động; không thêm route/framework/migration/config;
-quyền giữ nguyên 7.3–7.4; BIGINT/NULL/JSON-number giữ nguyên 8.7. Bước 4.0.7 rà tính đầy đủ
-sau bước này.
+Bước **4.0.6** đã chốt bảng mapping tập trung, một context dự án versioned inline, quy ước
+`Content-Type`/header/request ID/CORS/bounds và bảng error status/code dùng chung.
+*Lưu ý mốc checkpoint:* Khẳng định "không endpoint Stage 4 nào hoạt động" phản ánh mốc lịch sử Task 4.0.
+Hiện tại, toàn bộ mapper, inline context và HTTP error handling đã được triển khai trong
+`src/internal/digitaltwin/mapper/` và `src/internal/httpserver/`, phục vụ cho cả 7 endpoints đã hoạt động.
+Quyền giữ nguyên 7.3–7.4; BIGINT/NULL/JSON-number giữ nguyên 8.7.
 
 ### 11.1. Bảng mapping tập trung
 
@@ -2034,8 +2064,9 @@ Bước 4.0.7 hoàn tất việc rà soát toàn diện contract API Stage 4 và
    - #6 `POST /v1/digital-twins` (mục 10.1–10.4, 10.6, 10.7).
    - #7 `PATCH /v1/digital-twins/{entity_id}` (mục 10.5–10.7).
 2. **Đối chiếu các sự thật mã nguồn dễ sai lệch:**
-   - *Router:* Hiện chỉ có route #1 và #2 tồn tại dưới dạng stub trả `501 not_implemented` trong
-     `src/internal/httpserver/router.go`. Các route #3–#7 chưa được khai báo.
+   - *Router:* Tại mốc khảo sát Task 4.0, chỉ có route #1 và #2 tồn tại dưới dạng stub trả `501 not_implemented`
+     trong `src/internal/httpserver/router.go` và #3–#7 chưa được đăng ký. Đến Task 4.6, toàn bộ 7 route Stage 4
+     đã được mount và đăng ký đầy đủ dưới nhóm `/v1` (chỉ còn `/v1/ws` giữ stub `501` cho Stage 7).
    - *Membership & Admin:* Các truy vấn đọc sử dụng `user_gateways` (các role `owner`, `operator`, `viewer`),
      trong khi năng lực ghi quản trị (admin write capability) kiểm tra `platform_admins` (Gateway Owner được
      quản lý metadata sensor được gán theo ma trận quyền); không phải mọi truy vấn đọc/ghi đều đòi hỏi cả hai
@@ -2135,6 +2166,15 @@ Bước 4.0.7 hoàn tất việc rà soát toàn diện contract API Stage 4 và
      thêm public business route.
    - Tích hợp kiểm thử HTTP request/response, status codes, media types, schemas và constructor/config error
      handling; bảo đảm API Stage 2 create-or-exact-replay tiếp tục hoạt động theo contract cũ.
+7. **Tiến trình thực tế Tasks 4.1–4.8 (Reconciliation):**
+   - Task 4.1: Query models, bounds, read authorization đã hoàn thành ([báo cáo Task 4.1](../backend/stage-4-task-4.1-query-bounds-and-read-authorization.md)).
+   - Task 4.2: Telemetry raw & bucket history đã hoàn thành ([báo cáo Task 4.2](../backend/stage-4-task-4.2-telemetry-history.md), [số đo Task 4.2](../backend/stage-4-task-4.2-query-measurements.md)).
+   - Task 4.3: Twin list, detail, state, mapper, pagination đã hoàn thành ([báo cáo Task 4.3](../backend/stage-4-task-4.3-twin-read-and-mapper.md)).
+   - Task 4.4: Temporal history & value delegation đã hoàn thành ([báo cáo Task 4.4](../backend/stage-4-task-4.4-temporal-history.md)).
+   - Task 4.5: Entity metadata POST & PATCH đã hoàn thành ([báo cáo Task 4.5](../backend/stage-4-task-4.5-entity-metadata.md)).
+   - Task 4.6: HTTP composition & 7 routes mounted đã hoàn thành ([báo cáo Task 4.6](../backend/stage-4-task-4.6-http-composition.md)).
+   - Task 4.7: Integration test suite, query measurements uncompressed/compressed, remote CI 16/16 jobs PASS đã hoàn thành ([báo cáo Task 4.7](../backend/stage-4-task-4.7-integration-and-ci.md), [tóm tắt Task 4.7](../backend/stage-4-task-4.7-summary.json)).
+   - Task 4.8: Tài liệu tổng kết Stage 4 ([docs/backend/stage-4-history-and-twin-api.md](../backend/stage-4-history-and-twin-api.md)), client contracts 04/05/07/08 và protocol đã được đối soát trong phạm vi kế hoạch, chưa commit.
 
 #### 11.8.5. Kết quả kiểm tra tài liệu thuần túy (Document-only Verification)
 
@@ -2142,29 +2182,38 @@ Mọi kiểm tra tài liệu đã được thực hiện trực tiếp trên wor
 - **Parse JSON Fences:** 31/31 khối JSON trong tài liệu phân tích cú pháp hợp lệ (0 lỗi cú pháp).
 - **Giải mã Cursor Keyset:** Toàn bộ 3 mẫu cursor base64url trong tài liệu (`after` list, `relationship_after`
   detail, `next_cursor` list) giải mã chính xác cấu trúc JSON `{k, g, t}` và `{s, r, k}`, độ dài hợp lệ.
-- **Liên kết Markdown:** 8/8 liên kết nội bộ trong tài liệu phân giải chính xác đến các file tồn tại trong repo.
+- **Liên kết Markdown:** Các liên kết nội bộ trong tài liệu phân giải chính xác đến các file tồn tại trong repo.
 - **Định dạng & Whitespace:** Lệnh `git diff --check` thực thi không phát hiện bất kỳ lỗi khoảng trắng nào (whitespace only).
-- **Ranh giới thực thi:** Công việc thuần túy ở tầng tài liệu contract thiết kế; không chạy build Go, không chạy
-  test native/CI, không thay đổi runtime code hay cấu hình server.
+- **Ranh giới mốc Task 4.0:** Tại mốc Task 4.0, công việc thuần túy ở tầng tài liệu contract thiết kế; các bước triển khai code, native test và CI diễn ra sau đó trong Tasks 4.1–4.7.
 
 ---
 
 ## 12. Tham chiếu
 
-- [AGENTS.md](../../AGENTS.md) — chính sách MVP mục 0 và 16.
+- [AGENTS.md](../../AGENTS.md) — chính sách MVP mục 0, 1 và 16.
+- [Tài liệu tổng kết và bàn giao Stage 4](../backend/stage-4-history-and-twin-api.md) — tổng kết Stage 4 và bàn giao Stage 5.
+- [Báo cáo tích hợp Task 4.7](../backend/stage-4-task-4.7-integration-and-ci.md) — báo cáo kiểm thử tích hợp, đo lường uncompressed/compressed và CI.
+- [Báo cáo tóm tắt đo lường query Task 4.7](../backend/stage-4-task-4.7-summary.json) — số liệu đo lường query M1–M5 chi tiết.
 - [Task 4.0 detail plan](../../../docs/backend_plan/task_4.0_detail_plan.md).
 - [Stage 4 backend detailed plan](../../../docs/backend_plan/stage4_backend_detailed_plan.md) — mục 1–4.
+- [Task 4.8 detail plan](../../../docs/backend_plan/task_4.8_detail_plan.md).
 - [MQTT Application Protocol v1](mqtt-v1.md).
 - [Bàn giao Stage 3](../backend/stage-3-uplink.md).
-- CI lịch sử: run 38891798340 tại `2ce3a89`
+- CI lịch sử Stage 3: run 38891798340 tại `2ce3a89`
   (<https://github.com/TVTIT/project1_iot_server/actions/runs/38891798340>).
+- CI nghiệm thu Stage 4: run 39103564379 tại `aa7436d8838a6580c21b30930e2eed992999b11c`
+  (<https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379>).
 - Migrations: `migrations/000001` … `migrations/000020` (đường dẫn tính từ `main_src/`).
 - HTTP: `src/internal/httpserver/router.go`, `src/internal/httpapi/error.go`,
-  `src/internal/httpserver/cors.go`, `src/internal/auth/`.
+  `src/internal/httpserver/cors.go`, `src/internal/auth/`, `src/internal/httpserver/read_handlers.go`,
+  `src/internal/httpserver/mutation_handlers.go`.
 - Gateway: `src/internal/gateway/`.
 - Telemetry: `src/internal/telemetry/`.
-- Mapper: `src/internal/digitaltwin/mapper/identity.go`.
+- Digital Twin: `src/internal/digitaltwin/`, `src/internal/digitaltwin/mapper/identity.go`.
 
-**Trạng thái contract:** Task 4.0 (bao gồm Task 4.0.1–4.0.7) đã **HOÀN THÀNH**. Contract đã được chốt
-thiết kế kỹ thuật đầy đủ để triển khai (Stage 4 API DESIGN ONLY). Các endpoint Stage 4 **chưa khả dụng**
-trên runtime. **Task 4.1–4.8 chưa được triển khai** và không được suy diễn từ tài liệu thiết kế này.
+**Trạng thái contract và implementation:** Stage 4 API đã **HOÀN THÀNH TRIỂN KHAI VÀ KIỂM THỬ** (Tasks 4.0–4.7 hoàn thành;
+Task 4.8 tài liệu hóa và đối chiếu contract đã hoàn tất có giới hạn, chưa commit). Cả bảy endpoint Stage 4 (`GET /v1/telemetry/history`,
+`GET /v1/digital-twins`, `GET /v1/digital-twins/:entity_id`, `GET /v1/digital-twins/:entity_id/state`,
+`GET /v1/digital-twins/:entity_id/history`, `POST /v1/digital-twins`, `PATCH /v1/digital-twins/:entity_id`)
+đã **hoạt động thực tế trên runtime** và được xác minh qua 16/16 jobs CI thành công tại commit `aa7436d8838a6580c21b30930e2eed992999b11c`.
+Các nội dung thiết kế ban đầu của Task 4.0 được lưu giữ nguyên vẹn làm hồ sơ kỹ thuật lịch sử.
