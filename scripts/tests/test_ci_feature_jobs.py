@@ -243,10 +243,10 @@ class TestCIFeatureJobs(unittest.TestCase):
         assert_credential_job_contract(cred_job)
         assert_runtime_job_contract(runtime_job)
 
-        # Verify all 15 job IDs remain defined
+        # Verify all 16 job IDs remain defined
         jobs_content = self.raw_content.split('\njobs:\n', 1)[1]
         all_jobs = re.findall(r'^  ([a-z0-9-]+):[ \t]*$', jobs_content, re.MULTILINE)
-        self.assertEqual(len(all_jobs), 15, f"expected 15 jobs, found {len(all_jobs)}: {all_jobs}")
+        self.assertEqual(len(all_jobs), 16, f"expected 16 jobs, found {len(all_jobs)}: {all_jobs}")
         expected_jobs = {
             'lint-and-test', 'cross-compile', 'migration-check',
             'docker-build', 'authorization-integration',
@@ -255,7 +255,7 @@ class TestCIFeatureJobs(unittest.TestCase):
             'mosquitto-credential-integration', 'stage2-e2e',
             'legacy-runtime-image-build', 'dynsec-native-integration',
             'dynsec-bootstrap-tests', 'stage3-uplink-integration',
-            'native-compose-smoke',
+            'stage4-api-integration', 'native-compose-smoke',
         }
         self.assertEqual(set(all_jobs), expected_jobs)
 
@@ -357,6 +357,65 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertNotIn("ca.key", job)
         self.assertNotIn("dynamic-security.json", job)
 
+    def test_stage4_api_integration_job_structure_and_prerequisites(self):
+        """stage4-api-integration must run bounded timeout (30-45min), from root, and verify all prerequisites."""
+        job = self._extract_job_section("stage4-api-integration")
+        self.assertTrue(job, "Job stage4-api-integration must exist in ci.yml")
+        self.assertTrue(job.startswith('  stage4-api-integration:\n'))
+        self.assertIn("timeout-minutes: 45", job)
+        self.assertIn("working-directory: .", job)
+        self.assertIn("go-version: '1.27.2'", job)
+        self.assertIn("cache-dependency-path: src/go.sum", job)
+
+        # Prerequisites checks
+        self.assertIn("mkdir -p /tmp/opencode", job)
+        self.assertIn("python3 --version", job)
+        self.assertIn("openssl version", job)
+        self.assertIn("which setfacl getfacl", job)
+        self.assertIn("docker version", job)
+        self.assertIn("docker compose version", job)
+        self.assertIn("go version", job)
+
+    def test_stage4_api_integration_pinned_images(self):
+        """stage4-api-integration must pull digest-pinned timescaledb and mosquitto images."""
+        job = self._extract_job_section("stage4-api-integration")
+        timescale_img = "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a"
+        mosquitto_img = "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9"
+        self.assertIn(f"docker pull --platform linux/amd64 {timescale_img}", job)
+        self.assertIn(f"docker pull --platform linux/amd64 {mosquitto_img}", job)
+        self.assertLess(job.index("docker pull"), job.index("sh scripts/test-stage4-api.sh"))
+
+    def test_stage4_api_integration_runs_harness_tests_before_native(self):
+        """stage4-api-integration must run runner harness unit tests before native scripts."""
+        job = self._extract_job_section("stage4-api-integration")
+        self.assertIn("test_stage4_api_runner.py", job)
+        self.assertIn("test_stage4_vertical_scenario.py", job)
+        self.assertIn("test_stage4_contract_scenario.py", job)
+        self.assertIn("test_stage4_queries_scenario.py", job)
+        self.assertLess(job.index("test_stage4_api_runner.py"), job.index("sh scripts/test-stage4-api.sh"))
+
+    def test_stage4_api_integration_strict_markers_and_skip_rejection(self):
+        """Stage 4 API integration step must require pipefail, command timeout, skip rejection, and cleanup markers."""
+        job = self._extract_job_section("stage4-api-integration")
+        self.assertIn("timeout --signal=TERM --kill-after=90s 2100s sh scripts/test-stage4-api.sh --scenario all", job)
+        self.assertIn("MANDATORY_CI: '1'", job)
+        self.assertIn("Stage 4 API integration skipped unexpectedly", job)
+        self.assertIn("PASS: stage4 api integration (all scenarios passed: vertical, contract, queries)", job)
+        self.assertIn("Suite image cleanup verified: shared images removed", job)
+        self.assertIn("Fixture cleanup verified: containers/network/volumes/workdir absent", job)
+
+    def test_stage4_api_integration_safe_artifacts_and_no_leakage(self):
+        """stage4-api-integration uploads allowlisted summary artifact and does not leak secrets."""
+        job = self._extract_job_section("stage4-api-integration")
+        self.assertIn("STAGE4_API_REPORT", job)
+        self.assertIn("upload-artifact@v4", job)
+        self.assertIn("name: stage4-api-safe-report", job)
+        self.assertIn("path: ${{ runner.temp }}/stage4-api-${{ github.run_id }}-${{ github.run_attempt }}.json", job)
+        self.assertIn("if-no-files-found: error", job)
+        self.assertNotIn(".env", job)
+        self.assertNotIn("ca.key", job)
+        self.assertNotIn("dynamic-security.json", job)
+
     def test_job_contracts_allow_missing_or_changed_display_names(self):
         """Optional job labels must not determine job identity or routing."""
         without_names = re.sub(r'^    name:.*\n', '', self.raw_content, flags=re.MULTILINE)
@@ -374,6 +433,7 @@ class TestCIFeatureJobs(unittest.TestCase):
                 self.test_active_backend_build_keeps_legacy_builds_separate()
                 self.test_legacy_deferred_jobs_contracts_and_routing()
                 self.test_stage3_uplink_integration_job_structure_and_prerequisites()
+                self.test_stage4_api_integration_job_structure_and_prerequisites()
 
     def test_job_contracts_reject_missing_job_id_even_with_old_display_name(self):
         content = self.raw_content.replace(

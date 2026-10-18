@@ -579,6 +579,75 @@ jobs:
             exit 1
           fi
 
+  stage4-api-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+          cache-dependency-path: src/go.sum
+      - name: Check prerequisites
+        run: |
+          mkdir -p /tmp/opencode
+          python3 --version
+          openssl version
+          which setfacl getfacl
+          docker version
+          docker compose version
+          go version
+      - name: Test Stage 4 harness
+        run: |
+          mkdir -p /tmp/opencode
+          python3 -m unittest scripts/tests/test_stage4_api_runner.py scripts/tests/test_stage4_vertical_scenario.py scripts/tests/test_stage4_contract_scenario.py scripts/tests/test_stage4_queries_scenario.py scripts/tests/test_ci_feature_jobs.py
+      - name: Pull native images
+        run: |
+          docker pull --platform linux/amd64 timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          docker pull --platform linux/amd64 eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+      - name: Prepare report path
+        run: |
+          printf 'STAGE4_API_REPORT=%s/stage4-api-%s-%s.json\n' \
+            "${RUNNER_TEMP:-/tmp}" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Run Stage 4 API integration
+        env:
+          MANDATORY_CI: '1'
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP:-/tmp}/stage4-api.log"
+          cleanup() {
+            rm -f "$log_file"
+          }
+          trap cleanup EXIT INT TERM
+
+          timeout --signal=TERM --kill-after=90s 2100s sh scripts/test-stage4-api.sh --scenario all 2>&1 | tee "$log_file"
+
+          if grep -q '^SKIP:' "$log_file"; then
+            echo "Stage 4 API integration skipped unexpectedly" >&2
+            exit 1
+          fi
+          if ! grep -q '^PASS: stage4 api integration (all scenarios passed: vertical, contract, queries)$' "$log_file"; then
+            echo "Missing terminal PASS marker for stage4 api integration" >&2
+            exit 1
+          fi
+          if ! grep -q '^Suite image cleanup verified: shared images removed$' "$log_file"; then
+            echo "Missing suite image cleanup verification marker" >&2
+            exit 1
+          fi
+          if ! grep -q '^Fixture cleanup verified: containers/network/volumes/workdir absent$' "$log_file"; then
+            echo "Missing fixture cleanup verification marker" >&2
+            exit 1
+          fi
+      - name: Upload Stage 4 API safe verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage4-api-safe-report
+          path: ${{ runner.temp }}/stage4-api-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: error
+
   native-compose-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -534,7 +534,7 @@ class WorkflowGuards(unittest.TestCase):
                                     'mosquitto-credential-integration', 'stage2-e2e',
                                     'legacy-runtime-image-build', 'dynsec-native-integration',
                                     'dynsec-bootstrap-tests', 'stage3-uplink-integration',
-                                    'native-compose-smoke'})
+                                    'stage4-api-integration', 'native-compose-smoke'})
         job = extract_job_section(workflow, 'mosquitto-runtime-integration')
         assert_runtime_job_contract(job)
         for target in ('auth-init', 'reloader', 'backend'):

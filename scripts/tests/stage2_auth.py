@@ -584,10 +584,12 @@ SELECT
             assert_response(*http_request(base, path), 200)
         for path in ("/v1/telemetry/history", "/v1/digital-twins", "/v1/ws"):
             assert_response(*http_request(base, path), 401)
-            assert_response(*http_request(base, path, token), 501)
+        assert_response(*http_request(base, "/v1/telemetry/history", token), 400)
+        assert_response(*http_request(base, "/v1/digital-twins", token), 200)
+        assert_response(*http_request(base, "/v1/ws", token), 501)
         assert_response(*http_request(base, "/v1/ws", upgrade=True), 401)
         assert_response(*http_request(base, "/v1/ws", token, upgrade=True), 501)
-        print("PASS: public 200, unauthenticated 401, authenticated stubs 501")
+        print("PASS: public 200, unauthenticated 401, authenticated handlers 400/200 and stub 501")
 
     def check_bad_tokens(self, base: str, claims: dict) -> None:
         now = int(time.time())
