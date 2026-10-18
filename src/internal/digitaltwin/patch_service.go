@@ -21,7 +21,7 @@ var _ GatewayPatchService = (*gatewayPatchService)(nil)
 
 // NewGatewayPatchService constructs a new GatewayPatchService.
 // Both patcher and a positive timeout are required dependencies.
-func NewGatewayPatchService(patcher GatewayMetadataPatcher, timeout time.Duration) (*gatewayPatchService, error) {
+func NewGatewayPatchService(patcher GatewayMetadataPatcher, timeout time.Duration) (GatewayPatchService, error) {
 	if isNilDependency(patcher) {
 		return nil, fmt.Errorf("gateway metadata patcher is required")
 	}
@@ -74,7 +74,7 @@ var _ SensorPatchService = (*sensorPatchService)(nil)
 
 // NewSensorPatchService constructs a new SensorPatchService.
 // Both patcher and a positive timeout are required dependencies.
-func NewSensorPatchService(patcher SensorMetadataPatcher, timeout time.Duration) (*sensorPatchService, error) {
+func NewSensorPatchService(patcher SensorMetadataPatcher, timeout time.Duration) (SensorPatchService, error) {
 	if isNilDependency(patcher) {
 		return nil, fmt.Errorf("sensor metadata patcher is required")
 	}

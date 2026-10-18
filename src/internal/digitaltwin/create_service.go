@@ -18,7 +18,7 @@ var _ EntityCreateService = (*createService)(nil)
 
 // NewCreateService constructs a new EntityCreateService implementation.
 // Both gatewayProvisioner and sensorProvisioner are required non-nil dependencies.
-func NewCreateService(gw GatewayProvisioner, sensor SensorProvisioner) (*createService, error) {
+func NewCreateService(gw GatewayProvisioner, sensor SensorProvisioner) (EntityCreateService, error) {
 	if isNilDependency(gw) {
 		return nil, fmt.Errorf("gateway provisioner is required")
 	}

@@ -23,7 +23,7 @@ var _ ReadService = (*readService)(nil)
 
 // NewReadService creates a new ReadService implementation.
 // It verifies that preparation, reader, and telemetryHistory dependencies are non-nil (rejecting typed nils).
-func NewReadService(preparation *ReadPreparation, reader TwinReader, telemetryHistory TelemetryHistoryDelegator) (*readService, error) {
+func NewReadService(preparation *ReadPreparation, reader TwinReader, telemetryHistory TelemetryHistoryDelegator) (ReadService, error) {
 	if isNilDependency(preparation) {
 		return nil, fmt.Errorf("preparation is required")
 	}

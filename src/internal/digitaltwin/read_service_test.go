@@ -202,7 +202,6 @@ func TestNewReadService_Dependencies(t *testing.T) {
 	if svc == nil {
 		t.Fatal("expected non-nil service, got nil")
 	}
-	var _ ReadService = svc
 }
 
 func TestReadService_DependenciesFailClosed(t *testing.T) {
