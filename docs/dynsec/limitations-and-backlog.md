@@ -85,6 +85,18 @@ Lượt đo workload 600 batches / 60.000 samples (U14) và lane CI tích hợp 
 | Tệp SQLite outbox còn ~36KB sau drain | Dung lượng tệp trên đĩa giữ nguyên cấu trúc trang/journal của SQLite sau khi xóa hết hàng | Để dung lượng đĩa trống dự phòng ≥ 2× `GATEWAY_OUTBOX_MAX_BYTES` trên thiết bị nhúng | Khi tích hợp trên bo mạch phần cứng |
 | Chưa có kiểm thử runtime trên bo mạch nhúng ARM | Chỉ mới xác nhận biên dịch chéo (cross-build) thành công cho kiến trúc ARMv7 | Chạy và đo đạc trên bo mạch phần cứng thực tế (TI AM5728 / Luckfox Pico) tại checkpoint tích hợp thiết bị | Checkpoint tích hợp thiết bị / Giai đoạn 9 |
 
+### Cập nhật Task 4.7 — Tích hợp API Stage 4, Đo lường Truy vấn và CI (18/10/2026)
+
+Runner tích hợp API Stage 4 (`scripts/test-stage4-api.sh`), bộ kịch bản vertical/contract/queries và lane CI (`stage4-api-integration`) đã được xây dựng và kiểm chứng **PASS cục bộ (local PASS)** trên Docker services thật (Mosquitto 2.0.18, TimescaleDB PG16, Go backend, Gateway simulator). Bảng dưới ghi nhận các giới hạn kỹ thuật và ranh giới kiểm chuẩn mới phát sinh từ Task 4.7:
+
+| Giới hạn | Ảnh hưởng | Cách xử lý | Khi xem lại |
+| --- | --- | --- | --- |
+| Remote CI trên GitHub Actions cho Stage 4 chưa chạy | Job `stage4-api-integration` đã kết nối trong `.github/workflows/ci.yml` và pass cục bộ; remote run chưa chạy (`remote CI NOT RUN`) | Bằng chứng cục bộ là đủ cho ranh giới phát triển; remote CI sẽ chạy khi code được push theo luồng dự án | Khi push nhánh và chạy CI từ xa |
+| Legacy NULL provenance qua HTTP delegator chưa kiểm chứng live | `GET /v1/digital-twins/{id}/history?property=value` kế thừa logic ủy quyền và kiểm thử offline; chưa chạy trên HTTP với legacy CSDL | Giữ nguyên schema 20 có NOT NULL constraint; không gỡ bỏ ràng buộc CSDL dùng chung để test | Khi thực hiện migration rehearsal chuyên sâu |
+| Hủy bỏ truy vấn đang thực thi (executing query cancellation) chưa kiểm chứng | Bằng chứng timeout context chỉ bao phủ việc hết hạn chờ mượn connection từ pool (`Acquire`), chưa kiểm chứng ngắt query dài đang chạy trên DB server | Context timeout 5.0s được truyền xuống toàn bộ tầng database adapter; fail-closed an toàn | Khi kiểm thử khả năng chịu tải hoặc profiling DB |
+| Đơn hàng timestamp ties trong temporal history không bảo đảm thứ tự tuyệt đối | Khi nhiều observations có cùng microsecond timestamp, thứ tự trả về giữa các bản ghi cùng thời điểm là multiset, không bảo đảm thứ tự khóa phụ | API giữ nguyên dữ liệu gốc; client xử lý dữ liệu cùng timestamp như tập hợp đồng thời | Nếu có yêu cầu sắp xếp thứ tự phụ bổ sung |
+| Review Task 4.7: sáu findings đã CLOSED | Review đầu BLOCK (1 HIGH + 5 MEDIUM), sau sửa follow-up reviewer APPROVE; hai LOW về prose được chỉnh sau review | Giữ scope phê duyệt ở sáu findings và hồi quy liên quan, không chứng nhận toàn Stage4/production | Khi thay đổi liên quan làm mất hiệu lực kiểm chứng |
+
 ---
 
 ## 1. Phân Tích Chuyên Sâu Các Giới Hạn Kỹ Thuật (Detailed Technical Limitations)

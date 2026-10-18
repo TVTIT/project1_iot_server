@@ -148,6 +148,7 @@ STAGE4_HTTP_TEST_NATIVE=1 go test -race -v -count=1 -run TestNativeStage4HTTP_Sm
 3. **Các hạng mục chưa thực hiện (Giao cho Task 4.7–4.8):**
    - **Task 4.7:** Kiểm thử tích hợp từ đầu đến cuối MQTT Telemetry Ingress $\rightarrow$ Database $\rightarrow$ HTTP History / Twin Read APIs; ma trận nghiệm thu tích hợp đa dịch vụ.
    - **Task 4.8:** Tích hợp pipeline CI (`.github/workflows/ci.yml`), đo đạc hiệu năng nén hypertable và lập tài liệu tổng kết toàn bộ Stage 4.
+   - *Đính chính phạm vi & cam kết mã nguồn (Reconciliation ghi nhận ngày 18/10/2026):* Task 4.6 đã được commit đầy đủ qua các commit `df0846a`, `86b1371`, `4f1b4a4`, và `e6e304d`. Theo Kế hoạch tổng thể Stage 4 và Kế hoạch chi tiết Task 4.7, hai hạng mục **tích hợp CI pipeline** và **đo đạc hiệu năng nén hypertable** thuộc phạm vi của **Task 4.7** (đã được hiện thực và kiểm chứng trong Task 4.7), trong khi Task 4.8 chỉ đảm nhận việc lập tài liệu tổng kết Stage 4 (`stage-4-history-and-twin-api.md`) và cập nhật các hợp đồng client API.
    - **Các kiểm thử không thực hiện (NOT RUN):** Remote CI trên GitHub Actions, kiểm thử triển khai môi trường staging/production, kiểm tra nén tự động trên hypertable quy mô lớn.
 4. **Điểm nối tái sử dụng cho Task 4.7:**
    - Khởi tạo router và service: Tái sử dụng `composeStage4Dependencies` và `populateStage4Dependencies` trong `cmd/server/stage4.go`.
