@@ -172,7 +172,7 @@ func run() error {
 		return fmt.Errorf("create admin gateway service: %w", err)
 	}
 	readiness := ingressReadinessChecker(pool, cfg.ReadinessTimeout, ingress)
-	router, err := httpserver.NewRouter(httpserver.RouterDependencies{
+	routerDeps := httpserver.RouterDependencies{
 		CredentialAPIEnabled:       cfg.Credential.Enabled,
 		CredentialRequestTimeout:   cfg.Credential.RequestTimeout,
 		CredentialManager:          credentials.manager,
@@ -192,7 +192,11 @@ func run() error {
 		TokenVerifier:              tokenVerifier,
 		PlatformAdminChecker:       adminChecker,
 		CORSAllowedOrigins:         cfg.CORSAllowedOrigins,
-	})
+	}
+	if err := populateStage4Dependencies(&routerDeps, cfg, pool, provisioningService); err != nil {
+		return fmt.Errorf("compose stage 4 dependencies: %w", err)
+	}
+	router, err := httpserver.NewRouter(routerDeps)
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)
 	}
