@@ -19,6 +19,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import io
 import signal
 import sys
@@ -193,6 +194,7 @@ class AllVsPartialSemanticsTests(unittest.TestCase):
         self.assertIn('FAIL: unknown scenario selector', combined_err)
 
     @patch('stage4_api_runner.docker_available', return_value=False)
+    @patch.dict(os.environ, {'CI': 'false', 'MANDATORY_CI': '0', 'STAGE4_REQUIRE_RUN': '0'})
     def test_docker_unavailable_prints_skip_and_exits_0(self, mock_docker):
         captured_out = []
         with patch('sys.stdout.write', side_effect=lambda s: captured_out.append(s)):
@@ -200,6 +202,15 @@ class AllVsPartialSemanticsTests(unittest.TestCase):
         self.assertEqual(code, 0)
         combined = ''.join(captured_out)
         self.assertIn('SKIP: docker daemon or CLI unavailable', combined)
+
+    @patch('stage4_api_runner.docker_available', return_value=False)
+    def test_each_mandatory_environment_rejects_skip(self, mock_docker):
+        for variable, enabled in (('CI', 'true'), ('MANDATORY_CI', '1'), ('STAGE4_REQUIRE_RUN', '1')):
+            with self.subTest(variable=variable), \
+                 patch.dict(os.environ, {'CI': 'false', 'MANDATORY_CI': '0', 'STAGE4_REQUIRE_RUN': '0', variable: enabled}), \
+                 patch('sys.stdout', io.StringIO()) as output, patch('sys.stderr', io.StringIO()):
+                self.assertEqual(R.main([]), 1)
+                self.assertNotIn('SKIP:', output.getvalue())
 
     @patch('stage4_api_runner.docker_available', return_value=True)
     @patch('stage4_api_runner.build_image', return_value='sha256:dummyimage123456')
