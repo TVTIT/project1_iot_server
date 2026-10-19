@@ -122,8 +122,8 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 			},
 		},
 		{
-			name:     "valid filter entity_type Sensor",
-			rawQuery: "entity_type=Sensor",
+			name:     "valid filter type Sensor",
+			rawQuery: "type=Sensor",
 			validateQuery: func(t *testing.T, q *digitaltwin.TwinListQuery) {
 				if q.EntityType == nil || *q.EntityType != digitaltwin.EntityTypeSensor {
 					t.Errorf("EntityType = %v, want Sensor", q.EntityType)
@@ -131,8 +131,8 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 			},
 		},
 		{
-			name:     "valid filter entity_type Gateway",
-			rawQuery: "entity_type=Gateway",
+			name:     "valid filter type Gateway",
+			rawQuery: "type=Gateway",
 			validateQuery: func(t *testing.T, q *digitaltwin.TwinListQuery) {
 				if q.EntityType == nil || *q.EntityType != digitaltwin.EntityTypeGateway {
 					t.Errorf("EntityType = %v, want Gateway", q.EntityType)
@@ -141,7 +141,7 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 		},
 		{
 			name:     "valid list query with all parameters and matching cursor",
-			rawQuery: "gateway_id=gw_01&entity_type=Sensor&limit=75&after=" + validSensorCursor,
+			rawQuery: "gateway_id=gw_01&type=Sensor&limit=75&cursor=" + validSensorCursor,
 			validateQuery: func(t *testing.T, q *digitaltwin.TwinListQuery) {
 				if q.Limit != 75 {
 					t.Errorf("Limit = %d, want 75", q.Limit)
@@ -158,13 +158,33 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 			},
 		},
 		{
-			name:     "valid list query with after and no filters",
-			rawQuery: "after=" + noFilterCursor,
+			name:     "valid list query with cursor and no filters",
+			rawQuery: "cursor=" + noFilterCursor,
 			validateQuery: func(t *testing.T, q *digitaltwin.TwinListQuery) {
 				if q.After == nil || *q.After != noFilterCursor {
 					t.Errorf("After = %v, want %q", q.After, noFilterCursor)
 				}
 			},
+		},
+		{
+			name:        "reject replaced parameter entity_type",
+			rawQuery:    "entity_type=Sensor",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject replaced parameter after",
+			rawQuery:    "after=" + validSensorCursor,
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject repeated type",
+			rawQuery:    "type=Gateway&type=Sensor",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject repeated cursor",
+			rawQuery:    "cursor=" + validSensorCursor + "&cursor=" + validSensorCursor,
+			wantErrCode: "invalid_request",
 		},
 		{
 			name:        "reject unknown parameter user_id",
@@ -187,8 +207,8 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 			wantErrCode: "invalid_request",
 		},
 		{
-			name:        "reject empty entity_type parameter",
-			rawQuery:    "entity_type=",
+			name:        "reject empty type parameter",
+			rawQuery:    "type=",
 			wantErrCode: "invalid_request",
 		},
 		{
@@ -197,8 +217,8 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 			wantErrCode: "invalid_request",
 		},
 		{
-			name:        "reject empty after parameter",
-			rawQuery:    "after=",
+			name:        "reject empty cursor parameter",
+			rawQuery:    "cursor=",
 			wantErrCode: "invalid_request",
 		},
 		{
@@ -227,13 +247,13 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 			wantErrCode: "invalid_request",
 		},
 		{
-			name:        "reject invalid entity_type Device",
-			rawQuery:    "entity_type=Device",
+			name:        "reject invalid type Device",
+			rawQuery:    "type=Device",
 			wantErrCode: "invalid_request",
 		},
 		{
-			name:        "reject lowercase entity_type gateway",
-			rawQuery:    "entity_type=gateway",
+			name:        "reject lowercase type gateway",
+			rawQuery:    "type=gateway",
 			wantErrCode: "invalid_request",
 		},
 		{
@@ -248,19 +268,19 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 		},
 		{
 			name:         "reject invalid cursor string",
-			rawQuery:     "after=not-a-cursor",
+			rawQuery:     "cursor=not-a-cursor",
 			wantErrCode:  "invalid_cursor",
 			wantSentinel: digitaltwin.ErrInvalidCursor,
 		},
 		{
 			name:         "reject cursor with filter mismatch (cursor has Sensor, filter has Gateway)",
-			rawQuery:     "entity_type=Gateway&after=" + validSensorCursor,
+			rawQuery:     "type=Gateway&cursor=" + validSensorCursor,
 			wantErrCode:  "invalid_cursor",
 			wantSentinel: digitaltwin.ErrInvalidCursor,
 		},
 		{
 			name:         "reject cursor with gateway mismatch",
-			rawQuery:     "gateway_id=gw_02&after=" + validGatewayCursor,
+			rawQuery:     "gateway_id=gw_02&cursor=" + validGatewayCursor,
 			wantErrCode:  "invalid_cursor",
 			wantSentinel: digitaltwin.ErrInvalidCursor,
 		},
@@ -375,6 +395,46 @@ func TestParseTwinDetailQuery_TableDriven(t *testing.T) {
 					t.Errorf("RelationshipAfter = %v, want %q", q.RelationshipAfter, validRelCursor)
 				}
 			},
+		},
+		{
+			name:     "valid detail format simplified",
+			rawQuery: "format=simplified",
+			entityID: srcURN,
+			validateQuery: func(t *testing.T, q *digitaltwin.TwinDetailQuery) {
+				if q.EntityID != srcURN {
+					t.Errorf("EntityID = %q, want %q", q.EntityID, srcURN)
+				}
+			},
+		},
+		{
+			name:        "reject unsupported detail format",
+			rawQuery:    "format=normalized",
+			entityID:    srcURN,
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject detail format empty",
+			rawQuery:    "format=",
+			entityID:    srcURN,
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject format simplified mixed with relationship_limit",
+			rawQuery:    "format=simplified&relationship_limit=25",
+			entityID:    srcURN,
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject relationship_limit mixed with format simplified",
+			rawQuery:    "relationship_limit=25&format=simplified",
+			entityID:    srcURN,
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject unknown query parameter on detail",
+			rawQuery:    "unknown_param=123",
+			entityID:    srcURN,
+			wantErrCode: "invalid_request",
 		},
 		{
 			name:        "reject invalid entityID",
