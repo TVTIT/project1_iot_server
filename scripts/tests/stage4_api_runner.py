@@ -387,6 +387,9 @@ class Stage4HttpClient:
     def delete(self, path: str, **kwargs) -> HTTPResponse:
         return self.request('DELETE', path, **kwargs)
 
+    def options(self, path: str, **kwargs) -> HTTPResponse:
+        return self.request('OPTIONS', path, **kwargs)
+
 
 # --- Stage 4 Fixture Context -------------------------------------------------
 
@@ -419,6 +422,8 @@ class Stage4FixtureContext:
     jwt_audience: str
     backend_password: str = ''
     manager_password: str = ''
+    allowed_origin: str = 'https://dashboard.fixture.local'
+    denied_origin: str = 'https://denied.attacker.invalid'
 
     def assign_membership(self, user_id: str, gateway_id: str, role: str) -> None:
         """Assign or update a gateway membership in public.user_gateways."""
@@ -532,6 +537,7 @@ def backend_env(
         'TWIN_LIST_MAX_LIMIT': '200',
         'TWIN_RELATIONSHIP_DEFAULT_LIMIT': '50',
         'TWIN_RELATIONSHIP_MAX_LIMIT': '200',
+        'CORS_ALLOWED_ORIGINS': 'https://dashboard.fixture.local',
     }
     if extra_env:
         base.update(extra_env)

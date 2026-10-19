@@ -284,6 +284,74 @@ def assert_patch_preserves_content(before: dict, after: dict, spec) -> None:
     assert_content_unchanged(normalized(before), normalized(after))
 
 
+def assert_normalized_sensor_observations(
+    detail_json: dict,
+    reported_state: dict,
+    expected_unit_code: str = 'CEL',
+) -> None:
+    """Assert normalized Sensor detail properties match the committed SQL reported_state.
+
+    Validates:
+      - measurement is a Property with value equal to reported_state['value'].
+      - observedAt formatted in microsecond RFC3339 matching reported_state['observed_at'].
+      - unitCode mapped correctly (e.g. 'CEL' for 'degC').
+      - measurementUnit and root unitCode are omitted when unitCode is mapped.
+      - sample_interval_us is a Property with value equal to reported_state['sample_interval_us'].
+      - sample_interval_us.observedAt matches measurement.observedAt.
+    """
+    if not isinstance(reported_state, dict) or not reported_state:
+        raise AssertionError(f'reported_state must be a non-empty dict, got {reported_state}')
+
+    meas = detail_json.get('measurement')
+    if not isinstance(meas, dict) or meas.get('type') != 'Property':
+        raise AssertionError(f'expected measurement Property in sensor detail, got {meas}')
+
+    # Compare measurement value to reported_state value
+    rep_val = reported_state.get('value')
+    if rep_val is None:
+        raise AssertionError(f'missing value in reported_state: {reported_state}')
+    meas_val = meas.get('value')
+    if meas_val is None or abs(float(meas_val) - float(rep_val)) > 1e-6:
+        raise AssertionError(f'measurement.value {meas_val} != reported_state value {rep_val}')
+
+    # Compare observedAt timestamp (RFC3339 microsecond precision)
+    rep_obs = reported_state.get('observed_at')
+    if not rep_obs or not isinstance(rep_obs, str):
+        raise AssertionError(f'missing or invalid observed_at in reported_state: {reported_state}')
+    rep_obs_dt = datetime.datetime.fromisoformat(rep_obs.replace('Z', '+00:00'))
+    expected_obs_at = rep_obs_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    meas_obs = meas.get('observedAt')
+    if meas_obs != expected_obs_at:
+        raise AssertionError(f'measurement.observedAt {meas_obs} != expected {expected_obs_at} (from {rep_obs})')
+
+    # UN/CEFACT unitCode verification
+    meas_unit = meas.get('unitCode')
+    if meas_unit != expected_unit_code:
+        raise AssertionError(f'measurement.unitCode mismatch: got {meas_unit}, want {expected_unit_code}')
+
+    # Ensure measurementUnit and root unitCode are omitted when mapped
+    if 'measurementUnit' in detail_json:
+        raise AssertionError(f'measurementUnit must be omitted when unitCode is mapped: {detail_json.get("measurementUnit")}')
+    if 'unitCode' in detail_json:
+        raise AssertionError(f'root unitCode attribute forbidden by NGSI-LD contract: {detail_json.get("unitCode")}')
+
+    # Compare sample_interval_us property
+    interval_prop = detail_json.get('sample_interval_us')
+    if not isinstance(interval_prop, dict) or interval_prop.get('type') != 'Property':
+        raise AssertionError(f'expected sample_interval_us Property in sensor detail, got {interval_prop}')
+
+    rep_interval = reported_state.get('sample_interval_us')
+    if rep_interval is None:
+        raise AssertionError(f'missing sample_interval_us in reported_state: {reported_state}')
+    interval_val = interval_prop.get('value')
+    if interval_val is None or abs(float(interval_val) - float(rep_interval)) > 1e-6:
+        raise AssertionError(f'sample_interval_us.value {interval_val} != reported_state {rep_interval}')
+
+    interval_obs = interval_prop.get('observedAt')
+    if interval_obs != expected_obs_at:
+        raise AssertionError(f'sample_interval_us.observedAt {interval_obs} != expected {expected_obs_at}')
+
+
 def snapshot_invariants(
     fixture: DatabaseFixture,
     spec_a: GatewayFixtureSpec,
@@ -348,6 +416,8 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.post('/v1/digital-twins', token=admin_token, json_body=gw_a_payload)
     if resp.status != 201:
         raise RuntimeError(f'admin POST Gateway A failed: HTTP {resp.status} {resp.json}')
+    if resp.headers.get('location') != f'/v1/digital-twins/{urllib.parse.quote(spec_a.gateway_urn, safe=":")}':
+        raise RuntimeError(f'invalid Location on POST Gateway A: {resp.headers.get("location")}')
     if resp.headers.get('content-type') != 'application/json; charset=utf-8':
         raise RuntimeError(f'expected application/json; charset=utf-8, got {resp.headers.get("content-type")}')
     if resp.headers.get('cache-control') != 'no-store' or resp.headers.get('pragma') != 'no-cache':
@@ -359,6 +429,8 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     replay_resp = ctx.http.post('/v1/digital-twins', token=admin_token, json_body=gw_a_payload)
     if replay_resp.status != 200:
         raise RuntimeError(f'exact replay POST Gateway A failed: HTTP {replay_resp.status} {replay_resp.json}')
+    if replay_resp.headers.get('location'):
+        raise RuntimeError(f'unexpected Location on replay POST Gateway A: {replay_resp.headers.get("location")}')
 
     # 1b. Owner A POST Sensor A
     sens_a_payload = {
@@ -371,6 +443,8 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.post('/v1/digital-twins', token=owner_token, json_body=sens_a_payload)
     if resp.status != 201:
         raise RuntimeError(f'owner POST Sensor A failed: HTTP {resp.status} {resp.json}')
+    if resp.headers.get('location') != f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}':
+        raise RuntimeError(f'invalid Location on POST Sensor A: {resp.headers.get("location")}')
     if resp.json.get('entity_id') != spec_a.sensor_urn:
         raise RuntimeError(f'POST Sensor A returned invalid entity_id: {resp.json}')
 
@@ -378,6 +452,8 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     replay_sens = ctx.http.post('/v1/digital-twins', token=owner_token, json_body=sens_a_payload)
     if replay_sens.status != 200:
         raise RuntimeError(f'exact replay POST Sensor A failed: HTTP {replay_sens.status} {replay_sens.json}')
+    if replay_sens.headers.get('location'):
+        raise RuntimeError(f'unexpected Location on replay POST Sensor A: {replay_sens.headers.get("location")}')
 
     # 1c. Admin POST Gateway B with User B as Owner
     gw_b_payload = {
@@ -389,11 +465,15 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.post('/v1/digital-twins', token=admin_token, json_body=gw_b_payload)
     if resp.status != 201:
         raise RuntimeError(f'admin POST Gateway B failed: HTTP {resp.status} {resp.json}')
+    if resp.headers.get('location') != f'/v1/digital-twins/{urllib.parse.quote(spec_b.gateway_urn, safe=":")}':
+        raise RuntimeError(f'invalid Location on POST Gateway B: {resp.headers.get("location")}')
 
     # Exact replay POST Gateway B -> 200 OK
     replay_resp_b = ctx.http.post('/v1/digital-twins', token=admin_token, json_body=gw_b_payload)
     if replay_resp_b.status != 200:
         raise RuntimeError(f'exact replay POST Gateway B failed: HTTP {replay_resp_b.status}')
+    if replay_resp_b.headers.get('location'):
+        raise RuntimeError(f'unexpected Location on replay POST Gateway B: {replay_resp_b.headers.get("location")}')
 
     # 1d. User B (Owner of B) POST Sensor B (sharing identical sensor_id)
     sens_b_payload = {
@@ -406,11 +486,15 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.post('/v1/digital-twins', token=user_b_token, json_body=sens_b_payload)
     if resp.status != 201:
         raise RuntimeError(f'user B POST Sensor B failed: HTTP {resp.status} {resp.json}')
+    if resp.headers.get('location') != f'/v1/digital-twins/{urllib.parse.quote(spec_b.sensor_urn, safe=":")}':
+        raise RuntimeError(f'invalid Location on POST Sensor B: {resp.headers.get("location")}')
 
     # Exact replay POST Sensor B -> 200 OK
     replay_sens_b = ctx.http.post('/v1/digital-twins', token=user_b_token, json_body=sens_b_payload)
     if replay_sens_b.status != 200:
         raise RuntimeError(f'exact replay POST Sensor B failed: HTTP {replay_sens_b.status}')
+    if replay_sens_b.headers.get('location'):
+        raise RuntimeError(f'unexpected Location on replay POST Sensor B: {replay_sens_b.headers.get("location")}')
 
     # 1e. Assign operator and viewer memberships for Gateway A using fixture context
     ctx.assign_membership(ctx.users.operator.user_id, spec_a.gateway_id, 'operator')
@@ -425,14 +509,16 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     if gw_a_detail.json.get('@context') is None:
         raise RuntimeError('missing @context in Gateway detail')
     has_sensor = gw_a_detail.json.get('hasSensor')
-    if not isinstance(has_sensor, list) or len(has_sensor) != 1 or has_sensor[0].get('object') != spec_a.sensor_urn:
+    if not isinstance(has_sensor, dict) or has_sensor.get('type') != 'Relationship' or has_sensor.get('objectType') != 'Sensor':
         raise RuntimeError(f'invalid hasSensor relationship in Gateway detail: {has_sensor}')
+    if spec_a.sensor_urn not in has_sensor.get('object', []):
+        raise RuntimeError(f'missing sensor A URN in hasSensor.object: {has_sensor}')
 
     sens_a_detail = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}', token=owner_token)
     if sens_a_detail.status != 200:
         raise RuntimeError(f'GET Sensor A detail failed: HTTP {sens_a_detail.status}')
-    if sens_a_detail.json.get('unit', {}).get('value') != spec_a.sensor_unit:
-        raise RuntimeError(f'invalid sensor unit in Sensor detail: {sens_a_detail.json}')
+    if sens_a_detail.json.get('measurementUnit', {}).get('value') != spec_a.sensor_unit:
+        raise RuntimeError(f'invalid sensor measurementUnit in Sensor detail: {sens_a_detail.json}')
 
     print('PASS: step 1 provisioned Gateway/Sensor A and B with exact replay and graph validation', flush=True)
 
@@ -556,43 +642,46 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
         ('operator', operator_token),
         ('viewer', viewer_token),
     ):
-        # 3a. GET /v1/telemetry/history (raw window <= 10s)
+        # 3a. GET /v1/digital-twins/{sensor_urn}/temporal (raw window <= 10s)
         resp = ctx.http.get(
-            f'/v1/telemetry/history?gateway_id={spec_a.gateway_id}&sensor_id={spec_a.sensor_id}&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
+            f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(raw_from)}&endTimeAt={urllib.parse.quote(raw_to)}',
             token=token,
         )
         if resp.status != 200:
-            raise RuntimeError(f'telemetry history raw for {role_name} failed: HTTP {resp.status} {resp.json}')
+            raise RuntimeError(f'temporal raw for {role_name} failed: HTTP {resp.status} {resp.json}')
         if resp.headers.get('cache-control') != 'no-store':
-            raise RuntimeError('missing Cache-Control: no-store on telemetry history')
-        if resp.json.get('mode') != 'raw' or resp.json.get('point_count') != 200:
-            raise RuntimeError(f'expected 200 raw points for {role_name}, got {resp.json.get("point_count")}')
-        pts = resp.json.get('points', [])
+            raise RuntimeError('missing Cache-Control: no-store on temporal history')
+        meas = resp.json.get('measurement', {})
+        pts = meas.get('values', [])
         if len(pts) != 200:
-            raise RuntimeError(f'points array length mismatch for {role_name}: {len(pts)}')
+            raise RuntimeError(f'expected 200 raw points for {role_name}, got {len(pts)}')
         # Assert deterministic values
         first_pt = pts[0]
-        if first_pt.get('sequence_num') != '0' or abs(float(first_pt.get('value')) - synthetic_value(0)) > 1e-4:
+        if len(first_pt) != 2 or abs(float(first_pt[0]) - synthetic_value(0)) > 1e-4:
             raise RuntimeError(f'first point value mismatch: {first_pt}')
         last_pt = pts[199]
-        if last_pt.get('sequence_num') != '199' or abs(float(last_pt.get('value')) - synthetic_value(199)) > 1e-4:
+        if len(last_pt) != 2 or abs(float(last_pt[0]) - synthetic_value(199)) > 1e-4:
             raise RuntimeError(f'last point value mismatch: {last_pt}')
 
-        # 3b. GET /v1/telemetry/history (bucket downsampled with resolution=1s)
+        # 3b. GET /v1/digital-twins/{sensor_urn}/temporal (bucket downsampled with aggrPeriodDuration=PT1S)
         resp = ctx.http.get(
-            f'/v1/telemetry/history?gateway_id={spec_a.gateway_id}&sensor_id={spec_a.sensor_id}&from={urllib.parse.quote(bucket_from)}&to={urllib.parse.quote(bucket_to)}&resolution=1s',
+            f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(bucket_from)}&endTimeAt={urllib.parse.quote(bucket_to)}&aggrPeriodDuration=PT1S',
             token=token,
         )
         if resp.status != 200:
-            raise RuntimeError(f'telemetry history bucket for {role_name} failed: HTTP {resp.status}')
-        if resp.json.get('mode') != 'bucket' or resp.json.get('point_count', 0) < 1:
+            raise RuntimeError(f'temporal bucket for {role_name} failed: HTTP {resp.status}')
+        meas_b = resp.json.get('measurement', {})
+        total_counts = meas_b.get('totalCount', [])
+        if len(total_counts) < 1:
             raise RuntimeError(f'invalid bucket history for {role_name}: {resp.json}')
 
         # 3c. GET /v1/digital-twins (list)
         resp = ctx.http.get(f'/v1/digital-twins?gateway_id={spec_a.gateway_id}', token=token)
         if resp.status != 200:
             raise RuntimeError(f'twin list for {role_name} failed: HTTP {resp.status}')
-        items = resp.json.get('items', [])
+        if not isinstance(resp.json, list):
+            raise RuntimeError(f'twin list for {role_name} expected array, got: {type(resp.json)}')
+        items = resp.json
         item_ids = {it.get('id') for it in items}
         if spec_a.gateway_urn not in item_ids or spec_a.sensor_urn not in item_ids:
             raise RuntimeError(f'twin list for {role_name} missing A items: {items}')
@@ -603,46 +692,61 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
             raise RuntimeError(f'gateway detail for {role_name} failed: HTTP {resp.status}')
         if resp.json.get('id') != spec_a.gateway_urn or resp.json.get('type') != 'Gateway':
             raise RuntimeError(f'gateway detail body mismatch: {resp.json}')
+        has_sensor = resp.json.get('hasSensor')
+        if not isinstance(has_sensor, dict) or has_sensor.get('type') != 'Relationship' or has_sensor.get('objectType') != 'Sensor':
+            raise RuntimeError(f'gateway detail hasSensor mismatch: {has_sensor}')
+        if spec_a.sensor_urn not in has_sensor.get('object', []):
+            raise RuntimeError(f'gateway detail hasSensor missing sensor A: {has_sensor}')
 
         resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}', token=token)
         if resp.status != 200 or not resp.headers.get('content-type', '').startswith('application/ld+json'):
             raise RuntimeError(f'sensor detail for {role_name} failed: HTTP {resp.status}')
         if resp.json.get('id') != spec_a.sensor_urn or resp.json.get('type') != 'Sensor':
             raise RuntimeError(f'sensor detail body mismatch: {resp.json}')
+        is_hosted_by = resp.json.get('isHostedBy')
+        if not isinstance(is_hosted_by, dict) or is_hosted_by.get('object') != spec_a.gateway_urn:
+            raise RuntimeError(f'sensor detail isHostedBy mismatch: {is_hosted_by}')
+        assert_normalized_sensor_observations(resp.json, state_a['reported_state'], expected_unit_code='CEL')
 
-        # 3e. GET /v1/digital-twins/{entity_id}/state
-        resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/state', token=token)
+        # 3e. GET /v1/digital-twins/{entity_id}?format=simplified
+        resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}?format=simplified', token=token)
         if resp.status != 200:
             raise RuntimeError(f'twin state for {role_name} failed: HTTP {resp.status}')
         if resp.json.get('reported_version') != '2' or resp.json.get('desired_version') != '0':
             raise RuntimeError(f'unexpected twin state versions: {resp.json}')
 
-        # 3f. GET /v1/digital-twins/{entity_id}/history (property=value)
+        # 3f. GET /v1/digital-twins/{entity_id}/temporal (property=sample_interval_us)
         resp = ctx.http.get(
-            f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/history?property=value&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
+            f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(raw_from)}&endTimeAt={urllib.parse.quote(raw_to)}',
             token=token,
         )
         if resp.status != 200:
-            raise RuntimeError(f'twin history value for {role_name} failed: HTTP {resp.status}')
-        if resp.json.get('point_count') != 200 or resp.json.get('property') != 'value':
-            raise RuntimeError(f'twin history value mismatch: {resp.json}')
-
-        # 3g. GET /v1/digital-twins/{entity_id}/history (property=sample_interval_us)
-        resp = ctx.http.get(
-            f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/history?property=sample_interval_us&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
-            token=token,
-        )
-        if resp.status != 200:
-            raise RuntimeError(f'twin history sample_interval_us for {role_name} failed: HTTP {resp.status}')
-        if resp.json.get('point_count') != 2 or resp.json.get('property') != 'sample_interval_us':
-            raise RuntimeError(f'twin history interval mismatch: {resp.json}')
+            raise RuntimeError(f'twin temporal sample_interval_us for {role_name} failed: HTTP {resp.status}')
+        interval_prop = resp.json.get('sample_interval_us', {})
+        interval_pts = interval_prop.get('values', [])
+        if len(interval_pts) != 2:
+            raise RuntimeError(f'twin temporal interval mismatch: {resp.json}')
 
     print('PASS: owner, operator, and viewer read assertions verified', flush=True)
 
-    # 3h. Cross-Tenant Denials and Isolation: User B (owns B) vs Gateway A
-    # User B cannot read Gateway A telemetry history -> 404 Not Found
+    # Verify old routes return 404
     resp = ctx.http.get(
         f'/v1/telemetry/history?gateway_id={spec_a.gateway_id}&sensor_id={spec_a.sensor_id}&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
+        token=owner_token,
+    )
+    if resp.status != 404:
+        raise RuntimeError(f'expected 404 for removed /v1/telemetry/history, got {resp.status}')
+    resp = ctx.http.get(
+        f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/history?property=value&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
+        token=owner_token,
+    )
+    if resp.status != 404:
+        raise RuntimeError(f'expected 404 for removed /history route, got {resp.status}')
+
+    # 3g. Cross-Tenant Denials and Isolation: User B (owns B) vs Gateway A
+    # User B cannot read Gateway A temporal -> 404 Not Found
+    resp = ctx.http.get(
+        f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(raw_from)}&endTimeAt={urllib.parse.quote(raw_to)}',
         token=user_b_token,
     )
     if resp.status != 404:
@@ -659,7 +763,7 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
         raise RuntimeError(f'expected 404 for User B reading Sensor A detail, got {resp.status}')
 
     # User B cannot read Sensor A state -> 404
-    resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/state', token=user_b_token)
+    resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}?format=simplified', token=user_b_token)
     if resp.status != 404:
         raise RuntimeError(f'expected 404 for User B reading Sensor A state, got {resp.status}')
 
@@ -683,7 +787,8 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.get('/v1/digital-twins', token=user_b_token)
     if resp.status != 200:
         raise RuntimeError(f'User B twin list failed: HTTP {resp.status}')
-    b_item_ids = {it.get('id') for it in resp.json.get('items', [])}
+    b_items = resp.json if isinstance(resp.json, list) else resp.json.get('items', [])
+    b_item_ids = {it.get('id') for it in b_items}
     if spec_a.gateway_urn in b_item_ids or spec_a.sensor_urn in b_item_ids:
         raise RuntimeError(f'User B twin list contains Gateway A items: {b_item_ids}')
     if spec_b.gateway_urn not in b_item_ids or spec_b.sensor_urn not in b_item_ids:
@@ -693,8 +798,9 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.get(f'/v1/digital-twins?gateway_id={spec_a.gateway_id}', token=user_b_token)
     if resp.status != 200:
         raise RuntimeError(f'expected 200 for User B querying list with gateway_id=A, got {resp.status}')
-    if resp.json.get('items') != []:
-        raise RuntimeError(f'expected empty items for User B querying gateway_id=A, got {resp.json.get("items")}')
+    b_empty_items = resp.json if isinstance(resp.json, list) else resp.json.get("items")
+    if b_empty_items != []:
+        raise RuntimeError(f'expected empty items for User B querying gateway_id=A, got {resp.json}')
 
     # Owner A cannot read Gateway B detail -> 404
     resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_b.gateway_urn, safe=":")}', token=owner_token)
@@ -707,7 +813,7 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
         raise RuntimeError(f'expected 404 for Owner A reading Sensor B detail, got {resp.status}')
 
     # Owner A cannot read Sensor B state -> 404
-    resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_b.sensor_urn, safe=":")}/state', token=owner_token)
+    resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_b.sensor_urn, safe=":")}?format=simplified', token=owner_token)
     if resp.status != 404:
         raise RuntimeError(f'expected 404 for Owner A reading Sensor B state, got {resp.status}')
 
@@ -723,8 +829,9 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     resp = ctx.http.get(f'/v1/digital-twins?gateway_id={spec_b.gateway_id}', token=owner_token)
     if resp.status != 200:
         raise RuntimeError(f'expected 200 for Owner A querying list with gateway_id=B, got {resp.status}')
-    if resp.json.get('items') != []:
-        raise RuntimeError(f'expected empty items for Owner A querying gateway_id=B, got {resp.json.get("items")}')
+    a_empty_items = resp.json if isinstance(resp.json, list) else resp.json.get("items")
+    if a_empty_items != []:
+        raise RuntimeError(f'expected empty items for Owner A querying gateway_id=B, got {resp.json}')
 
     print('PASS: cross-tenant isolation and 404 denials verified for User B and Gateway A', flush=True)
 
@@ -736,24 +843,33 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     pre_patch_snap = snapshot_invariants(ctx.db_fixture, spec_a, spec_b)
     protected_before = snapshot_owned_content(ctx.db_fixture, [spec_a.gateway_id, spec_b.gateway_id])
 
-    # 4a. Owner A PATCHes Sensor A name
-    new_sensor_name = f'Patched Sensor A {secrets.token_hex(4)}'
-    resp = ctx.http.patch(
+    # Verify old root route /v1/digital-twins/{id} returns 405 Method Not Allowed
+    resp_old_patch = ctx.http.patch(
         f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}',
         token=owner_token,
-        json_body={'name': new_sensor_name},
+        json_body={'name': {'type': 'Property', 'value': 'Old'}},
+    )
+    if resp_old_patch.status != 405:
+        raise RuntimeError(f'expected 405 Method Not Allowed for old root PATCH, got {resp_old_patch.status}')
+
+    # 4a. Owner A PATCHes Sensor A name at /attrs
+    new_sensor_name = f'Patched Sensor A {secrets.token_hex(4)}'
+    resp = ctx.http.patch(
+        f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/attrs',
+        token=owner_token,
+        json_body={'name': {'type': 'Property', 'value': new_sensor_name}},
     )
     if resp.status != 200:
         raise RuntimeError(f'owner PATCH Sensor A failed: HTTP {resp.status} {resp.json}')
     if resp.json.get('name') != new_sensor_name:
         raise RuntimeError(f'PATCH Sensor A response name mismatch: {resp.json}')
 
-    # 4b. Admin non-member PATCHes Gateway A description
+    # 4b. Admin non-member PATCHes Gateway A description at /attrs
     new_gw_desc = f'Patched Gateway A Description {secrets.token_hex(4)}'
     resp = ctx.http.patch(
-        f'/v1/digital-twins/{urllib.parse.quote(spec_a.gateway_urn, safe=":")}',
+        f'/v1/digital-twins/{urllib.parse.quote(spec_a.gateway_urn, safe=":")}/attrs',
         token=admin_token,
-        json_body={'description': new_gw_desc},
+        json_body={'description': {'type': 'Property', 'value': new_gw_desc}},
     )
     if resp.status != 200:
         raise RuntimeError(f'admin PATCH Gateway A failed: HTTP {resp.status} {resp.json}')
@@ -814,24 +930,17 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     if gw_db['description'] != new_gw_desc:
         raise RuntimeError(f'Gateway description not updated in DB: {gw_db}')
 
-    # 4d. Assert Admin non-member still cannot GET state or history
+    # 4d. Assert Admin non-member still cannot GET state or temporal
     resp = ctx.http.get(
-        f'/v1/telemetry/history?gateway_id={spec_a.gateway_id}&sensor_id={spec_a.sensor_id}&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
+        f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(raw_from)}&endTimeAt={urllib.parse.quote(raw_to)}',
         token=admin_token,
     )
     if resp.status != 404:
-        raise RuntimeError(f'expected 404 for Admin GET telemetry history, got {resp.status}')
+        raise RuntimeError(f'expected 404 for Admin GET twin temporal, got {resp.status}')
 
-    resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/state', token=admin_token)
+    resp = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}?format=simplified', token=admin_token)
     if resp.status != 404:
         raise RuntimeError(f'expected 404 for Admin GET twin state, got {resp.status}')
-
-    resp = ctx.http.get(
-        f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}/history?property=value&from={urllib.parse.quote(raw_from)}&to={urllib.parse.quote(raw_to)}',
-        token=admin_token,
-    )
-    if resp.status != 404:
-        raise RuntimeError(f'expected 404 for Admin GET twin history value, got {resp.status}')
 
     print('PASS: metadata PATCH updated only allowed fields; admin non-member read denied (404)', flush=True)
 
@@ -896,7 +1005,7 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
         raise RuntimeError(f'expected 3 temporal rows after batch 3, got {temporal_a3_count}')
 
     state_a3 = query_json_row(ctx.db_fixture, f"""
-        SELECT reported_version, desired_version
+        SELECT reported_version, desired_version, reported_state
         FROM public.twin_states
         WHERE entity_id = (SELECT id FROM public.twin_entities WHERE entity_id = '{spec_a.sensor_urn}')
     """)
@@ -915,6 +1024,14 @@ def run_vertical_scenario(ctx: Stage4FixtureContext) -> None:
     """)['description']
     if gw_after_b3 != new_gw_desc:
         raise RuntimeError(f'patched gateway description reverted after ingestion: {gw_after_b3}')
+
+    # Verify Sensor detail after batch 3 reflects updated measurement and preserved patched name
+    resp_sens_b3 = ctx.http.get(f'/v1/digital-twins/{urllib.parse.quote(spec_a.sensor_urn, safe=":")}', token=owner_token)
+    if resp_sens_b3.status != 200:
+        raise RuntimeError(f'sensor detail after batch 3 failed: HTTP {resp_sens_b3.status}')
+    if resp_sens_b3.json.get('name', {}).get('value') != new_sensor_name:
+        raise RuntimeError(f'sensor name after batch 3 mismatch: {resp_sens_b3.json.get("name")}')
+    assert_normalized_sensor_observations(resp_sens_b3.json, state_a3['reported_state'], expected_unit_code='CEL')
 
     print(f'PASS: batch 3 committed (total 300 raw, 3 ledger, 3 interval, version 3), metadata preserved', flush=True)
 

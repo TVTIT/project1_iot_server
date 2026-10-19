@@ -114,6 +114,88 @@ class ContractScenarioUnitTests(unittest.TestCase):
         self.assertIn('FROM public.sensors r WHERE', content_sql)
         self.assertIn('FROM public.twin_entities r WHERE', content_sql)
 
+    def test_parse_rel_next_uri(self):
+        # Single link with rel="next"
+        self.assertEqual(
+            C.parse_rel_next_uri('</v1/digital-twins?limit=1&cursor=cur123>; rel="next"'),
+            '/v1/digital-twins?limit=1&cursor=cur123',
+        )
+        # Multiple links (prev, next)
+        self.assertEqual(
+            C.parse_rel_next_uri('</v1/prev>; rel="prev", </v1/next?c=1>; rel="next"'),
+            '/v1/next?c=1',
+        )
+        # Case insensitive and whitespace
+        self.assertEqual(
+            C.parse_rel_next_uri('  </v1/next?c=2>  ;  REL="NEXT"  '),
+            '/v1/next?c=2',
+        )
+        # Unquoted rel=next
+        self.assertEqual(
+            C.parse_rel_next_uri('</v1/next?c=3>; rel=next'),
+            '/v1/next?c=3',
+        )
+        # Missing rel=next
+        self.assertIsNone(C.parse_rel_next_uri('</v1/prev>; rel="prev"'))
+        # None or empty
+        self.assertIsNone(C.parse_rel_next_uri(None))
+        self.assertIsNone(C.parse_rel_next_uri(''))
+
+    def test_validate_next_uri_contract_valid(self):
+        next_uri = '/v1/digital-twins?gateway_id=gw1&limit=1&cursor=base64cursor'
+        cursor = C.validate_next_uri_contract(
+            next_uri,
+            expected_path='/v1/digital-twins',
+            expected_params={'gateway_id': 'gw1', 'limit': '1'},
+            cursor_param_name='cursor',
+        )
+        self.assertEqual(cursor, 'base64cursor')
+
+    def test_validate_next_uri_contract_rejects_non_relative(self):
+        next_uri = 'http://attacker.invalid/v1/digital-twins?gateway_id=gw1&limit=1&cursor=c1'
+        with self.assertRaises(AssertionError) as ctx:
+            C.validate_next_uri_contract(
+                next_uri,
+                expected_path='/v1/digital-twins',
+                expected_params={'gateway_id': 'gw1', 'limit': '1'},
+                cursor_param_name='cursor',
+            )
+        self.assertIn('rel="next" URI must be relative', str(ctx.exception))
+
+    def test_validate_next_uri_contract_rejects_path_mismatch(self):
+        next_uri = '/v1/other-endpoint?limit=1&cursor=c1'
+        with self.assertRaises(AssertionError) as ctx:
+            C.validate_next_uri_contract(
+                next_uri,
+                expected_path='/v1/digital-twins',
+                expected_params={'limit': '1'},
+                cursor_param_name='cursor',
+            )
+        self.assertIn('path mismatch', str(ctx.exception))
+
+    def test_validate_next_uri_contract_rejects_missing_or_mismatched_params(self):
+        # Missing limit
+        next_uri = '/v1/digital-twins?gateway_id=gw1&cursor=c1'
+        with self.assertRaises(AssertionError) as ctx:
+            C.validate_next_uri_contract(
+                next_uri,
+                expected_path='/v1/digital-twins',
+                expected_params={'gateway_id': 'gw1', 'limit': '1'},
+                cursor_param_name='cursor',
+            )
+        self.assertIn('parameter limit mismatch', str(ctx.exception))
+
+    def test_validate_next_uri_contract_rejects_missing_cursor(self):
+        next_uri = '/v1/digital-twins?gateway_id=gw1&limit=1'
+        with self.assertRaises(AssertionError) as ctx:
+            C.validate_next_uri_contract(
+                next_uri,
+                expected_path='/v1/digital-twins',
+                expected_params={'gateway_id': 'gw1', 'limit': '1'},
+                cursor_param_name='cursor',
+            )
+        self.assertIn('missing cursor parameter', str(ctx.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

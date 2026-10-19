@@ -58,6 +58,200 @@ class CompressionEquivalenceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             QS.assert_history_equivalent(before, copy.deepcopy(before), temporal=True)
 
+    def test_ngsi_ld_temporal_raw_and_bucket_equivalence(self):
+        # Raw format
+        raw_before = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'measurement': {
+                'type': 'Property',
+                'values': [
+                    [20.5, '2026-10-18T12:00:00.000000Z'],
+                    [21.0, '2026-10-18T12:00:01.000000Z'],
+                ],
+            },
+        }
+        QS.assert_history_equivalent(raw_before, copy.deepcopy(raw_before))
+
+        # Reordering ties in raw temporal values
+        temp_tie = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'sample_interval_us': {
+                'type': 'Property',
+                'values': [
+                    [10000.0, '2026-10-18T12:00:00.000000Z'],
+                    [20000.0, '2026-10-18T12:00:00.000000Z'],
+                ],
+            },
+        }
+        temp_tie_rev = copy.deepcopy(temp_tie)
+        temp_tie_rev['sample_interval_us']['values'].reverse()
+        QS.assert_history_equivalent(temp_tie, temp_tie_rev, temporal=True)
+
+        # Value mismatch in raw
+        raw_mismatch = copy.deepcopy(raw_before)
+        raw_mismatch['measurement']['values'][0][0] = 99.9
+        with self.assertRaises(AssertionError):
+            QS.assert_history_equivalent(raw_before, raw_mismatch)
+
+        # Bucket format
+        bucket_before = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'measurement': {
+                'type': 'Property',
+                'avg': [[20.5, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'min': [[20.0, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'max': [[21.0, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'totalCount': [[1000, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+            },
+        }
+        QS.assert_history_equivalent(bucket_before, copy.deepcopy(bucket_before))
+
+        # Missing field in bucket
+        bucket_missing = copy.deepcopy(bucket_before)
+        del bucket_missing['measurement']['totalCount']
+        with self.assertRaises(AssertionError):
+            QS.assert_history_equivalent(bucket_before, bucket_missing)
+
+    def test_total_count_differs_by_one_above_2_pow_53(self):
+        # 2^53 is 9007199254740992; IEEE-754 double rounds 2^53 and 2^53 + 1 to the same float.
+        val_a = 9007199254740992
+        val_b = 9007199254740993
+        before = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'measurement': {
+                'type': 'Property',
+                'avg': [[20.5, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'totalCount': [[val_a, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+            },
+        }
+        after = copy.deepcopy(before)
+        after['measurement']['totalCount'][0][0] = val_b
+        with self.assertRaises(AssertionError):
+            QS.assert_history_equivalent(before, after)
+        with self.assertRaises(AssertionError):
+            QS.assert_history_equivalent(after, before)
+
+    def test_total_count_slot_rejects_float_string_bool(self):
+        base = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'measurement': {
+                'type': 'Property',
+                'avg': [[20.5, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'totalCount': [[1000, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+            },
+        }
+        bad_tokens = [
+            1000.0,       # float instead of int
+            '1000',       # string instead of int
+            True,         # bool instead of int
+            False,        # bool instead of int
+            None,         # NoneType
+            [1000],       # nested list
+        ]
+        for bad_token in bad_tokens:
+            with self.subTest(bad_token=bad_token, bad_type=type(bad_token).__name__):
+                candidate = copy.deepcopy(base)
+                candidate['measurement']['totalCount'][0][0] = bad_token
+                with self.assertRaises(AssertionError):
+                    QS.assert_history_equivalent(base, candidate)
+                with self.assertRaises(AssertionError):
+                    QS.assert_history_equivalent(candidate, base)
+
+    def test_total_count_both_sides_malformed_even_if_equal(self):
+        malformed_total_counts = [
+            [[1000.0, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],  # float count token
+            [['1000', '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],  # string count token
+            [[True, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],    # bool count token
+            [[False, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],   # bool count token
+            [[1000]],                                                                     # length 1 instead of 3
+            [[1000, '2026-10-18T12:00:00.000000Z']],                                     # length 2 instead of 3
+            [[1000, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z', 1]],   # length 4
+            [[1000, 12345, '2026-10-18T12:00:10.000000Z']],                              # non-string start timestamp
+            [[1000, '2026-10-18T12:00:00.000000Z', 67890]],                              # non-string end timestamp
+            'not_a_list',                                                                 # not a list
+        ]
+        for malformed in malformed_total_counts:
+            with self.subTest(malformed=malformed):
+                doc = {
+                    'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+                    'type': 'Sensor',
+                    '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+                    'measurement': {
+                        'type': 'Property',
+                        'avg': [[20.5, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                        'totalCount': malformed,
+                    },
+                }
+                with self.assertRaises(AssertionError):
+                    QS.assert_history_equivalent(doc, copy.deepcopy(doc))
+
+    def test_valid_exact_int_counts(self):
+        val_large = 9007199254740992
+        before = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'measurement': {
+                'type': 'Property',
+                'avg': [[20.5, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'totalCount': [
+                    [1000, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z'],
+                    [0, '2026-10-18T12:00:10.000000Z', '2026-10-18T12:00:20.000000Z'],
+                    [val_large, '2026-10-18T12:00:20.000000Z', '2026-10-18T12:00:30.000000Z'],
+                ],
+            },
+        }
+        # Exact equal int counts should pass
+        QS.assert_history_equivalent(before, copy.deepcopy(before))
+
+        # Also works on sample_interval_us
+        temp_doc = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'sample_interval_us': {
+                'type': 'Property',
+                'avg': [[10000.0, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'totalCount': [[50, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+            },
+        }
+        QS.assert_history_equivalent(temp_doc, copy.deepcopy(temp_doc), temporal=True)
+
+    def test_ordinary_floating_measurement_tolerance(self):
+        before = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld'],
+            'measurement': {
+                'type': 'Property',
+                'avg': [[20.5, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'min': [[20.0, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'max': [[21.0, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+                'totalCount': [[1000, '2026-10-18T12:00:00.000000Z', '2026-10-18T12:00:10.000000Z']],
+            },
+        }
+        # Perturbation within 1e-9 tolerance passes
+        tolerated = copy.deepcopy(before)
+        tolerated['measurement']['avg'][0][0] = 20.5 + 1e-10
+        tolerated['measurement']['min'][0][0] = 20.0 - 1e-10
+        QS.assert_history_equivalent(before, tolerated)
+
+        # Perturbation exceeding tolerance fails
+        exceeded = copy.deepcopy(before)
+        exceeded['measurement']['avg'][0][0] = 20.5 + 1e-8
+        with self.assertRaises(AssertionError):
+            QS.assert_history_equivalent(before, exceeded)
+
 
 class MarkerParsingTests(unittest.TestCase):
     """Test extracting JSON measurement payloads from Go test outputs."""

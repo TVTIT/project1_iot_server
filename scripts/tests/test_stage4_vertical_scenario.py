@@ -127,6 +127,103 @@ class VerticalScenarioUnitTests(unittest.TestCase):
         self.assertIn('public.twin_states', executed)
         self.assertIn('public.twin_temporal_values', executed)
 
+    def test_assert_normalized_sensor_observations_valid(self):
+        rep_state = {
+            'value': 25.123,
+            'observed_at': '2026-10-18T12:00:00.123456Z',
+            'sample_interval_us': 10000,
+            'unit': 'degC',
+            'boot_id': '00000000-0000-0000-0000-000000000001',
+            'sequence_num': 10,
+        }
+        detail_json = {
+            'id': 'urn:ngsi-ld:Sensor:gw_a:sens_1',
+            'type': 'Sensor',
+            'measurement': {
+                'type': 'Property',
+                'value': 25.123,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+                'unitCode': 'CEL',
+            },
+            'sample_interval_us': {
+                'type': 'Property',
+                'value': 10000,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+            },
+        }
+        # Should not raise
+        V.assert_normalized_sensor_observations(detail_json, rep_state, expected_unit_code='CEL')
+
+    def test_assert_normalized_sensor_observations_detects_value_mismatch(self):
+        rep_state = {
+            'value': 25.123,
+            'observed_at': '2026-10-18T12:00:00.123456Z',
+            'sample_interval_us': 10000,
+        }
+        detail_json = {
+            'measurement': {
+                'type': 'Property',
+                'value': 99.999,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+                'unitCode': 'CEL',
+            },
+            'sample_interval_us': {
+                'type': 'Property',
+                'value': 10000,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+            },
+        }
+        with self.assertRaises(AssertionError) as ctx:
+            V.assert_normalized_sensor_observations(detail_json, rep_state, expected_unit_code='CEL')
+        self.assertIn('measurement.value 99.999 != reported_state value 25.123', str(ctx.exception))
+
+    def test_assert_normalized_sensor_observations_detects_unit_code_mismatch(self):
+        rep_state = {
+            'value': 25.123,
+            'observed_at': '2026-10-18T12:00:00.123456Z',
+            'sample_interval_us': 10000,
+        }
+        detail_json = {
+            'measurement': {
+                'type': 'Property',
+                'value': 25.123,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+                'unitCode': 'WRONG',
+            },
+            'sample_interval_us': {
+                'type': 'Property',
+                'value': 10000,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+            },
+        }
+        with self.assertRaises(AssertionError) as ctx:
+            V.assert_normalized_sensor_observations(detail_json, rep_state, expected_unit_code='CEL')
+        self.assertIn('measurement.unitCode mismatch', str(ctx.exception))
+
+    def test_assert_normalized_sensor_observations_detects_forbidden_measurement_unit(self):
+        rep_state = {
+            'value': 25.123,
+            'observed_at': '2026-10-18T12:00:00.123456Z',
+            'sample_interval_us': 10000,
+        }
+        detail_json = {
+            'measurement': {
+                'type': 'Property',
+                'value': 25.123,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+                'unitCode': 'CEL',
+            },
+            'measurementUnit': {'type': 'Property', 'value': 'degC'},
+            'sample_interval_us': {
+                'type': 'Property',
+                'value': 10000,
+                'observedAt': '2026-10-18T12:00:00.123456Z',
+            },
+        }
+        with self.assertRaises(AssertionError) as ctx:
+            V.assert_normalized_sensor_observations(detail_json, rep_state, expected_unit_code='CEL')
+        self.assertIn('measurementUnit must be omitted when unitCode is mapped', str(ctx.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

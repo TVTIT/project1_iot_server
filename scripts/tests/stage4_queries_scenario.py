@@ -26,6 +26,7 @@ on representative uncompressed datasets under application role 'iot_backend_app'
 """
 from __future__ import annotations
 
+import copy
 import datetime
 import json
 import math
@@ -52,38 +53,99 @@ from stage4_vertical_scenario import (
 
 def assert_history_equivalent(before: dict, after: dict, *, temporal: bool = False) -> None:
     """Compare actual wire fields, including explicit nulls, without assuming tie order."""
-    required = ({'observed_at', 'value', 'value_type', 'metadata', 'message_id'} if temporal else
-                {'measured_at', 'value', 'sequence_num', 'boot_id', 'message_id', 'sample_index'})
+    if 'mode' in before and 'points' in before:
+        required = ({'observed_at', 'value', 'value_type', 'metadata', 'message_id'} if temporal else
+                    {'measured_at', 'value', 'sequence_num', 'boot_id', 'message_id', 'sample_index'})
+        for response in (before, after):
+            if 'unit' not in response or 'points' not in response or 'mode' not in response:
+                raise AssertionError('history response missing required metadata')
+            for point in response['points']:
+                fields = required if response['mode'] == 'raw' else {'bucket_start', 'avg', 'min', 'max', 'count'}
+                if not fields.issubset(point):
+                    raise AssertionError('history point missing required wire fields')
+
+        def compare_legacy(left, right):
+            if isinstance(left, dict) and isinstance(right, dict):
+                if left.keys() != right.keys():
+                    raise AssertionError('history field presence changed')
+                for key in left:
+                    compare_legacy(left[key], right[key])
+            elif isinstance(left, list) and isinstance(right, list):
+                if len(left) != len(right):
+                    raise AssertionError('history length changed')
+                for a, b in zip(left, right):
+                    compare_legacy(a, b)
+            elif type(left) is int and type(right) is int:
+                if left != right:
+                    raise AssertionError(f'history integer value changed: {left} vs {right}')
+            elif (type(left) in (float, int) and type(right) in (float, int)
+                  and type(left) is not bool and type(right) is not bool):
+                if not math.isclose(left, right, rel_tol=0, abs_tol=1e-9):
+                    raise AssertionError('history numeric value changed')
+            elif type(left) is not type(right) or left != right:
+                raise AssertionError('history value or type changed')
+
+        a, b = dict(before), dict(after)
+        if temporal and before['mode'] == 'raw':
+            a['points'] = sorted(before['points'], key=lambda p: json.dumps(p, sort_keys=True))
+            b['points'] = sorted(after['points'], key=lambda p: json.dumps(p, sort_keys=True))
+        compare_legacy(a, b)
+        return
+
+    # NGSI-LD V1.9.1 Temporal representation
     for response in (before, after):
-        if 'unit' not in response or 'points' not in response or 'mode' not in response:
-            raise AssertionError('history response missing required metadata')
-        for point in response['points']:
-            fields = required if response['mode'] == 'raw' else {'bucket_start', 'avg', 'min', 'max', 'count'}
-            if not fields.issubset(point):
-                raise AssertionError('history point missing required wire fields')
+        if 'id' not in response or 'type' not in response or '@context' not in response:
+            raise AssertionError('temporal response missing id/type/@context')
+        attr = 'sample_interval_us' if 'sample_interval_us' in response else 'measurement'
+        if attr not in response:
+            raise AssertionError('temporal response missing target attribute property')
+        prop = response[attr]
+        if not isinstance(prop, dict) or prop.get('type') != 'Property':
+            raise AssertionError('temporal attribute missing type: Property')
+        if 'values' not in prop and 'totalCount' not in prop:
+            raise AssertionError('temporal property missing values or aggregate methods')
+
+        for candidate_name, candidate_prop in response.items():
+            if isinstance(candidate_prop, dict) and candidate_prop.get('type') == 'Property' and 'totalCount' in candidate_prop:
+                tc = candidate_prop['totalCount']
+                if not isinstance(tc, list):
+                    raise AssertionError('temporal totalCount must be a list')
+                for entry in tc:
+                    if not (isinstance(entry, (list, tuple)) and len(entry) == 3):
+                        raise AssertionError('temporal totalCount entry must be a 3-element list or tuple')
+                    count_token = entry[0]
+                    if type(count_token) is not int:
+                        raise AssertionError(f'temporal totalCount token must have type int, got {type(count_token).__name__}')
+                    if not isinstance(entry[1], str) or not isinstance(entry[2], str):
+                        raise AssertionError('temporal totalCount entry timestamps must be strings')
 
     def compare(left, right):
         if isinstance(left, dict) and isinstance(right, dict):
             if left.keys() != right.keys():
-                raise AssertionError('history field presence changed')
+                raise AssertionError(f'history field presence changed: {left.keys()} vs {right.keys()}')
             for key in left:
                 compare(left[key], right[key])
         elif isinstance(left, list) and isinstance(right, list):
             if len(left) != len(right):
-                raise AssertionError('history length changed')
+                raise AssertionError(f'history length changed: {len(left)} vs {len(right)}')
             for a, b in zip(left, right):
                 compare(a, b)
-        elif type(left) in (float, int) and type(right) in (float, int):
+        elif type(left) is int and type(right) is int:
+            if left != right:
+                raise AssertionError(f'history integer value changed: {left} vs {right}')
+        elif (type(left) in (float, int) and type(right) in (float, int)
+              and type(left) is not bool and type(right) is not bool):
             if not math.isclose(left, right, rel_tol=0, abs_tol=1e-9):
-                raise AssertionError('history numeric value changed')
+                raise AssertionError(f'history numeric value changed: {left} vs {right}')
         elif type(left) is not type(right) or left != right:
-            raise AssertionError('history value or type changed')
+            raise AssertionError(f'history value or type changed: {left} vs {right}')
 
-    a, b = dict(before), dict(after)
-    if temporal and before['mode'] == 'raw':
-        # Sort complete observations, not timestamps alone, to compare ties as a multiset.
-        a['points'] = sorted(before['points'], key=lambda p: json.dumps(p, sort_keys=True))
-        b['points'] = sorted(after['points'], key=lambda p: json.dumps(p, sort_keys=True))
+    a = copy.deepcopy(before)
+    b = copy.deepcopy(after)
+    attr = 'sample_interval_us' if 'sample_interval_us' in before else 'measurement'
+    if temporal and 'values' in before.get(attr, {}):
+        a[attr]['values'] = sorted(before[attr]['values'], key=lambda p: json.dumps(p, sort_keys=True))
+        b[attr]['values'] = sorted(after[attr]['values'], key=lambda p: json.dumps(p, sort_keys=True))
     compare(a, b)
 
 
@@ -294,35 +356,35 @@ def run_uncompressed_query_measurements(ctx: Stage4FixtureContext) -> dict:
     to_5s = (t_base + datetime.timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m1 = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_5s)}&to={urllib.parse.quote(to_5s)}&resolution=raw&max_points=500",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_5s)}&endTimeAt={urllib.parse.quote(to_5s)}&max_points=500",
         token=token_a,
     )
     m1_http_ms = (time.monotonic() - t0) * 1000.0
-    if resp_m1.status != 200 or resp_m1.json.get("point_count") != 500 or resp_m1.json.get("resolution") != "raw":
+    if resp_m1.status != 200 or len(resp_m1.json.get("measurement", {}).get("values", [])) != 500:
         raise AssertionError(f"M1 HTTP query failed: status {resp_m1.status}, body: {resp_m1.json}")
 
-    # M2 HTTP: Longer bucket window (10m: auto resolution 10s -> 60 buckets with cap 500)
+    # M2 HTTP: Longer bucket window (10m: aggrPeriodDuration=PT10S -> 60 buckets with cap 500)
     from_10m = t_base.isoformat().replace("+00:00", "Z")
     to_10m = (t_base + datetime.timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m2 = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_10m)}&to={urllib.parse.quote(to_10m)}&resolution=auto&max_points=500",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_10m)}&endTimeAt={urllib.parse.quote(to_10m)}&aggrPeriodDuration=PT10S&max_points=500",
         token=token_a,
     )
     m2_http_ms = (time.monotonic() - t0) * 1000.0
-    if resp_m2.status != 200 or resp_m2.json.get("point_count") != 60 or resp_m2.json.get("resolution") != "10s":
+    if resp_m2.status != 200 or len(resp_m2.json.get("measurement", {}).get("totalCount", [])) != 60:
         raise AssertionError(f"M2 HTTP query failed: status {resp_m2.status}, body: {resp_m2.json}")
 
-    # M3 HTTP: Short auto probe point overflow (8s: 800 samples -> cap 500 overflow -> fallback 100ms -> 80 buckets)
+    # M3 HTTP: Short probe window (8s: PT0.1S -> 80 buckets)
     from_8s = t_base.isoformat().replace("+00:00", "Z")
     to_8s = (t_base + datetime.timedelta(seconds=8)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m3 = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_8s)}&to={urllib.parse.quote(to_8s)}&resolution=auto&max_points=500",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_8s)}&endTimeAt={urllib.parse.quote(to_8s)}&aggrPeriodDuration=PT0.1S&max_points=500",
         token=token_a,
     )
     m3_http_ms = (time.monotonic() - t0) * 1000.0
-    if resp_m3.status != 200 or resp_m3.json.get("point_count") != 80 or resp_m3.json.get("resolution") != "100ms":
+    if resp_m3.status != 200 or len(resp_m3.json.get("measurement", {}).get("totalCount", [])) != 80:
         raise AssertionError(f"M3 HTTP query failed: status {resp_m3.status}, body: {resp_m3.json}")
 
     # M4 HTTP: Temporal raw query (10s: 10 observations)
@@ -330,37 +392,37 @@ def run_uncompressed_query_measurements(ctx: Stage4FixtureContext) -> dict:
     to_10s = (t_base + datetime.timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m4 = ctx.http.get(
-        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/history?property=sample_interval_us&from={urllib.parse.quote(from_10s)}&to={urllib.parse.quote(to_10s)}",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(from_10s)}&endTimeAt={urllib.parse.quote(to_10s)}",
         token=token_a,
     )
     m4_http_ms = (time.monotonic() - t0) * 1000.0
-    if resp_m4.status != 200 or resp_m4.json.get("point_count") != 10 or resp_m4.json.get("mode") != "raw":
+    if resp_m4.status != 200 or len(resp_m4.json.get("sample_interval_us", {}).get("values", [])) != 10:
         raise AssertionError(f"M4 HTTP query failed: status {resp_m4.status}, body: {resp_m4.json}")
 
     # M5 HTTP: Temporal bucket query (10m: resolution 1m -> 10 buckets)
     t0 = time.monotonic()
     resp_m5 = ctx.http.get(
-        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/history?property=sample_interval_us&from={urllib.parse.quote(from_10m)}&to={urllib.parse.quote(to_10m)}&resolution=1m",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(from_10m)}&endTimeAt={urllib.parse.quote(to_10m)}&aggrPeriodDuration=PT1M",
         token=token_a,
     )
     m5_http_ms = (time.monotonic() - t0) * 1000.0
-    if resp_m5.status != 200 or resp_m5.json.get("point_count") != 10 or resp_m5.json.get("mode") != "bucket":
+    if resp_m5.status != 200 or len(resp_m5.json.get("sample_interval_us", {}).get("totalCount", [])) != 10:
         raise AssertionError(f"M5 HTTP query failed: status {resp_m5.status}, body: {resp_m5.json}")
 
     # Tenant Isolation HTTP check: User B (owns distractor gateway) denied reading Target Gateway
     resp_iso_telem = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_5s)}&to={urllib.parse.quote(to_5s)}",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_5s)}&endTimeAt={urllib.parse.quote(to_5s)}",
         token=token_b,
     )
     if resp_iso_telem.status != 404:
-        raise AssertionError(f"User B expected 404 for target telemetry history, got {resp_iso_telem.status}")
+        raise AssertionError(f"User B expected 404 for target telemetry temporal, got {resp_iso_telem.status}")
 
     resp_iso_twin = ctx.http.get(
-        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/history?property=sample_interval_us&from={urllib.parse.quote(from_10s)}&to={urllib.parse.quote(to_10s)}",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(from_10s)}&endTimeAt={urllib.parse.quote(to_10s)}",
         token=token_b,
     )
     if resp_iso_twin.status != 404:
-        raise AssertionError(f"User B expected 404 for target twin history, got {resp_iso_twin.status}")
+        raise AssertionError(f"User B expected 404 for target twin temporal, got {resp_iso_twin.status}")
 
     print("PASS: HTTP queries and cross-tenant isolation verified", flush=True)
 
@@ -617,7 +679,7 @@ def run_compressed_query_measurements(
     to_5s = (t_base + datetime.timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m1 = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_5s)}&to={urllib.parse.quote(to_5s)}&resolution=raw&max_points=500",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_5s)}&endTimeAt={urllib.parse.quote(to_5s)}&max_points=500",
         token=token_a,
     )
     m1_http_ms = (time.monotonic() - t0) * 1000.0
@@ -629,16 +691,17 @@ def run_compressed_query_measurements(
     # Compare M1 result equivalence
     m1_u = uncompressed_results.get("m1", {})
     m1_c = resp_m1.json
-    if m1_c.get("point_count") != 500 or m1_c.get("resolution") != "raw":
+    m1_c_pts = m1_c.get("measurement", {}).get("values", [])
+    if len(m1_c_pts) != 500:
         raise AssertionError(f"M1 compressed metadata mismatch: {m1_c}")
     assert_history_equivalent(m1_u, m1_c)
 
-    # M2 HTTP: Longer bucket window (10m: auto resolution 10s -> 60 buckets)
+    # M2 HTTP: Longer bucket window (10m: aggrPeriodDuration=PT10S -> 60 buckets)
     from_10m = t_base.isoformat().replace("+00:00", "Z")
     to_10m = (t_base + datetime.timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m2 = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_10m)}&to={urllib.parse.quote(to_10m)}&resolution=auto&max_points=500",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_10m)}&endTimeAt={urllib.parse.quote(to_10m)}&aggrPeriodDuration=PT10S&max_points=500",
         token=token_a,
     )
     m2_http_ms = (time.monotonic() - t0) * 1000.0
@@ -647,31 +710,38 @@ def run_compressed_query_measurements(
     m2_u = uncompressed_results.get("m2", {})
     m2_c = resp_m2.json
     assert_history_equivalent(m2_u, m2_c)
-    if m2_c.get("point_count") != 60 or m2_c.get("resolution") != "10s":
-        raise AssertionError(f"M2 compressed metadata mismatch: {m2_c}")
+    m2_c_counts = m2_c.get("measurement", {}).get("totalCount", [])
+    if len(m2_c_counts) != 60:
+        raise AssertionError(f"M2 compressed count mismatch: {len(m2_c_counts)}")
     if m2_u:
-        b_u = m2_u.get("points", [])
-        b_c = m2_c.get("points", [])
+        b_u = m2_u.get("measurement", {}).get("totalCount", [])
+        b_c = m2_c.get("measurement", {}).get("totalCount", [])
+        avg_u = m2_u.get("measurement", {}).get("avg", [])
+        avg_c = m2_c.get("measurement", {}).get("avg", [])
+        min_u = m2_u.get("measurement", {}).get("min", [])
+        min_c = m2_c.get("measurement", {}).get("min", [])
+        max_u = m2_u.get("measurement", {}).get("max", [])
+        max_c = m2_c.get("measurement", {}).get("max", [])
         if len(b_u) != len(b_c):
             raise AssertionError(f"M2 buckets array length mismatch: {len(b_u)} vs {len(b_c)}")
-        for idx, (bu, bc) in enumerate(zip(b_u, b_c)):
-            if bu.get("bucket_start") != bc.get("bucket_start"):
-                raise AssertionError(f"M2 bucket[{idx}] bucket_start mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("avg")) - float(bc.get("avg"))) > 1e-6:
-                raise AssertionError(f"M2 bucket[{idx}] avg mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("min")) - float(bc.get("min"))) > 1e-6:
-                raise AssertionError(f"M2 bucket[{idx}] min mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("max")) - float(bc.get("max"))) > 1e-6:
-                raise AssertionError(f"M2 bucket[{idx}] max mismatch: {bu} vs {bc}")
-            if str(bu.get("count")) != str(bc.get("count")) or int(bc.get("count", 0)) != 1000:
-                raise AssertionError(f"M2 bucket[{idx}] count mismatch: {bu} vs {bc}")
+        for idx in range(len(b_c)):
+            if b_u[idx][1] != b_c[idx][1]:
+                raise AssertionError(f"M2 bucket[{idx}] bucket_start mismatch: {b_u[idx]} vs {b_c[idx]}")
+            if abs(float(avg_u[idx][0]) - float(avg_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M2 bucket[{idx}] avg mismatch: {avg_u[idx]} vs {avg_c[idx]}")
+            if abs(float(min_u[idx][0]) - float(min_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M2 bucket[{idx}] min mismatch: {min_u[idx]} vs {min_c[idx]}")
+            if abs(float(max_u[idx][0]) - float(max_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M2 bucket[{idx}] max mismatch: {max_u[idx]} vs {max_c[idx]}")
+            if int(b_c[idx][0]) != 1000:
+                raise AssertionError(f"M2 bucket[{idx}] count mismatch: {b_u[idx]} vs {b_c[idx]}")
 
-    # M3 HTTP: Short auto probe point overflow (8s: 800 samples -> fallback 100ms -> 80 buckets)
+    # M3 HTTP: Short probe window (8s: PT0.1S -> 80 buckets)
     from_8s = t_base.isoformat().replace("+00:00", "Z")
     to_8s = (t_base + datetime.timedelta(seconds=8)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m3 = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_8s)}&to={urllib.parse.quote(to_8s)}&resolution=auto&max_points=500",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_8s)}&endTimeAt={urllib.parse.quote(to_8s)}&aggrPeriodDuration=PT0.1S&max_points=500",
         token=token_a,
     )
     m3_http_ms = (time.monotonic() - t0) * 1000.0
@@ -680,27 +750,30 @@ def run_compressed_query_measurements(
     m3_u = uncompressed_results.get("m3", {})
     m3_c = resp_m3.json
     assert_history_equivalent(m3_u, m3_c)
-    if m3_c.get("point_count") != 80 or m3_c.get("resolution") != "100ms":
-        raise AssertionError(f"M3 compressed metadata mismatch: {m3_c}")
+    m3_c_counts = m3_c.get("measurement", {}).get("totalCount", [])
+    if len(m3_c_counts) != 80:
+        raise AssertionError(f"M3 compressed count mismatch: {len(m3_c_counts)}")
     if m3_u:
-        b_u = m3_u.get("points", [])
-        b_c = m3_c.get("points", [])
+        b_u = m3_u.get("measurement", {}).get("totalCount", [])
+        b_c = m3_c.get("measurement", {}).get("totalCount", [])
+        avg_u = m3_u.get("measurement", {}).get("avg", [])
+        avg_c = m3_c.get("measurement", {}).get("avg", [])
         if len(b_u) != len(b_c):
             raise AssertionError(f"M3 buckets array length mismatch: {len(b_u)} vs {len(b_c)}")
-        for idx, (bu, bc) in enumerate(zip(b_u, b_c)):
-            if bu.get("bucket_start") != bc.get("bucket_start"):
-                raise AssertionError(f"M3 bucket[{idx}] bucket_start mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("avg")) - float(bc.get("avg"))) > 1e-6:
-                raise AssertionError(f"M3 bucket[{idx}] avg mismatch: {bu} vs {bc}")
-            if str(bu.get("count")) != str(bc.get("count")) or int(bc.get("count", 0)) != 10:
-                raise AssertionError(f"M3 bucket[{idx}] count mismatch: {bu} vs {bc}")
+        for idx in range(len(b_c)):
+            if b_u[idx][1] != b_c[idx][1]:
+                raise AssertionError(f"M3 bucket[{idx}] bucket_start mismatch: {b_u[idx]} vs {b_c[idx]}")
+            if abs(float(avg_u[idx][0]) - float(avg_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M3 bucket[{idx}] avg mismatch: {avg_u[idx]} vs {avg_c[idx]}")
+            if int(b_c[idx][0]) != 10:
+                raise AssertionError(f"M3 bucket[{idx}] count mismatch: {b_u[idx]} vs {b_c[idx]}")
 
     # M4 HTTP: Temporal raw query (10s: 10 observations)
     from_10s = t_base.isoformat().replace("+00:00", "Z")
     to_10s = (t_base + datetime.timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
     t0 = time.monotonic()
     resp_m4 = ctx.http.get(
-        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/history?property=sample_interval_us&from={urllib.parse.quote(from_10s)}&to={urllib.parse.quote(to_10s)}",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(from_10s)}&endTimeAt={urllib.parse.quote(to_10s)}",
         token=token_a,
     )
     m4_http_ms = (time.monotonic() - t0) * 1000.0
@@ -708,16 +781,17 @@ def run_compressed_query_measurements(
         raise AssertionError(f"M4 compressed HTTP query failed: {resp_m4.status}")
     m4_u = uncompressed_results.get("m4", {})
     m4_c = resp_m4.json
-    if m4_c.get("point_count") != 10 or m4_c.get("mode") != "raw" or m4_c.get("unit") != "us":
+    m4_c_pts = m4_c.get("sample_interval_us", {}).get("values", [])
+    if len(m4_c_pts) != 10:
         raise AssertionError(f"M4 compressed metadata mismatch: {m4_c}")
     assert_history_equivalent(m4_u, m4_c, temporal=True)
-    if any(o['value'] != 10000.0 for o in m4_c['points']):
+    if any(o[0] != 10000.0 for o in m4_c_pts):
         raise AssertionError('M4 unexpected observation value')
 
     # M5 HTTP: Temporal bucket query (10m: resolution 1m -> 10 buckets)
     t0 = time.monotonic()
     resp_m5 = ctx.http.get(
-        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/history?property=sample_interval_us&from={urllib.parse.quote(from_10m)}&to={urllib.parse.quote(to_10m)}&resolution=1m",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(from_10m)}&endTimeAt={urllib.parse.quote(to_10m)}&aggrPeriodDuration=PT1M",
         token=token_a,
     )
     m5_http_ms = (time.monotonic() - t0) * 1000.0
@@ -726,27 +800,34 @@ def run_compressed_query_measurements(
     m5_u = uncompressed_results.get("m5", {})
     m5_c = resp_m5.json
     assert_history_equivalent(m5_u, m5_c, temporal=True)
-    if m5_c.get("point_count") != 10 or m5_c.get("mode") != "bucket" or m5_c.get("unit") != "us":
+    m5_c_counts = m5_c.get("sample_interval_us", {}).get("totalCount", [])
+    if len(m5_c_counts) != 10:
         raise AssertionError(f"M5 compressed metadata mismatch: {m5_c}")
     if m5_u:
-        b_u = m5_u.get("points", [])
-        b_c = m5_c.get("points", [])
+        b_u = m5_u.get("sample_interval_us", {}).get("totalCount", [])
+        b_c = m5_c.get("sample_interval_us", {}).get("totalCount", [])
+        avg_u = m5_u.get("sample_interval_us", {}).get("avg", [])
+        avg_c = m5_c.get("sample_interval_us", {}).get("avg", [])
+        min_u = m5_u.get("sample_interval_us", {}).get("min", [])
+        min_c = m5_c.get("sample_interval_us", {}).get("min", [])
+        max_u = m5_u.get("sample_interval_us", {}).get("max", [])
+        max_c = m5_c.get("sample_interval_us", {}).get("max", [])
         if len(b_u) != len(b_c):
             raise AssertionError(f"M5 buckets array length mismatch: {len(b_u)} vs {len(b_c)}")
-        for idx, (bu, bc) in enumerate(zip(b_u, b_c)):
-            if bu.get("bucket_start") != bc.get("bucket_start"):
-                raise AssertionError(f"M5 bucket[{idx}] bucket_start mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("avg")) - float(bc.get("avg"))) > 1e-6:
-                raise AssertionError(f"M5 bucket[{idx}] avg mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("min")) - float(bc.get("min"))) > 1e-6:
-                raise AssertionError(f"M5 bucket[{idx}] min mismatch: {bu} vs {bc}")
-            if abs(float(bu.get("max")) - float(bc.get("max"))) > 1e-6:
-                raise AssertionError(f"M5 bucket[{idx}] max mismatch: {bu} vs {bc}")
-            if str(bu.get("count")) != str(bc.get("count")):
-                raise AssertionError(f"M5 bucket[{idx}] count mismatch: {bu} vs {bc}")
+        for idx in range(len(b_c)):
+            if b_u[idx][1] != b_c[idx][1]:
+                raise AssertionError(f"M5 bucket[{idx}] bucket_start mismatch: {b_u[idx]} vs {b_c[idx]}")
+            if abs(float(avg_u[idx][0]) - float(avg_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M5 bucket[{idx}] avg mismatch: {avg_u[idx]} vs {avg_c[idx]}")
+            if abs(float(min_u[idx][0]) - float(min_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M5 bucket[{idx}] min mismatch: {min_u[idx]} vs {min_c[idx]}")
+            if abs(float(max_u[idx][0]) - float(max_c[idx][0])) > 1e-6:
+                raise AssertionError(f"M5 bucket[{idx}] max mismatch: {max_u[idx]} vs {max_c[idx]}")
+            if int(b_u[idx][0]) != int(b_c[idx][0]):
+                raise AssertionError(f"M5 bucket[{idx}] count mismatch: {b_u[idx]} vs {b_c[idx]}")
 
     # Explicit arithmetic and intentional gap verification on compressed M5
-    m5_counts = [int(b.get("count", 0)) for b in m5_c.get("points", [])]
+    m5_counts = [int(item[0]) for item in m5_c_counts]
     if sum(m5_counts) != 580:
         raise AssertionError(f"M5 total sample count mismatch: expected 580, got {sum(m5_counts)}")
     if m5_counts[5] != 40:
@@ -757,18 +838,18 @@ def run_compressed_query_measurements(
 
     # Tenant Isolation HTTP check on compressed data: User B still denied 404
     resp_iso_telem = ctx.http.get(
-        f"/v1/telemetry/history?gateway_id={target_gw}&sensor_id={target_sensor}&from={urllib.parse.quote(from_5s)}&to={urllib.parse.quote(to_5s)}",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=measurement&timerel=between&timeAt={urllib.parse.quote(from_5s)}&endTimeAt={urllib.parse.quote(to_5s)}",
         token=token_b,
     )
     if resp_iso_telem.status != 404:
-        raise AssertionError(f"User B expected 404 for target telemetry history on compressed chunk, got {resp_iso_telem.status}")
+        raise AssertionError(f"User B expected 404 for target telemetry temporal on compressed chunk, got {resp_iso_telem.status}")
 
     resp_iso_twin = ctx.http.get(
-        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/history?property=sample_interval_us&from={urllib.parse.quote(from_10s)}&to={urllib.parse.quote(to_10s)}",
+        f"/v1/digital-twins/{urllib.parse.quote(target_sensor_urn, safe=':')}/temporal?attrs=sample_interval_us&timerel=between&timeAt={urllib.parse.quote(from_10s)}&endTimeAt={urllib.parse.quote(to_10s)}",
         token=token_b,
     )
     if resp_iso_twin.status != 404:
-        raise AssertionError(f"User B expected 404 for target twin history on compressed chunk, got {resp_iso_twin.status}")
+        raise AssertionError(f"User B expected 404 for target twin temporal on compressed chunk, got {resp_iso_twin.status}")
 
     print("PASS: compressed HTTP queries, exact result equivalence, arithmetic, gap, and tenant isolation verified", flush=True)
 

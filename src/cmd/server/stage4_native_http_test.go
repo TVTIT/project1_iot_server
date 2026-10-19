@@ -555,6 +555,9 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 Created for admin POST Gateway, got %d: %s", resp.StatusCode, string(respBytes))
 	}
+	if wantLoc := "/v1/digital-twins/" + url.PathEscape(gwURN); resp.Header.Get("Location") != wantLoc {
+		t.Errorf("Location = %q, want %q", resp.Header.Get("Location"), wantLoc)
+	}
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
 		t.Errorf("Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
 	}
@@ -582,6 +585,9 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	resp, respBytes = doRequest(http.MethodPost, ts.URL+"/v1/digital-twins", adminToken, "req-post-gw-replay", gwCreateBody)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK for exact replay POST Gateway, got %d: %s", resp.StatusCode, string(respBytes))
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("Location on replay = %q, want empty", loc)
 	}
 	var gwReplayResp struct {
 		EntityID  string `json:"entity_id"`
@@ -620,6 +626,9 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 Created for owner POST Sensor, got %d: %s", resp.StatusCode, string(respBytes))
 	}
+	if wantLoc := "/v1/digital-twins/" + url.PathEscape(sensorURN); resp.Header.Get("Location") != wantLoc {
+		t.Errorf("Location = %q, want %q", resp.Header.Get("Location"), wantLoc)
+	}
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
 		t.Errorf("Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
 	}
@@ -648,6 +657,9 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	resp, respBytes = doRequest(http.MethodPost, ts.URL+"/v1/digital-twins", ownerToken, "req-post-sensor-replay", sensorCreateBody)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK for exact replay POST Sensor, got %d: %s", resp.StatusCode, string(respBytes))
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("Location on replay = %q, want empty", loc)
 	}
 	var sensorReplayResp struct {
 		EntityID  string `json:"entity_id"`
@@ -729,60 +741,67 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	bucketTimeFrom := baseTime.Add(-time.Minute).Format(time.RFC3339)
 	bucketTimeTo := baseTime.Add(time.Minute).Format(time.RFC3339)
 
-	// Route 1a: GET /v1/telemetry/history (raw, window <= 10s)
-	telemRawURL := fmt.Sprintf("%s/v1/telemetry/history?gateway_id=%s&sensor_id=%s&from=%s&to=%s",
-		ts.URL, gwID, sensorID, url.QueryEscape(rawTimeFrom), url.QueryEscape(rawTimeTo))
+	// Route 1a: GET /v1/digital-twins/{entity_id}/temporal (raw measurement, window <= 10s)
+	telemRawURL := fmt.Sprintf("%s/v1/digital-twins/%s/temporal?attrs=measurement&timerel=between&timeAt=%s&endTimeAt=%s",
+		ts.URL, url.PathEscape(sensorURN), url.QueryEscape(rawTimeFrom), url.QueryEscape(rawTimeTo))
 	resp, respBytes = doRequest(http.MethodGet, telemRawURL, ownerToken, "req-telem-raw-01", nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/telemetry/history raw failed with %d: %s", resp.StatusCode, string(respBytes))
+		t.Fatalf("GET /v1/digital-twins/{entity_id}/temporal raw failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		t.Errorf("Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/ld+json") {
+		t.Errorf("Content-Type = %q, want application/ld+json", resp.Header.Get("Content-Type"))
 	}
 	if resp.Header.Get("Cache-Control") != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
 	}
 
 	var telemRawResp struct {
-		Mode       string `json:"mode"`
-		PointCount int    `json:"point_count"`
-		Points     []struct {
-			SequenceNum string  `json:"sequence_num"`
-			Value       float64 `json:"value"`
-		} `json:"points"`
+		Measurement struct {
+			Type   string  `json:"type"`
+			Values [][]any `json:"values"`
+		} `json:"measurement"`
 	}
 	if err := json.Unmarshal(respBytes, &telemRawResp); err != nil {
 		t.Fatalf("unmarshal telemetry raw history: %v", err)
 	}
-	if telemRawResp.Mode != "raw" || telemRawResp.PointCount != sampleCount || len(telemRawResp.Points) != sampleCount {
-		t.Fatalf("expected 5 raw points in mode raw, got mode=%q, count=%d. Body: %s", telemRawResp.Mode, telemRawResp.PointCount, string(respBytes))
+	if len(telemRawResp.Measurement.Values) != sampleCount {
+		t.Fatalf("expected %d raw points in values array, got %d. Body: %s", sampleCount, len(telemRawResp.Measurement.Values), string(respBytes))
 	}
-	if telemRawResp.Points[0].SequenceNum != "5001" || telemRawResp.Points[0].Value != 25.1 {
-		t.Fatalf("unexpected first point: %+v", telemRawResp.Points[0])
+	firstTuple := telemRawResp.Measurement.Values[0]
+	if len(firstTuple) != 2 || firstTuple[0].(float64) != 25.1 {
+		t.Fatalf("unexpected first point tuple: %+v", firstTuple)
 	}
 
-	// Route 1b: GET /v1/telemetry/history (bucket downsampled, explicit resolution)
-	telemBucketURL := fmt.Sprintf("%s/v1/telemetry/history?gateway_id=%s&sensor_id=%s&from=%s&to=%s&resolution=1s",
-		ts.URL, gwID, sensorID, url.QueryEscape(bucketTimeFrom), url.QueryEscape(bucketTimeTo))
+	// Verify old route GET /v1/telemetry/history is removed and returns 404
+	oldTelemURL := fmt.Sprintf("%s/v1/telemetry/history?gateway_id=%s&sensor_id=%s&from=%s&to=%s",
+		ts.URL, gwID, sensorID, url.QueryEscape(rawTimeFrom), url.QueryEscape(rawTimeTo))
+	respOldTelem, _ := doRequest(http.MethodGet, oldTelemURL, ownerToken, "req-telem-old", nil)
+	if respOldTelem.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed /telemetry/history route, got %d", respOldTelem.StatusCode)
+	}
+
+	// Route 1b: GET /v1/digital-twins/{entity_id}/temporal (bucket downsampled measurement, PT1S)
+	telemBucketURL := fmt.Sprintf("%s/v1/digital-twins/%s/temporal?attrs=measurement&timerel=between&timeAt=%s&endTimeAt=%s&aggrPeriodDuration=PT1S",
+		ts.URL, url.PathEscape(sensorURN), url.QueryEscape(bucketTimeFrom), url.QueryEscape(bucketTimeTo))
 	resp, respBytes = doRequest(http.MethodGet, telemBucketURL, ownerToken, "req-telem-bucket-01", nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/telemetry/history bucket failed with %d: %s", resp.StatusCode, string(respBytes))
+		t.Fatalf("GET /v1/digital-twins/{entity_id}/temporal bucket failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
 	var telemBucketResp struct {
-		PointCount int `json:"point_count"`
-		Points     []struct {
-			Count string  `json:"count"`
-			Avg   float64 `json:"avg"`
-		} `json:"points"`
+		Measurement struct {
+			Type       string  `json:"type"`
+			Avg        [][]any `json:"avg"`
+			TotalCount [][]any `json:"totalCount"`
+		} `json:"measurement"`
 	}
 	if err := json.Unmarshal(respBytes, &telemBucketResp); err != nil {
 		t.Fatalf("unmarshal telemetry bucket history: %v", err)
 	}
-	if telemBucketResp.PointCount != 1 || len(telemBucketResp.Points) != 1 {
-		t.Fatalf("expected 1 bucket point, got %d", telemBucketResp.PointCount)
+	if len(telemBucketResp.Measurement.TotalCount) != 1 {
+		t.Fatalf("expected 1 bucket point in totalCount, got %d", len(telemBucketResp.Measurement.TotalCount))
 	}
-	if telemBucketResp.Points[0].Count != "5" {
-		t.Fatalf("expected count 5 in bucket, got %s", telemBucketResp.Points[0].Count)
+	if totalCountVal := telemBucketResp.Measurement.TotalCount[0][0].(float64); totalCountVal != 5 {
+		t.Fatalf("expected count 5 in bucket, got %v", totalCountVal)
 	}
 
 	// Route 2: GET /v1/digital-twins (list)
@@ -791,20 +810,18 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /v1/digital-twins failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		t.Errorf("Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/ld+json") {
+		t.Errorf("Content-Type = %q, want application/ld+json", resp.Header.Get("Content-Type"))
 	}
-	var twinListResp struct {
-		Items []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"`
-		} `json:"items"`
+	var twinListResp []struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(respBytes, &twinListResp); err != nil {
 		t.Fatalf("unmarshal twin list: %v", err)
 	}
-	if len(twinListResp.Items) != 2 {
-		t.Fatalf("expected 2 items in twin list for gateway, got %d", len(twinListResp.Items))
+	if len(twinListResp) != 2 {
+		t.Fatalf("expected 2 items in twin list for gateway, got %d", len(twinListResp))
 	}
 
 	// Route 3: GET /v1/digital-twins/{entity_id} (detail)
@@ -841,12 +858,49 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/ld+json") {
 		t.Errorf("Content-Type = %q, want application/ld+json", resp.Header.Get("Content-Type"))
 	}
+	var sensorDetailResp struct {
+		ID          string `json:"id"`
+		Type        string `json:"type"`
+		Measurement *struct {
+			Type       string  `json:"type"`
+			Value      float64 `json:"value"`
+			ObservedAt string  `json:"observedAt"`
+			UnitCode   string  `json:"unitCode"`
+		} `json:"measurement"`
+		MeasurementUnit *struct {
+			Type  string `json:"type"`
+			Value string `json:"value"`
+		} `json:"measurementUnit"`
+		SampleIntervalUS *struct {
+			Type       string  `json:"type"`
+			Value      float64 `json:"value"`
+			ObservedAt string  `json:"observedAt"`
+		} `json:"sample_interval_us"`
+	}
+	if err := json.Unmarshal(respBytes, &sensorDetailResp); err != nil {
+		t.Fatalf("unmarshal sensor detail: %v", err)
+	}
+	if sensorDetailResp.Measurement == nil {
+		t.Fatalf("expected measurement property in sensor detail, got nil")
+	}
+	if sensorDetailResp.Measurement.Value != 25.5 {
+		t.Errorf("sensor measurement.value = %v, want 25.5", sensorDetailResp.Measurement.Value)
+	}
+	if sensorDetailResp.MeasurementUnit == nil || sensorDetailResp.MeasurementUnit.Value != "celsius" {
+		t.Errorf("sensor measurementUnit = %+v, want celsius", sensorDetailResp.MeasurementUnit)
+	}
+	if sensorDetailResp.SampleIntervalUS == nil {
+		t.Fatalf("expected sample_interval_us property in sensor detail, got nil")
+	}
+	if sensorDetailResp.SampleIntervalUS.Value != 100000 {
+		t.Errorf("sensor sample_interval_us.value = %v, want 100000", sensorDetailResp.SampleIntervalUS.Value)
+	}
 
-	// Route 4: GET /v1/digital-twins/{entity_id}/state
-	sensorStateURL := fmt.Sprintf("%s/v1/digital-twins/%s/state", ts.URL, url.PathEscape(sensorURN))
+	// Route 4: GET /v1/digital-twins/{entity_id}?format=simplified (state view)
+	sensorStateURL := fmt.Sprintf("%s/v1/digital-twins/%s?format=simplified", ts.URL, url.PathEscape(sensorURN))
 	resp, respBytes = doRequest(http.MethodGet, sensorStateURL, ownerToken, "req-twin-state-01", nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/digital-twins/{entity_id}/state failed with %d: %s", resp.StatusCode, string(respBytes))
+		t.Fatalf("GET /v1/digital-twins/{entity_id}?format=simplified failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
 	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
 		t.Errorf("Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
@@ -862,57 +916,66 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 		t.Fatalf("expected reported_version '1', got %q", sensorStateResp.ReportedVersion)
 	}
 
-	// Route 5a: GET /v1/digital-twins/{entity_id}/history (property=value)
-	twinValueHistURL := fmt.Sprintf("%s/v1/digital-twins/%s/history?property=value&from=%s&to=%s",
-		ts.URL, url.PathEscape(sensorURN), url.QueryEscape(rawTimeFrom), url.QueryEscape(rawTimeTo))
-	resp, respBytes = doRequest(http.MethodGet, twinValueHistURL, ownerToken, "req-twin-hist-val-01", nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/digital-twins/{entity_id}/history property=value failed with %d: %s", resp.StatusCode, string(respBytes))
-	}
-	var twinValueHistResp struct {
-		PointCount int `json:"point_count"`
-	}
-	if err := json.Unmarshal(respBytes, &twinValueHistResp); err != nil {
-		t.Fatalf("unmarshal twin value history: %v", err)
-	}
-	if twinValueHistResp.PointCount != sampleCount {
-		t.Fatalf("expected %d points in twin value history, got %d", sampleCount, twinValueHistResp.PointCount)
+	// Verify old /state route returns 404
+	oldStateURL := fmt.Sprintf("%s/v1/digital-twins/%s/state", ts.URL, url.PathEscape(sensorURN))
+	respOld, _ := doRequest(http.MethodGet, oldStateURL, ownerToken, "req-twin-state-old", nil)
+	if respOld.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed /state route, got %d", respOld.StatusCode)
 	}
 
-	// Route 5b: GET /v1/digital-twins/{entity_id}/history (property=sample_interval_us, window <= 10s for raw observation)
-	twinIntervalHistURL := fmt.Sprintf("%s/v1/digital-twins/%s/history?property=sample_interval_us&from=%s&to=%s",
+	// Route 5: GET /v1/digital-twins/{entity_id}/temporal (sample_interval_us, window <= 10s for raw observation)
+	twinIntervalHistURL := fmt.Sprintf("%s/v1/digital-twins/%s/temporal?attrs=sample_interval_us&timerel=between&timeAt=%s&endTimeAt=%s",
 		ts.URL, url.PathEscape(sensorURN), url.QueryEscape(rawTimeFrom), url.QueryEscape(rawTimeTo))
 	resp, respBytes = doRequest(http.MethodGet, twinIntervalHistURL, ownerToken, "req-twin-hist-int-01", nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/digital-twins/{entity_id}/history property=sample_interval_us failed with %d: %s", resp.StatusCode, string(respBytes))
+		t.Fatalf("GET /v1/digital-twins/{entity_id}/temporal property=sample_interval_us failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
 	var twinIntervalHistResp struct {
-		Mode       string `json:"mode"`
-		PointCount int    `json:"point_count"`
-		Points     []struct {
-			Value float64 `json:"value"`
-		} `json:"points"`
+		SampleIntervalUS struct {
+			Type   string  `json:"type"`
+			Values [][]any `json:"values"`
+		} `json:"sample_interval_us"`
 	}
 	if err := json.Unmarshal(respBytes, &twinIntervalHistResp); err != nil {
 		t.Fatalf("unmarshal twin interval history: %v", err)
 	}
-	if twinIntervalHistResp.Mode != "raw" || twinIntervalHistResp.PointCount != 1 || len(twinIntervalHistResp.Points) != 1 {
-		t.Fatalf("expected 1 raw point in interval history, got mode=%q count=%d. Body: %s", twinIntervalHistResp.Mode, twinIntervalHistResp.PointCount, string(respBytes))
+	if len(twinIntervalHistResp.SampleIntervalUS.Values) != 1 {
+		t.Fatalf("expected 1 raw point in interval history, got count=%d. Body: %s", len(twinIntervalHistResp.SampleIntervalUS.Values), string(respBytes))
 	}
-	if twinIntervalHistResp.Points[0].Value != float64(intervalUS) {
-		t.Fatalf("expected interval observation %f, got %f. Body: %s", float64(intervalUS), twinIntervalHistResp.Points[0].Value, string(respBytes))
+	if intervalObsVal := twinIntervalHistResp.SampleIntervalUS.Values[0][0].(float64); intervalObsVal != float64(intervalUS) {
+		t.Fatalf("expected interval observation %f, got %f. Body: %s", float64(intervalUS), intervalObsVal, string(respBytes))
+	}
+
+	// Verify old route GET /v1/digital-twins/{entity_id}/history is removed and returns 404
+	oldHistURL := fmt.Sprintf("%s/v1/digital-twins/%s/history?property=value&from=%s&to=%s",
+		ts.URL, url.PathEscape(sensorURN), url.QueryEscape(rawTimeFrom), url.QueryEscape(rawTimeTo))
+	respOldHist, _ := doRequest(http.MethodGet, oldHistURL, ownerToken, "req-twin-hist-old", nil)
+	if respOldHist.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed /history route, got %d", respOldHist.StatusCode)
 	}
 
 	// -------------------------------------------------------------------------
 	// 12. PATCH Gateway description as admin and Sensor name as owner; GET metadata again
 	// -------------------------------------------------------------------------
+	gwAttrsURL := gwDetailURL + "/attrs"
+	sensorAttrsURL := sensorDetailURL + "/attrs"
+
+	// Verify old root route /v1/digital-twins/:entity_id returns 405 Method Not Allowed
+	respOldPatch, _ := doRequest(http.MethodPatch, gwDetailURL, adminToken, "req-patch-gw-old", []byte(`{"description":{"type":"Property","value":"Old"}}`))
+	if respOldPatch.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed for old root PATCH, got %d", respOldPatch.StatusCode)
+	}
+
 	patchGwBody, err := json.Marshal(map[string]any{
-		"description": "Patched Gateway Description",
+		"description": map[string]any{
+			"type":  "Property",
+			"value": "Patched Gateway Description",
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal patch gw body: %v", err)
 	}
-	resp, respBytes = doRequest(http.MethodPatch, gwDetailURL, adminToken, "req-patch-gw-01", patchGwBody)
+	resp, respBytes = doRequest(http.MethodPatch, gwAttrsURL, adminToken, "req-patch-gw-01", patchGwBody)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin PATCH Gateway description failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
@@ -939,12 +1002,15 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	}
 
 	patchSensorBody, err := json.Marshal(map[string]any{
-		"name": "Patched Sensor Name",
+		"name": map[string]any{
+			"type":  "Property",
+			"value": "Patched Sensor Name",
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal patch sensor body: %v", err)
 	}
-	resp, respBytes = doRequest(http.MethodPatch, sensorDetailURL, ownerToken, "req-patch-sensor-01", patchSensorBody)
+	resp, respBytes = doRequest(http.MethodPatch, sensorAttrsURL, ownerToken, "req-patch-sensor-01", patchSensorBody)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("owner PATCH Sensor name failed with %d: %s", resp.StatusCode, string(respBytes))
 	}
@@ -1025,7 +1091,7 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 
 	// Viewer mutation denial:
 	// Viewer PATCH Sensor -> 403 Forbidden
-	resp, _ = doRequest(http.MethodPatch, sensorDetailURL, viewerToken, "req-viewer-patch-sensor", []byte(`{"name":"Hacked Sensor"}`))
+	resp, _ = doRequest(http.MethodPatch, sensorAttrsURL, viewerToken, "req-viewer-patch-sensor", []byte(`{"name":{"type":"Property","value":"Hacked Sensor"}}`))
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for viewer PATCH sensor, got %d", resp.StatusCode)
 	}
@@ -1037,14 +1103,14 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	}
 
 	// Viewer PATCH Gateway -> 403 Forbidden
-	resp, _ = doRequest(http.MethodPatch, gwDetailURL, viewerToken, "req-viewer-patch-gw", []byte(`{"description":"Hacked Desc"}`))
+	resp, _ = doRequest(http.MethodPatch, gwAttrsURL, viewerToken, "req-viewer-patch-gw", []byte(`{"description":{"type":"Property","value":"Hacked Desc"}}`))
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for viewer PATCH gateway, got %d", resp.StatusCode)
 	}
 
 	// Operator mutation denial:
 	// Operator PATCH Sensor -> 403 Forbidden
-	resp, _ = doRequest(http.MethodPatch, sensorDetailURL, operatorToken, "req-operator-patch-sensor", []byte(`{"name":"Operator Sensor"}`))
+	resp, _ = doRequest(http.MethodPatch, sensorAttrsURL, operatorToken, "req-operator-patch-sensor", []byte(`{"name":{"type":"Property","value":"Operator Sensor"}}`))
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for operator PATCH sensor, got %d", resp.StatusCode)
 	}
@@ -1056,7 +1122,7 @@ func TestNativeStage4HTTP_Smoke(t *testing.T) {
 	}
 
 	// Operator PATCH Gateway -> 403 Forbidden
-	resp, _ = doRequest(http.MethodPatch, gwDetailURL, operatorToken, "req-operator-patch-gw", []byte(`{"description":"Operator Desc"}`))
+	resp, _ = doRequest(http.MethodPatch, gwAttrsURL, operatorToken, "req-operator-patch-gw", []byte(`{"description":{"type":"Property","value":"Operator Desc"}}`))
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for operator PATCH gateway, got %d", resp.StatusCode)
 	}
