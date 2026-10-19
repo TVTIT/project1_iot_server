@@ -36,6 +36,357 @@ func (e *QueryError) Unwrap() error {
 	return e.Err
 }
 
+// TemporalPresentationOptions contains presentation-only choices for the temporal endpoint.
+// It is kept in the HTTP layer and must never be passed to domain services or repositories.
+type TemporalPresentationOptions struct {
+	Format      string   // "temporalValues" or "aggregatedValues"
+	AggrMethods []string // e.g. ["avg", "min", "max", "totalCount"]
+	PublicAttr  string   // "measurement" or "sample_interval_us"
+}
+
+// CanonicalDurationsToResolution maps the 9 canonical ISO durations to telemetry.Resolution.
+var CanonicalDurationsToResolution = map[string]telemetry.Resolution{
+	"PT0.1S": telemetry.Resolution100ms,
+	"PT1S":   telemetry.Resolution1s,
+	"PT10S":  telemetry.Resolution10s,
+	"PT1M":   telemetry.Resolution1m,
+	"PT5M":   telemetry.Resolution5m,
+	"PT15M":  telemetry.Resolution15m,
+	"PT1H":   telemetry.Resolution1h,
+	"PT6H":   telemetry.Resolution6h,
+	"P1D":    telemetry.Resolution1d,
+}
+
+// ParseTemporalHistoryQuery parses and validates query string for GET /v1/digital-twins/{entity_id}/temporal.
+func (p *HistoryQueryParser) ParseTemporalHistoryQuery(rawQuery string, entityID string) (*digitaltwin.TwinHistoryQuery, *TemporalPresentationOptions, error) {
+	parsedEntity, err := digitaltwin.ParseEntityURN(entityID)
+	if err != nil {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "invalid entity_id",
+			Err:     digitaltwin.ErrInvalidInput,
+		}
+	}
+
+	if parsedEntity.Type == digitaltwin.EntityTypeGateway {
+		return nil, nil, &QueryError{
+			Code:    "invalid_property",
+			Message: "gateway entity has no supported history properties",
+			Err:     digitaltwin.ErrInvalidProperty,
+		}
+	}
+
+	allowedKeys := map[string]struct{}{
+		"attrs":              {},
+		"timerel":            {},
+		"timeAt":             {},
+		"endTimeAt":          {},
+		"timeproperty":       {},
+		"aggrPeriodDuration": {},
+		"aggrMethods":        {},
+		"format":             {},
+		"max_points":         {},
+	}
+
+	params, err := parseRawQuery(rawQuery, allowedKeys)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 1. attrs: REQUIRED, exactly one token
+	attrsVal, ok := params["attrs"]
+	if !ok || attrsVal == "" {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "missing required attrs parameter",
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+	if strings.Contains(attrsVal, ",") {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "multiple attrs tokens are not supported",
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+
+	var (
+		domainProp digitaltwin.HistorySelector
+		publicAttr string
+	)
+	switch attrsVal {
+	case "measurement":
+		domainProp = digitaltwin.SelectorValue
+		publicAttr = "measurement"
+	case "value":
+		domainProp = digitaltwin.SelectorValue
+		publicAttr = "measurement"
+	case "sample_interval_us":
+		domainProp = digitaltwin.SelectorSampleIntervalUS
+		publicAttr = "sample_interval_us"
+	default:
+		return nil, nil, &QueryError{
+			Code:    "invalid_property",
+			Message: fmt.Sprintf("unsupported attrs parameter: %s", attrsVal),
+			Err:     digitaltwin.ErrInvalidProperty,
+		}
+	}
+
+	// 2. timerel: REQUIRED, must be "between"
+	timerelVal, ok := params["timerel"]
+	if !ok || timerelVal == "" {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "missing required timerel parameter",
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+	if timerelVal != "between" {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: fmt.Sprintf("unsupported timerel: %s (must be between)", timerelVal),
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+
+	// 3. timeAt and endTimeAt: REQUIRED, UTC Z, <= 6 fractional digits
+	timeAtVal, ok := params["timeAt"]
+	if !ok || timeAtVal == "" {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "missing required timeAt parameter",
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+	timeAt, err := parseRFC3339MicroUTCZ(timeAtVal)
+	if err != nil {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: fmt.Sprintf("invalid timeAt timestamp: %v", err),
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+
+	endTimeAtVal, ok := params["endTimeAt"]
+	if !ok || endTimeAtVal == "" {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "missing required endTimeAt parameter",
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+	endTimeAt, err := parseRFC3339MicroUTCZ(endTimeAtVal)
+	if err != nil {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: fmt.Sprintf("invalid endTimeAt timestamp: %v", err),
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+
+	if !timeAt.Before(endTimeAt) {
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "timeAt must be strictly before endTimeAt",
+			Err:     telemetry.ErrHistoryInvalidInput,
+		}
+	}
+
+	// 4. timeproperty: OPTIONAL, if present must be "observedAt"
+	if tpVal, ok := params["timeproperty"]; ok {
+		if tpVal != "observedAt" {
+			return nil, nil, &QueryError{
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("unsupported timeproperty: %s (only observedAt is supported)", tpVal),
+				Err:     telemetry.ErrHistoryInvalidInput,
+			}
+		}
+	}
+
+	// 5. aggrPeriodDuration: OPTIONAL
+	// If absent: ResolutionRaw (never auto!)
+	// If present: canonical 9 ISO durations
+	var (
+		res      telemetry.Resolution
+		isBucket bool
+		format   string
+	)
+
+	durVal, hasDuration := params["aggrPeriodDuration"]
+	if hasDuration && durVal != "" {
+		mappedRes, ok := CanonicalDurationsToResolution[durVal]
+		if !ok {
+			return nil, nil, &QueryError{
+				Code:    "invalid_resolution",
+				Message: fmt.Sprintf("unsupported aggrPeriodDuration: %s", durVal),
+				Err:     telemetry.ErrHistoryInvalidResolution,
+			}
+		}
+		res = mappedRes
+		isBucket = true
+	} else {
+		res = telemetry.ResolutionRaw
+		isBucket = false
+	}
+
+	// 6. aggrMethods:
+	// If raw mode: FORBIDDEN!
+	// If bucket mode: default ["avg", "min", "max", "totalCount"], or valid non-repeating subset
+	var selectedMethods []string
+	if !isBucket {
+		if _, hasMethods := params["aggrMethods"]; hasMethods {
+			return nil, nil, &QueryError{
+				Code:    "invalid_request",
+				Message: "aggrMethods is not allowed when aggrPeriodDuration is not specified",
+				Err:     telemetry.ErrHistoryInvalidInput,
+			}
+		}
+	} else {
+		methodsVal, hasMethods := params["aggrMethods"]
+		if !hasMethods || methodsVal == "" {
+			selectedMethods = []string{"avg", "min", "max", "totalCount"}
+		} else {
+			tokens := strings.Split(methodsVal, ",")
+			seen := make(map[string]struct{}, len(tokens))
+			selectedMethods = make([]string, 0, len(tokens))
+			for _, t := range tokens {
+				t = strings.TrimSpace(t)
+				if t == "" {
+					return nil, nil, &QueryError{
+						Code:    "invalid_request",
+						Message: "empty aggrMethod token",
+						Err:     telemetry.ErrHistoryInvalidInput,
+					}
+				}
+				if _, dup := seen[t]; dup {
+					return nil, nil, &QueryError{
+						Code:    "invalid_request",
+						Message: fmt.Sprintf("duplicate aggrMethod: %s", t),
+						Err:     telemetry.ErrHistoryInvalidInput,
+					}
+				}
+				switch t {
+				case "avg", "min", "max", "totalCount":
+					seen[t] = struct{}{}
+					selectedMethods = append(selectedMethods, t)
+				default:
+					return nil, nil, &QueryError{
+						Code:    "invalid_request",
+						Message: fmt.Sprintf("unsupported aggrMethod: %s", t),
+						Err:     telemetry.ErrHistoryInvalidInput,
+					}
+				}
+			}
+		}
+	}
+
+	// 7. format: OPTIONAL
+	// raw mode defaults to temporalValues; bucket mode defaults to aggregatedValues
+	formatVal, hasFormat := params["format"]
+	if !hasFormat || formatVal == "" {
+		if isBucket {
+			format = "aggregatedValues"
+		} else {
+			format = "temporalValues"
+		}
+	} else {
+		switch formatVal {
+		case "temporalValues":
+			if isBucket {
+				return nil, nil, &QueryError{
+					Code:    "invalid_request",
+					Message: "format temporalValues is not allowed with aggrPeriodDuration",
+					Err:     telemetry.ErrHistoryInvalidInput,
+				}
+			}
+			format = "temporalValues"
+		case "aggregatedValues":
+			if !isBucket {
+				return nil, nil, &QueryError{
+					Code:    "invalid_request",
+					Message: "format aggregatedValues requires aggrPeriodDuration",
+					Err:     telemetry.ErrHistoryInvalidInput,
+				}
+			}
+			format = "aggregatedValues"
+		default:
+			return nil, nil, &QueryError{
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("unsupported format: %s", formatVal),
+				Err:     telemetry.ErrHistoryInvalidInput,
+			}
+		}
+	}
+
+	// 8. max_points: OPTIONAL
+	maxPoints := p.cfg.DefaultPoints
+	if pointsVal, ok := params["max_points"]; ok {
+		parsed, err := parseASCIIInteger(pointsVal)
+		if err != nil || parsed < p.cfg.MinPoints || parsed > p.cfg.MaxPoints {
+			return nil, nil, &QueryError{
+				Code:    "invalid_request",
+				Message: "invalid max_points parameter",
+				Err:     telemetry.ErrHistoryInvalidInput,
+			}
+		}
+		maxPoints = parsed
+	}
+
+	// 9. Time range validation using existing telemetry.ValidateHistoryTimeRange
+	tr := telemetry.TimeRange{From: timeAt, To: endTimeAt}
+	if err := telemetry.ValidateHistoryTimeRange(tr, res, p.cfg.MaxRange, p.cfg.RawWindow, maxPoints); err != nil {
+		if errors.Is(err, telemetry.ErrHistoryRangeTooLarge) {
+			return nil, nil, &QueryError{
+				Code:    "range_too_large",
+				Message: "time range exceeds maximum allowed range",
+				Err:     err,
+			}
+		}
+		if errors.Is(err, telemetry.ErrHistoryRawLimitExceeded) {
+			return nil, nil, &QueryError{
+				Code:    "raw_limit_exceeded",
+				Message: "raw window exceeds limit",
+				Err:     err,
+			}
+		}
+		if errors.Is(err, telemetry.ErrHistoryResolutionTooFine) {
+			return nil, nil, &QueryError{
+				Code:    "resolution_too_fine",
+				Message: "resolution too fine for window",
+				Err:     err,
+			}
+		}
+		if errors.Is(err, telemetry.ErrHistoryInvalidResolution) {
+			return nil, nil, &QueryError{
+				Code:    "invalid_resolution",
+				Message: "invalid resolution parameter",
+				Err:     err,
+			}
+		}
+		return nil, nil, &QueryError{
+			Code:    "invalid_request",
+			Message: "invalid time range",
+			Err:     err,
+		}
+	}
+
+	domainQuery := &digitaltwin.TwinHistoryQuery{
+		EntityID:   entityID,
+		Property:   domainProp,
+		Range:      tr,
+		Resolution: res,
+		MaxPoints:  maxPoints,
+	}
+
+	presOptions := &TemporalPresentationOptions{
+		Format:      format,
+		AggrMethods: selectedMethods,
+		PublicAttr:  publicAttr,
+	}
+
+	return domainQuery, presOptions, nil
+}
+
 // HistoryQueryParser parses and validates HTTP query strings for history and state endpoints.
 type HistoryQueryParser struct {
 	cfg config.HistoryConfig
@@ -485,6 +836,81 @@ func parseRFC3339Micro(s string) (time.Time, error) {
 	}
 
 	// Normalize to UTC exact microseconds
+	utc := parsed.UTC()
+	if utc.Year() < 1 || utc.Year() > 9999 {
+		return time.Time{}, errors.New("UTC normalized year out of range 0001-9999")
+	}
+	return utc.Truncate(time.Microsecond), nil
+}
+
+// parseRFC3339MicroUTCZ parses RFC3339 timestamps strictly requiring an uppercase 'Z' offset
+// and at most 6 fractional digits (0 to 6), with year in 0001-9999.
+func parseRFC3339MicroUTCZ(s string) (time.Time, error) {
+	if len(s) < 20 {
+		return time.Time{}, errors.New("timestamp too short")
+	}
+
+	for i := 0; i < 4; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return time.Time{}, errors.New("invalid year format")
+		}
+	}
+	yearVal := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+	if yearVal < 1 {
+		return time.Time{}, errors.New("invalid year: must be between 0001 and 9999")
+	}
+	if s[4] != '-' || s[7] != '-' {
+		return time.Time{}, errors.New("invalid date separator")
+	}
+	if s[5] < '0' || s[5] > '9' || s[6] < '0' || s[6] > '9' {
+		return time.Time{}, errors.New("invalid month format")
+	}
+	if s[8] < '0' || s[8] > '9' || s[9] < '0' || s[9] > '9' {
+		return time.Time{}, errors.New("invalid day format")
+	}
+
+	if s[10] != 'T' {
+		return time.Time{}, errors.New("missing T delimiter")
+	}
+
+	if s[13] != ':' || s[16] != ':' {
+		return time.Time{}, errors.New("invalid time separator")
+	}
+	for _, idx := range []int{11, 12, 14, 15, 17, 18} {
+		if s[idx] < '0' || s[idx] > '9' {
+			return time.Time{}, errors.New("invalid time digits")
+		}
+	}
+
+	idx := 19
+	if s[idx] == '.' {
+		idx++
+		dotStart := idx
+		for idx < len(s) && s[idx] >= '0' && s[idx] <= '9' {
+			idx++
+		}
+		numFracDigits := idx - dotStart
+		if numFracDigits < 1 || numFracDigits > 6 {
+			return time.Time{}, fmt.Errorf("fractional digits must be between 1 and 6, got %d", numFracDigits)
+		}
+	}
+
+	if idx >= len(s) {
+		return time.Time{}, errors.New("missing timezone offset indicator")
+	}
+
+	if s[idx] != 'Z' {
+		return time.Time{}, errors.New("timezone offset must be UTC Z")
+	}
+	if idx != len(s)-1 {
+		return time.Time{}, errors.New("unexpected trailing characters after Z offset")
+	}
+
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, err
+	}
+
 	utc := parsed.UTC()
 	if utc.Year() < 1 || utc.Year() > 9999 {
 		return time.Time{}, errors.New("UTC normalized year out of range 0001-9999")

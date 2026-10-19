@@ -896,3 +896,384 @@ func TestNewTwinHistoryResponseDTO_ValidationAndConsistencyErrors(t *testing.T) 
 		})
 	}
 }
+
+func TestTemporalHistoryResponseDTO_Serialization(t *testing.T) {
+	t.Parallel()
+
+	from := time.Date(2026, 8, 21, 10, 15, 0, 0, time.UTC)
+	to := time.Date(2026, 8, 21, 10, 15, 2, 0, time.UTC)
+	t1 := time.Date(2026, 8, 21, 10, 15, 0, 500000000, time.UTC)
+	t2 := time.Date(2026, 8, 21, 10, 15, 0, 500000000, time.UTC) // Tie: same timestamp!
+
+	t.Run("raw measurement with ties retention and exact values", func(t *testing.T) {
+		t.Parallel()
+		unit := "degC"
+		telemRes := &telemetry.TelemetryHistoryResult{
+			GatewayID:  "gateway_001",
+			SensorID:   "sensor_001",
+			Unit:       &unit,
+			From:       from,
+			To:         to,
+			Mode:       "raw",
+			Resolution: "raw",
+			PointCount: 2,
+			RawPoints: []telemetry.RawSamplePoint{
+				{MeasuredAt: t1, Value: 25.1, SequenceNum: 100},
+				{MeasuredAt: t2, Value: 25.2, SequenceNum: 101},
+			},
+		}
+
+		res := &digitaltwin.TwinHistoryResult{
+			EntityID:        "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+			Property:        digitaltwin.SelectorValue,
+			Unit:            &unit,
+			From:            from,
+			To:              to,
+			Mode:            "raw",
+			Resolution:      "raw",
+			PointCount:      2,
+			TelemetryResult: telemRes,
+		}
+
+		pres := &httpserver.TemporalPresentationOptions{
+			Format:     "temporalValues",
+			PublicAttr: "measurement",
+		}
+
+		dto, err := httpserver.NewTemporalHistoryResponseDTO(res, pres)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("json.Marshal failed: %v", err)
+		}
+		rawJSON := string(data)
+
+		// Assert no old envelope keys
+		for _, oldKey := range []string{`"mode"`, `"resolution"`, `"point_count"`, `"points"`, `"from"`, `"to"`} {
+			if strings.Contains(rawJSON, oldKey) {
+				t.Errorf("raw JSON must not contain old envelope key %s, got: %s", oldKey, rawJSON)
+			}
+		}
+
+		var parsed map[string]any
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("failed to unmarshal JSON: %v", err)
+		}
+
+		if parsed["id"] != "urn:ngsi-ld:Sensor:gateway_001:sensor_001" {
+			t.Errorf("id = %v, want urn:ngsi-ld:Sensor:gateway_001:sensor_001", parsed["id"])
+		}
+		if parsed["type"] != "Sensor" {
+			t.Errorf("type = %v, want Sensor", parsed["type"])
+		}
+		if parsed["@context"] == nil {
+			t.Error("@context is missing")
+		}
+
+		meas, ok := parsed["measurement"].(map[string]any)
+		if !ok {
+			t.Fatalf("measurement property is missing or not an object: %v", parsed["measurement"])
+		}
+		if meas["type"] != "Property" {
+			t.Errorf("measurement.type = %v, want Property", meas["type"])
+		}
+
+		values, ok := meas["values"].([]any)
+		if !ok {
+			t.Fatalf("measurement.values is not an array: %v", meas["values"])
+		}
+		if len(values) != 2 {
+			t.Fatalf("values length = %d, want 2 (ties must be retained)", len(values))
+		}
+
+		// Check tuple 1
+		tuple1, ok := values[0].([]any)
+		if !ok || len(tuple1) != 2 {
+			t.Fatalf("tuple1 must have exactly 2 elements, got: %v", values[0])
+		}
+		if tuple1[0].(float64) != 25.1 {
+			t.Errorf("tuple1[0] = %v, want 25.1", tuple1[0])
+		}
+		if tuple1[1].(string) != "2026-08-21T10:15:00.500000Z" {
+			t.Errorf("tuple1[1] = %v, want 2026-08-21T10:15:00.500000Z", tuple1[1])
+		}
+
+		// Check tuple 2 (tie timestamp retained)
+		tuple2, ok := values[1].([]any)
+		if !ok || len(tuple2) != 2 {
+			t.Fatalf("tuple2 must have exactly 2 elements, got: %v", values[1])
+		}
+		if tuple2[0].(float64) != 25.2 {
+			t.Errorf("tuple2[0] = %v, want 25.2", tuple2[0])
+		}
+		if tuple2[1].(string) != "2026-08-21T10:15:00.500000Z" {
+			t.Errorf("tuple2[1] = %v, want 2026-08-21T10:15:00.500000Z", tuple2[1])
+		}
+	})
+
+	t.Run("raw sample_interval_us", func(t *testing.T) {
+		t.Parallel()
+		intervalVal := 10000.0
+		res := &digitaltwin.TwinHistoryResult{
+			EntityID:   "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+			Property:   digitaltwin.SelectorSampleIntervalUS,
+			From:       from,
+			To:         to,
+			Mode:       "raw",
+			Resolution: "raw",
+			PointCount: 1,
+			TemporalPoints: []digitaltwin.TemporalSamplePoint{
+				{
+					ObservedAt:  t1,
+					ValueType:   "number",
+					ValueNumber: &intervalVal,
+					Metadata:    []byte(`{}`),
+				},
+			},
+		}
+
+		pres := &httpserver.TemporalPresentationOptions{
+			Format:     "temporalValues",
+			PublicAttr: "sample_interval_us",
+		}
+
+		dto, err := httpserver.NewTemporalHistoryResponseDTO(res, pres)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal error: %v", err)
+		}
+
+		var parsed map[string]any
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+
+		prop, ok := parsed["sample_interval_us"].(map[string]any)
+		if !ok {
+			t.Fatalf("sample_interval_us property is missing: %v", parsed)
+		}
+		values := prop["values"].([]any)
+		if len(values) != 1 {
+			t.Fatalf("values length = %d, want 1", len(values))
+		}
+		tuple := values[0].([]any)
+		if tuple[0].(float64) != 10000.0 {
+			t.Errorf("tuple[0] = %v, want 10000.0", tuple[0])
+		}
+	})
+
+	t.Run("raw authorized empty", func(t *testing.T) {
+		t.Parallel()
+		telemRes := &telemetry.TelemetryHistoryResult{
+			GatewayID:  "gateway_001",
+			SensorID:   "sensor_001",
+			From:       from,
+			To:         to,
+			Mode:       "raw",
+			Resolution: "raw",
+			PointCount: 0,
+			RawPoints:  []telemetry.RawSamplePoint{},
+		}
+		res := &digitaltwin.TwinHistoryResult{
+			EntityID:        "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+			Property:        digitaltwin.SelectorValue,
+			From:            from,
+			To:              to,
+			Mode:            "raw",
+			Resolution:      "raw",
+			PointCount:      0,
+			TelemetryResult: telemRes,
+		}
+
+		pres := &httpserver.TemporalPresentationOptions{
+			Format:     "temporalValues",
+			PublicAttr: "measurement",
+		}
+
+		dto, err := httpserver.NewTemporalHistoryResponseDTO(res, pres)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal error: %v", err)
+		}
+
+		var parsed map[string]any
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		meas := parsed["measurement"].(map[string]any)
+		values := meas["values"].([]any)
+		if values == nil || len(values) != 0 {
+			t.Errorf("values must be empty array [], got: %v", values)
+		}
+		if !strings.Contains(string(data), `"values":[]`) && !strings.Contains(string(data), `"values": []`) {
+			t.Errorf("expected values: [] in JSON, got: %s", string(data))
+		}
+	})
+
+	t.Run("aggregate measurement with 3-element tuples, method projection, and exact int64 > 2^53", func(t *testing.T) {
+		t.Parallel()
+		bigCount := int64(9007199254740993) // 2^53 + 1
+		bStart := time.Date(2026, 8, 21, 10, 15, 0, 0, time.UTC)
+		dur := time.Minute
+
+		telemRes := &telemetry.TelemetryHistoryResult{
+			GatewayID:  "gateway_001",
+			SensorID:   "sensor_001",
+			From:       from,
+			To:         to,
+			Mode:       "bucket",
+			Resolution: "1m",
+			PointCount: 1,
+			BucketPoints: []telemetry.BucketSamplePoint{
+				{
+					BucketStart: bStart,
+					Avg:         25.5,
+					Min:         25.1,
+					Max:         25.9,
+					Count:       bigCount,
+				},
+			},
+		}
+
+		res := &digitaltwin.TwinHistoryResult{
+			EntityID:        "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+			Property:        digitaltwin.SelectorValue,
+			From:            from,
+			To:              to,
+			Mode:            "bucket",
+			Resolution:      "1m",
+			PointCount:      1,
+			TelemetryResult: telemRes,
+		}
+
+		// Project ONLY avg and totalCount! min and max must be omitted!
+		pres := &httpserver.TemporalPresentationOptions{
+			Format:      "aggregatedValues",
+			AggrMethods: []string{"avg", "totalCount"},
+			PublicAttr:  "measurement",
+		}
+
+		dto, err := httpserver.NewTemporalHistoryResponseDTO(res, pres)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal error: %v", err)
+		}
+		rawJSON := string(data)
+
+		// Assert method projection: avg and totalCount present, min and max OMITTED!
+		if !strings.Contains(rawJSON, `"avg"`) {
+			t.Errorf("expected 'avg' in JSON, got: %s", rawJSON)
+		}
+		if !strings.Contains(rawJSON, `"totalCount"`) {
+			t.Errorf("expected 'totalCount' in JSON, got: %s", rawJSON)
+		}
+		if strings.Contains(rawJSON, `"min"`) {
+			t.Errorf("min must be omitted when not requested, got: %s", rawJSON)
+		}
+		if strings.Contains(rawJSON, `"max"`) {
+			t.Errorf("max must be omitted when not requested, got: %s", rawJSON)
+		}
+
+		// Assert totalCount is an exact unquoted integer > 2^53 (not float64 string or scientific notation)
+		expectedCountToken := "9007199254740993"
+		if !strings.Contains(rawJSON, expectedCountToken) {
+			t.Fatalf("expected exact integer %s in JSON bytes, got: %s", expectedCountToken, rawJSON)
+		}
+		if strings.Contains(rawJSON, `"`+expectedCountToken+`"`) {
+			t.Fatalf("totalCount must NOT be a string, got quoted: %s", rawJSON)
+		}
+
+		// Check tuple structure
+		var parsed map[string]any
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		meas := parsed["measurement"].(map[string]any)
+		avgArr := meas["avg"].([]any)
+		if len(avgArr) != 1 {
+			t.Fatalf("avg array length = %d, want 1", len(avgArr))
+		}
+		avgTuple := avgArr[0].([]any)
+		if len(avgTuple) != 3 {
+			t.Fatalf("avgTuple must have exactly 3 elements, got %d: %v", len(avgTuple), avgTuple)
+		}
+		if avgTuple[0].(float64) != 25.5 {
+			t.Errorf("avgTuple[0] = %v, want 25.5", avgTuple[0])
+		}
+		expectedStart := "2026-08-21T10:15:00.000000Z"
+		expectedEnd := bStart.Add(dur).Format("2006-01-02T15:04:05.000000Z")
+		if avgTuple[1].(string) != expectedStart {
+			t.Errorf("avgTuple[1] (start) = %v, want %v", avgTuple[1], expectedStart)
+		}
+		if avgTuple[2].(string) != expectedEnd {
+			t.Errorf("avgTuple[2] (end) = %v, want %v", avgTuple[2], expectedEnd)
+		}
+	})
+
+	t.Run("aggregate authorized empty has empty arrays for selected methods", func(t *testing.T) {
+		t.Parallel()
+		telemRes := &telemetry.TelemetryHistoryResult{
+			GatewayID:    "gateway_001",
+			SensorID:     "sensor_001",
+			From:         from,
+			To:           to,
+			Mode:         "bucket",
+			Resolution:   "1m",
+			PointCount:   0,
+			BucketPoints: []telemetry.BucketSamplePoint{},
+		}
+		res := &digitaltwin.TwinHistoryResult{
+			EntityID:        "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+			Property:        digitaltwin.SelectorValue,
+			From:            from,
+			To:              to,
+			Mode:            "bucket",
+			Resolution:      "1m",
+			PointCount:      0,
+			TelemetryResult: telemRes,
+		}
+
+		pres := &httpserver.TemporalPresentationOptions{
+			Format:      "aggregatedValues",
+			AggrMethods: []string{"avg", "min", "max", "totalCount"},
+			PublicAttr:  "measurement",
+		}
+
+		dto, err := httpserver.NewTemporalHistoryResponseDTO(res, pres)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal error: %v", err)
+		}
+
+		var parsed map[string]any
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		meas := parsed["measurement"].(map[string]any)
+		for _, m := range []string{"avg", "min", "max", "totalCount"} {
+			arr, ok := meas[m].([]any)
+			if !ok || arr == nil || len(arr) != 0 {
+				t.Errorf("method %s must be empty array [], got: %v", m, meas[m])
+			}
+		}
+	})
+}
