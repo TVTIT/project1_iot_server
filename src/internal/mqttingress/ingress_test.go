@@ -329,15 +329,19 @@ func TestACKOnlyAfterConfirmedCommit(t *testing.T) {
 	d := waitDelivery(t, pub.signal)
 	assertDeliveryShape(t, d, measuredAt)
 
+	// The fake signals inside Publish, before the worker updates ACKPublished.
+	// Wait for worker completion before asserting its final counters.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrain()
+	if err := ing.Drain(drainCtx); err != nil {
+		t.Fatalf("Drain = %v", err)
+	}
 	snap := ing.Snapshot()
 	if snap.Committed != 1 || snap.SamplesNew != 3 || snap.ACKPublished != 1 {
 		t.Fatalf("snapshot after commit = %+v", snap)
 	}
 	if snap.PersistFailures != 0 || snap.ValidationRejected != 0 {
 		t.Fatalf("unexpected failures in snapshot: %+v", snap)
-	}
-	if err := ing.Drain(context.Background()); err != nil {
-		t.Fatalf("Drain = %v", err)
 	}
 	if pub.count() != 1 {
 		t.Fatalf("ack published %d times, want exactly 1", pub.count())
