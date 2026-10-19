@@ -167,6 +167,44 @@ func TestPropertyDTO_JSON(t *testing.T) {
 	}
 }
 
+func TestCustomTerms_CoreTermsNotOverridden(t *testing.T) {
+	terms := ProjectCustomTerms()
+	data, err := json.Marshal(terms)
+	if err != nil {
+		t.Fatalf("failed to marshal custom terms: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("failed to unmarshal custom terms: %v", err)
+	}
+
+	// Core terms from NGSI-LD v1.9 must not be overridden in custom terms
+	forbiddenCoreTerms := []string{
+		"name",
+		"description",
+		"value",
+		"observedAt",
+		"unitCode",
+		"objectType",
+		"createdAt",
+		"modifiedAt",
+	}
+	for _, term := range forbiddenCoreTerms {
+		if _, ok := m[term]; ok {
+			t.Errorf("custom terms must not override core term %q", term)
+		}
+	}
+
+	// Project context array must have custom terms first and core context URI last
+	ctxArray := ProjectContextArray()
+	if len(ctxArray) != 2 {
+		t.Fatalf("expected @context array of length 2, got %d", len(ctxArray))
+	}
+	if ctxArray[1] != CoreContextV19 {
+		t.Errorf("core context must be last element, got %v", ctxArray[1])
+	}
+}
+
 func TestRelationshipDTO_JSON(t *testing.T) {
 	r := NewRelationship("urn:ngsi-ld:Sensor:gateway_001:sensor_001", "2026-10-15T08:30:00.000000Z")
 	b, err := json.Marshal(r)
@@ -221,5 +259,93 @@ func TestRelationshipPageDTO_JSON(t *testing.T) {
 	}
 	if !strings.Contains(string(bTerm), `"next_cursor":null`) {
 		t.Fatalf("expected next_cursor:null, got %s", string(bTerm))
+	}
+}
+
+func TestMapUNCEFACTUnit_Table(t *testing.T) {
+	tests := []struct {
+		name     string
+		rawUnit  string
+		wantCode string
+		wantOK   bool
+	}{
+		{
+			name:     "radian mapping to UN/CEFACT C81",
+			rawUnit:  "rad",
+			wantCode: "C81",
+			wantOK:   true,
+		},
+		{
+			name:     "degree angle mapping",
+			rawUnit:  "deg",
+			wantCode: "DD",
+			wantOK:   true,
+		},
+		{
+			name:     "degree Celsius mapping",
+			rawUnit:  "degC",
+			wantCode: "CEL",
+			wantOK:   true,
+		},
+		{
+			name:     "meter mapping",
+			rawUnit:  "m",
+			wantCode: "MTR",
+			wantOK:   true,
+		},
+		{
+			name:     "hertz mapping",
+			rawUnit:  "Hz",
+			wantCode: "HTZ",
+			wantOK:   true,
+		},
+		{
+			name:     "second mapping",
+			rawUnit:  "s",
+			wantCode: "SEC",
+			wantOK:   true,
+		},
+		{
+			name:     "volt mapping",
+			rawUnit:  "V",
+			wantCode: "VLT",
+			wantOK:   true,
+		},
+		{
+			name:     "ampere mapping",
+			rawUnit:  "A",
+			wantCode: "AMP",
+			wantOK:   true,
+		},
+		{
+			name:     "watt mapping",
+			rawUnit:  "W",
+			wantCode: "WTT",
+			wantOK:   true,
+		},
+		{
+			name:     "unknown unit returns empty and false",
+			rawUnit:  "custom_unknown_unit",
+			wantCode: "",
+			wantOK:   false,
+		},
+		{
+			name:     "empty unit returns empty and false",
+			rawUnit:  "",
+			wantCode: "",
+			wantOK:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotCode, gotOK := MapUNCEFACTUnit(tt.rawUnit)
+			if gotOK != tt.wantOK {
+				t.Errorf("MapUNCEFACTUnit(%q) gotOK = %v, wantOK = %v", tt.rawUnit, gotOK, tt.wantOK)
+			}
+			if gotCode != tt.wantCode {
+				t.Errorf("MapUNCEFACTUnit(%q) gotCode = %q, wantCode = %q", tt.rawUnit, gotCode, tt.wantCode)
+			}
+		})
 	}
 }

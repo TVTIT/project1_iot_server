@@ -1260,7 +1260,7 @@ func TestNativeTwinRead(t *testing.T) {
 			t.Fatalf("json.Marshal(listDTO) failed: %v", err)
 		}
 		listStr := string(listBytes)
-		if !strings.Contains(listStr, `"items":`) || !strings.Contains(listStr, `"next_cursor":`) {
+		if !strings.Contains(listStr, `"@context":`) || !strings.HasPrefix(listStr, "[") {
 			t.Fatalf("list JSON missing expected fields: %s", listStr)
 		}
 
@@ -1283,7 +1283,6 @@ func TestNativeTwinRead(t *testing.T) {
 		detailStr := string(detailBytes)
 		if !strings.Contains(detailStr, `"@context":`) ||
 			!strings.Contains(detailStr, `"hasSensor":`) ||
-			!strings.Contains(detailStr, `"relationship_page":`) ||
 			!strings.Contains(detailStr, `"Gateway A"`) {
 			t.Fatalf("gateway detail JSON missing expected fields: %s", detailStr)
 		}
@@ -1303,9 +1302,6 @@ func TestNativeTwinRead(t *testing.T) {
 		if sensDTO.HasSensor != nil {
 			t.Fatalf("sensor DTO HasSensor must be nil, got %v", sensDTO.HasSensor)
 		}
-		if sensDTO.RelationshipPage != nil {
-			t.Fatalf("sensor DTO RelationshipPage must be nil, got %v", sensDTO.RelationshipPage)
-		}
 		sensBytes, err := json.Marshal(sensDTO)
 		if err != nil {
 			t.Fatalf("json.Marshal(sensDTO) failed: %v", err)
@@ -1320,8 +1316,14 @@ func TestNativeTwinRead(t *testing.T) {
 		if _, ok := sensMap["relationship_page"]; ok {
 			t.Fatalf("sensor detail JSON root must not contain relationship_page: %s", string(sensBytes))
 		}
-		if _, ok := sensMap["unit"]; !ok {
-			t.Fatalf("sensor detail JSON missing unit: %s", string(sensBytes))
+		if _, ok := sensMap["measurementUnit"]; !ok {
+			t.Fatalf("unobserved sensor detail JSON missing measurementUnit: %s", string(sensBytes))
+		}
+		if _, ok := sensMap["unitCode"]; ok {
+			t.Fatalf("sensor detail JSON root must not contain unitCode: %s", string(sensBytes))
+		}
+		if _, ok := sensMap["isHostedBy"]; !ok {
+			t.Fatalf("sensor detail JSON missing isHostedBy: %s", string(sensBytes))
 		}
 
 		// 4. State DTO

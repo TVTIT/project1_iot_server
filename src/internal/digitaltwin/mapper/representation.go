@@ -25,8 +25,9 @@ func FormatRFC3339Micro(t time.Time) (string, error) {
 type PropertyDTO struct {
 	Type       string  `json:"type"`
 	Value      any     `json:"value"`
-	ModifiedAt string  `json:"modifiedAt"`
+	ModifiedAt string  `json:"modifiedAt,omitempty"`
 	ObservedAt *string `json:"observedAt,omitempty"`
+	UnitCode   *string `json:"unitCode,omitempty"`
 }
 
 // NewProperty creates a standard PropertyDTO with modifiedAt timestamp.
@@ -46,6 +47,59 @@ func NewObservationProperty(value any, modifiedAt string, observedAt string) Pro
 		ModifiedAt: modifiedAt,
 		ObservedAt: &observedAt,
 	}
+}
+
+// NewObservationPropertyWithUnit creates a PropertyDTO with value, observedAt, and optional unitCode.
+func NewObservationPropertyWithUnit(value any, observedAt string, unitCode *string) PropertyDTO {
+	return PropertyDTO{
+		Type:       "Property",
+		Value:      value,
+		ObservedAt: &observedAt,
+		UnitCode:   unitCode,
+	}
+}
+
+var uncefactUnitMap = map[string]string{
+	"degC": "CEL",
+	"CEL":  "CEL",
+	"%":    "P1",
+	"%RH":  "P1",
+	"V":    "VLT",
+	"mV":   "2Z",
+	"A":    "AMP",
+	"mA":   "4K",
+	"Pa":   "PAL",
+	"hPa":  "A97",
+	"s":    "SEC",
+	"ms":   "C26",
+	"us":   "B98",
+	"m":    "MTR",
+	"cm":   "CMT",
+	"mm":   "MMT",
+	"kg":   "KGM",
+	"g":    "GRM",
+	"Hz":   "HTZ",
+	"kHz":  "KHZ",
+	"MHz":  "MHZ",
+	"lx":   "LUX",
+	"lux":  "LUX",
+	"dB":   "2N",
+	"ppm":  "59",
+	"ppb":  "61",
+	"W":    "WTT",
+	"kW":   "KWT",
+	"J":    "JOU",
+	"K":    "KEL",
+	"rad":  "C81",
+	"deg":  "DD",
+	"rpm":  "RPM",
+}
+
+// MapUNCEFACTUnit maps known common unit symbols to UN/CEFACT Common Codes.
+// It returns (code, true) if a mapped code exists, or ("", false) if unknown.
+func MapUNCEFACTUnit(rawUnit string) (string, bool) {
+	code, ok := uncefactUnitMap[rawUnit]
+	return code, ok
 }
 
 // RelationshipDTO represents an NGSI-LD Relationship attribute in entity JSON-LD detail projection.

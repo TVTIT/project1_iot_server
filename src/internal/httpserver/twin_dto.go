@@ -1,10 +1,12 @@
 package httpserver
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/digitaltwin/mapper"
@@ -13,22 +15,20 @@ import (
 
 // TwinSummaryDTO represents a single entity summary in the list projection.
 type TwinSummaryDTO struct {
-	ID        string  `json:"id"`
-	Type      string  `json:"type"`
-	Name      *string `json:"name"`
-	GatewayID string  `json:"gateway_id"`
-	UpdatedAt string  `json:"updated_at"`
+	Context    any                 `json:"@context"`
+	ID         string              `json:"id"`
+	Type       string              `json:"type"`
+	Name       *mapper.PropertyDTO `json:"name,omitempty"`
+	GatewayID  mapper.PropertyDTO  `json:"gateway_id"`
+	ModifiedAt string              `json:"modifiedAt"`
 }
 
-// TwinListResponseDTO represents the wire format of GET /v1/digital-twins.
-type TwinListResponseDTO struct {
-	Items      []TwinSummaryDTO `json:"items"`
-	NextCursor *string          `json:"next_cursor"`
-}
+// TwinListResponseDTO represents the wire format of GET /v1/digital-twins (root summary array).
+type TwinListResponseDTO = []TwinSummaryDTO
 
 // NewTwinListResponseDTO maps a digitaltwin.TwinListResult to the list response wire DTO,
 // validating entity identity, types, and timestamps.
-func NewTwinListResponseDTO(res *digitaltwin.TwinListResult) (*TwinListResponseDTO, error) {
+func NewTwinListResponseDTO(res *digitaltwin.TwinListResult) ([]TwinSummaryDTO, error) {
 	if res == nil {
 		return nil, errors.New("twin list result must not be nil")
 	}
@@ -49,76 +49,67 @@ func NewTwinListResponseDTO(res *digitaltwin.TwinListResult) (*TwinListResponseD
 			return nil, fmt.Errorf("item %d: invalid gateway_id: %w", i, err)
 		}
 
-		updatedAtStr, err := mapper.FormatRFC3339Micro(item.UpdatedAt)
+		modifiedAtStr, err := mapper.FormatRFC3339Micro(item.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("item %d: invalid updated_at: %w", i, err)
 		}
 
+		var nameProp *mapper.PropertyDTO
+		if item.Name != nil {
+			nameProp = &mapper.PropertyDTO{
+				Type:  "Property",
+				Value: *item.Name,
+			}
+		}
+
+		gwProp := mapper.PropertyDTO{
+			Type:  "Property",
+			Value: item.GatewayID,
+		}
+
 		items = append(items, TwinSummaryDTO{
-			ID:        item.ID,
-			Type:      string(item.Type),
-			Name:      item.Name,
-			GatewayID: item.GatewayID,
-			UpdatedAt: updatedAtStr,
+			Context:    mapper.ProjectContextArray(),
+			ID:         item.ID,
+			Type:       string(item.Type),
+			Name:       nameProp,
+			GatewayID:  gwProp,
+			ModifiedAt: modifiedAtStr,
 		})
 	}
 
-	var nextCursor *string
-	if res.NextCursor != nil {
-		s := *res.NextCursor
-		nextCursor = &s
-	}
+	return items, nil
+}
 
-	return &TwinListResponseDTO{
-		Items:      items,
-		NextCursor: nextCursor,
-	}, nil
+// GatewayHasSensorDTO represents the NGSI-LD v1.9.1 hasSensor relationship on a Gateway.
+type GatewayHasSensorDTO struct {
+	Type       string   `json:"type"`
+	Object     []string `json:"object"`
+	ObjectType string   `json:"objectType"`
+}
+
+// SensorIsHostedByDTO represents the NGSI-LD v1.9.1 isHostedBy relationship on a Sensor.
+type SensorIsHostedByDTO struct {
+	Type   string `json:"type"`
+	Object string `json:"object"`
 }
 
 // TwinDetailResponseDTO represents the JSON-LD entity representation for GET /v1/digital-twins/{entity_id}.
 type TwinDetailResponseDTO struct {
-	Context          any                         `json:"@context"`
-	ID               string                      `json:"id"`
-	Type             string                      `json:"type"`
-	Name             mapper.PropertyDTO          `json:"name"`
-	Description      *mapper.PropertyDTO         `json:"description,omitempty"`
-	Unit             *mapper.PropertyDTO         `json:"unit,omitempty"`
-	GatewayID        string                      `json:"gateway_id"`
-	HasSensor        []mapper.RelationshipDTO    `json:"hasSensor,omitempty"`
-	RelationshipPage *mapper.RelationshipPageDTO `json:"relationship_page,omitempty"`
-}
-
-// MarshalJSON customizes serialization so that hasSensor is always an array (even if empty) for Gateways,
-// while remaining omitted for Sensors.
-func (d TwinDetailResponseDTO) MarshalJSON() ([]byte, error) {
-	type Alias TwinDetailResponseDTO
-	if d.Type == string(digitaltwin.EntityTypeGateway) {
-		aux := struct {
-			Alias
-			HasSensor []mapper.RelationshipDTO `json:"hasSensor"`
-		}{
-			Alias:     Alias(d),
-			HasSensor: d.HasSensor,
-		}
-		if aux.HasSensor == nil {
-			aux.HasSensor = make([]mapper.RelationshipDTO, 0)
-		}
-		return json.Marshal(aux)
-	}
-
-	aux := struct {
-		Alias
-		HasSensor any `json:"hasSensor,omitempty"`
-	}{
-		Alias:     Alias(d),
-		HasSensor: nil,
-	}
-	return json.Marshal(aux)
+	Context          any                  `json:"@context"`
+	ID               string               `json:"id"`
+	Type             string               `json:"type"`
+	Name             mapper.PropertyDTO   `json:"name"`
+	Description      *mapper.PropertyDTO  `json:"description,omitempty"`
+	IsHostedBy       *SensorIsHostedByDTO `json:"isHostedBy,omitempty"`
+	HasSensor        *GatewayHasSensorDTO `json:"hasSensor,omitempty"`
+	MeasurementUnit  *mapper.PropertyDTO  `json:"measurementUnit,omitempty"`
+	Measurement      *mapper.PropertyDTO  `json:"measurement,omitempty"`
+	SampleIntervalUS *mapper.PropertyDTO  `json:"sample_interval_us,omitempty"`
 }
 
 // NewTwinDetailResponseDTO maps a digitaltwin.TwinDetailResult to the entity detail JSON-LD DTO,
 // strictly checking entity type rules, URN validity, and relationship integrity.
-func NewTwinDetailResponseDTO(res *digitaltwin.TwinDetailResult) (*TwinDetailResponseDTO, error) {
+func NewTwinDetailResponseDTO(res *digitaltwin.TwinDetailResult, stateRes ...*digitaltwin.TwinStateResult) (*TwinDetailResponseDTO, error) {
 	if res == nil {
 		return nil, errors.New("twin detail result must not be nil")
 	}
@@ -151,65 +142,48 @@ func NewTwinDetailResponseDTO(res *digitaltwin.TwinDetailResult) (*TwinDetailRes
 			return nil, errors.New("gateway entity must not have unit")
 		}
 
-		descProp := &mapper.PropertyDTO{
-			Type:       "Property",
-			Value:      res.Description,
-			ModifiedAt: modifiedAtStr,
+		var descProp *mapper.PropertyDTO
+		if res.Description != nil {
+			descProp = &mapper.PropertyDTO{
+				Type:       "Property",
+				Value:      *res.Description,
+				ModifiedAt: modifiedAtStr,
+			}
 		}
 
-		hasSensor := make([]mapper.RelationshipDTO, 0, len(res.Relationships))
-		for i, rel := range res.Relationships {
-			relParsed, err := digitaltwin.ParseEntityURN(rel.TargetURN)
-			if err != nil {
-				return nil, fmt.Errorf("relationship %d: invalid target URN %q: %w", i, rel.TargetURN, err)
-			}
-			if relParsed.Type != digitaltwin.EntityTypeSensor {
-				return nil, fmt.Errorf("relationship %d: target must be Sensor, got %q", i, rel.TargetURN)
-			}
-			if relParsed.GatewayID != res.GatewayID {
-				return nil, fmt.Errorf("relationship %d: target gateway %q does not match parent %q", i, relParsed.GatewayID, res.GatewayID)
-			}
-
-			createdAtStr, err := mapper.FormatRFC3339Micro(rel.CreatedAt)
-			if err != nil {
-				return nil, fmt.Errorf("relationship %d: invalid created_at: %w", i, err)
-			}
-
-			hasSensor = append(hasSensor, mapper.NewRelationship(rel.TargetURN, createdAtStr))
+		var hasSensorDTO *GatewayHasSensorDTO
+		if res.RelationshipPage != nil && res.RelationshipPage.Count != len(res.Relationships) {
+			return nil, fmt.Errorf("relationship_page.count (%d) does not match relationships length (%d)", res.RelationshipPage.Count, len(res.Relationships))
 		}
-
-		var relPage *mapper.RelationshipPageDTO
-		if res.RelationshipPage != nil {
-			if res.RelationshipPage.Count != len(res.Relationships) {
-				return nil, fmt.Errorf("relationship_page.count (%d) does not match relationships length (%d)", res.RelationshipPage.Count, len(res.Relationships))
+		if len(res.Relationships) > 0 {
+			targetURNs := make([]string, 0, len(res.Relationships))
+			for i, rel := range res.Relationships {
+				relParsed, err := digitaltwin.ParseEntityURN(rel.TargetURN)
+				if err != nil {
+					return nil, fmt.Errorf("relationship %d: invalid target URN %q: %w", i, rel.TargetURN, err)
+				}
+				if relParsed.Type != digitaltwin.EntityTypeSensor {
+					return nil, fmt.Errorf("relationship %d: target must be Sensor, got %q", i, rel.TargetURN)
+				}
+				if relParsed.GatewayID != res.GatewayID {
+					return nil, fmt.Errorf("relationship %d: target gateway %q does not match parent %q", i, relParsed.GatewayID, res.GatewayID)
+				}
+				targetURNs = append(targetURNs, rel.TargetURN)
 			}
-			relPage = &mapper.RelationshipPageDTO{
-				RelationshipType: res.RelationshipPage.RelationshipType,
-				Limit:            res.RelationshipPage.Limit,
-				Count:            res.RelationshipPage.Count,
-				Partial:          res.RelationshipPage.Partial,
-				NextCursor:       res.RelationshipPage.NextCursor,
-			}
-		} else {
-			relPage = &mapper.RelationshipPageDTO{
-				RelationshipType: "hasSensor",
-				Limit:            len(hasSensor),
-				Count:            len(hasSensor),
-				Partial:          false,
-				NextCursor:       nil,
+			hasSensorDTO = &GatewayHasSensorDTO{
+				Type:       "Relationship",
+				Object:     targetURNs,
+				ObjectType: "Sensor",
 			}
 		}
 
 		return &TwinDetailResponseDTO{
-			Context:          mapper.ProjectInlineContext(),
-			ID:               res.ID,
-			Type:             string(res.Type),
-			Name:             mapper.NewProperty(res.Name, modifiedAtStr),
-			Description:      descProp,
-			Unit:             nil,
-			GatewayID:        res.GatewayID,
-			HasSensor:        hasSensor,
-			RelationshipPage: relPage,
+			Context:     mapper.ProjectContextArray(),
+			ID:          res.ID,
+			Type:        string(res.Type),
+			Name:        mapper.NewProperty(res.Name, modifiedAtStr),
+			Description: descProp,
+			HasSensor:   hasSensorDTO,
 		}, nil
 
 	case digitaltwin.EntityTypeSensor:
@@ -223,22 +197,83 @@ func NewTwinDetailResponseDTO(res *digitaltwin.TwinDetailResult) (*TwinDetailRes
 			return nil, errors.New("sensor entity must not have relationship_page")
 		}
 
-		unitProp := &mapper.PropertyDTO{
-			Type:       "Property",
-			Value:      res.Unit,
-			ModifiedAt: modifiedAtStr,
+		isHostedByDTO := &SensorIsHostedByDTO{
+			Type:   "Relationship",
+			Object: "urn:ngsi-ld:Gateway:" + res.GatewayID,
+		}
+
+		var mappedUnitCode *string
+		if res.Unit != nil && *res.Unit != "" {
+			if code, ok := mapper.MapUNCEFACTUnit(*res.Unit); ok {
+				mappedUnitCode = &code
+			}
+		}
+
+		var measurementProp *mapper.PropertyDTO
+		var sampleIntervalProp *mapper.PropertyDTO
+
+		if len(stateRes) > 0 && stateRes[0] != nil && len(stateRes[0].ReportedState) > 0 {
+			var stateMap map[string]any
+			dec := json.NewDecoder(bytes.NewReader(stateRes[0].ReportedState))
+			dec.UseNumber()
+			if err := dec.Decode(&stateMap); err == nil {
+				var formattedObservedAt string
+				if obsAtRaw, ok := stateMap["observed_at"].(string); ok && obsAtRaw != "" {
+					if t, err := time.Parse(time.RFC3339Nano, obsAtRaw); err == nil {
+						if formatted, err := mapper.FormatRFC3339Micro(t); err == nil {
+							formattedObservedAt = formatted
+						}
+					}
+				}
+
+				if formattedObservedAt != "" {
+					// Numeric telemetry validation: value must be a valid json.Number (rejecting strings, bools, objects)
+					if valRaw, ok := stateMap["value"]; ok && valRaw != nil {
+						if num, ok := valRaw.(json.Number); ok {
+							if _, err := num.Float64(); err == nil {
+								p := mapper.NewObservationPropertyWithUnit(num, formattedObservedAt, mappedUnitCode)
+								measurementProp = &p
+							}
+						}
+					}
+
+					// Interval bounds validation: sample_interval_us must be a positive number
+					if intRaw, ok := stateMap["sample_interval_us"]; ok && intRaw != nil {
+						if num, ok := intRaw.(json.Number); ok {
+							if parsedInt, err := num.Int64(); err == nil && parsedInt > 0 {
+								p := mapper.NewObservationProperty(num, "", formattedObservedAt)
+								sampleIntervalProp = &p
+							} else if parsedFloat, err := num.Float64(); err == nil && parsedFloat > 0 {
+								p := mapper.NewObservationProperty(num, "", formattedObservedAt)
+								sampleIntervalProp = &p
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Root unit representation:
+		// - unitCode is Property metadata on measurement, not an entity attribute.
+		// - For unobserved sensors, expose measurementUnit with original unit for discoverability.
+		// - For unknown units, expose measurementUnit.
+		var measUnitProp *mapper.PropertyDTO
+		if res.Unit != nil && *res.Unit != "" {
+			if measurementProp == nil || mappedUnitCode == nil {
+				p := mapper.NewProperty(*res.Unit, modifiedAtStr)
+				measUnitProp = &p
+			}
 		}
 
 		return &TwinDetailResponseDTO{
-			Context:          mapper.ProjectInlineContext(),
+			Context:          mapper.ProjectContextArray(),
 			ID:               res.ID,
 			Type:             string(res.Type),
 			Name:             mapper.NewProperty(res.Name, modifiedAtStr),
-			Description:      nil,
-			Unit:             unitProp,
-			GatewayID:        res.GatewayID,
-			HasSensor:        nil,
-			RelationshipPage: nil,
+			IsHostedBy:       isHostedByDTO,
+			MeasurementUnit:  measUnitProp,
+			Measurement:      measurementProp,
+			SampleIntervalUS: sampleIntervalProp,
 		}, nil
 
 	default:
@@ -255,8 +290,8 @@ type TwinStateResponseDTO struct {
 	DesiredState    json.RawMessage `json:"desired_state"`
 	ReportedVersion string          `json:"reported_version"`
 	DesiredVersion  string          `json:"desired_version"`
-	LastReportedAt  *string         `json:"last_reported_at"`
-	LastDesiredAt   *string         `json:"last_desired_at"`
+	LastReportedAt  *string         `json:"last_reported_at,omitempty"`
+	LastDesiredAt   *string         `json:"last_desired_at,omitempty"`
 	UpdatedAt       string          `json:"updated_at"`
 }
 
