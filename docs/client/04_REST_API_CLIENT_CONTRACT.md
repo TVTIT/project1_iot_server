@@ -54,28 +54,29 @@ Căn cứ hiện thực mã nguồn định tuyến tại `src/internal/httpserv
 | **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/rotate` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `200 OK` / `400` / `401` / `403` / `409` / `503` | Xoay vòng mật khẩu MQTT; `200` kèm password mới 1 lần duy nhất; replay cùng key trả về `200` metadata-only. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | **Admin Credentials** | `DELETE` | `/v1/admin/gateways/{gateway_id}/mqtt-credential` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `200 OK` / `400` / `401` / `403` / `503` | Vô hiệu hóa và thu hồi (disable/revoke) chứng chỉ MQTT của Gateway, ngắt kết nối socket hiện hành; không có cơ chế tự động khôi phục bí mật (cho phép re-provision với Idempotency-Key mới khi cần cấp phát lại); `200` metadata-only. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
 | **Admin Credentials** | `POST` | `/v1/admin/gateways/{gateway_id}/mqtt-credential/reset` | Bearer JWT + `platform_admins` + `Idempotency-Key` | `503 Service Unavailable` / `400` / `401` / `403` / `413` / `415` | Đã đăng ký route và parser payload `reason`, nhưng runtime prerequisite `denyOnlyResetPrerequisite{}` luôn fail-closed với `503` (`service_unavailable`). Chưa phải quy trình phục hồi khả dụng. Chi tiết tại [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md). |
-| **Telemetry History** | `GET` | `/v1/telemetry/history` | Bearer JWT (`authenticated`, thành viên trạm) | `200 OK` / `400` / `401` / `404` / `503` | Truy vấn chuỗi thời gian telemetry raw hoặc bucket qua TimescaleDB `time_bucket`. Hỗ trợ 9 độ phân giải allowlisted hoặc auto mode. Yêu cầu `gateway_id` và `sensor_id`. Non-member hoặc trạm không tồn tại trả về 404. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
-| **Twin Read** | `GET` | `/v1/digital-twins` | Bearer JWT (`authenticated`) | `200 OK` / `400` / `401` / `503` | Danh sách thực thể Digital Twin (`Gateway`, `Sensor`) thuộc các Gateway người dùng được phân quyền, hỗ trợ phân trang keyset cursor (`v1.{k,g,t}`). Trả về `items: []` nếu không có quyền trạm nào. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
-| **Twin Read** | `GET` | `/v1/digital-twins/{entity_id}` | Bearer JWT (`authenticated`, thành viên trạm) | `200 OK` / `400` / `401` / `404` / `503` | Chi tiết thực thể Digital Twin theo chuẩn NGSI-LD JSON-LD (`Content-Type: application/ld+json`), `@context` inline Object 1.1, phân trang quan hệ `hasSensor` (`v1.{s,r,k}`). Non-member trả về 404. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
-| **Twin Read** | `GET` | `/v1/digital-twins/{entity_id}/state` | Bearer JWT (`authenticated`, thành viên trạm) | `200 OK` / `400` / `401` / `404` / `503` | Đọc trạng thái hiện thời trực tiếp từ `twin_states` (`reported_state`, `desired_state`, version nguyên vẹn). Không quét hypertable. Non-member trả về 404. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
-| **Twin Read** | `GET` | `/v1/digital-twins/{entity_id}/history` | Bearer JWT (`authenticated`, thành viên trạm) | `200 OK` / `400` / `401` / `404` / `503` | Truy vấn lịch sử thuộc tính Twin của Sensor: `property=value` (ủy quyền sang telemetry history) hoặc `property=sample_interval_us` (đọc `twin_temporal_values`). Non-member trả về 404. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
-| **Twin Mutation** | `POST` | `/v1/digital-twins` | Bearer JWT (`authenticated`: Platform Admin cho Gateway; Platform Admin hoặc Gateway Owner cho Sensor) | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo thực thể Digital Twin (create-or-exact-replay). `201` nếu mới tạo, `200` nếu phát lại chính xác cùng thuộc tính; `409` nếu xung đột thuộc tính; `403` nếu không đủ quyền. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
-| **Twin Mutation** | `PATCH` | `/v1/digital-twins/{entity_id}` | Bearer JWT (`authenticated`: Platform Admin cho Gateway; Platform Admin hoặc Gateway Owner cho Sensor) | `200 OK` / `400` / `401` / `403` / `404` / `413` / `415` / `500` / `503` | Cập nhật metadata thực thể: Gateway chỉ cho phép `name` và `description` (lưu vào bảng `gateways`, giữ nguyên `twin_entities.attributes`); Sensor chỉ cho phép `name` (chuỗi không rỗng, `unit` là bất biến). No-op trả về `200 OK` giữ nguyên timestamp. Không cập nhật state hay gửi lệnh điều khiển. Xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis). |
+| **Twin List (NGSI-LD V1.9.1)** | `GET` | `/v1/digital-twins` | Bearer JWT (`authenticated`, scope `user_gateways`) | `200 OK` / `400` / `401` / `406` / `503` | Danh sách thực thể Digital Twin (`Gateway`, `Sensor`) thuộc các trạm người dùng có quyền, trả về mảng root array Entities `[...]` (`application/ld+json`), lọc theo `type`, phân trang keyset qua HTTP Header `Link: <URI>; rel="next"`. Thêm biến thể summary phẳng `?format=simplified` (`application/json`, không `@context`/Property wrapper; `format` được bảo toàn trong `Link`). Trả về `[]` nếu không có quyền trạm nào. Xem [Mục 5.4](#54-api-nhóm-stage-4-digital-twin-apis-chuẩn-hóa-theo-etsi-gs-cim-009-v191). |
+| **Twin Detail & State (NGSI-LD V1.9.1)** | `GET` | `/v1/digital-twins/{entity_id}` | Bearer JWT (`authenticated`, thành viên trạm) | `200 OK` / `400` / `401` / `404` / `503` | Mặc định: Chi tiết thực thể normalized NGSI-LD JSON-LD (`application/ld+json`), `@context` V1.9, phân trang quan hệ `hasSensor` qua header `Link` (mảng URI `object: [...]`, `objectType: "Sensor"`), tích hợp measurement/interval mới nhất và mã UN/CEFACT `unitCode`.<br>Nếu kèm query `?format=simplified`: Đọc trực tiếp trạng thái phẳng từ `twin_states` (`reported_state`, `desired_state`, version nguyên vẹn). Non-member trả về 404. Xem [Mục 5.4](#54-api-nhóm-stage-4-digital-twin-apis-chuẩn-hóa-theo-etsi-gs-cim-009-v191). |
+| **Twin Mutation (NGSI-LD V1.9.1)** | `POST` | `/v1/digital-twins` | Bearer JWT (`authenticated`: Platform Admin cho Gateway; Platform Admin hoặc Gateway Owner cho Sensor) | `201 Created` / `200 OK` / `400` / `401` / `403` / `404` / `409` / `413` / `415` / `500` / `503` | Khởi tạo thực thể Digital Twin (create-or-exact-replay). `201 Created` kèm header `Location: /v1/digital-twins/<escaped_urn>` nếu tạo mới; `200 OK` nếu phát lại chính xác cùng thuộc tính (không có Location); `409 Conflict` nếu xung đột thuộc tính; `403` nếu không đủ quyền. Xem [Mục 5.4](#54-api-nhóm-stage-4-digital-twin-apis-chuẩn-hóa-theo-etsi-gs-cim-009-v191). |
+| **Twin Mutation (NGSI-LD V1.9.1)** | `PATCH` | `/v1/digital-twins/{entity_id}/attrs` | Bearer JWT (`authenticated`: Platform Admin cho Gateway; Platform Admin hoặc Gateway Owner cho Sensor) | `200 OK` / `400` / `401` / `403` / `404` / `413` / `415` / `500` / `503` | Cập nhật metadata thực thể qua normalized Property fragment. Gateway: `name` và `description` (xóa mô tả bằng `urn:ngsi-ld:null`); Sensor: `name` (bắt buộc, `unit` bất biến). No-op trả về `200 OK` giữ nguyên timestamp. Không cập nhật state hay gửi lệnh. Đường dẫn gốc `PATCH /v1/digital-twins/{entity_id}` bị từ chối 405. Xem [Mục 5.4](#54-api-nhóm-stage-4-digital-twin-apis-chuẩn-hóa-theo-etsi-gs-cim-009-v191). |
+| **Twin Temporal History (NGSI-LD V1.9.1)** | `GET` | `/v1/digital-twins/{entity_id}/temporal` | Bearer JWT (`authenticated`, thành viên trạm) | `200 OK` / `400` / `401` / `404` / `503` | Hợp nhất lịch sử telemetry và temporal history cho Sensor (`attrs=measurement` hoặc `attrs=sample_interval_us`). Yêu cầu `timerel=between`, `timeAt`, `endTimeAt` UTCZ. Raw trả về tuples `[val, observedAt]`; bucket với 9 duration chuẩn hóa trả về triples `[res, start, end]` cho các method (`avg,min,max,totalCount`); `totalCount` là số nguyên exact integer. Các route cũ `/v1/telemetry/history` và `/{id}/history` đã thu hồi 404. Xem [Mục 5.4](#54-api-nhóm-stage-4-digital-twin-apis-chuẩn-hóa-theo-etsi-gs-cim-009-v191). |
 | **Authenticated Stub** | `GET` | `/v1/ws` | Bearer JWT (`authenticated`) | `501 Not Implemented` | Khung định tuyến WebSocket thời gian thực (Giai đoạn 7). |
 
 ### 1.3. Ranh giới phủ định rõ ràng (Explicit Negative Boundaries)
 
 Để tránh các giả định sai lầm khi lập trình ứng dụng Client, hệ thống xác định rõ các ranh giới phủ định sau trong Go Backend:
-1. **Tuyệt đối KHÔNG CÓ route đọc lẻ 1 Gateway (`GET /v1/gateways/{gateway_id}`):** Go router không cung cấp endpoint này. Ứng dụng Client lấy thông tin chi tiết của trạm thông qua danh sách trả về từ `GET /v1/gateways`.
-2. **Tuyệt đối KHÔNG CÓ route đọc lẻ 1 Sensor (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`):** Go router không cung cấp endpoint này. Thông tin toàn bộ cảm biến của trạm được trả về đầy đủ qua `GET /v1/gateways/{gateway_id}/sensors`.
+1. **Tuyệt đối KHÔNG CÓ route đọc lẻ 1 Gateway (`GET /v1/gateways/{gateway_id}`):** Go router không cung cấp endpoint này. Ứng dụng Client lấy thông tin chi tiết của trạm thông qua danh sách trả về từ `GET /v1/gateways` hoặc chi tiết Digital Twin `GET /v1/digital-twins/urn:ngsi-ld:Gateway:<gateway_id>`.
+2. **Tuyệt đối KHÔNG CÓ route đọc lẻ 1 Sensor (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`):** Go router không cung cấp endpoint này. Thông tin toàn bộ cảm biến của trạm được trả về đầy đủ qua `GET /v1/gateways/{gateway_id}/sensors` hoặc chi tiết Digital Twin `GET /v1/digital-twins/urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>`.
 3. **Tuyệt đối KHÔNG CÓ route CRUD người dùng hay quản lý thành viên `user_gateways` trên Go API:** Theo chính sách quản trị tập trung (`AGENTS.md` mục 6.5), việc tạo tài khoản người dùng và gán phân quyền thành viên trạm do Platform Admin thực hiện trực tiếp thông qua công cụ quản trị Supabase / SQL, không qua Go REST API.
 4. **Ranh giới endpoint cấu hình cảm biến của Gateway Owner (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`):** Đây là thao tác tạo mới hoặc phát lại chính xác (create-or-exact-replay) dành riêng cho vai trò `owner` của trạm cha. Tuyệt đối **KHÔNG PHẢI** là API cập nhật cấu hình cảm biến (không hỗ trợ thay đổi `name` hay `unit` đã tạo, vi phạm sẽ nhận `409 Conflict`), **KHÔNG PHẢI** API cấu hình thiết bị lâu bền (`desired_state`), và **KHÔNG PHẢI** lệnh điều khiển thiết bị (device commands).
-5. **Ranh giới tính năng Stage 4 và các tính năng giai đoạn sau (Stage 4 vs Future Stages):** Bảy endpoint Stage 4 (lịch sử telemetry, đọc Digital Twin list/detail/state/history, tạo entity và cập nhật metadata PATCH) đã được hiện thực và kiểm thử tích hợp hoàn chỉnh (xem [Mục 5.4](#54-api-nhóm-stage-4-telemetry-history-và-digital-twin-apis)). Tuy nhiên:
+5. **Ranh giới chuyển đổi giao diện ETSI GS CIM 009 V1.9.1 (5 Endpoint Profile vs 4 Route Cũ bị Thu hồi):**
+   - Sau chuyển đổi V1.9.1, Go Backend đã thu hồi hoàn toàn 4 route cũ: `GET /v1/telemetry/history` (404), `GET /v1/digital-twins/{entity_id}/state` (404), `GET /v1/digital-twins/{entity_id}/history` (404), và `PATCH /v1/digital-twins/{entity_id}` (405). Client gọi vào các path cũ này sẽ nhận mã lỗi tương ứng, không có chuyển hướng hay alias ngầm định.
+   - Nhóm 5 endpoint Digital Twin hiện hành bao gồm: List (`GET /v1/digital-twins`), Create/Replay (`POST /v1/digital-twins`), Detail/State View (`GET /v1/digital-twins/{entity_id}`), Patch Attributes (`PATCH /v1/digital-twins/{entity_id}/attrs`), và Temporal History (`GET /v1/digital-twins/{entity_id}/temporal`).
+6. **Ranh giới tính năng Stage 4 và các tính năng giai đoạn sau (Stage 4 vs Future Stages):**
    - Kênh truyền thời gian thực WebSocket (`GET /v1/ws`) hiện trả về `501 Not Implemented` (thuộc Giai đoạn 7).
    - Thiết lập cấu hình điều khiển bền vững (`desired_state`) và hàng đợi lệnh điều khiển thiết bị downlink (`twin_commands`, outbox) chưa khả dụng (thuộc Giai đoạn 5 và 6).
    - Tải lên/đọc tập tin media qua Supabase Storage chưa khả dụng (thuộc Giai đoạn 8).
-   - Thao tác `PATCH /v1/digital-twins/{entity_id}` chỉ cập nhật metadata (`name`, `description`), tuyệt đối **KHÔNG** cập nhật trạng thái `desired_state` hay `reported_state`, và **KHÔNG** phát sinh lệnh điều khiển thiết bị.
-   - Platform Admin không có tư cách thành viên trạm sẽ bị từ chối `404 Not Found` khi đọc dữ liệu nghiệp vụ (lịch sử telemetry, detail, state, history) của Gateway/Sensor. Admin chỉ được phép thực hiện các thao tác quản trị nền tảng hoặc mutation metadata khi có quyền.
+   - Thao tác `PATCH /v1/digital-twins/{entity_id}/attrs` chỉ cập nhật metadata (`name`, `description`), tuyệt đối **KHÔNG** cập nhật trạng thái `desired_state` hay `reported_state`, và **KHÔNG** phát sinh lệnh điều khiển thiết bị.
+   - Platform Admin không có tư cách thành viên trạm sẽ bị từ chối `404 Not Found` khi đọc dữ liệu nghiệp vụ (detail, state view, temporal history) của Gateway/Sensor. Admin chỉ được phép thực hiện các thao tác quản trị nền tảng hoặc mutation metadata khi có quyền.
    - Vai trò `operator` và `viewer` là **hoàn toàn chỉ đọc** đối với toàn bộ các endpoint Stage 4 (mọi nỗ lực `POST` hoặc `PATCH` đều nhận `403 Forbidden`).
 
 ---
@@ -108,22 +109,34 @@ Hệ thống định nghĩa hai biến môi trường Base URL chuẩn hóa:
 2. **`SUPABASE_URL` (Supabase API Gateway Root):**
     - Trỏ tới URL public của Supabase qua Nginx (local mặc định `http://localhost`); không dùng cổng nội bộ Envoy làm endpoint client. SDK tự nối tiền tố dịch vụ. Request Auth thuần thêm `/auth/v1`; hostname và cổng thay đổi theo cấu hình môi trường.
 
-#### B. Thực trạng CORS và Khoảng trống kỹ thuật (Declared Gap đối chiếu 06_PROJECT_SETUP_AND_ENV)
+#### B. Hiện trạng CORS, Phơi bày Header và Thương lượng Nội dung (CORS, Exposed Headers & Accept Negotiation)
 
-Khảo sát trực tiếp từ mã nguồn `src/internal/httpserver/router.go` và cấu hình mẫu `config/nginx/nginx.conf.template`:
+Khảo sát trực tiếp từ mã nguồn `src/internal/httpserver/cors.go`, `router.go`, và `negotiation.go`:
 
-1. **Go Backend chưa có CORS Middleware:**
-   - Trong `router.go`, Go Backend **hoàn toàn không tích hợp CORS middleware** và không xử lý preflight request `OPTIONS` cho các route nghiệp vụ `/v1/*`.
-   - Nếu nhận request `OPTIONS /v1/*`, Go router xử lý theo `router.HandleMethodNotAllowed = true` và phản hồi mã lỗi **`405 Method Not Allowed`** (`method_not_allowed`).
-2. **Nginx Reverse Proxy hiện tại CHƯA cấu hình CORS cho `/v1/`:**
-   - Trong file cấu hình Nginx hiện có (`config/nginx/nginx.conf.template`), khối `location /v1/` chỉ thực hiện `proxy_pass` đơn thuần, **không thêm bất kỳ header `Access-Control-Allow-*` nào**.
-    - Envoy có bộ lọc CORS cho Supabase, nhưng vẫn phải kiểm tra Origin và preflight thực tế của Auth/Storage trên môi trường mục tiêu; sự hiện diện của filter không chứng minh mọi Web request hoạt động.
-3. **Hiện tại CHƯA CÓ gói web tĩnh triển khai cùng domain (No Deployed Same-Origin Web Client):**
-   - Hệ thống hiện chưa thiết lập việc phục vụ các tệp tĩnh đóng gói của Flutter Web (`flutter build web`) trực tiếp trên Nginx cùng domain với Go Backend.
-4. **Hệ quả đối với Web Client chạy Cross-Origin & Hướng xử lý:**
-   - Khi chạy ứng dụng Flutter Web ở môi trường phát triển cục bộ (`http://localhost:3000`), mọi request chứa header tùy chỉnh (`Authorization`, `X-Request-ID`) gửi sang Go Backend (`http://localhost:80` hoặc `port 8080`) sẽ kích hoạt Preflight `OPTIONS` và **bị trình duyệt chặn đứng ngay lập tức tại tầng network** do thiếu header CORS phản hồi.
-   - **Kế hoạch xử lý:** Môi trường Web chạy cross-origin bắt buộc cần một cấu hình proxy trung gian có kế hoạch (Planned Proxy / Reverse Proxy phía Client cùng origin) hoặc bổ sung cấu hình CORS hợp lệ trên Nginx và xác minh thực tế (verified) trước khi vận hành.
-   - **NGHIÊM CẤM:** Tuyệt đối **KHÔNG** tắt tính năng bảo mật của trình duyệt (`--disable-web-security`) và **KHÔNG** sử dụng các tiện ích mở rộng can thiệp CORS (CORS unblocker extensions). Việc này vi phạm tiêu chuẩn bảo mật, che giấu các lỗi cấu hình biên thực tế và tạo ra thói quen kiểm thử sai lệch.
+1. **Go Backend đã tích hợp đầy đủ CORS Middleware:**
+   - Trong `router.go`, Go Backend đã tích hợp middleware CORS (`corsMiddleware`) áp dụng cho toàn bộ các route nghiệp vụ `/v1/*`.
+   - Middleware hỗ trợ xử lý preflight request `OPTIONS` tự động, phản hồi mã **`204 No Content`** cho các origin hợp lệ được khai báo trong biến cấu hình `CORS_ALLOWED_ORIGINS`.
+   - Header cho phép: `Authorization`, `Content-Type`, `Idempotency-Key`, `X-Request-ID`.
+   - Header phơi bày ra trình duyệt (**`Access-Control-Expose-Headers`**):
+     ```http
+     Access-Control-Expose-Headers: Link, Location, X-Request-ID
+     ```
+     Điều này bảo đảm ứng dụng Flutter Web có thể đọc trực tiếp URI phân trang từ header `Link` và URI thực thể vừa tạo từ header `Location`.
+   - Với Origin không hợp lệ: Preflight `OPTIONS` bị từ chối với **`403 Forbidden`** (code `forbidden`), và các actual request không được đính kèm header `Access-Control-Allow-Origin`. Phản hồi luôn có header `Vary: Origin`.
+
+2. **Cơ chế Thương lượng Nội dung (Accept Negotiation) và Mã lỗi `406 Not Acceptable`:**
+   - Go Backend kiểm tra nghiêm ngặt header `Accept` của client:
+     - Các endpoint trả về biểu diễn JSON-LD normalized (`GET /v1/digital-twins`, `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}/temporal`) mặc định Content-Type là `application/ld+json; charset=utf-8`.
+     - Endpoint state view (`GET /v1/digital-twins/{entity_id}?format=simplified`), các mutation responses (`POST`, `PATCH`), và error responses trả về `application/json; charset=utf-8`.
+   - Parser `Accept` hỗ trợ phân tích media-range kèm trọng số chất lượng `q` và quoted parameters (ví dụ: `profile="https://example.org/a,b"`).
+   - Cơ chế bảo mật fail-closed với RFC 2231: Bất kỳ tham số extended/continuation nào cho `q` (như `q*`, `q*0`, `q*0*`) đều bị gán ép về `q = 0.0` để chống việc nâng chất lượng trái phép.
+   - Nếu client gửi header `Accept` chỉ chấp nhận media type không tương thích (hoặc gán `q=0` cho media type của server), server sẽ trả về mã lỗi **`406 Not Acceptable`** (`Content-Type: application/json; charset=utf-8`, code `not_acceptable`).
+   - Phản hồi từ server luôn đính kèm header **`Vary: Accept`** khi nội dung phản hồi phụ thuộc vào yêu cầu thương lượng của client.
+
+3. **Cấu hình Nginx Reverse Proxy và Môi trường Web Client:**
+   - Nginx Reverse Proxy chuyển tiếp nguyên vẹn các header `Origin`, `Accept`, `Authorization`, và `X-Request-ID` tới Go Backend.
+   - Flutter Web chạy ở môi trường phát triển cục bộ (`http://localhost:3000`) cần được cấu hình Origin tương ứng trong danh sách `CORS_ALLOWED_ORIGINS` của Go backend để preflight 204 hoạt động bình thường.
+   - **NGHIÊM CẤM:** Tuyệt đối **KHÔNG** tắt tính năng bảo mật của trình duyệt (`--disable-web-security`) và **KHÔNG** sử dụng các tiện ích mở rộng can thiệp CORS (CORS unblocker extensions). Việc này vi phạm tiêu chuẩn bảo mật và che giấu các lỗi cấu hình biên thực tế.
 
 ### 2.2. Headers bắt buộc phía Client
 Mỗi request gửi tới các endpoint nghiệp vụ `/v1/*` bắt buộc phải chứa các header sau:
@@ -522,177 +535,255 @@ Endpoint này cho phép **Chủ sở hữu Gateway (`owner`)** tự cấp phát 
 
 ---
 
-### 5.4. API Nhóm Stage 4: Telemetry History và Digital Twin APIs
+### 5.4. API Nhóm Stage 4: Digital Twin APIs Chuẩn hóa theo ETSI GS CIM 009 V1.9.1
 
-Nhóm 7 endpoint Stage 4 phục vụ đọc chuỗi thời gian lịch sử, đọc mô hình Digital Twin (danh sách, chi tiết NGSI-LD, trạng thái hiện thời, lịch sử thuộc tính) và quản lý metadata thực thể. Xem đặc tả protocol đầy đủ tại [`docs/protocols/stage4-read-and-entity-api.md`](../protocols/stage4-read-and-entity-api.md).
+Sau khi hoàn thành kế hoạch chuyển đổi giao diện theo chuẩn **ETSI GS CIM 009 V1.9.1** ([`digital_twin_ngsi_ld_v1.9.1_migration_plan.md`](../../../docs/backend_plan/digital_twin_ngsi_ld_v1.9.1_migration_plan.md)), nhóm API Stage 4 được chuẩn hóa thành **đúng năm (05) endpoint chính thức** trong Go Backend. Xem đặc tả protocol chi tiết tại [`docs/protocols/stage4-read-and-entity-api.md`](../protocols/stage4-read-and-entity-api.md).
 
-#### 1. Lịch sử Telemetry (`GET /v1/telemetry/history`)
-- **Mục đích:** Truy vấn chuỗi thời gian mẫu đo từ hypertable TimescaleDB, hỗ trợ đọc `raw` hoặc downsample `time_bucket`.
-- **Yêu cầu xác thực & Quyền:** Bắt buộc JWT hợp lệ. Người dùng phải là thành viên (`owner`, `operator`, `viewer`) của `gateway_id` yêu cầu trong `user_gateways`. Non-member (kể cả Platform Admin không có membership) nhận `404 Not Found`.
+#### Bảng Ánh xạ Chuyển đổi từ 7 Route Cũ sang 5 Route Chuẩn hóa:
+| Nhóm chức năng | Route cũ (Stage 4 ban đầu) | Endpoint mới (V1.9.1 Profile) | Thay đổi Wire & Chú ý cho Client |
+|---|---|---|---|
+| **Danh sách Twin** | `GET /v1/digital-twins` | `GET /v1/digital-twins` | Tham số lọc đổi thành `type=Gateway\|Sensor` (bỏ `entity_type`), con trỏ đổi thành `cursor` (bỏ `after`). Body trả về mảng trực tiếp `[...]` (`application/ld+json`). Phân trang qua header `Link: <URI>; rel="next"`. |
+| **Tạo mới / Replay** | `POST /v1/digital-twins` | `POST /v1/digital-twins` | Giữ nguyên DTO provisioning create-or-exact-replay; bổ sung header `Location: /v1/digital-twins/<escaped_urn>` khi trả mã `201 Created`. |
+| **Chi tiết thực thể** | `GET /v1/digital-twins/{id}` | `GET /v1/digital-twins/{id}` | Chuẩn hóa quan hệ `hasSensor` thành mảng URI `object: [...]` và `objectType: "Sensor"`. Phân trang quan hệ qua header `Link`. Tích hợp `measurement` và `sample_interval_us` mới nhất kèm mã `unitCode` UN/CEFACT (như `CEL`, `C81`, `P1`) bên trong Property `measurement`. |
+| **Trạng thái phẳng** | `GET /v1/digital-twins/{id}/state` | `GET /v1/digital-twins/{id}?format=simplified` | Route cũ `/state` đã bị thu hồi (`404 Not Found`). Đọc trạng thái phẳng trực tiếp qua query extension `?format=simplified` trên endpoint detail (`application/json`). |
+| **Lịch sử đo lường** | `GET /v1/telemetry/history` | `GET /v1/digital-twins/{id}/temporal?attrs=measurement` | Route cũ `/telemetry/history` đã bị thu hồi (`404 Not Found`). Dữ liệu đo viễn trắc được truy vấn qua temporal endpoint của Sensor. |
+| **Lịch sử thuộc tính** | `GET /v1/digital-twins/{id}/history` | `GET /v1/digital-twins/{id}/temporal` | Route cũ `/history` đã bị thu hồi (`404 Not Found`). Hợp nhất thành endpoint `/temporal`. |
+| **Sửa metadata** | `PATCH /v1/digital-twins/{id}` | `PATCH /v1/digital-twins/{id}/attrs` | Đường dẫn cũ nhận `405 Method Not Allowed`. Chuyển sang `/attrs`, nhận body là normalized Property fragment. Xóa mô tả bằng `{"description":{"type":"Property","value":"urn:ngsi-ld:null"}}`. |
+
+---
+
+#### 1. Danh sách thực thể Digital Twin (`GET /v1/digital-twins`)
+- **Mục đích:** Liệt kê các thực thể Digital Twin (`Gateway`, `Sensor`) mà người dùng có quyền trong `user_gateways`.
+- **Yêu cầu xác thực & Quyền:** Bearer JWT (`authenticated`, scope `user_gateways`). Trả về `[]` nếu người dùng chưa được phân quyền trạm nào.
 - **Query Parameters:**
-  - `gateway_id` (string, bắt buộc): Định danh Gateway.
-  - `sensor_id` (string, bắt buộc): Định danh Sensor.
-  - `from` (string, bắt buộc): Mốc thời gian bắt đầu ISO 8601 / RFC3339, bắt buộc có múi giờ rõ ràng (ví dụ `Z` hoặc `+07:00`), độ chính xác microsecond.
-  - `to` (string, bắt buộc): Mốc thời gian kết thúc (phải có `to > from`).
-  - `resolution` (string, tùy chọn, mặc định `"auto"`): Nhận `"auto"`, `"raw"`, hoặc 1 trong 9 mức bucket allowlisted: `"100ms"`, `"1s"`, `"10s"`, `"1m"`, `"5m"`, `"15m"`, `"1h"`, `"6h"`, `"1d"`.
-  - `max_points` (int, tùy chọn, mặc định `1000` theo cấu hình `HISTORY_DEFAULT_POINTS`, giới hạn hợp đồng min `100` và max `2000` theo cấu hình `HISTORY_MIN_POINTS` và `HISTORY_MAX_POINTS`): Giới hạn số điểm trả về cho một truy vấn history (không dùng giá trị 500 của fixture làm hạn mức chung toàn hệ thống).
-- **Ranh giới & Quy tắc:**
-  - Khoảng thời gian không vượt `HISTORY_MAX_RANGE` (mặc định 30 ngày); truy vấn `raw` không vượt `HISTORY_RAW_WINDOW` (mặc định 1 giờ).
-  - Khoảng thời gian nửa mở: `[from, to)`. Output luôn chuẩn hóa UTC microsecond RFC3339 kết thúc bằng `Z`.
-  - Nếu số điểm raw thực tế vượt quá `max_points`, server trả về `400 Bad Request` (`raw_limit_exceeded`), **tuyệt đối không âm thầm cắt bớt dữ liệu**. Chế độ `"auto"` tự động thăm dò raw trong cửa sổ ngắn (<=10s), nếu vượt hạn mức sẽ tự động hạ cấp an toàn sang bucket phù hợp.
-  - Kiểu dữ liệu trên dây: `point_count` là số nguyên (numeric int), các trường số nguyên 64-bit (`sequence_num`, `count`) được định dạng chuỗi số nguyên (decimal string) để tránh mất độ chính xác trên JavaScript/Web (`> 2^53`). Điểm raw có `sequence_num` (string) và `value` (number); điểm bucket có `bucket` (string timestamp UTC), `avg`, `min`, `max` (number), và `count` (string). Các bucket rỗng không có dữ liệu sẽ bị bỏ qua (không gapfill số liệu giả).
-- **Ví dụ Response Raw (`200 OK`):**
+  - `type` (string, tùy chọn): Lọc theo `"Gateway"` hoặc `"Sensor"` (tham số cũ `entity_type` bị từ chối `400`).
+  - `gateway_id` (string, tùy chọn): Lọc theo trạm cụ thể.
+  - `limit` (int, tùy chọn, mặc định `50`, min `1`, max `200`).
+  - `cursor` (string, tùy chọn): Keyset cursor dạng opaque base64url `v1.{k,g,t}` (tham số cũ `after` bị từ chối `400`).
+- **Phân trang qua Header `Link` (RFC 8288):**
+  - Khi còn trang tiếp theo, server trả header:
+    ```http
+    Link: </v1/digital-twins?type=Sensor&limit=20&cursor=v1.xxx>; rel="next"
+    ```
+  - Khi đến trang cuối cùng hoặc danh sách rỗng, header `Link` hoàn toàn vắng mặt (terminal no-next). Không có `next_cursor` trong body.
+- **Response (`200 OK`):** Header `Content-Type: application/ld+json; charset=utf-8`. Trả về **mảng root array trực tiếp** các summary Entities:
   ```json
-  {
-    "gateway_id": "gateway_001",
-    "sensor_id": "sensor_001",
-    "mode": "raw",
-    "resolution": "raw",
-    "from": "2026-10-18T00:00:00.000000Z",
-    "to": "2026-10-18T00:00:05.000000Z",
-    "point_count": 2,
-    "points": [
-      {
-        "measured_at": "2026-10-18T00:00:01.000000Z",
-        "sequence_num": "1001",
-        "value": 25.4
+  [
+    {
+      "id": "urn:ngsi-ld:Gateway:gateway_001",
+      "type": "Gateway",
+      "name": {
+        "type": "Property",
+        "value": "AM5728 Gateway 001"
       },
+      "gateway_id": {
+        "type": "Property",
+        "value": "gateway_001"
+      },
+      "modifiedAt": "2026-10-18T08:30:00.000000Z",
+      "@context": [
+        {
+          "Gateway": "https://example.org/ngsi-ld/iot/v1#Gateway",
+          "Sensor": "https://example.org/ngsi-ld/iot/v1#Sensor",
+          "measurement": "https://example.org/ngsi-ld/iot/v1#measurement",
+          "sample_interval_us": "https://example.org/ngsi-ld/iot/v1#sampleIntervalUs",
+          "hasSensor": "https://example.org/ngsi-ld/iot/v1#hasSensor",
+          "isHostedBy": "https://example.org/ngsi-ld/iot/v1#isHostedBy",
+          "gateway_id": "https://example.org/ngsi-ld/iot/v1#gateway_id",
+          "measurementUnit": "https://example.org/ngsi-ld/iot/v1#measurementUnit"
+        },
+        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+      ]
+    }
+  ]
+  ```
+
+- **Biến thể summary phẳng (`?format=simplified`):** Khi thêm query `?format=simplified`, endpoint trả về **mảng root array phẳng** với `Content-Type: application/json; charset=utf-8` (không JSON-LD, không `@context`, không bọc Property). Mỗi item có đúng các field `id`, `type`, `name` (lược bỏ hoàn toàn khi `NULL`), `gateway_id` (chuỗi thẳng), `modifiedAt`. Danh sách rỗng trả `[]`.
+  - `format=simplified` kết hợp bình thường với `type`, `gateway_id`, `limit`, `cursor`; `format` **không** vào cursor (đổi filter giữa hai trang vẫn nhận `400 invalid_cursor`).
+  - Client gửi `Accept: application/json` cho biến thể này. `Accept` không tương thích (ví dụ `text/plain` hoặc `application/ld+json`) → `406 Not Acceptable`; thiếu `Accept` hoặc wildcard `*/*` → dùng mặc định của đúng nhánh.
+  - Giá trị `format` khác `simplified` (ví dụ `detail`) hoặc lặp key `format` → `400 Bad Request`.
+  - `Link` trang kế tiếp bảo toàn **đầy đủ** filter hiện hành **và** `format=simplified`; nhánh mặc định không chèn `format` vào `Link`.
+  - Đây là **danh sách summary rút gọn** (đọc `twin_entities`), **KHÁC** với `?format=simplified` ở endpoint **chi tiết** (đọc `twin_states`, Mục 3 bên dưới); không đọc state/history và không phát sinh truy vấn N+1.
+  - **Ví dụ URL:** `GET /v1/digital-twins?type=Sensor&gateway_id=gateway_001&limit=2&format=simplified` (`Accept: application/json`).
+    ```json
+    [
       {
-        "measured_at": "2026-10-18T00:00:02.000000Z",
-        "sequence_num": "1002",
-        "value": 25.6
+        "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+        "type": "Sensor",
+        "name": "Temperature",
+        "gateway_id": "gateway_001",
+        "modifiedAt": "2026-10-18T08:30:00.000000Z"
       }
     ]
-  }
-  ```
+    ```
 
-#### 2. Danh sách thực thể Digital Twin (`GET /v1/digital-twins`)
-- **Mục đích:** Liệt kê các thực thể Digital Twin (`Gateway`, `Sensor`) mà người dùng có quyền trong `user_gateways`.
-- **Yêu cầu xác thực & Quyền:** Bearer JWT. Trả về `items: []` nếu không có quyền trạm nào.
-- **Query Parameters:**
-  - `entity_type` (string, tùy chọn): Lọc theo `"Gateway"` hoặc `"Sensor"`.
-  - `gateway_id` (string, tùy chọn): Lọc theo trạm cụ thể.
-  - `limit` (int, tùy chọn, mặc định `20`, min `1`, max `100`).
-  - `cursor` (string, tùy chọn): Keyset cursor dạng opaque base64url (`v1.{k,g,t}`). **Lưu ý Client:** Phải reset cursor về null khi thay đổi filter (`entity_type`, `gateway_id`).
-- **Response (`200 OK`):** Header `Content-Type: application/json; charset=utf-8`.
+---
+
+#### 2. Khởi tạo thực thể Digital Twin (`POST /v1/digital-twins`)
+- **Mục đích:** Tạo mới hoặc phát lại chính xác (create-or-exact-replay) thực thể Gateway hoặc Sensor.
+- **Yêu cầu xác thực & Quyền:**
+  - `entity_type: "Gateway"`: Bắt buộc quyền Platform Admin (`platform_admins`).
+  - `entity_type: "Sensor"`: Bắt buộc Platform Admin hoặc Gateway Owner của trạm cha.
+  - Vai trò `operator` và `viewer` luôn bị từ chối `403 Forbidden`. Non-member gọi Sensor nhận `404 Not Found`.
+- **Phản hồi và Header `Location`:**
+  - **Tạo mới thành công (`201 Created`):** Server trả về header `Location`:
+    ```http
+    Location: /v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agateway_001
+    ```
+  - **Phát lại trùng khớp (`200 OK` Exact Replay):** Dữ liệu gửi lên trùng khớp bản ghi hiện có; **không** đính kèm header `Location`.
+  - **Xung đột (`409 Conflict`):** Cùng ID nhưng khác `name` hoặc `unit`.
+
+---
+
+#### 3. Chi tiết thực thể và State View (`GET /v1/digital-twins/{entity_id}`)
+- **Mục đích:** Đọc biểu diễn normalized JSON-LD của thực thể kèm đồ thị quan hệ, hoặc đọc trạng thái phẳng `twin_states` qua query extension `?format=simplified`.
+- **Yêu cầu xác thực & Quyền:** Bearer JWT (`authenticated`, thành viên trạm trong `user_gateways`). Non-member nhận `404 Not Found`.
+- **Path Parameter:** `entity_id` (string, bắt buộc): URN thực thể (URL-encoded một lần).
+- **Nhánh 1: Normalized Entity Detail (Mặc định không có format=simplified):**
+  - **Query Parameters:** `relationship_limit` (mặc định 20, max 200), `relationship_after` (cursor quan hệ).
+  - **Phân trang quan hệ qua Header `Link`:** Khi số lượng Sensor của Gateway vượt `relationship_limit`, server trả header:
+    `Link: </v1/digital-twins/urn:ngsi-ld:Gateway:gw_01?relationship_limit=20&relationship_after=...>; rel="next"`.
+    Không còn trường `relationship_page` trong body.
+  - **Cấu trúc `hasSensor` của Gateway:** Có trường `object` là mảng URI và `objectType: "Sensor"`. Nếu trạm chưa có sensor thì trường `hasSensor` được lược bỏ (omit).
+  - **Cấu trúc của Sensor Detail:** Bổ sung quan hệ `isHostedBy` trỏ về Gateway cha. Nếu sensor đã có dữ liệu đo đạc trong `reported_state`, DTO tự động tích hợp Property `measurement` (kèm `value`, `observedAt`, và mã `unitCode` UN/CEFACT như `CEL`, `C81`, `P1` bên trong `measurement`). Nếu đơn vị chưa map hoặc sensor chưa có dữ liệu quan sát, đơn vị thô được giữ dưới Property `measurementUnit` ở root entity (không có root `unitCode`, không tạo `measurement` giả). Bổ sung Property `sample_interval_us` nếu có.
+  - **Response (`200 OK`):** Header `Content-Type: application/ld+json; charset=utf-8`.
+    ```json
+    {
+      "id": "urn:ngsi-ld:Gateway:gateway_001",
+      "type": "Gateway",
+      "name": {
+        "type": "Property",
+        "value": "AM5728 Gateway 001",
+        "modifiedAt": "2026-10-18T08:30:00.000000Z"
+      },
+      "description": {
+        "type": "Property",
+        "value": "Tram quan trac nha kinh",
+        "modifiedAt": "2026-10-18T08:30:00.000000Z"
+      },
+      "hasSensor": {
+        "type": "Relationship",
+        "object": [
+          "urn:ngsi-ld:Sensor:gateway_001:sensor_001"
+        ],
+        "objectType": "Sensor"
+      },
+      "@context": [
+        {
+          "Gateway": "https://example.org/ngsi-ld/iot/v1#Gateway",
+          "Sensor": "https://example.org/ngsi-ld/iot/v1#Sensor",
+          "measurement": "https://example.org/ngsi-ld/iot/v1#measurement",
+          "sample_interval_us": "https://example.org/ngsi-ld/iot/v1#sampleIntervalUs",
+          "hasSensor": "https://example.org/ngsi-ld/iot/v1#hasSensor",
+          "isHostedBy": "https://example.org/ngsi-ld/iot/v1#isHostedBy",
+          "gateway_id": "https://example.org/ngsi-ld/iot/v1#gateway_id",
+          "measurementUnit": "https://example.org/ngsi-ld/iot/v1#measurementUnit"
+        },
+        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+      ]
+    }
+    ```
+- **Nhánh 2: Project State View Extension (`?format=simplified`):**
+  - Đọc trực tiếp trạng thái `twin_states` (không quét hypertable). Thay thế endpoint cũ `/state`.
+  - **Response (`200 OK`):** Header `Content-Type: application/json; charset=utf-8` (không có context).
+    ```json
+    {
+      "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+      "type": "Sensor",
+      "gateway_id": "gateway_001",
+      "reported_state": {
+        "value": 25.4,
+        "sample_interval_us": 10000
+      },
+      "desired_state": {},
+      "reported_version": "3",
+      "desired_version": "0",
+      "last_reported_at": "2026-10-18T08:35:00.000000Z",
+      "last_desired_at": null,
+      "updated_at": "2026-10-18T08:35:00.000000Z"
+    }
+    ```
+    *(Bảo toàn số nguyên lớn > 2^53 trong JSONB; versions định dạng chuỗi số nguyên).*
+
+---
+
+#### 4. Cập nhật Metadata Thực thể (`PATCH /v1/digital-twins/{entity_id}/attrs`)
+- **Mục đích:** Chỉnh sửa siêu dữ liệu (`name`, `description`) của thực thể đã tồn tại thông qua normalized Property fragment.
+- **Yêu cầu xác thực & Quyền:**
+  - Gateway: Bắt buộc Platform Admin (`platform_admins`). Gateway Owner gọi nhận `403 Forbidden`.
+  - Sensor: Bắt buộc Platform Admin hoặc Gateway Owner của trạm cha. Non-member nhận `404 Not Found`.
+  - Operator và Viewer luôn nhận `403 Forbidden`.
+- **Payload Property Fragment:**
   ```json
   {
-    "items": [
-      {
-        "entity_id": "urn:ngsi-ld:Gateway:gateway_001",
-        "entity_type": "Gateway",
-        "name": "AM5728 Gateway 001",
-        "gateway_id": "gateway_001",
-        "sensor_id": null,
-        "created_at": "2026-10-18T08:30:00.000000Z",
-        "updated_at": "2026-10-18T08:30:00.000000Z"
-      }
-    ],
-    "next_cursor": "djEuMS5nYXRld2F5XzAwMS5HYXRld2F5"
-  }
-  ```
-
-#### 3. Chi tiết thực thể Digital Twin (`GET /v1/digital-twins/{entity_id}`)
-- **Mục đích:** Đọc biểu diễn NGSI-LD đầy đủ của thực thể kèm quan hệ phân trang.
-- **Yêu cầu xác thực & Quyền:** Bearer JWT (`authenticated`, thành viên trạm). Non-member nhận `404 Not Found`.
-- **Path Parameter:** `entity_id` (string, bắt buộc): URN thực thể (ví dụ `urn:ngsi-ld:Gateway:gateway_001`). **Lưu ý:** Client chỉ encode URL một lần (`Uri.encodeComponent`), không double-encode.
-- **Query Parameters:** `relation_limit` (mặc định 20), `relation_cursor` (keyset cursor quan hệ riêng `v1.{s,r,k}`).
-- **Response (`200 OK`):** Header `Content-Type: application/ld+json; charset=utf-8`.
-  ```json
-  {
-    "id": "urn:ngsi-ld:Gateway:gateway_001",
-    "type": "Gateway",
     "name": {
       "type": "Property",
-      "value": "AM5728 Gateway 001"
+      "value": "AM5728 Gateway 001 Updated"
     },
     "description": {
       "type": "Property",
-      "value": "Tram quan trac nha kinh"
-    },
-    "hasSensor": [
-      {
-        "type": "Relationship",
-        "object": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
-        "observedAt": null
-      }
-    ],
-    "hasSensor_next_cursor": null,
-    "@context": {
-      "name": "https://uri.etsi.org/ngsi-ld/name",
-      "description": "https://uri.etsi.org/ngsi-ld/description",
-      "hasSensor": "https://uri.etsi.org/ngsi-ld/hasSensor",
-      "observedAt": "https://uri.etsi.org/ngsi-ld/observedAt",
-      "unit": "https://uri.etsi.org/ngsi-ld/unitCode"
+      "value": "Mô tả mới"
     }
   }
   ```
+- **Quy tắc đặc thù:**
+  - Để xóa mô tả Gateway về SQL NULL, gửi sentinel: `{"description": {"type": "Property", "value": "urn:ngsi-ld:null"}}`.
+  - Cấm gửi `unit` trong PATCH (trường bất biến, vi phạm nhận `400 Bad Request`).
+  - Cấm mọi trường khác ngoài `name` và `description` (`400`).
+  - Gửi giá trị trùng khớp hoàn toàn (Same-value No-Op) trả về `200 OK`, không ghi SQL, giữ nguyên `updated_at`.
+  - Tuyệt đối **KHÔNG** làm thay đổi `desired_state`, `reported_state`, không tạo command và không gửi MQTT.
 
-#### 4. Trạng thái hiện thời Digital Twin (`GET /v1/digital-twins/{entity_id}/state`)
-- **Mục đích:** Đọc nhanh trạng thái `reported_state` và `desired_state` trực tiếp từ bảng `twin_states` (không quét lịch sử hypertable).
-- **Yêu cầu xác thực & Quyền:** Bearer JWT (`authenticated`, thành viên trạm). Non-member nhận `404 Not Found`.
-- **Response (`200 OK`):** Header `Content-Type: application/json; charset=utf-8`. Lưu ý: payload trả về các trường định danh `id`, `type`, `gateway_id` (không dùng trường `entity_id`).
+---
+
+#### 5. Lịch sử Đo lường & Thuộc tính (`GET /v1/digital-twins/{entity_id}/temporal`)
+- **Mục đích:** Hợp nhất truy vấn chuỗi thời gian telemetry và temporal history cho thực thể Sensor theo chuẩn ETSI GS CIM 009 V1.9.1.
+- **Yêu cầu xác thực & Quyền:** Bearer JWT (`authenticated`, thành viên trạm trong `user_gateways`). Non-member nhận `404 Not Found`. Chỉ áp dụng cho thực thể Sensor.
+- **Query Parameters:**
+  - `attrs` (string, bắt buộc): Thuộc tính cần đọc: `measurement` (hoặc alias `value` chọn chuỗi viễn trắc telemetry) hoặc `sample_interval_us` (chọn chu kỳ lấy mẫu từ `twin_temporal_values`). Chỉ nhận 1 token duy nhất.
+  - `timerel` (string, bắt buộc): Bắt buộc là `between`.
+  - `timeAt` (string, bắt buộc): Mốc thời gian bắt đầu UTC microsecond kết thúc bằng `Z` (`2026-10-18T00:00:00.000000Z`).
+  - `endTimeAt` (string, bắt buộc): Mốc thời gian kết thúc UTC `Z` (`endTimeAt > timeAt`, khoảng cách $\le$ 744h). Cửa sổ truy vấn nửa mở: `[timeAt, endTimeAt)`.
+  - `aggrPeriodDuration` (string, tùy chọn): Kích hoạt chế độ gom nhóm **Aggregated Values**. Chỉ nhận 1 trong 9 canonical durations: `"PT0.1S"`, `"PT1S"`, `"PT10S"`, `"PT1M"`, `"PT5M"`, `"PT15M"`, `"PT1H"`, `"PT6H"`, `"P1D"`. Giá trị khác nhận `400 Bad Request`.
+  - `aggrMethods` (string, tùy chọn, mặc định `"avg,min,max,totalCount"`): Tập con không lặp các phương thức tổng hợp.
+  - `format` (string, tùy chọn): Tự động suy luận: `temporalValues` (khi không có `aggrPeriodDuration`) hoặc `aggregatedValues` (khi có `aggrPeriodDuration`).
+  - `max_points` (int, tùy chọn, mặc định 1000, min 100, max 2000): Nếu số điểm thô vượt ngưỡng, trả về `400 Bad Request` (`raw_limit_exceeded`), **không tự động fallback auto ra public API**.
+- **Response Raw (`format=temporalValues`):** Trả về bộ đôi (tuple 2 phần tử) `[kết_quả, mốc_thời_gian]`:
   ```json
   {
     "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
     "type": "Sensor",
-    "gateway_id": "gateway_001",
-    "reported_state": {
-      "value": 25.4,
-      "sample_interval_us": 10000
+    "measurement": {
+      "type": "Property",
+      "values": [
+        [25.4, "2026-10-18T00:00:01.000000Z"],
+        [25.6, "2026-10-18T00:00:02.000000Z"]
+      ]
     },
-    "desired_state": {},
-    "reported_version": "3",
-    "desired_version": "0",
-    "last_reported_at": "2026-10-18T08:35:00.000000Z",
-    "last_desired_at": null,
-    "updated_at": "2026-10-18T08:35:00.000000Z"
+    "@context": [ ... ]
   }
   ```
-  *(Lưu ý: `reported_version` và `desired_version` được định dạng chuỗi số nguyên để bảo toàn độ chính xác).*
-
-#### 5. Lịch sử thuộc tính Digital Twin (`GET /v1/digital-twins/{entity_id}/history`)
-- **Mục đích:** Truy vấn lịch sử thuộc tính cụ thể của thực thể Sensor.
-- **Yêu cầu xác thực & Quyền:** Bearer JWT (`authenticated`, thành viên trạm). Non-member nhận `404 Not Found`.
-- **Ranh giới Selector:** **Chỉ hỗ trợ thực thể Sensor** với đúng 2 thuộc tính:
-  - `property=value`: Tự động ủy quyền (delegate) sang dịch vụ `TelemetryHistoryService` mà không nhân đôi dữ liệu chuỗi thời gian.
-  - `property=sample_interval_us`: Đọc từ TimescaleDB hypertable `twin_temporal_values` (đơn vị lấy từ `metadata.unit` của temporal row, không lấy từ `sensors.unit`).
-  - Mọi selector khác hoặc truy vấn trên Gateway sẽ bị từ chối với lỗi domain (`400 Bad Request`).
-- **Response (`200 OK`):** Giữ nguyên cấu trúc `values` với các trường số nguyên chuỗi, và mảng rỗng `values: []` nếu không có điểm dữ liệu trong khoảng.
-
-#### 6. Khởi tạo thực thể Digital Twin (`POST /v1/digital-twins`)
-- **Mục đích:** Tạo thực thể Digital Twin mới hoặc phát lại chính xác (create-or-exact-replay).
-- **Yêu cầu xác thực & Quyền:**
-  - Loại `"Gateway"`: Bắt buộc quyền Quản trị viên (`platform_admins`).
-  - Loại `"Sensor"`: Bắt buộc Quản trị viên (`platform_admins`) hoặc Chủ sở hữu (`owner`) của Gateway cha.
-  - Vai trò `operator` và `viewer` luôn bị từ chối `403 Forbidden`.
-- **Ranh giới:**
-  - Tạo mới thành công trả về `201 Created` (`Created: true`).
-  - Phát lại chính xác cùng thuộc tính (Exact Replay) trả về `200 OK` (`Created: false`).
-  - Gửi cấu hình khác biệt trên thực thể đã tồn tại trả về `409 Conflict` (`resource conflict`).
-  - Không tự động cấp phát tài khoản Supabase Auth hay chứng chỉ MQTT (các quy trình này tách biệt hoàn toàn).
-
-#### 7. Cập nhật Metadata thực thể (`PATCH /v1/digital-twins/{entity_id}`)
-- **Mục đích:** Chỉnh sửa siêu dữ liệu (`name`, `description`) của thực thể đã tồn tại.
-- **Yêu cầu xác thực & Quyền:**
-  - Thực thể `Gateway`: Chỉ dành riêng cho Platform Admin (`platform_admins`). Gateway Owner gọi `PATCH` trên Gateway cha sẽ bị từ chối `403 Forbidden`.
-  - Thực thể `Sensor`: Dành cho Platform Admin hoặc Gateway Owner của trạm cha. Non-member nhận `404 Not Found` (anti-enumeration).
-  - Vai trò `operator` và `viewer` luôn nhận `403 Forbidden`.
-- **Quy tắc cập nhật trường (Field Allowlist):**
-  - Thực thể `Gateway`: Chỉ cho phép `name` (string) và `description` (presence-aware: không gửi = giữ nguyên, chuỗi = cập nhật, `null` = xóa về SQL NULL). Dữ liệu `description` được lưu vào bảng quan hệ `gateways.description`; trường `twin_entities.attributes` được bảo toàn nguyên vẹn!
-  - Thực thể `Sensor`: Chỉ cho phép duy nhất trường `name` (bắt buộc là chuỗi không rỗng). Trường `unit` là **bất biến (immutable)** và không được phép cập nhật.
-- **Ranh giới nghiệp vụ nghiêm ngặt:**
-  - Cập nhật cùng giá trị (Same-value No-Op) trả về `200 OK`, không thực hiện ghi SQL, giữ nguyên `updated_at`.
-  - Tuyệt đối **KHÔNG** cập nhật trạng thái `desired_state` hay `reported_state`.
-  - Tuyệt đối **KHÔNG** phát sinh lệnh điều khiển thiết bị hay gửi tin nhắn MQTT ra broker.
-  - Không chấp nhận query parameter trên mutation endpoint (vi phạm nhận `400 Bad Request`).
-  - Giới hạn body: `AdminMaxBodyBytes` (mặc định 64KB), vi phạm nhận `413 Payload Too Large`. Bắt buộc `Content-Type: application/json` (thiếu/sai nhận `415 Unsupported Media Type`).
+- **Response Aggregated (`format=aggregatedValues`):** Trả về bộ ba (triple 3 phần tử) `[kết_quả, bắt_đầu_bucket, kết_thúc_bucket]` cho từng method:
+  ```json
+  {
+    "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+    "type": "Sensor",
+    "measurement": {
+      "type": "Property",
+      "avg": [[25.5, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]],
+      "min": [[25.1, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]],
+      "max": [[25.9, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]],
+      "totalCount": [[120, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]]
+    },
+    "@context": [ ... ]
+  }
+  ```
+  *(Lưu ý: `totalCount` là số nguyên JSON exact integer, không ép kiểu qua float64; các bucket rỗng không có dữ liệu sẽ bị bỏ qua, không chèn số liệu giả).*
 
 ---
 
 ## 6. Danh sách Tính năng và API tương lai chưa khả dụng (Future Features Unavailable)
 
-Hệ thống tuân thủ nghiêm ngặt lộ trình phát triển phân tầng kiến trúc (`Backend_summary_plan.md` và `AGENTS.md`). Bảy endpoint Stage 4 (lịch sử chuỗi thời gian, đọc Digital Twin list/detail/state/history, tạo thực thể và cập nhật metadata) đã hoàn thành và hoạt động. Các tính năng dưới đây thuộc về các giai đoạn sau:
+Hệ thống tuân thủ nghiêm ngặt lộ trình phát triển phân tầng kiến trúc (`Backend_summary_plan.md` và `AGENTS.md`). Năm endpoint Digital Twin Stage 4 chuẩn hóa theo ETSI GS CIM 009 V1.9.1 (danh sách thực thể, tạo thực thể, chi tiết/trạng thái phẳng, cập nhật metadata attrs, và lịch sử chuỗi thời gian temporal) đã hoàn thành và hoạt động. Các tính năng dưới đây thuộc về các giai đoạn sau:
 
 | Endpoint / Nhóm tính năng | Method | Trạng thái hiện tại | Kế hoạch triển khai & Ghi chú |
 |---|:---:|:---:|---|
@@ -914,122 +1005,129 @@ class ApiErrorEnvelopeDto {
 }
 
 // ---------------------------------------------------------------------------
-// DTOs minh họa cho nhóm Stage 4: Telemetry History & Digital Twin
-// Lưu ý an toàn số lớn: Các trường sequence_num, count, reported_version,
-// desired_version là decimal string trên wire JSON. Khi parse bằng int.parse(),
-// cần lưu ý trên nền tảng JavaScript/Web số nguyên an toàn tối đa là 2^53 - 1.
-// Sử dụng BigInt.parse() nếu có khả năng giá trị vượt quá giới hạn này.
+// DTOs minh họa cho nhóm Digital Twin Stage 4 (ETSI GS CIM 009 V1.9.1 Profile)
+// Lưu ý an toàn số nguyên lớn:
+// - Trong phản hồi temporal aggregated, trường totalCount là JSON integer số nguyên.
+// - Trên Flutter Web (nền tảng JavaScript), việc sử dụng jsonDecode thông thường sẽ tự động
+//   ép kiểu token số sang JavaScript Number (IEEE 754 float64), làm mất độ chính xác TRƯỚC KHI
+//   gọi BigInt.from(). Để giải mã losslessly trên Web, client cần trích xuất token số nguyên
+//   từ chuỗi JSON gốc (trước khi double-rounding) hoặc dùng custom tokenizer/reviver rồi parse bằng BigInt.parse().
+// - Các trường phiên bản (reported_version, desired_version) ở state view là chuỗi decimal string
+//   trên wire, parse trực tiếp an toàn bằng BigInt.parse().
 // ---------------------------------------------------------------------------
 
-/// Điểm dữ liệu thô (raw telemetry point)
+/// Điểm dữ liệu thô (tuple [value, observedAt]) trong temporalValues
 @immutable
-class TelemetryRawPointDto {
-  final DateTime measuredAt;
-  final String sequenceNum; // decimal string
+class TemporalRawPointDto {
   final double value;
+  final DateTime observedAt;
 
-  const TelemetryRawPointDto({
-    required this.measuredAt,
-    required this.sequenceNum,
+  const TemporalRawPointDto({
     required this.value,
+    required this.observedAt,
   });
 
-  factory TelemetryRawPointDto.fromJson(Map<String, dynamic> json) {
-    return TelemetryRawPointDto(
-      measuredAt: DateTime.parse(json['measured_at'] as String).toUtc(),
-      sequenceNum: json['sequence_num'] as String,
-      value: (json['value'] as num).toDouble(),
+  factory TemporalRawPointDto.fromTuple(List<dynamic> tuple) {
+    return TemporalRawPointDto(
+      value: (tuple[0] as num).toDouble(),
+      observedAt: DateTime.parse(tuple[1] as String).toUtc(),
     );
   }
 }
 
-/// Điểm dữ liệu tổng hợp theo bucket (downsampled bucket point)
+/// Điểm dữ liệu tổng hợp (triple [result, start, end]) trong aggregatedValues
 @immutable
-class TelemetryBucketPointDto {
-  final DateTime bucket;
-  final double avg;
-  final double min;
-  final double max;
-  final String count; // decimal string
+class TemporalBucketTripleDto {
+  final double result;
+  final DateTime start;
+  final DateTime end;
 
-  const TelemetryBucketPointDto({
-    required this.bucket,
-    required this.avg,
-    required this.min,
-    required this.max,
-    required this.count,
+  const TemporalBucketTripleDto({
+    required this.result,
+    required this.start,
+    required this.end,
   });
 
-  factory TelemetryBucketPointDto.fromJson(Map<String, dynamic> json) {
-    return TelemetryBucketPointDto(
-      bucket: DateTime.parse(json['bucket'] as String).toUtc(),
-      avg: (json['avg'] as num).toDouble(),
-      min: (json['min'] as num).toDouble(),
-      max: (json['max'] as num).toDouble(),
-      count: json['count'] as String,
+  factory TemporalBucketTripleDto.fromTriple(List<dynamic> triple) {
+    return TemporalBucketTripleDto(
+      result: (triple[0] as num).toDouble(),
+      start: DateTime.parse(triple[1] as String).toUtc(),
+      end: DateTime.parse(triple[2] as String).toUtc(),
     );
   }
 }
 
-/// DTO phản hồi lịch sử chuỗi thời gian GET /v1/telemetry/history
+/// DTO phản hồi lịch sử chuỗi thời gian GET /v1/digital-twins/{entity_id}/temporal
 @immutable
-class TelemetryHistoryResponseDto {
-  final String gatewayId;
-  final String sensorId;
-  final String mode; // "raw" hoặc "bucket"
-  final String resolution;
-  final DateTime from;
-  final DateTime to;
-  final int pointCount; // numeric integer
-  final List<TelemetryRawPointDto>? rawPoints;
-  final List<TelemetryBucketPointDto>? bucketPoints;
+class TemporalHistoryResponseDto {
+  final String id;
+  final String type;
+  final String property; // "measurement" hoặc "sample_interval_us"
+  final List<TemporalRawPointDto>? rawPoints;
+  final Map<String, List<TemporalBucketTripleDto>>? bucketTriples;
+  final BigInt totalCount;
 
-  const TelemetryHistoryResponseDto({
-    required this.gatewayId,
-    required this.sensorId,
-    required this.mode,
-    required this.resolution,
-    required this.from,
-    required this.to,
-    required this.pointCount,
+  const TemporalHistoryResponseDto({
+    required this.id,
+    required this.type,
+    required this.property,
     this.rawPoints,
-    this.bucketPoints,
+    this.bucketTriples,
+    this.totalCount = BigInt.zero,
   });
 
-  factory TelemetryHistoryResponseDto.fromJson(Map<String, dynamic> json) {
-    final mode = json['mode'] as String;
-    final rawList = json['points'] as List<dynamic>? ?? [];
+  factory TemporalHistoryResponseDto.fromJson(Map<String, dynamic> json, {String propertyName = 'measurement'}) {
+    final id = json['id'] as String;
+    final type = json['type'] as String;
+    final propData = (json[propertyName] ?? json['measurement'] ?? json['sample_interval_us']) as Map<String, dynamic>? ?? {};
 
-    List<TelemetryRawPointDto>? rawPoints;
-    List<TelemetryBucketPointDto>? bucketPoints;
+    List<TemporalRawPointDto>? rawPoints;
+    Map<String, List<TemporalBucketTripleDto>>? bucketTriples;
+    BigInt totalCount = BigInt.zero;
 
-    if (mode == 'raw') {
+    // Nhánh Raw (values)
+    if (propData['values'] is List) {
+      final rawList = propData['values'] as List<dynamic>;
       rawPoints = rawList
-          .map((e) => TelemetryRawPointDto.fromJson(e as Map<String, dynamic>))
-          .toList(growable: false);
-    } else {
-      bucketPoints = rawList
-          .map((e) => TelemetryBucketPointDto.fromJson(e as Map<String, dynamic>))
+          .map((e) => TemporalRawPointDto.fromTuple(e as List<dynamic>))
           .toList(growable: false);
     }
 
-    return TelemetryHistoryResponseDto(
-      gatewayId: json['gateway_id'] as String,
-      sensorId: json['sensor_id'] as String,
-      mode: mode,
-      resolution: json['resolution'] as String,
-      from: DateTime.parse(json['from'] as String).toUtc(),
-      to: DateTime.parse(json['to'] as String).toUtc(),
-      pointCount: json['point_count'] as int,
+    // Nhánh Bucket Aggregated (avg, min, max, totalCount)
+    if (propData['avg'] is List || propData['totalCount'] is List) {
+      bucketTriples = {};
+      for (final method in ['avg', 'min', 'max', 'totalCount']) {
+        if (propData[method] is List) {
+          final list = propData[method] as List<dynamic>;
+          bucketTriples[method] = list
+              .map((e) => TemporalBucketTripleDto.fromTriple(e as List<dynamic>))
+              .toList(growable: false);
+        }
+      }
+
+      // Trích xuất totalCount lossless
+      if (propData['totalCount'] is List && (propData['totalCount'] as List).isNotEmpty) {
+        final firstTriple = (propData['totalCount'] as List)[0];
+        if (firstTriple is List && firstTriple.isNotEmpty) {
+          totalCount = BigInt.tryParse(firstTriple[0].toString()) ?? BigInt.zero;
+        }
+      }
+    }
+
+    return TemporalHistoryResponseDto(
+      id: id,
+      type: type,
+      property: propertyName,
       rawPoints: rawPoints,
-      bucketPoints: bucketPoints,
+      bucketTriples: bucketTriples,
+      totalCount: totalCount,
     );
   }
 }
 
-/// DTO phản hồi trạng thái hiện thời GET /v1/digital-twins/{entity_id}/state
+/// DTO phản hồi trạng thái phẳng GET /v1/digital-twins/{entity_id}?format=simplified
 @immutable
-class TwinStateResponseDto {
+class TwinStateViewResponseDto {
   final String id;
   final String type;
   final String gatewayId;
@@ -1041,7 +1139,7 @@ class TwinStateResponseDto {
   final DateTime? lastDesiredAt;
   final DateTime updatedAt;
 
-  const TwinStateResponseDto({
+  const TwinStateViewResponseDto({
     required this.id,
     required this.type,
     required this.gatewayId,
@@ -1054,15 +1152,15 @@ class TwinStateResponseDto {
     required this.updatedAt,
   });
 
-  factory TwinStateResponseDto.fromJson(Map<String, dynamic> json) {
-    return TwinStateResponseDto(
+  factory TwinStateViewResponseDto.fromJson(Map<String, dynamic> json) {
+    return TwinStateViewResponseDto(
       id: json['id'] as String,
       type: json['type'] as String,
       gatewayId: json['gateway_id'] as String,
       reportedState: json['reported_state'] as Map<String, dynamic>? ?? {},
       desiredState: json['desired_state'] as Map<String, dynamic>? ?? {},
-      reportedVersion: json['reported_version'] as String,
-      desiredVersion: json['desired_version'] as String,
+      reportedVersion: json['reported_version'] as String? ?? '0',
+      desiredVersion: json['desired_version'] as String? ?? '0',
       lastReportedAt: json['last_reported_at'] != null
           ? DateTime.parse(json['last_reported_at'] as String).toUtc()
           : null,
@@ -1475,12 +1573,12 @@ Lập trình viên Client cần đối soát kỹ các trường hợp kiểm th
 | **17** | Người vận hành (`operator`) hoặc Người xem (`viewer`) gọi khởi tạo Sensor (`PUT /v1/gateways/{id}/sensors/{id}`). | `HTTP 403 Forbidden`, code `forbidden`, message `access denied`. | Bắt `ForbiddenException`, ẩn hoặc vô hiệu hóa nút/giao diện tạo cảm biến đối với vai trò không phải `owner`. |
 | **18** | Khởi tạo Sensor nhưng gửi body chứa trường lạ không hỗ trợ (ví dụ `sensor_type`). | `HTTP 400 Bad Request`, code `invalid_request`. | Client kiểm soát form nhập liệu chặt chẽ, chỉ gửi `name` và `unit`. |
 | **19** | Khởi tạo Sensor nhưng thiếu hoặc sai header `Content-Type`. | `HTTP 415 Unsupported Media Type`, code `unsupported_media_type`. | Đảm bảo HTTP Client luôn đính kèm header `Content-Type: application/json`. |
-| **20** | Thành viên trạm truy vấn lịch sử `GET /v1/telemetry/history` với khoảng thời gian hợp lệ. | `HTTP 200 OK`, `Cache-Control: no-store`, trả về `mode`, `resolution`, `point_count`, mảng `points` kèm `sequence_num` (string) và `value`. | Render biểu đồ chuỗi thời gian chính xác, xử lý điểm raw hoặc bucket points. |
-| **21** | Truy vấn lịch sử `raw` nhưng số điểm trong khoảng vượt quá `max_points` (ví dụ >1000 điểm). | `HTTP 400 Bad Request`, code `raw_limit_exceeded`. | Bắt lỗi giới hạn dữ liệu; thông báo người dùng thu hẹp khoảng thời gian hoặc chuyển sang chế độ phân giải `auto` / bucket. |
-| **22** | Non-member (hoặc Platform Admin không có membership) đọc lịch sử telemetry hoặc Digital Twin state/detail. | `HTTP 404 Not Found`, code `not_found`, message `resource not found`. | Hiển thị thông báo không tìm thấy tài nguyên (bảo vệ anti-enumeration). |
-| **23** | Người dùng xem danh sách Digital Twin (`GET /v1/digital-twins`) có phân trang keyset cursor. | `HTTP 200 OK`, trả về `items` và `next_cursor` (opaque base64url). | Hiển thị danh sách; truyền `cursor=next_cursor` để tải trang tiếp theo; reset cursor về null khi đổi bộ lọc. |
-| **24** | Đọc chi tiết Digital Twin (`GET /v1/digital-twins/{entity_id}`). | `HTTP 200 OK`, header `Content-Type: application/ld+json`, đối tượng NGSI-LD kèm inline `@context` Object 1.1 và phân trang quan hệ `hasSensor`. | Hiển thị thông tin thực thể, thuộc tính và danh sách cảm biến gắn kèm. |
-| **25** | Gateway Owner cập nhật tên Sensor (`PATCH /v1/digital-twins/{sensor_urn}`). | `HTTP 200 OK`, `Cache-Control: no-store`, `Pragma: no-cache`, cập nhật `name` thành công. | Cập nhật tên cảm biến hiển thị trên giao diện người dùng. |
+| **20** | Thành viên trạm truy vấn lịch sử `GET /v1/digital-twins/{entity_id}/temporal` với khoảng thời gian hợp lệ (`timerel=between`). | `HTTP 200 OK`, `Cache-Control: no-store`, trả về biểu diễn temporal JSON-LD (`application/ld+json`), mảng tuples `values` (raw) hoặc các mảng triples (`avg`, `min`, `max`, `totalCount` exact integer). | Render biểu đồ chuỗi thời gian chính xác, xử lý điểm raw hoặc bucket triples. |
+| **21** | Truy vấn lịch sử thô (`temporal`) nhưng số điểm trong khoảng vượt quá `max_points` (ví dụ >1000 điểm). | `HTTP 400 Bad Request`, code `raw_limit_exceeded`. | Bắt lỗi giới hạn dữ liệu; thông báo người dùng thu hẹp khoảng thời gian hoặc chọn tham số gom nhóm `aggrPeriodDuration`. |
+| **22** | Non-member (hoặc Platform Admin không có membership) đọc dữ liệu Digital Twin (detail, state view, temporal). | `HTTP 404 Not Found`, code `not_found`, message `resource not found`. | Hiển thị thông báo không tìm thấy tài nguyên (bảo vệ anti-enumeration). |
+| **23** | Người dùng xem danh sách Digital Twin (`GET /v1/digital-twins`) theo chuẩn V1.9.1 profile. | `HTTP 200 OK`, trả về mảng root array Entities `[...]` (`application/ld+json`), phân trang qua HTTP header `Link: <URI>; rel="next"`. | Hiển thị danh sách; đọc URI tiếp theo từ header `Link` để tải trang tiếp theo; reset phân trang khi đổi bộ lọc. |
+| **24** | Đọc chi tiết Digital Twin (`GET /v1/digital-twins/{entity_id}`). | `HTTP 200 OK`, header `Content-Type: application/ld+json`, đối tượng NGSI-LD kèm `@context` V1.9, mảng quan hệ `hasSensor` và phân trang quan hệ qua header `Link`. | Hiển thị thông tin thực thể, thuộc tính và danh sách cảm biến gắn kèm. |
+| **25** | Gateway Owner cập nhật tên Sensor (`PATCH /v1/digital-twins/{sensor_urn}/attrs`). | `HTTP 200 OK`, `Cache-Control: no-store`, `Pragma: no-cache`, gửi Property fragment, cập nhật `name` thành công. | Cập nhật tên cảm biến hiển thị trên giao diện người dùng. Đường dẫn gốc thiếu `/attrs` nhận 405. |
 | **26** | Gateway Owner cố tình `PATCH` Gateway cha hoặc cố cập nhật trường `unit` của Sensor. | Với Gateway: `HTTP 403 Forbidden` (`forbidden`). Với Sensor `unit`: `HTTP 400 Bad Request` (`invalid_request`). | Client vô hiệu hóa form đổi tên Gateway đối với Owner; chặn trường `unit` trên form chỉnh sửa cảm biến. |
 | **27** | Vai trò `operator` hoặc `viewer` cố thực hiện `POST` hoặc `PATCH` Digital Twin. | `HTTP 403 Forbidden`, code `forbidden`, message `insufficient permissions`. | Ẩn toàn bộ nút tạo mới và chỉnh sửa trên giao diện đối với người dùng không phải owner/admin. |
 

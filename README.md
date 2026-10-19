@@ -423,38 +423,43 @@ Các route này đã được đăng ký trong router Go backend, có handler x�
 
 *Lưu ý về 4 endpoint Admin MQTT Credential*: Các route này đã được lập trình hoàn chỉnh trong code và kiểm thử trong harness test, nhưng trên cấu hình deployment thực tế mặc định bị vô hiệu hóa qua biến `MQTT_CREDENTIAL_API_ENABLED=false` (trả về lỗi an toàn HTTP `503 credential_runtime_disabled`). Chi tiết quy trình triển khai, hợp đồng API và giới hạn kỹ thuật xem tại [Tài liệu Kiến trúc DynSec](docs/dynsec/INDEX.md).
 
-#### 2. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
-Các route này đã được khai báo và đăng ký trong router Go backend nhưng chưa triển khai logic nghiệp vụ; yêu cầu Bearer JWT hợp lệ trước khi trả về HTTP `501 Not Implemented`:
+#### 2. Nhóm Endpoint Digital Twin Stage 4 (Chuẩn hóa theo ETSI GS CIM 009 V1.9.1 Profile):
+Các route này đã được triển khai hoàn chỉnh và kiểm thử tích hợp trên Go backend, hoạt động theo chuẩn ETSI GS CIM 009 V1.9.1 profile:
 
 | Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
 |---|---|---|---|---|
-| `GET` | `/v1/telemetry/history` | Bearer JWT `authenticated` | Truy vấn chuỗi lịch sử đo lường cảm biến (hỗ trợ downsampling `time_bucket`) | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
+| `GET` | `/v1/digital-twins` | Bearer JWT `authenticated` | Lấy danh sách thực thể Digital Twin mà người dùng có quyền (root array `[...]`, lọc theo `type=Gateway\|Sensor`, phân trang qua header `Link: <URI>; rel="next"`) | Đã triển khai: HTTP 200 OK (`application/ld+json`) |
+| `POST` | `/v1/digital-twins` | Bearer JWT (Gateway: Admin; Sensor: Admin/Owner) | Tạo mới hoặc phát lại chính xác thực thể Digital Twin (create-or-exact-replay) | Đã triển khai: HTTP 201 Created kèm header `Location: /v1/digital-twins/<escaped_urn>`; HTTP 200 OK replay (không Location); HTTP 409 Conflict |
+| `GET` | `/v1/digital-twins/{entity_id}` | Bearer JWT `authenticated` (thành viên trạm) | Lấy chi tiết thực thể dạng chuẩn JSON-LD normalized kèm context V1.9, mảng quan hệ `hasSensor`, phân trang qua header `Link`; hỗ trợ extension `?format=simplified` đọc trạng thái phẳng `twin_states` | Đã triển khai: HTTP 200 OK (`application/ld+json` cho detail, `application/json` cho state view) |
+| `PATCH` | `/v1/digital-twins/{entity_id}/attrs` | Bearer JWT (Gateway: Admin; Sensor: Admin/Owner) | Cập nhật siêu dữ liệu hiển thị (`name`, `description`) qua normalized Property fragment; Gateway xóa mô tả bằng `urn:ngsi-ld:null`; Sensor cấm sửa `unit` | Đã triển khai: HTTP 200 OK (no-op giữ nguyên timestamp). Đường dẫn gốc không có `/attrs` nhận HTTP 405 Method Not Allowed |
+| `GET` | `/v1/digital-twins/{entity_id}/temporal` | Bearer JWT `authenticated` (thành viên trạm) | Hợp nhất truy vấn lịch sử viễn trắc (`attrs=measurement`) và chu kỳ đo (`attrs=sample_interval_us`) cho Sensor; hỗ trợ raw tuples và bucket triples với 9 canonical durations; `totalCount` là số nguyên exact integer | Đã triển khai: HTTP 200 OK (`application/ld+json`) |
+
+*Ghi chú về 4 route cũ đã thu hồi:* Sau chuyển đổi V1.9.1, 4 route cũ gồm `GET /v1/telemetry/history` (404), `GET /v1/digital-twins/{entity_id}/state` (404), `GET /v1/digital-twins/{entity_id}/history` (404), và `PATCH /v1/digital-twins/{entity_id}` (405) đã bị thu hồi hoàn toàn.
+
+#### 3. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
+Hiện tại chỉ còn duy nhất 1 route stub cho WebSocket truyền dữ liệu thời gian thực (thuộc Giai đoạn 7):
+
+| Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
+|---|---|---|---|---|
 | `GET` | `/v1/ws` | Bearer JWT `authenticated` (header) | Nâng cấp kết nối WebSocket để streaming dữ liệu cảm biến thời gian thực | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
-| `GET` | `/v1/digital-twins` | Bearer JWT `authenticated` | Lấy danh sách thực thể Digital Twin mà người dùng có quyền truy cập | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
 
-*Ghi chú*: Cả 3 stub trên bắt buộc xác thực token người dùng trước khi phản hồi `501`. Mã lỗi `501` chỉ phản ánh việc endpoint chưa có handler nghiệp vụ, tuyệt đối không được coi là bằng chứng đã kiểm tra quyền User–Gateway thành công.
+#### 4. Nhóm Endpoint dự kiến theo thiết kế MVP (Planned Endpoints):
+Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ án nhưng **chưa được đăng ký trong router** Go backend. Mọi request gửi tới các đường dẫn này sẽ nhận phản hồi HTTP `404 Not Found`:
 
-#### 3. Nhóm Endpoint dự kiến theo thiết kế MVP (Planned Endpoints):
-Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ án nhưng **chưa được đăng ký trong router** Go backend. Mọi request gửi tới các đường dẫn này sẽ nhận phản hồi HTTP `404 Not Found` (hoặc `405 Method Not Allowed` nếu path trùng route khác):
-
-| Phương thức | Đường dẫn | Xác thực dự kiến | Mô tả theo thiết kế MVP |
-|---|---|---|---|
-| `POST` | `/v1/digital-twins` | Bearer JWT (Supabase) | Tạo mới thực thể Digital Twin (Gateway / Sensor / Device) |
-| `GET` | `/v1/digital-twins/{entity_id}` | Bearer JWT (Supabase) | Lấy thông tin chi tiết thực thể (định dạng NGSI-LD JSON) |
-| `PATCH` | `/v1/digital-twins/{entity_id}` | Bearer JWT (Supabase) | Cập nhật metadata / thuộc tính tĩnh của thực thể |
-| `GET` | `/v1/digital-twins/{entity_id}/state` | Bearer JWT (Supabase) | Xem trạng thái hiện thời (`reported_state` vs `desired_state`) |
-| `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Bearer JWT (Supabase) | Đặt cấu hình mong muốn (tạo lệnh và outbox trong transaction) |
-| `GET` | `/v1/digital-twins/{entity_id}/history` | Bearer JWT (Supabase) | Truy vấn lịch sử thuộc tính biến thiên theo thời gian (TimescaleDB) |
-| `POST` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Phát lệnh điều khiển trực tiếp (vd: reboot, capture_image) |
-| `GET` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Lấy danh sách chỉ lệnh đã phát cho thực thể |
-| `GET` | `/v1/commands/{command_id}` | Bearer JWT (Supabase) | Kiểm tra trạng thái thực thi của command |
-| `POST` | `/v1/media/upload-url` | Gateway HTTP Credential riêng | Cấp Signed Upload URL cho Gateway tải ảnh chụp lên private Storage |
+| Phương thức | Đường dẫn | Xác thực dự kiến | Mô tả theo thiết kế MVP | Giai đoạn |
+|---|---|---|---|---|
+| `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Bearer JWT (Supabase) | Đặt cấu hình mong muốn (tạo lệnh và outbox trong transaction) | Stage 5 |
+| `POST` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Phát lệnh điều khiển trực tiếp (vd: reboot, capture_image) | Stage 5 |
+| `GET` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Lấy danh sách chỉ lệnh đã phát cho thực thể | Stage 5 |
+| `GET` | `/v1/commands/{command_id}` | Bearer JWT (Supabase) | Kiểm tra trạng thái thực thi của command | Stage 5 |
+| `POST` | `/v1/media/upload-url` | Gateway HTTP Credential riêng | Cấp Signed Upload URL cho Gateway tải ảnh chụp lên private Storage | Stage 8 |
 
 *Lưu ý quan trọng về các tuyến đường không tồn tại*:
-- Router Go backend hiện **KHÔNG CÓ** endpoint xem chi tiết Gateway đơn lẻ (`GET /v1/gateways/{gateway_id}`) hay Sensor đơn lẻ (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`). Việc đọc danh sách Sensor được thực hiện thông qua route cha `GET /v1/gateways/{gateway_id}/sensors`.
+- Router Go backend hiện **KHÔNG CÓ** endpoint xem chi tiết Gateway đơn lẻ (`GET /v1/gateways/{gateway_id}`) hay Sensor đơn lẻ (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`). Việc đọc danh sách Sensor được thực hiện thông qua route cha `GET /v1/gateways/{gateway_id}/sensors` hoặc endpoint Digital Twin detail `GET /v1/digital-twins/{entity_id}`.
 - Hệ thống hiện **KHÔNG CÓ** REST API công khai hay admin để quản lý thành viên (`user_gateways`). Việc phân quyền, thay đổi vai trò (Owner / Operator / Viewer) hoặc thu hồi quyền thành viên Gateway được thực hiện thông qua công cụ vận hành nội bộ được bảo vệ (protected operator tooling) can thiệp trực tiếp CSDL. Không tuyên bố các API quản lý tài khoản tương lai này là đã hoàn thành.
+- **Mã nguồn ứng dụng Flutter Web client và bộ sưu tập Bruno API collections chưa được cập nhật theo hợp đồng mới** trong đợt bàn giao tài liệu này.
 
-#### 4. Danh mục tính năng tạm hoãn ngoài phạm vi MVP (Deferred Features per AGENTS.md §2):
+#### 5. Danh mục tính năng tạm hoãn ngoài phạm vi MVP (Deferred Features per AGENTS.md §2):
 Các tính năng sau đây đã được quyết định loại bỏ hoặc hoãn lại để đảm bảo tính khả thi cho đồ án đơn thành viên, tránh làm phức tạp kiến trúc và giao diện:
 - **gRPC và gRPC-Web**: Toàn bộ giao tiếp sử dụng REST và WebSocket nhằm loại bỏ chi phí Protobuf, code-generation và proxy phức tạp.
 - **Đăng ký công khai người dùng**: Tự đăng ký (`/auth/v1/signup`) bị vô hiệu hóa; chỉ platform admin được tạo tài khoản người dùng.

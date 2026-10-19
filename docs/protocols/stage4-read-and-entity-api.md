@@ -1,31 +1,29 @@
 # Contract đọc lịch sử và quản lý entity Stage 4
 
-> **Trạng thái: Stage 4 API IMPLEMENTED & TESTED; Task 4.8 tài liệu đã đối soát ngày 18/10/2026 (chưa commit). CI tại `aa7436d` áp dụng cho code đã chạy, không phải diff tài liệu mới.**
-> Toàn bộ bảy endpoint Stage 4 (`GET /v1/telemetry/history`, `GET /v1/digital-twins`,
-> `GET /v1/digital-twins/:entity_id`, `GET /v1/digital-twins/:entity_id/state`,
-> `GET /v1/digital-twins/:entity_id/history`, `POST /v1/digital-twins`,
-> `PATCH /v1/digital-twins/:entity_id`) đã được **triển khai đầy đủ trên runtime**
-> (Tasks 4.1–4.6) và **kiểm thử tích hợp, đo lường query, CI thành công** (Task 4.7).
-> Toàn bộ 7 route này đã được đăng ký và mount thực tế trong `src/internal/httpserver/router.go`
-> dưới nhóm xác thực `/v1` (thay thế các stub cũ; chỉ có `GET /v1/ws` giữ stub `501 not_implemented` thuộc Stage 7 WebSocket).
-> Remote CI GitHub Actions [run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379)
-> tại commit `aa7436d8838a6580c21b30930e2eed992999b11c` đã **thành công 16/16 jobs**, bao gồm
-> `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`.
-> Tài liệu tổng kết và bàn giao Stage 4 xem tại [docs/backend/stage-4-history-and-twin-api.md](../backend/stage-4-history-and-twin-api.md);
-> báo cáo tích hợp xem tại [docs/backend/stage-4-task-4.7-integration-and-ci.md](../backend/stage-4-task-4.7-integration-and-ci.md);
-> kết quả đo lường query local xem tại [docs/backend/stage-4-task-4.7-summary.json](../backend/stage-4-task-4.7-summary.json).
+> **Trạng thái: Stage 4 API MIGRATED TO ETSI GS CIM 009 V1.9.1 PROFILE (5 CANONICAL ENDPOINTS); Tasks N0–N7 hoàn tất, CI xanh tại `449697d` (19/10/2026).**
+> Hệ thống ban đầu hoàn thành bảy endpoint Stage 4 (Tasks 4.1–4.7, baseline `aa7436d`, remote CI [run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379) 16/16 jobs).
+> Tiếp theo, hệ thống đã hoàn thành kế hoạch chuyển đổi giao diện theo chuẩn **ETSI GS CIM 009 V1.9.1** ([`docs/backend_plan/digital_twin_ngsi_ld_v1.9.1_migration_plan.md`](../../../docs/backend_plan/digital_twin_ngsi_ld_v1.9.1_migration_plan.md)),
+> rút gọn và chuẩn hóa thành **đúng năm (05) endpoint Digital Twin** chính thức trong `src/internal/httpserver/router.go`:
+> 1. `GET /v1/digital-twins` (Danh sách thực thể summary dạng root array `[...]`, query `type`/`cursor`, phân trang header `Link`).
+> 2. `POST /v1/digital-twins` (Khởi tạo thực thể create-or-exact-replay, trả header `Location: /v1/digital-twins/<escaped_urn>` khi `201 Created`).
+> 3. `GET /v1/digital-twins/:entity_id` (Chi tiết thực thể JSON-LD normalized kèm context V1.9; hỗ trợ extension `?format=simplified` đọc trạng thái phẳng `twin_states`).
+> 4. `PATCH /v1/digital-twins/:entity_id/attrs` (Cập nhật metadata qua fragment Property chuẩn hóa; hỗ trợ `urn:ngsi-ld:null` để xóa mô tả Gateway).
+> 5. `GET /v1/digital-twins/:entity_id/temporal` (Hợp nhất lịch sử telemetry và temporal history; hỗ trợ `attrs=measurement` / `attrs=sample_interval_us`, raw tuples 2 phần tử, bucket triples 3 phần tử, 9 duration chuẩn hóa, `totalCount` số nguyên exact integer).
 >
-> *Ghi chú bảo lưu mốc lịch sử Task 4.0:* Các khối ghi nhận "DESIGN ONLY", "chưa triển khai"
-> hoặc "stub 501" trong các mục kế tiếp phản ánh **checkpoint thiết kế ban đầu tại Task 4.0**
-> (ngày 16–17/10/2026, commit `2ce3a89`) và được giữ lại làm hồ sơ kỹ thuật lịch sử,
-> không phản ánh trạng thái mã nguồn và runtime sau khi Tasks 4.1–4.7 hoàn tất.
+> Bốn route cũ (`GET /v1/telemetry/history`, `GET /v1/digital-twins/:entity_id/state`, `GET /v1/digital-twins/:entity_id/history`, `PATCH /v1/digital-twins/:entity_id`) đã được **thu hồi hoàn toàn** (trả về `404 Not Found` hoặc `405 Method Not Allowed`). Route WebSocket `GET /v1/ws` tiếp tục giữ stub `501 not_implemented` cho Stage 7.
+>
+> **Bằng chứng Remote CI sau chuyển đổi:**
+> GitHub Actions [run 39185129590](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590) tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e` đã **thành công toàn bộ 16/16 jobs**, bao gồm
+> `stage4-api-integration` ([job 117847592389](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117847592389)),
+> `stage3-uplink-integration` và `native-compose-smoke` ([job 117848365641](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117848365641)).
+>
+> Báo cáo kỹ thuật tổng kết và lịch sử chuyển đổi xem tại [docs/backend/stage-4-history-and-twin-api.md](../backend/stage-4-history-and-twin-api.md).
+>
+> *Ghi chú bảo lưu mốc lịch sử:* Các nội dung thiết kế ban đầu của Task 4.0 và hồ sơ 7-endpoint ban đầu được lưu giữ làm bằng chứng tiến trình kỹ thuật lịch sử.
 
-**Ngày lập:** 16/10/2026 (hoàn tất Task 4.0: 17/10/2026; cập nhật implementation Task 4.8: 18/10/2026).
+**Ngày lập:** 16/10/2026 (hoàn tất Task 4.0: 17/10/2026; cập nhật Task 4.8: 18/10/2026; cập nhật V1.9.1 migration Task N8: 19/10/2026).
 
-**Phạm vi:** Đặc tả contract kỹ thuật cho 7 endpoints đọc lịch sử, truy vấn Digital Twin và mutation metadata Stage 4.
-Đã phục hồi selector API HTTP `value` và `sample_interval_us` cho Twin history theo đúng Stage 4 plan;
-mapper representation JSON-LD giữ public terms `measurement` và `sampleIntervalUs` với bảng ánh xạ tường minh;
-đã kiểm tra và xác thực toàn bộ JSON fences, cursor schemas, bounds, links và whitespace.
+**Phạm vi:** Đặc tả contract kỹ thuật cho 5 endpoints Digital Twin chuẩn hóa theo ETSI GS CIM 009 V1.9.1 project profile, cùng bảng ánh xạ chuyển đổi từ 7 endpoint cũ.
 
 Các đường dẫn source trong dấu backtick tính từ gốc `main_src/`. Liên kết Markdown
 tính từ vị trí tài liệu này.
@@ -47,31 +45,48 @@ tính từ vị trí tài liệu này.
   Revision này trùng mốc khảo sát ban đầu của [Task 4.0 detail plan](../../../docs/backend_plan/task_4.0_detail_plan.md)
   và [Stage 4 plan](../../../docs/backend_plan/stage4_backend_detailed_plan.md).
 
-- **Mốc hoàn thành triển khai & kiểm thử Stage 4 (Task 4.7 / Task 4.8, 18/10/2026):**
+- **Mốc hoàn thành triển khai & kiểm thử Stage 4 ban đầu (Task 4.7 / Task 4.8, 18/10/2026):**
   ```text
   branch:  develop
   HEAD:    aa7436d8838a6580c21b30930e2eed992999b11c
   worktree: clean (tại thời điểm bắt đầu Task 4.8)
   HEAD subject: ci: cấp quyền actions read cho job stage4-api-integration
   ```
-  Chuỗi commit hoàn thành Stage 4 trên `develop`: Task 4.4 (`42dda31`), Task 4.5 (`f7a51bb`),
+  Chuỗi commit hoàn thành Stage 4 ban đầu: Task 4.4 (`42dda31`), Task 4.5 (`f7a51bb`),
   Task 4.6 (`e6e304d`), Task 4.7 (`6257f80`), và các bản sửa CI (`65d727b`, `aa7436d`).
 
-### 1.2. Bằng chứng CI (lịch sử Stage 3 và nghiệm thu Stage 4)
+- **Mốc hoàn thành chuyển đổi ETSI GS CIM 009 V1.9.1 (Tasks N0–N7 / N8, 19/10/2026):**
+  ```text
+  branch:  develop
+  HEAD:    449697ddbd8ba53173a3cd885c0d6804458cc81e
+  worktree: clean
+  HEAD subject: test(integration): đồng bộ kịch bản kiểm thử Stage 4 và bộ so sánh lịch sử theo API mới
+  ```
+  Chuỗi commit chuyển đổi 5 endpoint NGSI-LD: `43d5340`, `fe67ae9`, `8fd4dc3`, `2427f5a`, `aa8bbe1`, `449697d`.
+
+### 1.2. Bằng chứng CI (lịch sử Stage 3, Stage 4 ban đầu và sau chuyển đổi V1.9.1)
 
 - **Mốc lịch sử Stage 3 (tại thời điểm Task 4.0 bắt đầu):**
   GitHub Actions run **38891798340** tại commit `2ce3a89ebd6b95f46e17cd535c5400f2ba5ca6bd` (viết ngắn `2ce3a89`),
   cả **15 jobs** hoàn thành thành công, bao gồm `stage3-uplink-integration` và `native-compose-smoke`.
   Run URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/38891798340>.
-- **Nghiệm thu remote CI Stage 4 (Tasks 4.1–4.7 hoàn tất):**
+- **Nghiệm thu remote CI Stage 4 ban đầu (Tasks 4.1–4.7 hoàn tất):**
   GitHub Actions run **39103564379** tại commit `aa7436d8838a6580c21b30930e2eed992999b11c`, cả **16/16 jobs**
   hoàn thành thành công, bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`.
   Run URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379>.
-  Các ghi chú "NOT RUN" trước đây phản ánh checkpoint trước khi push/dispatch CI; hiện remote CI Stage 4 đã được xác minh PASS.
+- **Nghiệm thu remote CI sau chuyển đổi ETSI GS CIM 009 V1.9.1 (Tasks N0–N7 hoàn tất):**
+  GitHub Actions run **39185129590** tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e`, cả **16/16 jobs**
+  hoàn thành thành công:
+  - Overall Run URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590>.
+  - `stage4-api-integration` job URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117847592389>.
+  - `native-compose-smoke` job URL: <https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117848365641>.
+  - `stage3-uplink-integration` job thành công.
+  Các phát hiện từ closure review đã được giải quyết: 4 findings ban đầu đã CLOSED, lỗi MIME RFC 2231 extended parameter `q*` đã được khắc phục triệt để và CI xanh trên commit hoàn chỉnh.
 - **Lưu ý về nguồn số đo local:** Báo cáo tóm tắt đo lường local trong [docs/backend/stage-4-task-4.7-summary.json](../backend/stage-4-task-4.7-summary.json)
   ghi nhận revision dirty baseline và Docker image IDs của lần đo gốc (`sha256:9e6acf90d81657c3d76c7740cd35140f9c8f1e96896249478154225db92cf99a`
   cho backend và `sha256:58fe698a9e5e6586dd8c2b7c8017e2095e270be2e728ad4c3356edad44a48d09` cho gateway);
-  không bị ghi đè hay gán sang commit CI mới.
+  không bị ghi đè hay gán sang commit CI mới. Cần phân biệt rõ giữa bằng chứng native container thực tế và việc các job CI kế thừa chạy xanh không có nghĩa là mọi kịch bản native bỏ qua đều đã chạy lại.
+- **Extension danh sách phẳng `format=simplified` (chưa vào remote CI):** Tính năng `GET /v1/digital-twins?format=simplified` được kiểm chứng **local** trên worktree **dirty** kế thừa baseline `449697ddbd8ba53173a3cd885c0d6804458cc81e`: `python3 -m unittest discover -s scripts/tests` **885 tests PASS**; các gói Go ảnh hưởng (`internal/httpserver`, `cmd/server`) `go test -race`, `go build`, `go vet`, `golangci-lint` (0 issues) PASS; và `scripts/test-stage4-api.sh --scenario all --require-run` PASS trên dịch vụ thật. Remote CI run **39185129590** tại `449697d` **KHÔNG** bao phủ tính năng mới này (được thêm **sau** thời điểm đó); remote CI cho tính năng này **NOT RUN**, và **không** gán lại số đo mới cho commit/run cũ.
 
 ### 1.3. Schema, DB role, RLS và retention
 
@@ -124,29 +139,31 @@ tính từ vị trí tài liệu này.
   `sensor_handlers.go`): trả `{"items":[...]}`, luôn `Cache-Control: no-store`, và
   **từ chối** query param `user_id` (`400`) — không nhận identity từ query.
 
-### 1.5. Trạng thái route (đối chiếu lịch sử Task 4.0 và runtime hiện hành)
+### 1.5. Trạng thái route (đối chiếu lịch sử Task 4.0, Stage 4 ban đầu và runtime hiện hành sau chuyển đổi V1.9.1)
 
-Bảng dưới đây ghi nhận trạng thái route trong `src/internal/httpserver/router.go`:
+Bảng dưới đây ghi nhận trạng thái route trong `src/internal/httpserver/router.go` qua các mốc phát triển:
 
-| Method / route | Trạng thái tại Task 4.0 (Lịch sử) | Trạng thái Runtime hiện tại (Tasks 4.1–4.7 hoàn tất) | Ghi chú |
-| --- | --- | --- | --- |
-| `GET /v1/admin/gateways` | Đã có | Đã có | Platform admin inventory, keyset `after`/`limit` (default 100, max 200). |
-| `PUT /v1/admin/gateways/:gateway_id` | Đã có | Đã có | Admin provision Gateway (create-or-exact-replay). |
-| `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Đã có | Admin provision Sensor. |
-| `PUT /v1/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Đã có | Owner provision Sensor. |
-| `GET /v1/me/permissions` | Đã có | Đã có | Trả quyền của principal. |
-| `GET /v1/gateways` | Đã có | Đã có | List Gateway theo membership của user. |
-| `GET /v1/gateways/:gateway_id/sensors` | Đã có | Đã có | List Sensor theo gateway + membership. |
-| `GET /v1/telemetry/history` | **501 stub** | **Đã triển khai** | Handler `getTelemetryHistory`, query telemetry raw/bucket theo membership (Task 4.2, 4.6). |
-| `GET /v1/digital-twins` | **501 stub** | **Đã triển khai** | Handler `listDigitalTwins`, keyset pagination `v1.` theo membership (Task 4.3, 4.6). |
-| `POST /v1/digital-twins` | Chưa đăng ký | **Đã triển khai** | Handler `postDigitalTwin`, admin/owner metadata creation/replay (Task 4.5, 4.6). |
-| `GET /v1/digital-twins/:entity_id` | Chưa đăng ký | **Đã triển khai** | Handler `getDigitalTwinDetail`, JSON-LD entity + phân trang quan hệ (Task 4.3, 4.6). |
-| `PATCH /v1/digital-twins/:entity_id` | Chưa đăng ký | **Đã triển khai** | Handler `patchDigitalTwin`, admin/owner metadata mutation allowlist (Task 4.5, 4.6). |
-| `GET /v1/digital-twins/:entity_id/state` | Chưa đăng ký | **Đã triển khai** | Handler `getDigitalTwinState`, JSONB state view snapshot 9 cột `twin_states` (Task 4.3, 4.6). |
-| `GET /v1/digital-twins/:entity_id/history` | Chưa đăng ký | **Đã triển khai** | Handler `getDigitalTwinHistory`, selector `value`/`sample_interval_us` (Task 4.4, 4.6). |
-| `GET /v1/ws` | **501 stub** | **501 stub** | WebSocket realtime streaming chưa triển khai (thuộc Stage 7). |
+| Method / route | Trạng thái tại Task 4.0 (Lịch sử) | Trạng thái Stage 4 ban đầu (Tasks 4.1–4.7) | Trạng thái Runtime hiện tại (Sau chuyển đổi V1.9.1) | Ghi chú chuyển đổi & Phân loại |
+| --- | --- | --- | --- | --- |
+| `GET /v1/admin/gateways` | Đã có | Đã có | **Đã có (Giữ nguyên)** | Platform admin inventory, keyset `after`/`limit` (default 100, max 200). |
+| `PUT /v1/admin/gateways/:gateway_id` | Đã có | Đã có | **Đã có (Giữ nguyên)** | Admin provision Gateway (create-or-exact-replay). |
+| `PUT /v1/admin/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Đã có | **Đã có (Giữ nguyên)** | Admin provision Sensor. |
+| `PUT /v1/gateways/:gateway_id/sensors/:sensor_id` | Đã có | Đã có | **Đã có (Giữ nguyên)** | Owner provision Sensor. |
+| `GET /v1/me/permissions` | Đã có | Đã có | **Đã có (Giữ nguyên)** | Trả quyền của principal. |
+| `GET /v1/gateways` | Đã có | Đã có | **Đã có (Giữ nguyên)** | List Gateway theo membership của user. |
+| `GET /v1/gateways/:gateway_id/sensors` | Đã có | Đã có | **Đã có (Giữ nguyên)** | List Sensor theo gateway + membership. |
+| `GET /v1/digital-twins` | stub `501 not_implemented` | Đã triển khai | **Đã triển khai (Endpoint #1)** | Handler `listDigitalTwins`, query `type`/`cursor`, root array summary `[...]`, phân trang qua header `Link`. |
+| `POST /v1/digital-twins` | Chưa đăng ký | Đã triển khai | **Đã triển khai (Endpoint #2)** | Handler `postDigitalTwin`, tạo mới/exact-replay; trả `Location: /v1/digital-twins/<escaped_urn>` khi 201 Created. |
+| `GET /v1/digital-twins/:entity_id` | Chưa đăng ký | Đã triển khai | **Đã triển khai (Endpoint #3)** | Handler `getDigitalTwinDetail`, JSON-LD entity normalized (mặc định) hoặc JSON state view khi `?format=simplified`. |
+| `PATCH /v1/digital-twins/:entity_id/attrs` | Chưa đăng ký | Chưa đăng ký | **Đã triển khai (Endpoint #4)** | Handler `patchDigitalTwin`, nhận Property fragment chuẩn hóa (`name`, `description`); sentinel `urn:ngsi-ld:null` xóa mô tả. |
+| `GET /v1/digital-twins/:entity_id/temporal` | Chưa đăng ký | Chưa đăng ký | **Đã triển khai (Endpoint #5)** | Handler `getDigitalTwinTemporal`, hợp nhất truy vấn telemetry và temporal history của Sensor (`attrs=measurement\|sample_interval_us`). |
+| `GET /v1/telemetry/history` | stub `501 not_implemented` | Đã triển khai | **ĐÃ THU HỒI (404 Not Found)** | Hợp nhất vào `GET /v1/digital-twins/:entity_id/temporal?attrs=measurement`. |
+| `GET /v1/digital-twins/:entity_id/state` | Chưa đăng ký | Đã triển khai | **ĐÃ THU HỒI (404 Not Found)** | Thay thế bằng extension `GET /v1/digital-twins/:entity_id?format=simplified`. |
+| `GET /v1/digital-twins/:entity_id/history` | Chưa đăng ký | Đã triển khai | **ĐÃ THU HỒI (404 Not Found)** | Hợp nhất vào `GET /v1/digital-twins/:entity_id/temporal`. |
+| `PATCH /v1/digital-twins/:entity_id` | Chưa đăng ký | Đã triển khai | **ĐÃ THU HỒI (405 Method Not Allowed)** | Thay thế bằng `PATCH /v1/digital-twins/:entity_id/attrs` (path gốc không còn nhận PATCH). |
+| `GET /v1/ws` | stub `501 not_implemented` | stub `501 not_implemented` | **stub 501 (Giữ nguyên)** | WebSocket realtime streaming chưa triển khai (thuộc Stage 7). |
 
-Toàn bộ bảy route nghiệp vụ Stage 4 đã được đăng ký và hoạt động đầy đủ trong `router.go`. Chỉ duy nhất `/v1/ws` giữ stub `501 not_implemented` cho Stage 7.
+Hiện tại, nhóm Digital Twin chính thức gồm đúng **năm (05) endpoint** được đăng ký trong `router.go`. Bốn route cũ bị loại bỏ hoàn toàn, không có alias hay chuyển hướng ngầm định. Chỉ duy nhất `/v1/ws` giữ stub `501 not_implemented` cho Stage 7.
 
 ---
 
@@ -523,31 +540,57 @@ state). Sai graph → `ReasonResourceGraphIncomplete`; Gateway/Sensor không t�
 
 ---
 
-## 7. Contract Task 4.0.2 — danh sách endpoint, identity và quyền
+## 7. Contract Digital Twin — Danh sách Endpoint, Chuyển đổi V1.9.1, Identity và Phân quyền
 
-Bước **4.0.2** chốt **đúng bảy** endpoint, cách resolve identity công khai và hai ma
-trận quyền. DTO chi tiết, examples, time range `[from,to)`, raw/bucket,
-cursor/pagination, representation/context và bảng error đầy đủ thuộc Task
-4.0.4–4.0.6.
-*Lưu ý mốc checkpoint:* Các ghi chú "thiết kế ban đầu" phản ánh mốc Task 4.0 (16/10/2026).
-Hiện tại, cả bảy endpoint đã được triển khai đầy đủ (Tasks 4.1–4.6) và kiểm chứng tích hợp (Task 4.7).
+Sau khi hoàn tất kế hoạch chuyển đổi giao diện theo chuẩn **ETSI GS CIM 009 V1.9.1** (Tasks N0–N7, commit `449697d`, CI [run 39185129590](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590)), hệ thống chốt đúng **năm (05) endpoint Digital Twin** chính thức.
 
-### 7.1. Bảy endpoint
+### 7.1. Năm Endpoint Chuẩn hóa Hiện hành và Bảng Ánh xạ Chuyển đổi
 
-| # | Method / path | Trạng thái tại Task 4.0 (Lịch sử) | Trạng thái Runtime hiện tại | Input chính (tóm tắt) | Output chính (tóm tắt) |
+#### Bảng 1: Năm Endpoint Digital Twin Chuẩn hóa Hiện hành
+
+| # | Method / Path | Tên chức năng | Input chính | Output chính & Headers | Quyền truy cập |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `GET /v1/telemetry/history` | stub `501 not_implemented` | **Đã triển khai & kiểm thử** (Task 4.2, 4.6, 4.7) | `gateway_id`, `sensor_id`, `from`, `to`; optional `resolution`, `max_points` | một series raw hoặc bucket đã scope membership + metadata range/unit/mode/số điểm |
-| 2 | `GET /v1/digital-twins` | stub `501 not_implemented` | **Đã triển khai & kiểm thử** (Task 4.3, 4.6, 4.7) | optional `gateway_id`, `entity_type=Gateway\|Sensor`, `limit`, `after` | `items` (summary) + `next_cursor`; chỉ entity thuộc membership |
-| 3 | `GET /v1/digital-twins/{entity_id}` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.3, 4.6, 4.7) | `entity_id` URN URL-encoded; tham số phân trang quan hệ | entity view NGSI-LD-compatible + trang quan hệ bounded + `next_cursor` |
-| 4 | `GET /v1/digital-twins/{entity_id}/state` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.3, 4.6, 4.7) | `entity_id` URN URL-encoded | reported/desired JSONB, versions, `last_*_at`, audit được phép đọc |
-| 5 | `GET /v1/digital-twins/{entity_id}/history` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.4, 4.6, 4.7) | `entity_id`; `property`, `from`, `to`; optional `resolution`, `max_points` | series temporal (`property=value` ánh xạ raw telemetry; `property=sample_interval_us` đọc typed temporal) |
-| 6 | `POST /v1/digital-twins` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.5, 4.6, 4.7) | DTO admin: `entity_type` + identifier + name/metadata allowlist (Gateway cần owner profile) | `201` mới / `200` exact replay / `409` conflict |
-| 7 | `PATCH /v1/digital-twins/{entity_id}` | chưa đăng ký | **Đã triển khai & kiểm thử** (Task 4.5, 4.6, 4.7) | `entity_id` + allowlist `name`/`description` có presence/null semantics | `200` sau transaction metadata (không side effect state/command) |
+| 1 | `GET /v1/digital-twins` | Danh sách thực thể (List Entities) | Query: `type=Gateway\|Sensor`, `gateway_id`, `limit`, `cursor`; extension `format=simplified` | Mặc định: Mảng root array Entities `[...]` (`application/ld+json`); Nếu `format=simplified`: mảng summary **phẳng** (`application/json`, không `@context`); phân trang qua header `Link: <URI>; rel="next"` | JWT `authenticated`, scope `user_gateways` |
+| 2 | `POST /v1/digital-twins` | Khởi tạo thực thể (Create/Replay Entity) | Body JSON: `entity_type` (`Gateway` hoặc `Sensor`), ID, `name`, `unit`, `owner_user_id` (nếu Gateway) | `201 Created` kèm header `Location: /v1/digital-twins/<escaped_urn>` (mới); `200 OK` (exact replay, không Location); `409` conflict | Gateway: Platform Admin; Sensor: Platform Admin hoặc Gateway Owner |
+| 3 | `GET /v1/digital-twins/:entity_id` | Chi tiết thực thể hoặc State View | Path: `entity_id` (URN); Query: `relationship_limit`, `relationship_after`, hoặc extension `format=simplified` | Mặc định: Normalized Entity detail (`application/ld+json`) kèm `@context` V1.9, mảng quan hệ `hasSensor` và header `Link`; Nếu `format=simplified`: JSON state view phẳng (`twin_states`) | JWT `authenticated`, thành viên trạm trong `user_gateways` |
+| 4 | `PATCH /v1/digital-twins/:entity_id/attrs` | Cập nhật siêu dữ liệu (Patch Attributes) | Path: `entity_id` (URN); Body normalized Property fragment (`name`, `description`); sentinel `urn:ngsi-ld:null` | `200 OK` metadata response DTO (`application/json`), giữ nguyên `updated_at` nếu no-op | Gateway: Platform Admin; Sensor: Platform Admin hoặc Gateway Owner |
+| 5 | `GET /v1/digital-twins/:entity_id/temporal` | Lịch sử chuỗi thời gian & thuộc tính (Temporal History) | Path: `entity_id` (URN Sensor); Query: `attrs`, `timerel=between`, `timeAt`, `endTimeAt`, `aggrPeriodDuration`, `aggrMethods`, `format` | Normalized temporal representation (`application/ld+json`): raw tuples `[val, observedAt]` hoặc bucket triples `[res, start, end]`, `totalCount` số nguyên exact integer | JWT `authenticated`, thành viên trạm trong `user_gateways` |
 
-Tại mốc thiết kế Task 4.0, chỉ #1 và #2 có route stub `501` và #3–#7 chưa được đăng ký.
-Sau khi Tasks 4.1–4.6 hoàn tất, cả 7 route đã được mount đầy đủ trong `router.go`, nối các
-service/repository/parser tương ứng và được xác minh qua kịch bản tích hợp cùng CI (Task 4.7).
-Field/defaults/bounds, ví dụ và cursor chi tiết do Task 4.0.3–4.0.6 chốt ở các mục sau.
+#### Bảng 2: Bảng Ánh xạ Chuyển đổi (Migration Mapping: 7 Route Cũ → 5 Route Mới)
+
+| Route cũ (Stage 4 ban đầu) | Endpoint mới (V1.9.1 Profile) | Thay đổi Wire / Request & Response | Hành vi khi gọi route cũ |
+| --- | --- | --- | --- |
+| `GET /v1/digital-twins` | `GET /v1/digital-twins` | Query `type` thay `entity_type`; `cursor` thay `after`. Body đổi từ `{items, next_cursor}` sang mảng trực tiếp `[...]`. Phân trang chuyển vào header `Link`. | Endpoint vẫn giữ nhưng đổi tham số: dùng tham số cũ nhận `400 Bad Request`. |
+| `GET /v1/digital-twins/:id` | `GET /v1/digital-twins/:id` | Quan hệ `hasSensor` có `object: [...]` là mảng URI và `objectType: "Sensor"`. Xóa `hasSensor_next_cursor` khỏi body; phân trang quan hệ qua header `Link`. Sensor detail tích hợp `measurement` và `sample_interval_us` mới nhất kèm mã `unitCode` UN/CEFACT. | Endpoint giữ nguyên, cập trúc JSON-LD chuẩn. |
+| `GET /v1/digital-twins/:id/state` | `GET /v1/digital-twins/:id?format=simplified` | Thay vì endpoint con riêng, state view phẳng trở thành project presentation extension qua query `?format=simplified`. Giữ nguyên số nguyên lớn và version chuỗi. | Route cũ bị xóa: nhận `404 Not Found`. |
+| `GET /v1/telemetry/history` | `GET /v1/digital-twins/:id/temporal?attrs=measurement` | Hợp nhất vào temporal endpoint của Sensor. Yêu cầu `timerel=between`, `timeAt`/`endTimeAt` UTCZ. Bỏ envelope cũ; raw trả về `values: [[val, time]]`. | Route cũ bị xóa: nhận `404 Not Found`. |
+| `GET /v1/digital-twins/:id/history` | `GET /v1/digital-twins/:id/temporal` | Dùng `attrs=measurement` (hoặc alias `attrs=value`) cho telemetry, hoặc `attrs=sample_interval_us` cho chu kỳ đo. Hỗ trợ 9 duration chuẩn hóa và `aggrMethods`. | Route cũ bị xóa: nhận `404 Not Found`. |
+| `POST /v1/digital-twins` | `POST /v1/digital-twins` | Giữ nguyên DTO provisioning create-or-exact-replay; bổ sung header `Location: /v1/digital-twins/<escaped_urn>` khi trả `201 Created`. | Endpoint giữ nguyên. |
+| `PATCH /v1/digital-twins/:id` | `PATCH /v1/digital-twins/:id/attrs` | Chuyển path sang `/attrs`. Body nhận normalized Property fragment thay vì JSON phẳng. Xóa mô tả bằng `{"description":{"type":"Property","value":"urn:ngsi-ld:null"}}`. | Route gốc bị bỏ: nhận `405 Method Not Allowed` khi gửi PATCH. |
+
+#### Bảng 3: Ranh giới Project Profile so với Chuẩn ETSI Toàn phần (Explicit Deviations)
+Hệ thống là một **Project API Profile áp dụng các cấu trúc ETSI GS CIM 009 V1.9.1 được lựa chọn**, KHÔNG PHẢI là triển khai đầy đủ của một Context Broker:
+- Base path dự án là `/v1/digital-twins` (không dùng base path `/ngsi-ld/v1/entities` hay `/ngsi-ld/v1/temporal/entities`).
+- Không hỗ trợ Subscriptions, Temporal Subscriptions, Registrations/Federation, Context Hosting ngoài mạng.
+- State view `?format=simplified` là tiện ích đọc nhanh `twin_states` phẳng của dự án, không phải phép rút gọn compaction theo Clause 4.5.4 của chuẩn.
+- Bảng ánh xạ đơn vị UN/CEFACT trong mapper (`uncefactUnitMap`) là tập hợp cố định hỗ trợ các ký hiệu chuẩn: `degC`/`CEL` $\rightarrow$ `CEL`, `%`/`%RH` $\rightarrow$ `P1`, `rad` $\rightarrow$ `C81`, `V` $\rightarrow$ `VLT`, `mV` $\rightarrow$ `2Z`, `A` $\rightarrow$ `AMP`, `mA` $\rightarrow$ `4K`, `Pa` $\rightarrow$ `PAL`, `hPa` $\rightarrow$ `A97`, `s` $\rightarrow$ `SEC`, `ms` $\rightarrow$ `C26`, `us` $\rightarrow$ `B98`, `m` $\rightarrow$ `MTR`, `cm` $\rightarrow$ `CMT`, `mm` $\rightarrow$ `MMT`, `kg` $\rightarrow$ `KGM`, `g` $\rightarrow$ `GRM`, `Hz` $\rightarrow$ `HTZ`, `kHz` $\rightarrow$ `KHZ`, `MHz` $\rightarrow$ `MHZ`, `lx`/`lux` $\rightarrow$ `LUX`, `dB` $\rightarrow$ `2N`, `ppm` $\rightarrow$ `59`, `ppb` $\rightarrow$ `61`, `W` $\rightarrow$ `WTT`, `kW` $\rightarrow$ `KWT`, `J` $\rightarrow$ `JOU`, `K` $\rightarrow$ `KEL`, `deg` $\rightarrow$ `DD`, `rpm` $\rightarrow$ `RPM`. Các ký hiệu chưa có mapping (như `m/s`, `percent`, hoặc symbol tùy biến) được giữ nguyên dưới Property riêng `measurementUnit` ở root entity, tuyệt đối không tự chế mã `unitCode`.
+- Quản trị tài khoản, cấp phát chứng chỉ MQTT và phân quyền thành viên hoàn toàn tách biệt, tuân thủ nguyên tắc quản trị tập trung (AGENTS.md mục 6.5).
+
+*Ghi chú bảo lưu lịch sử Task 4.0:*
+Bảng dưới đây lưu vết trạng thái 7 endpoints ban đầu khi thiết kế Task 4.0:
+
+| # | Method / path | Trạng thái tại Task 4.0 (Lịch sử) | Trạng thái Stage 4 ban đầu | Input chính (tóm tắt) | Output chính (tóm tắt) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `GET /v1/telemetry/history` | stub `501 not_implemented` | Đã triển khai (Task 4.2) | `gateway_id`, `sensor_id`, `from`, `to`; optional `resolution`, `max_points` | một series raw hoặc bucket đã scope membership + metadata range/unit/mode/số điểm |
+| 2 | `GET /v1/digital-twins` | stub `501 not_implemented` | Đã triển khai (Task 4.3) | optional `gateway_id`, `entity_type`, `limit`, `after` | `items` (summary) + `next_cursor`; chỉ entity thuộc membership |
+| 3 | `GET /v1/digital-twins/{entity_id}` | chưa đăng ký | Đã triển khai (Task 4.3) | `entity_id` URN; tham số quan hệ `relation_limit`, `relation_cursor` | entity view NGSI-LD-compatible + trang quan hệ bounded + `next_cursor` |
+| 4 | `GET /v1/digital-twins/{entity_id}/state` | chưa đăng ký | Đã triển khai (Task 4.3) | `entity_id` URN URL-encoded | reported/desired JSONB, versions, `last_*_at`, audit được phép đọc |
+| 5 | `GET /v1/digital-twins/{entity_id}/history` | chưa đăng ký | Đã triển khai (Task 4.4) | `entity_id`; `property=value\|sample_interval_us`, `from`, `to` | series temporal (`property=value` ánh xạ raw telemetry; `property=sample_interval_us` đọc typed temporal) |
+| 6 | `POST /v1/digital-twins` | chưa đăng ký | Đã triển khai (Task 4.5) | DTO admin: `entity_type` + identifier + name/metadata allowlist | `201` mới / `200` exact replay / `409` conflict |
+| 7 | `PATCH /v1/digital-twins/{entity_id}` | chưa đăng ký | Đã triển khai (Task 4.5) | `entity_id` + allowlist `name`/`description` | `200` sau transaction metadata (không side effect state/command) |
+
+
+*Ghi chú lịch sử:* Tại mốc thiết kế Task 4.0 ban đầu, route #1 và #2 mang tính chất stub `501` và #3–#7 chưa được đăng ký. Sau đó Stage 4 ban đầu triển khai đủ 7 route (commit `aa7436d`). Đến đợt chuyển đổi V1.9.1 (commit `449697d`), hệ thống đã hoàn thiện rút gọn thành 5 endpoint như Bảng 1 trên.
 
 ### 7.2. Public URN, encode URL và resolve identity
 
@@ -601,8 +644,8 @@ Field/defaults/bounds, ví dụ và cursor chi tiết do Task 4.0.3–4.0.6 ch�
 | --- | --- | --- | --- | --- | --- |
 | `POST /v1/digital-twins` (`entity_type=Gateway`) | DB `platform_admins` | Không | Không | Không | Không |
 | `POST /v1/digital-twins` (`entity_type=Sensor`) | DB `platform_admins` | Được | Không | Không | Không |
-| `PATCH /v1/digital-twins/{entity_id}` (Gateway) | DB `platform_admins` | Không (không thêm quyền mới) | Không | Không | Không |
-| `PATCH /v1/digital-twins/{entity_id}` (Sensor) | DB `platform_admins` | Được | Không | Không | Không |
+| `PATCH /v1/digital-twins/{entity_id}/attrs` (Gateway) | DB `platform_admins` | Không (không thêm quyền mới) | Không | Không | Không |
+| `PATCH /v1/digital-twins/{entity_id}/attrs` (Sensor) | DB `platform_admins` | Được | Không | Không | Không |
 
 - Capability admin kiểm **bằng DB** `platform_admins` (middleware/checker hiện có),
   **không** nhận role/user từ query/body/cursor và **không** dựa vào JWT `service_role`.
@@ -658,17 +701,80 @@ Field/defaults/bounds, ví dụ và cursor chi tiết do Task 4.0.3–4.0.6 ch�
 
 ---
 
-## 8. Contract Task 4.0.3 — telemetry và temporal history
+## 8. Contract Telemetry và Temporal History — Hợp nhất Endpoint Chuẩn hóa `/temporal`
 
-Bước **4.0.3** đã chốt request/response, thời gian, raw/bucket, temporal typed history,
-safe BIGINT/NULL và error cho hai endpoint history (**#1** `GET /v1/telemetry/history`
-và **#5** `GET /v1/digital-twins/{entity_id}/history`, đánh số theo mục 7.1).
-*Lưu ý mốc checkpoint:* Ghi nhận "thiết kế", "stub 501", "chưa đăng ký" là mốc lịch sử Task 4.0.
-Hiện tại, cả hai endpoint này đã được triển khai (Task 4.2, Task 4.4), đăng ký trong `router.go`
-(Task 4.6), và kiểm chứng tích hợp thành công trên CI (Task 4.7). Các bounds dưới đây được cấu hình
-trong `config.HistoryConfig` và `config.TwinConfig`. Bảng error đầy đủ thống nhất tại 4.0.6 (mục 11.5).
+### 8.0. Hợp nhất Lịch sử theo Chuẩn ETSI GS CIM 009 V1.9.1: Endpoint duy nhất `GET /v1/digital-twins/:entity_id/temporal`
 
-### 8.1. Endpoint #1 request
+> **Lưu ý chuyển đổi:** Hai endpoint lịch sử ban đầu (`GET /v1/telemetry/history` và `GET /v1/digital-twins/{entity_id}/history`) đã được **hợp nhất thành một endpoint duy nhất** theo chuẩn ETSI GS CIM 009 V1.9.1:
+> **`GET /v1/digital-twins/{entity_id}/temporal`**
+> Các route cũ đã bị xóa (gọi sẽ nhận `404 Not Found`).
+
+#### Bảng tham số truy vấn `GET /v1/digital-twins/{entity_id}/temporal`:
+
+| Tham số Query | Bắt buộc | Kiểu | Mặc định | Ý nghĩa & Quy tắc Ràng buộc |
+| --- | --- | --- | --- | --- |
+| `attrs` | **Có** | string | — | Chọn thuộc tính lịch sử: `measurement` (alias `value`) cho dữ liệu đo viễn trắc; `sample_interval_us` cho chu kỳ đo. Chỉ nhận đúng 1 token. Tên thuộc tính trong JSON phản hồi luôn là tên chuẩn (`measurement` hoặc `sample_interval_us`). |
+| `timerel` | **Có** | string | — | Bắt buộc là `between` (ngữ nghĩa khoảng nửa mở Clause 4.11). Giá trị khác → `400 Bad Request`. |
+| `timeAt` | **Có** | RFC3339 | — | Mốc bắt đầu khoảng thời gian, định dạng UTC kết thúc bằng `Z` (ví dụ `2026-10-18T00:00:00.000000Z`). Tối đa 6 chữ số microsecond. |
+| `endTimeAt` | **Có** | RFC3339 | — | Mốc kết thúc khoảng thời gian, định dạng UTC `Z` (`endTimeAt > timeAt`, khoảng cách $\le$ 744h). Cửa sổ truy vấn: `[timeAt, endTimeAt)`. |
+| `timeproperty` | Không | string | `observedAt` | Chỉ chấp nhận `observedAt`. |
+| `aggrPeriodDuration` | Không | string | — | Khoảng thời gian gom nhóm. Khi có tham số này, truy vấn ở chế độ **Aggregated Values** (`format=aggregatedValues`). Bắt buộc là 1 trong 9 canonical duration: `PT0.1S` (100ms), `PT1S` (1s), `PT10S` (10s), `PT1M` (1m), `PT5M` (5m), `PT15M` (15m), `PT1H` (1h), `PT6H` (6h), `P1D` (1d). Định dạng khác (như `1m`, `PT0S`, tháng/năm) → `400 Bad Request`. |
+| `aggrMethods` | Không | string | `avg,min,max,totalCount` | Danh sách phương thức tổng hợp không trùng lặp, là tập con của `avg,min,max,totalCount`. Thiếu tham số thì mặc định đủ cả 4 methods. |
+| `format` | Không | string | Suy luận từ aggr | `temporalValues` (cho raw) hoặc `aggregatedValues` (cho bucket). Tự động suy luận dựa trên sự hiện diện của `aggrPeriodDuration`. |
+| `max_points` | Không | int | `1000` | Giới hạn số điểm cho phép (`100..2000`). Nếu raw query có số quan sát vượt `max_points`, server trả `400 Bad Request` (`raw_limit_exceeded`), **không tự động fallback auto ra public API**. |
+
+#### Cấu trúc Wire Representation DTO (`application/ld+json; charset=utf-8`):
+1. **Chế độ Raw (`format=temporalValues`):** Trả về bộ đôi (tuple 2 phần tử) `[kết_quả_đo, mốc_thời_gian]`:
+   ```json
+   {
+     "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+     "type": "Sensor",
+     "measurement": {
+       "type": "Property",
+       "values": [
+         [25.4, "2026-10-18T00:00:01.000000Z"],
+         [25.6, "2026-10-18T00:00:02.000000Z"]
+       ]
+     },
+     "@context": [
+       {
+         "Gateway": "https://example.org/ngsi-ld/iot/v1#Gateway",
+         "Sensor": "https://example.org/ngsi-ld/iot/v1#Sensor",
+         "measurement": "https://example.org/ngsi-ld/iot/v1#measurement",
+         "sample_interval_us": "https://example.org/ngsi-ld/iot/v1#sampleIntervalUs",
+         "hasSensor": "https://example.org/ngsi-ld/iot/v1#hasSensor",
+         "isHostedBy": "https://example.org/ngsi-ld/iot/v1#isHostedBy",
+         "gateway_id": "https://example.org/ngsi-ld/iot/v1#gateway_id",
+         "measurementUnit": "https://example.org/ngsi-ld/iot/v1#measurementUnit"
+       },
+       "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+     ]
+   }
+   ```
+2. **Chế độ Aggregated (`format=aggregatedValues`):** Trả về bộ ba (triple 3 phần tử) `[kết_quả, bắt_đầu_bucket, kết_thúc_bucket]` cho từng method:
+   ```json
+   {
+     "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+     "type": "Sensor",
+     "measurement": {
+       "type": "Property",
+       "avg": [[25.5, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]],
+       "min": [[25.1, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]],
+       "max": [[25.9, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]],
+       "totalCount": [[120, "2026-10-18T00:00:00.000000Z", "2026-10-18T00:01:00.000000Z"]]
+     },
+     "@context": [ ... ]
+   }
+   ```
+   - `totalCount` là số nguyên JSON exact integer, parse chính xác số nguyên không bị mất mát trên $2^{53}$.
+   - Biên bucket là UTC epoch `[bucketStart, bucketStart + duration)`. Không gapfill bucket rỗng.
+   - Khi không có dữ liệu trong khoảng nhưng có quyền truy cập: `200 OK` với `values: []` hoặc mảng method rỗng.
+
+---
+
+### 8.1. Hồ sơ Lịch sử: Hai endpoint Stage 4 ban đầu (#1 và #5)
+
+Phần dưới đây lưu lại đặc tả lịch sử của hai endpoint ban đầu khi thiết kế Task 4.0:
 
 | Param | Bắt buộc | Kiểu | Default | Ràng buộc |
 | --- | --- | --- | --- | --- |
@@ -1008,39 +1114,27 @@ và kiểm thử thành công trong kịch bản tích hợp cùng remote CI (Ta
 `Cache-Control: no-store` theo middleware hiện có (mục 1.4), không lặp lại. BIGINT/NULL/JSON-number dùng chung **8.7**;
 time range `[from,to)` (8.2) thuộc history, **không** áp cho list/detail/state.
 
-### 9.1. List `GET /v1/digital-twins`
+### 9.1. List `GET /v1/digital-twins` (Profile V1.9.1)
 
-**Request** (query; unknown/lặp → `400`; `user_id`/role/identity → `400` như list hiện có):
+**Request** (query; unknown/lặp → `400`; `user_id`/role/identity → `400` như list hiện có; tham số cũ `entity_type`/`after` bị từ chối rõ ràng bằng `400`):
 
 | Param | Bắt buộc | Kiểu | Default | Ràng buộc |
 | --- | --- | --- | --- | --- |
 | `gateway_id` | Không | string | — | `ValidateGatewayID` (5.1). |
-| `entity_type` | Không | string | — | Allowlist **`Gateway`**, **`Sensor`**; token khác (kể cả `Device`) → `400`. |
+| `type` | Không | string | — | Allowlist **`Gateway`**, **`Sensor`** (thay thế tham số cũ `entity_type`); token khác (kể cả `Device`) → `400`. |
 | `limit` | Không | int base-10 | `50` | `1..200`; ngoài khoảng/không phải digit → `400`. |
-| `after` | Không | string | — | Cursor list v1 (9.2); sai → `400 invalid_cursor`. |
+| `cursor` | Không | string | — | Keyset cursor v1 `v1.{k,g,t}` (thay thế tham số cũ `after`); sai định dạng hoặc checksum → `400 invalid_cursor`. |
 
-**Query scope membership** (thay cho kiểm từng entity; platform admin **không** bypass, 7.3):
+**Phân trang qua HTTP Header `Link` (RFC 8288):**
+- Server phát header `Link` khi còn trang kế tiếp: `Link: </v1/digital-twins?type=Sensor&limit=20&cursor=...>; rel="next"`.
+- Khi đến trang cuối cùng hoặc danh sách rỗng: **không phát header `Link`** (terminal no-next).
+- Không nhúng `next_cursor` vào body.
 
-```sql
-FROM twin_entities e
-JOIN user_gateways ug ON ug.gateway_id = e.gateway_id AND ug.user_id = $principal
-WHERE ($gateway_id IS NULL OR e.gateway_id = $gateway_id)
-  AND ($entity_type IS NULL OR e.entity_type = $entity_type)
-  AND ($after IS NULL OR e.entity_id COLLATE "C" > $after COLLATE "C")
-ORDER BY e.entity_id COLLATE "C" ASC
-LIMIT $limit + 1
-```
+**Response Body (`application/ld+json; charset=utf-8`):**
+Body là **mảng root array trực tiếp các summary Entities** `[...]`, không còn bọc trong envelope `{items, next_cursor}`:
+Trang rỗng trả về `[]` với status `200 OK`. Mỗi item chứa `id`, `type`, `name` (Property), `gateway_id` (Property), `modifiedAt` và `@context`.
 
-**Envelope** (không trả total; `count` chỉ là số item trang; `items` là summary ở bảng
-dưới, `next_cursor` là cursor v1 hoặc `null`):
-
-```json
-{ "items": [], "next_cursor": null }
-```
-
-- `limit+1` chỉ để phát hiện còn trang; `next_cursor` = cursor dựng từ `entity_id` cuối
-  **đã trả** khi còn dư, ngược lại `null`. Không `offset`, không `COUNT` toàn bộ.
-- Không có tài nguyên trong quyền → `200 items=[]`, `next_cursor: null`.
+*Hồ sơ Lịch sử Task 4.0:* Thiết kế ban đầu từng dùng envelope `{ "items": [], "next_cursor": null }` và tham số `entity_type`, `after`. Bố cục này đã được chuẩn hóa sang root array và header `Link` theo V1.9.1.
 
 **Summary projection** (không nhúng relationship/property/state; không load cả graph):
 
@@ -1055,6 +1149,45 @@ dưới, `next_cursor` là cursor v1 hoặc `null`):
 - Thứ tự keyset: `entity_id COLLATE "C" ASC` (khớp `gateway_id COLLATE "C"` của admin
   inventory, `src/internal/gateway/postgres_repository.go`). Không dùng `twin_entities.id`
   (internal UUID) hay offset làm contract public.
+
+### 9.1.1. Extension danh sách dạng phẳng `format=simplified` (Project Summary Presentation)
+
+> Tham số `format=simplified` của endpoint **danh sách** là extension trình bày **summary rút gọn** của dự án, **KHÁC** hoàn toàn với `format=simplified` của endpoint **chi tiết** (mục 9.5 — đọc state phẳng `twin_states`). Đây **không** phải state view, **không** đọc history/telemetry, **không** tải đồ thị quan hệ.
+
+- **Media type:** nhánh `format=simplified` phục vụ `application/json; charset=utf-8` (không JSON-LD, không `@context`, không bọc Property wrapper). Nhánh mặc định (không có `format`) **giữ nguyên** `application/ld+json; charset=utf-8`, byte-identical (`@context`, Property wrapper, `Link` không đổi).
+- **Thương lượng Accept:** `negotiateAccept` chạy **sau** khi phân tích `format`, với media type mục tiêu theo nhánh (mặc định `application/ld+json`, simplified `application/json`). Thiếu header `Accept`, hoặc `Accept` chứa wildcard `*/*`, dùng **mặc định của đúng nhánh**. `Accept` không tương thích với media type của nhánh (ví dụ `text/plain`, `text/html`, hoặc `application/ld+json` khi gọi `format=simplified`) → `406 not_acceptable` và **không** chạy truy vấn.
+- **Binding filter/cursor:** `format` **chỉ** là lựa chọn trình bày HTTP, **không** phải bộ lọc dữ liệu; nó **không** vào cursor (`ParseListCursor` bất biến). `format=simplified` kết hợp bình thường với `type`, `gateway_id`, `limit`, `cursor`; cursor do `type`/`gateway_id` khác tạo vẫn bị từ chối `400 invalid_cursor` như nhánh mặc định.
+- **Validation `format`:** giá trị khác `simplified` (ví dụ `detail`, `Simplified`) → `400 invalid_request`; `format` lặp (`format=simplified&format=simplified`) hoặc `format` rỗng → `400 invalid_request` (do `parseRawQuery` từ chối key lặp/rỗng và allowlist chỉ phân tích **một lần**).
+- **Response Body:** mảng root array trực tiếp **phẳng** các summary entity; mỗi item có đúng các field: `id`, `type`, `name` (**lược bỏ hoàn toàn** khi `NULL`), `gateway_id` (chuỗi thẳng, **không** Property wrapper), `modifiedAt` (RFC3339 UTC microsecond). **Không** có `@context`; **không** bọc Property. Danh sách rỗng trả `[]` (không `null`).
+- **Nguồn dữ liệu:** summary lấy từ `twin_entities` (giống 9.1); **không** đọc `twin_states`, **không** đọc history/telemetry, **không** phát sinh truy vấn N+1 hay tải `twin_relationships`. Quyền scope `user_gateways` theo principal như 7.3.
+- **Phân trang `Link`:** khi còn trang kế tiếp, server phát `Link` tương đối bảo toàn **đầy đủ** filter hiện hành **và** `format=simplified`:
+  ```http
+  Link: </v1/digital-twins?type=Sensor&gateway_id=gateway_001&limit=20&format=simplified&cursor=v1.xxx>; rel="next"
+  ```
+  Trang cuối/rỗng **không** phát `Link`; `Link` luôn là tham chiếu **tương đối** (không dựng từ `Host`/`Forwarded`). Nhánh normalized **không** chèn `format` vào `Link`.
+- **CORS / cache:** middleware không đổi — `Cache-Control: no-store` trên **cả hai** nhánh, `Vary: Accept` và `Vary: Origin`, exposed `Access-Control-Expose-Headers: Link, Location, X-Request-ID`; header `Link` đọc được từ Flutter Web ở cả hai nhánh.
+
+**Ví dụ URL và response hợp lệ** — `GET /v1/digital-twins?type=Sensor&gateway_id=gateway_001&limit=2&format=simplified` (`Accept: application/json`):
+
+```json
+[
+  {
+    "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+    "type": "Sensor",
+    "name": "Temperature",
+    "gateway_id": "gateway_001",
+    "modifiedAt": "2026-10-18T08:30:00.000000Z"
+  },
+  {
+    "id": "urn:ngsi-ld:Sensor:gateway_001:sensor_002",
+    "type": "Sensor",
+    "gateway_id": "gateway_001",
+    "modifiedAt": "2026-10-18T08:30:10.000000Z"
+  }
+]
+```
+
+(Item thứ hai **không** có `name` vì `twin_entities.name` là `NULL` → field `name` lược bỏ hoàn toàn.)
 
 ### 9.2. Cursor list — unsigned, versioned, base64url
 
@@ -1107,12 +1240,12 @@ filter, **không** phải ảnh chụp cố định.
 Cursor Stage 4 (**versioned base64url**) khác `after` admin inventory (`gateway_id` thô,
 validate identifier). Contract admin `GET /v1/admin/gateways` **không** đổi.
 
-### 9.3. Detail `GET /v1/digital-twins/{entity_id}`
+### 9.3. Detail `GET /v1/digital-twins/{entity_id}` (Profile V1.9.1)
 
 - `{entity_id}` URL-encoded, decode một lần, validate/parse/resolve URN và membership theo
   7.2; ngoài quyền **hoặc** không tồn tại → `404 not_found`. Internal UUID không trả ra.
 - Read-only; **không** `FOR UPDATE`, không dựng current từ history.
-- Slice chỉ có quan hệ `hasSensor`.
+- Hỗ trợ extension dự án: `format=simplified` (chuyển sang đọc state view phẳng từ `twin_states`, xem 9.5).
 
 **Query phân trang quan hệ** (unknown/lặp → `400`):
 
@@ -1121,19 +1254,24 @@ validate identifier). Contract admin `GET /v1/admin/gateways` **không** đổi.
 | `relationship_limit` | Không | int base-10 | `50` | `1..200`. |
 | `relationship_after` | Không | string | — | Cursor **quan hệ** v1 (9.4); sai → `400 invalid_cursor`. |
 
-**Detail projection** (entity JSON-LD — chốt ở 4.0.6, mục 11.1–11.3):
+**Phân trang quan hệ `hasSensor` qua Header `Link` (RFC 8288):**
+- Khi còn trang quan hệ kế tiếp: server phát header `Link: </v1/digital-twins/urn:ngsi-ld:Gateway:gw_01?relationship_limit=20&relationship_after=...>; rel="next"`.
+- Bỏ trường `relationship_page` và `hasSensor_next_cursor` khỏi JSON body.
 
-| Member | Representation | Nguồn authoritative | Ghi chú |
+**Detail projection** (normalized entity JSON-LD theo V1.9.1 profile):
+
+| Member | Representation | Nguồn authoritative | Ghi chú V1.9.1 Profile |
 | --- | --- | --- | --- |
-| `@context` | inline object | hằng số versioned (11.3) | Không fetch remote context. |
-| `id` | JSON-LD `id` | `twin_entities.entity_id` | URN public ổn định. |
-| `type` | JSON-LD `type` | `twin_entities.entity_type` | Lấy từ URN (7.2). |
+| `@context` | mảng 2 phần tử | Inline term mappings + Core Context V1.9 | Term mapping riêng + `https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld`. |
+| `id` | JSON-LD `@id` | `twin_entities.entity_id` | URN public ổn định. |
+| `type` | JSON-LD `@type` | `twin_entities.entity_type` | `Gateway` hoặc `Sensor`. |
 | `name` | `Property` | Gateway: `gateways.name`; Sensor: `sensors.name` | `value` = tên; `modifiedAt` = `twin_entities.updated_at`. |
-| `description` | `Property` (chỉ Gateway) | `gateways.description` | `value` nullable → giữ `null`; cột Gateway authoritative. |
-| `unit` | `Property` (chỉ Sensor) | `sensors.unit` | `value` = unit **symbol** (không phải `unitCode`); nullable → `null`. |
-| `gateway_id` | JSON string (scope) | `twin_entities.gateway_id` | Parent scope; không phải Property. |
-| `hasSensor` | mảng `Relationship` (chỉ Gateway) | `twin_relationships` JOIN `twin_entities` target | Mỗi object: `type`, `object` (URN), `createdAt`. Trang lại ở 9.4. |
-| `relationship_page` | JSON object | suy ra từ page | Metadata phân trang (9.3). |
+| `description` | `Property` (chỉ Gateway) | `gateways.description` | `value` nullable → omit nếu null; cột Gateway authoritative. |
+| `measurementUnit` | `Property` (chỉ Sensor) | `sensors.unit` | Property ở root entity, xuất hiện khi sensor chưa có quan sát (unobserved) hoặc đơn vị không có mã UN/CEFACT. Tuyệt đối **không** có root `unitCode`. |
+| `hasSensor` | `Relationship` (chỉ Gateway) | `twin_relationships` JOIN `twin_entities` | Đối tượng Relationship có `object: [...]` là mảng URI và `objectType: "Sensor"`. Omit nếu không có Sensor. |
+| `isHostedBy` | `Relationship` (chỉ Sensor) | URN Gateway cha | `object` là URN Gateway cha, `objectType: "Gateway"`. |
+| `measurement` | `Property` (chỉ Sensor) | Observation mới nhất từ `reported_state` | Tích hợp từ trạng thái: `value`, `observedAt`, và metadata `unitCode` (khi đơn vị map được). Omit nếu chưa có quan sát (không tạo quan sát giả). |
+| `sample_interval_us` | `Property` (chỉ Sensor) | Observation mới nhất từ `reported_state` | Tích hợp từ trạng thái: `value`, `observedAt`. Omit nếu chưa có. |
 
 - Timestamp NGSI-LD: attribute metadata dùng `modifiedAt` = server write time
   (`twin_entities.updated_at`); object `hasSensor` dùng `createdAt` =
@@ -1233,11 +1371,15 @@ LIMIT $relationship_limit + 1
 - Order dùng `COLLATE "C"`; PK/index hiện dùng collation mặc định → là **caveat query-plan**
   ghi limitation, không đổi ngữ nghĩa (đo ở Task 4.2/4.3, không thêm index ở 4.0.4).
 
-### 9.5. State `GET /v1/digital-twins/{entity_id}/state`
+### 9.5. State View `GET /v1/digital-twins/{entity_id}?format=simplified` (Profile V1.9.1 Extension)
+
+> **Lưu ý chuyển đổi:** Endpoint con riêng `GET /v1/digital-twins/{entity_id}/state` đã được **thu hồi** (gọi nhận `404 Not Found`).
+> Thay vào đó, tính năng đọc nhanh trạng thái `twin_states` được tích hợp vào endpoint chi tiết thông qua query parameter extension của dự án:
+> **`GET /v1/digital-twins/{entity_id}?format=simplified`**
 
 Chín cột `twin_states` là authoritative: `entity_id`, `reported_state`, `desired_state`,
 `reported_version`, `desired_version`, `last_reported_at`, `last_desired_at`, `updated_at`,
-`last_desired_by`. Response **chỉ** map các cột này (không bịa field audit khác):
+`last_desired_by`. Response **chỉ** map các cột này (không bịa field audit khác, không có `@context`, Content-Type `application/json; charset=utf-8`):
 
 ```json
 {
@@ -1253,6 +1395,11 @@ Chín cột `twin_states` là authoritative: `entity_id`, `reported_state`, `des
   "updated_at": "2026-10-15T09:30:00.000000Z"
 }
 ```
+
+- Bảo toàn chính xác các số nguyên lớn `> 2^53` trong raw JSONB của `reported_state` và `desired_state`.
+- `reported_version` và `desired_version` định dạng chuỗi số nguyên thập phân (decimal string).
+- Tuyệt đối không quét hypertable TimescaleDB; đọc trực tiếp từ bảng quan hệ `twin_states`.
+- Đây là extension riêng của dự án, không phải phép compaction Entity chuẩn ETSI Clause 4.5.4. Không ghép `reported_state` thành `desired_state`.
 
 - **BIGINT → chuỗi thập phân** (đồng nhất 8.7): `reported_version`, `desired_version`.
   Số bounded (`count`, `limit`) vẫn JSON number.
@@ -1509,78 +1656,50 @@ Body là **JSON object** với **allowlist key**; identity do server derive — 
   (`mapper.GatewayEntityID`/`SensorEntityID`) — client **không** cung cấp `entity_id`.
 - Sensor **không** nhận `owner_user_id`/`description`; Gateway **không** nhận `sensor_id`/`unit`.
 
-### 10.2. POST reuse transaction provisioning + exact replay
+### 10.2. POST reuse transaction provisioning + exact replay và Header Location
 
-**#6 tái dùng đúng hai transaction Stage 2** (`ProvisionGateway`,
+**POST tái dùng đúng hai transaction Stage 2** (`ProvisionGateway`,
 `ProvisionSensor`/`ProvisionSensorForOwner`, mục 5.4): cùng bước ghi, cùng bất biến, cùng
 thứ tự khóa. Không thêm graph/relationship/credential nào mới.
 
-**Gateway transaction** (so `src/internal/gateway/postgres_gateway_provisioning.go`):
+**Header Location khi tạo mới:**
+- Khi tạo mới thành công (`201 Created`): server trả về header `Location: /v1/digital-twins/<escaped_urn>`. URN được escape đúng một lần (`url.PathEscape`).
+- Khi phát lại chính xác (`200 OK` Exact Replay) hoặc khi lỗi: **không trả header `Location`**.
 
-1. `BeginTx` ReadCommitted.
-2. Kiểm **platform admin** qua `platform_admins` **trong transaction**; non-admin → `403`.
-3. Kiểm `owner_user_id` tồn tại → thiếu `404`.
-4. `INSERT INTO gateways ... ON CONFLICT (gateway_id) DO NOTHING RETURNING created_at`.
-5. **Tạo mới:** `user_gateways(role='owner')` + `twin_entities('Gateway')` + `twin_states`.
-6. **Replay:** `verifyGatewayRetry` (xem dưới).
-7. `Commit`.
+### 10.3. PATCH Metadata qua Fragment Chuẩn hóa: `PATCH /v1/digital-twins/{entity_id}/attrs`
 
-**Sensor transaction:** nhánh admin (kiểm admin) **hoặc** nhánh owner (khóa Gateway cha
-`FOR UPDATE`, `user_gateways FOR SHARE`, role `owner`) theo thứ tự an toàn 7.4; resolve
-parent twin; `INSERT INTO sensors ON CONFLICT (gateway_id,sensor_id) DO NOTHING`; tạo mới →
-`twin_entities('Sensor')` + `twin_states` + `twin_relationships('hasSensor')`; replay →
-`verifySensorRetry`.
+> **Lưu ý chuyển đổi:** Endpoint cập nhật metadata đã đổi path sang:
+> **`PATCH /v1/digital-twins/{entity_id}/attrs`**
+> (Gửi PATCH vào path cũ `/{entity_id}` nhận `405 Method Not Allowed`).
 
-**Exact replay fields (đọc từ source — không suy diễn):**
+Body là **normalized Property fragment** theo V1.9.1 profile:
 
-| Entity | Field so sánh replay | Quy tắc |
-| --- | --- | --- |
-| Gateway | `name` | Khớp **chính xác** chuỗi. |
-| Gateway | `description` | Nullable **so chính xác** (`sameNullableString`: cùng `NULL` hoặc cùng chuỗi). |
-| Gateway | **owner membership** | Gateway row **không** có cột owner; replay đọc `user_gateways` với `role='owner'` và so **đúng một** owner + `user_id = owner_user_id`. Khác owner → **`409`**. |
-| Gateway | Twin graph | Đúng **một** Gateway entity khớp URN + `entity_type` + `gateway_id` + `name` và có hàng `twin_states`; state **không** bị so/ghi. |
-| Sensor | `name` | Khớp chính xác. |
-| Sensor | `unit` | Nullable so chính xác. |
-| Sensor | Twin graph | Đúng **một** Sensor entity khớp URN + type + `gateway_id` + `name` + relationship `hasSensor` từ parent + hàng `twin_states`; state **không** bị so/ghi. |
+```json
+{
+  "name": {
+    "type": "Property",
+    "value": "Tên mới của thực thể"
+  },
+  "description": {
+    "type": "Property",
+    "value": "Mô tả mới của Gateway"
+  }
+}
+```
 
-→ **Lưu ý owner:** vì replay so **membership**, gửi cùng `name`/`description` nhưng khác
-`owner_user_id` là **conflict đại diện** (`409`), không phải no-op.
-
-**Status `#6`:** `201 Created` khi tạo mới; `200 OK` khi **exact replay** (no-op);
-`409 conflict` khi cùng identity nhưng đại diện khác (`name`/`description`/`unit`/owner);
-`404` khi owner profile (Gateway) hoặc Gateway cha (Sensor) không tồn tại; `403` thiếu
-capability; `400/413/415` input/body/media; `503` admin-lookup/timeout/unavailable;
-graph **bất nhất** (`ErrProvisioningInconsistent`) → `500` (không phải `409`), khớp mapping
-handler hiện có (mục 5.4).
-
-**Không side effect credential/account:** provisioning chỉ ghi `gateways`,
-`user_gateways`, `twin_entities`, `twin_states`, `sensors`, `twin_relationships`. **Không**
-tạo `gateway_mqtt_credentials`/`gateway_mqtt_credential_events`, **không** tạo
-`auth.users`/profile human, **không** phát MQTT. MQTT credential vẫn chỉ qua route admin
-riêng (Stage 2); `#6` **không** sinh credential hay account.
-
-### 10.3. PATCH allowlist (`#7`)
-
-Body là JSON object allowlist; `{entity_id}` URL-encoded (7.2), validate/parse/resolve URN
-và membership theo 7.4 (`PATCH` Gateway: admin-only; `PATCH` Sensor: admin-hoặc-owner).
-Query phải rỗng.
-
-| Field | Entity | Kiểu | Bắt buộc | Null | Vắng | Ràng buộc |
-| --- | --- | --- | --- | --- | --- | --- |
-| `name` | Gateway/Sensor | string | Không | **Không** (null → `400`) | giữ nguyên | Không rỗng sau `TrimSpace`, `≤256` byte, UTF-8 hợp lệ, không NUL; ghi `twin_entities.name` **và** cột `gateways.name`/`sensors.name`. |
-| `description` | **Gateway only** | string | Không | **Có** | giữ nguyên | `null` → **xóa** (SQL `NULL`); nếu có chuỗi: `≤4096` byte, UTF-8 hợp lệ, không NUL; ghi `gateways.description`. Sensor gửi `description` → `400` (unknown field). |
-
-- **Omitted = unchanged:** field không có trong body **không** bị ghi đè (không set `NULL`,
-  không set giá trị mặc định).
-- **`name` không NULL/rỗng:** `null` hoặc rỗng (sau trim) → `400`.
-- **`description` NULL để xóa:** chỉ Gateway; `null` tường minh là **clear** hợp lệ.
-- **Empty patch bị từ chối:** body `{}` (không có field allowlist nào) → `400`
-  `invalid_request` (không có gì để đổi).
-- **Same-value no-op:** gửi đúng giá trị hiện tại → **no-op**, không ghi row, không đổi
-  `updated_at`, **không** đổi state/version; trả `200`.
-- **`unit` create-only:** PATCH **không** đổi `unit` (raw history dùng `unit` tại thời điểm
-  ghi; đổi unit của history là **ngoài** Stage 4). Gửi `unit` trong PATCH → `400` (unknown
-  field). Muốn `unit` khác phải tạo Sensor mới (create-only) — không backfill.
+**Quy tắc các trường Property fragment:**
+- **`name`:** Gateway hoặc Sensor. Trường `type` bắt buộc là `"Property"`. `value` là chuỗi không rỗng sau trim, $\le 256$ byte, UTF-8 hợp lệ. Cấm `null` hoặc chuỗi rỗng (`400`).
+- **`description` (Chỉ dành riêng cho Gateway):**
+  - Để cập nhật mô tả: `{"description": {"type": "Property", "value": "Mô tả mới"}}` ($\le 4096$ byte).
+  - Để xóa mô tả về SQL `NULL`: Sử dụng giá trị sentinel chuẩn NGSI-LD:
+    `{"description": {"type": "Property", "value": "urn:ngsi-ld:null"}}`.
+  - Vắng mặt (omitted): giữ nguyên mô tả cũ.
+  - Không nhận JSON null literal `{"description": null}`.
+  - Sensor gửi `description` → `400 Bad Request`.
+- **`unit` bất biến (strictly immutable):** Cấm gửi `unit` trong PATCH (vi phạm nhận `400 Bad Request`).
+- **Content-Type hỗ trợ:** `application/json` hoặc `application/ld+json`. Nếu là JSON-LD, context bắt buộc phải trùng khớp context khóa của dự án; context lạ bị từ chối `400`.
+- **Same-value No-Op:** Nếu giá trị gửi lên trùng khớp hoàn toàn giá trị hiện tại, server không chạy SQL update, commit an toàn, giữ nguyên `twin_entities.updated_at` và trả về `200 OK`.
+- **Ranh giới:** Tuyệt đối không thay đổi `reported_state`, `desired_state`, không tạo command hay gửi MQTT. Dữ liệu `description` của Gateway được ghi vào bảng `gateways.description`; `twin_entities.attributes` được bảo toàn nguyên vẹn.
 
 ### 10.4. Field bị từ chối + strict JSON (`#6` và `#7`)
 
@@ -1852,8 +1971,11 @@ Ghi chú:
   `twin_states.updated_at`). Hai nguồn **khác nhau**; response **không** lấy request time thay thế.
   Metadata entity (`name`/`description`/`unit`/`hasSensor`) **không** có `observedAt` vì không
   phải measurement.
-- **`unit` symbol ≠ `unitCode`:** `unit` giữ symbol thô (`degC`, `us`); dự án **chưa** có mapping
-  sang `unitCode` chuẩn nên **không** gọi symbol là `unitCode`.
+- **Ngữ nghĩa đơn vị đo và phân định `unitCode` vs `measurementUnit`:**
+  - *Hồ sơ lịch sử Task 4.0:* Ban đầu hệ thống chưa xây dựng bảng ánh xạ `unitCode`, giữ nguyên symbol thô (`degC`, `us`).
+  - *Hợp đồng hiện hành V1.9.1 Profile:* Hệ thống đã tích hợp bảng ánh xạ `MapUNCEFACTUnit` (`src/internal/digitaltwin/mapper/representation.go`). Khi Sensor có quan sát đo lường (`measurement`) và đơn vị có trong bảng mapping (ví dụ `degC`/`CEL` $\rightarrow$ `CEL`, `%`/`%RH` $\rightarrow$ `P1`, `rad` $\rightarrow$ `C81`, `V` $\rightarrow$ `VLT`, `A` $\rightarrow$ `AMP`, `Pa` $\rightarrow$ `PAL`, `s` $\rightarrow$ `SEC`, `m` $\rightarrow$ `MTR`, `kg` $\rightarrow$ `KGM`, `Hz` $\rightarrow$ `HTZ`, `lx` $\rightarrow$ `LUX`, `dB` $\rightarrow$ `2N`, `ppm` $\rightarrow$ `59`, `W` $\rightarrow$ `WTT`, `J` $\rightarrow$ `JOU`, `K` $\rightarrow$ `KEL`, `rpm` $\rightarrow$ `RPM`), trường `unitCode` được đặt làm metadata **bên trong Property `measurement`** (`"unitCode": "CEL"`). Tuyệt đối **không** có thuộc tính `unitCode` ở cấp root Entity.
+  - Khi Sensor chưa có quan sát nào trong `reported_state` (unobserved sensor), server trả về Property gốc `measurementUnit: {"type": "Property", "value": "<raw_unit>"}` ở root entity để phục vụ discoverability, tuyệt đối không tạo quan sát `measurement` giả tạo.
+  - Các đơn vị chưa có mapping (như `m/s`, `percent`, `km/h`) được giữ nguyên dưới Property `measurementUnit` ở root, và `measurement` không có trường `unitCode`.
 - **BIGINT → string:** `sequence_num`, bucket `count`, `reported_version`/`desired_version` (8.7).
   **NULL giữ NULL:** `boot_id`/`message_id`/`sample_index` legacy và `unit`/`description` nullable —
   không thay zero/UUID giả.
@@ -1871,70 +1993,65 @@ Ghi chú:
   HTTP độc lập**. Tham số query HTTP `property=value` và `property=sample_interval_us` thuộc giao diện
   REST API URL, không lồng cấu trúc JSON-LD, do đó được giữ nguyên vẹn theo kế hoạch đã phê duyệt.
 
-### 11.2. Representation theo response (chốt nhất quán list/detail/state/history/mutation)
+### 11.2. Representation theo response (chốt nhất quán theo V1.9.1 profile)
 
 | Endpoint | Shape | `Content-Type` | Identity | Attribute/relationship | Timestamp |
 | --- | --- | --- | --- | --- | --- |
-| #3 detail | **entity JSON-LD** | `application/ld+json; charset=utf-8` | `id`/`type`/`gateway_id` | `Property`/`Relationship` | `modifiedAt`/`createdAt` |
-| #2 list | summary view | `application/json; charset=utf-8` | `id`/`type`/`gateway_id` | scalar `name` (= `name.value`) | `updated_at` |
-| #4 state | state view | `application/json; charset=utf-8` | `id`/`type`/`gateway_id` | `reported_state`/`desired_state` verbatim | `last_*_at`/`updated_at` |
-| #1/#5 history | series view | `application/json; charset=utf-8` | `gateway_id`/`sensor_id` hoặc `entity_id`/`property` | point list | `measured_at`/`observed_at`/`bucket_start` |
-| #6/#7 mutation | mutation metadata view | `application/json; charset=utf-8` | `gateway_id`/`sensor_id`/`entity_id`/`id`/`type` | scalar metadata | `created_at`/`updated_at` |
+| #1 `GET /v1/digital-twins` | root array summary JSON-LD | `application/ld+json; charset=utf-8` | `id`/`type`/`gateway_id` | Property `name`, Property `gateway_id` | `modifiedAt` |
+| #2 `POST /v1/digital-twins` | mutation response view | `application/json; charset=utf-8` | `gateway_id`/`sensor_id`/URN | scalar metadata | `created_at`/`updated_at` |
+| #3 `GET /v1/digital-twins/:id` (detail) | **normalized entity JSON-LD** | `application/ld+json; charset=utf-8` | `id`/`type` | `Property`/`Relationship` | `modifiedAt`/`createdAt` |
+| #3 `GET /v1/digital-twins/:id?format=simplified` | state view phẳng | `application/json; charset=utf-8` | `id`/`type`/`gateway_id` | `reported_state`/`desired_state` verbatim | `last_*_at`/`updated_at` |
+| #4 `PATCH /v1/digital-twins/:id/attrs` | mutation metadata view | `application/json; charset=utf-8` | `gateway_id`/`sensor_id`/URN | scalar metadata | `updated_at` |
+| #5 `GET /v1/digital-twins/:id/temporal` | normalized temporal JSON-LD | `application/ld+json; charset=utf-8` | `id`/`type` | Property `measurement` hoặc `sample_interval_us` | raw `observedAt` / bucket `[start, end)` |
 | error | error envelope | `application/json; charset=utf-8` | — | `error{code,message,request_id}` | — |
 
-- Mọi shape dùng **cùng public term và nguồn** (11.1); identity `id`/`type`/`gateway_id` giống
-  nhau. Khác biệt `Property` (detail) vs scalar (view) là **quy ước có chủ đích** cho response
-  dạng *view*, không phải hai định nghĩa dữ liệu mâu thuẫn.
-- Server write time: detail dùng per-attribute `modifiedAt`; các view dùng field `updated_at` —
-  **cùng nguồn** `twin_entities.updated_at`/`twin_states.updated_at`.
-- **Không fake unobserved:** entity metadata nullable giữ `null` (Property `value: null` hoặc
-  field `null`), không bịa `observedAt`/measurement; Gateway không tự `online`.
+- Representation JSON-LD (`application/ld+json`): Áp dụng cho List, Detail mặc định và Temporal.
+- Representation JSON thuần (`application/json`): Áp dụng cho State View (`?format=simplified`), POST/PATCH response DTOs và Error envelopes.
+- Header `Link` (RFC 8288): Expose qua CORS cho cả List (`rel="next"`) và Detail Gateway (`hasSensor rel="next"`).
 
-### 11.3. Context dự án versioned (một context inline)
+### 11.3. Context dự án V1.9 (Project Terms + ETSI Core Context V1.9)
 
-Một context duy nhất, versioned, **inline** ở đầu entity JSON-LD; custom term IRI dùng namespace
-ví dụ dành riêng (RFC 2606), **không** dùng domain thật của dự án:
+Context được biểu diễn dưới dạng mảng 2 phần tử cố định inline ở đầu JSON-LD:
+1. Object map các terms riêng của dự án sang namespace ổn định `https://example.org/ngsi-ld/iot/v1#`.
+2. URL Core Context V1.9 chính thức: `https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld`.
 
 ```json
-{
-  "@version": 1.1,
-  "id": "@id",
-  "type": "@type",
-  "Property": "https://uri.etsi.org/ngsi-ld/Property",
-  "Relationship": "https://uri.etsi.org/ngsi-ld/Relationship",
-  "value": "https://uri.etsi.org/ngsi-ld/hasValue",
-  "observedAt": "https://uri.etsi.org/ngsi-ld/observedAt",
-  "createdAt": "https://uri.etsi.org/ngsi-ld/createdAt",
-  "modifiedAt": "https://uri.etsi.org/ngsi-ld/modifiedAt",
-  "name": "https://example.org/ngsi-ld/iot/v1#name",
-  "description": "https://example.org/ngsi-ld/iot/v1#description",
-  "unit": "https://example.org/ngsi-ld/iot/v1#unit",
-  "measurement": "https://example.org/ngsi-ld/iot/v1#measurement",
-  "sampleIntervalUs": "https://example.org/ngsi-ld/iot/v1#sampleIntervalUs",
-  "hasSensor": "https://example.org/ngsi-ld/iot/v1#hasSensor",
-  "gateway_id": "https://example.org/ngsi-ld/iot/v1#gatewayId"
-}
+[
+  {
+    "Gateway": "https://example.org/ngsi-ld/iot/v1#Gateway",
+    "Sensor": "https://example.org/ngsi-ld/iot/v1#Sensor",
+    "measurement": "https://example.org/ngsi-ld/iot/v1#measurement",
+    "sample_interval_us": "https://example.org/ngsi-ld/iot/v1#sampleIntervalUs",
+    "hasSensor": "https://example.org/ngsi-ld/iot/v1#hasSensor",
+    "isHostedBy": "https://example.org/ngsi-ld/iot/v1#isHostedBy",
+    "gateway_id": "https://example.org/ngsi-ld/iot/v1#gateway_id",
+    "measurementUnit": "https://example.org/ngsi-ld/iot/v1#measurementUnit"
+  },
+  "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+]
 ```
 
-- **Không fetch context remote** (kể cả context do client gửi); server là pure mapper, **không**
-  chạy JSON-LD processing framework, **không** thêm route phục vụ context. Context là hằng số
-  versioned (namespace `…/iot/v1#`) lưu trong source/tài liệu.
-- Chỉ **subset NGSI-LD-compatible** của dự án; **không** tuyên bố full conformance. Term NGSI-LD
-  lõi giữ IRI ETSI làm hằng chuỗi; custom term map sang namespace ví dụ. Không nhận `@context` do
-  client chọn và không nhận arbitrary JSON-LD để tạo graph (10.4).
+- Không tải remote context động qua mạng khi phục vụ request.
+- Tận dụng định nghĩa mặc định của Core Context V1.9 cho `name`, `description`, `observedAt`, `unitCode`, `objectType`.
+- Ánh xạ mã đơn vị đo UN/CEFACT: Sử dụng bảng ánh xạ chuẩn xác trong `src/internal/digitaltwin/mapper/representation.go`: `CEL` (`degC`, `CEL`), `P1` (`%`, `%RH`), `C81` (`rad`), `VLT` (`V`), `AMP` (`A`), `PAL` (`Pa`), `SEC` (`s`), `MTR` (`m`), `KGM` (`kg`), `HTZ` (`Hz`), `LUX` (`lx`, `lux`), `RPM` (`rpm`), `DD` (`deg`), `KEL` (`K`), `WTT` (`W`), `JOU` (`J`)... Các ký hiệu chưa nằm trong map (như `m/s`, `percent`, `km/h`) không được ánh xạ và luôn được biểu diễn nguyên bản bằng Property `measurementUnit` ở root entity. Mã `unitCode` chỉ xuất hiện bên trong Property `measurement` khi có dữ liệu quan sát.
 
-### 11.4. Content-Type, header, request ID, CORS và bounds
+### 11.4. Content-Type, Accept Negotiation, CORS, Cache và Bounds
 
-`Content-Type` theo shape (11.2): entity JSON-LD `application/ld+json; charset=utf-8`; mọi shape
-JSON khác `application/json; charset=utf-8`. Body mutation (#6/#7) yêu cầu `application/json`
-(charset `utf-8`), khác → `415` (5.3).
+**Thương lượng nội dung (Accept Negotiation):**
+- Parser Accept hỗ trợ phân tích media-range với tham số `q` và quoted parameters (profile có chứa dấu phẩy/chấm phẩy trong ngoặc kép).
+- Fail-closed RFC 2231: Tham số extended/continuation dạng `q*`, `q*0`, `q*0*` bị fail-closed về `q=0.0`, ngăn chặn việc nâng quyền chấp nhận ngoài ý muốn.
+- Nếu client gửi header `Accept` không tương thích với media type phản hồi: server trả về `406 Not Acceptable` (`Content-Type: application/json; charset=utf-8`, code `not_acceptable`).
+- Header phản hồi thêm `Vary: Accept` và `Vary: Origin`.
 
-Header/middleware (theo 1.4, không thêm header mới):
+**CORS Policy:**
+- Cho phép exact-origin đã cấu hình. Preflight `OPTIONS` trả về `204 No Content` với `Access-Control-Allow-Methods` và `Access-Control-Allow-Headers`.
+- Header được expose ra browser (`Access-Control-Expose-Headers`):
+  `Link, Location, X-Request-ID`.
+- Denied origin nhận `403 Forbidden` trên preflight và bị loại bỏ toàn bộ CORS headers trên actual request.
 
-- `Cache-Control: no-store` mọi protected response; route admin/owner thêm `Pragma: no-cache`.
-- `X-Request-ID`: echo nếu hợp lệ (regex 1.4), ngược lại sinh UUID; expose qua CORS.
-- `401` kèm `WWW-Authenticate: Bearer`. CORS exact-origin; allow header `authorization,
-  content-type, idempotency-key, x-request-id`; allow method gồm `PATCH` cho #7.
+**Cache-Control:**
+- Mọi response xác thực và error responses đều có `Cache-Control: no-store`.
+- Các mutation (`POST`, `PATCH`) và preflight `OPTIONS` có thêm `Pragma: no-cache`.
 
 Bounds:
 
@@ -2175,6 +2292,7 @@ Bước 4.0.7 hoàn tất việc rà soát toàn diện contract API Stage 4 và
    - Task 4.6: HTTP composition & 7 routes mounted đã hoàn thành ([báo cáo Task 4.6](../backend/stage-4-task-4.6-http-composition.md)).
    - Task 4.7: Integration test suite, query measurements uncompressed/compressed, remote CI 16/16 jobs PASS đã hoàn thành ([báo cáo Task 4.7](../backend/stage-4-task-4.7-integration-and-ci.md), [tóm tắt Task 4.7](../backend/stage-4-task-4.7-summary.json)).
    - Task 4.8: Tài liệu tổng kết Stage 4 ([docs/backend/stage-4-history-and-twin-api.md](../backend/stage-4-history-and-twin-api.md)), client contracts 04/05/07/08 và protocol đã được đối soát trong phạm vi kế hoạch, chưa commit.
+   - Kế hoạch chuyển đổi ETSI GS CIM 009 V1.9.1 (Tasks N0–N7): Hoàn thành rút gọn và chuẩn hóa thành 5 endpoint Digital Twin chính thức, CI 16/16 jobs PASS tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e` (run 39185129590).
 
 #### 11.8.5. Kết quả kiểm tra tài liệu thuần túy (Document-only Verification)
 
@@ -2203,17 +2321,14 @@ Mọi kiểm tra tài liệu đã được thực hiện trực tiếp trên wor
   (<https://github.com/TVTIT/project1_iot_server/actions/runs/38891798340>).
 - CI nghiệm thu Stage 4: run 39103564379 tại `aa7436d8838a6580c21b30930e2eed992999b11c`
   (<https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379>).
+- CI nghiệm thu chuyển đổi ETSI GS CIM 009 V1.9.1: run 39185129590 tại `449697ddbd8ba53173a3cd885c0d6804458cc81e`
+  (<https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590>).
 - Migrations: `migrations/000001` … `migrations/000020` (đường dẫn tính từ `main_src/`).
 - HTTP: `src/internal/httpserver/router.go`, `src/internal/httpapi/error.go`,
   `src/internal/httpserver/cors.go`, `src/internal/auth/`, `src/internal/httpserver/read_handlers.go`,
-  `src/internal/httpserver/mutation_handlers.go`.
+  `src/internal/httpserver/mutation_handlers.go`, `src/internal/httpserver/negotiation.go`.
 - Gateway: `src/internal/gateway/`.
 - Telemetry: `src/internal/telemetry/`.
-- Digital Twin: `src/internal/digitaltwin/`, `src/internal/digitaltwin/mapper/identity.go`.
+- Digital Twin: `src/internal/digitaltwin/`, `src/internal/digitaltwin/mapper/identity.go`, `src/internal/digitaltwin/mapper/representation.go`.
 
-**Trạng thái contract và implementation:** Stage 4 API đã **HOÀN THÀNH TRIỂN KHAI VÀ KIỂM THỬ** (Tasks 4.0–4.7 hoàn thành;
-Task 4.8 tài liệu hóa và đối chiếu contract đã hoàn tất có giới hạn, chưa commit). Cả bảy endpoint Stage 4 (`GET /v1/telemetry/history`,
-`GET /v1/digital-twins`, `GET /v1/digital-twins/:entity_id`, `GET /v1/digital-twins/:entity_id/state`,
-`GET /v1/digital-twins/:entity_id/history`, `POST /v1/digital-twins`, `PATCH /v1/digital-twins/:entity_id`)
-đã **hoạt động thực tế trên runtime** và được xác minh qua 16/16 jobs CI thành công tại commit `aa7436d8838a6580c21b30930e2eed992999b11c`.
-Các nội dung thiết kế ban đầu của Task 4.0 được lưu giữ nguyên vẹn làm hồ sơ kỹ thuật lịch sử.
+**Trạng thái contract và implementation:** Stage 4 API đã **HOÀN THÀNH CHUYỂN ĐỔI SANG 5 ENDPOINT ETSI GS CIM 009 V1.9.1 PROFILE** (Tasks N0–N7 hoàn thành, CI xanh tại `449697ddbd8ba53173a3cd885c0d6804458cc81e`). Cả năm endpoint Digital Twin (`GET /v1/digital-twins`, `POST /v1/digital-twins`, `GET /v1/digital-twins/:entity_id`, `PATCH /v1/digital-twins/:entity_id/attrs`, `GET /v1/digital-twins/:entity_id/temporal`) đã **hoạt động thực tế trên runtime** và được xác minh qua 16/16 jobs CI thành công tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e` (run 39185129590). Bốn route cũ đã được thu hồi hoàn toàn. Các nội dung thiết kế ban đầu của Task 4.0 và 7-endpoint Stage 4 được lưu giữ nguyên vẹn làm hồ sơ kỹ thuật lịch sử.

@@ -1,12 +1,13 @@
 # Báo cáo Kỹ thuật Tổng kết Stage 4 — API Lịch sử Đo đạc và Digital Twin Entity
 
-**Tài liệu:** Báo cáo kỹ thuật tổng kết và bàn giao Giai đoạn 4 (Stage 4 Handover)  
-**Mục tiêu hệ thống:** Đồ án 1 (ET3290) — Nền tảng IoT Gateway–Server  
-**Ngày lập:** 18/10/2026  
-**Trạng thái:** Stage 4 bounded complete; Task 4.8 tài liệu đã đối soát ngày 18/10/2026, chưa commit. Remote CI xác minh cho code tại `aa7436d`, không phải một lần chạy mới cho diff tài liệu này. Không chứng nhận client Flutter/production đã hoàn tất.  
-**Git Baseline & Remote CI:**  
-- Commit hoàn tất Task 4.7 trên nhánh `develop`: `aa7436d8838a6580c21b30930e2eed992999b11c` (qua chuỗi commit `a526981`, `f3edc3d`, `6257f80`, cùng 2 commit sửa CI `65d727b` và `aa7436d`).
-- GitHub Actions: [Run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379), trạng thái `completed / success`, **16/16 jobs thành công** (bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`).
+**Tài liệu:** Báo cáo kỹ thuật tổng kết, chuyển đổi giao diện ETSI GS CIM 009 V1.9.1 và bàn giao Giai đoạn 4 (Stage 4 Handover & Migration Record)
+**Mục tiêu hệ thống:** Đồ án 1 (ET3290) — Nền tảng IoT Gateway–Server
+**Ngày lập:** 18/10/2026 (Cập nhật sau chuyển đổi V1.9.1: 19/10/2026)
+**Trạng thái:** Stage 4 bounded complete; Kế hoạch chuyển đổi giao diện theo ETSI GS CIM 009 V1.9.1 (Tasks N0–N8) đã hoàn tất. Remote CI xanh tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e`. Không chứng nhận client Flutter/production đã hoàn tất.
+**Git Baseline & Remote CI Provenance:**
+- Mốc hoàn thành Stage 4 ban đầu (Tasks 4.0–4.7): Commit `aa7436d8838a6580c21b30930e2eed992999b11c`, GitHub Actions [Run 39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379), 16/16 jobs thành công.
+- Mốc hoàn thành chuyển đổi ETSI GS CIM 009 V1.9.1 (Tasks N0–N7): Commit `449697ddbd8ba53173a3cd885c0d6804458cc81e`, GitHub Actions [Run 39185129590](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590), 16/16 jobs thành công (bao gồm `stage4-api-integration` [job 117847592389](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117847592389), `stage3-uplink-integration` và `native-compose-smoke` [job 117848365641](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117848365641)).
+- Toàn bộ 5 endpoint Digital Twin chuẩn hóa đã hoạt động trên runtime; 4 route cũ bị thu hồi hoàn toàn. Số liệu đo lường query local lịch sử trong `stage-4-task-4.7-summary.json` được bảo toàn nguyên vẹn.
 
 ---
 
@@ -62,10 +63,10 @@ Hệ thống kết hợp chặt chẽ luồng ghi nhận dữ liệu cảm biế
                       │  (Đọc độc lập sau commit)
   ┌───────────────────┴───────────────────────────────────────────────┐
   │                           Go HTTP REST API (Port 8080)             │
-  │  ├── GET /v1/telemetry/history  ──► Đọc raw hoặc time_bucket      │
-  │  ├── GET /v1/digital-twins/...  ──► Đọc đồ thị thực thể & state    │
+  │  ├── GET /v1/digital-twins/...  ──► Đọc danh sách, detail & state │
+  │  ├── GET /v1/digital-twins/../temporal ──► Đọc lịch sử đo lường   │
   │  ├── POST /v1/digital-twins     ──► Tạo thực thể Gateway / Sensor  │
-  │  └── PATCH /v1/digital-twins/.. ──► Cập nhật metadata (tên/mô tả) │
+  │  └── PATCH /v1/digital-twins/../attrs ──► Cập nhật metadata       │
   └───────────────────▲───────────────────────────────────────────────┘
                       │ (HTTPS + Supabase JWT)
               [Flutter Web / Người dùng]
@@ -80,7 +81,9 @@ Hệ thống kết hợp chặt chẽ luồng ghi nhận dữ liệu cảm biế
 
 ---
 
-## 3. Danh mục bảy endpoints và contract dữ liệu
+## 3. Hồ sơ Lịch sử: Danh mục bảy endpoints Stage 4 ban đầu
+
+*(Lưu ý về mốc chuyển đổi:* Bảy endpoint dưới đây ghi nhận trạng thái bàn giao Stage 4 ban đầu trước đợt chuyển đổi theo ETSI GS CIM 009 V1.9.1. Nhóm endpoint hiện hành đã được rút gọn và chuẩn hóa thành đúng 5 endpoint tại [Mục 11](#11-báo-cáo-chuyển-đổi-giao-diện-digital-twin-theo-etsi-gs-cim-009-v191-tasks-n0n8); các route cũ `/telemetry/history`, `/{id}/state`, `/{id}/history`, và `PATCH /{id}` đã bị thu hồi hoàn toàn).*
 
 Toàn bộ 7 endpoints đều nằm dưới tiền tố `/v1`, yêu cầu xác thực JWT qua header `Authorization: Bearer <token>`, áp dụng header phản hồi `Cache-Control: no-store` (kèm `Pragma: no-cache` cho các thao tác sửa đổi). Chi tiết đặc tả đầy đủ xem tại [Stage 4 Protocol Contract](../protocols/stage4-read-and-entity-api.md).
 
@@ -365,3 +368,79 @@ Toàn bộ mã nguồn, cấu hình và kịch bản của Stage 4 tạo thành 
 2. Thiết kế bảng hàng đợi lệnh gửi đi (`twin_commands`) và bảng outbox giao dịch (`twin_outbox`).
 3. Xây dựng Outbox Publisher gửi lệnh an toàn qua giao thức MQTT tới topic của Gateway.
 4. Xử lý phản hồi xác nhận thực thi từ Gateway, cập nhật kết quả lệnh và đồng bộ trạng thái `reported_state` sau khi thiết bị xác nhận hoàn thành.
+
+---
+
+## 11. Báo cáo Chuyển đổi Giao diện Digital Twin theo ETSI GS CIM 009 V1.9.1 (Tasks N0–N8)
+
+Theo chỉ thị của người dùng và kế hoạch chuyển đổi [`docs/backend_plan/digital_twin_ngsi_ld_v1.9.1_migration_plan.md`](../../../docs/backend_plan/digital_twin_ngsi_ld_v1.9.1_migration_plan.md), toàn bộ nội dung nghiệm thu chuyển đổi giao diện Digital Twin từ 7 endpoint ban đầu sang 5 endpoint chuẩn hóa được tích hợp trực tiếp vào tài liệu tổng kết bàn giao Stage 4 này (không tạo file báo cáo riêng).
+
+### 11.1 Bối cảnh và Mục tiêu Chuyển đổi
+- **Bối cảnh:** Giai đoạn 4 ban đầu hoàn thành 7 endpoints (`GET /v1/telemetry/history`, `GET /v1/digital-twins`, `GET /v1/digital-twins/:id`, `GET /v1/digital-twins/:id/state`, `GET /v1/digital-twins/:id/history`, `POST /v1/digital-twins`, `PATCH /v1/digital-twins/:id`), đạt kết quả kiểm thử xanh trên remote CI run 39103564379 tại commit `aa7436d`.
+- **Mục tiêu:** Rút gọn và chuẩn hóa giao diện REST API theo cấu trúc dữ liệu của đặc tả kỹ thuật **ETSI GS CIM 009 V1.9.1 (2025-07)** mà không làm thay đổi các tầng dịch vụ backend, schema CSDL (Schema 20) hay quy tắc phân quyền người dùng.
+- **Kết quả:** Nhóm endpoint Digital Twin được rút gọn thành đúng **năm (05) endpoint canonical**, 4 route cũ bị thu hồi hoàn toàn.
+
+### 11.2 Bảng Đối chiếu Trước / Sau Chuyển đổi (Before / After Mapping)
+
+| Đặc tính / Hành vi | Trước chuyển đổi (Stage 4 ban đầu) | Sau chuyển đổi (ETSI GS CIM 009 V1.9.1 Profile) | Ghi chú kỹ thuật |
+|---|---|---|---|
+| **Tổng số Endpoints** | 7 endpoints riêng lẻ | **5 endpoints canonical** | Thu hồi 4 route cũ (`/telemetry/history`, `/{id}/state`, `/{id}/history`, `PATCH /{id}`). |
+| **Danh sách Twin** | `GET /v1/digital-twins`<br>Query: `entity_type`, `after`<br>Body: `{items: [...], next_cursor: "..."}` | `GET /v1/digital-twins`<br>Query: `type=Gateway\|Sensor`, `cursor`<br>Body: Root array `[...]` (`application/ld+json`) | Phân trang chuyển hoàn toàn vào HTTP Header `Link: <URI>; rel="next"`. Loại bỏ `next_cursor` khỏi body. |
+| **Chi tiết Thực thể** | `GET /v1/digital-twins/:id`<br>Quan hệ: `hasSensor: [{type, object, createdAt}]`<br>Trang: `relationship_page` trong body | `GET /v1/digital-twins/:id`<br>Quan hệ: `hasSensor: {type: "Relationship", object: [URI...], objectType: "Sensor"}`<br>Trang: Header `Link: <URI>; rel="next"` | Chuẩn hóa mảng URI theo Clause 4.5.3. Loại bỏ `relationship_page` khỏi body. Sensor detail tích hợp measurement/interval mới nhất và `unitCode` UN/CEFACT. |
+| **Đọc Trạng thái** | Endpoint riêng:<br>`GET /v1/digital-twins/:id/state` | Query extension trên detail:<br>`GET /v1/digital-twins/:id?format=simplified` | Route cũ bị xóa (404). Extension trả về JSON phẳng trạng thái `twin_states` (`application/json`), giữ nguyên số nguyên lớn và version chuỗi. |
+| **Lịch sử Chuỗi thời gian** | 2 endpoints tách biệt:<br>- `GET /v1/telemetry/history`<br>- `GET /v1/digital-twins/:id/history` | **1 endpoint duy nhất:**<br>`GET /v1/digital-twins/:id/temporal` | Hợp nhất truy vấn viễn trắc (`attrs=measurement`) và chu kỳ lấy mẫu (`attrs=sample_interval_us`) cho Sensor. Route cũ bị xóa (404). |
+| **Định dạng Temporal Raw** | Envelope: `{points: [{measured_at, sequence_num, value}]}` | Tuples 2 phần tử chuẩn hóa:<br>`measurement: {type: "Property", values: [[val, observedAt], ...]}` | Bỏ envelope metadata cũ. Yêu cầu `timerel=between`, `timeAt`/`endTimeAt` UTCZ. Overflow trả `400 raw_limit_exceeded`, không auto public fallback. |
+| **Định dạng Temporal Bucket** | Envelope: `{points: [{bucket, avg, min, max, count}]}` | Triples 3 phần tử chuẩn hóa:<br>`measurement: {avg: [[val, start, end]], min: [...], max: [...], totalCount: [...]}` | Hỗ trợ 9 canonical durations: `PT0.1S`, `PT1S`, `PT10S`, `PT1M`, `PT5M`, `PT15M`, `PT1H`, `PT6H`, `P1D`. `totalCount` là số nguyên JSON exact integer. |
+| **Khởi tạo Thực thể** | `POST /v1/digital-twins`<br>Response `201 Created` / `200 OK` (không Location) | `POST /v1/digital-twins`<br>Trả header `Location: /v1/digital-twins/<escaped_urn>` khi `201 Created` | Replay 200 không có Location. Xung đột trả `409 Conflict`. Quyền Admin (Gateway) và Admin/Owner (Sensor) giữ nguyên. |
+| **Cập nhật Metadata** | `PATCH /v1/digital-twins/:id`<br>Body JSON phẳng: `{"name": "...", "description": "..."}` | `PATCH /v1/digital-twins/:id/attrs`<br>Body Property fragment:<br>`{"name": {"type": "Property", "value": "..."}, ...}` | Đổi path sang `/attrs`. Đường dẫn cũ nhận `405 Method Not Allowed`. Gateway xóa mô tả bằng `{"description": {"type": "Property", "value": "urn:ngsi-ld:null"}}`. Sensor chỉ cho phép sửa `name`, cấm sửa `unit`. |
+| **Thương lượng Accept** | Không hỗ trợ thương lượng chặt chẽ; router chấp nhận nhiều Accept khác nhau | Kiểm tra thương lượng nghiêm ngặt; hỗ trợ quoted parameters, fail-closed `q*`, trả về `406 Not Acceptable` khi incompatible | Header `Vary: Accept` và `Vary: Origin`. |
+| **CORS Policy** | Chưa expose đầy đủ header phân trang | Tích hợp CORS middleware (`cors.go`), xử lý preflight 204, expose: `Access-Control-Expose-Headers: Link, Location, X-Request-ID` | Cho phép Web client đọc trực tiếp URI phân trang và Location thực thể. Denied origin nhận 403. |
+
+### 11.3 Bằng chứng Thực thi TDD (RED → GREEN Table)
+
+Quá trình chuyển đổi được thực hiện theo quy trình TDD test-first nghiêm ngặt qua 8 nhiệm vụ kỹ thuật (Tasks N0–N7):
+
+| Task | Hạng mục công việc | Test Cases xây dựng trước (RED) | Giải pháp kỹ thuật triển khai | Kết quả kiểm thử (GREEN) |
+|---|---|---|---|:---:|
+| **N0** | Khóa Baseline & Lập kế hoạch | Kiểm tra baseline commit `986096f`, worktree sạch, đối chiếu 5 route và ma trận chuyển đổi | Xác lập kế hoạch chuyển đổi [`digital_twin_ngsi_ld_v1.9.1_migration_plan.md`](../../../docs/backend_plan/digital_twin_ngsi_ld_v1.9.1_migration_plan.md) | **PASS** |
+| **N1** | List Query & Link Pagination | `twin_query_parser_test.go`, `twin_dto_test.go`, `read_handlers_test.go`: RED cho `type`/`cursor`, từ chối `entity_type`/`after`, root array `[...]`, header `Link: <URI>; rel="next"`, terminal no-link | Triển khai parser `type`/`cursor`, summary serializer mảng trực tiếp, helper định dạng header `Link` | **PASS** (Commit `fe67ae9`) |
+| **N2** | Detail JSON-LD & State View | `representation_test.go`, `read_handlers_test.go`: RED cho mảng URI `hasSensor`, `isHostedBy`, `unitCode` UN/CEFACT trong `measurement`, `?format=simplified` đọc trạng thái phẳng `twin_states`, loại bỏ route `/state` cũ | Triển khai context V1.9, bảng map mã đơn vị UN/CEFACT (`CEL`, `C81`, `P1`, ...), presentation adapter dispatch theo `format=simplified` | **PASS** (Commit `43d5340`, `fe67ae9`) |
+| **N3** | Hợp nhất Lịch sử `/temporal` | `history_query_parser_test.go`, `twin_history_dto_test.go`, `read_handlers_test.go`: RED cho route `/temporal`, bắt buộc `attrs`, `timerel=between`, 9 canonical durations, raw tuples, bucket triples, `totalCount` exact integer, loại bỏ `/telemetry/history` và `/{id}/history` cũ | Hợp nhất truy vấn vào duy nhất `getDigitalTwinTemporal`, gọi `GetTwinHistory` với selector ủy quyền, serializer raw tuples 2 phần tử và bucket triples 3 phần tử | **PASS** (Commit `8fd4dc3`) |
+| **N4** | POST Location & PATCH Fragment | `mutation_handlers_test.go`, `patch_entity_request_test.go`: RED cho header `Location` trên 201, route `PATCH /attrs`, Property fragment cho `name`/`description`, sentinel `urn:ngsi-ld:null` xóa mô tả, từ chối `unit` và trường lạ | Bổ sung header `Location` trong `postDigitalTwin`, adapter `parsePatchEntityRequest` kiểm tra Property fragment, sentinel mapper cho Gateway description | **PASS** (Commit `2427f5a`) |
+| **N5** | Headers, CORS, Cache & Composition | `read_handlers_test.go`, `cors_test.go`, `stage4_headers_test.go`: RED cho Content-Type từng nhánh, Accept negotiation, 406 khi không tương thích, CORS expose `Link, Location`, preflight 204 | Tích hợp `negotiation.go` (tokenizer tách media range, quoted parameters, fail-closed `q*`), cập nhật `cors.go`, gắn middleware vào `router.go` | **PASS** (Commit `aa8bbe1`) |
+| **N6** | Chuyển đổi Integration Harness | `stage4_vertical_scenario.py`, `stage4_contract_scenario.py`, `stage4_queries_scenario.py`: RED khi kịch bản gọi 7 route cũ | Cập nhật bộ runner Python sang 5 route mới, duyệt phân trang trực tiếp qua header `Link`, kiểm chứng exact integer cho `totalCount` | **PASS** (Commit `449697d`) |
+| **N7** | Hồi quy Toàn diện & Remote CI | Chạy kiểm thử toàn bộ 18 Go packages, 877 Python unit tests, `test-stage4-api.sh --scenario all` trên Docker thật | Chạy kiểm thử đa dịch vụ thực tế, đóng các phát hiện review, đẩy commit lên remote CI | **PASS** (Commit `449697d`, CI run `39185129590`) |
+
+### 11.4 Đóng các Phát hiện từ Đợt Rà soát Kỹ thuật (Review Closure)
+1. **Finding 1 (Kiểm thực Context PATCH):** Đã đóng và kiểm chứng bằng 14 test cases trong `patch_entity_request_test.go`. Toàn bộ directives lạ (`@import`), terms lạ, thay đổi IRI nội bộ, hoặc ghi đè core terms đều bị từ chối `400 Bad Request`. Bằng chứng 0 writer function calls.
+2. **Finding 2 (Accept Quoted-Parameters):** Đã đóng bằng `splitAcceptRanges` và `splitMediaRangeSemicolons` trong `negotiation.go`. Header Accept chứa tham số có dấu ngoặc kép (như `profile="..."`) được phân tích cú pháp an toàn.
+3. **Finding 3 (UN/CEFACT Code C81 cho Radian):** Đã chuẩn hóa ánh xạ `"rad": "C81"` theo UNECE Rec 20 Annex I trong `representation.go`, kiểm chứng qua table-driven unit tests.
+4. **Finding 4 (Exact Integer totalCount trong Bộ so sánh Nén):** Đã đóng bằng kiểm tra `type(x) is int` và so sánh số nguyên tuyệt đối trước khi áp dụng dung sai số thực trong `stage4_queries_scenario.py`, phát hiện mất độ chính xác trên $2^{53}$.
+5. **Khắc phục Regression Phát sinh về MIME RFC 2231 Extended Parameter `q*`:**
+   - Trong quá trình rà soát closure review, phát hiện thư viện chuẩn Go `mime.ParseMediaType` tự động giải mã các tham số RFC 2231 dạng `q*`, `q*0`, `q*0*` thành key `"q"`, vô tình ghi đè giá trị `q=0` thành `q=1.0`.
+   - Lỗi này đã được khắc phục triệt để bằng bộ tách tham số độc lập và cơ chế **fail-closed**: bất kỳ sự xuất hiện nào của tham số dạng `q*` đều bị gán ép về `q = 0.0`, bảo đảm trả về `406 Not Acceptable` và 0 writer calls khi client từ chối media type.
+   - Kiểm chứng bằng 11 subtests router mutation/read với instrumented writer call counters (đạt GREEN) và toàn bộ 16/16 jobs CI từ xa thành công tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e`.
+
+### 11.5 Bằng chứng CI Nghiệm thu Chuyển đổi V1.9.1
+Trạng thái kiểm định CI từ xa đã được thẩm tra trực tiếp thông qua GitHub Actions metadata:
+- **Workflow Run:** [39185129590](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590)
+- **Commit SHA:** `449697ddbd8ba53173a3cd885c0d6804458cc81e` (HEAD của nhánh `develop` sau chuyển đổi).
+- **Kết quả:** **16/16 jobs completed successfully** (100% thành công):
+  * `stage4-api-integration`: Thực hiện build authoritative Docker images, chạy toàn bộ 3 kịch bản vertical, contract, queries trên 5 route chuẩn hóa, đạt PASS sạch ([Job URL](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117847592389)).
+  * `native-compose-smoke`: Đạt PASS sạch ([Job URL](https://github.com/TVTIT/project1_iot_server/actions/runs/39185129590/job/117848365641)).
+  * `stage3-uplink-integration`, `go-test-race`, `golangci-lint` (0 issues), `python-tests` (877 tests) đều đạt kết quả xanh.
+
+### 11.6 Ranh giới và Giới hạn Kỹ thuật Sau Chuyển đổi
+1. **Ranh giới Chuẩn ETSI GS CIM 009 V1.9.1:** Hệ thống là một Project API Profile áp dụng các cấu trúc dữ liệu được lựa chọn của V1.9.1, không phải là Context Broker toàn phần (không triển khai `/ngsi-ld/v1/entities`, không có subscription, federation, hay context hosting động).
+2. **Bảo tồn Số liệu Đo lường Gốc:** Báo cáo tóm tắt đo lường query local trong `docs/backend/stage-4-task-4.7-summary.json` bảo toàn nguyên vẹn số liệu và Docker image IDs của lần đo gốc (`sha256:9e6acf90...` và `sha256:58fe698a...`), không bị ghi đè bởi CI commit mới.
+3. **Mã nguồn Client và Bộ sưu tập Bruno:** Công việc chuyển đổi này thuần túy nằm ở tầng Backend API, Integration Harness và Tài liệu kỹ thuật. **Mã nguồn ứng dụng Flutter Web client và bộ sưu tập Bruno API collections chưa được cập nhật theo hợp đồng mới** trong đợt bàn giao này.
+
+### 11.7 Bổ sung: Extension danh sách Twin phẳng `format=simplified` (Bằng chứng Local, chưa vào Remote CI)
+
+- **Phạm vi:** Extension **summary rút gọn** (additive) cho `GET /v1/digital-twins?format=simplified`: mảng phẳng `id`/`type`/`name` (lược bỏ khi `NULL`)/`gateway_id`/`modifiedAt`, `application/json`, không `@context`/Property wrapper, `[]` khi rỗng. Nhánh danh sách normalized JSON-LD mặc định **không đổi**. Đây là phần kế thừa thêm **sau** đợt chuyển đổi Tasks N0–N8. Contract chi tiết xem [`docs/protocols/stage4-read-and-entity-api.md`](../protocols/stage4-read-and-entity-api.md) mục 9.1.1.
+- **Trạng thái baseline:** Worktree **dirty** kế thừa baseline `449697ddbd8ba53173a3cd885c0d6804458cc81e`; tính năng này chưa được commit tại thời điểm ghi.
+- **Bằng chứng đã chạy (local):**
+  - `python3 -m unittest discover -s scripts/tests` → **885 tests PASS** (kịch bản `stage4_contract_scenario.py` bổ sung section 2g-bis "Simplified list presentation parity and pagination").
+  - Go (Go 1.27.2): `go test -race -count=1 ./internal/httpserver/ ./cmd/server/`, `go build ./...`, `go vet`, `gofmt`, `git diff --check` PASS; `golangci-lint` **0 issues**.
+  - Tích hợp dịch vụ thật: `bash scripts/test-stage4-api.sh --scenario all --require-run` PASS (vertical, contract, queries) trên PostgreSQL 16.15 / TimescaleDB 2.29.2 (schema 20, role `iot_backend_app`), Mosquitto 2.0.18.
+- **Ranh giới / non-claims:** Remote CI run `39185129590` tại `449697d` **KHÔNG** bao phủ tính năng mới; remote CI cho tính năng này là **NOT RUN**. Kết quả local dùng môi trường test dùng chung, **không** phải production và **không** chứng nhận production readiness. Số đo cũ (mục 11.5) và mốc N8 **không** được gán lại làm bằng chứng cho tính năng mới. Bộ sưu tập Bruno API collections **chưa** được cập nhật cho biến thể này.

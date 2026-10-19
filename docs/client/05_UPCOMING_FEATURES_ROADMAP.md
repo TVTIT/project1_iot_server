@@ -13,17 +13,16 @@
 Hệ thống backend Go đã hoàn thành các mốc kỹ thuật quan trọng theo lộ trình 9 giai đoạn:
 - **Giai đoạn 2 (Xác thực, phân quyền và quản lý trạm cơ bản):** Định danh tập trung qua Supabase Auth, kiểm tra JWT nội bộ kết hợp quan hệ `user_gateways` và quyền quản trị `platform_admins`. Các API danh mục (`GET /v1/gateways`, `GET /v1/gateways/{gateway_id}/sensors`) và khởi tạo cảm biến (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`) hoạt động với quy tắc fail-closed chặt chẽ. Quản trị MQTT Dynamic Security được thiết lập qua endpoint admin.
 - **Giai đoạn 3 (Uplink hoàn chỉnh: MQTT → Ingress → Lưu DB → Commit ACK):** Pipeline thu thập dữ liệu từ trạm hoàn chỉnh: Gateway simulator lưu SQLite outbox trước khi phát qua MQTT TLS, Go subscriber nhận qua hàng đợi có giới hạn và fixed worker pool, ghi đồng thời vào PostgreSQL transaction (raw telemetry, dedup ledger `processed_messages`, cập nhật `reported_state` cảm biến và bản ghi temporal `sample_interval_us` trong `twin_temporal_values`), chỉ gửi application commit ACK khi giao dịch đã commit thành công.
-- **Giai đoạn 4 (API Lịch sử, Đọc Digital Twin & Quản lý Metadata Thực thể - ĐÃ HOÀN TẤT & ĐƯỢC KIỂM CHỨNG TRÊN BACKEND):**
-  Toàn bộ 7 endpoint của Giai đoạn 4 đã được triển khai đầy đủ và tích hợp trên Go Backend (`src/internal/httpserver/router.go`), bao gồm:
-  1. `GET /v1/telemetry/history`: Truy vấn lịch sử chuỗi thời gian (hỗ trợ raw `[from, to)` với cửa sổ $\le 10$s hoặc gom nhóm `time_bucket` với các độ phân giải cho phép, tự động fallback an toàn khi vượt ngưỡng `max_points`).
-  2. `GET /v1/digital-twins`: Danh sách thực thể Digital Twin có phân trang keyset cursor (`v1.{k,g,t}`).
-  3. `GET /v1/digital-twins/{entity_id}`: Chi tiết thực thể dạng chuẩn JSON-LD (`application/ld+json`) kèm `@context` nội tuyến và danh sách quan hệ `hasSensor`.
-  4. `GET /v1/digital-twins/{entity_id}/state`: Đọc trạng thái trực tiếp (`reported_state`, `desired_state`, `reported_version`, `desired_version`, timestamps) từ bảng `twin_states` (không quét hypertable, bảo toàn số nguyên lớn $> 2^{53}$).
-  5. `GET /v1/digital-twins/{entity_id}/history`: Truy vấn lịch sử thuộc tính Digital Twin (hỗ trợ selector `value` ủy quyền sang telemetry history và `sample_interval_us` đọc từ `twin_temporal_values`).
-  6. `POST /v1/digital-twins`: Khởi tạo thực thể mới hoặc phát lại chính xác (create-or-exact-replay) cho Gateway (yêu cầu Platform Admin) hoặc Sensor (yêu cầu Platform Admin hoặc Gateway Owner).
-  7. `PATCH /v1/digital-twins/{entity_id}`: Cập nhật siêu dữ liệu thực thể (Gateway: cho phép sửa `name`, `description`; Sensor: cho phép sửa `name`; cấm sửa `unit` và không làm thay đổi trạng thái reported/desired hay thiết bị).
+- **Giai đoạn 4 (API Lịch sử, Đọc Digital Twin & Quản lý Metadata Thực thể - ĐÃ HOÀN TẤT & CHUYỂN ĐỔI SANG 5 ENDPOINT ETSI GS CIM 009 V1.9.1 PROFILE):**
+  Hệ thống ban đầu triển khai 7 endpoint Stage 4 (commit `aa7436d`, CI run 39103564379). Sau đó, hệ thống đã hoàn tất kế hoạch chuyển đổi theo chuẩn ETSI GS CIM 009 V1.9.1 profile thành **đúng năm (05) endpoint chính thức** trên Go Backend (`src/internal/httpserver/router.go`), bao gồm:
+  1. `GET /v1/digital-twins`: Danh sách thực thể Digital Twin dạng mảng root array `[...]` (`application/ld+json`), lọc `type=Gateway\|Sensor`, phân trang qua HTTP Header `Link: <URI>; rel="next"`.
+  2. `POST /v1/digital-twins`: Khởi tạo thực thể mới hoặc phát lại chính xác (create-or-exact-replay) cho Gateway (yêu cầu Platform Admin) hoặc Sensor (yêu cầu Platform Admin hoặc Gateway Owner), trả về header `Location: /v1/digital-twins/<escaped_urn>` khi `201 Created`.
+  3. `GET /v1/digital-twins/{entity_id}`: Chi tiết thực thể dạng chuẩn JSON-LD (`application/ld+json`) kèm `@context` V1.9 nội tuyến và mảng quan hệ `hasSensor` (`objectType: "Sensor"`), phân trang quan hệ qua header `Link`. Hỗ trợ extension dự án `?format=simplified` đọc trạng thái phẳng `twin_states` (`application/json`).
+  4. `PATCH /v1/digital-twins/{entity_id}/attrs`: Cập nhật siêu dữ liệu thực thể qua Property fragment (Gateway: sửa `name`, `description`; Sensor: sửa `name`; xóa mô tả Gateway bằng sentinel `urn:ngsi-ld:null`; `unit` bất biến). Đường dẫn gốc không có `/attrs` nhận `405 Method Not Allowed`.
+  5. `GET /v1/digital-twins/{entity_id}/temporal`: Hợp nhất truy vấn lịch sử viễn trắc telemetry (`attrs=measurement`) và chu kỳ đo (`attrs=sample_interval_us`) cho Sensor; yêu cầu `timerel=between`, `timeAt`/`endTimeAt` UTCZ, hỗ trợ raw tuples và bucket triples với 9 canonical durations; `totalCount` là số nguyên exact integer.
+  *(Bốn route cũ `/v1/telemetry/history`, `/{id}/state`, `/{id}/history`, và `PATCH /{id}` đã thu hồi hoàn toàn, trả về 404 hoặc 405).*
 
-  *Bằng chứng kiểm chứng backend:* Bộ kiểm thử tích hợp đa dịch vụ thực `scripts/test-stage4-api.sh --scenario all` đã PASS (kèm số đo truy vấn trên dataset 60.000 mẫu trước và sau nén TimescaleDB hypertable `compress_chunk`). Trên hệ thống CI từ xa GitHub Actions, **run 39103564379** tại commit `aa7436d8838a6580c21b30930e2eed992999b11c` đã hoàn thành thành công toàn bộ **16/16 jobs** (bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`). Kết quả kiểm chứng CI này xác nhận tính đúng đắn của mã nguồn backend nhưng **không phải là chứng nhận chất lượng cho môi trường sản xuất (production certification)**, và **không đồng nghĩa với việc giao diện người dùng Flutter Web đã được hiện thực hóa hay hoàn thiện**.
+  *Bằng chứng kiểm chứng backend:* Bộ kiểm thử tích hợp đa dịch vụ thực `scripts/test-stage4-api.sh --scenario all` đã PASS toàn bộ. Trên hệ thống CI từ xa GitHub Actions, **run 39185129590** tại commit `449697ddbd8ba53173a3cd885c0d6804458cc81e` đã hoàn thành thành công toàn bộ **16/16 jobs** (bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`). Kết quả kiểm chứng CI này xác nhận tính đúng đắn của mã nguồn backend nhưng **không phải là chứng nhận chất lượng cho môi trường sản xuất (production certification)**, và **không đồng nghĩa với việc giao diện người dùng Flutter Web đã được hiện thực hóa hay hoàn thiện**.
 
 ### 1.2. Phân định rõ ràng giữa Hợp đồng chính thức Stage 4 và Bản phác thảo dự kiến tương lai
 
@@ -71,29 +70,28 @@ Hệ thống backend Go đã hoàn thành các mốc kỹ thuật quan trọng t
 ### 2.1. Rào cản Dữ liệu Lớn và Nguyên lý Gom mẫu Thích ứng trên Backend
 - Cảm biến tần số cao trong hệ thống có thể thu thập dữ liệu với tốc độ lên tới **100 Hz** (100 mẫu/giây = 8.640.000 mẫu/ngày cho mỗi kênh đo).
 - Giai đoạn 3 của backend đã hoàn thiện việc tiếp nhận và lưu trữ toàn bộ các mẫu thô này vào TimescaleDB hypertable (`telemetry`), ghi nhận bản ghi temporal `sample_interval_us` trong `twin_temporal_values`, và cập nhật `reported_state` cảm biến.
-- **Tại Giai đoạn 4**, backend đã chính thức cung cấp endpoint truy vấn chuỗi thời gian `GET /v1/telemetry/history` và lịch sử thuộc tính Digital Twin `GET /v1/digital-twins/{entity_id}/history?property=value`.
+- **Tại Giai đoạn 4**, backend đã chính thức cung cấp endpoint truy vấn chuỗi thời gian hợp nhất theo chuẩn ETSI GS CIM 009 V1.9.1:
+  `GET /v1/digital-twins/{entity_id}/temporal` (hỗ trợ `attrs=measurement` cho viễn trắc telemetry và `attrs=sample_interval_us` cho chu kỳ đo).
+  *(Lưu ý: Route cũ `GET /v1/telemetry/history` và `GET /v1/digital-twins/{entity_id}/history` đã được thu hồi và trả về `404 Not Found`).*
 - Backend sử dụng hàm `time_bucket()` của **TimescaleDB** để tính toán gộp mẫu thích ứng (Adaptive Downsampling). Phía Client sẽ nhận dữ liệu đã được tổng hợp theo các khoảng thời gian đều nhau với số lượng điểm tối ưu từ 500 đến 1.000 điểm cho một biểu đồ hiển thị. Toàn bộ mẫu thô vẫn được lưu trữ đầy đủ trong TimescaleDB để phục vụ phân tích chuyên sâu.
 
 ### 2.2. Trạng thái Endpoint và Quy chuẩn Hợp đồng Chính thức
 
-> **Thông tin trạng thái chính thức:** Endpoint `GET /v1/telemetry/history` **ĐÃ HOẠT ĐỘNG HOÀN TOÀN TRÊN BACKEND** (không còn là stub 501). Hợp đồng chính thức với đầy đủ thông số được ghi nhận tại [`docs/client/04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md) (Mục 5.4).
+> **Thông tin trạng thái chính thức:** Endpoint lịch sử hiện hành là `GET /v1/digital-twins/{entity_id}/temporal` **ĐÃ HOẠT ĐỘNG HOÀN TOÀN TRÊN BACKEND**. Hợp đồng chính thức với đầy đủ thông số được ghi nhận tại [`docs/client/04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md) (Mục 5.4).
 
 Tóm tắt các quy chuẩn quan trọng mà client cần tuân thủ khi tích hợp:
-- **Phương thức & Đường dẫn:** `GET /v1/telemetry/history`
+- **Phương thức & Đường dẫn:** `GET /v1/digital-twins/{entity_id}/temporal` (với `{entity_id}` là URN của Sensor).
 - **Xác thực:** Yêu cầu Bearer JWT (`authenticated`). Kiểm tra phân quyền theo bảng `user_gateways` (các vai trò `owner`, `operator`, `viewer` thuộc trạm đều được đọc; người dùng không thuộc trạm nhận `404 Not Found`).
 - **Tham số truy vấn (Query Parameters):**
-  - `gateway_id` (bắt buộc): Mã định danh trạm (1–64 ký tự `[a-z0-9_-]`).
-  - `sensor_id` (bắt buộc): Mã định danh cảm biến (1–64 ký tự `[a-z0-9_-]`).
-  - `from` & `to` (bắt buộc): Khoảng thời gian nửa mở $[from, to)$ theo định dạng UTC ISO 8601 / RFC 3339 có microsecond (ví dụ `2026-10-01T00:00:00.000000Z`). Yêu cầu $from < to$ và khoảng cách $(to - from) \le 744$ giờ (31 ngày).
-  - `resolution` (tùy chọn, mặc định `auto`): Các giá trị cho phép gồm 9 độ phân giải bucket hợp lệ: `100ms`, `1s`, `10s`, `1m`, `5m`, `15m`, `1h`, `6h`, `1d`, hoặc `raw`, hoặc `auto`.
-- **Cơ chế xử lý Raw và Auto Fallback:**
-  - Ngưỡng giới hạn điểm dữ liệu `max_points` được cấu hình trên server (mặc định hợp đồng: 1.000 điểm; tối thiểu 100, trần cứng tối đa 2.000; giá trị 500 chỉ là tham số của bộ fixture kiểm thử).
-  - Khi yêu cầu `resolution=raw`: Cửa sổ thời gian tối đa là **10 giây**. Nếu số điểm vượt quá `max_points` cấu hình của hệ thống, backend sẽ từ chối với lỗi `400 Bad Request` (`raw_limit_exceeded`).
-  - Khi yêu cầu `resolution=auto`: Hệ thống thăm dò dữ liệu thô cho cửa sổ ngắn ($\le 10$s); nếu vượt ngưỡng `max_points`, hệ thống tự động fallback về độ phân giải bucket nhỏ nhất trong danh sách cho phép mà vẫn bảo đảm số điểm $\le max\_points$ cho khoảng thời gian truy vấn (ví dụ với cửa sổ 8s trong bài đo M3 với giới hạn fixture 500 điểm, hệ thống chọn `100ms`), hoàn toàn không làm gián đoạn request của client.
-- **Cấu trúc DTO phản hồi chính thức từ backend (`200 OK`):**
-  - Trả về đối tượng JSON gồm `gateway_id`, `sensor_id`, `unit` (có thể null), `from`, `to`, `mode` (`"raw"` hoặc `"bucket"`), `resolution`, `point_count`, và mảng `points`.
-  - Trong chế độ `mode="raw"`: Mỗi phần tử trong `points` gồm `measured_at`, `value` (số thực), `sequence_num` (chuỗi số thập phân), cùng `boot_id`, `message_id`, `sample_index` (tùy chọn).
-  - Trong chế độ `mode="bucket"`: Mỗi phần tử trong `points` gồm `bucket_start`, `avg`, `min`, `max` (số thực), và `count` (chuỗi số thập phân thể hiện số mẫu gộp).
+  - `attrs` (bắt buộc): `measurement` (alias `value`) hoặc `sample_interval_us`.
+  - `timerel` (bắt buộc): `between`.
+  - `timeAt` & `endTimeAt` (bắt buộc): Khoảng thời gian nửa mở $[timeAt, endTimeAt)$ theo định dạng UTC ISO 8601 / RFC 3339 microsecond kết thúc bằng `Z` (ví dụ `2026-10-01T00:00:00.000000Z`). Yêu cầu $timeAt < endTimeAt$ và khoảng cách $(endTimeAt - timeAt) \le 744$ giờ (31 ngày).
+  - `aggrPeriodDuration` (tùy chọn): Kích hoạt chế độ aggregated values với 9 canonical durations: `PT0.1S`, `PT1S`, `PT10S`, `PT1M`, `PT5M`, `PT15M`, `PT1H`, `PT6H`, `P1D`.
+  - `aggrMethods` (tùy chọn, mặc định `avg,min,max,totalCount`): Tập con các phương thức tổng hợp.
+  - `format` (tùy chọn): `temporalValues` (cho raw) hoặc `aggregatedValues` (cho bucket).
+- **Cấu trúc DTO phản hồi chính thức từ backend (`200 OK`, `application/ld+json; charset=utf-8`):**
+  - Trong chế độ raw (`format=temporalValues`): Property `measurement` chứa mảng `values: [[val, time], ...]`.
+  - Trong chế độ gom cụm (`format=aggregatedValues`): Property `measurement` chứa các mảng bộ ba `[kết_quả, bắt_đầu, kết_thúc]` cho `avg`, `min`, `max`, và `totalCount`. Trường `totalCount` là số nguyên JSON exact integer.
 
 ### 2.3. Định hướng Trải nghiệm Trực quan hóa Biểu đồ trên Client (Flutter UI Roadmap)
 - **Tình trạng UI:** Phía backend đã sẵn sàng phục vụ dữ liệu, tuy nhiên màn hình biểu đồ lịch sử trên Flutter Web hiện **đang nằm trong lộ trình xây dựng giao diện** và chưa được xuất xưởng.
@@ -162,8 +160,8 @@ Database Commit Event -> Worker Pool -> WebSocket Fan-Out -> Client Dashboard
 Để tránh hiểu nhầm nghiêm trọng trong quá trình phát triển hệ thống IoT, cần nắm vững 4 khái niệm riêng biệt:
 1. **`reported_state` (Trạng thái thực tế):** Phản ánh những gì phần cứng Gateway thực tế đã đo đạc hoặc xác nhận thông qua MQTT. Backend cập nhật trường này khi nhận telemetry hoặc kết quả thực thi lệnh (`command_result`) từ Gateway.
 2. **`desired_state` (Cấu hình mục tiêu lâu dài):** Cấu hình mong muốn do người dùng có thẩm quyền yêu cầu thiết lập (ví dụ `sampling_interval_seconds = 5`). Cập nhật cấu hình này sẽ sinh ra lệnh gửi xuống thiết bị nếu có sự khác biệt so với trạng thái thực tế.
-3. **Đọc trạng thái Digital Twin (`GET /v1/digital-twins/{entity_id}/state`):** **ĐÃ ĐƯỢC HIỆN THỰC HÓA VÀ KIỂM CHỨNG TẠI STAGE 4 BACKEND**. Endpoint này cho phép người dùng có quyền đọc xem nội dung hiện tại của cả `reported_state` và `desired_state`. **Lưu ý quan trọng: Quyền đọc cấu hình mong muốn (`desired_state`) hoàn toàn KHÔNG ĐỒNG NGHĨA với quyền ghi hay sửa đổi cấu hình đó.**
-4. **Chỉnh sửa siêu dữ liệu (`PATCH /v1/digital-twins/{entity_id}`):** **ĐÃ ĐƯỢC HIỆN THỰC HÓA VÀ KIỂM CHỨNG TẠI STAGE 4 BACKEND**. Thao tác này chỉ cho phép sửa thông tin mô tả hành chính (`name`, `description` của Gateway bởi Admin; `name` của Sensor bởi Owner). **Thao tác này tuyệt đối KHÔNG PHẢI là lệnh điều khiển thiết bị (device command)**, không gửi bất kỳ bản tin nào qua MQTT xuống trạm và không làm thay đổi trạng thái hoạt động của thiết bị vật lý.
+3. **Đọc trạng thái Digital Twin (`GET /v1/digital-twins/{entity_id}?format=simplified`):** **ĐÃ ĐƯỢC HIỆN THỰC HÓA VÀ KIỂM CHỨNG TẠI STAGE 4 BACKEND**. Endpoint này cho phép người dùng có quyền đọc xem nội dung hiện tại của cả `reported_state` và `desired_state` qua project extension đọc trực tiếp `twin_states` (thay thế route cũ `/{id}/state` đã thu hồi 404). **Lưu ý quan trọng: Quyền đọc cấu hình mong muốn (`desired_state`) hoàn toàn KHÔNG ĐỒNG NGHĨA với quyền ghi hay sửa đổi cấu hình đó.**
+4. **Chỉnh sửa siêu dữ liệu (`PATCH /v1/digital-twins/{entity_id}/attrs`):** **ĐÃ ĐƯỢC HIỆN THỰC HÓA VÀ KIỂM CHỨNG TẠI STAGE 4 BACKEND**. Thao tác này chỉ cho phép sửa thông tin mô tả hành chính qua Property fragment (`name`, `description` của Gateway bởi Admin; `name` của Sensor bởi Owner; xóa mô tả Gateway qua `urn:ngsi-ld:null`). Đường dẫn gốc `PATCH /v1/digital-twins/{entity_id}` nhận `405 Method Not Allowed`. **Thao tác này tuyệt đối KHÔNG PHẢI là lệnh điều khiển thiết bị (device command)**, không gửi bất kỳ bản tin nào qua MQTT xuống trạm và không làm thay đổi trạng thái hoạt động của thiết bị vật lý.
 
 ### 5.2. Mô hình Phân quyền và Ranh giới An toàn Điều khiển Thiết bị
 Theo quy định tại `AGENTS.md` (Mục 6, 6.5, 10, 18):

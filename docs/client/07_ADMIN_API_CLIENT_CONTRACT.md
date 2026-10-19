@@ -34,7 +34,7 @@
 
 Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản trị nền tảng (Platform Admin API Client Contract)** chính thức cho:
 1. Bảy (07) endpoint quản trị Stage 2 thuộc tiền tố `/v1/admin/*` đã được hiện thực trong mã nguồn Go backend (`src/cmd/server`, `src/internal/httpserver`), cùng 1 tuyến đường reset có giám sát đã đăng ký cú pháp nhưng áp dụng rào chắn an toàn fail-closed.
-2. Hai (02) endpoint khởi tạo thực thể và biến đổi siêu dữ liệu (Entity Creation & Metadata Mutation) Stage 4 thuộc tiền tố `/v1/digital-twins` (`POST /v1/digital-twins` và `PATCH /v1/digital-twins/{entity_id}`) có liên quan trực tiếp đến thẩm quyền Platform Admin và Gateway Owner.
+2. Hai (02) endpoint khởi tạo thực thể và biến đổi siêu dữ liệu (Entity Creation & Metadata Mutation) Stage 4 thuộc tiền tố `/v1/digital-twins` (`POST /v1/digital-twins` và `PATCH /v1/digital-twins/{entity_id}/attrs`) có liên quan trực tiếp đến thẩm quyền Platform Admin và Gateway Owner.
 
 ### 1.1 Danh mục Endpoint Quản trị Stage 2 và Endpoint Biến đổi Metadata Stage 4
 
@@ -52,8 +52,8 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
   - Khi tính năng credential được kích hoạt (`MQTT_CREDENTIAL_API_ENABLED=true`), runtime này **LUÔN LUÔN từ chối (fail-closed)** mọi yêu cầu hợp lệ vượt qua parser với mã lỗi HTTP **`503 Service Unavailable`** (`code: "service_unavailable"`, `message: "credential request failed"`). Nếu tính năng credential bị tắt (`MQTT_CREDENTIAL_API_ENABLED=false`), server phản hồi HTTP **`503 Service Unavailable`** với mã lỗi `code: "credential_runtime_disabled"` (chứ không phải `service_unavailable`). Nếu vi phạm xác thực, phân quyền hoặc cú pháp request, server phản hồi các mã lỗi parser tương ứng (`401`, `403`, `400`, `413`, `415`). Đây là rào chắn an toàn kỹ thuật, **CHƯA PHẢI là quy trình phục hồi khả dụng** (xem chi tiết tại [Mục 4.7](#47-ngoại-lệ-đặt-lại-credential-có-giám-sát-post-v1admingatewaysgateway_idmqtt-credentialreset)).
 
 #### B. Nhóm Endpoint Khởi tạo Thực thể và Sửa đổi Metadata Stage 4 (`/v1/digital-twins`):
-8. `POST /v1/digital-twins`: Khởi tạo mới hoặc gửi lại trùng khớp (Create-or-Exact-Replay) thực thể Digital Twin Gateway hoặc Sensor theo chuẩn NGSI-LD; trả về `201 Created` khi tạo mới hoặc `200 OK` khi replay trùng khớp hoàn toàn payload cũ; trả về `409 Conflict` nếu trùng định danh nhưng sai lệch thông tin biểu diễn.
-9. `PATCH /v1/digital-twins/{entity_id}`: Cập nhật siêu dữ liệu hiển thị (`name`, `description`) của thực thể Gateway hoặc Sensor thông qua định danh URN chuẩn NGSI-LD (`urn:ngsi-ld:Gateway:<gateway_id>` hoặc `urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>`); trả về `200 OK` kèm bản ghi metadata đã cập nhật (hoặc giữ nguyên nếu gửi bản vá trùng giá trị hiện tại — no-op).
+8. `POST /v1/digital-twins`: Khởi tạo mới hoặc gửi lại trùng khớp (Create-or-Exact-Replay) thực thể Digital Twin Gateway hoặc Sensor theo chuẩn NGSI-LD; trả về `201 Created` kèm header `Location: /v1/digital-twins/<escaped_urn>` khi tạo mới hoặc `200 OK` (không Location) khi replay trùng khớp hoàn toàn payload cũ; trả về `409 Conflict` nếu trùng định danh nhưng sai lệch thông tin biểu diễn.
+9. `PATCH /v1/digital-twins/{entity_id}/attrs`: Cập nhật siêu dữ liệu hiển thị (`name`, `description`) của thực thể Gateway hoặc Sensor thông qua Property fragment chuẩn hóa theo V1.9.1 profile; trả về `200 OK` kèm bản ghi metadata đã cập nhật (hoặc giữ nguyên timestamp nếu gửi bản vá trùng giá trị hiện tại — no-op). Đường dẫn gốc không có `/attrs` nhận `405 Method Not Allowed`.
 
 ---
 
@@ -65,9 +65,9 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
 |---|---|---|
 | **Tiền tố URL (Path Prefix)** | Bắt buộc bắt đầu bằng `/v1/admin/...` | Bắt đầu bằng `/v1/digital-twins/...` (nằm trong nhóm route nghiệp vụ xác thực `/v1/*`). |
 | **Phạm vi Phân quyền (RBAC)** | **Admin toàn cầu (Globally Admin-Only):** Bắt buộc người dùng phải tồn tại trong bảng `public.platform_admins`. Mọi người dùng thường (kể cả Gateway `owner`) đều bị từ chối `403 Forbidden`. | **Không phải toàn bộ là Admin-only!** Phân quyền phụ thuộc vào loại thực thể (`entity_type`) và hành động cụ thể. |
-| **Quyền tạo thực thể (`POST`)** | N/A (Stage 2 dùng `PUT` create-or-exact-replay). | - Tạo Gateway: **Bắt buộc Platform Admin** (vì liên quan chỉ định chủ sở hữu `owner_user_id`).<br>- Tạo Sensor: **Platform Admin HOẶC Gateway Owner** (người sở hữu trạm có quyền thêm cảm biến cho trạm của mình). |
-| **Quyền sửa metadata (`PATCH`)** | N/A (Stage 2 không hỗ trợ PATCH; gọi PUT sửa thông tin sẽ nhận `409 Conflict`). | - Sửa Gateway: **Bắt buộc Platform Admin** (sửa `name`, `description`). Mọi tài khoản không phải Admin (kể cả Gateway `owner`) đều bị từ chối `403 Forbidden`.<br>- Sửa Sensor: **Platform Admin HOẶC Gateway Owner** (chỉ sửa `name`; `unit` là bất biến).<br>- Vai trò `operator` / `viewer`: Luôn bị từ chối `403 Forbidden`.<br>- Người không phải thành viên trạm: Bị từ chối `404 Not Found`. |
-| **Tác động tới quyền Đọc dữ liệu** | Platform Admin không tự động đọc được dữ liệu nghiệp vụ của trạm nếu không có quyền trong `user_gateways`. | **Admin sửa metadata KHÔNG bypass quyền đọc!** Platform Admin tạo hoặc patch Gateway/Sensor vẫn nhận `404 Not Found` khi gọi `GET /v1/telemetry/history`, `GET /v1/digital-twins/{id}/state` hay `GET /v1/digital-twins/{id}/history` nếu chưa được gán thành viên trong `user_gateways`. |
+| **Quyền tạo thực thể (`POST`)** | N/A (Stage 2 dùng `PUT` create-or-exact-replay). | - Tạo Gateway: **Bắt buộc Platform Admin** (vì liên quan chỉ định chủ sở hữu `owner_user_id`).<br>- Tạo Sensor: **Platform Admin HOẶC Gateway Owner** (người sở hữu trạm có quyền thêm cảm biến cho trạm của mình). Trả về `Location` khi `201`. |
+| **Quyền sửa metadata (`PATCH`)** | N/A (Stage 2 không hỗ trợ PATCH; gọi PUT sửa thông tin sẽ nhận `409 Conflict`). | - Sửa Gateway: **Bắt buộc Platform Admin** (sửa `name`, `description`). Mọi tài khoản không phải Admin (kể cả Gateway `owner`) đều bị từ chối `403 Forbidden`.<br>- Sửa Sensor: **Platform Admin HOẶC Gateway Owner** (chỉ sửa `name`; `unit` là bất biến).<br>- Path bắt buộc là `/attrs`, nhận Property fragment.<br>- Vai trò `operator` / `viewer`: Luôn bị từ chối `403 Forbidden`.<br>- Người không phải thành viên trạm: Bị từ chối `404 Not Found`. |
+| **Tác động tới quyền Đọc dữ liệu** | Platform Admin không tự động đọc được dữ liệu nghiệp vụ của trạm nếu không có quyền trong `user_gateways`. | **Admin sửa metadata KHÔNG bypass quyền đọc!** Platform Admin tạo hoặc patch Gateway/Sensor vẫn nhận `404 Not Found` khi gọi `GET /v1/digital-twins/{id}`, `GET /v1/digital-twins/{id}?format=simplified` hay `GET /v1/digital-twins/{id}/temporal` nếu chưa được gán thành viên trong `user_gateways`. |
 | **Khởi tạo tài khoản & xác thực** | Trực tiếp cấp phát / xoay vòng / thu hồi mật khẩu MQTT DynSec cho trạm. | **TUYỆT ĐỐI KHÔNG cấp mật khẩu MQTT hay tài khoản Auth!** Lệnh POST tạo Gateway/Sensor chỉ ghi nhận thực thể vào bảng CSDL quan hệ và Digital Twin; việc cấp mật khẩu MQTT vẫn phải thực hiện qua API Credential hoặc quy trình riêng. |
 
 ---
@@ -83,7 +83,7 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
     - `GET /v1/admin/gateways` là danh mục kiểm kê toàn cầu độc lập với quyền sở hữu, chỉ dành cho Platform Admin (`platform_admins`). Trả về danh sách Gateway kèm phân trang keyset cursor (`limit`, `after`), không chứa thông tin vai trò hay bí mật.
     - `GET /v1/gateways` là API đọc nghiệp vụ người dùng, chỉ trả về các trạm mà người dùng hiện tại có liên kết quyền trong `user_gateways` kèm vai trò (`role`). Một Platform Admin nếu chưa được gán quyền trong `user_gateways` cho trạm nào thì khi gọi `GET /v1/gateways` vẫn nhận mảng rỗng `{"items":[]}` (Admin không tự động bypass CSDL nghiệp vụ).
   - **Ranh giới Phân quyền Đọc dữ liệu Chi tiết (Read Isolation Boundary):**
-    - Toàn bộ các API truy vấn chuỗi thời gian và trạng thái trạm (`GET /v1/telemetry/history`, `GET /v1/digital-twins`, `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}/state`, `GET /v1/digital-twins/{entity_id}/history`) đều thực thi thẩm định quyền thành viên thông qua CTE SQL `user_gateways`.
+    - Toàn bộ các API truy vấn chuỗi thời gian và trạng thái trạm (`GET /v1/digital-twins`, `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}?format=simplified`, `GET /v1/digital-twins/{entity_id}/temporal`) đều thực thi thẩm định quyền thành viên thông qua CTE SQL `user_gateways`. Các route cũ (`/v1/telemetry/history`, `/{id}/state`, `/{id}/history`) đã thu hồi và luôn trả về `404 Not Found`.
     - **Platform Admin KHÔNG được tự động bypass bộ lọc này:** Một Platform Admin thực hiện khởi tạo trạm (`POST /v1/digital-twins` hoặc `PUT /v1/admin/gateways/{id}`) và gán cho người khác làm `owner_user_id` thì chính Admin đó **KHÔNG THỂ** đọc dữ liệu viễn trắc, trạng thái hiện thời, hay lịch sử của trạm đó (nhận `404 Not Found`), trừ khi Admin được thêm bản ghi vào `user_gateways` cho trạm tương ứng.
 - **Không sáng tác endpoint tự kiểm tra quyền Admin (No Admin Self-Query Endpoint):** Go backend hiện tại không cung cấp endpoint kiểu `/v1/admin/me` hay `/v1/admin/whoami`. Phía client không được sáng tác hoặc gọi các endpoint giả định này.
 - **Không có API CRUD người dùng hoặc quản lý thành viên qua Go Backend:** Việc tạo tài khoản người dùng và gán phân quyền thành viên `user_gateways` hiện vẫn được thực thi thông qua công cụ quản trị hạ tầng của Supabase Auth (Admin API / Studio) và script nội bộ an toàn (xem [Tài liệu 03](03_USER_GATEWAY_AUTHORIZATION.md)). Khóa hạ tầng đặc quyền `service_role` tuyệt đối không bao giờ được cấu hình hay chia sẻ cho client.
@@ -498,19 +498,19 @@ Content-Type: application/json
 
 ---
 
-### 3.6 Cập nhật Siêu dữ liệu Digital Twin: `PATCH /v1/digital-twins/{entity_id}`
+### 3.6 Cập nhật Siêu dữ liệu Digital Twin: `PATCH /v1/digital-twins/{entity_id}/attrs`
 
-Endpoint này cho phép cập nhật có kiểm soát các trường siêu dữ liệu hiển thị (`name`, `description`) của Gateway hoặc Sensor thông qua mã định danh URN chuẩn NGSI-LD.
+Endpoint này cho phép cập nhật có kiểm soát các trường siêu dữ liệu hiển thị (`name`, `description`) của Gateway hoặc Sensor thông qua mã định danh URN chuẩn NGSI-LD và normalized Property fragment.
 
 - **HTTP Method:** `PATCH`
-- **Đường dẫn:** `/v1/digital-twins/{entity_id}`
+- **Đường dẫn:** `/v1/digital-twins/{entity_id}/attrs` (Đường dẫn gốc không có `/attrs` nhận phản hồi `405 Method Not Allowed`).
 - **Tham số Đường dẫn (`entity_id`):** Bắt buộc là URN chuẩn NGSI-LD:
   - Gateway URN: `urn:ngsi-ld:Gateway:<gateway_id>`
   - Sensor URN: `urn:ngsi-ld:Sensor:<gateway_id>:<sensor_id>`
   - **Quy tắc giải mã URL (Single URL-Decode Rule):** URN trong path được giải mã đúng một lần bởi tầng HTTP router (`c.Param("entity_id")`). Parser kiểm tra trực tiếp định dạng URN và **TUYỆT ĐỐI KHÔNG thực hiện giải mã lần 2**; các URN bị mã hóa 2 lần (ví dụ `%253A`) sẽ lập tức nhận **`400 Bad Request`**.
 - **Quy chuẩn Header:**
   - `Authorization: Bearer <jwt>` (bắt buộc).
-  - `Content-Type: application/json` (cho phép `charset=utf-8`).
+  - `Content-Type: application/json` hoặc `application/ld+json` (cho phép `charset=utf-8`). Nếu là JSON-LD, context bắt buộc phải trùng khớp context khóa của dự án.
   - `Cache-Control: no-store` và `Pragma: no-cache` tự động được thiết lập.
 - **Ranh giới Phân quyền (RBAC Policy):**
   - **PATCH Gateway:** Chỉ dành riêng cho **Platform Admin** (kiểm tra `public.platform_admins` trước tiên trong giao dịch). Mọi người dùng khác (kể cả Gateway `owner`) nhận **`403 Forbidden`** (`code: "forbidden"`, `message: "access denied"`).
@@ -522,26 +522,42 @@ Endpoint này cho phép cập nhật có kiểm soát các trường siêu dữ 
   - **TUYỆT ĐỐI KHÔNG can thiệp** vào `reported_state`, `desired_state`, các phiên bản (`reported_version`, `desired_version`), dữ liệu viễn trắc (`telemetry`), chuỗi giá trị thời gian (`twin_temporal_values`), lệnh điều khiển (`twin_commands`), outbox, hay thông tin xác thực broker.
   - **Admin sửa metadata KHÔNG bypass quyền đọc:** Platform Admin patch trạm nhưng không có quyền trong `user_gateways` thì vẫn nhận `404 Not Found` khi truy vấn dữ liệu đo hoặc trạng thái trạm.
 
-#### A. Quy chuẩn Body và Cơ chế Hiện diện của Gateway PATCH
-- Danh sách trường được phép gửi (Allowlist): **Duy nhất hai trường `name` và `description`**.
-  - `name` (string, tùy chọn): Tên hiển thị mới (1..256 UTF-8 bytes, không được rỗng hoặc chỉ chứa khoảng trắng). **Không được là `null`** (nếu truyền `null` nhận ngay 400).
-  - `description` (string hoặc null, tùy chọn): Mô tả trạm Gateway (tối đa 4096 UTF-8 bytes). Áp dụng **ngữ nghĩa nhận biết sự hiện diện (Presence-Aware Ternary Semantics)**:
-    - **Omitted (không truyền trường `description` trong JSON):** Giữ nguyên mô tả hiện tại, không sửa đổi.
-    - **Truyền chuỗi văn bản (`"description": "..."`):** Cập nhật mô tả mới vào CSDL.
-    - **Truyền giá trị null (`"description": null`):** Xóa mô tả hiện tại về giá trị SQL `NULL`.
+#### A. Quy chuẩn Body và Cơ chế Hiện diện của Gateway PATCH (Property Fragment)
+- Định dạng yêu cầu: **Normalized Property Fragment** theo V1.9.1 profile.
+- Danh sách trường được phép gửi (Allowlist): **Duy nhất hai Property `name` và `description`**.
+  - `name`: Object Property có `type: "Property"` và `value` (string, 1..256 UTF-8 bytes, không được rỗng hoặc chỉ chứa khoảng trắng). **Không được là `null`** (nếu truyền `null` nhận ngay 400).
+  - `description`: Object Property có `type: "Property"` và `value` (string tối đa 4096 UTF-8 bytes, hoặc chuỗi sentinel để xóa). Áp dụng **ngữ nghĩa nhận biết sự hiện diện (Presence-Aware Ternary Semantics)**:
+    - **Omitted (không truyền Property `description`):** Giữ nguyên mô tả hiện tại, không sửa đổi.
+    - **Truyền chuỗi văn bản (`"value": "..."`):** Cập nhật mô tả mới vào CSDL.
+    - **Xóa mô tả về SQL `NULL`:** Truyền sentinel chuẩn NGSI-LD:
+      ```json
+      {
+        "description": {
+          "type": "Property",
+          "value": "urn:ngsi-ld:null"
+        }
+      }
+      ```
+      *(Không nhận JSON literal null `{"description": null}`).*
   - **Quy tắc Lưu trữ Description (Description Storage Invariant):** Trường `description` được ghi **DUY NHẤT vào cột quan hệ `public.gateways.description`**; trường `twin_entities.attributes` tuyệt đối không bị ghi đè hay biến đổi.
   - Cấm trường lạ (ví dụ `owner_user_id`, `gateway_id`, `unit`, `state`): Nhận ngay **`400 Bad Request`**.
   - Cấm Body rỗng `{}`: Bắt buộc phải có ít nhất một trường (`name` hoặc `description`).
 
 *Ví dụ Request PATCH Gateway:*
 ```http
-PATCH /v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-station-alpha
+PATCH /v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-station-alpha/attrs
 Authorization: Bearer <platform_admin_jwt>
 Content-Type: application/json
 
 {
-  "name": "Gateway Tram Quan Trac Alpha V2",
-  "description": "Tram moi truong khu vuc A da nang cap"
+  "name": {
+    "type": "Property",
+    "value": "Gateway Tram Quan Trac Alpha V2"
+  },
+  "description": {
+    "type": "Property",
+    "value": "Tram moi truong khu vuc A da nang cap"
+  }
 }
 ```
 
@@ -558,20 +574,23 @@ Content-Type: application/json
 ```
 
 #### B. Quy chuẩn Body và Tính Bất biến Đơn vị của Sensor PATCH
-- Danh sách trường được phép gửi (Allowlist): **DUY NHẤT một trường `name`**.
-  - `name` (string, bắt buộc): Tên cảm biến mới (1..256 UTF-8 bytes, không được rỗng, không được là `null`).
+- Định dạng yêu cầu: Property fragment chỉ chứa duy nhất trường `name`.
+  - `name`: Object Property có `type: "Property"` và `value` (string bắt buộc, 1..256 UTF-8 bytes, không rỗng, không null).
   - **ĐƠN VỊ ĐO LƯỜNG LÀ BẤT BIẾN (Unit is Immutable):** Trường `unit` của Sensor được khóa bất biến sau khi khởi tạo nhằm bảo đảm tính toàn vẹn của chuỗi dữ liệu đo trong hypertable TimescaleDB. **Nếu request PATCH có chứa trường `unit` (dù là cùng giá trị, giá trị mới, hay null), bộ phân tích cú pháp sẽ lập tức từ chối với HTTP `400 Bad Request` (`code: "invalid_request"`)**.
   - Cấm trường lạ (như `sensor_id`, `gateway_id`, `unit`, `sensor_type`).
   - Cấm Body rỗng `{}`.
 
 *Ví dụ Request PATCH Sensor:*
 ```http
-PATCH /v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw-station-alpha%3Asensor-dht22-temp
+PATCH /v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw-station-alpha%3Asensor-dht22-temp/attrs
 Authorization: Bearer <owner_or_admin_jwt>
 Content-Type: application/json
 
 {
-  "name": "Cam Bien Nhiet Do Moi Truong Chinh Xac Cao"
+  "name": {
+    "type": "Property",
+    "value": "Cam Bien Nhiet Do Moi Truong Chinh Xac Cao"
+  }
 }
 ```
 
@@ -597,14 +616,15 @@ Content-Type: application/json
 2. **Cập nhật Mốc thời gian khi có Thay đổi Thực sự:**
    - Khi có ít nhất một trường thay đổi giá trị thực tế, cột `twin_entities.updated_at` được cập nhật bằng `statement_timestamp()` (thời điểm thực thi câu lệnh SQL sau khi đã chiếm khóa, tránh hiện tượng trôi ngược mốc thời gian sau các giao dịch đồng thời).
 
-#### D. Mã Trạng thái HTTP của `PATCH /v1/digital-twins/{entity_id}`
+#### D. Mã Trạng thái HTTP của `PATCH /v1/digital-twins/{entity_id}/attrs`
 - **HTTP 200 OK:** Cập nhật thành công siêu dữ liệu (hoặc ghi nhận no-op trùng khớp).
-- **HTTP 400 Bad Request (`code: "invalid_request"`):** URN sai định dạng, truyền trường `unit` khi patch Sensor, truyền `name: null`, body rỗng `{}`, chứa trường lạ, hoặc chứa URL query.
+- **HTTP 400 Bad Request (`code: "invalid_request"`):** URN sai định dạng, truyền trường `unit` khi patch Sensor, truyền `name: null`, body rỗng `{}`, chứa trường lạ, sai kiểu Property, hoặc chứa URL query.
 - **HTTP 401 Unauthorized (`code: "unauthorized"`):** Thiếu hoặc sai token JWT.
 - **HTTP 403 Forbidden (`code: "forbidden"`):** Không đủ quyền: Người dùng không phải Platform Admin khi patch Gateway (kể cả Gateway `owner`); vai trò `operator`/`viewer` khi patch Sensor (sau khi request đã vượt qua kiểm tra cấu trúc cú pháp hợp lệ).
 - **HTTP 404 Not Found (`code: "not_found"`):** Thực thể không tồn tại trong hệ thống, hoặc người gọi không có quyền thành viên trạm (đối với Sensor).
+- **HTTP 405 Method Not Allowed (`code: "method_not_allowed"`):** Gửi `PATCH` vào đường dẫn gốc không có `/attrs`.
 - **HTTP 413 Payload Too Large (`code: "payload_too_large"`):** Body vượt quá `ADMIN_MAX_BODY_BYTES`.
-- **HTTP 415 Unsupported Media Type (`code: "unsupported_media_type"`):** `Content-Type` khác `application/json`.
+- **HTTP 415 Unsupported Media Type (`code: "unsupported_media_type"`):** `Content-Type` khác `application/json` hoặc `application/ld+json`.
 - **HTTP 500 Internal Server Error (`code: "internal_error"`):** Bất nhất đồ thị thực thể (`ErrInconsistentGraph`) hoặc lỗi server không lường trước.
 - **HTTP 503 Service Unavailable (`code: "service_unavailable"`):** Database timeout, gián đoạn kết nối, hoặc bất định trong commit giao dịch.
 
