@@ -3,7 +3,7 @@
 
 This module provides the reproducible, isolated test fixture for Stage 4
 HTTP and MQTT cross-service integration (Task 4.7.2):
-  - Isolated database (DatabaseFixture with TimescaleDB schema terminal 20)
+  - Isolated database (DatabaseFixture with verified TimescaleDB schema terminal 21)
   - Isolated Mosquitto broker (TLS 8883, DynSec per-Gateway ACLs, manager control)
   - Isolated backend container (built from current source target 'backend')
   - Isolated gateway simulator image (built from current source target 'gateway')
@@ -54,7 +54,41 @@ from task26_harness_helpers import RESPONSE  # noqa: E402
 
 # --- Pinned Constants and Timeouts -------------------------------------------
 
-TERMINAL_SCHEMA_VERSION = 20
+TERMINAL_SCHEMA_VERSION = 21
+
+
+def expected_stage4_schema_history() -> list[str]:
+    return [f'{int(p.name[:6])}:{p.name.split("_", 1)[1].removesuffix(".up.sql")}'
+            for p in sorted((ROOT / 'migrations').glob('*.up.sql'))
+            if int(p.name[:6]) <= TERMINAL_SCHEMA_VERSION and int(p.name[:6]) != 5]
+
+
+def verify_terminal_schema(fixture: DatabaseFixture) -> int:
+    code, output = fixture.sql(b"\\t on\n\\a\nSELECT 'STAGE4_SCHEMA=' || json_agg(version::text || ':' || name ORDER BY version)::text FROM public.schema_migrations;")
+    lines = [line.removeprefix('STAGE4_SCHEMA=') for line in output.decode().splitlines()
+             if line.startswith('STAGE4_SCHEMA=')]
+    try:
+        history = json.loads(lines[0]) if len(lines) == 1 else None
+    except ValueError:
+        history = None
+    if code or history != expected_stage4_schema_history():
+        raise RuntimeError('Stage 4 exact schema history verification failed')
+    return int(history[-1].split(':', 1)[0])
+
+
+def migrate_stage4_fixture(fixture: DatabaseFixture) -> int:
+    bootstrap_to_9(fixture)
+    # Minimal Auth table for FK/profile-trigger prerequisites, not a GoTrue
+    # integration claim. Reuse migration 4 as the existing compatibility helper.
+    fixture.sql(b'''CREATE TABLE auth.users (
+        id uuid PRIMARY KEY, email text, aud text, role text,
+        raw_app_meta_data jsonb NOT NULL DEFAULT '{}',
+        raw_user_meta_data jsonb NOT NULL DEFAULT '{}',
+        created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz);
+    ''')
+    fixture.sql((ROOT / 'migrations/000004_supabase_compat.up.sql').read_bytes())
+    run_existing_migration_runner(fixture, TERMINAL_SCHEMA_VERSION)
+    return verify_terminal_schema(fixture)
 
 IMAGE_BUILD_TIMEOUT = 900
 CONTAINER_START_TIMEOUT = 90
@@ -471,7 +505,7 @@ def collect_metadata(backend_image: str | None = None, gateway_image: str | None
         'timescaledb_image': PG_IMAGE,
         'python_version': sys.version.split()[0],
         'go_version': 'unavailable',
-        'terminal_schema': TERMINAL_SCHEMA_VERSION,
+        'terminal_schema': None,  # Only a verified DB result may populate this.
     }
     try:
         p = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, stdout=subprocess.PIPE, text=True, timeout=5)
@@ -652,9 +686,7 @@ def create_stage4_fixture(
         fixture.wait_ready()
         docker(['network', 'connect', '--alias', 'database', net_name, fixture.container_id], timeout=30)
 
-        # Migrate to terminal schema version 20
-        bootstrap_to_9(fixture)
-        run_existing_migration_runner(fixture, TERMINAL_SCHEMA_VERSION)
+        verified_schema = migrate_stage4_fixture(fixture)
 
         # Seed only users, profiles, and platform_admins (no entity graphs)
         seed_fixture_users(fixture, users)
@@ -755,6 +787,7 @@ def create_stage4_fixture(
         }
 
         metadata = collect_metadata(backend_image, gateway_image)
+        metadata['terminal_schema'] = verified_schema
 
         ctx = Stage4FixtureContext(
             work_dir=work,
@@ -807,7 +840,10 @@ def run_single_scenario_fixture(scenario: str, backend_image: str, gateway_image
     """Run an isolated fixture lifecycle for one scenario with strict cleanup."""
     ctx, cleanup = create_stage4_fixture(backend_image, gateway_image)
     try:
-        return run_scenario(scenario, ctx)
+        result = run_scenario(scenario, ctx)
+        result = dict(result) if isinstance(result, dict) else {}
+        result['_verified_schema'] = ctx.metadata['terminal_schema']
+        return result
     finally:
         cleanup()
 
@@ -901,7 +937,7 @@ def build_safe_compact_summary(
             'python': meta.get('python_version'),
             'timescaledb': meta.get('timescaledb_image'),
             'mosquitto': meta.get('mosquitto_image'),
-            'schema_version': meta.get('terminal_schema', 20),
+            'schema_version': meta.get('terminal_schema'),
         },
         'profiles': {
             'selector': selector,
@@ -1031,6 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
             print('=== Running fixture lifecycle self-test (lifecycle-only) ===', flush=True)
             ctx, cleanup = create_stage4_fixture(backend_image, gateway_image)
             try:
+                meta['terminal_schema'] = ctx.metadata['terminal_schema']
                 resp = ctx.http.get('/readyz')
                 if resp.status != 200:
                     raise RuntimeError(f'/readyz returned HTTP {resp.status}')
@@ -1048,6 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
                     completed_scenarios.append(sc)
                     if res is not None:
                         scenario_results[sc] = res
+                        if isinstance(res, dict):
+                            meta['terminal_schema'] = res.get('_verified_schema')
                     print(f'stage=scenario:{sc}:verified', flush=True)
                 except NotImplementedError as nie:
                     print(f'FAIL: stage4 api integration incomplete: {nie}', file=sys.stderr, flush=True)

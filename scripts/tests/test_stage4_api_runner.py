@@ -43,6 +43,41 @@ class SelectorAndScenarioContractTests(unittest.TestCase):
         self.assertEqual(R.resolve_scenario('queries'), 'queries')
         self.assertEqual(R.resolve_scenario('all'), 'all')
 
+class SchemaEvidenceTests(unittest.TestCase):
+    def test_unverified_metadata_does_not_claim_schema(self):
+        self.assertIsNone(R.collect_metadata()['terminal_schema'])
+
+    def test_schema_skip_or_history_drift_is_rejected(self):
+        expected = R.expected_stage4_schema_history()
+        for history in (expected[:-1], expected + ['22:unexpected'],
+                        [row.replace('admin_user_management', 'wrong') for row in expected]):
+            fixture = MagicMock()
+            fixture.sql.return_value = (0, ('STAGE4_SCHEMA=' + json.dumps(history) + '\n').encode())
+            with self.assertRaisesRegex(RuntimeError, 'schema'):
+                R.verify_terminal_schema(fixture)
+
+    def test_schema_is_read_from_database(self):
+        fixture = MagicMock()
+        fixture.sql.return_value = (0, ('STAGE4_SCHEMA=' + json.dumps(R.expected_stage4_schema_history()) + '\n').encode())
+        self.assertEqual(R.verify_terminal_schema(fixture), 21)
+        self.assertIn(b'schema_migrations', fixture.sql.call_args.args[0])
+
+    def test_schema_read_errors_cannot_claim_success(self):
+        for response in ((1, b''), (0, b'STAGE4_SCHEMA=invalid\n'), (0, b'')):
+            fixture = MagicMock()
+            fixture.sql.return_value = response
+            with self.assertRaisesRegex(RuntimeError, 'schema'):
+                R.verify_terminal_schema(fixture)
+
+    def test_scenario_result_uses_verified_fixture_metadata(self):
+        ctx, cleanup = MagicMock(), MagicMock()
+        ctx.metadata = {'terminal_schema': 21}
+        with patch.object(R, 'create_stage4_fixture', return_value=(ctx, cleanup)), \
+             patch.object(R, 'run_scenario', return_value={'status': 'PASS'}):
+            result = R.run_single_scenario_fixture('contract', 'backend', 'gateway')
+        self.assertEqual(result['_verified_schema'], 21)
+        cleanup.assert_called_once()
+
 
 class InterruptedSuiteTests(unittest.TestCase):
     def test_signals_never_publish_success(self):

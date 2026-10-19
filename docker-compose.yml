@@ -173,6 +173,8 @@ services:
     container_name: supabase_auth
     restart: unless-stopped
     depends_on:
+      application-migrations:
+        condition: service_completed_successfully
       supabase-role-provisioner:
         condition: service_completed_successfully
     healthcheck:
@@ -217,10 +219,11 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
       - ./migrations/000004_supabase_compat.up.sql:/migrations/000004_supabase_compat.up.sql:ro
+      - ./migrations/000021_admin_user_management.up.sql:/migrations/000021_admin_user_management.up.sql:ro
     command:
       - /bin/sh
       - -ec
-      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql
     networks:
       - iot_net
 
@@ -355,7 +358,13 @@ services:
       SUPABASE_JWT_ISSUER: ${GOTRUE_JWT_ISSUER:?GOTRUE_JWT_ISSUER is required}
       SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:?SUPABASE_JWT_AUDIENCE is required}
       SUPABASE_JWT_CLOCK_SKEW: ${SUPABASE_JWT_CLOCK_SKEW:-30s}
-      SUPABASE_URL: "http://supabase-envoy:8000"
+      AUTH_ADMIN_BASE_URL: ${AUTH_ADMIN_BASE_URL:-http://supabase-envoy:8000}
+      AUTH_ADMIN_TIMEOUT: ${AUTH_ADMIN_TIMEOUT:-10s}
+      AUTH_ADMIN_MAX_BODY_BYTES: ${AUTH_ADMIN_MAX_BODY_BYTES:-16384}
+      USER_LIST_MAX_USERS: ${USER_LIST_MAX_USERS:-1000}
+      USER_LIST_MAX_MEMBERSHIPS: ${USER_LIST_MAX_MEMBERSHIPS:-10000}
+      USER_LIST_MAX_RESPONSE_BYTES: ${USER_LIST_MAX_RESPONSE_BYTES:-2097152}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY:-}}
     depends_on:
       postgres:
         condition: service_healthy
