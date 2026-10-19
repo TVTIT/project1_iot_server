@@ -102,6 +102,8 @@ jobs:
           go test -json -race -count=1 -coverprofile=coverage.out ./... > "$json_log" 2> "$err_log" || test_exit=$?
 
           guard_exit=0
+          # The guard prints failed test names and allowlisted gatewaysim error
+          # context. Raw test logs remain private and are removed by cleanup.
           python3 ../scripts/ci_go_test_guard.py \
             --input "$json_log" \
             --require 'iot-platform/internal/config:TestAdminMaxBodyBytes' \

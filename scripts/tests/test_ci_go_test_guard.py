@@ -50,6 +50,105 @@ class TestCiGoTestGuard(unittest.TestCase):
         self.addCleanup(lambda: Path(tmp.name).unlink(missing_ok=True))
         return tmp.name
 
+    def test_gatewaysim_nonrequired_failure_has_safe_reason_and_location(self):
+        pkg = 'iot-platform/internal/gatewaysim'
+        path = self._write_jsonl([
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'pass', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestScheduler/retry'},
+            {'Action': 'output', 'Package': pkg, 'Test': 'TestScheduler/retry',
+             'Output': '    scheduler_test.go:261: timed out waiting for password=private-sentinel\n'},
+            {'Action': 'fail', 'Package': pkg, 'Test': 'TestScheduler/retry'},
+            {'Action': 'fail', 'Package': pkg},
+        ])
+        ok, diagnostics = ci_go_test_guard.verify_test_log(path, [pkg + ':TestRequired'])
+        self.assertFalse(ok)
+        text = '\n'.join(diagnostics)
+        self.assertIn('Failed test: ' + pkg + ':TestScheduler/retry', text)
+        self.assertIn('scheduler_test.go:261', text)
+        self.assertIn('condition wait timed out', text)
+        self.assertNotIn('private-sentinel', text)
+
+    def test_gatewaysim_raw_secrets_and_controls_are_not_printed(self):
+        pkg = 'iot-platform/internal/gatewaysim'
+        outputs = [
+            '    transport_test.go:500: Authorization: Bearer private-sentinel',
+            '    outbox_test.go:20: postgres://user:private-sentinel@host/db?token=private-sentinel',
+            '    ack_test.go:10: {"password":"private-sentinel","access_token":"private-sentinel"}',
+            '\x1b[31m::error::private-sentinel\n\u202eprivate-sentinel',
+            '    scheduler_test.go:22: unexpected opaque-private-sentinel',
+        ]
+        events = [{'Action': 'run', 'Package': pkg, 'Test': 'TestRequired'}]
+        events += [{'Action': 'output', 'Package': pkg, 'Test': 'TestRequired', 'Output': s} for s in outputs]
+        events += [{'Action': 'fail', 'Package': pkg, 'Test': 'TestRequired'}, {'Action': 'fail', 'Package': pkg}]
+        ok, diagnostics = ci_go_test_guard.verify_test_log(self._write_jsonl(events), [pkg + ':TestRequired'])
+        self.assertFalse(ok)
+        text = '\n'.join(diagnostics)
+        self.assertIn('details withheld', text)
+        for forbidden in ('private-sentinel', 'postgres://', 'Authorization:', '\x1b', '\u202e', '::error::'):
+            self.assertNotIn(forbidden, text)
+
+    def test_gatewaysim_package_panic_without_test_failure_is_diagnosed(self):
+        pkg = 'iot-platform/internal/gatewaysim'
+        events = [
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'pass', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'output', 'Package': pkg, 'Output': 'panic: test timed out after 10m password=private-sentinel'},
+            {'Action': 'fail', 'Package': pkg},
+        ]
+        ok, diagnostics = ci_go_test_guard.verify_test_log(self._write_jsonl(events), [pkg + ':TestRequired'])
+        self.assertFalse(ok)
+        self.assertIn('go test timeout', '\n'.join(diagnostics))
+        self.assertNotIn('private-sentinel', '\n'.join(diagnostics))
+
+    def test_gatewaysim_context_is_bounded_and_passed_output_is_suppressed(self):
+        pkg = 'iot-platform/internal/gatewaysim'
+        events = [
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'output', 'Package': pkg, 'Test': 'TestRequired',
+             'Output': '    batch_test.go:99: context canceled'},
+            {'Action': 'pass', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestBroken'},
+        ]
+        events += [{'Action': 'output', 'Package': pkg, 'Test': 'TestBroken',
+                    'Output': f'    scheduler_test.go:{line}: context deadline exceeded token=private-sentinel'}
+                   for line in range(1, 101)]
+        events += [{'Action': 'fail', 'Package': pkg, 'Test': 'TestBroken'}, {'Action': 'fail', 'Package': pkg}]
+        ok, diagnostics = ci_go_test_guard.verify_test_log(self._write_jsonl(events), [pkg + ':TestRequired'])
+        self.assertFalse(ok)
+        text = '\n'.join(diagnostics)
+        self.assertEqual(text.count('scheduler_test.go:'), ci_go_test_guard.MAX_CONTEXT_LINES)
+        self.assertNotIn('batch_test.go', text)
+        self.assertNotIn('private-sentinel', text)
+
+    def test_gatewaysim_incomplete_test_named_on_package_timeout(self):
+        pkg = 'iot-platform/internal/gatewaysim'
+        events = [
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'pass', 'Package': pkg, 'Test': 'TestRequired'},
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestHung'},
+            {'Action': 'fail', 'Package': pkg},
+        ]
+        ok, diagnostics = ci_go_test_guard.verify_test_log(self._write_jsonl(events), [pkg + ':TestRequired'])
+        self.assertFalse(ok)
+        self.assertIn('Incomplete test at package failure: ' + pkg + ':TestHung', diagnostics)
+
+    def test_gatewaysim_diagnostic_cli_remains_nonzero_and_secret_safe(self):
+        pkg = 'iot-platform/internal/gatewaysim'
+        events = [
+            {'Action': 'run', 'Package': pkg, 'Test': 'TestBroken'},
+            {'Action': 'output', 'Package': pkg, 'Test': 'TestBroken',
+             'Output': '    outbox_test.go:42: SQL logic error SQLITE_BUSY password=private-sentinel'},
+            {'Action': 'fail', 'Package': pkg, 'Test': 'TestBroken'},
+            {'Action': 'fail', 'Package': pkg},
+        ]
+        result = subprocess.run([sys.executable, ci_go_test_guard.__file__, '--input', self._write_jsonl(events),
+                                 '--require', pkg + ':TestBroken'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Failed test: ' + pkg + ':TestBroken', result.stderr)
+        self.assertIn('SQLite busy', result.stderr)
+        self.assertNotIn('private-sentinel', result.stdout + result.stderr)
+
     def test_happy_path_multi_package_and_subtests(self):
         """Happy path: multiple packages, required root tests and subtests all run and pass, with terminal package pass."""
         events = [

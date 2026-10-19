@@ -17,14 +17,18 @@ Requirements & Rules:
   * Only test list or package cached output is present (cached pass without explicit test 'run' is rejected).
 - Diagnostics do not print raw Output or unvalidated file paths/specs that may leak secrets or control chars.
 - Validates identifiers without arbitrary control characters; supports Unicode subtest identifiers.
-- Diagnostics contain only safe identifiers and counts.
+- Failed gatewaysim tests are named even when they are not mandatory targets.
+- Gatewaysim failure context contains only source locations and allowlisted
+  reason labels; dynamic values and unknown messages are withheld, not regex-masked.
 - Exits 0 on success, non-zero on failure.
 """
 
 import argparse
 import json
+import re
 import sys
-from collections import defaultdict
+import unicodedata
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -42,6 +46,43 @@ VALID_GO_TEST_ACTIONS = {
 
 DISALLOWED_PKG_NAME_CHARS = set("*?[]()^$+{}\\|~`!@#%&=:;'\",<> ")
 
+GATEWAYSIM_PACKAGE = 'iot-platform/internal/gatewaysim'
+MAX_FAILURE_TESTS = 20
+MAX_CONTEXT_LINES = 6
+_TEST_LOCATION = re.compile(
+    r'^\s*((?:ack|batch|config|latency|outbox|scheduler|transport)_test\.go):([0-9]{1,6}):\s*(.*)\s*$'
+)
+_SAFE_REASONS = (
+    ('panic: test timed out', 'go test timeout'),
+    ('WARNING: DATA RACE', 'data race detected'),
+    ('race detected during execution of test', 'data race detected'),
+    ('timed out waiting for', 'condition wait timed out'),
+    ('scheduler did not finish in time', 'scheduler completion timed out'),
+    ('scheduler did not stop in time', 'scheduler shutdown timed out'),
+    ('context deadline exceeded', 'context deadline exceeded'),
+    ('context canceled', 'context canceled'),
+    ('SQLITE_BUSY', 'SQLite busy'),
+    ('database is locked', 'SQLite database locked'),
+    ('SQLITE_LOCKED', 'SQLite locked'),
+    ('panic:', 'panic (details withheld)'),
+)
+
+
+def safe_gatewaysim_context(output):
+    """Never echo free-form test output, even when no known secret pattern matches."""
+    if not isinstance(output, str) or len(output) > 8192:
+        return None
+    line = output.rstrip('\r\n')
+    match = _TEST_LOCATION.fullmatch(line)
+    location = f'{match[1]}:{match[2]}: ' if match else ''
+    message = match[3] if match else line
+    for marker, reason in _SAFE_REASONS:
+        if marker in message:
+            return location + reason + ' [dynamic details withheld]'
+    if match:
+        return location + 'assertion/error details withheld (unrecognized message)'
+    return None
+
 
 def is_safe_identifier(val: str) -> bool:
     """Check if identifier contains no control characters or newlines."""
@@ -50,7 +91,7 @@ def is_safe_identifier(val: str) -> bool:
     for ch in val:
         # Reject control characters (ord < 32 or 127 <= ord <= 159)
         o = ord(ch)
-        if o < 32 or (127 <= o <= 159):
+        if o < 32 or (127 <= o <= 159) or unicodedata.category(ch) == 'Cf':
             return False
     return True
 
@@ -160,6 +201,7 @@ def verify_test_log(
     pkg_terminal_actions: Dict[str, List[str]] = defaultdict(list)
     test_actions: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     pkg_tests: Dict[str, Set[str]] = defaultdict(set)
+    failure_context = defaultdict(lambda: deque(maxlen=MAX_CONTEXT_LINES))
 
     malformed_lines_count = 0
     invalid_event_count = 0
@@ -202,6 +244,11 @@ def verify_test_log(
 
                 all_seen_packages.add(pkg)
 
+                if pkg == GATEWAYSIM_PACKAGE and action == 'output':
+                    context = safe_gatewaysim_context(event.get('Output'))
+                    if context and context not in failure_context[test]:
+                        failure_context[test].append(context)
+
                 if test is None:
                     # Package-level event
                     if action == "start":
@@ -224,6 +271,26 @@ def verify_test_log(
 
     if invalid_event_count > 0:
         diagnostics.append(f"Found {invalid_event_count} invalid event records (type error or unknown action)")
+
+    # Include non-required gatewaysim failures without widening raw log exposure.
+    failed_tests = sorted(key for key, actions in test_actions.items()
+                          if key[0] == GATEWAYSIM_PACKAGE and 'fail' in actions)
+    for pkg, test in failed_tests[:MAX_FAILURE_TESTS]:
+        diagnostics.append(f'Failed test: {pkg}:{test[:512]}')
+        if pkg == GATEWAYSIM_PACKAGE:
+            contexts = failure_context.get(test) or ['error details withheld (no recognized assertion output)']
+            for context in contexts:
+                diagnostics.append(f'  {context}')
+    if len(failed_tests) > MAX_FAILURE_TESTS:
+        diagnostics.append(f'Additional failed tests omitted: {len(failed_tests) - MAX_FAILURE_TESTS}')
+    if 'fail' in pkg_terminal_actions.get(GATEWAYSIM_PACKAGE, []):
+        incomplete = sorted(test for (pkg, test), actions in test_actions.items()
+                            if pkg == GATEWAYSIM_PACKAGE and 'run' in actions
+                            and not actions.intersection({'pass', 'fail', 'skip'}))
+        for test in incomplete[:MAX_FAILURE_TESTS]:
+            diagnostics.append(f'Incomplete test at package failure: {GATEWAYSIM_PACKAGE}:{test[:512]}')
+        for context in failure_context.get(None, []):
+            diagnostics.append(f'Gatewaysim package context: {context}')
 
     # (3) ALL packages that appeared in the log must have terminal pass (or verified no-test exemption)
     for pkg in sorted(all_seen_packages):
