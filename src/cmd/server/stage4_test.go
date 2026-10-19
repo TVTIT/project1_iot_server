@@ -446,7 +446,7 @@ func TestComposeStage4Dependencies_OverridePropagation(t *testing.T) {
 
 	// Verify override propagation through TwinQueryParser:
 	// A raw list query without limit should receive overridden ListDefaultLimit (15).
-	parsedList, err := deps.TwinQueryParser.ParseTwinListQuery("")
+	parsedList, _, err := deps.TwinQueryParser.ParseTwinListQuery("")
 	if err != nil {
 		t.Fatalf("parse twin list query failed: %v", err)
 	}
@@ -455,12 +455,12 @@ func TestComposeStage4Dependencies_OverridePropagation(t *testing.T) {
 	}
 
 	// Limit=35 should be accepted (up to ListMaxLimit override).
-	if _, err := deps.TwinQueryParser.ParseTwinListQuery("limit=35"); err != nil {
+	if _, _, err := deps.TwinQueryParser.ParseTwinListQuery("limit=35"); err != nil {
 		t.Fatalf("expected limit=35 to be accepted, got: %v", err)
 	}
 
 	// Limit=36 should be rejected (exceeds ListMaxLimit override of 35).
-	if _, err := deps.TwinQueryParser.ParseTwinListQuery("limit=36"); err == nil {
+	if _, _, err := deps.TwinQueryParser.ParseTwinListQuery("limit=36"); err == nil {
 		t.Fatal("expected limit=36 to be rejected, got nil")
 	}
 

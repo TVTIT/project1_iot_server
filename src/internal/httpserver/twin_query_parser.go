@@ -39,24 +39,48 @@ func (p *TwinQueryParser) QueryTimeout() time.Duration {
 	return digitaltwin.ContractDefaultQueryTimeout
 }
 
+// TwinListPresentationOptions contains presentation-only choices for the Twin list endpoint.
+// It is kept in the HTTP layer and must never be passed to domain services or repositories.
+type TwinListPresentationOptions struct {
+	Format string // "" (normalized default) or "simplified"
+}
+
 // ParseTwinListQuery parses and validates query parameters for GET /v1/digital-twins.
-func (p *TwinQueryParser) ParseTwinListQuery(rawQuery string) (*digitaltwin.TwinListQuery, error) {
+// It returns the domain query together with HTTP-only presentation options so that
+// presentation choices never enter digitaltwin.TwinListQuery.
+func (p *TwinQueryParser) ParseTwinListQuery(rawQuery string) (*digitaltwin.TwinListQuery, *TwinListPresentationOptions, error) {
 	allowedKeys := map[string]struct{}{
 		"gateway_id": {},
 		"type":       {},
 		"limit":      {},
 		"cursor":     {},
+		"format":     {},
 	}
 
 	params, err := parseRawQuery(rawQuery, allowedKeys)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	// Parse the presentation-only format once, alongside the domain query, so
+	// unknown/empty/repeated keys are rejected consistently by parseRawQuery and
+	// no second parser can silently bypass the allowlist.
+	pres := &TwinListPresentationOptions{}
+	if val, ok := params["format"]; ok {
+		if val != "simplified" {
+			return nil, nil, &QueryError{
+				Code:    "invalid_request",
+				Message: "unsupported format parameter",
+				Err:     digitaltwin.ErrInvalidInput,
+			}
+		}
+		pres.Format = "simplified"
 	}
 
 	var gatewayID *string
 	if val, ok := params["gateway_id"]; ok {
 		if err := gateway.ValidateGatewayID(val); err != nil {
-			return nil, &QueryError{
+			return nil, nil, &QueryError{
 				Code:    "invalid_request",
 				Message: "invalid gateway_id parameter",
 				Err:     digitaltwin.ErrInvalidInput,
@@ -69,7 +93,7 @@ func (p *TwinQueryParser) ParseTwinListQuery(rawQuery string) (*digitaltwin.Twin
 	if val, ok := params["type"]; ok {
 		et := digitaltwin.EntityType(val)
 		if !et.Valid() {
-			return nil, &QueryError{
+			return nil, nil, &QueryError{
 				Code:    "invalid_request",
 				Message: "invalid type parameter",
 				Err:     digitaltwin.ErrInvalidInput,
@@ -82,7 +106,7 @@ func (p *TwinQueryParser) ParseTwinListQuery(rawQuery string) (*digitaltwin.Twin
 	if val, ok := params["limit"]; ok {
 		parsed, err := parseASCIIInteger(val)
 		if err != nil || parsed < 1 || parsed > p.cfg.ListMaxLimit {
-			return nil, &QueryError{
+			return nil, nil, &QueryError{
 				Code:    "invalid_request",
 				Message: "invalid limit parameter",
 				Err:     digitaltwin.ErrInvalidInput,
@@ -94,7 +118,7 @@ func (p *TwinQueryParser) ParseTwinListQuery(rawQuery string) (*digitaltwin.Twin
 	var after *string
 	if val, ok := params["cursor"]; ok {
 		if _, err := digitaltwin.ParseListCursor(val, gatewayID, entityType); err != nil {
-			return nil, &QueryError{
+			return nil, nil, &QueryError{
 				Code:    "invalid_cursor",
 				Message: "invalid cursor",
 				Err:     digitaltwin.ErrInvalidCursor,
@@ -108,7 +132,7 @@ func (p *TwinQueryParser) ParseTwinListQuery(rawQuery string) (*digitaltwin.Twin
 		EntityType: entityType,
 		Limit:      limit,
 		After:      after,
-	}, nil
+	}, pres, nil
 }
 
 // ParseTwinDetailQuery parses and validates query parameters for GET /v1/digital-twins/{entity_id}.

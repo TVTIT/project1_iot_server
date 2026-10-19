@@ -26,14 +26,26 @@ type TwinSummaryDTO struct {
 // TwinListResponseDTO represents the wire format of GET /v1/digital-twins (root summary array).
 type TwinListResponseDTO = []TwinSummaryDTO
 
-// NewTwinListResponseDTO maps a digitaltwin.TwinListResult to the list response wire DTO,
-// validating entity identity, types, and timestamps.
-func NewTwinListResponseDTO(res *digitaltwin.TwinListResult) ([]TwinSummaryDTO, error) {
+// twinSummaryProjection is the validated, presentation-neutral list item shared by the
+// normalized JSON-LD list and the flat project simplified list. Both DTO constructors
+// derive from it so the two representations cannot drift on identity, type, gateway
+// linkage, or timestamp validation.
+type twinSummaryProjection struct {
+	ID         string
+	Type       string
+	Name       *string
+	GatewayID  string
+	ModifiedAt string
+}
+
+// projectTwinSummaries validates entity identity, type, gateway linkage, and timestamp
+// for every list item and returns the shared projection.
+func projectTwinSummaries(res *digitaltwin.TwinListResult) ([]twinSummaryProjection, error) {
 	if res == nil {
 		return nil, errors.New("twin list result must not be nil")
 	}
 
-	items := make([]TwinSummaryDTO, 0, len(res.Items))
+	projections := make([]twinSummaryProjection, 0, len(res.Items))
 	for i, item := range res.Items {
 		parsed, err := digitaltwin.ParseEntityURN(item.ID)
 		if err != nil {
@@ -54,27 +66,81 @@ func NewTwinListResponseDTO(res *digitaltwin.TwinListResult) ([]TwinSummaryDTO, 
 			return nil, fmt.Errorf("item %d: invalid updated_at: %w", i, err)
 		}
 
+		projections = append(projections, twinSummaryProjection{
+			ID:         item.ID,
+			Type:       string(item.Type),
+			Name:       item.Name,
+			GatewayID:  item.GatewayID,
+			ModifiedAt: modifiedAtStr,
+		})
+	}
+
+	return projections, nil
+}
+
+// NewTwinListResponseDTO maps a digitaltwin.TwinListResult to the normalized JSON-LD list
+// response wire DTO, validating entity identity, types, and timestamps.
+func NewTwinListResponseDTO(res *digitaltwin.TwinListResult) ([]TwinSummaryDTO, error) {
+	projections, err := projectTwinSummaries(res)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]TwinSummaryDTO, 0, len(projections))
+	for _, p := range projections {
 		var nameProp *mapper.PropertyDTO
-		if item.Name != nil {
+		if p.Name != nil {
 			nameProp = &mapper.PropertyDTO{
 				Type:  "Property",
-				Value: *item.Name,
+				Value: *p.Name,
 			}
 		}
 
 		gwProp := mapper.PropertyDTO{
 			Type:  "Property",
-			Value: item.GatewayID,
+			Value: p.GatewayID,
 		}
 
 		items = append(items, TwinSummaryDTO{
 			Context:    mapper.ProjectContextArray(),
-			ID:         item.ID,
-			Type:       string(item.Type),
+			ID:         p.ID,
+			Type:       p.Type,
 			Name:       nameProp,
 			GatewayID:  gwProp,
-			ModifiedAt: modifiedAtStr,
+			ModifiedAt: p.ModifiedAt,
 		})
+	}
+
+	return items, nil
+}
+
+// TwinSummaryFlatDTO is the flat project simplified SUMMARY representation used by
+// GET /v1/digital-twins?format=simplified. It is neither the NGSI-LD JSON-LD list nor
+// the detail simplified STATE view: no @context, Property wrappers, state, history,
+// or relationships.
+type TwinSummaryFlatDTO struct {
+	ID         string  `json:"id"`
+	Type       string  `json:"type"`
+	Name       *string `json:"name,omitempty"`
+	GatewayID  string  `json:"gateway_id"`
+	ModifiedAt string  `json:"modifiedAt"`
+}
+
+// TwinSimplifiedListResponseDTO is the wire format of the simplified list (root array).
+type TwinSimplifiedListResponseDTO = []TwinSummaryFlatDTO
+
+// NewTwinSimplifiedListResponseDTO maps a digitaltwin.TwinListResult to the flat
+// simplified list DTO, reusing the shared validation so normalized and simplified
+// output cannot drift. An empty result yields a non-nil empty slice ([] not null).
+func NewTwinSimplifiedListResponseDTO(res *digitaltwin.TwinListResult) ([]TwinSummaryFlatDTO, error) {
+	projections, err := projectTwinSummaries(res)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]TwinSummaryFlatDTO, 0, len(projections))
+	for _, p := range projections {
+		items = append(items, TwinSummaryFlatDTO(p))
 	}
 
 	return items, nil

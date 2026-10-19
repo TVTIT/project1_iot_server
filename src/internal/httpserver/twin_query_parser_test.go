@@ -298,7 +298,7 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			q, err := parser.ParseTwinListQuery(tt.rawQuery)
+			q, _, err := parser.ParseTwinListQuery(tt.rawQuery)
 			if tt.wantErrCode != "" {
 				if err == nil {
 					t.Fatalf("expected error code %q, got nil error", tt.wantErrCode)
@@ -320,6 +320,225 @@ func TestParseTwinListQuery_TableDriven(t *testing.T) {
 				if tt.validateQuery != nil {
 					tt.validateQuery(t, q)
 				}
+			}
+		})
+	}
+}
+
+// TestParseTwinListQuery_Presentation_TableDriven locks the format=simplified
+// presentation extension on GET /v1/digital-twins: it must accept format=simplified
+// combined with type/gateway_id/limit/cursor, keep presentation outside the domain
+// TwinListQuery, keep the existing query bounds and filter-bound cursor codec, and
+// fail closed (400 invalid_request / 400 invalid_cursor) for unknown, empty, repeated,
+// or unsupported format values and invalid filters/cursors.
+func TestParseTwinListQuery_Presentation_TableDriven(t *testing.T) {
+	cfg := validTwinConfig()
+	parser, err := httpserver.NewTwinQueryParser(&cfg)
+	if err != nil {
+		t.Fatalf("failed to create parser: %v", err)
+	}
+
+	gw01 := "gw_01"
+	sensorType := digitaltwin.EntityTypeSensor
+	gatewayType := digitaltwin.EntityTypeGateway
+
+	validSensorCursor, err := digitaltwin.EncodeListCursor("urn:ngsi-ld:Sensor:gw_01:s1", &gw01, &sensorType)
+	if err != nil {
+		t.Fatalf("failed to encode cursor: %v", err)
+	}
+	validGatewayCursor, err := digitaltwin.EncodeListCursor("urn:ngsi-ld:Gateway:gw_01", &gw01, &gatewayType)
+	if err != nil {
+		t.Fatalf("failed to encode cursor: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		rawQuery     string
+		wantErrCode  string
+		wantSentinel error
+		validate     func(t *testing.T, q *digitaltwin.TwinListQuery, pres *httpserver.TwinListPresentationOptions)
+	}{
+		{
+			name:     "format simplified alone selects simplified presentation with default domain query",
+			rawQuery: "format=simplified",
+			validate: func(t *testing.T, q *digitaltwin.TwinListQuery, pres *httpserver.TwinListPresentationOptions) {
+				if pres == nil || pres.Format != "simplified" {
+					t.Fatalf("presentation = %+v, want Format=simplified", pres)
+				}
+				if q.Limit != 50 {
+					t.Errorf("Limit = %d, want 50", q.Limit)
+				}
+				if q.GatewayID != nil || q.EntityType != nil || q.After != nil {
+					t.Errorf("domain query must carry no filters/cursor, got %+v", q)
+				}
+			},
+		},
+		{
+			name:     "format simplified combined with type filter",
+			rawQuery: "format=simplified&type=Sensor",
+			validate: func(t *testing.T, q *digitaltwin.TwinListQuery, pres *httpserver.TwinListPresentationOptions) {
+				if pres == nil || pres.Format != "simplified" {
+					t.Fatalf("presentation = %+v, want Format=simplified", pres)
+				}
+				if q.EntityType == nil || *q.EntityType != digitaltwin.EntityTypeSensor {
+					t.Errorf("EntityType = %v, want Sensor", q.EntityType)
+				}
+			},
+		},
+		{
+			name:     "format simplified combined with all query parameters and matching cursor",
+			rawQuery: "format=simplified&gateway_id=gw_01&type=Sensor&limit=75&cursor=" + validSensorCursor,
+			validate: func(t *testing.T, q *digitaltwin.TwinListQuery, pres *httpserver.TwinListPresentationOptions) {
+				if pres == nil || pres.Format != "simplified" {
+					t.Fatalf("presentation = %+v, want Format=simplified", pres)
+				}
+				if q.Limit != 75 {
+					t.Errorf("Limit = %d, want 75", q.Limit)
+				}
+				if q.GatewayID == nil || *q.GatewayID != "gw_01" {
+					t.Errorf("GatewayID = %v, want gw_01", q.GatewayID)
+				}
+				if q.EntityType == nil || *q.EntityType != digitaltwin.EntityTypeSensor {
+					t.Errorf("EntityType = %v, want Sensor", q.EntityType)
+				}
+				if q.After == nil || *q.After != validSensorCursor {
+					t.Errorf("After = %v, want %q", q.After, validSensorCursor)
+				}
+			},
+		},
+		{
+			name:     "format simplified combined with gateway type and filter-bound cursor",
+			rawQuery: "format=simplified&type=Gateway&gateway_id=gw_01&cursor=" + validGatewayCursor,
+			validate: func(t *testing.T, q *digitaltwin.TwinListQuery, pres *httpserver.TwinListPresentationOptions) {
+				if pres == nil || pres.Format != "simplified" {
+					t.Fatalf("presentation = %+v, want Format=simplified", pres)
+				}
+				if q.EntityType == nil || *q.EntityType != digitaltwin.EntityTypeGateway {
+					t.Errorf("EntityType = %v, want Gateway", q.EntityType)
+				}
+				if q.After == nil || *q.After != validGatewayCursor {
+					t.Errorf("After = %v, want %q", q.After, validGatewayCursor)
+				}
+			},
+		},
+		{
+			name:     "absent format keeps normalized default presentation",
+			rawQuery: "type=Sensor&limit=10",
+			validate: func(t *testing.T, q *digitaltwin.TwinListQuery, pres *httpserver.TwinListPresentationOptions) {
+				if pres == nil {
+					t.Fatal("presentation must not be nil")
+				}
+				if pres.Format != "" {
+					t.Errorf("Format = %q, want empty (normalized default)", pres.Format)
+				}
+				if q.Limit != 10 {
+					t.Errorf("Limit = %d, want 10", q.Limit)
+				}
+			},
+		},
+		{
+			name:        "reject empty format value",
+			rawQuery:    "format=",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject repeated format",
+			rawQuery:    "format=simplified&format=simplified",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject repeated format with different values",
+			rawQuery:    "format=simplified&format=normalized",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject unsupported format normalized",
+			rawQuery:    "format=normalized",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject unsupported format flat",
+			rawQuery:    "format=flat",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject case-sensitive format Simplified",
+			rawQuery:    "format=Simplified",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject unknown key combined with format",
+			rawQuery:    "format=simplified&entity_type=Sensor",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject replaced parameter after combined with format",
+			rawQuery:    "format=simplified&after=" + validSensorCursor,
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject unknown parameter foo combined with format",
+			rawQuery:    "format=simplified&foo=bar",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject invalid limit combined with format",
+			rawQuery:    "format=simplified&limit=201",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject zero limit combined with format",
+			rawQuery:    "format=simplified&limit=0",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject invalid type combined with format",
+			rawQuery:    "format=simplified&type=Device",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:        "reject invalid gateway_id combined with format",
+			rawQuery:    "format=simplified&gateway_id=gw@01",
+			wantErrCode: "invalid_request",
+		},
+		{
+			name:         "reject invalid cursor combined with format",
+			rawQuery:     "format=simplified&type=Sensor&cursor=not-a-cursor",
+			wantErrCode:  "invalid_cursor",
+			wantSentinel: digitaltwin.ErrInvalidCursor,
+		},
+		{
+			name:         "reject cursor filter mismatch combined with format",
+			rawQuery:     "format=simplified&type=Gateway&cursor=" + validSensorCursor,
+			wantErrCode:  "invalid_cursor",
+			wantSentinel: digitaltwin.ErrInvalidCursor,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q, pres, err := parser.ParseTwinListQuery(tt.rawQuery)
+			if tt.wantErrCode != "" {
+				if err == nil {
+					t.Fatalf("expected error code %q, got nil error", tt.wantErrCode)
+				}
+				var qe *httpserver.QueryError
+				if !errors.As(err, &qe) {
+					t.Fatalf("expected *httpserver.QueryError, got %T: %v", err, err)
+				}
+				if qe.Code != tt.wantErrCode {
+					t.Errorf("QueryError.Code = %q, want %q", qe.Code, tt.wantErrCode)
+				}
+				if tt.wantSentinel != nil && !errors.Is(err, tt.wantSentinel) {
+					t.Errorf("got error %v, want sentinel %v", err, tt.wantSentinel)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.validate != nil {
+				tt.validate(t, q, pres)
 			}
 		})
 	}

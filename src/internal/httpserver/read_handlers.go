@@ -51,7 +51,7 @@ type TelemetryHistoryQueryParser interface {
 
 // TwinListQueryParser is the parser dependency for GET /v1/digital-twins.
 type TwinListQueryParser interface {
-	ParseTwinListQuery(rawQuery string) (*digitaltwin.TwinListQuery, error)
+	ParseTwinListQuery(rawQuery string) (*digitaltwin.TwinListQuery, *TwinListPresentationOptions, error)
 }
 
 // TwinDetailQueryParser is the parser dependency for GET /v1/digital-twins/{entity_id}.
@@ -164,16 +164,27 @@ func listDigitalTwins(reader TwinListReader, parser TwinListQueryParser) gin.Han
 			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
 			return
 		}
-		if !negotiateAccept(c, mimeJSONLD) {
-			return
-		}
 		if parser == nil || reader == nil {
 			writeReadError(c, "list_digital_twins", digitaltwin.ErrDependencyUnavailable)
 			return
 		}
-		q, err := parser.ParseTwinListQuery(c.Request.URL.RawQuery)
+		// Parse the HTTP-only presentation choice before selecting the served media
+		// type: the normalized list is JSON-LD, while format=simplified is plain JSON.
+		q, pres, err := parser.ParseTwinListQuery(c.Request.URL.RawQuery)
 		if err != nil {
 			writeReadError(c, "list_digital_twins", err)
+			return
+		}
+		simplified := pres != nil && pres.Format == "simplified"
+		format := ""
+		if pres != nil {
+			format = pres.Format
+		}
+		targetMime := mimeJSONLD
+		if simplified {
+			targetMime = mimeJSON
+		}
+		if !negotiateAccept(c, targetMime) {
 			return
 		}
 		res, err := reader.ListTwins(c.Request.Context(), principal.UserID, *q)
@@ -185,6 +196,26 @@ func listDigitalTwins(reader TwinListReader, parser TwinListQueryParser) gin.Han
 			writeReadError(c, "list_digital_twins", digitaltwin.ErrUnexpected)
 			return
 		}
+
+		if simplified {
+			dto, err := NewTwinSimplifiedListResponseDTO(res)
+			if err != nil {
+				slog.ErrorContext(c.Request.Context(), "twin simplified list dto projection failed",
+					"request_id", httpapi.RequestIDFrom(c),
+					"error", err.Error(),
+				)
+				httpapi.WriteError(c, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+			// Emit the relative next link only after the projection succeeded, so a
+			// failed projection never leaves a partial-success Link header.
+			if res.NextCursor != nil {
+				c.Header("Link", formatTwinListNextLink(*q, *res.NextCursor, format))
+			}
+			writeReadJSONResponse(c, "list_digital_twins", http.StatusOK, dto)
+			return
+		}
+
 		dto, err := NewTwinListResponseDTO(res)
 		if err != nil {
 			slog.ErrorContext(c.Request.Context(), "twin list dto projection failed",
@@ -195,14 +226,16 @@ func listDigitalTwins(reader TwinListReader, parser TwinListQueryParser) gin.Han
 			return
 		}
 		if res.NextCursor != nil {
-			c.Header("Link", formatTwinListNextLink(*q, *res.NextCursor))
+			c.Header("Link", formatTwinListNextLink(*q, *res.NextCursor, format))
 		}
 		writeReadJSONLDResponse(c, "list_digital_twins", http.StatusOK, dto)
 	}
 }
 
 // formatTwinListNextLink builds an RFC 8288 Link header value preserving active query filters.
-func formatTwinListNextLink(q digitaltwin.TwinListQuery, nextCursor string) string {
+// The header is always a relative reference (never derived from Host/Forwarded) so proxy
+// headers cannot rewrite it; format is emitted only for the simplified presentation.
+func formatTwinListNextLink(q digitaltwin.TwinListQuery, nextCursor, format string) string {
 	var parts []string
 	if q.EntityType != nil {
 		parts = append(parts, "type="+url.QueryEscape(string(*q.EntityType)))
@@ -211,6 +244,9 @@ func formatTwinListNextLink(q digitaltwin.TwinListQuery, nextCursor string) stri
 		parts = append(parts, "gateway_id="+url.QueryEscape(*q.GatewayID))
 	}
 	parts = append(parts, "limit="+strconv.Itoa(q.Limit))
+	if format == "simplified" {
+		parts = append(parts, "format="+url.QueryEscape(format))
+	}
 	parts = append(parts, "cursor="+url.QueryEscape(nextCursor))
 	return fmt.Sprintf("</v1/digital-twins?%s>; rel=\"next\"", strings.Join(parts, "&"))
 }

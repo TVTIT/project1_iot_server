@@ -536,6 +536,9 @@ func TestListDigitalTwins_Handler(t *testing.T) {
 		if link := w.Header().Get("Link"); link != wantLink {
 			t.Errorf("Link header = %q, want %q", link, wantLink)
 		}
+		if link := w.Header().Get("Link"); strings.Contains(link, "format=") {
+			t.Errorf("normalized Link must not invent a format parameter: %q", link)
+		}
 
 		// Body must be root JSON array and not contain next_cursor
 		if strings.Contains(w.Body.String(), "next_cursor") {
@@ -704,6 +707,623 @@ func TestListDigitalTwins_Handler(t *testing.T) {
 		code, _ := parseErrorResponse(t, w.Body.Bytes())
 		if code != "not_found" {
 			t.Errorf("error code = %q, want %q", code, "not_found")
+		}
+	})
+}
+
+// TestListDigitalTwins_SimplifiedFormat locks the project simplified SUMMARY
+// projection (?format=simplified): a flat root array, no JSON-LD wrappers, and
+// JSON media negotiation. This is intentionally distinct from the detail
+// simplified STATE view.
+func TestListDigitalTwins_SimplifiedFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	_, tp := setupTestParsers(t)
+	testActor := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+
+	buildRouter := func(reader *mockTwinListReader) *gin.Engine {
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
+		return r
+	}
+
+	summaryItems := func() []digitaltwin.TwinSummary {
+		return []digitaltwin.TwinSummary{
+			{
+				ID:        "urn:ngsi-ld:Gateway:gw_01",
+				Type:      digitaltwin.EntityTypeGateway,
+				Name:      ptr("Gateway 1"),
+				GatewayID: "gw_01",
+				UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+			},
+			{
+				ID:        "urn:ngsi-ld:Sensor:gw_01:s1",
+				Type:      digitaltwin.EntityTypeSensor,
+				Name:      nil,
+				GatewayID: "gw_01",
+				UpdatedAt: time.Date(2026, 10, 15, 16, 0, 0, 123000000, time.FixedZone("ICT", 7*60*60)),
+			},
+		}
+	}
+
+	decodeRawString := func(t *testing.T, raw json.RawMessage) string {
+		t.Helper()
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			t.Fatalf("expected JSON string, got %s: %v", string(raw), err)
+		}
+		return s
+	}
+
+	t.Run("flat_summary_shape", func(t *testing.T) {
+		var listCalls int
+		var receivedQuery digitaltwin.TwinListQuery
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, actor uuid.UUID, q digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				listCalls++
+				if actor != testActor {
+					t.Errorf("actor = %v, want %v", actor, testActor)
+				}
+				receivedQuery = q
+				return &digitaltwin.TwinListResult{Items: summaryItems()}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified&type=Sensor&limit=10", nil)
+		req.Header.Set("Accept", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want application/json; charset=utf-8", ct)
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("Cache-Control = %q, want no-store", cc)
+		}
+		if vary := w.Header().Get("Vary"); !strings.Contains(vary, "Accept") {
+			t.Errorf("Vary = %q, want it to contain Accept", vary)
+		}
+		if listCalls != 1 {
+			t.Errorf("ListTwins calls = %d, want 1", listCalls)
+		}
+		if receivedQuery.Limit != 10 {
+			t.Errorf("received limit = %d, want 10", receivedQuery.Limit)
+		}
+		if receivedQuery.EntityType == nil || *receivedQuery.EntityType != digitaltwin.EntityTypeSensor {
+			t.Errorf("received entity type = %v, want Sensor", receivedQuery.EntityType)
+		}
+
+		if strings.Contains(w.Body.String(), "@context") || strings.Contains(w.Body.String(), "items") {
+			t.Errorf("simplified list must not contain JSON-LD context or items envelope: %s", w.Body.String())
+		}
+
+		var resp []map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal root array response: %v (body: %s)", err, w.Body.String())
+		}
+		if len(resp) != 2 {
+			t.Fatalf("len(resp) = %d, want 2 (body: %s)", len(resp), w.Body.String())
+		}
+
+		allowedKeys := map[string]bool{
+			"id": true, "type": true, "name": true, "gateway_id": true, "modifiedAt": true,
+		}
+		for i, item := range resp {
+			for key := range item {
+				if !allowedKeys[key] {
+					t.Errorf("item %d has unexpected key %q (body: %s)", i, key, w.Body.String())
+				}
+			}
+		}
+
+		if got := decodeRawString(t, resp[0]["id"]); got != "urn:ngsi-ld:Gateway:gw_01" {
+			t.Errorf("item 0 id = %q", got)
+		}
+		if got := decodeRawString(t, resp[0]["type"]); got != "Gateway" {
+			t.Errorf("item 0 type = %q", got)
+		}
+		if got := decodeRawString(t, resp[0]["gateway_id"]); got != "gw_01" {
+			t.Errorf("item 0 gateway_id = %q", got)
+		}
+		if got := decodeRawString(t, resp[0]["name"]); got != "Gateway 1" {
+			t.Errorf("item 0 name = %q, want flat string", got)
+		}
+		if got := decodeRawString(t, resp[0]["modifiedAt"]); got != "2026-10-15T09:00:00.000000Z" {
+			t.Errorf("item 0 modifiedAt = %q", got)
+		}
+
+		if _, ok := resp[1]["name"]; ok {
+			t.Errorf("item 1 (nil name) must omit the name key, got: %s", string(resp[1]["name"]))
+		}
+		if got := decodeRawString(t, resp[1]["modifiedAt"]); got != "2026-10-15T09:00:00.123000Z" {
+			t.Errorf("item 1 modifiedAt = %q, want UTC microsecond instant", got)
+		}
+	})
+
+	t.Run("next_cursor_link_preserves_simplified_format_and_filters", func(t *testing.T) {
+		nextCursor := "v1.eyJrIjoidGVzdCJ9+abc/def=="
+		var receivedQuery digitaltwin.TwinListQuery
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, q digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				receivedQuery = q
+				return &digitaltwin.TwinListResult{Items: summaryItems(), NextCursor: &nextCursor}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified&type=Sensor&gateway_id=gw_01&limit=10", nil)
+		req.Header.Set("Accept", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		// The relative next link must preserve format=simplified plus the active
+		// filters and URL-encode the opaque cursor bytes.
+		wantLink := "</v1/digital-twins?type=Sensor&gateway_id=gw_01&limit=10&format=simplified&cursor=v1.eyJrIjoidGVzdCJ9%2Babc%2Fdef%3D%3D>; rel=\"next\""
+		if link := w.Header().Get("Link"); link != wantLink {
+			t.Errorf("Link header = %q, want %q", link, wantLink)
+		}
+		if receivedQuery.EntityType == nil || *receivedQuery.EntityType != digitaltwin.EntityTypeSensor {
+			t.Errorf("received entity type = %v, want Sensor", receivedQuery.EntityType)
+		}
+		if receivedQuery.GatewayID == nil || *receivedQuery.GatewayID != "gw_01" {
+			t.Errorf("received gateway id = %v, want gw_01", receivedQuery.GatewayID)
+		}
+		if receivedQuery.After != nil {
+			t.Errorf("received cursor = %v, want nil", receivedQuery.After)
+		}
+	})
+
+	t.Run("simplified_last_page_has_no_link", func(t *testing.T) {
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{Items: summaryItems(), NextCursor: nil}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified&limit=10", nil)
+		req.Header.Set("Accept", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if link := w.Header().Get("Link"); link != "" {
+			t.Errorf("Link header must be absent on the last page, got: %q", link)
+		}
+	})
+
+	t.Run("incoming_cursor_replaced_and_format_is_not_a_data_filter", func(t *testing.T) {
+		gwID := "gw_01"
+		sensorType := digitaltwin.EntityTypeSensor
+		incomingCursor, err := digitaltwin.EncodeListCursor("urn:ngsi-ld:Sensor:gw_01:s0", &gwID, &sensorType)
+		if err != nil {
+			t.Fatalf("failed to encode incoming cursor: %v", err)
+		}
+		nextCursor := "v1.eyJrIjoibmV4dCJ9"
+		var receivedQuery digitaltwin.TwinListQuery
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, q digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				receivedQuery = q
+				return &digitaltwin.TwinListResult{Items: summaryItems(), NextCursor: &nextCursor}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified&type=Sensor&gateway_id=gw_01&limit=10&cursor="+incomingCursor, nil)
+		req.Header.Set("Accept", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		// Cursor bytes and filter binding are unchanged: format never enters the
+		// domain query or the cursor binding.
+		if receivedQuery.After == nil || *receivedQuery.After != incomingCursor {
+			t.Errorf("received cursor = %v, want %q passed through unchanged", receivedQuery.After, incomingCursor)
+		}
+		wantLink := "</v1/digital-twins?type=Sensor&gateway_id=gw_01&limit=10&format=simplified&cursor=" + nextCursor + ">; rel=\"next\""
+		if link := w.Header().Get("Link"); link != wantLink {
+			t.Errorf("Link header = %q, want %q", link, wantLink)
+		}
+		if link := w.Header().Get("Link"); strings.Contains(link, "cursor="+incomingCursor) {
+			t.Errorf("Link must replace the request cursor, not append it: %q", link)
+		}
+	})
+
+	t.Run("relative_link_ignores_hostile_host_and_forwarded", func(t *testing.T) {
+		nextCursor := "v1.next"
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{Items: summaryItems(), NextCursor: &nextCursor}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified&limit=10", nil)
+		req.Host = "evil.example"
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-Forwarded-Host", "evil.example")
+		req.Header.Set("Forwarded", "host=evil.example;proto=http")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		link := w.Header().Get("Link")
+		wantLink := "</v1/digital-twins?limit=10&format=simplified&cursor=v1.next>; rel=\"next\""
+		if link != wantLink {
+			t.Errorf("Link header = %q, want %q", link, wantLink)
+		}
+		if strings.Contains(strings.ToLower(link), "evil.example") || strings.Contains(link, "http") {
+			t.Errorf("Link must stay relative and never derive from Host/Forwarded: %q", link)
+		}
+	})
+
+	t.Run("cors_exposes_link_and_keeps_no_store_and_vary", func(t *testing.T) {
+		nextCursor := "v1.next"
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{Items: summaryItems(), NextCursor: &nextCursor}, nil
+			},
+		}
+		const origin = "https://app.example.com"
+		r := gin.New()
+		r.Use(corsMiddleware([]string{origin}))
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified&limit=10", nil)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Origin", origin)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != origin {
+			t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, origin)
+		}
+		if got := w.Header().Get("Access-Control-Expose-Headers"); got != "Link, Location, X-Request-ID" {
+			t.Errorf("Access-Control-Expose-Headers = %q, want Link, Location, X-Request-ID", got)
+		}
+		vary := w.Header().Get("Vary")
+		if !strings.Contains(vary, "Accept") || !strings.Contains(vary, "Origin") {
+			t.Errorf("Vary = %q, want it to contain Accept and Origin", vary)
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("Cache-Control = %q, want no-store", cc)
+		}
+		if link := w.Header().Get("Link"); link == "" {
+			t.Error("Link header must be present when NextCursor is set")
+		}
+	})
+
+	t.Run("empty_result_is_empty_array", func(t *testing.T) {
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{Items: nil}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want application/json; charset=utf-8", ct)
+		}
+		if body := w.Body.String(); body != "[]" {
+			t.Errorf("body = %s, want [] (not null)", body)
+		}
+	})
+
+	t.Run("invalid_identity_fails_closed", func(t *testing.T) {
+		cases := []struct {
+			name string
+			item digitaltwin.TwinSummary
+		}{
+			{
+				name: "invalid_urn",
+				item: digitaltwin.TwinSummary{
+					ID:        "not-a-urn",
+					Type:      digitaltwin.EntityTypeSensor,
+					GatewayID: "gw_01",
+					UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+				},
+			},
+			{
+				name: "type_mismatch",
+				item: digitaltwin.TwinSummary{
+					ID:        "urn:ngsi-ld:Sensor:gw_01:s1",
+					Type:      digitaltwin.EntityTypeGateway,
+					GatewayID: "gw_01",
+					UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+				},
+			},
+			{
+				name: "gateway_mismatch",
+				item: digitaltwin.TwinSummary{
+					ID:        "urn:ngsi-ld:Sensor:gw_01:s1",
+					Type:      digitaltwin.EntityTypeSensor,
+					GatewayID: "gw_02",
+					UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+				},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				reader := &mockTwinListReader{
+					fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+						return &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{tc.item}}, nil
+					},
+				}
+				r := buildRouter(reader)
+
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified", nil)
+				r.ServeHTTP(w, req)
+
+				if w.Code != http.StatusInternalServerError {
+					t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusInternalServerError, w.Body.String())
+				}
+				if link := w.Header().Get("Link"); link != "" {
+					t.Errorf("no partial success: Link must be absent when projection fails, got %q", link)
+				}
+				code, _ := parseErrorResponse(t, w.Body.Bytes())
+				if code != "internal_error" {
+					t.Errorf("error code = %q, want internal_error", code)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid_timestamp_fails_closed", func(t *testing.T) {
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{
+					{
+						ID:        "urn:ngsi-ld:Gateway:gw_01",
+						Type:      digitaltwin.EntityTypeGateway,
+						GatewayID: "gw_01",
+						UpdatedAt: time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
+					},
+				}}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?format=simplified", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusInternalServerError, w.Body.String())
+		}
+		code, _ := parseErrorResponse(t, w.Body.Bytes())
+		if code != "internal_error" {
+			t.Errorf("error code = %q, want internal_error", code)
+		}
+	})
+
+	t.Run("normalized_default_unchanged", func(t *testing.T) {
+		var listCalls int
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				listCalls++
+				return &digitaltwin.TwinListResult{Items: summaryItems()}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?limit=10", nil)
+		req.Header.Set("Accept", "application/ld+json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/ld+json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want application/ld+json; charset=utf-8", ct)
+		}
+		if listCalls != 1 {
+			t.Errorf("ListTwins calls = %d, want 1", listCalls)
+		}
+
+		var resp []map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal normalized response: %v (body: %s)", err, w.Body.String())
+		}
+		if len(resp) != 2 {
+			t.Fatalf("len(resp) = %d, want 2", len(resp))
+		}
+		if _, ok := resp[0]["@context"]; !ok {
+			t.Errorf("normalized item must keep @context (body: %s)", w.Body.String())
+		}
+		var gwProp map[string]any
+		if err := json.Unmarshal(resp[0]["gateway_id"], &gwProp); err != nil {
+			t.Fatalf("normalized gateway_id must be a Property object: %v", err)
+		}
+		if gwProp["type"] != "Property" {
+			t.Errorf("normalized gateway_id type = %v, want Property", gwProp["type"])
+		}
+		var nameProp map[string]any
+		if err := json.Unmarshal(resp[0]["name"], &nameProp); err != nil {
+			t.Fatalf("normalized name must decode: %v", err)
+		}
+		if nameProp["type"] != "Property" {
+			t.Errorf("normalized name must remain a Property wrapper, got: %s", string(resp[0]["name"]))
+		}
+	})
+
+	t.Run("accept_negotiation", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			path       string
+			accept     string
+			wantStatus int
+			wantCT     string
+		}{
+			{
+				name:       "simplified absent Accept serves JSON",
+				path:       "/v1/digital-twins?format=simplified",
+				wantStatus: http.StatusOK,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified */* serves JSON",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "*/*",
+				wantStatus: http.StatusOK,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified application/* serves JSON",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "application/*",
+				wantStatus: http.StatusOK,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified exact JSON serves JSON",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "application/json",
+				wantStatus: http.StatusOK,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified positive q serves JSON",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "application/json;q=0.5",
+				wantStatus: http.StatusOK,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified ld+json is incompatible",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "application/ld+json",
+				wantStatus: http.StatusNotAcceptable,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified text/html is incompatible",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "text/html, text/plain",
+				wantStatus: http.StatusNotAcceptable,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified q=0 exclusion returns 406",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     "application/json;q=0",
+				wantStatus: http.StatusNotAcceptable,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "simplified extended q* overriding q=0 returns 406",
+				path:       "/v1/digital-twins?format=simplified",
+				accept:     `application/json;q=0;q*=utf-8''1`,
+				wantStatus: http.StatusNotAcceptable,
+				wantCT:     "application/json; charset=utf-8",
+			},
+			{
+				name:       "normalized still rejects JSON-only",
+				path:       "/v1/digital-twins?type=Gateway&limit=10",
+				accept:     "application/json",
+				wantStatus: http.StatusNotAcceptable,
+				wantCT:     "application/json; charset=utf-8",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var listCalls int
+				reader := &mockTwinListReader{
+					fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+						listCalls++
+						return &digitaltwin.TwinListResult{Items: summaryItems()}, nil
+					},
+				}
+				r := buildRouter(reader)
+
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+				if tc.accept != "" {
+					req.Header.Set("Accept", tc.accept)
+				}
+				r.ServeHTTP(w, req)
+
+				if w.Code != tc.wantStatus {
+					t.Fatalf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
+				}
+				if ct := w.Header().Get("Content-Type"); ct != tc.wantCT {
+					t.Errorf("Content-Type = %q, want %q", ct, tc.wantCT)
+				}
+				if vary := w.Header().Get("Vary"); !strings.Contains(vary, "Accept") {
+					t.Errorf("Vary = %q, want it to contain Accept", vary)
+				}
+				wantCalls := 1
+				if tc.wantStatus != http.StatusOK {
+					wantCalls = 0
+				}
+				if listCalls != wantCalls {
+					t.Errorf("ListTwins calls = %d, want %d", listCalls, wantCalls)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects_unsupported_or_repeated_format", func(t *testing.T) {
+		var listCalls int
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				listCalls++
+				return &digitaltwin.TwinListResult{Items: summaryItems()}, nil
+			},
+		}
+		r := buildRouter(reader)
+
+		for _, query := range []string{
+			"format=detail",
+			"format=",
+			"format=simplified&format=simplified",
+		} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?"+query, nil)
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("query %q: status = %d, want %d (body: %s)", query, w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			code, _ := parseErrorResponse(t, w.Body.Bytes())
+			if code != "invalid_request" {
+				t.Errorf("query %q: code = %q, want invalid_request", query, code)
+			}
+		}
+		if listCalls != 0 {
+			t.Errorf("ListTwins calls = %d, want 0 for rejected formats", listCalls)
 		}
 	})
 }

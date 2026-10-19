@@ -600,6 +600,132 @@ func TestTwinListResponseDTO(t *testing.T) {
 	}
 }
 
+func TestTwinSimplifiedListResponseDTO(t *testing.T) {
+	name := "Sensor 1"
+	res := &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{
+		{
+			ID:        "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+			Type:      digitaltwin.EntityTypeSensor,
+			Name:      &name,
+			GatewayID: "gateway_001",
+			UpdatedAt: time.Date(2026, 10, 15, 16, 0, 0, 123000000, time.FixedZone("ICT", 7*60*60)),
+		},
+		{
+			ID:        "urn:ngsi-ld:Gateway:gateway_001",
+			Type:      digitaltwin.EntityTypeGateway,
+			Name:      nil,
+			GatewayID: "gateway_001",
+			UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+		},
+	}}
+
+	dto, err := NewTwinSimplifiedListResponseDTO(res)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	b, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal(b, &items); err != nil {
+		t.Fatalf("failed to unmarshal root array: %v (raw: %s)", err, string(b))
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+
+	item0 := items[0]
+	if item0["id"] != "urn:ngsi-ld:Sensor:gateway_001:sensor_001" {
+		t.Errorf("item 0 id = %v", item0["id"])
+	}
+	if item0["type"] != "Sensor" {
+		t.Errorf("item 0 type = %v", item0["type"])
+	}
+	if item0["gateway_id"] != "gateway_001" {
+		t.Errorf("item 0 gateway_id = %v, want flat string", item0["gateway_id"])
+	}
+	if item0["name"] != "Sensor 1" {
+		t.Errorf("item 0 name = %v, want flat string", item0["name"])
+	}
+	if item0["modifiedAt"] != "2026-10-15T09:00:00.123000Z" {
+		t.Errorf("item 0 modifiedAt = %v, want UTC microsecond", item0["modifiedAt"])
+	}
+	if _, ok := item0["@context"]; ok {
+		t.Errorf("simplified item must not carry @context: %v", item0["@context"])
+	}
+
+	if _, ok := items[1]["name"]; ok {
+		t.Errorf("nil name must be omitted, got: %v", items[1]["name"])
+	}
+	if len(items[1]) != 4 {
+		t.Errorf("item 1 keys = %v, want 4 keys (id, type, gateway_id, modifiedAt)", items[1])
+	}
+
+	// Empty items -> root [] (not null)
+	bEmpty, err := json.Marshal(mustSimplifiedDTO(t, &digitaltwin.TwinListResult{Items: nil}))
+	if err != nil {
+		t.Fatalf("failed to marshal empty: %v", err)
+	}
+	if string(bEmpty) != "[]" {
+		t.Errorf("expected \"[]\", got %s", string(bEmpty))
+	}
+
+	// Validation is shared with the normalized projection.
+	invalid := []struct {
+		name string
+		res  *digitaltwin.TwinListResult
+	}{
+		{name: "nil_result", res: nil},
+		{
+			name: "invalid_urn",
+			res: &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{{
+				ID: "not-a-urn", Type: digitaltwin.EntityTypeSensor, GatewayID: "gateway_001",
+			}}},
+		},
+		{
+			name: "type_mismatch",
+			res: &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{{
+				ID: "urn:ngsi-ld:Sensor:gateway_001:sensor_001", Type: digitaltwin.EntityTypeGateway, GatewayID: "gateway_001",
+			}}},
+		},
+		{
+			name: "gateway_mismatch",
+			res: &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{{
+				ID: "urn:ngsi-ld:Sensor:gateway_001:sensor_001", Type: digitaltwin.EntityTypeSensor, GatewayID: "gateway_002",
+			}}},
+		},
+		{
+			name: "invalid_timestamp",
+			res: &digitaltwin.TwinListResult{Items: []digitaltwin.TwinSummary{{
+				ID: "urn:ngsi-ld:Sensor:gateway_001:sensor_001", Type: digitaltwin.EntityTypeSensor, GatewayID: "gateway_001",
+				UpdatedAt: time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
+			}}},
+		},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewTwinSimplifiedListResponseDTO(tc.res); err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+		})
+	}
+}
+
+func mustSimplifiedDTO(t *testing.T, res *digitaltwin.TwinListResult) []TwinSummaryFlatDTO {
+	t.Helper()
+	dto, err := NewTwinSimplifiedListResponseDTO(res)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dto == nil {
+		t.Fatal("simplified DTO must be non-nil so it marshals as [] not null")
+	}
+	return dto
+}
+
 func TestTwinStateResponseDTO(t *testing.T) {
 	updatedAt := time.Date(2026, 10, 15, 9, 30, 0, 0, time.UTC)
 	lastReported := time.Date(2026, 8, 21, 10, 15, 1, 250000000, time.UTC)
