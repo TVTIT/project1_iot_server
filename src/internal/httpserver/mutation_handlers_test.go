@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -55,10 +56,10 @@ func TestMutationHandlers_ErrorLogsExcludeRawCause(t *testing.T) {
 					c.Next()
 				})
 				router.POST("/v1/digital-twins", postDigitalTwin(creator, testBodyLimit))
-				router.PATCH("/v1/digital-twins/:entity_id", patchDigitalTwin(patcher, &mockSensorPatcher{}, testBodyLimit))
+				router.PATCH("/v1/digital-twins/:entity_id/attrs", patchDigitalTwin(patcher, &mockSensorPatcher{}, testBodyLimit))
 				path, body, operation := "/v1/digital-twins", `{"entity_type":"Gateway","gateway_id":"gw-01","name":"Gateway","owner_user_id":"`+uuid.NewString()+`"}`, "post_digital_twin"
 				if method == http.MethodPatch {
-					path, body, operation = "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01", `{"name":"Updated Gateway"}`, "patch_digital_twin"
+					path, body, operation = "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01/attrs", `{"name":{"type":"Property","value":"Updated Gateway"}}`, "patch_digital_twin"
 				}
 				req := httptest.NewRequest(method, path, strings.NewReader(body))
 				req.Header.Set("Content-Type", "application/json")
@@ -151,7 +152,7 @@ func setupMutationTestRouter(creator EntityCreator, gwPatcher GatewayPatcher, se
 		})
 	}
 	r.POST("/v1/digital-twins", postDigitalTwin(creator, limit))
-	r.PATCH("/v1/digital-twins/:entity_id", patchDigitalTwin(gwPatcher, sensorPatcher, limit))
+	r.PATCH("/v1/digital-twins/:entity_id/attrs", patchDigitalTwin(gwPatcher, sensorPatcher, limit))
 	return r
 }
 
@@ -175,8 +176,8 @@ func TestMutationHandlers_AuthenticationRequired(t *testing.T) {
 		{
 			name:   "patch_digital_twins_missing_principal",
 			method: http.MethodPatch,
-			url:    "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01",
-			body:   `{"name":"Renamed GW"}`,
+			url:    "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01/attrs",
+			body:   `{"name":{"type":"Property","value":"Renamed GW"}}`,
 		},
 	}
 
@@ -253,7 +254,7 @@ func TestMutationHandlers_NilDependency(t *testing.T) {
 	t.Run("patch_digital_twins_nil_gw_patcher", func(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, nil, &mockSensorPatcher{}, testBodyLimit, principal)
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01", strings.NewReader(`{"name":"GW"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01/attrs", strings.NewReader(`{"name":{"type":"Property","value":"GW"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -269,7 +270,7 @@ func TestMutationHandlers_NilDependency(t *testing.T) {
 	t.Run("patch_digital_twins_nil_sensor_patcher", func(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, &mockGatewayPatcher{}, nil, testBodyLimit, principal)
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw_01:s_01", strings.NewReader(`{"name":"Sensor"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw_01:s_01/attrs", strings.NewReader(`{"name":{"type":"Property","value":"Sensor"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -342,6 +343,16 @@ func TestPostDigitalTwin_GatewayCreateAndReplay(t *testing.T) {
 
 			if w.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if tc.created {
+				wantLoc := "/v1/digital-twins/" + url.PathEscape("urn:ngsi-ld:Gateway:gw_lab_01")
+				if loc := w.Header().Get("Location"); loc != wantLoc {
+					t.Errorf("Location header = %q, want %q", loc, wantLoc)
+				}
+			} else {
+				if loc := w.Header().Get("Location"); loc != "" {
+					t.Errorf("Location header on replay = %q, want empty", loc)
+				}
 			}
 			if w.Header().Get("Content-Type") != "application/json; charset=utf-8" {
 				t.Errorf("Content-Type = %q, want application/json; charset=utf-8", w.Header().Get("Content-Type"))
@@ -434,6 +445,16 @@ func TestPostDigitalTwin_SensorCreateAndReplay(t *testing.T) {
 			if w.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
 			}
+			if tc.created {
+				wantLoc := "/v1/digital-twins/" + url.PathEscape("urn:ngsi-ld:Sensor:gw_01:temp_01")
+				if loc := w.Header().Get("Location"); loc != wantLoc {
+					t.Errorf("Location header = %q, want %q", loc, wantLoc)
+				}
+			} else {
+				if loc := w.Header().Get("Location"); loc != "" {
+					t.Errorf("Location header on replay = %q, want empty", loc)
+				}
+			}
 			if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Pragma") != "no-cache" {
 				t.Errorf("missing expected cache headers")
 			}
@@ -494,7 +515,7 @@ func TestPatchDigitalTwin_Gateway(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, gwPatcher, &mockSensorPatcher{}, testBodyLimit, principal)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01", strings.NewReader(`{"name":"Updated GW Name","description":"Updated GW Description"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01/attrs", strings.NewReader(`{"name":{"type":"Property","value":"Updated GW Name"},"description":{"type":"Property","value":"Updated GW Description"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -547,7 +568,7 @@ func TestPatchDigitalTwin_Gateway(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, gwPatcher, &mockSensorPatcher{}, testBodyLimit, principal)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01", strings.NewReader(`{"description":null}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw_01/attrs", strings.NewReader(`{"description":{"type":"Property","value":"urn:ngsi-ld:null"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -603,7 +624,7 @@ func TestPatchDigitalTwin_Sensor(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, &mockGatewayPatcher{}, sensorPatcher, testBodyLimit, principal)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw_01:s_01", strings.NewReader(`{"name":"Updated Sensor Name"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw_01:s_01/attrs", strings.NewReader(`{"name":{"type":"Property","value":"Updated Sensor Name"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -637,7 +658,7 @@ func TestPatchDigitalTwin_Sensor(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, &mockGatewayPatcher{}, &mockSensorPatcher{}, testBodyLimit, principal)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw_01:s_01", strings.NewReader(`{"unit":"degF"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw_01:s_01/attrs", strings.NewReader(`{"name":{"type":"Property","value":"Valid"},"unit":{"type":"Property","value":"degF"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -761,7 +782,7 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_malformed_json",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1",
+			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
 			body:       `{broken`,
 			mediaType:  "application/json; charset=utf-8",
 			limit:      testBodyLimit,
@@ -771,7 +792,7 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_empty_body",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1",
+			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
 			body:       `{}`,
 			mediaType:  "application/json; charset=utf-8",
 			limit:      testBodyLimit,
@@ -781,8 +802,8 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_query_params_rejected",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1?refresh=true",
-			body:       `{"name":"Renamed"}`,
+			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs?refresh=true",
+			body:       `{"name":{"type":"Property","value":"Renamed"}}`,
 			mediaType:  "application/json; charset=utf-8",
 			limit:      testBodyLimit,
 			wantStatus: http.StatusBadRequest,
@@ -791,8 +812,8 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_invalid_urn",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/not-a-valid-urn",
-			body:       `{"name":"Renamed"}`,
+			url:        "/v1/digital-twins/not-a-valid-urn/attrs",
+			body:       `{"name":{"type":"Property","value":"Renamed"}}`,
 			mediaType:  "application/json; charset=utf-8",
 			limit:      testBodyLimit,
 			wantStatus: http.StatusBadRequest,
@@ -801,8 +822,8 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_unsupported_entity_type_urn",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/urn:ngsi-ld:Device:dev_01",
-			body:       `{"name":"Renamed"}`,
+			url:        "/v1/digital-twins/urn:ngsi-ld:Device:dev_01/attrs",
+			body:       `{"name":{"type":"Property","value":"Renamed"}}`,
 			mediaType:  "application/json; charset=utf-8",
 			limit:      testBodyLimit,
 			wantStatus: http.StatusBadRequest,
@@ -811,8 +832,8 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_oversized_body",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1",
-			body:       `{"name":"This name is intentionally made much longer than the small limit threshold to trigger 413"}`,
+			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			body:       `{"name":{"type":"Property","value":"This name is intentionally made much longer than the small limit threshold to trigger 413"}}`,
 			mediaType:  "application/json; charset=utf-8",
 			limit:      smallLimit,
 			wantStatus: http.StatusRequestEntityTooLarge,
@@ -821,8 +842,8 @@ func TestMutationHandlers_ValidationAndFramingNegatives(t *testing.T) {
 		{
 			name:       "patch_unsupported_media_type",
 			method:     http.MethodPatch,
-			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1",
-			body:       `{"name":"Renamed"}`,
+			url:        "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			body:       `{"name":{"type":"Property","value":"Renamed"}}`,
 			mediaType:  "application/xml",
 			limit:      testBodyLimit,
 			wantStatus: http.StatusUnsupportedMediaType,
@@ -959,7 +980,7 @@ func TestMutationHandlers_DomainErrors(t *testing.T) {
 			r := setupMutationTestRouter(&mockEntityCreator{}, gwPatcher, &mockSensorPatcher{}, testBodyLimit, principal)
 
 			w := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", strings.NewReader(`{"name":"Renamed"}`))
+			req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs", strings.NewReader(`{"name":{"type":"Property","value":"Renamed"}}`))
 			req.Header.Set("Content-Type", "application/json; charset=utf-8")
 			r.ServeHTTP(w, req)
 
@@ -1026,7 +1047,7 @@ func TestMutationHandlers_DTOProjectionFailure(t *testing.T) {
 		r := setupMutationTestRouter(&mockEntityCreator{}, gwPatcher, &mockSensorPatcher{}, testBodyLimit, principal)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", strings.NewReader(`{"name":"Renamed"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs", strings.NewReader(`{"name":{"type":"Property","value":"Renamed"}}`))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		r.ServeHTTP(w, req)
 
@@ -1066,4 +1087,316 @@ func TestMutationHandlers_DTOProjectionFailure(t *testing.T) {
 			t.Errorf("code = %q, want %q", code, "internal_error")
 		}
 	})
+}
+
+func TestPostDigitalTwin_LocationHeader_OnlyOn201(t *testing.T) {
+	adminID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	principal := &auth.Principal{UserID: adminID, Role: "authenticated"}
+
+	t.Run("post_conflict_409_has_no_location", func(t *testing.T) {
+		creator := &mockEntityCreator{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.CreateEntityInput) (digitaltwin.CreateEntityResult, error) {
+				return digitaltwin.CreateEntityResult{}, digitaltwin.ErrProvisioningConflict
+			},
+		}
+		r := setupMutationTestRouter(creator, &mockGatewayPatcher{}, &mockSensorPatcher{}, testBodyLimit, principal)
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/digital-twins", strings.NewReader(`{"entity_type":"Gateway","gateway_id":"gw_01","name":"GW","owner_user_id":"00000000-0000-0000-0000-000000000001"}`))
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
+		}
+		if loc := w.Header().Get("Location"); loc != "" {
+			t.Errorf("Location header = %q, want empty", loc)
+		}
+	})
+
+	t.Run("post_bad_request_400_has_no_location", func(t *testing.T) {
+		creator := &mockEntityCreator{}
+		r := setupMutationTestRouter(creator, &mockGatewayPatcher{}, &mockSensorPatcher{}, testBodyLimit, principal)
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/digital-twins", strings.NewReader(`{"invalid":"json"`))
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		if loc := w.Header().Get("Location"); loc != "" {
+			t.Errorf("Location header = %q, want empty", loc)
+		}
+	})
+}
+
+func TestPatchDigitalTwin_OldRootRoute_CannotWrite(t *testing.T) {
+	adminID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	principal := &auth.Principal{UserID: adminID, Role: "authenticated"}
+
+	gwCalled := false
+	gwPatcher := &mockGatewayPatcher{
+		fn: func(_ context.Context, _ uuid.UUID, _ string, _ digitaltwin.PatchGatewayInput) (digitaltwin.PatchGatewayResult, error) {
+			gwCalled = true
+			return digitaltwin.PatchGatewayResult{}, nil
+		},
+	}
+
+	r := setupMutationTestRouter(&mockEntityCreator{}, gwPatcher, &mockSensorPatcher{}, testBodyLimit, principal)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", strings.NewReader(`{"name":{"type":"Property","value":"New Name"}}`))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	r.ServeHTTP(w, req)
+
+	// Since root route /v1/digital-twins/:entity_id is not registered for PATCH on this router,
+	// it must return 404 (or 405 if another method exists on this router).
+	if w.Code != http.StatusNotFound && w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 404 or 405", w.Code)
+	}
+	if gwCalled {
+		t.Fatal("writer was called on old root PATCH route!")
+	}
+}
+
+func TestPatchDigitalTwin_InvalidRequest_NeverCallsWriter(t *testing.T) {
+	adminID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	principal := &auth.Principal{UserID: adminID, Role: "authenticated"}
+
+	cases := []struct {
+		name        string
+		url         string
+		contentType string
+		body        string
+		wantStatus  int
+	}{
+		{
+			name:        "empty_object",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "flat_body_compatibility_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":"plain string"}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "json_null_literal",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":null}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "property_value_null",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":null}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "name_deletion_sentinel_forbidden",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":"urn:ngsi-ld:null"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "wrong_property_type",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Relationship","value":"gw1"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "missing_property_type",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"value":"gw1"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "missing_property_value",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "extra_keys_in_property",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":"gw1","extra":"field"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "nested_duplicate_keys",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","type":"Property","value":"gw1"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "root_duplicate_keys",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":"a"},"name":{"type":"Property","value":"b"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "sensor_description_forbidden",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"description":{"type":"Property","value":"not allowed"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "sensor_unit_forbidden",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":"s1"},"unit":{"type":"Property","value":"degC"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "forbidden_id_injection",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"id":"urn:ngsi-ld:Gateway:gw2","name":{"type":"Property","value":"gw1"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "forbidden_type_injection",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"type":"Sensor","name":{"type":"Property","value":"gw1"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "forbidden_measurement_injection",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":"s1"},"measurement":{"type":"Property","value":25.0}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_missing_context",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"}}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_foreign_context",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":"https://evil.org/context.jsonld"}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_json_with_context_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/json; charset=utf-8",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_import_directive_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":[{"@import":"https://attacker.invalid/context.jsonld"},"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_unknown_term_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":[{"unknownTerm":"https://example.org/ngsi-ld/iot/v1#unknown"},"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_changed_custom_iri_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":[{"measurement":"https://attacker.invalid/a"},"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_core_override_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":[{"name":"https://example.org/ngsi-ld/iot/v1#name"},"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_duplicate_keys_within_context_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":[{"measurement":"https://attacker.invalid/a","measurement":"https://attacker.invalid/b"},"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_duplicate_keys_same_value_within_context_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":[{"measurement":"https://example.org/ngsi-ld/iot/v1#measurement","measurement":"https://example.org/ngsi-ld/iot/v1#measurement"},"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_duplicate_core_context_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":["https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld","https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_project_namespace_as_url_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":["https://example.org/ngsi-ld/iot/v1#","https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "application_ld_json_inverted_context_order_rejected",
+			url:         "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1/attrs",
+			contentType: "application/ld+json",
+			body:        `{"name":{"type":"Property","value":"gw1"},"@context":["https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld",{"Gateway":"https://example.org/ngsi-ld/iot/v1#Gateway"}]}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writerCalled := false
+			gwPatcher := &mockGatewayPatcher{
+				fn: func(_ context.Context, _ uuid.UUID, _ string, _ digitaltwin.PatchGatewayInput) (digitaltwin.PatchGatewayResult, error) {
+					writerCalled = true
+					return digitaltwin.PatchGatewayResult{}, nil
+				},
+			}
+			sensorPatcher := &mockSensorPatcher{
+				fn: func(_ context.Context, _ uuid.UUID, _ string, _ string, _ digitaltwin.PatchSensorInput) (digitaltwin.PatchSensorResult, error) {
+					writerCalled = true
+					return digitaltwin.PatchSensorResult{}, nil
+				},
+			}
+
+			r := setupMutationTestRouter(&mockEntityCreator{}, gwPatcher, sensorPatcher, testBodyLimit, principal)
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPatch, tc.url, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			r.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if writerCalled {
+				t.Fatalf("writer was called on invalid request: %s", tc.name)
+			}
+		})
+	}
 }

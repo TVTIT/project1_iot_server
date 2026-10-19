@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -40,6 +41,10 @@ func postDigitalTwin(creator EntityCreator, limit int64) gin.HandlerFunc {
 			return
 		}
 
+		if !negotiateAccept(c, mimeJSON) {
+			return
+		}
+
 		if creator == nil {
 			writeMutationError(c, "post_digital_twin", digitaltwin.ErrDependencyUnavailable)
 			return
@@ -70,6 +75,15 @@ func postDigitalTwin(creator EntityCreator, limit int64) gin.HandlerFunc {
 			return
 		}
 
+		if resStatus == http.StatusCreated {
+			parsedURN, parseErr := digitaltwin.ParseEntityURN(res.EntityID)
+			if parseErr != nil || parsedURN.URN == "" {
+				writeMutationError(c, "post_digital_twin_location", digitaltwin.ErrUnexpected)
+				return
+			}
+			c.Header("Location", "/v1/digital-twins/"+url.PathEscape(parsedURN.URN))
+		}
+
 		writeReadJSONResponse(c, "post_digital_twin", resStatus, body)
 	}
 }
@@ -83,6 +97,10 @@ func patchDigitalTwin(gwPatcher GatewayPatcher, sensorPatcher SensorPatcher, lim
 		principal, ok := auth.PrincipalFrom(c)
 		if !ok || principal.UserID == uuid.Nil {
 			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+
+		if !negotiateAccept(c, mimeJSON) {
 			return
 		}
 
