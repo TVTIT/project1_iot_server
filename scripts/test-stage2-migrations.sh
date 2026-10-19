@@ -507,14 +507,25 @@ timeout 15 docker container logs "$FAILED_DB" 2>&1 | grep -q 'intentional isolat
 rm -rf "$INVALID_DIR"
 INVALID_DIR=""
 
+# Setup Auth prerequisite before running migrations 20 and 21
+for container in "$UPGRADE_DB" "$FRESH_DB"; do
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U stage2_admin -d stage2_test \
+        -c "CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}'); INSERT INTO auth.users (id) SELECT id FROM public.profiles ON CONFLICT DO NOTHING;"
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U stage2_admin -d stage2_test \
+        < "$PROJECT_ROOT/migrations/000004_supabase_compat.up.sql"
+done
+
 # Only after every historical v19 assertion has passed, upgrade both fixtures
-# through the existing migration runner and verify v20 schema-only invariants.
+# through the existing migration runner and verify v20 and v21 schema invariants.
 run_migrations "$UPGRADE_DB" "$PROJECT_ROOT/migrations" >/dev/null
 run_migrations "$FRESH_DB" "$PROJECT_ROOT/migrations" >/dev/null
 for container in "$UPGRADE_DB" "$FRESH_DB"; do
     docker exec -i "$container" psql -v ON_ERROR_STOP=1 -v stage3_verify_writes=false \
         -U stage2_admin -d stage2_test \
         < "$PROJECT_ROOT/scripts/sql/verify-migration-000020.sql"
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 \
+        -U stage2_admin -d stage2_test \
+        < "$PROJECT_ROOT/scripts/sql/verify-migration-000021.sql"
 done
 
-echo "Stage 2 historical migration tests passed through version 19; version 20 fresh/upgrade schema verification passed."
+echo "Stage 2 historical migration tests passed through version 19; version 20 and 21 fresh/upgrade schema verification passed."

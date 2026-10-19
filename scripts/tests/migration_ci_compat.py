@@ -100,6 +100,12 @@ class Fixture:
         self.login('supabase_auth_admin', self.passwords['AUTH_DB_PASSWORD'])
         self.login('supabase_storage_admin', self.passwords['STORAGE_DB_PASSWORD'])
         print('Supabase repeated compatibility, RLS=6, trigger, FK and TCP logins passed.', flush=True)
+        # Apply and verify migration 21 once Auth tables and triggers exist
+        for _ in range(2):
+            self.sql((ROOT / 'migrations/000021_admin_user_management.up.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text())
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version = 21 AND name = 'admin_user_management';", '1')
+        print('Migration 21 repeated compatibility, least-privilege grants and verifier passed.', flush=True)
 
     def cleanup(self):
         if self.id is None:

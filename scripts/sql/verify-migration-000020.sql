@@ -6,7 +6,7 @@ DECLARE
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
                  WHERE version=20 AND name='stage3_telemetry_ingestion')
-     OR (SELECT max(version) FROM public.schema_migrations) <> 20 THEN
+     OR (SELECT max(version) FROM public.schema_migrations) < 20 THEN
     RAISE EXCEPTION 'migration 20 tracking is missing or unexpected';
   END IF;
   SELECT pg_get_constraintdef(oid) INTO pk_def FROM pg_constraint
