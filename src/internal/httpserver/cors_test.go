@@ -98,8 +98,8 @@ func TestCORSPreflightAllowed(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Max-Age"); got != "600" {
 		t.Errorf("Access-Control-Max-Age = %q, want 600", got)
 	}
-	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "X-Request-ID" {
-		t.Errorf("Access-Control-Expose-Headers = %q, want X-Request-ID", got)
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "Link, Location, X-Request-ID" {
+		t.Errorf("Access-Control-Expose-Headers = %q, want Link, Location, X-Request-ID", got)
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
 		t.Errorf("Access-Control-Allow-Credentials = %q, want empty", got)
@@ -559,8 +559,8 @@ func TestPermissionsEndpointWithAllowedOriginAndJWT(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:12345" {
 		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "http://localhost:12345")
 	}
-	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "X-Request-ID" {
-		t.Errorf("Access-Control-Expose-Headers = %q, want X-Request-ID", got)
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "Link, Location, X-Request-ID" {
+		t.Errorf("Access-Control-Expose-Headers = %q, want Link, Location, X-Request-ID", got)
 	}
 
 	var payload struct {

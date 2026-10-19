@@ -144,8 +144,8 @@ func TestPlannedBusinessRoutesRequireAuthenticationBeforeStub(t *testing.T) {
 		t.Errorf("GET /v1/ws with token status = %d, want %d", authorized.Code, http.StatusNotImplemented)
 	}
 
-	// Replaced routes /v1/telemetry/history and /v1/digital-twins require auth and dispatch to handlers (not 501).
-	for _, path := range []string{"/v1/telemetry/history", "/v1/digital-twins"} {
+	// Replaced route /v1/digital-twins requires auth and dispatches to handler (not 501).
+	for _, path := range []string{"/v1/digital-twins"} {
 		unauth := httptest.NewRecorder()
 		router.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, path, nil))
 		if unauth.Code != http.StatusUnauthorized {

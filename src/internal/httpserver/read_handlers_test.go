@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,7 +133,7 @@ func TestReadHandlers_AuthenticationRequired(t *testing.T) {
 			name:    "twin_detail",
 			method:  http.MethodGet,
 			path:    "/v1/digital-twins/:entity_id",
-			handler: getDigitalTwinDetail(&mockTwinDetailReader{}, tp),
+			handler: getDigitalTwinDetail(&mockTwinDetailReader{}, &mockTwinStateReader{}, tp),
 		},
 		{
 			name:    "twin_state",
@@ -471,21 +472,93 @@ func TestListDigitalTwins_Handler(t *testing.T) {
 	_, tp := setupTestParsers(t)
 	testActor := uuid.MustParse("22222222-2222-4222-8222-222222222222")
 
-	t.Run("success_dispatch_and_empty_items_preserved", func(t *testing.T) {
+	t.Run("success_root_array_and_link_header", func(t *testing.T) {
 		var receivedActor uuid.UUID
 		var receivedQuery digitaltwin.TwinListQuery
-
+		nextCursor := "v1.eyJrIjoidGVzdCJ9"
 		reader := &mockTwinListReader{
 			fn: func(_ context.Context, actor uuid.UUID, q digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
 				receivedActor = actor
 				receivedQuery = q
 				return &digitaltwin.TwinListResult{
-					Items:      []digitaltwin.TwinSummary{},
+					Items: []digitaltwin.TwinSummary{
+						{
+							ID:        "urn:ngsi-ld:Sensor:gw_01:s1",
+							Type:      digitaltwin.EntityTypeSensor,
+							Name:      ptr("Sensor 1"),
+							GatewayID: "gw_01",
+							UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+						},
+						{
+							ID:        "urn:ngsi-ld:Sensor:gw_01:s2",
+							Type:      digitaltwin.EntityTypeSensor,
+							Name:      ptr("Sensor 2"),
+							GatewayID: "gw_01",
+							UpdatedAt: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC),
+						},
+					},
+					NextCursor: &nextCursor,
+				}, nil
+			},
+		}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?type=Sensor&gateway_id=gw_01&limit=10", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/ld+json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want application/ld+json; charset=utf-8", ct)
+		}
+		if receivedActor != testActor {
+			t.Errorf("received actor = %v, want %v", receivedActor, testActor)
+		}
+		if receivedQuery.Limit != 10 {
+			t.Errorf("received limit = %d, want 10", receivedQuery.Limit)
+		}
+		if receivedQuery.EntityType == nil || *receivedQuery.EntityType != digitaltwin.EntityTypeSensor {
+			t.Errorf("received entity type = %v, want Sensor", receivedQuery.EntityType)
+		}
+		if receivedQuery.GatewayID == nil || *receivedQuery.GatewayID != "gw_01" {
+			t.Errorf("received gateway id = %v, want gw_01", receivedQuery.GatewayID)
+		}
+
+		// Verify Link header
+		wantLink := "</v1/digital-twins?type=Sensor&gateway_id=gw_01&limit=10&cursor=" + nextCursor + ">; rel=\"next\""
+		if link := w.Header().Get("Link"); link != wantLink {
+			t.Errorf("Link header = %q, want %q", link, wantLink)
+		}
+
+		// Body must be root JSON array and not contain next_cursor
+		if strings.Contains(w.Body.String(), "next_cursor") {
+			t.Errorf("response body must not contain next_cursor: %s", w.Body.String())
+		}
+		var resp []map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal root array response: %v (body: %s)", err, w.Body.String())
+		}
+		if len(resp) != 2 {
+			t.Errorf("len(resp) = %d, want 2", len(resp))
+		}
+	})
+
+	t.Run("success_empty_or_last_page_no_link", func(t *testing.T) {
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{
+					Items:      nil,
 					NextCursor: nil,
 				}, nil
 			},
 		}
-
 		r := gin.New()
 		r.Use(func(c *gin.Context) {
 			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
@@ -500,22 +573,89 @@ func TestListDigitalTwins_Handler(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
 		}
-		if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
-			t.Errorf("Content-Type = %q, want application/json; charset=utf-8", ct)
+		if link := w.Header().Get("Link"); link != "" {
+			t.Errorf("Link header must be absent on empty/last page, got: %q", link)
 		}
-		if receivedActor != testActor {
-			t.Errorf("received actor = %v, want %v", receivedActor, testActor)
+		if w.Body.String() != "[]" {
+			t.Errorf("expected \"[]\", got %s", w.Body.String())
 		}
-		if receivedQuery.Limit != 10 {
-			t.Errorf("received limit = %d, want 10", receivedQuery.Limit)
-		}
+	})
 
-		var resp TwinListResponseDTO
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to unmarshal response: %v", err)
+	t.Run("link_header_url_encoding", func(t *testing.T) {
+		rawCursor := "v1.test+cursor/123=="
+		reader := &mockTwinListReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinListQuery) (*digitaltwin.TwinListResult, error) {
+				return &digitaltwin.TwinListResult{
+					Items:      nil,
+					NextCursor: &rawCursor,
+				}, nil
+			},
 		}
-		if resp.Items == nil || len(resp.Items) != 0 || resp.NextCursor != nil {
-			t.Errorf("unexpected items in response: %+v", resp)
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?limit=10", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		wantLink := "</v1/digital-twins?limit=10&cursor=v1.test%2Bcursor%2F123%3D%3D>; rel=\"next\""
+		if link := w.Header().Get("Link"); link != wantLink {
+			t.Errorf("Link header = %q, want %q", link, wantLink)
+		}
+	})
+
+	t.Run("reject_replaced_query_parameters", func(t *testing.T) {
+		reader := &mockTwinListReader{}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
+
+		for _, param := range []string{"entity_type=Sensor", "after=some_cursor"} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?"+param, nil)
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("param %q: status = %d, want %d", param, w.Code, http.StatusBadRequest)
+			}
+			code, _ := parseErrorResponse(t, w.Body.Bytes())
+			if code != "invalid_request" {
+				t.Errorf("param %q: code = %q, want %q", param, code, "invalid_request")
+			}
+		}
+	})
+
+	t.Run("reject_duplicate_query_parameters", func(t *testing.T) {
+		reader := &mockTwinListReader{}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
+
+		for _, query := range []string{"type=Gateway&type=Sensor", "cursor=a&cursor=b"} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?"+query, nil)
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("query %q: status = %d, want %d", query, w.Code, http.StatusBadRequest)
+			}
+			code, _ := parseErrorResponse(t, w.Body.Bytes())
+			if code != "invalid_request" {
+				t.Errorf("query %q: code = %q, want %q", query, code, "invalid_request")
+			}
 		}
 	})
 
@@ -529,7 +669,7 @@ func TestListDigitalTwins_Handler(t *testing.T) {
 		r.GET("/v1/digital-twins", listDigitalTwins(reader, tp))
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?after=invalid_cursor_without_prefix", nil)
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?cursor=invalid_cursor_without_prefix", nil)
 		r.ServeHTTP(w, req)
 
 		if w.Code != http.StatusBadRequest {
@@ -598,7 +738,7 @@ func TestGetDigitalTwinDetail_Handler(t *testing.T) {
 			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
 			c.Next()
 		})
-		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, tp))
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, &mockTwinStateReader{}, tp))
 
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", nil)
@@ -626,7 +766,7 @@ func TestGetDigitalTwinDetail_Handler(t *testing.T) {
 			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
 			c.Next()
 		})
-		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, tp))
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, &mockTwinStateReader{}, tp))
 
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/not-a-valid-urn", nil)
@@ -664,7 +804,7 @@ func TestGetDigitalTwinDetail_Handler(t *testing.T) {
 			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
 			c.Next()
 		})
-		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, tp))
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, &mockTwinStateReader{}, tp))
 
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", nil)
@@ -676,6 +816,400 @@ func TestGetDigitalTwinDetail_Handler(t *testing.T) {
 		code, _ := parseErrorResponse(t, w.Body.Bytes())
 		if code != "internal_error" {
 			t.Errorf("error code = %q, want %q", code, "internal_error")
+		}
+	})
+
+	t.Run("format_simplified_dispatches_to_state_reader", func(t *testing.T) {
+		var receivedActor uuid.UUID
+		var receivedQuery digitaltwin.TwinStateQuery
+
+		stateReader := &mockTwinStateReader{
+			fn: func(_ context.Context, actor uuid.UUID, q digitaltwin.TwinStateQuery) (*digitaltwin.TwinStateResult, error) {
+				receivedActor = actor
+				receivedQuery = q
+				return &digitaltwin.TwinStateResult{
+					ID:              "urn:ngsi-ld:Gateway:gw1",
+					Type:            digitaltwin.EntityTypeGateway,
+					GatewayID:       "gw1",
+					ReportedState:   json.RawMessage(`{"status":"online"}`),
+					DesiredState:    json.RawMessage(`{}`),
+					ReportedVersion: 1,
+					DesiredVersion:  0,
+					UpdatedAt:       updatedAt,
+				}, nil
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(&mockTwinDetailReader{}, stateReader, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1?format=simplified", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want application/json; charset=utf-8", ct)
+		}
+		if receivedActor != testActor {
+			t.Errorf("received actor = %v, want %v", receivedActor, testActor)
+		}
+		if receivedQuery.EntityID != "urn:ngsi-ld:Gateway:gw1" {
+			t.Errorf("received entity_id = %q, want urn:ngsi-ld:Gateway:gw1", receivedQuery.EntityID)
+		}
+		if strings.Contains(w.Body.String(), "@context") {
+			t.Errorf("state response must not contain @context: %s", w.Body.String())
+		}
+	})
+
+	t.Run("format_invalid_rejected_400", func(t *testing.T) {
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(&mockTwinDetailReader{}, &mockTwinStateReader{}, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1?format=invalid", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		code, _ := parseErrorResponse(t, w.Body.Bytes())
+		if code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", code)
+		}
+	})
+
+	t.Run("format_simplified_mixed_with_relationship_limit_rejected_400", func(t *testing.T) {
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(&mockTwinDetailReader{}, &mockTwinStateReader{}, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1?format=simplified&relationship_limit=10", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+		code, _ := parseErrorResponse(t, w.Body.Bytes())
+		if code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", code)
+		}
+	})
+
+	t.Run("gateway_detail_with_next_cursor_emits_link_header", func(t *testing.T) {
+		reader := &mockTwinDetailReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinDetailQuery) (*digitaltwin.TwinDetailResult, error) {
+				return &digitaltwin.TwinDetailResult{
+					ID:            "urn:ngsi-ld:Gateway:gw1",
+					Type:          digitaltwin.EntityTypeGateway,
+					Name:          "Gateway 1",
+					GatewayID:     "gw1",
+					Relationships: []digitaltwin.RelationshipItem{{TargetURN: "urn:ngsi-ld:Sensor:gw1:s1"}},
+					RelationshipPage: &digitaltwin.RelationshipPage{
+						Limit:      10,
+						Count:      1,
+						NextCursor: ptr("v1.nextcursor123"),
+					},
+					UpdatedAt: updatedAt,
+				}, nil
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, &mockTwinStateReader{}, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1?relationship_limit=10", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		link := w.Header().Get("Link")
+		expectedLink := `</v1/digital-twins/urn:ngsi-ld:Gateway:gw1?relationship_limit=10&relationship_after=v1.nextcursor123>; rel="next"`
+		if link != expectedLink {
+			t.Errorf("Link header = %q, want %q", link, expectedLink)
+		}
+	})
+
+	t.Run("gateway_detail_terminal_page_no_link_header", func(t *testing.T) {
+		reader := &mockTwinDetailReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinDetailQuery) (*digitaltwin.TwinDetailResult, error) {
+				return &digitaltwin.TwinDetailResult{
+					ID:            "urn:ngsi-ld:Gateway:gw1",
+					Type:          digitaltwin.EntityTypeGateway,
+					Name:          "Gateway 1",
+					GatewayID:     "gw1",
+					Relationships: []digitaltwin.RelationshipItem{{TargetURN: "urn:ngsi-ld:Sensor:gw1:s1"}},
+					RelationshipPage: &digitaltwin.RelationshipPage{
+						Limit:      10,
+						Count:      1,
+						NextCursor: nil,
+					},
+					UpdatedAt: updatedAt,
+				}, nil
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, &mockTwinStateReader{}, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if link := w.Header().Get("Link"); link != "" {
+			t.Errorf("expected no Link header on terminal page, got: %q", link)
+		}
+	})
+
+	t.Run("sensor_detail_calls_both_readers_under_same_context", func(t *testing.T) {
+		detailCalled := false
+		stateCalled := false
+
+		reader := &mockTwinDetailReader{
+			fn: func(_ context.Context, actor uuid.UUID, _ digitaltwin.TwinDetailQuery) (*digitaltwin.TwinDetailResult, error) {
+				detailCalled = true
+				if actor != testActor {
+					t.Errorf("detail actor = %v, want %v", actor, testActor)
+				}
+				return &digitaltwin.TwinDetailResult{
+					ID:        "urn:ngsi-ld:Sensor:gw1:s1",
+					Type:      digitaltwin.EntityTypeSensor,
+					Name:      "Sensor 1",
+					Unit:      ptr("degC"),
+					GatewayID: "gw1",
+					UpdatedAt: updatedAt,
+				}, nil
+			},
+		}
+
+		stateReader := &mockTwinStateReader{
+			fn: func(_ context.Context, actor uuid.UUID, q digitaltwin.TwinStateQuery) (*digitaltwin.TwinStateResult, error) {
+				stateCalled = true
+				if actor != testActor {
+					t.Errorf("state actor = %v, want %v", actor, testActor)
+				}
+				if q.EntityID != "urn:ngsi-ld:Sensor:gw1:s1" {
+					t.Errorf("state entity_id = %q, want urn:ngsi-ld:Sensor:gw1:s1", q.EntityID)
+				}
+				return &digitaltwin.TwinStateResult{
+					ID:              "urn:ngsi-ld:Sensor:gw1:s1",
+					Type:            digitaltwin.EntityTypeSensor,
+					GatewayID:       "gw1",
+					ReportedState:   json.RawMessage(`{"value":25.4,"observed_at":"2026-10-18T00:00:01.000000Z","sample_interval_us":10000.0}`),
+					ReportedVersion: 1,
+					UpdatedAt:       updatedAt,
+				}, nil
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, stateReader, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+		}
+		if !detailCalled || !stateCalled {
+			t.Errorf("expected both readers called: detail=%v, state=%v", detailCalled, stateCalled)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &m)
+		if m["isHostedBy"] == nil {
+			t.Error("missing isHostedBy in Sensor detail response")
+		}
+		if m["measurement"] == nil {
+			t.Error("missing measurement in Sensor detail response")
+		}
+		if m["sample_interval_us"] == nil {
+			t.Error("missing sample_interval_us in Sensor detail response")
+		}
+	})
+
+	t.Run("sensor_detail_fails_if_state_reader_fails", func(t *testing.T) {
+		reader := &mockTwinDetailReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinDetailQuery) (*digitaltwin.TwinDetailResult, error) {
+				return &digitaltwin.TwinDetailResult{
+					ID:        "urn:ngsi-ld:Sensor:gw1:s1",
+					Type:      digitaltwin.EntityTypeSensor,
+					Name:      "Sensor 1",
+					Unit:      ptr("degC"),
+					GatewayID: "gw1",
+					UpdatedAt: updatedAt,
+				}, nil
+			},
+		}
+
+		stateReader := &mockTwinStateReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinStateQuery) (*digitaltwin.TwinStateResult, error) {
+				return nil, digitaltwin.ErrUnexpected
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, stateReader, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500 when state reader fails", w.Code)
+		}
+	})
+
+	t.Run("nil_dependencies_fail_closed", func(t *testing.T) {
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(nil, nil, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw1", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 for nil dependency", w.Code)
+		}
+	})
+
+	t.Run("slow_first_reader_consumes_second_reader_budget", func(t *testing.T) {
+		shortTimeoutParser, err := NewTwinQueryParser(&tp.cfg, 50*time.Millisecond)
+		if err != nil {
+			t.Fatalf("failed to create parser: %v", err)
+		}
+
+		reader := &mockTwinDetailReader{
+			fn: func(ctx context.Context, _ uuid.UUID, _ digitaltwin.TwinDetailQuery) (*digitaltwin.TwinDetailResult, error) {
+				// First reader consumes 40ms of the 50ms budget
+				select {
+				case <-time.After(40 * time.Millisecond):
+					return &digitaltwin.TwinDetailResult{
+						ID:        "urn:ngsi-ld:Sensor:gw1:s1",
+						Type:      digitaltwin.EntityTypeSensor,
+						Name:      "Sensor 1",
+						Unit:      ptr("degC"),
+						GatewayID: "gw1",
+						UpdatedAt: updatedAt,
+					}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			},
+		}
+
+		stateReader := &mockTwinStateReader{
+			fn: func(ctx context.Context, _ uuid.UUID, _ digitaltwin.TwinStateQuery) (*digitaltwin.TwinStateResult, error) {
+				// Second reader tries to take 30ms.
+				// Total time would be 40ms + 30ms = 70ms > 50ms total budget.
+				// If readers share the budget, ctx.Done() will fire here and return error.
+				select {
+				case <-time.After(30 * time.Millisecond):
+					return &digitaltwin.TwinStateResult{
+						ID:              "urn:ngsi-ld:Sensor:gw1:s1",
+						Type:            digitaltwin.EntityTypeSensor,
+						GatewayID:       "gw1",
+						ReportedState:   json.RawMessage(`{"value":25.4,"observed_at":"2026-10-18T00:00:01.000000Z"}`),
+						ReportedVersion: 1,
+						UpdatedAt:       updatedAt,
+					}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, stateReader, shortTimeoutParser))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable when budget is exhausted across readers, got %d (body: %s)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("earlier_request_deadline_is_preserved", func(t *testing.T) {
+		reader := &mockTwinDetailReader{
+			fn: func(ctx context.Context, _ uuid.UUID, _ digitaltwin.TwinDetailQuery) (*digitaltwin.TwinDetailResult, error) {
+				select {
+				case <-time.After(30 * time.Millisecond):
+					return &digitaltwin.TwinDetailResult{
+						ID:        "urn:ngsi-ld:Sensor:gw1:s1",
+						Type:      digitaltwin.EntityTypeSensor,
+						Name:      "Sensor 1",
+						Unit:      ptr("degC"),
+						GatewayID: "gw1",
+						UpdatedAt: updatedAt,
+					}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id", getDigitalTwinDetail(reader, &mockTwinStateReader{}, tp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1", nil)
+		// Tight 10ms deadline on request context
+		ctxWithDeadline, cancel := context.WithTimeout(req.Context(), 10*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctxWithDeadline)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable when request deadline expires, got %d (body: %s)", w.Code, w.Body.String())
 		}
 	})
 }
@@ -1149,6 +1683,283 @@ func TestReadError_MappingBranches(t *testing.T) {
 		code, _ := parseErrorResponse(t, w.Body.Bytes())
 		if code != "internal_error" {
 			t.Errorf("error code = %q, want %q", code, "internal_error")
+		}
+	})
+}
+
+func TestGetDigitalTwinTemporal_Handler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hCfg := config.DefaultHistoryConfig()
+	hp, err := NewHistoryQueryParser(&hCfg)
+	if err != nil {
+		t.Fatalf("NewHistoryQueryParser failed: %v", err)
+	}
+	testActor := uuid.MustParse("0195e18c-9fc1-7a42-9064-69ea49e63bf1")
+
+	from := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 10, 18, 0, 0, 5, 0, time.UTC)
+	_ = to
+	unit := "degC"
+
+	t.Run("success_raw_measurement_and_clean_domain_query", func(t *testing.T) {
+		var receivedActor uuid.UUID
+		var receivedQuery digitaltwin.TwinHistoryQuery
+
+		reader := &mockTwinHistoryReader{
+			fn: func(_ context.Context, actor uuid.UUID, q digitaltwin.TwinHistoryQuery) (*digitaltwin.TwinHistoryResult, error) {
+				receivedActor = actor
+				receivedQuery = q
+				return &digitaltwin.TwinHistoryResult{
+					EntityID:   q.EntityID,
+					Property:   q.Property,
+					Unit:       &unit,
+					From:       q.Range.From,
+					To:         q.Range.To,
+					Mode:       "raw",
+					Resolution: "raw",
+					PointCount: 1,
+					TelemetryResult: &telemetry.TelemetryHistoryResult{
+						GatewayID:  "gw1",
+						SensorID:   "s1",
+						Unit:       &unit,
+						From:       q.Range.From,
+						To:         q.Range.To,
+						Mode:       "raw",
+						Resolution: "raw",
+						PointCount: 1,
+						RawPoints: []telemetry.RawSamplePoint{
+							{MeasuredAt: from, Value: 25.4, SequenceNum: 100},
+						},
+					},
+				}, nil
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:05Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/ld+json; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want application/ld+json; charset=utf-8", ct)
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("Cache-Control = %q, want no-store", cc)
+		}
+
+		// Verify fake reader received clean domain query
+		if receivedActor != testActor {
+			t.Errorf("received actor = %v, want %v", receivedActor, testActor)
+		}
+		if receivedQuery.Property != digitaltwin.SelectorValue {
+			t.Errorf("received property = %q, want value", receivedQuery.Property)
+		}
+		if receivedQuery.Resolution != telemetry.ResolutionRaw {
+			t.Errorf("received resolution = %q, want raw (never auto!)", receivedQuery.Resolution)
+		}
+		if receivedQuery.EntityID != "urn:ngsi-ld:Sensor:gw1:s1" {
+			t.Errorf("received entityID = %q, want urn:ngsi-ld:Sensor:gw1:s1", receivedQuery.EntityID)
+		}
+
+		var parsed map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &parsed); err != nil {
+			t.Fatalf("failed to unmarshal JSON: %v", err)
+		}
+		if parsed["id"] != "urn:ngsi-ld:Sensor:gw1:s1" || parsed["type"] != "Sensor" {
+			t.Errorf("unexpected entity identity: %v, %v", parsed["id"], parsed["type"])
+		}
+		meas, ok := parsed["measurement"].(map[string]any)
+		if !ok {
+			t.Fatalf("measurement property is missing: %v", parsed)
+		}
+		values, ok := meas["values"].([]any)
+		if !ok || len(values) != 1 {
+			t.Fatalf("values length = %d, want 1: %v", len(values), meas["values"])
+		}
+	})
+
+	t.Run("success_bucket_measurement_with_projection", func(t *testing.T) {
+		dur := time.Minute
+		reader := &mockTwinHistoryReader{
+			fn: func(_ context.Context, _ uuid.UUID, q digitaltwin.TwinHistoryQuery) (*digitaltwin.TwinHistoryResult, error) {
+				return &digitaltwin.TwinHistoryResult{
+					EntityID:   q.EntityID,
+					Property:   q.Property,
+					From:       q.Range.From,
+					To:         q.Range.To,
+					Mode:       "bucket",
+					Resolution: "1m",
+					PointCount: 1,
+					TelemetryResult: &telemetry.TelemetryHistoryResult{
+						GatewayID:  "gw1",
+						SensorID:   "s1",
+						From:       q.Range.From,
+						To:         q.Range.To,
+						Mode:       "bucket",
+						Resolution: "1m",
+						PointCount: 1,
+						BucketPoints: []telemetry.BucketSamplePoint{
+							{BucketStart: from, Avg: 25.5, Min: 25.1, Max: 25.9, Count: 60},
+						},
+					},
+				}, nil
+			},
+		}
+
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:05:00Z&aggrPeriodDuration=PT1M&aggrMethods=avg,totalCount", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body: %s)", w.Code, http.StatusOK, w.Body.String())
+		}
+		rawJSON := w.Body.String()
+		if !strings.Contains(rawJSON, `"avg"`) || !strings.Contains(rawJSON, `"totalCount"`) {
+			t.Errorf("expected avg and totalCount in JSON: %s", rawJSON)
+		}
+		if strings.Contains(rawJSON, `"min"`) || strings.Contains(rawJSON, `"max"`) {
+			t.Errorf("min and max must be omitted: %s", rawJSON)
+		}
+		_ = dur
+	})
+
+	t.Run("unauthorized_missing_token", func(t *testing.T) {
+		reader := &mockTwinHistoryReader{}
+		r := gin.New()
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:05Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("non_member_not_found", func(t *testing.T) {
+		reader := &mockTwinHistoryReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinHistoryQuery) (*digitaltwin.TwinHistoryResult, error) {
+				return nil, telemetry.ErrHistoryNotFound
+			},
+		}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:05Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("query_validation_error_invalid_timerel", func(t *testing.T) {
+		reader := &mockTwinHistoryReader{}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=before&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:05Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("raw_limit_exceeded_error", func(t *testing.T) {
+		reader := &mockTwinHistoryReader{}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:15Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		code, _ := parseErrorResponse(t, w.Body.Bytes())
+		if code != "raw_limit_exceeded" {
+			t.Errorf("error code = %q, want raw_limit_exceeded", code)
+		}
+	})
+
+	t.Run("domain_timeout_503", func(t *testing.T) {
+		reader := &mockTwinHistoryReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinHistoryQuery) (*digitaltwin.TwinHistoryResult, error) {
+				return nil, context.DeadlineExceeded
+			},
+		}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=measurement&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:05Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+		}
+	})
+
+	t.Run("domain_inconsistent_unit_error", func(t *testing.T) {
+		reader := &mockTwinHistoryReader{
+			fn: func(_ context.Context, _ uuid.UUID, _ digitaltwin.TwinHistoryQuery) (*digitaltwin.TwinHistoryResult, error) {
+				return nil, digitaltwin.ErrInconsistentUnit
+			},
+		}
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			auth.SetPrincipal(c, auth.Principal{UserID: testActor, Role: "authenticated"})
+			c.Next()
+		})
+		r.GET("/v1/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(reader, hp))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw1:s1/temporal?attrs=sample_interval_us&timerel=between&timeAt=2026-10-18T00:00:00Z&endTimeAt=2026-10-18T00:00:05Z", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		code, _ := parseErrorResponse(t, w.Body.Bytes())
+		if code != "inconsistent_unit" {
+			t.Errorf("error code = %q, want %q", code, "inconsistent_unit")
 		}
 	})
 }

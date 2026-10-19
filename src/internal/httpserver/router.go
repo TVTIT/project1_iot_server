@@ -209,14 +209,12 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
 	authenticated.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensorForOwner(deps.OwnerSensorProvisioner, deps.AdminMaxBodyBytes))
-	authenticated.GET("/telemetry/history", getTelemetryHistory(deps.TelemetryHistoryReader, deps.HistoryQueryParser))
 	authenticated.GET("/ws", notImplemented)
 	authenticated.GET("/digital-twins", listDigitalTwins(deps.TwinListReader, deps.TwinQueryParser))
 	authenticated.POST("/digital-twins", postDigitalTwin(deps.EntityCreator, deps.TwinMaxBodyBytes))
-	authenticated.GET("/digital-twins/:entity_id", getDigitalTwinDetail(deps.TwinDetailReader, deps.TwinQueryParser))
-	authenticated.PATCH("/digital-twins/:entity_id", patchDigitalTwin(deps.GatewayPatcher, deps.SensorPatcher, deps.TwinMaxBodyBytes))
-	authenticated.GET("/digital-twins/:entity_id/state", getDigitalTwinState(deps.TwinStateReader))
-	authenticated.GET("/digital-twins/:entity_id/history", getDigitalTwinHistory(deps.TwinHistoryReader, deps.HistoryQueryParser))
+	authenticated.GET("/digital-twins/:entity_id", getDigitalTwinDetail(deps.TwinDetailReader, deps.TwinStateReader, deps.TwinQueryParser))
+	authenticated.PATCH("/digital-twins/:entity_id/attrs", patchDigitalTwin(deps.GatewayPatcher, deps.SensorPatcher, deps.TwinMaxBodyBytes))
+	authenticated.GET("/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(deps.TwinHistoryReader, deps.HistoryQueryParser))
 
 	return router, nil
 }

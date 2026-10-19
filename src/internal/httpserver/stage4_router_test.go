@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,7 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		twinStateCalled  bool
 		twinHistCalled   bool
 	)
+	_ = telemetryCalled
 
 	router := newTestStage4Router(t, verifier, func(deps *RouterDependencies) {
 		deps.TelemetryHistoryReader = &mockTelemetryHistoryReader{
@@ -204,7 +206,7 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("1. GET /v1/telemetry/history", func(t *testing.T) {
+	t.Run("1. GET /v1/telemetry/history is removed and returns 404", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/telemetry/history?gateway_id=gw-01&sensor_id=s-01&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("X-Request-ID", "req-hist-01")
@@ -212,25 +214,13 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 
 		router.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
-		}
-		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
-			t.Errorf("Content-Type = %q, want application/json", rec.Header().Get("Content-Type"))
-		}
-		if rec.Header().Get("X-Request-ID") != "req-hist-01" {
-			t.Errorf("X-Request-ID = %q, want req-hist-01", rec.Header().Get("X-Request-ID"))
-		}
-		if rec.Header().Get("Cache-Control") != "no-store" {
-			t.Errorf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
-		}
-		if !telemetryCalled {
-			t.Error("telemetry history reader was not called")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for removed /telemetry/history, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 
 	t.Run("2. GET /v1/digital-twins", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?limit=10", nil)
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?type=Gateway&limit=10", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("X-Request-ID", "req-list-01")
 		rec := httptest.NewRecorder()
@@ -240,8 +230,8 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
 		}
-		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
-			t.Errorf("Content-Type = %q, want application/json", rec.Header().Get("Content-Type"))
+		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/ld+json") {
+			t.Errorf("Content-Type = %q, want application/ld+json", rec.Header().Get("Content-Type"))
 		}
 		if rec.Header().Get("X-Request-ID") != "req-list-01" {
 			t.Errorf("X-Request-ID = %q, want req-list-01", rec.Header().Get("X-Request-ID"))
@@ -251,6 +241,23 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		}
 		if !twinListCalled {
 			t.Error("twin list reader was not called")
+		}
+
+		// Rejection of replaced parameters: entity_type and after
+		reqBadType := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?entity_type=Gateway", nil)
+		reqBadType.Header.Set("Authorization", "Bearer valid-token")
+		recBadType := httptest.NewRecorder()
+		router.ServeHTTP(recBadType, reqBadType)
+		if recBadType.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for entity_type parameter, got %d", recBadType.Code)
+		}
+
+		reqBadAfter := httptest.NewRequest(http.MethodGet, "/v1/digital-twins?after=some_cursor", nil)
+		reqBadAfter.Header.Set("Authorization", "Bearer valid-token")
+		recBadAfter := httptest.NewRecorder()
+		router.ServeHTTP(recBadAfter, reqBadAfter)
+		if recBadAfter.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request for after parameter, got %d", recBadAfter.Code)
 		}
 	})
 
@@ -266,6 +273,10 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("expected 201 Created, got %d: %s", rec.Code, rec.Body.String())
+		}
+		wantLoc := "/v1/digital-twins/" + url.PathEscape("urn:ngsi-ld:Gateway:gw-01")
+		if rec.Header().Get("Location") != wantLoc {
+			t.Errorf("Location = %q, want %q", rec.Header().Get("Location"), wantLoc)
 		}
 		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
 			t.Errorf("Content-Type = %q, want application/json", rec.Header().Get("Content-Type"))
@@ -301,9 +312,9 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("5. PATCH /v1/digital-twins/:entity_id", func(t *testing.T) {
-		body := `{"name":"Updated GW"}`
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-01", strings.NewReader(body))
+	t.Run("5. PATCH /v1/digital-twins/:entity_id/attrs and root PATCH rejection", func(t *testing.T) {
+		body := `{"name":{"type":"Property","value":"Updated GW"}}`
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-01/attrs", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Request-ID", "req-patch-01")
@@ -323,10 +334,20 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		if !patchGwCalled {
 			t.Error("gateway patcher was not called")
 		}
+
+		// Old root PATCH /v1/digital-twins/:entity_id must return 405 Method Not Allowed (cannot write!)
+		reqRoot := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-01", strings.NewReader(body))
+		reqRoot.Header.Set("Authorization", "Bearer valid-token")
+		reqRoot.Header.Set("Content-Type", "application/json")
+		recRoot := httptest.NewRecorder()
+		router.ServeHTTP(recRoot, reqRoot)
+		if recRoot.Code != http.StatusMethodNotAllowed {
+			t.Errorf("expected 405 Method Not Allowed for root PATCH, got %d", recRoot.Code)
+		}
 	})
 
-	t.Run("6. GET /v1/digital-twins/:entity_id/state", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-01/state", nil)
+	t.Run("6. GET /v1/digital-twins/:entity_id?format=simplified and /state 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-01?format=simplified", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("X-Request-ID", "req-state-01")
 		rec := httptest.NewRecorder()
@@ -334,7 +355,7 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		router.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+			t.Fatalf("expected 200 OK for ?format=simplified, got %d: %s", rec.Code, rec.Body.String())
 		}
 		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
 			t.Errorf("Content-Type = %q, want application/json", rec.Header().Get("Content-Type"))
@@ -345,10 +366,19 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		if !twinStateCalled {
 			t.Error("twin state reader was not called")
 		}
+
+		// Old /state route must be removed and return 404
+		reqOld := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%3Angsi-ld%3AGateway%3Agw-01/state", nil)
+		reqOld.Header.Set("Authorization", "Bearer valid-token")
+		recOld := httptest.NewRecorder()
+		router.ServeHTTP(recOld, reqOld)
+		if recOld.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for removed /state route, got %d: %s", recOld.Code, recOld.Body.String())
+		}
 	})
 
-	t.Run("7. GET /v1/digital-twins/:entity_id/history", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw-01%3As-01/history?property=value&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z", nil)
+	t.Run("7. GET /v1/digital-twins/:entity_id/temporal", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw-01%3As-01/temporal?attrs=measurement&timerel=between&timeAt=2026-08-21T10:15:00Z&endTimeAt=2026-08-21T10:15:05Z", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("X-Request-ID", "req-twin-hist-01")
 		rec := httptest.NewRecorder()
@@ -358,14 +388,23 @@ func TestStage4Router_SevenDispatchPaths(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
 		}
-		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
-			t.Errorf("Content-Type = %q, want application/json", rec.Header().Get("Content-Type"))
+		if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/ld+json") {
+			t.Errorf("Content-Type = %q, want application/ld+json", rec.Header().Get("Content-Type"))
 		}
 		if rec.Header().Get("Cache-Control") != "no-store" {
 			t.Errorf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
 		}
 		if !twinHistCalled {
 			t.Error("twin history reader was not called")
+		}
+
+		// Also verify removed route /history returns 404
+		reqOld := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw-01%3As-01/history?property=value&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z", nil)
+		reqOld.Header.Set("Authorization", "Bearer valid-token")
+		recOld := httptest.NewRecorder()
+		router.ServeHTTP(recOld, reqOld)
+		if recOld.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for removed route /history, got %d: %s", recOld.Code, recOld.Body.String())
 		}
 	})
 }
@@ -475,7 +514,7 @@ func TestStage4Router_EncodedAndDoubleEncodedURN(t *testing.T) {
 	})
 
 	t.Run("double encoded URN on state is rejected with 400 Bad Request", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%253Angsi-ld%253AGateway%253Agw-01/state", nil)
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%253Angsi-ld%253AGateway%253Agw-01?format=simplified", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 
@@ -486,8 +525,8 @@ func TestStage4Router_EncodedAndDoubleEncodedURN(t *testing.T) {
 		}
 	})
 
-	t.Run("double encoded URN on history is rejected with 400 Bad Request", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%253Angsi-ld%253ASensor%253Agw-01%253As-01/history?property=value&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z", nil)
+	t.Run("double encoded URN on temporal is rejected with 400 Bad Request", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/digital-twins/urn%253Angsi-ld%253ASensor%253Agw-01%253As-01/temporal?attrs=measurement&timerel=between&timeAt=2026-08-21T10:15:00Z&endTimeAt=2026-08-21T10:16:00Z", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 
@@ -499,7 +538,7 @@ func TestStage4Router_EncodedAndDoubleEncodedURN(t *testing.T) {
 	})
 
 	t.Run("double encoded URN on patch is rejected with 400 Bad Request", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn%253Angsi-ld%253AGateway%253Agw-01", strings.NewReader(`{"name":"GW"}`))
+		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn%253Angsi-ld%253AGateway%253Agw-01/attrs", strings.NewReader(`{"name":{"type":"Property","value":"GW"}}`))
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -578,13 +617,12 @@ func TestStage4Router_JWTRejectionWithoutUseCaseCalls(t *testing.T) {
 		url    string
 		body   string
 	}{
-		{http.MethodGet, "/v1/telemetry/history?gateway_id=gw-01&sensor_id=s-01&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z", ""},
 		{http.MethodGet, "/v1/digital-twins", ""},
 		{http.MethodPost, "/v1/digital-twins", `{"entity_type":"Gateway","gateway_id":"gw-01"}`},
 		{http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01", ""},
-		{http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01", `{"name":"GW"}`},
-		{http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01/state", ""},
-		{http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw-01:s-01/history?property=value&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z", ""},
+		{http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01/attrs", `{"name":{"type":"Property","value":"GW"}}`},
+		{http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01?format=simplified", ""},
+		{http.MethodGet, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw-01:s-01/temporal?attrs=measurement&timerel=between&timeAt=2026-08-21T10:15:00Z&endTimeAt=2026-08-21T10:15:05Z", ""},
 	}
 
 	for _, ep := range endpoints {
@@ -717,7 +755,7 @@ func TestStage4Router_CacheHeadersAndCORS(t *testing.T) {
 	})
 
 	t.Run("405 on read path has no-store without pragma", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/v1/telemetry/history", nil)
+		req := httptest.NewRequest(http.MethodPost, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw-01:s-01/temporal", nil)
 		rec := httptest.NewRecorder()
 
 		router.ServeHTTP(rec, req)
@@ -932,7 +970,7 @@ func TestStage4Router_RepresentativeDomainErrors(t *testing.T) {
 		{
 			name:   "500 unexpected error on state",
 			method: http.MethodGet,
-			url:    "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01/state",
+			url:    "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01?format=simplified",
 			mockSetup: func(deps *RouterDependencies) {
 				deps.TwinStateReader = &mockTwinStateReader{
 					fn: func(context.Context, uuid.UUID, digitaltwin.TwinStateQuery) (*digitaltwin.TwinStateResult, error) {
@@ -944,12 +982,12 @@ func TestStage4Router_RepresentativeDomainErrors(t *testing.T) {
 			wantCode:   "internal_error",
 		},
 		{
-			name:   "503 dependency unavailable on history",
+			name:   "503 dependency unavailable on temporal history",
 			method: http.MethodGet,
-			url:    "/v1/telemetry/history?gateway_id=gw-01&sensor_id=s-01&from=2026-08-21T10:15:00.000Z&to=2026-08-21T10:16:00.000Z",
+			url:    "/v1/digital-twins/urn:ngsi-ld:Sensor:gw-01:s-01/temporal?attrs=measurement&timerel=between&timeAt=2026-08-21T10:15:00Z&endTimeAt=2026-08-21T10:15:05Z",
 			mockSetup: func(deps *RouterDependencies) {
-				deps.TelemetryHistoryReader = &mockTelemetryHistoryReader{
-					fn: func(context.Context, uuid.UUID, telemetry.TelemetryHistoryQuery) (*telemetry.TelemetryHistoryResult, error) {
+				deps.TwinHistoryReader = &mockTwinHistoryReader{
+					fn: func(context.Context, uuid.UUID, digitaltwin.TwinHistoryQuery) (*digitaltwin.TwinHistoryResult, error) {
 						return nil, digitaltwin.ErrDependencyUnavailable
 					},
 				}

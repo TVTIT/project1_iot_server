@@ -148,7 +148,7 @@ func composeStage4Dependencies(
 		return stage4Dependencies{}, fmt.Errorf("create history query parser: %w", err)
 	}
 
-	twinQueryParser, err := httpserver.NewTwinQueryParser(&cfg.Twin)
+	twinQueryParser, err := httpserver.NewTwinQueryParser(&cfg.Twin, cfg.History.QueryTimeout)
 	if err != nil {
 		return stage4Dependencies{}, fmt.Errorf("create twin query parser: %w", err)
 	}

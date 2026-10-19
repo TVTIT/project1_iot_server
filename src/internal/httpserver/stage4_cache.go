@@ -41,11 +41,13 @@ func isStage4Route(path string) bool {
 	if len(parts) == 4 && parts[1] == "v1" && parts[2] == "digital-twins" && parts[3] != "" {
 		return true
 	}
-	// Expected parts for /v1/digital-twins/<entity_id>/{state|history}:
+	// Expected parts for /v1/digital-twins/<entity_id>/{state|history|temporal|attrs}:
 	// ["", "v1", "digital-twins", <entity_id>, "state"] -> len == 5
 	// ["", "v1", "digital-twins", <entity_id>, "history"] -> len == 5
+	// ["", "v1", "digital-twins", <entity_id>, "temporal"] -> len == 5
+	// ["", "v1", "digital-twins", <entity_id>, "attrs"] -> len == 5
 	if len(parts) == 5 && parts[1] == "v1" && parts[2] == "digital-twins" && parts[3] != "" {
-		if parts[4] == "state" || parts[4] == "history" {
+		if parts[4] == "state" || parts[4] == "history" || parts[4] == "temporal" || parts[4] == "attrs" {
 			return true
 		}
 	}
@@ -53,7 +55,7 @@ func isStage4Route(path string) bool {
 }
 
 // isStage4Mutation determines whether a request targeting a Stage 4 route represents
-// a mutation (POST /v1/digital-twins, PATCH /v1/digital-twins/:entity_id, or non-safe method like 405, or CORS preflight requesting them).
+// a mutation (POST /v1/digital-twins, PATCH /v1/digital-twins/:entity_id/attrs, or non-safe method like 405, or CORS preflight requesting them).
 func isStage4Mutation(path string, method string, reqMethod string) bool {
 	effMethod := method
 	if method == http.MethodOptions && reqMethod != "" {
@@ -67,6 +69,10 @@ func isStage4Mutation(path string, method string, reqMethod string) bool {
 	parts := strings.Split(p, "/")
 	// /v1/digital-twins/:entity_id: mutation if non-GET/HEAD/OPTIONS
 	if len(parts) == 4 && parts[1] == "v1" && parts[2] == "digital-twins" && parts[3] != "" {
+		return effMethod != http.MethodGet && effMethod != http.MethodHead && effMethod != http.MethodOptions
+	}
+	// /v1/digital-twins/:entity_id/attrs: mutation if non-GET/HEAD/OPTIONS
+	if len(parts) == 5 && parts[1] == "v1" && parts[2] == "digital-twins" && parts[3] != "" && parts[4] == "attrs" {
 		return effMethod != http.MethodGet && effMethod != http.MethodHead && effMethod != http.MethodOptions
 	}
 	return false

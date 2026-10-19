@@ -2,8 +2,13 @@ package httpserver
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -52,11 +57,62 @@ type TwinListQueryParser interface {
 // TwinDetailQueryParser is the parser dependency for GET /v1/digital-twins/{entity_id}.
 type TwinDetailQueryParser interface {
 	ParseTwinDetailQuery(rawQuery string, entityID string) (*digitaltwin.TwinDetailQuery, error)
+	ParseDetailFormat(rawQuery string) (string, error)
+	QueryTimeout() time.Duration
 }
 
 // TwinHistoryQueryParser is the parser dependency for GET /v1/digital-twins/{entity_id}/history.
 type TwinHistoryQueryParser interface {
 	ParseTwinHistoryQuery(rawQuery string, entityID string) (*digitaltwin.TwinHistoryQuery, error)
+}
+
+// TemporalHistoryQueryParser is the parser dependency for GET /v1/digital-twins/{entity_id}/temporal.
+type TemporalHistoryQueryParser interface {
+	ParseTemporalHistoryQuery(rawQuery string, entityID string) (*digitaltwin.TwinHistoryQuery, *TemporalPresentationOptions, error)
+}
+
+// getDigitalTwinTemporal handles GET /v1/digital-twins/{entity_id}/temporal.
+func getDigitalTwinTemporal(reader TwinHistoryReader, parser TemporalHistoryQueryParser) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		principal, ok := auth.PrincipalFrom(c)
+		if !ok || principal.UserID == uuid.Nil {
+			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if !negotiateAccept(c, mimeJSONLD) {
+			return
+		}
+		if parser == nil || reader == nil {
+			writeReadError(c, "get_digital_twin_temporal", digitaltwin.ErrDependencyUnavailable)
+			return
+		}
+		entityID := c.Param("entity_id")
+		q, pres, err := parser.ParseTemporalHistoryQuery(c.Request.URL.RawQuery, entityID)
+		if err != nil {
+			writeReadError(c, "get_digital_twin_temporal", err)
+			return
+		}
+		res, err := reader.GetTwinHistory(c.Request.Context(), principal.UserID, *q)
+		if err != nil {
+			writeReadError(c, "get_digital_twin_temporal", err)
+			return
+		}
+		if res == nil {
+			writeReadError(c, "get_digital_twin_temporal", digitaltwin.ErrUnexpected)
+			return
+		}
+		dto, err := NewTemporalHistoryResponseDTO(res, pres)
+		if err != nil {
+			slog.ErrorContext(c.Request.Context(), "temporal history dto projection failed",
+				"request_id", httpapi.RequestIDFrom(c),
+				"error", err.Error(),
+			)
+			httpapi.WriteError(c, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeReadJSONLDResponse(c, "get_digital_twin_temporal", http.StatusOK, dto)
+	}
 }
 
 // getTelemetryHistory handles GET /v1/telemetry/history.
@@ -108,6 +164,9 @@ func listDigitalTwins(reader TwinListReader, parser TwinListQueryParser) gin.Han
 			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
 			return
 		}
+		if !negotiateAccept(c, mimeJSONLD) {
+			return
+		}
 		if parser == nil || reader == nil {
 			writeReadError(c, "list_digital_twins", digitaltwin.ErrDependencyUnavailable)
 			return
@@ -135,12 +194,29 @@ func listDigitalTwins(reader TwinListReader, parser TwinListQueryParser) gin.Han
 			httpapi.WriteError(c, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		writeReadJSONResponse(c, "list_digital_twins", http.StatusOK, dto)
+		if res.NextCursor != nil {
+			c.Header("Link", formatTwinListNextLink(*q, *res.NextCursor))
+		}
+		writeReadJSONLDResponse(c, "list_digital_twins", http.StatusOK, dto)
 	}
 }
 
+// formatTwinListNextLink builds an RFC 8288 Link header value preserving active query filters.
+func formatTwinListNextLink(q digitaltwin.TwinListQuery, nextCursor string) string {
+	var parts []string
+	if q.EntityType != nil {
+		parts = append(parts, "type="+url.QueryEscape(string(*q.EntityType)))
+	}
+	if q.GatewayID != nil {
+		parts = append(parts, "gateway_id="+url.QueryEscape(*q.GatewayID))
+	}
+	parts = append(parts, "limit="+strconv.Itoa(q.Limit))
+	parts = append(parts, "cursor="+url.QueryEscape(nextCursor))
+	return fmt.Sprintf("</v1/digital-twins?%s>; rel=\"next\"", strings.Join(parts, "&"))
+}
+
 // getDigitalTwinDetail handles GET /v1/digital-twins/{entity_id}.
-func getDigitalTwinDetail(reader TwinDetailReader, parser TwinDetailQueryParser) gin.HandlerFunc {
+func getDigitalTwinDetail(reader TwinDetailReader, stateReader TwinStateReader, parser TwinDetailQueryParser) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		principal, ok := auth.PrincipalFrom(c)
@@ -148,17 +224,83 @@ func getDigitalTwinDetail(reader TwinDetailReader, parser TwinDetailQueryParser)
 			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
 			return
 		}
-		if parser == nil || reader == nil {
+		targetMime := mimeJSONLD
+		if c.Query("format") == "simplified" {
+			targetMime = mimeJSON
+		}
+		if !negotiateAccept(c, targetMime) {
+			return
+		}
+		if parser == nil || reader == nil || stateReader == nil {
 			writeReadError(c, "get_digital_twin_detail", digitaltwin.ErrDependencyUnavailable)
 			return
 		}
+
+		format, err := parser.ParseDetailFormat(c.Request.URL.RawQuery)
+		if err != nil {
+			writeReadError(c, "get_digital_twin_detail", err)
+			return
+		}
+
+		timeout := digitaltwin.ContractDefaultQueryTimeout
+		if parser.QueryTimeout() > 0 {
+			timeout = parser.QueryTimeout()
+		}
+
+		ctx := c.Request.Context()
+		var cancel context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok {
+			if time.Until(deadline) > timeout {
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+			} else {
+				ctx, cancel = context.WithCancel(ctx)
+			}
+		} else {
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		defer cancel()
+
 		entityID := c.Param("entity_id")
+
+		if format == "simplified" {
+			if _, err := digitaltwin.ParseEntityURN(entityID); err != nil {
+				writeReadError(c, "get_digital_twin_detail", &QueryError{
+					Code:    "invalid_request",
+					Message: "invalid entity_id",
+					Err:     digitaltwin.ErrInvalidInput,
+				})
+				return
+			}
+
+			res, err := stateReader.GetTwinState(ctx, principal.UserID, digitaltwin.TwinStateQuery{EntityID: entityID})
+			if err != nil {
+				writeReadError(c, "get_digital_twin_detail", err)
+				return
+			}
+			if res == nil {
+				writeReadError(c, "get_digital_twin_detail", digitaltwin.ErrUnexpected)
+				return
+			}
+			dto, err := NewTwinStateResponseDTO(res)
+			if err != nil {
+				slog.ErrorContext(c.Request.Context(), "twin state dto projection failed",
+					"request_id", httpapi.RequestIDFrom(c),
+					"error", err.Error(),
+				)
+				httpapi.WriteError(c, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+			writeReadJSONResponse(c, "get_digital_twin_detail", http.StatusOK, dto)
+			return
+		}
+
 		q, err := parser.ParseTwinDetailQuery(c.Request.URL.RawQuery, entityID)
 		if err != nil {
 			writeReadError(c, "get_digital_twin_detail", err)
 			return
 		}
-		res, err := reader.GetTwinDetail(c.Request.Context(), principal.UserID, *q)
+
+		res, err := reader.GetTwinDetail(ctx, principal.UserID, *q)
 		if err != nil {
 			writeReadError(c, "get_digital_twin_detail", err)
 			return
@@ -167,7 +309,22 @@ func getDigitalTwinDetail(reader TwinDetailReader, parser TwinDetailQueryParser)
 			writeReadError(c, "get_digital_twin_detail", digitaltwin.ErrUnexpected)
 			return
 		}
-		dto, err := NewTwinDetailResponseDTO(res)
+
+		var stateRes *digitaltwin.TwinStateResult
+		if res.Type == digitaltwin.EntityTypeSensor {
+			var err error
+			stateRes, err = stateReader.GetTwinState(ctx, principal.UserID, digitaltwin.TwinStateQuery{EntityID: q.EntityID})
+			if err != nil {
+				writeReadError(c, "get_digital_twin_detail", err)
+				return
+			}
+			if stateRes == nil {
+				writeReadError(c, "get_digital_twin_detail", digitaltwin.ErrUnexpected)
+				return
+			}
+		}
+
+		dto, err := NewTwinDetailResponseDTO(res, stateRes)
 		if err != nil {
 			slog.ErrorContext(c.Request.Context(), "twin detail dto projection failed",
 				"request_id", httpapi.RequestIDFrom(c),
@@ -176,8 +333,19 @@ func getDigitalTwinDetail(reader TwinDetailReader, parser TwinDetailQueryParser)
 			httpapi.WriteError(c, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
+
+		if res.Type == digitaltwin.EntityTypeGateway && res.RelationshipPage != nil && res.RelationshipPage.NextCursor != nil {
+			c.Header("Link", formatTwinDetailNextLink(q.EntityID, q.RelationshipLimit, *res.RelationshipPage.NextCursor))
+		}
+
 		writeReadJSONLDResponse(c, "get_digital_twin_detail", http.StatusOK, dto)
 	}
+}
+
+// formatTwinDetailNextLink builds an RFC 8288 Link header for Gateway detail relationship pagination.
+func formatTwinDetailNextLink(entityID string, limit int, nextCursor string) string {
+	return fmt.Sprintf("</v1/digital-twins/%s?relationship_limit=%d&relationship_after=%s>; rel=\"next\"",
+		url.PathEscape(entityID), limit, url.QueryEscape(nextCursor))
 }
 
 // getDigitalTwinState handles GET /v1/digital-twins/{entity_id}/state.
