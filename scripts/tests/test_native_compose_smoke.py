@@ -120,6 +120,44 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing_interpolation"):
                 smoke.require_inputs("${NEW_REQUIRED:-production}", fixture.values)
 
+    def test_task34_telemetry_ingress_defaults_explicit(self):
+        # Task 3.4 added telemetry/MQTT-ingress keys to the root compose; the
+        # fixture must carry explicit safe local defaults mirroring the compose
+        # `:-` fallbacks so prepare() never fails closed with a missing key.
+        expected = {
+            "MQTT_INGRESS_ENABLED": "false", "MQTT_CONNECT_TIMEOUT": "5s",
+            "MQTT_SUBSCRIBE_TIMEOUT": "3s", "MQTT_PUBLISH_TIMEOUT": "3s",
+            "MQTT_RECONNECT_MAX_INTERVAL": "30s",
+            "TELEMETRY_MAX_SAMPLES_PER_MESSAGE": "1000",
+            "TELEMETRY_MAX_BATCH_DURATION": "60s",
+            "TELEMETRY_MAX_FUTURE_SKEW": "2m", "TELEMETRY_DB_TIMEOUT": "5s",
+        }
+        for key, value in expected.items():
+            self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            for key, value in expected.items():
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", fixture.env_file.read_text())
+
+    def test_user_management_and_auth_admin_defaults_explicit(self):
+        expected = {
+            "AUTH_ADMIN_BASE_URL": "http://supabase-envoy:8000",
+            "AUTH_ADMIN_TIMEOUT": "10s",
+            "AUTH_ADMIN_MAX_BODY_BYTES": "16384",
+            "USER_LIST_MAX_USERS": "1000",
+            "USER_LIST_MAX_MEMBERSHIPS": "10000",
+            "USER_LIST_MAX_RESPONSE_BYTES": "2097152",
+            "SUPABASE_SERVICE_ROLE_KEY": "",
+        }
+        for key, value in expected.items():
+            self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            for key, value in expected.items():
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", fixture.env_file.read_text())
+
     def test_dynsec_qualification_defaults_match_verified_config_identity(self):
         root = Path(__file__).resolve().parents[2]
         env_text = (root / ".env.example").read_text()
@@ -300,6 +338,51 @@ class PreparationTests(unittest.TestCase):
                     smoke.validate_summary(dict(report, **{extra: "secret"}))
             with self.assertRaises(ValueError):
                 smoke.validate_summary(dict(report, status="PASS"))
+
+
+class SchemaHistoryTests(unittest.TestCase):
+    """Focused regression: the smoke must accept only the exact supported schema.
+
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 21);
+    stale, missing, renamed, extra, or failed histories must all fail closed.
+    """
+
+    def test_current_schema_history_matches_pinned_terminal(self):
+        expected = smoke.expected_schema_history()
+        self.assertIn("21:admin_user_management", expected)
+        self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
+        self.assertTrue(smoke.schema_history_verified(0, expected, expected))
+
+    def test_stale_schema20_history_rejected(self):
+        expected = smoke.expected_schema_history()
+        stale = expected.replace("21:admin_user_management", "20:stage3_telemetry_ingestion")
+        self.assertFalse(smoke.schema_history_verified(0, stale, expected))
+
+    def test_missing_terminal_migration_rejected(self):
+        expected = smoke.expected_schema_history()
+        missing = ",".join(p for p in expected.split(",") if p != "21:admin_user_management")
+        self.assertFalse(smoke.schema_history_verified(0, missing, expected))
+
+    def test_wrong_terminal_name_rejected(self):
+        expected = smoke.expected_schema_history()
+        wrong = expected.replace("21:admin_user_management", "21:unexpected_name")
+        self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
+
+    def test_extra_migration_row_rejected(self):
+        expected = smoke.expected_schema_history()
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",22:future_migration", expected))
+
+    def test_failed_migration_returncode_rejected(self):
+        expected = smoke.expected_schema_history()
+        self.assertFalse(smoke.schema_history_verified(1, expected, expected))
+
+    def test_unpinned_future_terminal_rejected(self):
+        # Guards the pin itself: a history that matches its own files but no
+        # longer ends at the pinned terminal is rejected, so adding a supported
+        # migration forces an explicit terminal update instead of passing.
+        expected = smoke.expected_schema_history()
+        future = expected.replace("21:admin_user_management", "22:future_migration")
+        self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 
 class ReceiptTests(unittest.TestCase):
@@ -580,6 +663,19 @@ class ModelTests(unittest.TestCase):
                 self.assertGreater(call.kwargs["timeout"], 0)
                 self.assertEqual(call.kwargs["env"], smoke.process_env(fixture))
             self.assertEqual((fixture.private / "effective.json").stat().st_mode & 0o777, 0o600)
+
+    def test_rendered_compose_backend_environment_carries_nonsecret_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prep_dir = Path(directory) / "fixture"
+            fixture = smoke.prepare(prep_dir)
+            model = smoke.dry_effective_config(fixture)
+            backend_env = model["services"]["backend"].get("environment", {})
+            self.assertEqual(backend_env.get("AUTH_ADMIN_BASE_URL"), "http://supabase-envoy:8000")
+            self.assertEqual(backend_env.get("AUTH_ADMIN_TIMEOUT"), "10s")
+            self.assertEqual(backend_env.get("AUTH_ADMIN_MAX_BODY_BYTES"), "16384")
+            self.assertEqual(backend_env.get("USER_LIST_MAX_USERS"), "1000")
+            self.assertEqual(backend_env.get("USER_LIST_MAX_MEMBERSHIPS"), "10000")
+            self.assertEqual(backend_env.get("USER_LIST_MAX_RESPONSE_BYTES"), "2097152")
 
 
 class AllocationTests(unittest.TestCase):
@@ -1215,8 +1311,8 @@ class AllocationTests(unittest.TestCase):
                 def fake_cmd(cmd):
                     if "psql" in cmd:
                         if "SELECT string_agg" in cmd[-1]:
-                            return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                        if "profiles_id_fkey" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": image_inspect, "stderr": b""})()
 
@@ -1334,8 +1430,8 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": image_inspect, "stderr": b""})()
 
@@ -1653,8 +1749,8 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
 
@@ -1723,8 +1819,8 @@ class AllocationTests(unittest.TestCase):
                 def fake_cmd(cmd):
                     if "psql" in cmd:
                         if "SELECT string_agg" in cmd[-1]:
-                            return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                        if "profiles_id_fkey" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
 
@@ -1891,8 +1987,8 @@ class AllocationTests(unittest.TestCase):
                 def fake_cmd(cmd):
                     if "psql" in cmd:
                         if "SELECT string_agg" in cmd[-1]:
-                            return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                        if "profiles_id_fkey" in cmd[-1]:
+                            return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
 
@@ -1967,8 +2063,8 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
 
@@ -2043,8 +2139,8 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": expected_schema.encode(), "stderr": b""})()
-                    if "profiles_id_fkey" in cmd[-1]:
+                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                    if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
 
@@ -2374,8 +2470,8 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if 'psql' in cmd:
                     if 'SELECT string_agg' in cmd[-1]:
-                        return type('Res', (), {'returncode': 0, 'stdout': expected_schema.encode(), 'stderr': b''})()
-                    if 'profiles_id_fkey' in cmd[-1]:
+                        return type('Res', (), {'returncode': 0, 'stdout': (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), 'stderr': b''})()
+                    if 'profiles_id_fkey' in cmd[-1] or 'on_auth_user_created' in cmd[-1]:
                         return type('Res', (), {'returncode': 0, 'stdout': b'1\n', 'stderr': b''})()
                 return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()
 
@@ -2439,8 +2535,8 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if 'psql' in cmd:
                     if 'SELECT string_agg' in cmd[-1]:
-                        return type('Res', (), {'returncode': 0, 'stdout': expected_schema.encode(), 'stderr': b''})()
-                    if 'profiles_id_fkey' in cmd[-1]:
+                        return type('Res', (), {'returncode': 0, 'stdout': (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), 'stderr': b''})()
+                    if 'profiles_id_fkey' in cmd[-1] or 'on_auth_user_created' in cmd[-1]:
                         return type('Res', (), {'returncode': 0, 'stdout': b'1\n', 'stderr': b''})()
                 return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()
 

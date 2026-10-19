@@ -1,8 +1,8 @@
 # Tài liệu Client — 02: Cơ chế Xác thực và Quản lý phiên làm việc trên Flutter Web (Authentication & Session Management)
 
-**Cập nhật:** 2026-10-05
+**Cập nhật:** 2026-10-19
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
-**Tài liệu tham chiếu chuẩn:** `AGENTS.md`, `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md`, `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`, `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md`, `docs/backend/stage-2-task-2.2-authentication.md`, `docs/backend/stage-2-task-2.2A-centralized-accounts.md`.
+**Tài liệu tham chiếu chuẩn:** [`../../AGENTS.md`](../../AGENTS.md), [`01_OVERVIEW_AND_ARCHITECTURE.md`](01_OVERVIEW_AND_ARCHITECTURE.md), [`07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md), [`08_API_INTEGRATION_AND_STATE_HANDLING.md`](08_API_INTEGRATION_AND_STATE_HANDLING.md), [`../backend/stage-2-task-2.2-authentication.md`](../backend/stage-2-task-2.2-authentication.md), [`../backend/stage-2-task-2.2A-centralized-accounts.md`](../backend/stage-2-task-2.2A-centralized-accounts.md), [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md), [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md).
 
 ---
 
@@ -95,10 +95,27 @@ Căn cứ theo kiến trúc quy định tại `AGENTS.md` (Mục 6.5) và kết 
   - Không đặt liên kết hoặc nút bấm "Đăng ký" trên màn hình đăng nhập.
   - Hiển thị thông báo rõ ràng: *"Tài khoản người dùng được cấp phát tập trung bởi Quản trị viên hệ thống (Platform Administrator)."*
 
-### 2.2. Không hỗ trợ User CRUD và Gateway Self-Claim trên Go Backend
-- **Go Backend không có API quản lý tài khoản:** Go Backend không cung cấp endpoint tạo, sửa, xóa người dùng (`User CRUD`).
-- **Quyền Platform Admin không tự cấp quyền Auth Admin:** Một người dùng có quyền Quản trị viên hệ sinh thái trong bảng `platform_admins` của PostgreSQL khi gửi JWT cá nhân (`role: authenticated`) tới GoTrue Admin API (`POST /auth/v1/admin/users`) **sẽ bị GoTrue từ chối với mã lỗi 403 Forbidden**. GoTrue chỉ chấp nhận `service_role` key cho các thao tác Admin API này.
-- **Không có cơ chế Gateway Self-Claim:** Người dùng không thể tự nhận trạm (claim gateway) bằng cách gửi `gateway_id`. Việc khởi tạo trạm IoT và gán quyền sở hữu (`owner_user_id`) được thực hiện tập trung bởi Platform Admin thông qua Go Admin API (`PUT /v1/admin/gateways/:gateway_id`). Chi tiết được quy định tại `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`.
+### 2.2. Quy trình Cấp phát Tài khoản Tập trung (Admin-Provisioned Accounts) và Giới hạn Bounded CRUD
+- **Tạo tài khoản tập trung qua Go Backend (`POST /v1/admin/users`):**
+  - Go Backend cung cấp endpoint `POST /v1/admin/users` dành riêng cho Quản trị viên hệ thống (Platform Admin, thẩm định qua bảng `public.platform_admins`).
+  - Quản trị viên nhập `full_name`, `email`, và `password`. Backend gọi Supabase Auth Admin API nội bộ với `email_confirm: true`.
+  - **Tài khoản được tự động kích hoạt:** Người dùng không cần nhận email xác thực qua SMTP, có thể đăng nhập ngay lập tức qua `POST /auth/v1/token?grant_type=password`.
+  - **Trạng thái ban đầu:** Tài khoản mới tạo luôn mang vai trò người dùng thông thường (`platform_role: "user"`) và hoàn toàn chưa có quyền trên bất kỳ trạm Gateway nào (`gateway_roles: []`). Quyền trạm phải được cấp phát thông qua các API riêng sau đó.
+- **Ranh giới bảo mật khóa hạ tầng đặc quyền (`SUPABASE_SERVICE_ROLE_KEY`):**
+  - Khóa `service_role` chỉ tồn tại ở tầng server nội bộ, **TUYỆT ĐỐI KHÔNG chia sẻ cho client**.
+  - Client của Platform Admin chỉ gửi token JWT cá nhân thông thường (`role: "authenticated"`). Go Backend tự xác thực quyền admin trong CSDL PostgreSQL trước khi sử dụng `service_role` key gọi sang GoTrue Admin API.
+  - Nếu khóa `SUPABASE_SERVICE_ROLE_KEY` chưa được cấu hình, server vẫn khởi động bình thường (không làm đổ vỡ tiến trình backend); bốn endpoint quản trị CSDL vẫn hoạt động, chỉ riêng `POST /v1/admin/users` (CreateUser) trả về HTTP 503 `service_unavailable`.
+- **Nguồn chân lý của tên hiển thị (`full_name`):**
+  - Trigger `on_auth_user_created` (được tạo bởi migration 4 sau khi GoTrue khởi tạo bảng `auth.users`) tự động sao chép `full_name` vào bảng `public.profiles` khi tài khoản được tạo.
+  - Khi tên được cập nhật qua `PATCH /v1/admin/users/{user_id}`, `public.profiles.full_name` là nguồn chân lý duy nhất cho toàn bộ hệ thống; client và backend không fallback về Auth metadata.
+- **Giới hạn phạm vi quản trị tài khoản (Bounded Account CRUD Scope):**
+  - Chức năng quản trị tài khoản qua Go Backend chỉ bao gồm 5 thao tác: tạo tài khoản, đọc danh sách người dùng kèm quyền trạm, đổi tên hiển thị/quyền admin, gán quyền operator/viewer và chuyển owner trạm.
+  - **NGOÀI PHẠM VI:** Không có API xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu, reset mật khẩu, gửi email lời mời (invitations), hay xóa membership hoàn toàn.
+- **Xử lý sự cố mạng & Timeout khi tạo tài khoản (Supervised Reconcile, No Blind Retry):**
+  - Nếu request `POST /v1/admin/users` gặp timeout hoặc lỗi 503, backend **không tự động xóa tài khoản** (để bảo toàn kiểm toán).
+  - Phía Client/Admin **tuyệt đối không gửi lại request ngay lập tức (no blind retry)**.
+  - Việc email chưa xuất hiện trong danh mục `GET /v1/admin/users` không chứng minh rằng request cũ không thể hoàn tất muộn hơn trên GoTrue. Cần quy trình đối soát có giám sát (supervised reconciliation), chờ hệ thống ổn định và kiểm tra lỗi missing-profile trước khi quyết định thử lại thủ công.
+- **Không có cơ chế Gateway Self-Claim:** Người dùng không thể tự nhận trạm (claim gateway) bằng cách gửi `gateway_id`. Việc khởi tạo trạm IoT và gán quyền sở hữu (`owner_user_id`) được thực hiện tập trung bởi Platform Admin thông qua Go Admin API (`PUT /v1/admin/gateways/:gateway_id` hoặc `POST /v1/digital-twins`). Chi tiết được quy định tại `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`.
 
 ---
 

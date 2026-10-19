@@ -506,7 +506,7 @@ func TestSimplifiedHTTPNativeRotateRevoke(t *testing.T) {
 		t.Fatalf("failed to create admin gateway service: %v", err)
 	}
 
-	routerHandler, err := httpserver.NewRouter(httpserver.RouterDependencies{
+	routerHandler, err := httpserver.NewRouter(httpserver.AttachTestStage4Dependencies(httpserver.RouterDependencies{
 		CredentialAPIEnabled:       true,
 		CredentialRequestTimeout:   credCfg.RequestTimeout,
 		CredentialManager:          composition.manager,
@@ -525,7 +525,7 @@ func TestSimplifiedHTTPNativeRotateRevoke(t *testing.T) {
 		AuthorizationTimeout:       2 * time.Second,
 		TokenVerifier:              verifier,
 		PlatformAdminChecker:       adminChecker,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("failed to create HTTP router: %v", err)
 	}

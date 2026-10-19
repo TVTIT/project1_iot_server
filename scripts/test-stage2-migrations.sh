@@ -8,6 +8,7 @@ UPGRADE_DB="$RUN_ID-upgrade"
 FRESH_DB="$RUN_ID-fresh"
 FAILED_DB="$RUN_ID-failed"
 BASELINE_DIR="$(mktemp -d /tmp/opencode/migrations-baseline.XXXXXX)"
+HISTORICAL_DIR="$(mktemp -d /tmp/opencode/migrations-v19.XXXXXX)"
 RECEIPT_DIR="$(mktemp -d /tmp/opencode/migrations-receipts.XXXXXX)"
 INVALID_DIR=""
 first_pid=""
@@ -65,6 +66,7 @@ cleanup() {
     done
     rm -rf "$RECEIPT_DIR" || cleanup_status=1
     rm -rf "$BASELINE_DIR" || cleanup_status=1
+    rm -rf "$HISTORICAL_DIR" || cleanup_status=1
     if [ -n "$INVALID_DIR" ]; then
         rm -rf "$INVALID_DIR" || cleanup_status=1
     fi
@@ -107,6 +109,20 @@ for migration in "$PROJECT_ROOT"/migrations/00000[0-9]*; do
     cp "$migration" "$BASELINE_DIR/"
 done
 
+# Keep the historical Stage 2 checkpoints pinned to schema 019. Task 3 adds
+# migration 020 after those assertions have completed.
+chmod 755 "$HISTORICAL_DIR"
+for migration in "$PROJECT_ROOT"/migrations/0000*; do
+    [ -e "$migration" ] || continue
+    filename="${migration##*/}"
+    version_text="${filename%%_*}"
+    version="$(printf '%s' "$version_text" | sed 's/^0*//')"
+    [ -n "$version" ] || version=0
+    if [ "$version" -le 19 ]; then
+        cp "$migration" "$HISTORICAL_DIR/"
+    fi
+done
+
 start_database() {
     container="$1"
     migration_dir="$2"
@@ -131,8 +147,9 @@ wait_for_version() {
         query="SELECT count(*) FROM schema_migrations WHERE version = $version AND name = '$expected_name'"
     fi
     for _ in $(seq 1 90); do
-        if docker exec "$container" psql -U stage2_admin -d stage2_test -Atc \
-            "$query" \
+        if docker exec "$container" sh -c \
+            'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -h 127.0.0.1 -U stage2_admin -d stage2_test -Atc "$1"' \
+            sh "$query" \
             2>/dev/null | grep -qx 1; then
             ready=true
             break
@@ -148,12 +165,13 @@ wait_for_version() {
 
 run_migrations() {
     container="$1"
+    migration_dir="${2:-$HISTORICAL_DIR}"
     owned_run attached --network "container:$container" \
         -e PGHOST=127.0.0.1 \
         -e PGUSER=stage2_admin \
         -e PGPASSWORD \
         -e PGDATABASE=stage2_test \
-        -v "$PROJECT_ROOT/migrations:/migrations:ro" \
+        -v "$migration_dir:/migrations:ro" \
         -v "$PROJECT_ROOT/scripts/run-migrations.sh:/run-migrations.sh:ro" \
         --entrypoint /bin/sh "$IMAGE" /run-migrations.sh
 }
@@ -374,7 +392,7 @@ docker exec -i "$UPGRADE_DB" psql -v ON_ERROR_STOP=1 -U stage2_admin -d stage2_t
     < "$PROJECT_ROOT/scripts/sql/verify-migration-000015-upgrade.sql"
 
 # A clean database initialized from the complete migration directory must match.
-start_database "$FRESH_DB" "$PROJECT_ROOT/migrations"
+start_database "$FRESH_DB" "$HISTORICAL_DIR"
 wait_for_version "$FRESH_DB" 19 mqtt_simplified_journal
 verify_admission_regressions "$FRESH_DB" replacement
 verify_stage2_schema "$FRESH_DB"
@@ -489,4 +507,25 @@ timeout 15 docker container logs "$FAILED_DB" 2>&1 | grep -q 'intentional isolat
 rm -rf "$INVALID_DIR"
 INVALID_DIR=""
 
-echo "Stage 2 migration tests passed for version-9/10/13/14/15 upgrade and clean version-19 install."
+# Setup Auth prerequisite before running migrations 20 and 21
+for container in "$UPGRADE_DB" "$FRESH_DB"; do
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U stage2_admin -d stage2_test \
+        -c "CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}'); INSERT INTO auth.users (id) SELECT id FROM public.profiles ON CONFLICT DO NOTHING;"
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U stage2_admin -d stage2_test \
+        < "$PROJECT_ROOT/migrations/000004_supabase_compat.up.sql"
+done
+
+# Only after every historical v19 assertion has passed, upgrade both fixtures
+# through the existing migration runner and verify v20 and v21 schema invariants.
+run_migrations "$UPGRADE_DB" "$PROJECT_ROOT/migrations" >/dev/null
+run_migrations "$FRESH_DB" "$PROJECT_ROOT/migrations" >/dev/null
+for container in "$UPGRADE_DB" "$FRESH_DB"; do
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 -v stage3_verify_writes=false \
+        -U stage2_admin -d stage2_test \
+        < "$PROJECT_ROOT/scripts/sql/verify-migration-000020.sql"
+    docker exec -i "$container" psql -v ON_ERROR_STOP=1 \
+        -U stage2_admin -d stage2_test \
+        < "$PROJECT_ROOT/scripts/sql/verify-migration-000021.sql"
+done
+
+echo "Stage 2 historical migration tests passed through version 19; version 20 and 21 fresh/upgrade schema verification passed."

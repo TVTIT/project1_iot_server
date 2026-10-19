@@ -173,6 +173,8 @@ services:
     container_name: supabase_auth
     restart: unless-stopped
     depends_on:
+      application-migrations:
+        condition: service_completed_successfully
       supabase-role-provisioner:
         condition: service_completed_successfully
     healthcheck:
@@ -217,10 +219,11 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
       - ./migrations/000004_supabase_compat.up.sql:/migrations/000004_supabase_compat.up.sql:ro
+      - ./migrations/000021_admin_user_management.up.sql:/migrations/000021_admin_user_management.up.sql:ro
     command:
       - /bin/sh
       - -ec
-      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql
     networks:
       - iot_net
 
@@ -300,9 +303,19 @@ services:
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-backend_monolith}
       MQTT_USERNAME: ${MQTT_USERNAME:-backend_service}
       MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD is required}
+      # MQTT telemetry ingress is opt-in and independent of the credential flags.
+      MQTT_INGRESS_ENABLED: ${MQTT_INGRESS_ENABLED:-false}
       MQTT_QUEUE_CAPACITY: ${MQTT_QUEUE_CAPACITY:-256}
       MQTT_WORKER_COUNT: ${MQTT_WORKER_COUNT:-4}
-      MQTT_MAX_PAYLOAD_BYTES: ${MQTT_MAX_PAYLOAD_BYTES:-1048576}
+      MQTT_MAX_PAYLOAD_BYTES: ${MQTT_MAX_PAYLOAD_BYTES:-65536}
+      TELEMETRY_MAX_SAMPLES_PER_MESSAGE: ${TELEMETRY_MAX_SAMPLES_PER_MESSAGE:-1000}
+      TELEMETRY_MAX_BATCH_DURATION: ${TELEMETRY_MAX_BATCH_DURATION:-60s}
+      TELEMETRY_MAX_FUTURE_SKEW: ${TELEMETRY_MAX_FUTURE_SKEW:-2m}
+      TELEMETRY_DB_TIMEOUT: ${TELEMETRY_DB_TIMEOUT:-5s}
+      MQTT_CONNECT_TIMEOUT: ${MQTT_CONNECT_TIMEOUT:-5s}
+      MQTT_SUBSCRIBE_TIMEOUT: ${MQTT_SUBSCRIBE_TIMEOUT:-3s}
+      MQTT_PUBLISH_TIMEOUT: ${MQTT_PUBLISH_TIMEOUT:-3s}
+      MQTT_RECONNECT_MAX_INTERVAL: ${MQTT_RECONNECT_MAX_INTERVAL:-30s}
       # Explicit legacy runtime disabled.
       MQTT_CREDENTIAL_RUNTIME_ENABLED: "false"
       # Credential API configurable through environment; defaults false until prerequisites are supplied.
@@ -330,11 +343,28 @@ services:
       MQTT_CREDENTIAL_OPERATION_TIMEOUT: ${MQTT_CREDENTIAL_OPERATION_TIMEOUT:-10s}
       MQTT_CREDENTIAL_REQUEST_TIMEOUT: ${MQTT_CREDENTIAL_REQUEST_TIMEOUT:-40s}
       MQTT_CREDENTIAL_RECOVERY_TIMEOUT: ${MQTT_CREDENTIAL_RECOVERY_TIMEOUT:-5s}
+      # Stage 4 Read Bounds
+      HISTORY_QUERY_TIMEOUT: ${HISTORY_QUERY_TIMEOUT:-5s}
+      HISTORY_MAX_RANGE: ${HISTORY_MAX_RANGE:-744h}
+      HISTORY_RAW_WINDOW: ${HISTORY_RAW_WINDOW:-10s}
+      HISTORY_DEFAULT_POINTS: ${HISTORY_DEFAULT_POINTS:-1000}
+      HISTORY_MAX_POINTS: ${HISTORY_MAX_POINTS:-2000}
+      HISTORY_MIN_POINTS: ${HISTORY_MIN_POINTS:-100}
+      TWIN_LIST_DEFAULT_LIMIT: ${TWIN_LIST_DEFAULT_LIMIT:-50}
+      TWIN_LIST_MAX_LIMIT: ${TWIN_LIST_MAX_LIMIT:-200}
+      TWIN_RELATIONSHIP_DEFAULT_LIMIT: ${TWIN_RELATIONSHIP_DEFAULT_LIMIT:-50}
+      TWIN_RELATIONSHIP_MAX_LIMIT: ${TWIN_RELATIONSHIP_MAX_LIMIT:-200}
       SUPABASE_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       SUPABASE_JWT_ISSUER: ${GOTRUE_JWT_ISSUER:?GOTRUE_JWT_ISSUER is required}
       SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:?SUPABASE_JWT_AUDIENCE is required}
       SUPABASE_JWT_CLOCK_SKEW: ${SUPABASE_JWT_CLOCK_SKEW:-30s}
-      SUPABASE_URL: "http://supabase-envoy:8000"
+      AUTH_ADMIN_BASE_URL: ${AUTH_ADMIN_BASE_URL:-http://supabase-envoy:8000}
+      AUTH_ADMIN_TIMEOUT: ${AUTH_ADMIN_TIMEOUT:-10s}
+      AUTH_ADMIN_MAX_BODY_BYTES: ${AUTH_ADMIN_MAX_BODY_BYTES:-16384}
+      USER_LIST_MAX_USERS: ${USER_LIST_MAX_USERS:-1000}
+      USER_LIST_MAX_MEMBERSHIPS: ${USER_LIST_MAX_MEMBERSHIPS:-10000}
+      USER_LIST_MAX_RESPONSE_BYTES: ${USER_LIST_MAX_RESPONSE_BYTES:-2097152}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY:-}}
     depends_on:
       postgres:
         condition: service_healthy

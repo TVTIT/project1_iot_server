@@ -1,0 +1,258 @@
+{
+  "provenance": {
+    "git_head": "8ceccaa7e9fc75335981499ffbe886d818152b47",
+    "git_dirty": true,
+    "dirty_files_count": 18,
+    "dirty_qualification": "uncommitted changes preserved",
+    "backend_image_id": "sha256:e214e7ced7d1fdbb334479f1db2144113deac0c342ad26a79d488be6df1d69a5",
+    "gateway_image_id": "sha256:7aff01c3167bd9e10effeacdeca445da875560ae4b0b16cf288ef7b098ecb551"
+  },
+  "environment": {
+    "host_os": "Linux",
+    "host_arch": "x86_64",
+    "available_cpus": 12,
+    "available_ram_bytes": 16681451520,
+    "versions": {
+      "docker": "Docker version 29.9.1, build dfc520d",
+      "go": "go version go1.27.2 linux/amd64",
+      "mosquitto": "eclipse-mosquitto:2.0.18",
+      "timescaledb": "timescale/timescaledb:2.29.2-pg16"
+    }
+  },
+  "profile": {
+    "rate_hz": 100,
+    "samples_per_batch": 100,
+    "sample_interval_us": 10000,
+    "target_batches": 600,
+    "target_samples": 60000,
+    "backend": {
+      "queue_capacity": 256,
+      "workers": 4,
+      "max_payload_bytes": 65536,
+      "database_max_conns": 10,
+      "database_op_timeout": "5s"
+    },
+    "gateway": {
+      "max_inflight": 8,
+      "ack_timeout": "5s",
+      "retry_min_delay": "1s",
+      "retry_max_delay": "30s",
+      "outbox_max_rows": 5000,
+      "outbox_max_bytes": 67108864
+    }
+  },
+  "counts": {
+    "enqueued_unique": 600,
+    "publish_attempts": 600,
+    "first_publishes": 600,
+    "retry_attempts": 0,
+    "app_acknowledged": 600,
+    "raw_samples": 60000,
+    "ledger_rows": 600,
+    "temporal_rows": 600,
+    "duplicate_committed": 0,
+    "missing_origins": 0,
+    "overflow_samples": 0,
+    "pending_rows": 0,
+    "pending_bytes": 0,
+    "quarantined_rows": 0,
+    "quarantined_bytes": 0,
+    "backlog_high_water_rows": 1,
+    "backlog_high_water_bytes": 1340,
+    "in_flight": "unavailable"
+  },
+  "durations_and_windows": {
+    "runner_wall_start_utc": "2026-10-16T09:07:13.859271+00:00",
+    "runner_wall_end_utc": "2026-10-16T09:17:13.719918+00:00",
+    "runner_total_duration_s": 599.861,
+    "tracker_first_to_last_enqueue_s": 599.326,
+    "tracker_run_start_to_last_enqueue_s": "unavailable",
+    "tracker_publish_to_drain_s": 599.369,
+    "tracker_total_duration_s": 599.37
+  },
+  "throughput": {
+    "first_to_last_enqueue_window": {
+      "duration_s": 599.326,
+      "batches_per_sec": 1.001,
+      "samples_per_sec": 100.112
+    },
+    "run_start_to_last_enqueue_window": {
+      "duration_s": "unavailable",
+      "batches_per_sec": "unavailable",
+      "samples_per_sec": "unavailable"
+    },
+    "publish_to_drain_window": {
+      "duration_s": 599.369,
+      "batches_per_sec": 1.001,
+      "samples_per_sec": 100.105
+    },
+    "runner_total_window": {
+      "duration_s": 599.861,
+      "batches_per_sec": 1.0,
+      "samples_per_sec": 100.023
+    }
+  },
+  "latency": {
+    "samples": 600,
+    "p50_ms": 43.63,
+    "p95_ms": 47.86,
+    "min_ms": 40.47,
+    "max_ms": 48.6
+  },
+  "backend_ingress": {
+    "accepted": 600,
+    "committed": 600,
+    "duplicate_committed": 0,
+    "validation_rejected": 0,
+    "persist_failures": 0,
+    "queue_capacity": 256,
+    "queue_depth": 0,
+    "queue_high_water": 0,
+    "queue_high_water_semantic": "admission-observed",
+    "queue_full": 0
+  },
+  "resource_sampling": {
+    "sample_count": 199,
+    "observed_interval_mean_s": 3.022,
+    "observed_interval_min_s": 3.02,
+    "observed_interval_max_s": 3.025,
+    "gaps_over_3s_count": 198,
+    "containers": {
+      "backend": {
+        "cpu_max_pct": 0.43,
+        "cpu_mean_pct": 0.2,
+        "ram_max_bytes": 15130951,
+        "ram_mean_bytes": 14179555,
+        "ram_max_mb": 14.43,
+        "ram_mean_mb": 13.52,
+        "limits": {
+          "cpu_quota": 0,
+          "cpu_period": 0,
+          "nano_cpus": 0,
+          "cpuset_cpus": "",
+          "memory_bytes": 0
+        }
+      },
+      "gateway": {
+        "cpu_max_pct": 0.46,
+        "cpu_mean_pct": 0.2,
+        "ram_max_bytes": 15435038,
+        "ram_mean_bytes": 14501478,
+        "ram_max_mb": 14.72,
+        "ram_mean_mb": 13.83,
+        "limits": {
+          "cpu_quota": 0,
+          "cpu_period": 0,
+          "nano_cpus": 0,
+          "cpuset_cpus": "",
+          "memory_bytes": 0
+        }
+      },
+      "broker": {
+        "cpu_max_pct": 0.06,
+        "cpu_mean_pct": 0.03,
+        "ram_max_bytes": 1188036,
+        "ram_mean_bytes": 935206,
+        "ram_max_mb": 1.13,
+        "ram_mean_mb": 0.89,
+        "limits": {
+          "cpu_quota": 0,
+          "cpu_period": 0,
+          "nano_cpus": 0,
+          "cpuset_cpus": "",
+          "memory_bytes": 0
+        }
+      },
+      "database": {
+        "cpu_max_pct": 4.71,
+        "cpu_mean_pct": 0.65,
+        "ram_max_bytes": 299473305,
+        "ram_mean_bytes": 250683432,
+        "ram_max_mb": 285.6,
+        "ram_mean_mb": 239.07,
+        "limits": {
+          "cpu_quota": 0,
+          "cpu_period": 0,
+          "nano_cpus": 0,
+          "cpuset_cpus": "",
+          "memory_bytes": 0
+        }
+      }
+    },
+    "sqlite_trend_sample_count": 199,
+    "sqlite_trend_last": {
+      "mono_time": 55095.256443653,
+      "pending_rows": 0,
+      "pending_bytes": 0,
+      "quarantined_rows": 0,
+      "quarantined_bytes": 0,
+      "in_flight": "unavailable"
+    },
+    "backlog_high_water_rows": 1,
+    "backlog_high_water_bytes": 1340,
+    "in_flight": "unavailable"
+  },
+  "storage": {
+    "before": {
+      "telemetry_hypertable_bytes": 40960,
+      "telemetry_detailed": {
+        "index_bytes": 32768,
+        "table_bytes": 0,
+        "toast_bytes": 8192,
+        "total_bytes": 40960
+      },
+      "telemetry_chunks": 0,
+      "temporal_hypertable_bytes": 24576,
+      "temporal_detailed": {
+        "index_bytes": 16384,
+        "table_bytes": 0,
+        "toast_bytes": 8192,
+        "total_bytes": 24576
+      },
+      "temporal_chunks": 0,
+      "ledger_table_bytes": 0,
+      "ledger_indexes_bytes": 16384,
+      "ledger_total_bytes": 24576,
+      "database_bytes": 10853399,
+      "sqlite_file_bytes": 0
+    },
+    "after": {
+      "telemetry_hypertable_bytes": 27770880,
+      "telemetry_detailed": {
+        "index_bytes": 18268160,
+        "table_bytes": 9486336,
+        "toast_bytes": 16384,
+        "total_bytes": 27770880
+      },
+      "telemetry_chunks": 1,
+      "temporal_hypertable_bytes": 311296,
+      "temporal_detailed": {
+        "index_bytes": 147456,
+        "table_bytes": 147456,
+        "toast_bytes": 16384,
+        "total_bytes": 311296
+      },
+      "temporal_chunks": 1,
+      "ledger_table_bytes": 188416,
+      "ledger_indexes_bytes": 163840,
+      "ledger_total_bytes": 385024,
+      "database_bytes": 39574551,
+      "sqlite_file_bytes": 36864
+    },
+    "deltas": {
+      "telemetry_hypertable_bytes_delta": 27729920,
+      "telemetry_chunks_delta": 1,
+      "temporal_hypertable_bytes_delta": 286720,
+      "temporal_chunks_delta": 1,
+      "ledger_table_bytes_delta": 188416,
+      "ledger_indexes_bytes_delta": 147456,
+      "ledger_total_bytes_delta": 360448,
+      "database_bytes_delta": 28721152,
+      "sqlite_file_bytes_delta": 36864
+    }
+  },
+  "cleanup": {
+    "verified": true,
+    "details": "containers/network/volumes/workdir absent"
+  }
+}

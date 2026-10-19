@@ -1,0 +1,350 @@
+{
+  "checks": {
+    "vertical": "PASS",
+    "contract": "PASS",
+    "queries": "PASS",
+    "all_mandatory_passed": true
+  },
+  "cleanup": {
+    "suite_images_removed": true,
+    "fixture_cleanup_verified": true
+  },
+  "counts": {
+    "vertical": {
+      "gateway_a_raw_count": 300,
+      "gateway_a_ledger_count": 3,
+      "gateway_a_temporal_count": 3,
+      "gateway_a_reported_version": 3,
+      "resend_dedup_verified": true
+    },
+    "queries": {
+      "target_sample_count": 60000,
+      "target_temporal_count": 580,
+      "compressed_chunks_count": 2,
+      "is_compressed": true
+    }
+  },
+  "image_ids": {
+    "backend": "sha256:9e6acf90d81657c3d76c7740cd35140f9c8f1e96896249478154225db92cf99a",
+    "gateway": "sha256:58fe698a9e5e6586dd8c2b7c8017e2095e270be2e728ad4c3356edad44a48d09"
+  },
+  "profiles": {
+    "selector": "all",
+    "mandatory_scenarios": [
+      "vertical",
+      "contract",
+      "queries"
+    ],
+    "worktree_clean": false
+  },
+  "query_measurements": {
+    "comparison": {
+      "m1_raw_telemetry": {
+        "uncompressed": {
+          "planning_time_ms": 3.672,
+          "execution_time_ms": 0.598,
+          "actual_rows": 500,
+          "shared_hit_blocks": 32,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Limit",
+            "Sort",
+            "Nested Loop",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Scan"
+          ],
+          "service_elapsed_ms": 2.266,
+          "http_elapsed_ms": 12.785
+        },
+        "compressed": {
+          "planning_time_ms": 5.178,
+          "execution_time_ms": 0.871,
+          "actual_rows": 500,
+          "shared_hit_blocks": 57,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Limit",
+            "Sort",
+            "Nested Loop",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Custom Scan",
+            "Index Scan"
+          ],
+          "service_elapsed_ms": 2.364,
+          "http_elapsed_ms": 5.678
+        }
+      },
+      "m2_bucket_telemetry": {
+        "uncompressed": {
+          "planning_time_ms": 0.962,
+          "execution_time_ms": 58.226,
+          "actual_rows": 60,
+          "shared_hit_blocks": 2101,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Limit",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Sort",
+            "Nested Loop",
+            "CTE Scan",
+            "Aggregate",
+            "Sort",
+            "Nested Loop",
+            "CTE Scan",
+            "Index Scan"
+          ],
+          "service_elapsed_ms": 46.068,
+          "http_elapsed_ms": 49.787
+        },
+        "compressed": {
+          "planning_time_ms": 1.149,
+          "execution_time_ms": 46.487,
+          "actual_rows": 60,
+          "shared_hit_blocks": 418,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Limit",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Sort",
+            "Nested Loop",
+            "CTE Scan",
+            "Aggregate",
+            "Sort",
+            "Nested Loop",
+            "CTE Scan",
+            "Custom Scan",
+            "Index Scan"
+          ],
+          "service_elapsed_ms": 39.689,
+          "http_elapsed_ms": 45.182
+        }
+      },
+      "m3_overflow_fallback_telemetry": {
+        "uncompressed": {
+          "probe_planning_time_ms": 0.3,
+          "probe_execution_time_ms": 0.629,
+          "probe_actual_rows": 501,
+          "fallback_planning_time_ms": 0.39,
+          "fallback_execution_time_ms": 0.977,
+          "fallback_actual_rows": 80,
+          "total_execution_time_ms": 1.6059999999999999,
+          "service_elapsed_ms": 3.084,
+          "http_elapsed_ms": 4.061
+        },
+        "compressed": {
+          "probe_planning_time_ms": 0.386,
+          "probe_execution_time_ms": 0.617,
+          "probe_actual_rows": 501,
+          "fallback_planning_time_ms": 0.464,
+          "fallback_execution_time_ms": 0.922,
+          "fallback_actual_rows": 80,
+          "total_execution_time_ms": 1.5390000000000001,
+          "service_elapsed_ms": 3.264,
+          "http_elapsed_ms": 4.686
+        }
+      },
+      "m4_raw_temporal": {
+        "uncompressed": {
+          "planning_time_ms": 5.199,
+          "execution_time_ms": 0.546,
+          "actual_rows": 10,
+          "shared_hit_blocks": 32,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Sort",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Scan",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Only Scan",
+            "Nested Loop",
+            "Nested Loop",
+            "CTE Scan",
+            "Aggregate",
+            "Nested Loop",
+            "CTE Scan",
+            "Index Scan",
+            "Limit",
+            "Sort",
+            "Nested Loop",
+            "CTE Scan",
+            "Index Scan"
+          ],
+          "service_elapsed_ms": 2.59,
+          "http_elapsed_ms": 8.414
+        },
+        "compressed": {
+          "planning_time_ms": 6.383,
+          "execution_time_ms": 0.888,
+          "actual_rows": 10,
+          "shared_hit_blocks": 68,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Sort",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Scan",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Only Scan",
+            "Nested Loop",
+            "Nested Loop",
+            "CTE Scan",
+            "Aggregate",
+            "Hash Join",
+            "Custom Scan",
+            "Index Scan",
+            "Hash",
+            "CTE Scan",
+            "Limit",
+            "Sort",
+            "Hash Join",
+            "Custom Scan",
+            "Index Scan",
+            "Hash",
+            "CTE Scan"
+          ],
+          "service_elapsed_ms": 2.892,
+          "http_elapsed_ms": 5.518
+        }
+      },
+      "m5_bucket_temporal": {
+        "uncompressed": {
+          "planning_time_ms": 1.665,
+          "execution_time_ms": 1.808,
+          "actual_rows": 10,
+          "shared_hit_blocks": 52,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Sort",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Scan",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Only Scan",
+            "Nested Loop",
+            "Nested Loop",
+            "CTE Scan",
+            "Aggregate",
+            "Nested Loop",
+            "CTE Scan",
+            "Index Scan",
+            "Limit",
+            "Aggregate",
+            "Sort",
+            "Nested Loop",
+            "CTE Scan",
+            "Index Scan"
+          ],
+          "service_elapsed_ms": 3.794,
+          "http_elapsed_ms": 4.903,
+          "bucket_counts": [
+            60,
+            60,
+            60,
+            60,
+            60,
+            40,
+            60,
+            60,
+            60,
+            60
+          ],
+          "arithmetic_valid": true,
+          "gap_verified": true
+        },
+        "compressed": {
+          "planning_time_ms": 1.592,
+          "execution_time_ms": 1.446,
+          "actual_rows": 10,
+          "shared_hit_blocks": 26,
+          "shared_read_blocks": 0,
+          "plan_nodes": [
+            "Sort",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Nested Loop",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Scan",
+            "Index Scan",
+            "Index Only Scan",
+            "Index Only Scan",
+            "Nested Loop",
+            "Nested Loop",
+            "CTE Scan",
+            "Aggregate",
+            "Hash Join",
+            "Custom Scan",
+            "Index Scan",
+            "Hash",
+            "CTE Scan",
+            "Limit",
+            "Aggregate",
+            "Sort",
+            "Hash Join",
+            "Custom Scan",
+            "Index Scan",
+            "Hash",
+            "CTE Scan"
+          ],
+          "service_elapsed_ms": 3.443,
+          "http_elapsed_ms": 4.513,
+          "bucket_counts": [
+            60,
+            60,
+            60,
+            60,
+            60,
+            40,
+            60,
+            60,
+            60,
+            60
+          ],
+          "arithmetic_valid": true,
+          "gap_verified": true
+        }
+      }
+    },
+    "schema_decision": "Retain Schema 20 and existing indexes without speculative changes; both uncompressed and compressed queries execute comfortably within 5.0s budget"
+  },
+  "revision": "e6e304d41b3915b2be51e27fee6bf100b04e60ea",
+  "status": "PASS",
+  "task": "4.7.6",
+  "timestamp": "2026-10-18T04:41:44.357005+00:00",
+  "versions": {
+    "go": "go version go1.27.2 linux/amd64",
+    "python": "3.13.5",
+    "timescaledb": "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+    "mosquitto": "eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+    "schema_version": 20
+  }
+}

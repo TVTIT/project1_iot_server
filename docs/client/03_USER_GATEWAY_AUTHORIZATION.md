@@ -1,15 +1,18 @@
 # Tài liệu Client — 03: Cơ chế Phân quyền Người dùng và Trạm Gateway (User–Gateway Authorization) trên Flutter Web
 
-**Cập nhật:** 2026-10-14
+**Cập nhật:** 2026-10-19
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:**
-- `AGENTS.md` (Mục 6, 6.4, 6.5, 10, 16, 18)
+- [`../../AGENTS.md`](../../AGENTS.md) (Mục 6, 6.4, 6.5, 10, 16, 18)
+- [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch quản lý User & Gateway Membership)
+- [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
 - `docs/client/04_REST_API_CLIENT_CONTRACT.md` (Hợp đồng REST API chuẩn)
 - `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md` (Hợp đồng API Quản trị nền tảng)
 - `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md` (Tích hợp API và Quản lý trạng thái giao diện)
 - `docs/backend/stage-2-task-2.3-authorization.md` (Đặc tả phân quyền Backend Giai đoạn 2)
+- `migrations/000021_admin_user_management.up.sql` (Migration quản trị người dùng và thành viên)
 
 ---
 
@@ -40,8 +43,13 @@ Trong các ứng dụng IoT chuyên dụng, sự nhầm lẫn giữa **Xác th�
 ### Ranh giới bảo mật phía Client Web:
 1. **Không tự suy diễn quyền ở Client Web:** Client không được tự đọc payload của JWT để quyết định mở khóa các chức năng nhạy cảm. Mọi danh sách tài nguyên và quyền thao tác được phép đều bắt nguồn trực tiếp từ dữ liệu phản hồi của Go Backend.
 2. **Không truyền `user_id` trong Request Body hoặc URL Query:** Để triệt tiêu nguy cơ tấn công mạo danh tham chiếu đối tượng trực tiếp (IDOR - Insecure Direct Object References), Go Backend **từ chối tức thì (HTTP 400 Bad Request)** mọi request có chứa query param `user_id`. Backend chỉ trích xuất duy nhất `user_id` từ claim `sub` trong JWT đã được xác minh chữ ký mã hóa.
-3. **Phân quyền động tại thời điểm truy vấn (Same JWT, Next DB Query, No Live Push):** Quyền của người dùng được kiểm tra trực tiếp trên từng truy vấn SQL tại PostgreSQL. Khi dùng cùng một JWT, nếu quản trị viên cập nhật hoặc thu hồi quyền của người dùng trong cơ sở dữ liệu (`user_gateways`), hiệu lực sẽ được áp dụng ngay tại lần truy vấn cơ sở dữ liệu tiếp theo (next DB query) của HTTP request kế tiếp. Hệ thống không sử dụng cơ chế đẩy quyền trực tiếp (no live push / no WebSocket permission push).
-4. **Tạo tài khoản không tự động cấp quyền (Account Creation Grants Nothing):** Việc tạo tài khoản người dùng mới trên Supabase Auth chỉ cấp danh tính (JWT hợp lệ), hoàn toàn không gán quyền cho bất kỳ trạm nào. Kết quả gọi `GET /v1/gateways` ban đầu luôn trả về `200 OK` với mảng rỗng `{"items": []}`.
+3. **Phân quyền động tại thời điểm truy vấn (Same JWT, Next DB Query, No Live Push):** Quyền của người dùng được kiểm tra trực tiếp trên từng truy vấn SQL tại PostgreSQL. Khi dùng cùng một JWT, nếu quản trị viên cập nhật hoặc thu hồi quyền của người dùng trong cơ sở dữ liệu (`user_gateways` hoặc `platform_admins`), hiệu lực sẽ được áp dụng ngay tại lần truy vấn cơ sở dữ liệu tiếp theo (next DB query) của HTTP request kế tiếp. Hệ thống không sử dụng cơ chế đẩy quyền trực tiếp (no live push / no WebSocket permission push).
+4. **Tạo tài khoản không tự động cấp quyền (Account Creation Grants Nothing):** Việc tạo tài khoản người dùng mới trên Supabase Auth (kể cả qua API `POST /v1/admin/users`) chỉ cấp danh tính (JWT hợp lệ), hoàn toàn không gán quyền cho bất kỳ trạm nào. Kết quả gọi `GET /v1/gateways` ban đầu luôn trả về `200 OK` với mảng rỗng `{"items": []}`.
+5. **Tách biệt tuyệt đối giữa Quyền Nền tảng (`platform_admins`) và Quyền Trạm (`user_gateways`):**
+   - Quyền Platform Admin là quyền quản trị hạ tầng toàn hệ thống (cho phép gọi các API `/v1/admin/*`).
+   - Quyền này **hoàn toàn tách biệt** với quyền thành viên trạm trong `public.user_gateways`.
+   - **Platform Admin KHÔNG có quyền bypass đọc dữ liệu viễn trắc/Digital Twin:** Toàn bộ các API nghiệp vụ đều áp dụng cơ chế lọc theo tư cách thành viên trạm (`user_gateways`). Danh sách trạm (`GET /v1/gateways`) được lọc theo thành viên và trả về `200 OK` với mảng rỗng `{"items": []}` nếu admin không có membership trên trạm nào; các truy vấn chi tiết thực thể hoặc cảm biến không thuộc quyền (`GET /v1/digital-twins/{id}`, `GET /v1/digital-twins/{id}?format=simplified`, `GET /v1/digital-twins/{id}/temporal`, `GET /v1/gateways/{id}/sensors`) đều trả về `404 Not Found` (không có cơ chế blanket read bypass cho Platform Admin).
+   - Ngược lại, việc là chủ sở hữu (`owner`) của một trạm không cấp bất kỳ quyền hạn nào để gọi các API quản trị `/v1/admin/*` (nhận `403 Forbidden`).
 
 ---
 
@@ -96,32 +104,41 @@ Trong cơ sở dữ liệu PostgreSQL, ràng buộc kiểm tra schema quy địn
 CHECK (role IN ('owner', 'operator', 'viewer'))
 ```
 
-### 3.1. Thực tế API Giai đoạn 2 (Stage 2 Reality Check)
+### 3.1. Hiện trạng API và Cơ chế Quản lý Thành viên Gateway
 
-> **CẢNH BÁO QUAN TRỌNG VỀ PHẠM VI API HIỆN TẠI (STAGE 2):**
-> Trong Giai đoạn 2 (Stage 2), Go Backend **ĐÃ TRIỂN KHAI VÀ ĐĂNG KÝ 2 ENDPOINT ĐỌC DÀNH CHO NGƯỜI DÙNG CÓ XÁC THỰC CÙNG 1 NGOẠI LỆ GHI CẢM BIẾN DÀNH CHO OWNER**:
-> 1. `GET /v1/gateways`: Lấy danh sách các trạm mà người dùng được gán quyền trong `user_gateways`.
-> 2. `GET /v1/gateways/{gateway_id}/sensors`: Lấy danh sách cảm biến trực thuộc trạm mà người dùng có quyền.
-> 3. `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`: **Ngoại lệ khởi tạo hoặc phát lại chính xác cảm biến (create-or-exact-replay) dành riêng cho vai trò `owner` của trạm** (xem chi tiết tại [`04_REST_API_CLIENT_CONTRACT.md`](04_REST_API_CLIENT_CONTRACT.md)).
+> **CẬP NHẬT HIỆN THỰC HỆ THỐNG:**
+> 1. **Nhóm API Đọc Nghiệp vụ & Bản sao số Digital Twin (Stage 4 & NGSI-LD Profile):**
+>    - `GET /v1/gateways` & `GET /v1/gateways/{gateway_id}/sensors`: Đọc danh sách trạm và cảm biến mà người dùng có quyền thành viên trong `user_gateways`.
+>    - `GET /v1/digital-twins`: Danh sách tóm tắt thực thể Digital Twin theo chuẩn NGSI-LD (phân trang keyset cursor).
+>    - `GET /v1/digital-twins/{entity_id}`: Chi tiết thực thể JSON-LD chuẩn hóa kèm quan hệ phân cấp `hasSensor`.
+>    - `GET /v1/digital-twins/{entity_id}?format=simplified`: Truy vấn trạng thái hiện thời (`reported_state`, `desired_state`, versions) trực tiếp từ `twin_states` không quét hypertable.
+>    - `GET /v1/digital-twins/{entity_id}/temporal`: Lịch sử biến thiên chuỗi thời gian cho cảm biến (`attrs=measurement` hoặc `attrs=sample_interval_us`), hỗ trợ cả dạng chuỗi thô (raw tuples) và tổng hợp TimescaleDB `time_bucket` (bucket triples).
+>    - Toàn bộ các API đọc trên đều thẩm định tư cách thành viên qua CTE SQL `user_gateways`. Cả ba vai trò `owner`, `operator`, `viewer` đều có quyền đọc các tài nguyên này trên trạm được phân quyền. Người không phải thành viên nhận HTTP `404 Not Found`.
 >
-> Tất cả các tài nguyên dữ liệu khác (Telemetry, Lịch sử số đo, WebSocket stream, Digital Twin) hiện chỉ là **stub trả về HTTP `501 Not Implemented`** hoặc **chưa đăng ký route** ở Stage 2:
-> - `GET /v1/telemetry/history`: Stub trả về HTTP `501 Not Implemented` (`{"code": "not_implemented", "message": "endpoint not implemented"}`).
-> - `GET /v1/ws`: Stub trả về HTTP `501 Not Implemented` (`{"code": "not_implemented", "message": "endpoint not implemented"}`).
-> - `GET /v1/digital-twins`: Stub trả về HTTP `501 Not Implemented` (`{"code": "not_implemented", "message": "endpoint not implemented"}`).
-> - Media upload / read: Chưa đăng ký HTTP route trong router ở Stage 2.
-> - Cấu hình thiết bị (`desired_state`) / Lệnh điều khiển downlink (`commands`): Chưa có endpoint ở Stage 2, hoàn toàn fail-closed.
+> 2. **Hai Cơ chế Phân quyền Quản trị Thành viên Gateway Tập trung:**
+>    Việc gán thành viên và chuyển chủ sở hữu trạm do Platform Admin thực thi thông qua 2 endpoint riêng biệt:
+>    - **Gán vai trò thông thường (`PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`):**
+>      * Chỉ chấp nhận `{"role": "operator"}` hoặc `{"role": "viewer"}`.
+>      * Cấm gán `owner` qua endpoint này (trả về `400 Bad Request`, `code: "invalid_role"`).
+>      * Cấm hạ quyền của người dùng hiện đang là `owner` qua endpoint này (trả về `409 Conflict`, `code: "owner_transfer_required"`).
+>      * Nếu người dùng đã có vai trò tương ứng: Server thực hiện no-op an toàn và bảo toàn thời điểm tạo ban đầu (`created_at`).
+>    - **Chuyển giao quyền chủ sở hữu (`PUT /v1/admin/gateways/{gateway_id}/owner`):**
+>      * Thực thi nguyên tử trong một transaction: người nhận trở thành `owner`; owner cũ được chuyển thành `viewer`.
+>      * **Chính sách bảo toàn quyền đọc của owner cũ:** Owner cũ không bị xóa khỏi trạm mà chuyển thành `viewer`, tiếp tục duy trì quyền đọc dữ liệu giám sát và viễn trắc; các quyền ghi và tạo cảm biến bị thu hồi (`403 Forbidden`).
+>      * Hệ thống bắt buộc luôn duy trì **đúng một owner duy nhất** trên mỗi trạm (`gateway_owner_inconsistent` nếu sai lệch).
+>      * **Tác động tới Replay Provisioning:** Sau khi chuyển owner, nếu gửi lại request khởi tạo trạm cũ (`PUT /v1/admin/gateways/{id}`) với thông tin owner cũ, server sẽ phản hồi `409 Conflict` (bảo vệ quyền sở hữu hiện tại).
 >
-> Do đó, trong Giai đoạn 2 hiện tại:
-> - Cả hai vai trò **`operator` và `viewer` ĐỀU HOÀN TOÀN CHỈ ĐỌC** trên 2 endpoint danh mục `GET /v1/gateways` và `GET /v1/gateways/{gateway_id}/sensors` (mọi yêu cầu gọi `PUT /v1/gateways/{id}/sensors/{id}` đều bị từ chối với `403 Forbidden`).
-> - Vai trò **`owner`** có quyền đọc 2 endpoint trên kèm **ngoại lệ duy nhất** là khởi tạo mới hoặc replay chính xác cảm biến thuộc trạm mình sở hữu qua `PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`. Các thao tác cập nhật cấu hình thiết bị (`desired_state`), sửa đổi/xóa cảm biến hiện hữu, hay lệnh điều khiển trong tương lai vẫn **hoàn toàn chưa khả dụng (fail-closed)**. Mọi mô tả về đọc telemetry, history, media hay digital twin trong tài liệu trước đây là mục tiêu kiến trúc dài hạn cho các giai đoạn sau, KHÔNG PHẢI là chức năng khả dụng ở Stage 2.
+> 3. **Quyền Biến đổi Siêu dữ liệu Cảm biến:**
+>    - Vai trò `owner` có quyền tạo cảm biến mới (`PUT /v1/gateways/{id}/sensors/{id}` hoặc `POST /v1/digital-twins`) và sửa tên cảm biến (`PATCH /v1/digital-twins/{entity_id}/attrs`).
+>    - Vai trò `operator` và `viewer` hoàn toàn không có quyền tạo hoặc sửa cảm biến (`403 Forbidden`).
 
 ### 3.2. Bảng phân định quyền hạn thực tế và định hướng tương lai
 
-| Vai trò (`role`) | Tên hiển thị (VN) | Quyền hạn dữ liệu thực tế (Stage 2) | Kế hoạch Giai đoạn sau (Downlink/Control/Twin/Telemetry) | Hiển thị Client (Role Badge) |
+| Vai trò (`role`) | Tên hiển thị (VN) | Quyền hạn dữ liệu thực tế | Kế hoạch Giai đoạn sau (Downlink/Control/WebSocket/Media) | Hiển thị Client (Role Badge) |
 |---|---|---|---|---|
-| `owner` | **Chủ sở hữu** | Đọc danh sách trạm (`GET /v1/gateways`), danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán, và **ngoại lệ khởi tạo/replay chính xác cảm biến** (`PUT /v1/gateways/{gateway_id}/sensors/{sensor_id}`, xem [`04`](04_REST_API_CLIENT_CONTRACT.md)). Chưa có quyền sửa/xóa cảm biến hay cấu hình thiết bị. | Cấu hình trạm (`desired_state`), quản lý metadata cảm biến toàn diện, ra lệnh vận hành an toàn trong server allowlist. | `Badge(Color: Amber, Label: "Chủ sở hữu", Icon: admin_panel_settings)` |
-| `operator` | **Người vận hành** | **Hoàn toàn chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán (fail-closed; mọi yêu cầu ghi nhận `403 Forbidden`). | Được thực thi các lệnh vận hành an toàn trong server allowlist (ví dụ: `capture-image`). **Không** được sửa `desired_state`, **không** được sửa metadata cảm biến. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
-| `viewer` | **Người xem** | **Hoàn toàn chỉ đọc** danh sách trạm (`GET /v1/gateways`) và danh sách cảm biến (`GET /v1/gateways/{gateway_id}/sensors`) của trạm được gán. | Hoàn toàn chỉ đọc (Read-only) telemetry, history, media, digital twin khi các API này sẵn sàng. Vĩnh viễn **không** có quyền ghi, không điều khiển thiết bị, không sửa cấu hình. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
+| `owner` | **Chủ sở hữu** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường (`measurement`, `sample_interval_us`). Có quyền tạo cảm biến (`PUT /v1/gateways/{id}/sensors/{id}` hoặc `POST /v1/digital-twins`) và sửa tên cảm biến (`PATCH /v1/digital-twins/{id}/attrs`). | Cấu hình trạm (`desired_state`), ra lệnh điều khiển thiết bị an toàn trong server allowlist, nhận WebSocket realtime stream. | `Badge(Color: Amber, Label: "Chủ sở hữu", Icon: admin_panel_settings)` |
+| `operator` | **Người vận hành** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Không có quyền tạo/sửa cảm biến hoặc sửa trạm (`403 Forbidden`). | Được thực thi các lệnh vận hành an toàn trong server allowlist (ví dụ: `capture-image`). **Không** được sửa `desired_state`, **không** được sửa metadata cảm biến. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
+| `viewer` | **Người xem** | Hoàn toàn chỉ đọc (Read-only) danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Vĩnh viễn không có quyền ghi (`403 Forbidden`). | Tiếp tục duy trì trạng thái chỉ đọc trên telemetry, history, media, digital twin, WebSocket. Không có quyền gửi lệnh điều khiển. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
 
 ### 3.3. Trải nghiệm phân quyền trên Web Dashboard (Desktop / Tablet / Responsive)
 Khác với giao diện màn hình hẹp của thiết bị di động vốn chỉ hiển thị danh sách cuộn dọc đơn giản, nền tảng **Flutter Web Dashboard** sở hữu không gian hiển thị rộng rãi, cho phép tối ưu hóa trải nghiệm giám sát thông qua bố cục linh hoạt:

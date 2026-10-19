@@ -18,7 +18,11 @@ type LookupFunc func(string) (string, bool)
 // Config contains process-level settings required by the backend.
 type Config struct {
 	Credential                 CredentialConfig
+	Ingress                    IngressConfig
 	MQTTCredentialRuntime      mqttcredential.StartupConfig
+	History                    HistoryConfig
+	Twin                       TwinConfig
+	UserManagement             UserManagementConfig
 	CORSAllowedOrigins         []string
 	ServerPort                 int
 	ServerEnv                  string
@@ -36,9 +40,6 @@ type Config struct {
 	HTTPWriteTimeout           time.Duration
 	HTTPIdleTimeout            time.Duration
 	ShutdownTimeout            time.Duration
-	MQTTQueueCapacity          int
-	MQTTWorkerCount            int
-	MQTTMaxPayloadBytes        int
 	SupabaseJWTSecret          string
 	SupabaseJWTIssuer          string
 	SupabaseJWTAudience        string
@@ -153,20 +154,22 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 
-	if cfg.MQTTQueueCapacity, err = integer(lookup, "MQTT_QUEUE_CAPACITY", 256, 1, 1_000_000); err != nil {
-		return Config{}, err
-	}
-	if cfg.MQTTWorkerCount, err = integer(lookup, "MQTT_WORKER_COUNT", 4, 1, 10_000); err != nil {
-		return Config{}, err
-	}
-	if cfg.MQTTMaxPayloadBytes, err = integer(lookup, "MQTT_MAX_PAYLOAD_BYTES", 1_048_576, 1, 268_435_455); err != nil {
-		return Config{}, err
-	}
-
 	if cfg.MQTTCredentialRuntime, err = mqttcredential.LoadConfig(lookup); err != nil {
 		return Config{}, err
 	}
 	if cfg.Credential, err = loadCredential(lookup, cfg); err != nil {
+		return Config{}, err
+	}
+	if cfg.Ingress, err = loadIngress(lookup, cfg.DatabaseMaxConns, cfg.Credential.Enabled, cfg.ShutdownTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.History, err = loadHistory(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.Twin, err = loadTwin(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.UserManagement, err = loadUserManagement(lookup, cfg.AdminMaxBodyBytes); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

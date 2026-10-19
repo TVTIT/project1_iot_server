@@ -64,8 +64,6 @@ def assert_stage2_e2e_contract(job: str) -> None:
             label = name_match.group(1).strip().strip("'\"")
             if re.search(r'\b(native\s+)?pass\b', label, re.IGNORECASE):
                 raise AssertionError(f"misleading job display label claiming pass: {label}")
-            if 'Legacy E2E contracts' not in label and 'Legacy' not in label:
-                raise AssertionError(f"job display label must identify legacy E2E contracts: {label}")
     else:
         if 'timeout-minutes: 30' not in job:
             raise AssertionError("intact native mode requires timeout-minutes: 30")

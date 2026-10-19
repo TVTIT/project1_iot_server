@@ -30,6 +30,40 @@ TEMPLATE = Path(__file__).with_suffix(".override.yml")
 SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
             "supabase-auth", "supabase-compat-migration", "mosquitto",
             "backend", "supabase-envoy", "nginx")
+# Terminal state of the currently supported schema. The fixture records every
+# migration under migrations/ (versions 4 and 5 do not write history rows) and
+# must reach exactly this version:name pair last. Pinning the terminal instead
+# of accepting any suffix keeps a missing, extra, renamed, or wrong-version
+# history failing closed; a newly supported migration must update this pin
+# explicitly rather than being silently accepted.
+EXPECTED_SCHEMA_TERMINAL = "21:admin_user_management"
+
+
+def expected_schema_history(directory=None):
+    """Exact ``version:name`` history the fixture must record, version-ordered.
+
+    Derived from the migration files so a supported migration is reflected
+    automatically; the pinned terminal in :data:`EXPECTED_SCHEMA_TERMINAL` is
+    enforced separately by :func:`schema_history_verified`.
+    """
+    migrations = ROOT / "migrations" if directory is None else Path(directory)
+    return ",".join(
+        str(int(p.name.split("_")[0])) + ":" + p.name.split("_", 1)[1].removesuffix(".up.sql")
+        for p in sorted(migrations.glob("0*.up.sql"))
+        if int(p.name.split("_")[0]) not in (4, 5)
+    )
+
+
+def schema_history_verified(returncode, stdout, expected, terminal=EXPECTED_SCHEMA_TERMINAL):
+    """True only when the recorded history is exact and reaches the pinned terminal.
+
+    A nonzero returncode, a history that differs from ``expected`` (missing,
+    extra, or renamed rows), or an ``expected`` that does not end at the pinned
+    terminal are all rejected.
+    """
+    return returncode == 0 and stdout == expected and expected.endswith(terminal)
+
+
 BUDGETS = {"config": 30, "build": 600, "up": 180, "bootstrap": 120,
            "inspect": 15, "cleanup": 60, "http": 10, "acceptance": 180}
 # Explicit reviewed values, including inputs from inactive root services. Never
@@ -49,6 +83,14 @@ DEFAULTS = dict(
     MQTT_MAX_PAYLOAD_BYTES="1048576", MQTT_CREDENTIAL_API_ENABLED="true",
     INGRESS_GATE_ENABLED="true", MQTT_TLS_CA_FILE="/mosquitto/config/certs/ca.crt",
     MQTT_INTERNAL_MANAGEMENT_URL="ssl://mosquitto:8883",
+    # Task 3.4 telemetry ingress keys referenced by the root compose. They are
+    # safe local defaults mirroring the compose `:-` fallbacks and .env.example;
+    # require_inputs fails closed unless every root interpolation key is explicit.
+    MQTT_INGRESS_ENABLED="false", MQTT_CONNECT_TIMEOUT="5s",
+    MQTT_SUBSCRIBE_TIMEOUT="3s", MQTT_PUBLISH_TIMEOUT="3s",
+    MQTT_RECONNECT_MAX_INTERVAL="30s", TELEMETRY_MAX_SAMPLES_PER_MESSAGE="1000",
+    TELEMETRY_MAX_BATCH_DURATION="60s", TELEMETRY_MAX_FUTURE_SKEW="2m",
+    TELEMETRY_DB_TIMEOUT="5s",
     MQTT_DYNSEC_MANAGER_USERNAME="credential_manager",
     MQTT_DYNSEC_JSON_PATH="/mosquitto/dynsec/dynamic-security.json",
     MQTT_DYNSEC_WRITER_UID="1883",
@@ -61,7 +103,17 @@ DEFAULTS = dict(
     MQTT_CREDENTIAL_RECONCILE_TIMEOUT="2m", MQTT_CREDENTIAL_RECONCILE_BATCH_SIZE="64",
     MQTT_CREDENTIAL_RECONCILE_MAX_PAGES="16", MQTT_CREDENTIAL_OPERATION_TIMEOUT="10s",
     MQTT_CREDENTIAL_REQUEST_TIMEOUT="40s", MQTT_CREDENTIAL_RECOVERY_TIMEOUT="5s",
-    SUPABASE_JWT_CLOCK_SKEW="30s", CLOUDFLARE_TUNNEL_TOKEN="fixture-unused-not-a-token")
+    # Stage 4 Read Bounds
+    HISTORY_QUERY_TIMEOUT="5s", HISTORY_MAX_RANGE="744h", HISTORY_RAW_WINDOW="10s",
+    HISTORY_DEFAULT_POINTS="1000", HISTORY_MAX_POINTS="2000", HISTORY_MIN_POINTS="100",
+    TWIN_LIST_DEFAULT_LIMIT="50", TWIN_LIST_MAX_LIMIT="200",
+    TWIN_RELATIONSHIP_DEFAULT_LIMIT="50", TWIN_RELATIONSHIP_MAX_LIMIT="200",
+    SUPABASE_JWT_CLOCK_SKEW="30s", CLOUDFLARE_TUNNEL_TOKEN="fixture-unused-not-a-token",
+    # User Management & Auth Admin bounds
+    AUTH_ADMIN_BASE_URL="http://supabase-envoy:8000",
+    AUTH_ADMIN_TIMEOUT="10s", AUTH_ADMIN_MAX_BODY_BYTES="16384",
+    USER_LIST_MAX_USERS="1000", USER_LIST_MAX_MEMBERSHIPS="10000",
+    USER_LIST_MAX_RESPONSE_BYTES="2097152", SUPABASE_SERVICE_ROLE_KEY="")
 
 
 @dataclass(frozen=True)
@@ -536,7 +588,10 @@ def validate_effective_model(fixture, model):
         "postgres": {str(ROOT / "migrations"): "/docker-entrypoint-initdb.d"},
         "application-migrations": {str(ROOT / "migrations"): "/migrations", str(ROOT / "scripts/run-migrations.sh"): "/run-migrations.sh"},
         "supabase-role-provisioner": {str(ROOT / "migrations/000000_configure_supabase_roles.sh"): "/migrations/000000_configure_supabase_roles.sh"},
-        "supabase-compat-migration": {str(ROOT / "migrations/000004_supabase_compat.up.sql"): "/migrations/000004_supabase_compat.up.sql"},
+        "supabase-compat-migration": {
+            str(ROOT / "migrations/000004_supabase_compat.up.sql"): "/migrations/000004_supabase_compat.up.sql",
+            str(ROOT / "migrations/000021_admin_user_management.up.sql"): "/migrations/000021_admin_user_management.up.sql",
+        },
         "supabase-envoy": {str(ROOT / "config/envoy" / name): target for name, target in (
             ("envoy.yaml", "/etc/envoy/envoy.yaml"), ("cds.yaml", "/etc/envoy/cds.yaml"),
             ("lds.template.yaml", "/etc/envoy/lds.template.yaml"), ("docker-entrypoint.sh", "/docker-entrypoint.sh"))},
@@ -550,7 +605,7 @@ def validate_effective_model(fixture, model):
         "postgres": {}, "mosquitto": {},
         "supabase-role-provisioner": {"postgres": "service_healthy"},
         "application-migrations": {"postgres": "service_healthy", "supabase-role-provisioner": "service_completed_successfully"},
-        "supabase-auth": {"supabase-role-provisioner": "service_completed_successfully"},
+        "supabase-auth": {"supabase-role-provisioner": "service_completed_successfully", "application-migrations": "service_completed_successfully"},
         "supabase-compat-migration": {"postgres": "service_healthy", "supabase-auth": "service_healthy", "application-migrations": "service_completed_successfully"},
         "backend": {"postgres": "service_healthy", "mosquitto": "service_started", "application-migrations": "service_completed_successfully", "supabase-compat-migration": "service_completed_successfully"},
         "supabase-envoy": {"supabase-auth": "service_healthy"},
@@ -597,7 +652,7 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_rootfs_rejected")
     commands = {"application-migrations": ["/bin/sh", "/run-migrations.sh"],
                 "supabase-role-provisioner": ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"],
-                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql']}
+                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql']}
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})
@@ -778,19 +833,33 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                             raise ValueError('phase_health_timeout')
                         time.sleep(1)
                     if name == 'application-migrations':
-                        sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations"
+                        sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations WHERE version <= 20"
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
-                        expected = ','.join(str(int(p.name.split('_')[0])) + ':' + p.name.split('_', 1)[1].removesuffix('.up.sql') for p in sorted((ROOT / 'migrations').glob('0*.up.sql')) if int(p.name.split('_')[0]) not in (4, 5))
-                        if result.returncode or result.stdout.decode().strip() != expected or not expected.endswith('19:mqtt_simplified_journal'):
-                            raise ValueError('schema19_exact_rejected')
-                        evidence['schema19'] = True
+                        # Auth-dependent migration 21 is applied in the compat phase.
+                        expected = expected_schema_history().rsplit(',', 1)[0]
+                        if not schema_history_verified(result.returncode, result.stdout.decode().strip(), expected, terminal='20:stage3_telemetry_ingestion'):
+                            raise ValueError('schema_exact_rejected')
+                        evidence['schema_pre_auth_exact'] = True
                     if name == 'supabase-compat-migration':
                         # Root psql command lacks ON_ERROR_STOP; exit0 alone cannot
                         # prove that its FK statements actually took effect.
-                        sql = "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey' AND conrelid = 'public.profiles'::regclass AND confrelid = 'auth.users'::regclass AND contype = 'f'"
+                        sql = "SELECT count(*) FROM pg_constraint WHERE conname = 'profiles_id_fkey' AND conrelid = 'public.profiles'::regclass AND confrelid = 'auth.users'::regclass AND contype = 'f' AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 4 AND name = 'supabase_compat')"
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
                         if result.returncode or result.stdout.strip() != b'1':
                             raise ValueError('compat_constraints_rejected')
+                        # Migration 21 runs in the post-Auth compatibility phase; verify that
+                        # trigger prerequisites existed and the exact terminal schema21 is recorded.
+                        trigger_sql = "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'auth' AND c.relname = 'users' AND t.tgname = 'on_auth_user_created'"
+                        result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', trigger_sql])
+                        if result.returncode or result.stdout.strip() != b'1':
+                            raise ValueError('compat_constraints_rejected')
+                        # Version 4 was checked above; exclude it from the application history.
+                        schema_sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations WHERE version <> 4"
+                        result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', schema_sql])
+                        expected = expected_schema_history()
+                        if not schema_history_verified(result.returncode, result.stdout.decode().strip(), expected):
+                            raise ValueError('schema_exact_rejected')
+                        evidence['schema_exact'] = True
                     durable_json(fixture.private / 'startup-progress.json', {'phase': phase, 'evidence': evidence})
                 obj = registry.resolve(containers['nginx'])
                 ports = obj['NetworkSettings']['Ports'].get('80/tcp') or []
@@ -1067,7 +1136,7 @@ def cleanup_commands(receipts, inspect, veto=False):
 
 
 PENDING = ("effective_compose_isolation", "tls_uid1883", "bootstrap_cli_receipt",
-           "real_migrations_exit_zero_and_schema19", "dockerfile_backend_image",
+           "real_migrations_exit_zero_and_schema_exact", "dockerfile_backend_image",
            "nginx_envoy_password_login", "admin_inventory", "nonadmin_inventory_denials",
            "owner_sensor_create_retry", "operator_viewer_nonmember_sensor_denials",
            "cross_gateway_no_db_mutation", "missing_invalid_expired_jwt", "no_secret_fields",
@@ -1151,7 +1220,7 @@ ALLOWED_FAILURE_ERROR_CODES = {
     "compose_phase_unresolved", "compose_phase_failed",
     "phase_container_absent", "phase_health_timeout",
     "health_failed", "migration_nonzero",
-    "runtime_receipt_rejected", "schema19_exact_rejected",
+    "runtime_receipt_rejected", "schema_exact_rejected",
     "compat_constraints_rejected", "mapped_endpoint_rejected",
     "admin_user_creation_failed", "admin_user_uuid_invalid",
     "login_failed", "token_format_invalid",

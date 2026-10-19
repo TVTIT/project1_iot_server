@@ -29,7 +29,7 @@ const (
 	preflightMaxAge       = "600"
 	preflightAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 	preflightAllowHeaders = "Authorization, Content-Type, Idempotency-Key, X-Request-ID"
-	exposeHeaders         = "X-Request-ID"
+	exposeHeaders         = "Link, Location, X-Request-ID"
 )
 
 // corsMiddleware enforces exact-origin CORS access control.

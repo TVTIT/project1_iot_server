@@ -19,16 +19,16 @@ func (r *postgresProvisioningRepository) ProvisionGateway(ctx context.Context, a
 	}
 	tx, err := r.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return result, fmt.Errorf("begin provisioning: %w", err)
+		return result, fmt.Errorf("begin provisioning: %w", classifyGatewayProvisioningError(err))
 	}
 	defer rollbackProvisioning(tx)
 	checker, err := auth.NewPostgresPlatformAdminChecker(tx)
 	if err != nil {
-		return result, fmt.Errorf("%w: %w", ErrProvisioningAdminLookup, err)
+		return result, fmt.Errorf("%w: %w", ErrProvisioningAdminLookup, classifyGatewayProvisioningError(err))
 	}
 	admin, err := checker.IsPlatformAdmin(ctx, actor)
 	if err != nil {
-		return result, fmt.Errorf("%w: %w", ErrProvisioningAdminLookup, err)
+		return result, fmt.Errorf("%w: %w", ErrProvisioningAdminLookup, classifyGatewayProvisioningError(err))
 	}
 	if !admin {
 		return result, ErrProvisioningForbidden
@@ -40,7 +40,7 @@ func (r *postgresProvisioningRepository) ProvisionGateway(ctx context.Context, a
 		return result, ErrProvisioningNotFound
 	}
 	if err != nil {
-		return result, fmt.Errorf("resolve provisioning owner: %w", err)
+		return result, fmt.Errorf("resolve provisioning owner: %w", classifyGatewayProvisioningError(err))
 	}
 	result = ProvisionGatewayResult{GatewayID: input.GatewayID, Name: input.Name, Description: input.Description,
 		OwnerUserID: input.OwnerUserID, EntityID: mapper.GatewayEntityID(input.GatewayID)}
@@ -50,15 +50,15 @@ func (r *postgresProvisioningRepository) ProvisionGateway(ctx context.Context, a
 	case err == nil:
 		result.Created = true
 		if _, err := tx.Exec(ctx, `INSERT INTO public.user_gateways(user_id,gateway_id,role) VALUES ($1,$2,'owner')`, owner, input.GatewayID); err != nil {
-			return ProvisionGatewayResult{}, fmt.Errorf("insert provisioning owner: %w", err)
+			return ProvisionGatewayResult{}, fmt.Errorf("insert provisioning owner: %w", classifyGatewayProvisioningError(err))
 		}
 		var entity uuid.UUID
 		if err := tx.QueryRow(ctx, `INSERT INTO public.twin_entities(entity_id,entity_type,name,gateway_id)
 		VALUES ($1,'Gateway',$2,$3) RETURNING id`, result.EntityID, input.Name, input.GatewayID).Scan(&entity); err != nil {
-			return ProvisionGatewayResult{}, fmt.Errorf("insert Gateway twin: %w", err)
+			return ProvisionGatewayResult{}, fmt.Errorf("insert Gateway twin: %w", classifyGatewayProvisioningError(err))
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO public.twin_states(entity_id) VALUES ($1)`, entity); err != nil {
-			return ProvisionGatewayResult{}, fmt.Errorf("insert Gateway state: %w", err)
+			return ProvisionGatewayResult{}, fmt.Errorf("insert Gateway state: %w", classifyGatewayProvisioningError(err))
 		}
 	case errors.Is(err, pgx.ErrNoRows):
 		// A separate READ COMMITTED statement sees the winner after ON CONFLICT
@@ -67,10 +67,11 @@ func (r *postgresProvisioningRepository) ProvisionGateway(ctx context.Context, a
 			return ProvisionGatewayResult{}, err
 		}
 	default:
-		return ProvisionGatewayResult{}, fmt.Errorf("insert Gateway: %w", err)
+		return ProvisionGatewayResult{}, fmt.Errorf("insert Gateway: %w", classifyGatewayProvisioningError(err))
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return ProvisionGatewayResult{}, fmt.Errorf("commit Gateway provisioning: %w", err)
+		// A lost confirmation is unavailable, not evidence that writes rolled back.
+		return ProvisionGatewayResult{}, fmt.Errorf("commit Gateway provisioning: %w", classifyGatewayProvisioningError(err))
 	}
 	return result, nil
 }
@@ -83,7 +84,7 @@ func verifyGatewayRetry(ctx context.Context, tx pgx.Tx, input ProvisionGatewayIn
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrProvisioningInconsistent
 		}
-		return fmt.Errorf("read existing Gateway: %w", err)
+		return fmt.Errorf("read existing Gateway: %w", classifyGatewayProvisioningError(err))
 	}
 	if name != input.Name || !sameNullableString(description, input.Description) {
 		return ErrProvisioningConflict
@@ -91,7 +92,7 @@ func verifyGatewayRetry(ctx context.Context, tx pgx.Tx, input ProvisionGatewayIn
 	var owners, matchingOwners int
 	if err := tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE user_id=$2)
 	FROM public.user_gateways WHERE gateway_id=$1 AND role='owner'`, input.GatewayID, input.OwnerUserID).Scan(&owners, &matchingOwners); err != nil {
-		return fmt.Errorf("verify Gateway owner: %w", err)
+		return fmt.Errorf("verify Gateway owner: %w", classifyGatewayProvisioningError(err))
 	}
 	if owners == 0 || owners > 1 {
 		return ErrProvisioningInconsistent
@@ -107,7 +108,7 @@ func verifyGatewayRetry(ctx context.Context, tx pgx.Tx, input ProvisionGatewayIn
 	WHERE e.entity_id=$1 AND e.entity_type='Gateway' AND e.gateway_id=$2 AND e.name=$3
 	) AND (SELECT count(*) FROM public.twin_entities WHERE gateway_id=$2 AND entity_type='Gateway')=1`,
 		result.EntityID, input.GatewayID, input.Name).Scan(&valid); err != nil {
-		return fmt.Errorf("verify Gateway twin graph: %w", err)
+		return fmt.Errorf("verify Gateway twin graph: %w", classifyGatewayProvisioningError(err))
 	}
 	if !valid {
 		return ErrProvisioningInconsistent

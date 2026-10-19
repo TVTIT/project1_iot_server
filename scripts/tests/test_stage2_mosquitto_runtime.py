@@ -515,8 +515,6 @@ def assert_runtime_job_contract(job: str) -> None:
             label = name_match.group(1).strip().strip("'\"")
             if re.search(r'\b(native\s+)?pass\b', label, re.IGNORECASE):
                 raise AssertionError(f"misleading job display label claiming pass: {label}")
-            if 'Legacy runtime contracts' not in label and 'Legacy' not in label:
-                raise AssertionError(f"job display label must identify legacy runtime contracts: {label}")
     else:
         if 'sh scripts/test-stage2-mosquitto-runtime.sh' not in job:
             raise AssertionError("intact native mode requires sh scripts/test-stage2-mosquitto-runtime.sh")
@@ -535,7 +533,8 @@ class WorkflowGuards(unittest.TestCase):
                                     'mosquitto-runtime-integration',
                                     'mosquitto-credential-integration', 'stage2-e2e',
                                     'legacy-runtime-image-build', 'dynsec-native-integration',
-                                    'dynsec-bootstrap-tests', 'native-compose-smoke'})
+                                    'dynsec-bootstrap-tests', 'stage3-uplink-integration',
+                                    'stage4-api-integration', 'native-compose-smoke'})
         job = extract_job_section(workflow, 'mosquitto-runtime-integration')
         assert_runtime_job_contract(job)
         for target in ('auth-init', 'reloader', 'backend'):

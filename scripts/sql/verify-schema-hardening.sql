@@ -129,19 +129,42 @@ BEGIN
     END;
 
     BEGIN
-        INSERT INTO processed_messages (gateway_id, message_id, payload_hash)
-        VALUES ('__missing_gateway', gen_random_uuid(), '__constraint_test');
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'processed_messages'
+              AND column_name = 'source_topic'
+        ) THEN
+            EXECUTE 'INSERT INTO processed_messages
+                (gateway_id, message_id, payload_hash, source_topic, sensor_id, boot_id,
+                 first_sequence, last_sequence, sample_count)
+                VALUES (''__missing_gateway'', gen_random_uuid(), ''__constraint_test'',
+                        ''gateways/__missing_gateway/telemetry/__constraint_sensor'',
+                        ''__constraint_sensor'', gen_random_uuid(), 0, 0, 1)';
+        ELSE
+            EXECUTE 'INSERT INTO processed_messages (gateway_id, message_id, payload_hash)
+                VALUES (''__missing_gateway'', gen_random_uuid(), ''__constraint_test'')';
+        END IF;
         RAISE EXCEPTION 'Verification failed: processed message for an unknown Gateway was accepted';
     EXCEPTION
         WHEN foreign_key_violation THEN NULL;
     END;
 
     BEGIN
-        INSERT INTO telemetry (
-            measured_at, gateway_id, sensor_id, sequence_num, value
-        ) VALUES (
-            now(), test_gateway_id, '__missing_sensor', 1, 1
-        );
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'telemetry'
+              AND column_name = 'sample_index'
+        ) THEN
+            EXECUTE 'INSERT INTO telemetry
+                (measured_at, gateway_id, sensor_id, sequence_num, value, boot_id, message_id, sample_index)
+                VALUES (now(), $1, ''__missing_sensor'', 1, 1, gen_random_uuid(), gen_random_uuid(), 0)'
+                USING test_gateway_id;
+        ELSE
+            EXECUTE 'INSERT INTO telemetry
+                (measured_at, gateway_id, sensor_id, sequence_num, value)
+                VALUES (now(), $1, ''__missing_sensor'', 1, 1)'
+                USING test_gateway_id;
+        END IF;
         RAISE EXCEPTION 'Verification failed: telemetry for an unknown Sensor was accepted';
     EXCEPTION
         WHEN foreign_key_violation THEN NULL;

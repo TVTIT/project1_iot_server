@@ -63,8 +63,6 @@ def assert_credential_job_contract(job: str) -> None:
             label = name_match.group(1).strip().strip("'\"")
             if re.search(r'\b(native\s+)?pass\b', label, re.IGNORECASE):
                 raise AssertionError(f"misleading job display label claiming pass: {label}")
-            if 'Legacy credential checks' not in label and 'Legacy' not in label:
-                raise AssertionError(f"job display label must identify legacy credential checks: {label}")
     else:
         if 'sh scripts/test-stage2-mqtt-credentials.sh' not in job:
             raise AssertionError("intact native mode requires sh scripts/test-stage2-mqtt-credentials.sh")

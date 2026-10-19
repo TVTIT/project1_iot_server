@@ -15,7 +15,6 @@ defaults:
 
 jobs:
   stage2-e2e:
-    name: Legacy E2E contracts
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -25,7 +24,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |
@@ -57,7 +56,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Format check
         run: |
@@ -103,6 +102,8 @@ jobs:
           go test -json -race -count=1 -coverprofile=coverage.out ./... > "$json_log" 2> "$err_log" || test_exit=$?
 
           guard_exit=0
+          # The guard prints failed test names and allowlisted gatewaysim error
+          # context. Raw test logs remain private and are removed by cleanup.
           python3 ../scripts/ci_go_test_guard.py \
             --input "$json_log" \
             --require 'iot-platform/internal/config:TestAdminMaxBodyBytes' \
@@ -130,7 +131,16 @@ jobs:
             --require 'iot-platform/internal/mqttcredential:TestSimplifiedService_ConstructorAndGuards' \
             --require 'iot-platform/internal/mqttcredential:TestSimplifiedStartupClassifier_InvalidOptions' \
             --require 'iot-platform/internal/mqttcredential:TestSimplifiedStartupClassifier_EmptyScan' \
-            --allow-no-test-package 'iot-platform/cmd/gateway' || guard_exit=$?
+            --require 'iot-platform/cmd/gateway:TestAdminCountAndPendingMetadataOnly' \
+            --require 'iot-platform/cmd/gateway:TestRunRestartResendsPriorBootByteExact' \
+            --require 'iot-platform/internal/telemetry:TestValidatorExpandsEverySampleAndNormalizesTime' \
+            --require 'iot-platform/internal/telemetry:TestDecodeBatchValidAndWhitespace' \
+            --require 'iot-platform/internal/telemetry:TestNewCommitACKWireContract' \
+            --require 'iot-platform/internal/telemetry:TestPersistNewMessageAppliesReportedStateThenTemporalBeforeCommit' \
+            --require 'iot-platform/internal/mqttingress:TestACKOnlyAfterConfirmedCommit' \
+            --require 'iot-platform/internal/mqttingress:TestFixedWorkerBound' \
+            --require 'iot-platform/internal/gatewaysim:TestOutboxEnqueueReopenByteExact' \
+            --require 'iot-platform/internal/gatewaysim:TestACKProcessorDeletesOnlyExactPending' || guard_exit=$?
 
           if [ "$test_exit" -ne 0 ]; then
             echo "Go unit test suite execution failed with exit code $test_exit." >&2
@@ -160,7 +170,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Build server (linux/amd64)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/server
@@ -246,7 +256,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Prepare test directory
         working-directory: .
@@ -269,7 +279,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Prepare test directory
         working-directory: .
@@ -292,7 +302,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Test Auth harness
         working-directory: .
@@ -305,7 +315,6 @@ jobs:
         run: sh scripts/test-stage2-admin.sh
 
   mosquitto-credential-integration:
-    name: Legacy credential checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -315,7 +324,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Prepare coverage directory
         run: mkdir -p /tmp/opencode
@@ -344,7 +353,6 @@ jobs:
           docker build --target credential-controller -t task2612-controller:ci src
 
   mosquitto-runtime-integration:
-    name: Legacy runtime contracts
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -354,7 +362,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Prepare test directory
         run: mkdir -p /tmp/opencode
@@ -384,7 +392,7 @@ jobs:
             "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Test native harness
         run: |
@@ -477,6 +485,171 @@ jobs:
           path: ${{ runner.temp }}/dynsec-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}.json
           if-no-files-found: error
 
+  stage3-uplink-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+          cache-dependency-path: src/go.sum
+      - name: Check prerequisites
+        run: |
+          mkdir -p /tmp/opencode
+          python3 --version
+          openssl version
+          which setfacl getfacl
+          docker version
+          docker compose version
+          go version
+      - name: Test Stage 3 harness
+        run: |
+          mkdir -p /tmp/opencode
+          python3 -m unittest scripts/tests/test_stage3_uplink_runner.py scripts/tests/test_ci_feature_jobs.py
+      - name: Pull native images
+        run: |
+          docker pull --platform linux/amd64 timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          docker pull --platform linux/amd64 eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+      - name: Run Stage 3 persistence fixtures
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP:-/tmp}/stage3-persistence.log"
+          cleanup() {
+            rm -f "$log_file"
+          }
+          trap cleanup EXIT INT TERM
+
+          timeout --signal=TERM --kill-after=90s 600s sh scripts/test-stage3-persistence.sh 2>&1 | tee "$log_file"
+
+          if grep -q '^FAIL:' "$log_file"; then
+            echo "Persistence rehearsals reported failure" >&2
+            exit 1
+          fi
+          if grep -q '^SKIP:' "$log_file"; then
+            echo "Persistence rehearsals reported unexpected skip" >&2
+            exit 1
+          fi
+          if ! grep -q '^PASS: isolated database-only migration 000020 rehearsals$' "$log_file"; then
+            echo "Missing terminal PASS marker for persistence rehearsals" >&2
+            exit 1
+          fi
+          if ! grep -q '^FRESH FIXTURE: .* PASS$' "$log_file"; then
+            echo "Missing fresh fixture PASS marker" >&2
+            exit 1
+          fi
+          if ! grep -q '^UPGRADE FIXTURE: .* PASS$' "$log_file"; then
+            echo "Missing upgrade fixture PASS marker" >&2
+            exit 1
+          fi
+          if ! grep -q '^ROLLBACK FIXTURE: .* PASS$' "$log_file"; then
+            echo "Missing rollback fixture PASS marker" >&2
+            exit 1
+          fi
+          if ! grep -q '^Fixture cleanup verified: True$' "$log_file"; then
+            echo "Missing fixture cleanup verification marker" >&2
+            exit 1
+          fi
+      - name: Run Stage 3 uplink integration
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP:-/tmp}/stage3-uplink.log"
+          cleanup() {
+            rm -f "$log_file"
+          }
+          trap cleanup EXIT INT TERM
+
+          timeout --signal=TERM --kill-after=90s 1800s sh scripts/test-stage3-uplink.sh --scenario all 2>&1 | tee "$log_file"
+
+          if grep -q '^SKIP:' "$log_file"; then
+            echo "Stage 3 uplink integration skipped unexpectedly" >&2
+            exit 1
+          fi
+          if ! grep -q '^PASS: stage3 uplink integration (all scenarios passed: normal, tls-credential, acl-control, ack-fault, db-timeout, queue-full, gateway-reconnect, process-restart, broker-controlled-restart)$' "$log_file"; then
+            echo "Missing terminal PASS marker for stage3 uplink integration" >&2
+            exit 1
+          fi
+          if ! grep -q '^Suite image cleanup verified: shared images removed$' "$log_file"; then
+            echo "Missing suite image cleanup verification marker" >&2
+            exit 1
+          fi
+          if ! grep -q '^Fixture cleanup verified: containers/network/volumes/workdir absent$' "$log_file"; then
+            echo "Missing fixture cleanup verification marker" >&2
+            exit 1
+          fi
+
+  stage4-api-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+          cache-dependency-path: src/go.sum
+      - name: Check prerequisites
+        run: |
+          mkdir -p /tmp/opencode
+          python3 --version
+          openssl version
+          which setfacl getfacl
+          docker version
+          docker compose version
+          go version
+      - name: Test Stage 4 harness
+        run: |
+          mkdir -p /tmp/opencode
+          python3 -m unittest scripts/tests/test_stage4_api_runner.py scripts/tests/test_stage4_vertical_scenario.py scripts/tests/test_stage4_contract_scenario.py scripts/tests/test_stage4_queries_scenario.py scripts/tests/test_ci_feature_jobs.py
+      - name: Pull native images
+        run: |
+          docker pull --platform linux/amd64 timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          docker pull --platform linux/amd64 eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+      - name: Prepare report path
+        run: |
+          printf 'STAGE4_API_REPORT=%s/stage4-api-%s-%s.json\n' \
+            "${RUNNER_TEMP:-/tmp}" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Run Stage 4 API integration
+        env:
+          MANDATORY_CI: '1'
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP:-/tmp}/stage4-api.log"
+          cleanup() {
+            rm -f "$log_file"
+          }
+          trap cleanup EXIT INT TERM
+
+          timeout --signal=TERM --kill-after=90s 2100s sh scripts/test-stage4-api.sh --scenario all 2>&1 | tee "$log_file"
+
+          if grep -q '^SKIP:' "$log_file"; then
+            echo "Stage 4 API integration skipped unexpectedly" >&2
+            exit 1
+          fi
+          if ! grep -q '^PASS: stage4 api integration (all scenarios passed: vertical, contract, queries)$' "$log_file"; then
+            echo "Missing terminal PASS marker for stage4 api integration" >&2
+            exit 1
+          fi
+          if ! grep -q '^Suite image cleanup verified: shared images removed$' "$log_file"; then
+            echo "Missing suite image cleanup verification marker" >&2
+            exit 1
+          fi
+          if ! grep -q '^Fixture cleanup verified: containers/network/volumes/workdir absent$' "$log_file"; then
+            echo "Missing fixture cleanup verification marker" >&2
+            exit 1
+          fi
+      - name: Upload Stage 4 API safe verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage4-api-safe-report
+          path: ${{ runner.temp }}/stage4-api-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: error
+
   native-compose-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -490,7 +663,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |

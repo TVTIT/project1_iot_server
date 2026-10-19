@@ -74,7 +74,7 @@ def assert_connack(packet, accepted):
         raise RuntimeError('expected exact MQTT authentication CONNACK')
 
 
-def mqtt_connection(port, ca, username, password, accepted=True):
+def mqtt_connection(port, ca, username, password, accepted=True, keepalive=5):
     # create_default_context verifies CA AND localhost SAN; no insecure fallback.
     context = ssl.create_default_context(cafile=str(ca))
     connection = context.wrap_socket(socket.create_connection(('127.0.0.1', port), 2),
@@ -83,7 +83,10 @@ def mqtt_connection(port, ca, username, password, accepted=True):
     def text(value):
         value = value.encode()
         return struct.pack('!H', len(value)) + value
-    body = text('MQTT') + b'\x04\xc2\x00\x05' + text('poc_' + uuid.uuid4().hex)
+    # keepalive=0 disables the broker's idle timeout for long-lived bounded
+    # probes that do not otherwise originate traffic; the default 5s is kept for
+    # every existing caller.
+    body = text('MQTT') + b'\x04\xc2' + struct.pack('!H', keepalive) + text('poc_' + uuid.uuid4().hex)
     body += text(username) + text(password)
     length = len(body)
     encoded = bytearray()

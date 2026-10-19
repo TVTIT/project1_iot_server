@@ -27,11 +27,17 @@ type credentialComposition struct {
 }
 
 func (c credentialComposition) close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.cleanupTimeout)
+	defer cancel()
+	return c.closeContext(ctx)
+}
+
+// closeContext drains credential work using the caller's deadline so a shared
+// shutdown budget covers the credential close together with HTTP and ingress.
+func (c credentialComposition) closeContext(ctx context.Context) error {
 	if c.drain == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), c.cleanupTimeout)
-	defer cancel()
 	return c.drain(ctx)
 }
 

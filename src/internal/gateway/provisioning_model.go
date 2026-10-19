@@ -93,13 +93,24 @@ func ValidateProvisionSensorInput(actorUserID uuid.UUID, input ProvisionSensorIn
 }
 
 func validProvisioningName(value string) bool {
-	return validMetadata(value, 256) && strings.TrimSpace(value) != ""
+	return ValidProvisioningName(value)
 }
 
 func validNullableMetadata(value *string, maxBytes int) bool {
-	return value == nil || validMetadata(*value, maxBytes)
+	return ValidNullableMetadata(value, maxBytes)
 }
 
-func validMetadata(value string, maxBytes int) bool {
+// ValidProvisioningName checks that value <= 256 bytes, valid UTF-8, contains no NUL, and non-empty after TrimSpace.
+func ValidProvisioningName(value string) bool {
+	return ValidMetadata(value, 256) && strings.TrimSpace(value) != ""
+}
+
+// ValidNullableMetadata checks that value is nil or ValidMetadata(*value, maxBytes).
+func ValidNullableMetadata(value *string, maxBytes int) bool {
+	return value == nil || ValidMetadata(*value, maxBytes)
+}
+
+// ValidMetadata checks that len(value) <= maxBytes, valid UTF-8, and contains no NUL.
+func ValidMetadata(value string, maxBytes int) bool {
 	return len(value) <= maxBytes && utf8.ValidString(value) && !strings.ContainsRune(value, '\x00')
 }

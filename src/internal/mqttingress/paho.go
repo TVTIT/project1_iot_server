@@ -1,0 +1,89 @@
+package mqttingress
+
+import (
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+// waitToken is the minimal Paho token surface the transport waits on. It is
+// deliberately narrow so tests can supply a small fake token.
+type waitToken interface {
+	Done() <-chan struct{}
+	Error() error
+}
+
+// subscribeToken additionally exposes the per-filter SUBACK result. Paho's
+// *mqtt.SubscribeToken implements it; a completed token is not proof the
+// subscription was granted, so the transport always reads Result().
+type subscribeToken interface {
+	waitToken
+	Result() map[string]byte
+}
+
+// mqttMessageHandler is the transport's message callback shape. It is invoked
+// from Paho's ordered router goroutine, never a per-message goroutine.
+type mqttMessageHandler func(topic string, payload []byte, retained bool)
+
+// mqttClient is the narrow Paho client boundary the supervisor uses. The real
+// *mqtt.Client is adapted by pahoClient below; tests inject a fake.
+type mqttClient interface {
+	Connect() waitToken
+	Disconnect(quiesce uint)
+	Subscribe(topic string, qos byte, handler mqttMessageHandler) subscribeToken
+	Publish(topic string, qos byte, retained bool, payload []byte) waitToken
+}
+
+// pahoClient adapts a real *mqtt.Client to mqttClient.
+type pahoClient struct{ c mqtt.Client }
+
+func newPahoClient(opts *mqtt.ClientOptions) mqttClient {
+	return &pahoClient{c: mqtt.NewClient(opts)}
+}
+
+func (p *pahoClient) Connect() waitToken { return pahoWait{token: p.c.Connect()} }
+
+func (p *pahoClient) Disconnect(quiesce uint) { p.c.Disconnect(quiesce) }
+
+func (p *pahoClient) Publish(topic string, qos byte, retained bool, payload []byte) waitToken {
+	return pahoWait{token: p.c.Publish(topic, qos, retained, payload)}
+}
+
+func (p *pahoClient) Subscribe(topic string, qos byte, handler mqttMessageHandler) subscribeToken {
+	token := p.c.Subscribe(topic, qos, func(_ mqtt.Client, message mqtt.Message) {
+		handler(message.Topic(), message.Payload(), message.Retained())
+	})
+	if st, ok := token.(*mqtt.SubscribeToken); ok {
+		return &pahoSubscribe{token: st}
+	}
+	return &pahoSubscribe{fallback: pahoWait{token: token}}
+}
+
+type pahoWait struct{ token mqtt.Token }
+
+func (w pahoWait) Done() <-chan struct{} { return w.token.Done() }
+func (w pahoWait) Error() error          { return w.token.Error() }
+
+type pahoSubscribe struct {
+	token    *mqtt.SubscribeToken
+	fallback pahoWait
+}
+
+func (s *pahoSubscribe) Done() <-chan struct{} {
+	if s.token != nil {
+		return s.token.Done()
+	}
+	return s.fallback.Done()
+}
+
+func (s *pahoSubscribe) Error() error {
+	if s.token != nil {
+		return s.token.Error()
+	}
+	return s.fallback.Error()
+}
+
+func (s *pahoSubscribe) Result() map[string]byte {
+	if s.token != nil {
+		return s.token.Result()
+	}
+	return nil
+}

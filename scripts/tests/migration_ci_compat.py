@@ -68,7 +68,10 @@ class Fixture:
     def wait_ready(self, attempts=90):
         for _ in range(attempts):
             try:
-                if self.sql("SELECT count(*) FROM schema_migrations WHERE version = 19 AND name = 'mqtt_simplified_journal';") == '1':
+                if self.sql(
+                    "SELECT count(*) FROM schema_migrations WHERE version = 20 AND name = 'stage3_telemetry_ingestion';",
+                    password=self.passwords['POSTGRES_PASSWORD'],
+                ) == '1':
                     return
             except Failure:
                 pass
@@ -97,6 +100,12 @@ class Fixture:
         self.login('supabase_auth_admin', self.passwords['AUTH_DB_PASSWORD'])
         self.login('supabase_storage_admin', self.passwords['STORAGE_DB_PASSWORD'])
         print('Supabase repeated compatibility, RLS=6, trigger, FK and TCP logins passed.', flush=True)
+        # Apply and verify migration 21 once Auth tables and triggers exist
+        for _ in range(2):
+            self.sql((ROOT / 'migrations/000021_admin_user_management.up.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text())
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version = 21 AND name = 'admin_user_management';", '1')
+        print('Migration 21 repeated compatibility, least-privilege grants and verifier passed.', flush=True)
 
     def cleanup(self):
         if self.id is None:
@@ -123,7 +132,7 @@ def main():
     try:
         fixture.start()
         fixture.wait_ready()
-        print('Fresh compatibility schema 19 ready.', flush=True)
+        print('Fresh compatibility schema 20 ready.', flush=True)
         fixture.verify()
     except Failure as error:
         print(str(error), file=sys.stderr)
