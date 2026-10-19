@@ -22,6 +22,7 @@ type Config struct {
 	MQTTCredentialRuntime      mqttcredential.StartupConfig
 	History                    HistoryConfig
 	Twin                       TwinConfig
+	UserManagement             UserManagementConfig
 	CORSAllowedOrigins         []string
 	ServerPort                 int
 	ServerEnv                  string
@@ -166,6 +167,9 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Twin, err = loadTwin(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.UserManagement, err = loadUserManagement(lookup, cfg.AdminMaxBodyBytes); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
