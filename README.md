@@ -3,12 +3,12 @@
 Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biến thời gian thực từ các Gateway không đồng nhất (heterogeneous Gateways: ESP32, Luckfox Pico Plus, TI AM5728), lưu trữ chuỗi thời gian (time-series) trên TimescaleDB, hỗ trợ truy vấn lịch sử, streaming dữ liệu thời gian thực qua WebSocket, xác thực và phân quyền người dùng thông qua Supabase Auth/RLS, quản lý tải lên media (hình ảnh) qua private storage, và tích hợp phân hệ **Digital Twin** (quản lý thực thể theo chuẩn NGSI-LD, đồng bộ trạng thái `reported_state` / `desired_state`, điều khiển Gateway qua MQTT Transactional Outbox và lưu trữ lịch sử thuộc tính biến thiên theo thời gian).
 
 Đây là kiến trúc/mục tiêu MVP, không phải toàn bộ tính năng đã hoàn thành:
-- **Trạng thái phát triển hiện tại (Stage 2)**:
-  - **Task 2.2**: Đã triển khai xác thực JWT qua Supabase Auth và phân quyền platform admin trên PostgreSQL (`platform_admins`).
-  - **Task 2.3**: Đã triển khai API đọc danh sách Gateway (`/v1/gateways`) và danh sách Sensor (`/v1/gateways/{gateway_id}/sensors`) theo quan hệ thành viên (`user_gateways`).
-  - **Task 2.4**: Đã triển khai hai Admin PUT provision Gateway/Sensor và đồ thị Digital Twin (`twin_entities`, `twin_relationships`, `twin_states`) trong cùng transaction atomically.
-  - **Task 2.5 (Static Legacy Baseline)**: Đã hoàn thành hạ tầng runtime Mosquitto tĩnh (quản lý file mật khẩu `password_file` trong named volume `mosquitto_auth`, atomic replace có lock/fsync, reload qua Unix domain socket sidecar không dùng Docker socket, và probe kiểm chứng kết nối MQTT TLS).
-  - **Task 2.6 (Dynamic Security Lifecycle)**: Đã hoàn thành triển khai 4 endpoint Admin MQTT Credential (`/v1/admin/gateways/{gateway_id}/mqtt-credential*`: GET metadata, POST provision, POST rotate, DELETE revoke), Mosquitto Dynamic Security (DynSec) adapter, hàng rào Ingress Gate fail-closed (khởi động `CLOSED`, chỉ `OPEN` sau khi đối soát authority DB, epoch và recovery checkpoint), recovery checkpoints và chuỗi migration CSDL đến version 16 (`000016_mqtt_event_authority_guard.up.sql`).
+- **Trạng thái phát triển hiện tại**:
+  - **Giai đoạn 2 (Stage 2 Bounded Closeout)**: Đã triển khai xác thực JWT qua Supabase Auth, phân quyền platform admin (`platform_admins`), danh sách trạm/cảm biến (`/v1/gateways*`), provisioning Gateway/Sensor, và chu trình sống Dynamic Security (DynSec) Mosquitto.
+  - **Giai đoạn 3 (Stage 3 Telemetry Uplink Pipeline)**: Đã triển khai pipeline thu thập telemetry từ Gateway qua MQTT TLS đến TimescaleDB, khử trùng lặp `processed_messages`, xác nhận commit-before-ACK qua MQTT application ACK, Gateway simulator với outbox SQLite bền vững, và kiểm chứng tích hợp 9 kịch bản uplink trên runner dịch vụ thật.
+  - **Giai đoạn 4 (Stage 4 History & Digital Twin API - ETSI GS CIM 009 V1.9.1 Profile)**: Đã triển khai và chuẩn hóa 5 endpoint canonical Digital Twin (`GET /v1/digital-twins`, `POST /v1/digital-twins`, `GET /v1/digital-twins/{id}`, `PATCH /v1/digital-twins/{id}/attrs`, `GET /v1/digital-twins/{id}/temporal` kèm query extension `?format=simplified`).
+  - **Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership - Tasks U0–U8)**: Đã triển khai Migration 21 (`000021_admin_user_management.up.sql`), 5 endpoint quản trị tập trung (`POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`), adapter Supabase Auth Admin (với `email_confirm: true`), cơ chế khóa Gateway cha tuần tự, cấm tự hạ quyền admin (`409 Conflict`), và chuyển giao owner nguyên tử (owner cũ trở thành viewer).
+  - **Kiểm chứng CI từ xa (Remote CI Verification)**: GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` đã hoàn thành thành công toàn bộ **16/16 jobs**, bao gồm `lint-and-test` (job 118127109089), `stage4-api-integration` (job 118127109577), `stage3-uplink-integration` (job 118127109787) và `native-compose-smoke` (job 118129034156).
 - **Mặc định môi trường triển khai & Cổng nghiệm thu riêng (Rollout Gates)**:
   - Trên môi trường triển khai chính (root deployment), tính năng quản lý credential MQTT mặc định bị **vô hiệu hóa** (`MQTT_CREDENTIAL_API_ENABLED=false`, các endpoint trả về HTTP `503 credential_runtime_disabled`).
   - Việc kích hoạt trên production yêu cầu các cổng chuyển đổi riêng biệt (separate rollout gates) chưa hoàn thành: kiểm chứng topology Rathole thật không bypass qua Internet, chính sách xử lý mất kết nối CSDL sau khi Ingress Gate OPEN, và quy trình nghiệm thu bàn giao secret qua phần cứng USB/encrypted storage.
@@ -247,6 +247,14 @@ Compose yêu cầu `JWT_SECRET`, `GOTRUE_JWT_ISSUER` và
   - Timeouts HTTP: `READINESS_TIMEOUT` (2s), `HTTP_READ_HEADER_TIMEOUT` (5s), `HTTP_READ_TIMEOUT` (15s), `HTTP_WRITE_TIMEOUT` (30s), `HTTP_IDLE_TIMEOUT` (60s), `SHUTDOWN_TIMEOUT` (10s).
   - MQTT ingress (tắt mặc định): `MQTT_INGRESS_ENABLED` (false), độc lập với credential API và legacy runtime; khi bật yêu cầu `MQTT_BROKER_URL` (`ssl://`, không userinfo/query/fragment), `MQTT_CLIENT_ID`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS_CA_FILE`.
   - Giới hạn MQTT: `MQTT_QUEUE_CAPACITY` (256), `MQTT_WORKER_COUNT` (4), `MQTT_MAX_PAYLOAD_BYTES` (mặc định 64KB, tối đa 1MB).
+  - **Quản trị người dùng & Thành viên Gateway (Admin User Management)**:
+    - `AUTH_ADMIN_BASE_URL`: URL gọi Supabase Auth Admin qua Envoy Gateway (mặc định: `http://supabase-envoy:8000`, ưu tiên cao hơn `SUPABASE_URL`).
+    - `SUPABASE_SERVICE_ROLE_KEY`: Khóa dịch vụ đặc quyền máy chủ nội bộ gọi Auth Admin API (ưu tiên cao hơn `SERVICE_ROLE_KEY`; tuyệt đối không cấp cho client). Nếu để trống, server vẫn khởi động bình thường, 4 endpoint CSDL vẫn hoạt động, chỉ `POST /v1/admin/users` trả HTTP 503 `service_unavailable`.
+    - `AUTH_ADMIN_TIMEOUT`: Ngân sách timeout bao trùm toàn bộ nghiệp vụ user-management service operation (mặc định: `10s`, ưu tiên cao hơn `USER_MANAGEMENT_TIMEOUT`, dải: 100ms..60s).
+    - `AUTH_ADMIN_MAX_BODY_BYTES`: Giới hạn đọc phản hồi từ dịch vụ Auth thượng nguồn (upstream Auth response read bound trong `SupabaseAuthAdapterConfig`, mặc định: `16384` bytes, dải: 1..1048576). Request body từ client gửi lên backend được giới hạn bởi `ADMIN_MAX_BODY_BYTES` (`cfg.AdminMaxBodyBytes`).
+    - `USER_LIST_MAX_USERS`: Giới hạn số lượng tài khoản tối đa trong danh sách (mặc định: `1000`, dải: 1..10000).
+    - `USER_LIST_MAX_MEMBERSHIPS`: Giới hạn số lượng membership tối đa trong danh sách (mặc định: `10000`, dải: 1..100000, bắt buộc $\ge$ `USER_LIST_MAX_USERS`).
+    - `USER_LIST_MAX_RESPONSE_BYTES`: Giới hạn kích thước phản hồi JSON danh sách (mặc định: `2097152` bytes = 2 MiB, dải: 1024..10485760).
 
 ```bash
 docker compose up -d backend
@@ -261,15 +269,15 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
   - `CORS_ALLOWED_ORIGINS` nhận danh sách exact web origin phân tách bằng dấu phẩy. Nếu để trống hoặc không cấu hình, backend tự động vô hiệu hóa quyền cross-origin của trình duyệt nhưng vẫn cho phép các request không có header `Origin` (như `/healthz`, `/readyz` và gọi trực tiếp giữa các service).
   - **Development (Flutter Web)**: Cấu hình cổng cố định cho Flutter Web, ví dụ `http://localhost:12345` trong `.env` (`flutter run -d chrome --web-port=12345`).
   - **Production**: Cấu hình tường minh HTTPS origin của frontend (ví dụ `https://dashboard.example.com`). Origin phải có scheme `http` hoặc `https`, hostname, port số hợp lệ nếu có; cấm path, trailing slash `/`, userinfo, query (kể cả `?` rỗng), fragment (kể cả `#` rỗng) hoặc wildcard `*`; port được khai báo tường minh không được rỗng. Host chỉ chấp nhận `localhost`, IPv4/IPv6 literal hợp lệ, hoặc DNS labels ASCII thông thường. Unicode domain bị từ chối vì backend không thực hiện IDNA; dùng hostname ASCII punycode đã được chuyển đổi (ví dụ `xn--...`) nếu cần. Trailing slash bị từ chối lúc khởi động để bảo đảm khớp origin chính xác.
-  - **Tái tạo container khi đổi biến môi trường**: Khi chỉnh sửa `CORS_ALLOWED_ORIGINS` trong `.env`, cần chạy `docker compose up -d` để Docker Compose tái tạo container backend với biến môi trường mới thay vì `docker compose restart` (lệnh restart không đọc lại `.env`).
+  - **Tái tạo container khi đổi biến môi trường**: Khi chỉnh sửa biến môi trường trong `.env`, cần chạy `docker compose up -d --force-recreate backend` (hoặc `docker compose up -d`) để Docker Compose tái tạo container backend với biến môi trường mới thay vì `docker compose restart` (lệnh restart không đọc lại `.env`).
   - **Phạm vi độc lập (Scope)**: Middleware này chỉ áp dụng cho Go business REST API (`/v1/*`, `/healthz`, `/readyz`). Không bao gồm hay thay thế CORS của Supabase Auth/Storage trên Envoy API Gateway, và không thay thế Origin check khi upgrade kết nối WebSocket (`/v1/ws`).
 - `docker compose stop backend` gửi tín hiệu `SIGTERM` để backend dừng tiếp nhận kết nối mới, hoàn tất request đang xử lý trong thời gian `SHUTDOWN_TIMEOUT` và đóng connection pool PostgreSQL an toàn.
 
 ### 3.3 Áp dụng migration
 
-Hệ thống quản lý schema CSDL thông qua chuỗi **16 migrations** (`000001` đến `000016`):
+Hệ thống quản lý schema CSDL thông qua chuỗi **21 migrations** (`000001` đến `000021`):
 - Các migration `000001` đến `000009` trong `/docker-entrypoint-initdb.d` chỉ tự chạy khi PostgreSQL khởi tạo data volume mới.
-- Từ version 10 trở đi (`000010` đến `000016`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
+- Từ version 10 trở đi (`000010` đến `000021`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
   - `000010`: Bổ sung bảng `platform_admins`, `gateway_mqtt_credentials`, ràng buộc định dạng định danh Gateway/Sensor, và phân quyền tối thiểu (least-privilege) cho role `iot_backend_app`.
   - `000011`: Bổ sung bảng nhật ký audit bất biến `mqtt_credential_events`, quản lý thế hệ `generation` và khóa `idempotency_key`.
   - `000012`: Bổ sung bảng khóa bảo trì toàn cục `mqtt_credential_maintenance`.
@@ -277,6 +285,8 @@ Hệ thống quản lý schema CSDL thông qua chuỗi **16 migrations** (`00000
   - `000014`: Quản lý các điểm checkpoint khôi phục sự cố (`recovery_checkpoint`) và phương án xử lý (`recovery_disposition`).
   - `000015`: Bổ sung rào chắn bảo vệ quyền thẩm định và ranh giới phục hồi lỗi.
   - `000016`: Trigger và rào chắn bảo vệ tính bất biến tuyệt đối của nhật ký audit (`mqtt_event_authority_guard`).
+  - `000020`: Bổ sung schema telemetry ingestion, hypertable raw samples, deduplication ledger và temporal observations cho Stage 3.
+  - `000021`: Bổ sung quyền tối thiểu cho quản trị người dùng (`profiles.full_name`, `platform_admins`), tạo hàm bảo mật `list_admin_users_projection` đọc thông tin định danh an toàn từ `auth.users` cho backend.
 
 Migration `000009` tạo bảng `schema_migrations` sau khi schema hiện hữu đã được đối chiếu. Trên database hiện hữu, chỉ áp dụng migration này sau khi `000006`–`000008` đã được xác minh; không chạy lại các migration hardening khi constraint đã tồn tại.
 
@@ -436,14 +446,25 @@ Các route này đã được triển khai hoàn chỉnh và kiểm thử tích 
 
 *Ghi chú về 4 route cũ đã thu hồi:* Sau chuyển đổi V1.9.1, 4 route cũ gồm `GET /v1/telemetry/history` (404), `GET /v1/digital-twins/{entity_id}/state` (404), `GET /v1/digital-twins/{entity_id}/history` (404), và `PATCH /v1/digital-twins/{entity_id}` (405) đã bị thu hồi hoàn toàn.
 
-#### 3. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
+#### 3. Nhóm Endpoint Quản trị Tài khoản Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership APIs):
+Các route này đã được triển khai hoàn chỉnh theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`), dành riêng cho Platform Admin:
+
+| Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
+|---|---|---|---|---|
+| `POST` | `/v1/admin/users` | Bearer JWT + `platform_admins` | Tạo tài khoản người dùng mới (auto-confirm qua Supabase Auth Admin API), tự động tạo profile | Đã triển khai: HTTP 201 Created kèm `Location: /v1/admin/users/{id}`; HTTP 409 nếu trùng email |
+| `GET` | `/v1/admin/users` | Bearer JWT + `platform_admins` | Lấy danh sách toàn bộ người dùng trong bound kèm `platform_role` và `gateway_roles: [{gateway_id, role}]`; không query/search | Đã triển khai: HTTP 200 OK (`items: [...]`); HTTP 409 nếu vượt giới hạn cấu hình (capacity exceeded) |
+| `PATCH` | `/v1/admin/users/{user_id}` | Bearer JWT + `platform_admins` | Cập nhật nguyên tử tên hiển thị `full_name` (profiles) và/hoặc vai trò `platform_role` (platform_admins) | Đã triển khai: HTTP 200 OK; HTTP 409 nếu tự hạ quyền admin (`self_admin_demotion_forbidden`) |
+| `PUT` | `/v1/admin/gateways/{gateway_id}/users/{user_id}` | Bearer JWT + `platform_admins` | Gán vai trò `operator` hoặc `viewer` cho người dùng trên Gateway trong `user_gateways` | Đã triển khai: HTTP 200 OK; HTTP 400 nếu gán `owner`; HTTP 409 nếu hạ owner hiện tại |
+| `PUT` | `/v1/admin/gateways/{gateway_id}/owner` | Bearer JWT + `platform_admins` | Chuyển giao quyền sở hữu trạm Gateway nguyên tử; owner cũ chuyển thành `viewer` (duy trì quyền đọc) | Đã triển khai: HTTP 200 OK; HTTP 409 nếu trạng thái trạm không có hoặc thừa owner |
+
+#### 4. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
 Hiện tại chỉ còn duy nhất 1 route stub cho WebSocket truyền dữ liệu thời gian thực (thuộc Giai đoạn 7):
 
 | Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
 |---|---|---|---|---|
 | `GET` | `/v1/ws` | Bearer JWT `authenticated` (header) | Nâng cấp kết nối WebSocket để streaming dữ liệu cảm biến thời gian thực | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
 
-#### 4. Nhóm Endpoint dự kiến theo thiết kế MVP (Planned Endpoints):
+#### 5. Nhóm Endpoint dự kiến theo thiết kế MVP (Planned Endpoints):
 Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ án nhưng **chưa được đăng ký trong router** Go backend. Mọi request gửi tới các đường dẫn này sẽ nhận phản hồi HTTP `404 Not Found`:
 
 | Phương thức | Đường dẫn | Xác thực dự kiến | Mô tả theo thiết kế MVP | Giai đoạn |
@@ -456,10 +477,10 @@ Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ á
 
 *Lưu ý quan trọng về các tuyến đường không tồn tại*:
 - Router Go backend hiện **KHÔNG CÓ** endpoint xem chi tiết Gateway đơn lẻ (`GET /v1/gateways/{gateway_id}`) hay Sensor đơn lẻ (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`). Việc đọc danh sách Sensor được thực hiện thông qua route cha `GET /v1/gateways/{gateway_id}/sensors` hoặc endpoint Digital Twin detail `GET /v1/digital-twins/{entity_id}`.
-- Hệ thống hiện **KHÔNG CÓ** REST API công khai hay admin để quản lý thành viên (`user_gateways`). Việc phân quyền, thay đổi vai trò (Owner / Operator / Viewer) hoặc thu hồi quyền thành viên Gateway được thực hiện thông qua công cụ vận hành nội bộ được bảo vệ (protected operator tooling) can thiệp trực tiếp CSDL. Không tuyên bố các API quản lý tài khoản tương lai này là đã hoàn thành.
+- Chức năng quản trị tài khoản và phân quyền thành viên Gateway hiện đã có 5 API quản trị cho Platform Admin (nhóm 3 ở trên). Tuy nhiên, **phạm vi được giới hạn có chủ đích (bounded scope)**: không có API Delete/ban tài khoản, đổi email, đổi/reset mật khẩu, gửi email lời mời, hay xóa membership hoàn toàn.
 - **Mã nguồn ứng dụng Flutter Web client và bộ sưu tập Bruno API collections chưa được cập nhật theo hợp đồng mới** trong đợt bàn giao tài liệu này.
 
-#### 5. Danh mục tính năng tạm hoãn ngoài phạm vi MVP (Deferred Features per AGENTS.md §2):
+#### 6. Danh mục tính năng tạm hoãn ngoài phạm vi MVP (Deferred Features per AGENTS.md §2):
 Các tính năng sau đây đã được quyết định loại bỏ hoặc hoãn lại để đảm bảo tính khả thi cho đồ án đơn thành viên, tránh làm phức tạp kiến trúc và giao diện:
 - **gRPC và gRPC-Web**: Toàn bộ giao tiếp sử dụng REST và WebSocket nhằm loại bỏ chi phí Protobuf, code-generation và proxy phức tạp.
 - **Đăng ký công khai người dùng**: Tự đăng ký (`/auth/v1/signup`) bị vô hiệu hóa; chỉ platform admin được tạo tài khoản người dùng.

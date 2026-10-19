@@ -1,9 +1,11 @@
 # Tài liệu Client — 07: Quy chuẩn Hợp đồng Admin API (Platform Admin API Client Contract)
 
-**Cập nhật:** 2026-10-18
+**Cập nhật:** 2026-10-19
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
 **Tài liệu tham chiếu:**  
-- `AGENTS.md` (Mục 0, 5, 6, 6.5, 7, 10, 15, 16, 18; Stage 4 Progress & Reconciliation)
+- `AGENTS.md` (Mục 0, 5, 6, 6.5, 7, 10, 15, 16, 18; Stage 4 & Admin User Management Progress & Reconciliation)
+- [`docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết quản lý User và Gateway Membership)
+- [`docs/backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan hệ thống)  
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực người dùng và Quản lý phiên)  
 - `docs/client/03_USER_GATEWAY_AUTHORIZATION.md` (Cơ chế phân quyền người dùng và trạm Gateway)  
@@ -13,6 +15,10 @@
 - `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md` (Tích hợp API và Quản lý trạng thái Client)  
 - `docs/protocols/stage4-read-and-entity-api.md` (Đặc tả giao thức Stage 4 Read & Entity Mutation API)
 - `docs/backend/stage-4-history-and-twin-api.md` (Tài liệu tổng kết và bàn giao Stage 4 API)
+- `src/internal/httpserver/admin_user_handlers.go` (Mã nguồn Admin User & Gateway Membership Handlers)
+- `src/internal/usermanagement/service.go` (Domain Service quản lý User và Membership)
+- `src/internal/usermanagement/postgres_repository.go` (PostgreSQL Repository & Transactional Logic)
+- `src/internal/usermanagement/auth_adapter.go` (Supabase Auth Admin HTTP Adapter qua Envoy)
 - `src/internal/httpserver/admin_gateway_handlers.go` (Mã nguồn Admin Gateway Inventory & Provisioning)
 - `src/internal/httpserver/admin_sensor_handlers.go` (Mã nguồn Admin Sensor Provisioning)
 - `src/internal/httpserver/admin_mqtt_credential_handlers.go` (Mã nguồn Admin MQTT Credential Handlers)
@@ -23,20 +29,22 @@
 - `src/internal/digitaltwin/postgres_gateway_patch.go` (Triển khai Transactional Gateway PATCH)
 - `src/internal/digitaltwin/postgres_sensor_patch.go` (Triển khai Transactional Sensor PATCH)
 - `src/cmd/server/credential.go` (Tầng composition Credential & denyOnlyResetPrerequisite)
+- `migrations/000021_admin_user_management.up.sql` (Migration CSDL cấp quyền và security-definer function)
 - [docs/dynsec/INDEX.md](../dynsec/INDEX.md) (Tổng quan kiến trúc và ma trận bằng chứng DynSec)
 - [docs/dynsec/flows-and-api.md](../dynsec/flows-and-api.md) (Chi tiết các luồng vận hành và hợp đồng HTTP API DynSec)
 - [docs/dynsec/limitations-and-backlog.md](../dynsec/limitations-and-backlog.md) (Hạn chế kỹ thuật và tồn đọng DynSec)
-- **Kiểm chứng Remote CI:** GitHub Actions Run [39103564379](https://github.com/TVTIT/project1_iot_server/actions/runs/39103564379) tại clean commit `aa7436d8838a6580c21b30930e2eed992999b11c` (16/16 jobs hoàn thành thành công, bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`).
+- **Kiểm chứng Remote CI:** GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` (16/16 jobs hoàn thành thành công, bao gồm `lint-and-test` job 118127109089, `stage4-api-integration` job 118127109577, `stage3-uplink-integration` job 118127109787, và `native-compose-smoke` job 118129034156).
 
 ---
 
 ## 1. Mục tiêu và Ranh giới Phạm vi (Scope & Architectural Boundaries)
 
 Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản trị nền tảng (Platform Admin API Client Contract)** chính thức cho:
-1. Bảy (07) endpoint quản trị Stage 2 thuộc tiền tố `/v1/admin/*` đã được hiện thực trong mã nguồn Go backend (`src/cmd/server`, `src/internal/httpserver`), cùng 1 tuyến đường reset có giám sát đã đăng ký cú pháp nhưng áp dụng rào chắn an toàn fail-closed.
+1. Bảy (07) endpoint quản trị hạ tầng Stage 2 thuộc tiền tố `/v1/admin/*` đã được hiện thực trong mã nguồn Go backend (`src/cmd/server`, `src/internal/httpserver`), cùng 1 tuyến đường reset có giám sát đã đăng ký cú pháp nhưng áp dụng rào chắn an toàn fail-closed.
 2. Hai (02) endpoint khởi tạo thực thể và biến đổi siêu dữ liệu (Entity Creation & Metadata Mutation) Stage 4 thuộc tiền tố `/v1/digital-twins` (`POST /v1/digital-twins` và `PATCH /v1/digital-twins/{entity_id}/attrs`) có liên quan trực tiếp đến thẩm quyền Platform Admin và Gateway Owner.
+3. Năm (05) endpoint quản trị tài khoản người dùng và quyền thành viên Gateway (Admin User & Gateway Membership Management) mới được hiện thực theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`): `POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, và `PUT /v1/admin/gateways/{gateway_id}/owner`.
 
-### 1.1 Danh mục Endpoint Quản trị Stage 2 và Endpoint Biến đổi Metadata Stage 4
+### 1.1 Danh mục Endpoint Quản trị Hệ thống
 
 #### A. Nhóm Endpoint Quản trị Hạ tầng Stage 2 (`/v1/admin/*`):
 1. `GET /v1/admin/gateways`: Danh mục kiểm kê Gateway toàn hệ thống (Admin Gateway Inventory) cho Platform Admin, độc lập với tư cách thành viên, hỗ trợ phân trang keyset cursor (`limit`, `after`).
@@ -54,6 +62,18 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
 #### B. Nhóm Endpoint Khởi tạo Thực thể và Sửa đổi Metadata Stage 4 (`/v1/digital-twins`):
 8. `POST /v1/digital-twins`: Khởi tạo mới hoặc gửi lại trùng khớp (Create-or-Exact-Replay) thực thể Digital Twin Gateway hoặc Sensor theo chuẩn NGSI-LD; trả về `201 Created` kèm header `Location: /v1/digital-twins/<escaped_urn>` khi tạo mới hoặc `200 OK` (không Location) khi replay trùng khớp hoàn toàn payload cũ; trả về `409 Conflict` nếu trùng định danh nhưng sai lệch thông tin biểu diễn.
 9. `PATCH /v1/digital-twins/{entity_id}/attrs`: Cập nhật siêu dữ liệu hiển thị (`name`, `description`) của thực thể Gateway hoặc Sensor thông qua Property fragment chuẩn hóa theo V1.9.1 profile; trả về `200 OK` kèm bản ghi metadata đã cập nhật (hoặc giữ nguyên timestamp nếu gửi bản vá trùng giá trị hiện tại — no-op). Đường dẫn gốc không có `/attrs` nhận `405 Method Not Allowed`.
+
+#### C. Nhóm Endpoint Quản trị Tài khoản Người dùng và Thành viên Gateway (`/v1/admin/users`, `/v1/admin/gateways/...`):
+10. `POST /v1/admin/users`: Tạo tài khoản người dùng mới (được cấu hình `email_confirm: true` qua Supabase Auth Admin API), tự động tạo bản ghi hồ sơ `public.profiles`, trả về `201 Created` kèm header `Location: /v1/admin/users/{id}` và bản ghi tài khoản không chứa secret.
+11. `GET /v1/admin/users`: Truy vấn danh sách toàn bộ người dùng trong giới hạn tài nguyên cấu hình (`items: [...]`), kèm thông tin vai trò nền tảng `platform_role` và danh sách quyền Gateway `gateway_roles: [{gateway_id, role}]`, không hỗ trợ query pagination/search, vượt giới hạn trả về `409 Conflict` (không cắt xén partial list).
+12. `PATCH /v1/admin/users/{user_id}`: Cập nhật nguyên tử trong một transaction tên hiển thị `full_name` (trong `public.profiles`) và/hoặc vai trò nền tảng `platform_role` (cấp/thu hồi `public.platform_admins`), cấm tự hạ quyền admin (`409 Conflict`).
+13. `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`: Gán vai trò thành viên `operator` hoặc `viewer` cho người dùng trên Gateway trong `public.user_gateways`; từ chối gán `owner` qua route này (`400 Bad Request`); nếu người dùng đang là owner thì từ chối (`409 Conflict`).
+14. `PUT /v1/admin/gateways/{gateway_id}/owner`: Chuyển giao quyền sở hữu trạm Gateway nguyên tử trong `public.user_gateways`: người nhận trở thành `owner`, owner cũ được hạ thành `viewer` (bảo toàn quyền đọc, không xóa membership), bảo toàn ràng buộc duy nhất một owner trên trạm.
+
+**Ranh giới phạm vi nghiệp vụ tài khoản (Account CRUD Bounded Scope):**
+Chức năng quản trị tài khoản qua Go Backend được giới hạn nghiêm ngặt theo danh mục 5 endpoint trên:
+- **ĐÃ TRIỂN KHAI:** Tạo tài khoản kèm mật khẩu (auto-confirm), xem danh sách toàn bộ kèm quyền trạm, đổi tên hiển thị, cấp/thu hồi quyền Platform Admin, gán quyền operator/viewer, và chuyển quyền sở hữu trạm Gateway.
+- **NGOÀI PHẠM VI (KHÔNG TRIỂN KHAI):** Xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu người dùng, reset mật khẩu, gửi email lời mời (invitations), tự đăng ký công khai (public signup), hoặc xóa hoàn toàn bản ghi thành viên (`DELETE membership`). Khi cần xử lý các tác vụ ngoài phạm vi này, quản trị viên sử dụng công cụ quản trị hạ tầng (Supabase Studio / CLI) dưới sự giám sát trực tiếp.
 
 ---
 
@@ -86,7 +106,10 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
     - Toàn bộ các API truy vấn chuỗi thời gian và trạng thái trạm (`GET /v1/digital-twins`, `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}?format=simplified`, `GET /v1/digital-twins/{entity_id}/temporal`) đều thực thi thẩm định quyền thành viên thông qua CTE SQL `user_gateways`. Các route cũ (`/v1/telemetry/history`, `/{id}/state`, `/{id}/history`) đã thu hồi và luôn trả về `404 Not Found`.
     - **Platform Admin KHÔNG được tự động bypass bộ lọc này:** Một Platform Admin thực hiện khởi tạo trạm (`POST /v1/digital-twins` hoặc `PUT /v1/admin/gateways/{id}`) và gán cho người khác làm `owner_user_id` thì chính Admin đó **KHÔNG THỂ** đọc dữ liệu viễn trắc, trạng thái hiện thời, hay lịch sử của trạm đó (nhận `404 Not Found`), trừ khi Admin được thêm bản ghi vào `user_gateways` cho trạm tương ứng.
 - **Không sáng tác endpoint tự kiểm tra quyền Admin (No Admin Self-Query Endpoint):** Go backend hiện tại không cung cấp endpoint kiểu `/v1/admin/me` hay `/v1/admin/whoami`. Phía client không được sáng tác hoặc gọi các endpoint giả định này.
-- **Không có API CRUD người dùng hoặc quản lý thành viên qua Go Backend:** Việc tạo tài khoản người dùng và gán phân quyền thành viên `user_gateways` hiện vẫn được thực thi thông qua công cụ quản trị hạ tầng của Supabase Auth (Admin API / Studio) và script nội bộ an toàn (xem [Tài liệu 03](03_USER_GATEWAY_AUTHORIZATION.md)). Khóa hạ tầng đặc quyền `service_role` tuyệt đối không bao giờ được cấu hình hay chia sẻ cho client.
+- **Phạm vi API Quản lý Tài khoản & Quyền Thành viên qua Go Backend:**
+  - Khác với giai đoạn trước (khi toàn bộ việc tạo tài khoản phải thực hiện thủ công qua Supabase Studio), Go Backend hiện cung cấp năm (05) endpoint quản trị tài khoản và quyền thành viên dưới `/v1/admin/users` và `/v1/admin/gateways/...` dành riêng cho Platform Admin (thẩm định qua `public.platform_admins`).
+  - **Khóa hạ tầng đặc quyền `SUPABASE_SERVICE_ROLE_KEY` TUYỆT ĐỐI KHÔNG chia sẻ cho client:** Backend sử dụng khóa này ở tầng server nội bộ để gọi sang Supabase Auth Admin API thông qua Envoy Gateway (`http://supabase-envoy:8000/auth/v1/admin/users`). Human caller chỉ gửi JWT cá nhân (`role: "authenticated"`).
+  - **Ranh giới Bounded CRUD:** Backend chỉ hỗ trợ tạo tài khoản, đọc danh sách, đổi tên/vai trò toàn cục, gán operator/viewer và chuyển owner. Backend **KHÔNG** cung cấp API Delete/ban tài khoản, đổi email, đổi/reset mật khẩu, gửi email lời mời, hay xóa hoàn toàn membership.
 - **Trạng thái cấu hình Root Docker Compose: Tính năng Credential API mặc định TẮT:**
   - Trong tệp cấu hình triển khai `docker-compose.yml`, biến môi trường được đặt mặc định là:
     ```yaml
@@ -107,6 +130,8 @@ Mọi request gửi tới các endpoint quản trị đều phải trải qua ch
        v
 1. Request ID & Cache Gate Middleware
    - Sinh hoặc xác thực X-Request-ID (1..128 ký tự an toàn)
+   - Tuyến đường admin user management (/v1/admin/users, /v1/admin/gateways/.../users, /v1/admin/gateways/.../owner):
+     Gán Cache-Control: no-store trên toàn bộ 5 route; gán thêm Pragma: no-cache trên các mutation (POST, PATCH, PUT)
    - Tuyến đường admin inventory (GET /v1/admin/gateways) và credential gán: Cache-Control: no-store, Pragma: no-cache
    - Tuyến đường provisioning (PUT) gán: Cache-Control: no-store
        |
@@ -132,7 +157,10 @@ Mọi request gửi tới các endpoint quản trị đều phải trải qua ch
        |
        v
 5. Request Parser & Input Validation
-   - Kiểm tra Query Parameters, Content-Type, Kích thước Body, Cú pháp JSON khắt khe
+   - Kiểm tra Query Parameters (cấm query lạ/thừa trên POST/PATCH/PUT/GET /v1/admin/users)
+   - Kiểm tra Content-Type (bắt buộc application/json trên mutation body)
+   - Giới hạn kích thước Body nghiêm ngặt (ADMIN_MAX_BODY_BYTES)
+   - Kiểm tra cú pháp JSON khắt khe (cấm duplicate keys, unknown fields, null values trên non-nullable fields)
    -> Vi phạm: HTTP 400 Bad Request, HTTP 413 Payload/Request Too Large, hoặc HTTP 415 Unsupported Media Type
        |
        v
@@ -996,7 +1024,331 @@ Tuyến đường này đã được định tuyến tại `src/internal/httpser
 
 ---
 
-## 5. Bảng Ánh xạ Mã Lỗi Nghiệp vụ Credential Chi tiết (Error Code Mapping Table)
+## 5. Chi tiết Các Endpoint Quản trị Tài khoản Người dùng và Quyền Thành viên Gateway (Admin User & Gateway Membership APIs)
+
+Nhóm 5 endpoint này được hiện thực nhằm đáp ứng năng lực quản trị người dùng và phân quyền Gateway tập trung dành cho Platform Admin theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`), giải quyết hoàn toàn hạn chế trước đây khi phải can thiệp thủ công qua Supabase Studio.
+
+### 5.1 Tạo Tài khoản Người dùng Mới: `POST /v1/admin/users`
+
+Endpoint này cho phép Platform Admin tạo tài khoản người dùng mới trực tiếp thông qua Go Backend. Backend gọi Supabase Auth Admin API (thông qua Envoy Gateway) với cờ `email_confirm: true`, tự động sinh bản ghi hồ sơ trong `public.profiles`.
+
+- **HTTP Method:** `POST`
+- **Đường dẫn:** `/v1/admin/users`
+- **Yêu cầu xác thực & Thẩm quyền:**
+  - Bearer JWT của người dùng đã xác thực (`role == "authenticated"`).
+  - Bắt buộc phải có quyền Platform Admin trong bảng `public.platform_admins`.
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+  - `Content-Type: application/json`
+  - `X-Request-ID: <id>` (khuyến nghị)
+- **Response Headers:**
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+  - `Location: /v1/admin/users/<user_id>` (khi `201 Created`)
+- **Quy tắc Kiểm tra Cú pháp & Ranh giới Dữ liệu (Strict Validation):**
+  - Cấm query string (`?`) trên URL; vi phạm trả về `400 Bad Request` (`code: "invalid_request"`).
+  - Kích thước Body client gửi lên bị giới hạn bởi `ADMIN_MAX_BODY_BYTES` (mặc định 16 KiB, tối đa 1 MiB); vượt quá trả về `413 Payload Too Large` (`code: "payload_too_large"`). Phản hồi từ dịch vụ Auth thượng nguồn được giới hạn đọc an toàn bởi `AUTH_ADMIN_MAX_BODY_BYTES` trong Go adapter.
+  - Cấm trường lạ (unknown fields) hoặc trùng lặp khóa JSON -> `400 Bad Request`.
+  - `full_name` (string, bắt buộc): Chuỗi UTF-8 hợp lệ, độ dài từ 1 đến 256 bytes, không được để trống hoặc chỉ chứa khoảng trắng. Không nhận alias `name`.
+  - `email` (string, bắt buộc): Định dạng email hợp lệ theo RFC 5322, tối đa 254 bytes. Khoảng trắng ngoài rìa được chuẩn hóa tự động; giữ nguyên chữ hoa/thường (case-preserving). Cấm chứa ký tự điều khiển, newline, hoặc display-name.
+  - `password` (string, bắt buộc): Mật khẩu do Admin nhập. Độ dài bắt buộc từ 6 ký tự (runes) đến tối đa 72 bytes UTF-8 (phù hợp với giới hạn thuật toán bcrypt của GoTrue). Không được để trống.
+  - Cấm client gửi `platform_role`, membership, `email_confirm`, hay UUID trong body POST.
+- **Hành vi Xử lý Phía Server:**
+  - Backend kiểm tra quyền Platform Admin của actor trong CSDL trước khi tạo tác dụng phụ sang Auth.
+  - Backend gọi sang Supabase Auth Admin API nội bộ với `email_confirm: true` và `user_metadata: {"full_name": ...}`.
+  - Sau khi Auth tạo tài khoản, backend xác minh bản ghi hồ sơ `public.profiles` đã được tạo tương ứng với đúng tên, đồng thời xác nhận tài khoản mới chưa có quyền `platform_admin` và chưa có membership Gateway nào.
+  - Tài khoản mới tạo là người dùng thông thường (`platform_role: "user"`) và chưa có quyền trên bất kỳ trạm nào (`gateway_roles: []`). Người dùng có thể đăng nhập ngay bằng email/mật khẩu qua `POST /auth/v1/token?grant_type=password` mà không cần xác nhận email qua SMTP.
+- **Request Body Mẫu:**
+  ```json
+  {
+    "full_name": "Nguyen Van A",
+    "email": "nguyenvana@example.com",
+    "password": "SecurePassword123!"
+  }
+  ```
+- **Response Phản hồi Thành công (`201 Created`):**
+  ```http
+  HTTP/1.1 201 Created
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+  Pragma: no-cache
+  Location: /v1/admin/users/11111111-2222-3333-4444-555555555555
+  X-Request-ID: 00000000-0000-0000-0000-000000000101
+
+  {
+    "id": "11111111-2222-3333-4444-555555555555",
+    "email": "nguyenvana@example.com",
+    "full_name": "Nguyen Van A",
+    "platform_role": "user",
+    "created_at": "2026-10-19T10:00:00Z"
+  }
+  ```
+  *(Lưu ý an toàn: Phản hồi tuyệt đối không chứa mật khẩu, hash mật khẩu, hoặc token xác thực).*
+- **Các Trường hợp Lỗi Nghiệp vụ:**
+  - `409 Conflict` (`code: "user_already_exists"`): Email đã được đăng ký trong hệ thống.
+  - `400 Bad Request` (`code: "invalid_request"`): Vi phạm định dạng email, mật khẩu quá ngắn (<6 ký tự) hoặc quá dài (>72 bytes), tên để trống hoặc chứa UTF-8 không hợp lệ.
+  - `503 Service Unavailable` (`code: "service_unavailable"`): Dịch vụ Supabase Auth không phản hồi, bị timeout, hoặc kiểm tra hồ sơ sau tạo thất bại.
+  - *Xử lý sự cố timeout/không rõ kết quả (Uncertain Outcome):* Nếu request gặp timeout hoặc lỗi 503, backend **tuyệt đối không tự ý xóa tài khoản (no automatic rollback deletion)** và client **không được tự động thử lại mù quáng (no blind retry)**. Quản trị viên cần gọi `GET /v1/admin/users` để kiểm tra tài khoản đã tồn tại hay chưa trước khi tiến hành bước tiếp theo.
+
+---
+
+### 5.2 Truy vấn Toàn bộ Danh sách Người dùng: `GET /v1/admin/users`
+
+Endpoint này cung cấp danh sách toàn bộ tài khoản người dùng trong hệ thống, bao gồm vai trò nền tảng (`platform_role`) và danh sách các quyền trạm Gateway (`gateway_roles`), phục vụ giao diện quản trị phân quyền mà không cần thực hiện N+1 truy vấn.
+
+- **HTTP Method:** `GET`
+- **Đường dẫn:** `/v1/admin/users`
+- **Yêu cầu xác thực & Thẩm quyền:**
+  - Bearer JWT của Platform Admin (`public.platform_admins`).
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+- **Response Headers:**
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+- **Quy tắc Kiểm tra Cú pháp & Giới hạn Tài nguyên (Bounds & Capacity):**
+  - **Cấm tuyệt đối Query Parameters:** Bất kỳ query string nào (ví dụ: `?limit=10`, `?search=abc`) đều bị từ chối với `400 Bad Request` (`code: "invalid_request"`). Không hỗ trợ phân trang hay tìm kiếm phía server.
+  - **Cấm Request Body:** Body gửi kèm phải hoàn toàn rỗng; vi phạm trả về `400 Bad Request`.
+  - **Ranh giới tài nguyên cấu hình:**
+    - `USER_LIST_MAX_USERS` (mặc định 1.000, cấu hình từ 1 đến 10.000).
+    - `USER_LIST_MAX_MEMBERSHIPS` (mặc định 10.000, cấu hình từ 1 đến 100.000).
+    - `USER_LIST_MAX_RESPONSE_BYTES` (mặc định 2 MiB, cấu hình từ 1 KiB đến 10 MiB).
+  - **Cơ chế Phát hiện Tràn Giới hạn (Overflow Detection):** Backend truy vấn cơ sở dữ liệu với giới hạn `bound + 1`. Nếu số lượng người dùng vượt quá `MaxUsers`, số lượng membership vượt quá `MaxMemberships`, hoặc dung lượng JSON vượt quá `MaxResponseBytes`, server phản hồi ngay lập tức mã lỗi **`409 Conflict`** (`code: "user_list_capacity_exceeded"`), **tuyệt đối không âm thầm cắt ngắn danh sách (no silent truncation)** và không trả về danh sách một phần.
+- **Hành vi Sắp xếp & Nguồn Dữ liệu:**
+  - Danh sách người dùng được sắp xếp ổn định: `created_at ASC, id ASC`.
+  - Danh sách quyền trạm `gateway_roles` của mỗi người dùng được sắp xếp ổn định theo `gateway_id ASC`.
+  - Trường `full_name` được lấy duy nhất từ `public.profiles.full_name` (dạng con trỏ nullable `*string` để giữ nguyên tính trung thực của các tài khoản legacy nếu thiếu tên, không tự bịa chuỗi rỗng `""`). Sau khi đổi tên qua PATCH, tên mới là nguồn chân lý duy nhất (không fallback sang Auth metadata).
+  - Dữ liệu định danh được đọc thông qua hàm bảo mật `public.list_admin_users_projection` (quyền hạn hẹp, không để lộ mật khẩu, hash hay token). Nếu phát hiện tài khoản Auth tồn tại nhưng thiếu bản ghi `profiles`, hàm trả lỗi bất nhất (`ErrInconsistentProfile`) thay vì bỏ qua tài khoản.
+- **Response Phản hồi Thành công (`200 OK`):**
+  ```http
+  HTTP/1.1 200 OK
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+  Pragma: no-cache
+  X-Request-ID: 00000000-0000-0000-0000-000000000102
+
+  {
+    "items": [
+      {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "email": "admin@example.com",
+        "full_name": "System Administrator",
+        "platform_role": "platform_admin",
+        "created_at": "2026-08-24T00:00:00Z",
+        "gateway_roles": [
+          {
+            "gateway_id": "gw-001",
+            "role": "owner"
+          }
+        ]
+      },
+      {
+        "id": "11111111-2222-3333-4444-555555555555",
+        "email": "nguyenvana@example.com",
+        "full_name": "Nguyen Van A",
+        "platform_role": "user",
+        "created_at": "2026-10-19T10:00:00Z",
+        "gateway_roles": []
+      }
+    ]
+  }
+  ```
+  *(Nếu hệ thống chưa có người dùng nào, phản hồi trả về `{"items": []}`).*
+
+---
+
+### 5.3 Cập nhật Tên hiển thị và Quyền Nền tảng: `PATCH /v1/admin/users/{user_id}`
+
+Endpoint này cho phép cập nhật tên hiển thị người dùng và/hoặc gán/thu hồi quyền Platform Admin toàn hệ thống trong một giao dịch cơ sở dữ liệu duy nhất.
+
+- **HTTP Method:** `PATCH`
+- **Đường dẫn:** `/v1/admin/users/{user_id}` (với `{user_id}` là chuỗi UUID v4 hợp lệ khác nil).
+- **Yêu cầu xác thực & Thẩm quyền:**
+  - Bearer JWT của Platform Admin.
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+  - `Content-Type: application/json`
+- **Response Headers:**
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+- **Quy tắc Kiểm tra Request:**
+  - Kích thước Body giới hạn theo `ADMIN_MAX_BODY_BYTES`.
+  - Body phải chứa ít nhất một trong hai trường: `full_name` hoặc `platform_role`.
+  - Cấm truyền giá trị `null` cho các trường có mặt trong payload (`400 Bad Request`).
+  - `full_name` (string, tùy chọn): 1 đến 256 bytes UTF-8, không được chứa toàn khoảng trắng. Sửa trực tiếp vào `public.profiles.full_name`.
+  - `platform_role` (string, tùy chọn): Chỉ chấp nhận đúng 2 giá trị `"platform_admin"` hoặc `"user"`. Mọi giá trị khác (kể cả `"authenticated"`, `"service_role"`, `"owner"`) đều bị từ chối với `400 Bad Request`.
+- **Nguyên tắc Giao dịch & An toàn Nghiệp vụ:**
+  - **Thực thi nguyên tử trong Transaction:** Cập nhật tên và vai trò diễn ra trong cùng một transaction PostgreSQL có khóa dòng `FOR UPDATE` trên bản ghi profile. Nếu việc gán vai trò thất bại, phần đổi tên cũng tự động được rollback.
+  - **Cấm tuyệt đối tự hạ quyền Admin (Self-Demotion Forbidden):**
+    - Nếu `actor_id == user_id` và yêu cầu `platform_role: "user"`, server từ chối ngay lập tức với mã HTTP **`409 Conflict`** (`code: "self_admin_demotion_forbidden"`).
+    - Quy tắc này áp dụng ngay cả khi request kết hợp cả đổi tên và hạ quyền: toàn bộ request bị từ chối và tên không bị thay đổi.
+    - Quản trị viên được phép tự đổi tên của chính mình (`full_name`) hoặc gửi `platform_role: "platform_admin"` cho chính mình dưới dạng no-op.
+  - **Không có chính sách bảo vệ admin cuối cùng (No Last-Admin Count Policy):** Hệ thống không thực hiện đếm tổng số admin để khóa việc hạ quyền của admin khác. Một admin có thể hạ quyền của một admin khác miễn là không tự hạ quyền chính mình.
+  - **Xử lý No-op an toàn:** Nếu gán vai trò `"platform_admin"` cho người đã là admin, hệ thống thực thi no-op (`ON CONFLICT DO NOTHING`), bảo toàn nguyên vẹn thông tin người cấp ban đầu (`granted_by`) và thời điểm cấp (`granted_at`).
+  - **Hiệu lực quyền tức thì ở request kế tiếp:** Việc thêm hoặc xóa dòng trong `public.platform_admins` có hiệu lực ngay lập tức ở lần kiểm tra CSDL tiếp theo. Token JWT không cần cấp lại và không cần chờ token hết hạn.
+- **Request Body Mẫu:**
+  ```json
+  {
+    "full_name": "Nguyen Van A (Cap nhat)",
+    "platform_role": "platform_admin"
+  }
+  ```
+- **Response Phản hồi Thành công (`200 OK`):**
+  ```http
+  HTTP/1.1 200 OK
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+  Pragma: no-cache
+  X-Request-ID: 00000000-0000-0000-0000-000000000103
+
+  {
+    "id": "11111111-2222-3333-4444-555555555555",
+    "full_name": "Nguyen Van A (Cap nhat)",
+    "platform_role": "platform_admin"
+  }
+  ```
+- **Các Trường hợp Lỗi Nghiệp vụ:**
+  - `409 Conflict` (`code: "self_admin_demotion_forbidden"`): Admin tự gửi yêu cầu hạ quyền admin của chính mình.
+  - `404 Not Found` (`code: "not_found"`): Không tìm thấy người dùng mục tiêu trong `public.profiles`.
+  - `400 Bad Request` (`code: "invalid_request"`): Body rỗng, chứa trường lạ, hoặc giá trị role không hợp lệ.
+
+---
+
+### 5.4 Gán Quyền Operator / Viewer trên Gateway: `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`
+
+Endpoint này cho phép Platform Admin gán hoặc cập nhật vai trò thành viên thông thường (`operator` hoặc `viewer`) cho người dùng trên một trạm Gateway cụ thể.
+
+- **HTTP Method:** `PUT`
+- **Đường dẫn:** `/v1/admin/gateways/{gateway_id}/users/{user_id}`
+- **Yêu cầu xác thực & Thẩm quyền:**
+  - Bearer JWT của Platform Admin.
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+  - `Content-Type: application/json`
+- **Response Headers:**
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+- **Quy tắc Kiểm tra Request:**
+  - `gateway_id`: Định dạng Gateway ID hợp lệ (1..64 ký tự, regex chuẩn, khác `backend_service`).
+  - `user_id`: UUID v4 hợp lệ khác nil.
+  - Body: JSON object chứa đúng một trường `role`.
+  - `role` (string, bắt buộc): **Chỉ chấp nhận `"operator"` hoặc `"viewer"`.**
+  - **Cấm vai trò `owner` qua endpoint này:** Nếu gửi `{"role": "owner"}`, server phản hồi mã HTTP **`400 Bad Request`** với mã lỗi `code: "invalid_role"` và thông báo `"owner role requires owner transfer endpoint"`. Thao tác gán owner bắt buộc phải qua endpoint chuyển giao quyền sở hữu riêng biệt.
+- **Nguyên tắc Giao dịch & An toàn Nghiệp vụ:**
+  - **Khóa trạm Gateway (`FOR UPDATE`):** Transaction khóa dòng của Gateway mục tiêu, đảm bảo các thao tác gán quyền và chuyển giao chủ sở hữu trên cùng trạm được tuần tự hóa an toàn.
+  - **Xác thực tồn tại:** Cả trạm Gateway và người dùng mục tiêu đều phải tồn tại trong CSDL (`404 Not Found` nếu thiếu một trong hai).
+  - **Bảo vệ vị thế Chủ sở hữu hiện tại (Existing Owner Protection):** Nếu người dùng mục tiêu hiện đang là `owner` của Gateway này, server từ chối hạ quyền với mã HTTP **`409 Conflict`** (`code: "owner_transfer_required"`). Không thể hạ quyền owner thành operator/viewer thông qua API này.
+  - **Bảo toàn `created_at` khi cập nhật:**
+    - Nếu người dùng chưa có membership: Thêm mới bản ghi vào `public.user_gateways`.
+    - Nếu người dùng đã có vai trò operator/viewer: Cập nhật trường `role`. Thời điểm cấp ban đầu (`created_at`) được giữ nguyên vẹn.
+    - Nếu gửi lại đúng vai trò hiện tại: Server thực hiện no-op an toàn và trả về `200 OK`.
+- **Request Body Mẫu:**
+  ```json
+  {
+    "role": "operator"
+  }
+  ```
+- **Response Phản hồi Thành công (`200 OK`):**
+  ```http
+  HTTP/1.1 200 OK
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+  Pragma: no-cache
+  X-Request-ID: 00000000-0000-0000-0000-000000000104
+
+  {
+    "gateway_id": "gw-001",
+    "user_id": "11111111-2222-3333-4444-555555555555",
+    "role": "operator"
+  }
+  ```
+
+---
+
+### 5.5 Chuyển Quyền Sở hữu Gateway: `PUT /v1/admin/gateways/{gateway_id}/owner`
+
+Endpoint này cho phép Platform Admin chuyển giao quyền chủ sở hữu (`owner`) của trạm Gateway cho một người dùng khác một cách nguyên tử tuyệt đối.
+
+- **HTTP Method:** `PUT`
+- **Đường dẫn:** `/v1/admin/gateways/{gateway_id}/owner`
+- **Yêu cầu xác thực & Thẩm quyền:**
+  - Bearer JWT của Platform Admin.
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+  - `Content-Type: application/json`
+- **Response Headers:**
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+- **Quy tắc Kiểm tra Request:**
+  - `gateway_id`: Định dạng Gateway ID hợp lệ khác `backend_service`.
+  - Body: JSON object chứa trường `user_id` của chủ sở hữu mới.
+  - `user_id` (string, bắt buộc): Chuỗi UUID v4 hợp lệ khác nil của người dùng nhận quyền sở hữu.
+- **Nguyên tắc Giao dịch Nguyên tử (Atomic Owner Transfer Semantics):**
+  Thao tác diễn ra trong đúng một transaction duy nhất với các bước kiểm tra chặt chẽ:
+  1. Tái thẩm định quyền Platform Admin của actor trong transaction.
+  2. Khóa dòng trạm Gateway mục tiêu bằng `SELECT ... FOR UPDATE` (cùng cơ chế khóa với endpoint 5.4).
+  3. Xác thực người dùng mục tiêu tồn tại trong `public.profiles` (`404 Not Found` nếu không tồn tại).
+  4. Đọc danh sách owner hiện tại của trạm kèm khóa `FOR UPDATE`: Bắt buộc phải có **đúng 1 owner hiện hữu**. Nếu trạm có 0 owner hoặc nhiều hơn 1 owner, server fail-closed và trả về mã lỗi **`409 Conflict`** (`code: "gateway_owner_inconsistent"`), tuyệt đối không tự ý sửa dữ liệu legacy.
+  5. Nếu người dùng mục tiêu chính là owner hiện tại: Transaction commit ngay dưới dạng no-op an toàn và trả về `200 OK`.
+  6. **Chuyển giao và Hạ quyền Owner cũ thành Viewer (Demote Old Owner to Viewer):**
+     - Bản ghi membership của owner cũ được cập nhật thành `role = 'viewer'`.
+     - Owner cũ **tiếp tục duy trì quyền đọc** dữ liệu trạm và viễn trắc; quyền ghi cảm biến bị thu hồi (`403 Forbidden`). Thời điểm tạo ban đầu (`created_at`) của owner cũ được bảo toàn.
+  7. **Thăng cấp Người nhận thành Owner:**
+     - Nếu người nhận đã có vai trò `operator` hoặc `viewer`: Cập nhật thành `role = 'owner'`, giữ nguyên `created_at`.
+     - Nếu người nhận chưa có membership: Thêm mới bản ghi với `role = 'owner'`.
+  8. **Kiểm tra Hậu điều kiện (Post-condition Verification):** Truy vấn lại số lượng owner của trạm trong transaction, khẳng định còn đúng 1 owner duy nhất trước khi Commit.
+- **Tác động Nghiệp vụ Quan trọng:**
+  - Thao tác chuyển owner **chỉ thay đổi bảng thành viên `public.user_gateways`**. Không đặt lại hoặc ảnh hưởng đến thực thể Digital Twin, `reported_state`, `desired_state`, chuỗi thời gian hay thông tin xác thực MQTT của Gateway.
+  - **Tác động tới Gateway Provisioning Replay:** Sau khi chuyển owner, nếu một request tạo Gateway cũ gửi lại (`PUT /v1/admin/gateways/{gateway_id}`) với thông tin `owner_user_id` là owner cũ, Go backend sẽ phản hồi **`409 Conflict`** do vi phạm kiểm tra trùng khớp chủ sở hữu (theo đúng quy chuẩn replay bất biến). Quản trị viên và client cần ghi nhận hành vi chuẩn này.
+- **Request Body Mẫu:**
+  ```json
+  {
+    "user_id": "11111111-2222-3333-4444-555555555555"
+  }
+  ```
+- **Response Phản hồi Thành công (`200 OK`):**
+  ```http
+  HTTP/1.1 200 OK
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+  Pragma: no-cache
+  X-Request-ID: 00000000-0000-0000-0000-000000000105
+
+  {
+    "gateway_id": "gw-001",
+    "owner_user_id": "11111111-2222-3333-4444-555555555555"
+  }
+  ```
+- **Các Trường hợp Lỗi Nghiệp vụ:**
+  - `409 Conflict` (`code: "gateway_owner_inconsistent"`): Trạng thái CSDL trạm bất thường (không có owner hoặc có nhiều owner).
+  - `404 Not Found` (`code: "not_found"`): Không tìm thấy trạm Gateway hoặc người dùng mục tiêu.
+  - `400 Bad Request` (`code: "invalid_request"`): Định dạng `user_id` hoặc `gateway_id` không hợp lệ.
+
+---
+
+## 6. Bảng Ánh xạ Mã Lỗi Nghiệp vụ Toàn diện (Error Code Mapping Table)
+
+### 6.1 Mã Lỗi Nghiệp vụ Quản trị Người dùng & Thành viên (User Management Error Codes)
+
+Các endpoint `/v1/admin/users*` và `/v1/admin/gateways/{id}/users*`, `/owner` trả về phong bì lỗi chuẩn (`httpapi.APIErrorEnvelope`) với các mã lỗi nghiệp vụ rõ ràng:
+
+| Mã lỗi HTTP | Mã lỗi nghiệp vụ (`code`) | Thông báo lỗi (`message`) | Nguyên nhân kích hoạt trong hệ thống | Hướng xử lý phía Client / Administrator |
+|---|---|---|---|---|
+| **400 Bad Request** | `invalid_request` | `invalid request` | Payload sai định dạng, thiếu trường bắt buộc, chứa trường lạ, chứa query string, body quá lớn, tên/mật khẩu sai kích thước. | Kiểm tra kỹ payload JSON theo đúng đặc tả DTO của từng endpoint. |
+| **400 Bad Request** | `invalid_role` | `owner role requires owner transfer endpoint` | Gửi `role: "owner"` tới `PUT /v1/admin/gateways/{id}/users/{user_id}`. | Dùng endpoint riêng `PUT /v1/admin/gateways/{id}/owner` để chuyển quyền owner. |
+| **401 Unauthorized** | `unauthorized` | `authentication required` | Thiếu token JWT, token hết hạn, sai chữ ký, hoặc claim `role != "authenticated"`. | Đăng nhập lại qua Supabase Auth để lấy access token mới. |
+| **403 Forbidden** | `forbidden` | `access denied` | Caller không có quyền Platform Admin trong `public.platform_admins`. | Chỉ Platform Admin mới có quyền gọi các API quản trị này. |
+| **404 Not Found** | `not_found` | `resource not found` | Không tìm thấy người dùng mục tiêu trong `public.profiles` hoặc Gateway trong `public.gateways`. | Kiểm tra lại tính tồn tại của UUID người dùng và Gateway ID. |
+| **409 Conflict** | `user_already_exists` | `user already exists` | Email gửi trong `POST /v1/admin/users` đã tồn tại trong Supabase Auth. | Kiểm tra danh sách người dùng qua `GET /v1/admin/users` hoặc dùng email khác. |
+| **409 Conflict** | `user_list_capacity_exceeded` | `user list capacity exceeded` | Số lượng user, membership hoặc dung lượng JSON vượt quá ngưỡng cấu hình của server. | Nâng ngưỡng `USER_LIST_MAX_USERS`, `USER_LIST_MAX_MEMBERSHIPS` hoặc `USER_LIST_MAX_RESPONSE_BYTES` trên server. |
+| **409 Conflict** | `self_admin_demotion_forbidden` | `self admin demotion forbidden` | Admin tự gửi yêu cầu hạ quyền admin của chính mình (`actorID == targetID` và `platform_role: "user"`). | Một admin khác phải thực hiện thao tác hạ quyền này nếu cần thiết. |
+| **409 Conflict** | `owner_transfer_required` | `owner transfer required` | Cố tình gọi `PUT /users/{id}` để hạ quyền của người dùng hiện đang là `owner`. | Sử dụng `PUT /owner` để chuyển owner cho người khác; người cũ sẽ tự động trở thành `viewer`. |
+| **409 Conflict** | `gateway_owner_inconsistent` | `gateway owner inconsistent` | Trạm Gateway hiện tại có 0 owner hoặc nhiều hơn 1 owner trong `public.user_gateways`. | Dữ liệu CSDL không nhất quán; liên hệ kỹ sư CSDL để đối soát, server fail-closed không tự sửa. |
+| **413 Payload Too Large** | `payload_too_large` | `payload too large` | Kích thước body gửi lên vượt quá giới hạn cấu hình `ADMIN_MAX_BODY_BYTES`. | Rút gọn payload trong giới hạn cho phép. |
+| **415 Unsupported Media Type** | `unsupported_media_type` | `unsupported media type` | Header `Content-Type` thiếu hoặc khác `application/json`. | Đính kèm `Content-Type: application/json; charset=utf-8`. |
+| **503 Service Unavailable** | `service_unavailable` | `service unavailable` | Supabase Auth không phản hồi, timeout, hoặc kiểm tra hồ sơ sau tạo thất bại. | Kiểm tra trạng thái dịch vụ Supabase Auth/Envoy; đối soát danh sách qua `GET` trước khi thử lại. |
+| **500 Internal Server Error** | `internal_error` | `internal server error` | Lỗi máy chủ CSDL hoặc lỗi nội bộ backend chưa phân loại. | Kiểm tra nhật ký hệ thống (log) của backend theo `request_id`. |
+
+### 6.2 Mã Lỗi Nghiệp vụ Quản trị Credential MQTT (MQTT Credential Error Codes)
 
 Theo hiện thực tại `writeCredentialError` (`src/internal/httpserver/admin_mqtt_credential_handlers.go`), đối với mọi lỗi nghiệp vụ miền Credential, thông báo lỗi trong phong bì JSON luôn là `message: "credential request failed"`. Các lỗi phát sinh tại tầng middleware hoặc request parser sẽ mang thông báo lỗi chuẩn riêng biệt:
 
@@ -1021,20 +1373,24 @@ Theo hiện thực tại `writeCredentialError` (`src/internal/httpserver/admin_
 
 ---
 
-## 6. Ảnh hưởng Tác vụ Vận hành tới Kết nối Mạng và Trạng thái Broker (Broker Runtime & Network Impacts)
+## 7. Ảnh hưởng Tác vụ Vận hành tới Kết nối Mạng và Trạng thái Broker / Hệ thống (Runtime & Network Impacts)
 
-### 6.1 Cơ chế Khóa Đồng thời và Trật tự Thực thi (Local Concurrency Control)
+### 7.1 Cơ chế Khóa Đồng thời và Trật tự Thực thi (Local Concurrency Control)
 - **PostgreSQL Session Advisory Lock (`0x494f545f43524544`):**
   - Mọi thao tác biến đổi credential (`POST`, `POST /rotate`, `DELETE`, `POST /reset`) đều phải chiếm giữ khóa session advisory lock trên CSDL PostgreSQL trước khi thực thi lệnh native trên broker.
   - Cơ chế này đảm bảo tại một thời điểm chỉ có duy nhất một tiến trình backend được phép thực hiện mutation trên broker (single active mutation owner per database).
   - *Lưu ý về ranh giới:* Advisory lock cung cấp cơ chế loại trừ tương hỗ (mutual exclusion) cục bộ trong phạm vi Go backend, **không phải là distributed fencing hay chứng minh tĩnh lặng (quiescence) trên toàn bộ broker**.
+- **PostgreSQL Row-level Locks cho User và Gateway Membership:**
+  - `PATCH /v1/admin/users/{user_id}`: Khóa dòng `public.profiles` của target bằng `FOR UPDATE`.
+  - `PUT /v1/admin/gateways/{id}/users/{id}` & `PUT /v1/admin/gateways/{id}/owner`: Khóa dòng `public.gateways` của target bằng `FOR UPDATE`.
+  - Thứ tự khóa nhất quán: Khóa Gateway cha trước khi kiểm tra hoặc thao tác trên dòng con `public.user_gateways` (`FOR UPDATE`), ngăn chặn triệt để nguy cơ deadlock hai chiều với các tiến trình provisioning.
 
-### 6.2 Bảo vệ Khởi động lại Backend (`SimplifiedStartupClassifier`)
+### 7.2 Bảo vệ Khởi động lại Backend (`SimplifiedStartupClassifier`)
 - Khi tiến trình Go backend khởi động lại, thành phần `SimplifiedStartupClassifier` sẽ tự động rà quét các thao tác kiểm toán chưa kết thúc (ở các phase `intent`, `dynsec_mutation`, hoặc `snapshot_readback`) trong bảng `gateway_mqtt_credential_events`.
 - Các thao tác dở dang này được chuyển trạng thái an toàn sang `recovery_needed`.
 - Hệ thống **tuyệt đối KHÔNG tự ý tự động phát lại (no auto-replay)** các mutation chưa hoàn tất khi khởi động lại, nhằm bảo vệ tính toàn vẹn của broker.
 
-### 6.3 Hạn chế Kỹ thuật Tồn đọng và Ranh giới Nghiệm thu (Technical Limitations & Backlog)
+### 7.3 Hạn chế Kỹ thuật Tồn đọng và Ranh giới Nghiệm thu (Technical Limitations & Backlog)
 Căn cứ tài liệu kỹ thuật chuẩn hóa [`docs/dynsec/limitations-and-backlog.md`](../dynsec/limitations-and-backlog.md):
 1. **Kiểm chứng đĩa sau khởi động lạnh (Cold Restart Acceptance - T10 & ROT2):** Kiểm chứng kiểm tra mật khẩu mới đã ghi bền vững xuống tệp cấu hình trên đĩa (`ROT2`) và kiểm chứng khởi động lạnh E2E cho broker Mosquitto hiện vẫn đang ở phạm vi hoãn lại (deferred).
 2. **Thời điểm bền bỉ đĩa DynSec (Persistence Timing):** Thời điểm plugin Mosquitto DynSec thực hiện flush/fsync dữ liệu xuống đĩa chưa được đo đạc trong mã nguồn, tiềm ẩn nguy cơ rollback cấu hình nếu broker gặp sự cố mất điện đột ngột trước khi ghi đĩa.
@@ -1043,7 +1399,7 @@ Căn cứ tài liệu kỹ thuật chuẩn hóa [`docs/dynsec/limitations-and-ba
 
 ---
 
-## 7. Khuyến nghị Vận hành và Tích hợp Phía Client (Client Integration Best Practices)
+## 8. Khuyến nghị Vận hành và Tích hợp Phía Client (Client Integration Best Practices)
 
 1. **Phân biệt rạch ròi các loại thông tin xác thực:**
    - **Mật khẩu MQTT của Gateway:** Do Mosquitto quản lý, chỉ dùng cho Gateway kết nối MQTT qua TLS.
@@ -1052,18 +1408,29 @@ Căn cứ tài liệu kỹ thuật chuẩn hóa [`docs/dynsec/limitations-and-ba
    - **Supabase `service_role` Key:** Khóa bí mật hạ tầng đặc quyền cao nhất của server; tuyệt đối không bao giờ được cấu hình hoặc đưa vào mã nguồn Client.
 2. **Xử lý sự cố Timeout khi kết quả không rõ ràng (Handling Timeout / Unknown Outcome):**
    - Khi gọi một mutation (`POST`, `POST /rotate`, `DELETE`) mà gặp lỗi timeout kết nối mạng (Socket Timeout / Network Drop), **tuyệt đối không tự ý sinh một `Idempotency-Key` mới và gửi lại ngay lập tức**. Việc tự ý sinh key mới sẽ gây xung đột trạng thái (`409 Conflict`) hoặc dẫn tới rủi ro tạo ra các bản ghi mồ côi.
-   - **Quy trình chuẩn:**
+   - **Quy trình chuẩn cho Credential:**
      - Bước 1: Giữ nguyên `Idempotency-Key` vừa sử dụng và gọi lại request mutation đó. Nếu server đã xử lý xong trước đó, phản hồi replay sẽ trả về mã `200 OK` hoặc `201 Created` kèm metadata hiện tại (`secret_returned: false`, trường password bị lược bỏ hoàn toàn).
      - Bước 2: Gọi `GET /v1/admin/gateways/{gateway_id}/mqtt-credential` để kiểm tra `credential_version`, `status` và `last_operation_id`.
      - Bước 3: Nếu xác định mật khẩu mới đã kích hoạt thành công trên server (`status == "active"`) nhưng Client bị mất phản hồi (không nhận được mật khẩu), tạo một `Idempotency-Key` mới và thực hiện lệnh `POST /rotate` để cấp mật khẩu mới có kiểm soát. Tuyệt đối không blind-rotate nếu metadata chưa rõ ràng hoặc CSDL còn checkpoint bảo dưỡng chưa hoàn tất.
+   - **Quy trình chuẩn cho User Creation (`POST /v1/admin/users`):**
+     - Khi tạo user gặp timeout hoặc lỗi 503 từ server, **tuyệt đối không gửi lại ngay lập tức (no blind retry)**.
+     - Bước 1: Chờ hệ thống ổn định và gọi `GET /v1/admin/users` để kiểm tra xem email dự kiến tạo đã xuất hiện trong danh sách hay chưa.
+     - Bước 2: Nếu tài khoản đã xuất hiện: kiểm tra trạng thái profile có đồng bộ đúng hay không trước khi sử dụng `id`.
+     - Bước 3: Lưu ý việc email chưa xuất hiện trong danh sách **không chứng minh** request cũ không thể hoàn tất muộn hơn trên GoTrue. Quản trị viên cần thực hiện quy trình đối soát có giám sát (supervised reconciliation), kiểm tra log hoặc cơ sở dữ liệu nếu nghi ngờ request đang treo trước khi quyết định thử lại thủ công.
+     - Server tuyệt đối không tự động xóa tài khoản (no automatic rollback deletion) khi xảy ra lỗi profile verification, bảo toàn nguyên vẹn nhật ký để đối soát có giám sát.
 3. **Tuân thủ ranh giới đọc dữ liệu:**
-   - Để hiển thị danh mục Gateway và Sensor cho người dùng thông thường trên bảng điều khiển Dashboard, luôn sử dụng các API đọc nghiệp vụ chuẩn đã được kiểm thử phân quyền chặt chẽ tại [Tài liệu 04](04_REST_API_CLIENT_CONTRACT.md) (`GET /v1/gateways`, `GET /v1/gateways/{gateway_id}/sensors`, và các API Digital Twin `GET /v1/digital-twins`, `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}/state`, `GET /v1/digital-twins/{entity_id}/history`).
+   - Để hiển thị danh mục Gateway và Sensor cho người dùng thông thường trên bảng điều khiển Dashboard, luôn sử dụng các API đọc nghiệp vụ chuẩn đã được kiểm thử phân quyền chặt chẽ tại [Tài liệu 04](04_REST_API_CLIENT_CONTRACT.md) (`GET /v1/gateways`, `GET /v1/gateways/{gateway_id}/sensors`, và các API Digital Twin `GET /v1/digital-twins`, `GET /v1/digital-twins/{entity_id}`, `GET /v1/digital-twins/{entity_id}?format=simplified`, `GET /v1/digital-twins/{entity_id}/temporal`).
    - Tuyến đường `GET /v1/admin/gateways` là danh mục kiểm kê hạ tầng toàn cầu dành riêng cho Platform Admin, không lọc theo tư cách thành viên và không chứa dữ liệu trạng thái hay đo lường.
    - **Ranh giới bất di bất dịch:** Platform Admin sửa đổi hoặc tạo metadata của trạm **KHÔNG tự động có quyền đọc** viễn trắc hay trạng thái trạm đó nếu chưa được gán quyền thành viên trong `public.user_gateways`.
 4. **Quy tắc tích hợp Metadata Mutation (POST & PATCH /v1/digital-twins):**
-   - **Phân định thẩm quyền:** Chỉ Platform Admin mới có quyền tạo Gateway (`POST /v1/digital-twins` với `entity_type: "Gateway"`, bắt buộc `owner_user_id` đã tồn tại trong `public.profiles`) và sửa Gateway (`PATCH /v1/digital-twins/{entity_id}`); mọi tài khoản không phải Admin (kể cả Gateway `owner`) khi PATCH Gateway đều nhận `403 Forbidden`. Gateway Owner có quyền tạo Sensor cho trạm mình sở hữu và sửa tên Sensor (`PATCH /v1/digital-twins/{entity_id}`); vai trò `operator`/`viewer` nhận `403 Forbidden` (sau khi request hợp lệ về cấu trúc); người không có membership trạm nhận `404 Not Found`.
+   - **Phân định thẩm quyền:** Chỉ Platform Admin mới có quyền tạo Gateway (`POST /v1/digital-twins` với `entity_type: "Gateway"`, bắt buộc `owner_user_id` đã tồn tại trong `public.profiles`) và sửa Gateway (`PATCH /v1/digital-twins/{entity_id}/attrs`); mọi tài khoản không phải Admin (kể cả Gateway `owner`) khi PATCH Gateway đều nhận `403 Forbidden`. Gateway Owner có quyền tạo Sensor cho trạm mình sở hữu và sửa tên Sensor (`PATCH /v1/digital-twins/{entity_id}/attrs`); vai trò `operator`/`viewer` nhận `403 Forbidden` (sau khi request hợp lệ về cấu trúc); người không có membership trạm nhận `404 Not Found`.
    - **Đơn vị Sensor là bất biến (`unit` is immutable):** Tuyệt đối không gửi trường `unit` trong request PATCH Sensor; vi phạm sẽ nhận `400 Bad Request`.
    - **Xử lý sự cố mạng khi gọi POST/PATCH:** Không đoán định thành công hay thất bại. Việc đọc lại kiểm tra trạng thái (`GET /v1/digital-twins/{entity_id}`) chỉ khả dụng nếu caller có quyền thành viên trạm (không suy đoán mã 404 là lỗi metadata hay thực thể chưa tồn tại). Nếu không có quyền đọc lại, sử dụng công cụ đối soát có giám sát (supervised reconciliation) hoặc gửi lại có giới hạn với cùng thông tin ban đầu, tuyệt đối không tùy tiện ghi đè metadata. Hệ thống hỗ trợ gửi lại trùng khớp (`200 OK`) cho POST và no-op (`200 OK`, giữ nguyên `updated_at`) cho PATCH an toàn.
    - **Tách biệt với xác thực:** Khởi tạo thực thể Digital Twin qua POST không tạo tài khoản Supabase Auth và không cấp mật khẩu MQTT DynSec.
-5. **Tham chiếu tài liệu hạn chế kỹ thuật:**
+5. **Quy tắc tích hợp Quản trị Người dùng & Quyền Thành viên Gateway:**
+   - **Giao diện phân quyền tách biệt:** Phía client tách biệt hoàn toàn hai nút/luồng thao tác: “Gán vai trò operator/viewer” (`PUT /gateways/{id}/users/{id}`) và “Chuyển quyền sở hữu Gateway” (`PUT /gateways/{id}/owner`).
+   - **Hiển thị rõ ràng hậu quả chuyển Owner:** Biểu mẫu chuyển owner cần thông báo rõ ràng cho quản trị viên rằng: *“Chủ sở hữu hiện tại sẽ được chuyển thành viewer (tiếp tục có quyền đọc dữ liệu trạm nhưng không thể quản trị cảm biến hay cấu hình trạm)”*.
+   - **Cấm tự hạ quyền Admin:** Giao diện cần vô hiệu hóa (disable) hoặc cảnh báo nếu admin đang chỉnh sửa chính tài khoản của mình mà chọn hạ vai trò thành `"user"`, tránh nhận lỗi `409 self_admin_demotion_forbidden`.
+   - **Giới hạn danh sách người dùng:** Giao diện gọi `GET /v1/admin/users` cần xử lý trường hợp mã lỗi `409 user_list_capacity_exceeded` để hiển thị thông báo liên hệ quản trị viên nâng ngưỡng cấu hình server, không giả định danh sách luôn có thể tải toàn bộ nếu hệ thống phình to.
+6. **Tham chiếu tài liệu hạn chế kỹ thuật:**
    - Chi tiết các giới hạn vận hành, tồn đọng và ma trận nghiệm thu được duy trì chuẩn hóa tại [`docs/dynsec/limitations-and-backlog.md`](../dynsec/limitations-and-backlog.md) và [`docs/dynsec/flows-and-api.md`](../dynsec/flows-and-api.md).

@@ -1,9 +1,11 @@
 # Tài liệu Client — 08: Tích hợp API và Quản lý Trạng thái Giao diện (API Integration and State Handling)
 
-**Cập nhật:** 2026-10-18
+**Cập nhật:** 2026-10-19
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:**
-- `AGENTS.md` (Mục 1, 2, 5, 6, 6.5, 10, 16, 18)
+- [`../../AGENTS.md`](../../AGENTS.md) (Mục 1, 2, 5, 6, 6.5, 10, 16, 18)
+- [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết quản lý User và Gateway Membership)
+- [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
 - `docs/protocols/stage4-read-and-entity-api.md` (Hợp đồng Stage 4 Read & Entity API)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
@@ -326,6 +328,54 @@ Khi tích hợp các chức năng quản trị dành cho Platform Admin (danh m�
   - Nếu vi phạm xác thực, phân quyền hoặc cú pháp request (body sai/rỗng, vượt hạn mức, thiếu `Idempotency-Key`...), server phản hồi các mã lỗi parser chuẩn tương ứng (`401`, `403`, `400`, `413`, `415`).
   - Chỉ khi request hoàn toàn hợp lệ và tính năng credential được kích hoạt, thành phần runtime `denyOnlyResetPrerequisite{}` (hoặc rào chắn khởi động chưa sẵn sàng) mới chặn an toàn với `HTTP 503 Service Unavailable` (`code: "service_unavailable"`, `message: "credential request failed"`).
   - Tuyệt đối không tự động thử lại vào endpoint reset này; các sự cố bất định hoặc mất secret phải được xử lý có giám sát theo runbook hạ tầng.
+
+### 7.4 Tích hợp Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership Integration)
+
+*Xem chi tiết toàn bộ hợp đồng API tại:* [docs/client/07_ADMIN_API_CLIENT_CONTRACT.md](07_ADMIN_API_CLIENT_CONTRACT.md#5-chi-tiết-các-endpoint-quản-trị-tài-khoản-người-dùng-và-quyền-thành-viên-gateway-admin-user--gateway-membership-apis).
+
+Khi xây dựng giao diện quản trị dành cho Platform Admin, ứng dụng Client cần áp dụng các quy chuẩn thiết kế biểu mẫu, xử lý lỗi và đồng bộ trạng thái như sau:
+
+#### A. Biểu mẫu Tạo Tài khoản Người dùng Mới (`POST /v1/admin/users`)
+1. **Kiểm tra hợp lệ trước khi gửi (Client-side Pre-validation):**
+   - `full_name`: Bắt buộc nhập, độ dài 1 đến 256 bytes UTF-8, không được để trống hoặc chỉ có khoảng trắng.
+   - `email`: Định dạng email chuẩn RFC 5322, tối đa 254 bytes. Client nên tự động loại bỏ khoảng trắng thừa đầu/cuối trước khi gửi; giữ nguyên chữ hoa/thường.
+   - `password`: Độ dài bắt buộc từ 6 ký tự trở lên và tối đa 72 bytes UTF-8 (giới hạn cứng của thuật toán mã hóa mật khẩu bcrypt trên GoTrue).
+2. **Xử lý sự cố mạng & Timeout (Supervised Reconcile via User List, No Blind Retry):**
+   - Nếu request tạo tài khoản gặp lỗi quá thời gian (Network/Socket Timeout) hoặc mã lỗi `503 Service Unavailable`, **tuyệt đối KHÔNG tự ý gửi lại request tạo mới ngay lập tức (no blind retry)**.
+   - Khi timeout xảy ra, tài khoản có thể đã được GoTrue Auth tạo thành công nhưng phản hồi mạng bị thất lạc hoặc việc kiểm tra hồ sơ bị gián đoạn. Gửi lại ngay có thể nhận mã lỗi `409 user_already_exists`.
+   - **Quy trình đối soát an toàn (Supervised Reconcile):** Client gọi `GET /v1/admin/users` để kiểm tra danh sách:
+     * Nếu email vừa tạo đã có trong danh sách: Tài khoản đã được tạo, kiểm tra hồ sơ có đồng bộ đúng hay không trước khi trích xuất `id`.
+     * Việc email chưa xuất hiện trong danh sách **không chứng minh** request cũ không thể hoàn tất muộn hơn trên GoTrue. Quản trị viên cần chờ hệ thống ổn định, đối soát log hoặc kiểm tra lỗi missing-profile trước khi quyết định thử lại thủ công.
+   - Backend **tuyệt đối không tự động xóa tài khoản (no automatic account deletion)** khi có lỗi kiểm tra hồ sơ, nhằm bảo toàn dữ liệu phục vụ đối soát có giám sát.
+
+#### B. Đọc Danh sách Người dùng và Hiển thị Tên (`GET /v1/admin/users` & `PATCH /v1/admin/users/{user_id}`)
+1. **Nguồn chân lý của tên hiển thị:**
+   - Trường `full_name` hiển thị trên bảng người dùng được đọc trực tiếp từ `public.profiles.full_name` trong DTO phản hồi.
+   - Trường này có thể là `null` đối với một số tài khoản legacy cũ; giao diện cần xử lý hiển thị fallback an toàn (ví dụ: hiển thị email hoặc `"(Chưa đặt tên)"`, không tự động gửi chuỗi rỗng lên server).
+   - Sau khi admin đổi tên qua `PATCH /v1/admin/users/{id}`, tên mới trong `public.profiles` là nguồn chân lý duy nhất. Tuyệt đối không fallback sang Auth metadata.
+2. **Xử lý giới hạn dung lượng danh sách (`409 user_list_capacity_exceeded`):**
+   - `GET /v1/admin/users` tải toàn bộ danh sách người dùng trong một response duy nhất và không hỗ trợ query pagination/search.
+   - Nếu số lượng tài khoản/membership vượt ngưỡng cấu hình server (`USER_LIST_MAX_USERS`, `USER_LIST_MAX_MEMBERSHIPS`, `USER_LIST_MAX_RESPONSE_BYTES`), server trả về mã lỗi `409 Conflict` (`user_list_capacity_exceeded`).
+   - Giao diện client phải bắt mã lỗi này và hiển thị thông báo rõ ràng cho quản trị viên liên hệ kỹ sư hạ tầng nâng hạn mức cấu hình server, tránh crash giao diện hoặc hiển thị danh sách rỗng giả định.
+3. **Cấm tự hạ quyền Admin (Self-Demotion Guard):**
+   - Khi chỉnh sửa tài khoản, nếu tài khoản mục tiêu trùng với tài khoản của admin đang đăng nhập (`actorID == targetID`), giao diện nên **vô hiệu hóa (disable) hoặc ẩn tùy chọn hạ vai trò xuống `"user"`**.
+   - Nếu admin cố tình gửi request hạ quyền của chính mình, server sẽ từ chối với mã lỗi `409 Conflict` (`self_admin_demotion_forbidden`) và rollback nguyên tử toàn bộ thay đổi (kể cả phần đổi tên).
+   - *Lưu ý về chính sách:* Server không có cơ chế đếm admin cuối cùng (no last-admin count policy). Việc bảo vệ chỉ nhằm ngăn chặn hành vi tự tước quyền của chính caller; tình trạng mất toàn bộ admin vẫn có thể xảy ra nếu hai admin thực hiện hạ quyền chéo đồng thời qua API (`concurrent API cross-demotions`) hoặc do can thiệp trực tiếp ngoài API trên CSDL.
+
+#### C. Hai Luồng Giao diện Phân quyền Gateway Tách biệt Hoàn toàn
+Giao diện quản trị phải chia ranh giới rõ ràng thành 2 nút bấm / biểu mẫu độc lập, không gộp chung vào một luồng:
+1. **Biểu mẫu Gán Vai trò Thông thường (`PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`):**
+   - Hộp thoại gán quyền thành viên chỉ cung cấp 2 lựa chọn: **Operator (Vận hành)** hoặc **Viewer (Xem)**.
+   - Tuyệt đối không đưa lựa chọn `Owner` vào danh sách dropdown của biểu mẫu này (gửi `owner` sẽ bị server từ chối `400 Bad Request` với mã `invalid_role`).
+   - Nếu người dùng mục tiêu hiện đang là `owner` của trạm, giao diện phải vô hiệu hóa việc đổi vai trò qua biểu mẫu này (server từ chối `409 Conflict` với mã `owner_transfer_required`).
+2. **Biểu mẫu Chuyển quyền Sở hữu Gateway (`PUT /v1/admin/gateways/{gateway_id}/owner`):**
+   - Hộp thoại chọn một người dùng trong hệ thống để chuyển giao vị thế `owner`.
+   - **Thông báo xác nhận bắt buộc (Confirmation Dialog):** Phải hiển thị cảnh báo rõ ràng cho quản trị viên:
+     > *"Chủ sở hữu hiện tại của trạm sẽ được chuyển thành Viewer (tiếp tục có quyền đọc dữ liệu nhưng mất toàn bộ quyền quản trị cảm biến và cấu hình trạm). Mỗi trạm chỉ có duy nhất một Owner."*
+   - Sau khi chuyển owner thành công, nếu có request tạo Gateway cũ gửi lại (`PUT /v1/admin/gateways/{id}`) với owner cũ, server sẽ từ chối `409 Conflict` (đúng logic replay bất biến).
+
+#### D. Tuyên bố Hiện thực (No Premature Flutter Implementation Claims)
+Các mô tả biểu mẫu và quy trình trên là đặc tả chuẩn hóa hành vi và hướng dẫn tích hợp giao diện client. Hệ thống **KHÔNG khẳng định mã nguồn giao diện Flutter Web đã được hiện thực hoặc kiểm thử hoàn chỉnh** ở giai đoạn này.
 
 ---
 
