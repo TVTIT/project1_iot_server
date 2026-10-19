@@ -197,5 +197,135 @@ class ContractScenarioUnitTests(unittest.TestCase):
         self.assertIn('missing cursor parameter', str(ctx.exception))
 
 
+class SimplifiedSummaryUnitTests(unittest.TestCase):
+    """Verify the flat simplified list projection helpers (no Docker required).
+
+    These helpers back the format=simplified contract checks: they must be strict
+    about the flat shape (no @context, no Property wrappers), agree with the
+    normalized JSON-LD projection on identity/type/name/gateway_id/modifiedAt,
+    and enforce the served media type / cache headers.
+    """
+
+    def _flat_item(self, **overrides):
+        item = {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            'name': 'Sensor 1',
+            'gateway_id': 'gw1',
+            'modifiedAt': '2026-10-15T09:00:00.000000Z',
+        }
+        item.update(overrides)
+        return item
+
+    def _normalized_item(self, **overrides):
+        item = {
+            '@context': ['https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context.jsonld'],
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            'name': {'type': 'Property', 'value': 'Sensor 1'},
+            'gateway_id': {'type': 'Property', 'value': 'gw1'},
+            'modifiedAt': '2026-10-15T09:00:00.000000Z',
+        }
+        item.update(overrides)
+        return item
+
+    def test_validate_simplified_summary_valid_flat_item(self):
+        out = C.validate_simplified_summary(self._flat_item(), 'flat')
+        self.assertEqual(out['id'], 'urn:ngsi-ld:Sensor:gw1:s1')
+        self.assertEqual(out['name'], 'Sensor 1')
+        self.assertEqual(out['gateway_id'], 'gw1')
+
+    def test_validate_simplified_summary_name_optional_none(self):
+        item = self._flat_item()
+        del item['name']
+        out = C.validate_simplified_summary(item, 'flat-no-name')
+        self.assertIsNone(out['name'])
+
+    def test_validate_simplified_summary_rejects_context_and_wrappers(self):
+        with self.assertRaises(AssertionError) as ctx:
+            C.validate_simplified_summary(self._normalized_item(), 'wrapped')
+        self.assertIn('extra', str(ctx.exception).lower())
+        with self.assertRaises(AssertionError):
+            C.validate_simplified_summary(self._flat_item(name={'type': 'Property', 'value': 'x'}), 'nested-name')
+
+    def test_validate_simplified_summary_rejects_missing_or_blank_fields(self):
+        for key in ('id', 'type', 'gateway_id', 'modifiedAt'):
+            item = self._flat_item()
+            del item[key]
+            with self.assertRaises(AssertionError):
+                C.validate_simplified_summary(item, f'missing-{key}')
+        with self.assertRaises(AssertionError):
+            C.validate_simplified_summary(self._flat_item(id=''), 'blank-id')
+
+    def test_project_normalized_summary_extracts_property_values(self):
+        out = C.project_normalized_summary(self._normalized_item(), 'norm')
+        self.assertEqual(out, {
+            'id': 'urn:ngsi-ld:Sensor:gw1:s1',
+            'type': 'Sensor',
+            'name': 'Sensor 1',
+            'gateway_id': 'gw1',
+            'modifiedAt': '2026-10-15T09:00:00.000000Z',
+        })
+        no_name = self._normalized_item()
+        del no_name['name']
+        self.assertIsNone(C.project_normalized_summary(no_name, 'norm-no-name')['name'])
+
+    def test_project_normalized_summary_rejects_non_property_wrapper(self):
+        with self.assertRaises(AssertionError):
+            C.project_normalized_summary(self._normalized_item(gateway_id='gw1'), 'raw-gw')
+
+    def test_assert_simplified_matches_normalized_parity_and_drift(self):
+        normalized = [self._normalized_item(), self._normalized_item(
+            id='urn:ngsi-ld:Gateway:gw1', type='Gateway',
+            name={'type': 'Property', 'value': 'Gateway 1'}, gateway_id={'type': 'Property', 'value': 'gw1'},
+        )]
+        simplified = [
+            self._flat_item(),
+            self._flat_item(id='urn:ngsi-ld:Gateway:gw1', type='Gateway', name='Gateway 1'),
+        ]
+        C.assert_simplified_matches_normalized(normalized, simplified, 'parity')
+
+        with self.assertRaises(AssertionError):
+            C.assert_simplified_matches_normalized(normalized, list(reversed(simplified)), 'reordered')
+        with self.assertRaises(AssertionError):
+            C.assert_simplified_matches_normalized(normalized, [self._flat_item(name='Drifted')], 'count-or-value')
+
+    def test_validate_simplified_list_response_shape_and_headers(self):
+        resp = MockHTTPResponse(
+            status=200,
+            headers={
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+                'vary': 'Accept',
+            },
+            json_data=[self._flat_item()],
+        )
+        items = C.validate_simplified_list_response(resp, 'ok')
+        self.assertEqual(len(items), 1)
+
+        empty = MockHTTPResponse(
+            status=200,
+            headers={'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'vary': 'Accept'},
+            json_data=[],
+        )
+        self.assertEqual(C.validate_simplified_list_response(empty, 'empty'), [])
+
+        bad_ct = MockHTTPResponse(
+            status=200,
+            headers={'content-type': 'application/ld+json; charset=utf-8', 'cache-control': 'no-store', 'vary': 'Accept'},
+            json_data=[self._flat_item()],
+        )
+        with self.assertRaises(AssertionError):
+            C.validate_simplified_list_response(bad_ct, 'ld-json')
+
+        not_array = MockHTTPResponse(
+            status=200,
+            headers={'content-type': 'application/json', 'cache-control': 'no-store', 'vary': 'Accept'},
+            json_data={'items': []},
+        )
+        with self.assertRaises(AssertionError):
+            C.validate_simplified_list_response(not_array, 'object-root')
+
+
 if __name__ == '__main__':
     unittest.main()

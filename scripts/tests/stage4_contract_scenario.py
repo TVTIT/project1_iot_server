@@ -18,6 +18,9 @@ and error envelopes across real services:
        versions, timestamps, and history records remain untouched, not counts alone)
      - Relationship contents and pagination (relationship_limit, relationship_after, cursor format)
      - Twin list keyset cursor pagination (limit, after, malformed cursor 400, mismatched cursor 400)
+     - Simplified list presentation (format=simplified) parity with the normalized list,
+       flat shape without wrappers, role/member isolation, bounded rel="next" traversal,
+       and incompatible Accept 406 / invalid-or-duplicate format 400
   3. HTTP Query and Body Boundaries:
      - Raw overflow (range > rawWindow) 400 'raw_limit_exceeded' vs auto resolution 200 fallback
      - Bad precision, invalid time range (from > to, range > 744h), invalid resolution, unsupported property -> 400
@@ -140,6 +143,104 @@ def validate_next_uri_contract(
     if not cursor_vals or not cursor_vals[0]:
         raise AssertionError(f'rel="next" missing cursor parameter {cursor_param_name} in {next_uri}')
     return cursor_vals[0]
+
+
+# Flat project simplified SUMMARY fields (see GET /v1/digital-twins?format=simplified).
+# The simplified list is NOT the JSON-LD list and NOT the detail simplified STATE view:
+# exactly these five flat keys, no @context and no Property wrappers.
+SIMPLIFIED_SUMMARY_FIELDS = ('id', 'type', 'name', 'gateway_id', 'modifiedAt')
+_SIMPLIFIED_REQUIRED_FIELDS = ('id', 'type', 'gateway_id', 'modifiedAt')
+
+
+def project_normalized_summary(item: dict, label: str) -> dict:
+    """Extract the flat identity fields from a normalized JSON-LD summary item.
+
+    Unwraps the ``name`` and ``gateway_id`` NGSI-LD Property objects so the result
+    is directly comparable with the flat simplified representation.
+    """
+    if not isinstance(item, dict):
+        raise AssertionError(f'[{label}] normalized summary must be an object, got: {item!r}')
+    out: dict = {}
+    for key in ('id', 'type'):
+        value = item.get(key)
+        if not isinstance(value, str) or not value:
+            raise AssertionError(f'[{label}] normalized summary {key} must be a non-empty string: {item!r}')
+        out[key] = value
+
+    name = item.get('name')
+    if name is None:
+        out['name'] = None
+    else:
+        if not isinstance(name, dict) or name.get('type') != 'Property':
+            raise AssertionError(f'[{label}] normalized name must be a Property wrapper: {name!r}')
+        if not isinstance(name.get('value'), str):
+            raise AssertionError(f'[{label}] normalized name Property value must be a string: {name!r}')
+        out['name'] = name['value']
+
+    gw = item.get('gateway_id')
+    if not isinstance(gw, dict) or gw.get('type') != 'Property' or not isinstance(gw.get('value'), str) or not gw.get('value'):
+        raise AssertionError(f'[{label}] normalized gateway_id must be a non-empty Property wrapper: {gw!r}')
+    out['gateway_id'] = gw['value']
+
+    modified = item.get('modifiedAt')
+    if not isinstance(modified, str) or not modified:
+        raise AssertionError(f'[{label}] normalized modifiedAt must be a non-empty string: {item!r}')
+    out['modifiedAt'] = modified
+    return out
+
+
+def validate_simplified_summary(item: dict, label: str) -> dict:
+    """Validate one flat simplified summary item and return its flat projection.
+
+    Rejects JSON-LD context, Property wrappers, and any undeclared key so a
+    regression that leaks the normalized representation cannot pass silently.
+    """
+    if not isinstance(item, dict):
+        raise AssertionError(f'[{label}] simplified summary must be an object, got: {item!r}')
+    extra = sorted(set(item) - set(SIMPLIFIED_SUMMARY_FIELDS))
+    if extra:
+        raise AssertionError(f'[{label}] simplified summary exposes extra/wrapper fields {extra}: {item!r}')
+    for key in _SIMPLIFIED_REQUIRED_FIELDS:
+        if key not in item:
+            raise AssertionError(f'[{label}] simplified summary missing required field {key!r}: {item!r}')
+        if not isinstance(item[key], str) or not item[key]:
+            raise AssertionError(f'[{label}] simplified summary {key} must be a non-empty string: {item!r}')
+    if 'name' in item and not isinstance(item['name'], str):
+        raise AssertionError(f'[{label}] simplified name must be a flat string when present: {item!r}')
+    return {key: item.get(key) for key in SIMPLIFIED_SUMMARY_FIELDS}
+
+
+def assert_simplified_matches_normalized(normalized_items: list, simplified_items: list, label: str) -> None:
+    """Assert ordered identity/type/name/gateway_id/modifiedAt parity between presentations."""
+    if not isinstance(normalized_items, list) or not isinstance(simplified_items, list):
+        raise AssertionError(f'[{label}] both list presentations must be root arrays')
+    if len(normalized_items) != len(simplified_items):
+        raise AssertionError(
+            f'[{label}] item count diverged: normalized={len(normalized_items)} simplified={len(simplified_items)}'
+        )
+    for idx, (norm, flat) in enumerate(zip(normalized_items, simplified_items)):
+        projected = project_normalized_summary(norm, f'{label}[{idx}].normalized')
+        validated = validate_simplified_summary(flat, f'{label}[{idx}].simplified')
+        if projected != validated:
+            raise AssertionError(f'[{label}] item {idx} projection diverged: normalized={projected} simplified={validated}')
+
+
+def validate_simplified_list_response(resp, label: str) -> list:
+    """Assert the served simplified list envelope and flat item shape, returning items."""
+    if resp.status != 200:
+        raise AssertionError(f'[{label}] expected HTTP 200, got {resp.status}: {resp.json}')
+    ctype = resp.headers.get('content-type', '')
+    if not ctype.startswith('application/json') or 'ld+json' in ctype:
+        raise AssertionError(f'[{label}] expected Content-Type application/json, got {ctype}')
+    if resp.headers.get('cache-control') != 'no-store':
+        raise AssertionError(f'[{label}] expected Cache-Control: no-store, got {resp.headers.get("cache-control")}')
+    if 'accept' not in resp.headers.get('vary', '').lower():
+        raise AssertionError(f'[{label}] expected Vary: Accept, got {resp.headers.get("vary")}')
+    if not isinstance(resp.json, list):
+        raise AssertionError(f'[{label}] simplified list must be a root array, got: {type(resp.json)}')
+    for idx, item in enumerate(resp.json):
+        validate_simplified_summary(item, f'{label}[{idx}]')
+    return resp.json
 
 
 def run_contract_scenario(ctx: Stage4FixtureContext) -> None:
@@ -562,6 +663,198 @@ def run_contract_scenario(ctx: Stage4FixtureContext) -> None:
     assert_error_envelope(r_mismatch_cur, 400, "invalid_cursor", "mismatched list cursor")
 
     # -------------------------------------------------------------------------
+    # 2g-bis. Simplified list presentation (format=simplified) parity and pagination
+    # -------------------------------------------------------------------------
+    # The flat simplified list must agree in order and identity with the normalized
+    # JSON-LD list over the same bounded dataset, expose no wrappers, honor role and
+    # member isolation, follow the same keyset cursor binding, and reject incompatible
+    # Accept / invalid / duplicate format without disturbing the baseline invariants.
+    simplified_json_accept = {"Accept": "application/json"}
+    normalized_list_uri = f"/v1/digital-twins?gateway_id={gw_id}&limit=10"
+
+    r_norm_full = ctx.http.get(normalized_list_uri, token=owner_token, headers={"Accept": "application/ld+json"})
+    if r_norm_full.status != 200 or not r_norm_full.headers.get("content-type", "").startswith("application/ld+json"):
+        raise AssertionError(f"normalized list baseline failed: {r_norm_full.status} {r_norm_full.headers}")
+    if not isinstance(r_norm_full.json, list) or len(r_norm_full.json) != 3:
+        raise AssertionError(f"expected 3 normalized summaries, got: {r_norm_full.json}")
+
+    r_flat_full = ctx.http.get(
+        f"{normalized_list_uri}&format=simplified",
+        token=owner_token,
+        headers=simplified_json_accept,
+    )
+    flat_full_items = validate_simplified_list_response(r_flat_full, "simplified full list")
+    if len(flat_full_items) != 3:
+        raise AssertionError(f"expected 3 simplified summaries, got: {flat_full_items}")
+    assert_simplified_matches_normalized(r_norm_full.json, flat_full_items, "simplified vs normalized full list")
+
+    # Ordered identity parity with the same bounded dataset.
+    if [item["id"] for item in flat_full_items] != [item["id"] for item in r_norm_full.json]:
+        raise AssertionError(f"simplified list order diverged: {flat_full_items}")
+    if set(item["id"] for item in flat_full_items) != expected_ids:
+        raise AssertionError(f"simplified list dataset mismatch: {flat_full_items}")
+
+    # No JSON-LD context or Property wrapper leakage on the flat representation.
+    for idx, item in enumerate(flat_full_items):
+        if "@context" in item:
+            raise AssertionError(f"simplified item {idx} must not carry @context: {item}")
+        for wrapper_key in ("name", "gateway_id"):
+            value = item.get(wrapper_key)
+            if value is not None and not isinstance(value, str):
+                raise AssertionError(f"simplified item {idx} {wrapper_key} must be a flat string: {item}")
+    if '"@context"' in r_flat_full.body.decode("utf-8") or '"Property"' in r_flat_full.body.decode("utf-8"):
+        raise AssertionError(f"simplified list body leaked JSON-LD wrappers: {r_flat_full.body!r}")
+
+    # Repeat fetch must be deterministic (same order and projection).
+    r_flat_repeat = ctx.http.get(
+        f"{normalized_list_uri}&format=simplified",
+        token=owner_token,
+        headers=simplified_json_accept,
+    )
+    repeat_items = validate_simplified_list_response(r_flat_repeat, "simplified repeat")
+    if repeat_items != flat_full_items:
+        raise AssertionError(f"simplified list is not deterministic across reads: {repeat_items} vs {flat_full_items}")
+
+    # Role isolation: owner/operator/viewer on the assigned gateway see the same dataset.
+    for role_name, token in [("owner", owner_token), ("operator", operator_token), ("viewer", viewer_token)]:
+        r_role_flat = ctx.http.get(
+            f"{normalized_list_uri}&format=simplified",
+            token=token,
+            headers=simplified_json_accept,
+        )
+        role_items = validate_simplified_list_response(r_role_flat, f"simplified list {role_name}")
+        assert_simplified_matches_normalized(r_norm_full.json, role_items, f"simplified vs normalized {role_name}")
+
+    # Member isolation: non-member and unassigned users get an authorized-empty [].
+    r_nonmember_flat = ctx.http.get(
+        f"{normalized_list_uri}&format=simplified",
+        token=user_b_token,
+        headers=simplified_json_accept,
+    )
+    if validate_simplified_list_response(r_nonmember_flat, "simplified list non-member") != []:
+        raise AssertionError(f"non-member simplified list must be empty: {r_nonmember_flat.json}")
+    r_unassigned_flat = ctx.http.get(
+        "/v1/digital-twins?format=simplified",
+        token=unassigned_token,
+        headers=simplified_json_accept,
+    )
+    if validate_simplified_list_response(r_unassigned_flat, "simplified list unassigned") != []:
+        raise AssertionError(f"unassigned simplified list must be empty: {r_unassigned_flat.json}")
+
+    # Simplified traversal: follow complete relative rel="next" URIs to the terminal page.
+    cur_flat_uri = f"/v1/digital-twins?gateway_id={gw_id}&limit=1&format=simplified"
+    seen_flat_uris: set[str] = set()
+    simplified_order: list[str] = []
+    simplified_page_count = 0
+    saved_simplified_cursor = ""
+    simplified_terminal_had_link = None
+    while cur_flat_uri:
+        simplified_page_count += 1
+        if simplified_page_count > max_pages:
+            raise AssertionError(f"simplified list pagination exceeded maximum bounded pages ({max_pages})")
+        if cur_flat_uri in seen_flat_uris:
+            raise AssertionError(f"simplified pagination loop detected on URI: {cur_flat_uri}")
+        seen_flat_uris.add(cur_flat_uri)
+
+        r_flat_page = ctx.http.get(cur_flat_uri, token=owner_token, headers=simplified_json_accept)
+        page_items = validate_simplified_list_response(r_flat_page, f"simplified page {simplified_page_count}")
+        if len(page_items) != 1:
+            raise AssertionError(f"expected exactly 1 item on simplified page {simplified_page_count}, got {len(page_items)}")
+        page_id = page_items[0]["id"]
+        if page_id in simplified_order:
+            raise AssertionError(f"duplicate entity id {page_id} across simplified pages")
+        simplified_order.append(page_id)
+
+        next_uri = parse_rel_next_uri(r_flat_page.headers.get("link"))
+        if next_uri:
+            cursor_val = validate_next_uri_contract(
+                next_uri,
+                expected_path="/v1/digital-twins",
+                expected_params={"gateway_id": gw_id, "limit": "1", "format": "simplified"},
+                cursor_param_name="cursor",
+            )
+            qs_next = urllib.parse.parse_qs(urllib.parse.urlsplit(next_uri).query)
+            if qs_next.get("format") != ["simplified"]:
+                raise AssertionError(f'simplified rel="next" must retain format=simplified: {next_uri}')
+            saved_simplified_cursor = cursor_val
+            cur_flat_uri = next_uri
+        else:
+            simplified_terminal_had_link = False
+            cur_flat_uri = None
+
+    if simplified_page_count != 3:
+        raise AssertionError(f"expected exactly 3 simplified pages for 3 entities with limit=1, took {simplified_page_count}")
+    if simplified_order != [item["id"] for item in flat_full_items]:
+        raise AssertionError(f"simplified pagination order diverged from full list: {simplified_order}")
+    if simplified_terminal_had_link is not False:
+        raise AssertionError("simplified terminal page must not emit a Link header")
+
+    # Filter retention: type=Sensor&gateway_id&limit=1&format=simplified traverses 2 pages.
+    cur_flat_sensor_uri = f"/v1/digital-twins?gateway_id={gw_id}&type=Sensor&limit=1&format=simplified"
+    simplified_sensor_ids: list[str] = []
+    flat_sensor_pages = 0
+    while cur_flat_sensor_uri:
+        flat_sensor_pages += 1
+        if flat_sensor_pages > max_pages:
+            raise AssertionError("simplified sensor pagination loop")
+        r_flat_spage = ctx.http.get(cur_flat_sensor_uri, token=owner_token, headers=simplified_json_accept)
+        spage_items = validate_simplified_list_response(r_flat_spage, f"simplified sensor page {flat_sensor_pages}")
+        if len(spage_items) != 1:
+            raise AssertionError(f"expected 1 item on simplified sensor page {flat_sensor_pages}, got {len(spage_items)}")
+        simplified_sensor_ids.append(spage_items[0]["id"])
+        next_sensor_uri = parse_rel_next_uri(r_flat_spage.headers.get("link"))
+        if next_sensor_uri:
+            validate_next_uri_contract(
+                next_sensor_uri,
+                expected_path="/v1/digital-twins",
+                expected_params={"gateway_id": gw_id, "type": "Sensor", "limit": "1", "format": "simplified"},
+                cursor_param_name="cursor",
+            )
+            cur_flat_sensor_uri = next_sensor_uri
+        else:
+            cur_flat_sensor_uri = None
+    if set(simplified_sensor_ids) != {sens_1_urn, sens_2_urn} or flat_sensor_pages != 2:
+        raise AssertionError(f"simplified type=Sensor pagination mismatch: {simplified_sensor_ids} pages={flat_sensor_pages}")
+
+    # Cursor binding is unchanged by presentation: malformed and mismatched cursors fail closed.
+    r_flat_bad_cur = ctx.http.get(
+        "/v1/digital-twins?format=simplified&cursor=garbage_cursor_not_base64!",
+        token=owner_token,
+        headers=simplified_json_accept,
+    )
+    assert_error_envelope(r_flat_bad_cur, 400, "invalid_cursor", "simplified malformed cursor")
+    r_flat_mismatch_cur = ctx.http.get(
+        f"/v1/digital-twins?format=simplified&gateway_id=other_gw&cursor={urllib.parse.quote(saved_simplified_cursor)}",
+        token=owner_token,
+        headers=simplified_json_accept,
+    )
+    assert_error_envelope(r_flat_mismatch_cur, 400, "invalid_cursor", "simplified mismatched cursor")
+
+    # Incompatible Accept on the simplified presentation -> 406 fail-closed.
+    for bad_accept in ("text/plain", "application/ld+json", "text/html"):
+        r_flat_incompat = ctx.http.get(
+            f"{normalized_list_uri}&format=simplified",
+            token=owner_token,
+            headers={"Accept": bad_accept},
+        )
+        assert_error_envelope(r_flat_incompat, 406, "not_acceptable", f"simplified incompatible Accept {bad_accept}")
+
+    # Invalid or duplicate format -> 400 invalid_request (never silently normalized).
+    for bad_format in ("detail", "Simplified", ""):
+        r_flat_bad_format = ctx.http.get(
+            f"/v1/digital-twins?gateway_id={gw_id}&format={bad_format}",
+            token=owner_token,
+            headers=simplified_json_accept,
+        )
+        assert_error_envelope(r_flat_bad_format, 400, "invalid_request", f"unsupported format {bad_format!r}")
+    r_flat_dup_format = ctx.http.get(
+        "/v1/digital-twins?gateway_id=gw_dup&format=simplified&format=simplified",
+        token=owner_token,
+        headers=simplified_json_accept,
+    )
+    assert_error_envelope(r_flat_dup_format, 400, "invalid_request", "duplicate format parameter")
+
+    # -------------------------------------------------------------------------
     # 2h. Real Container HTTP Accept 406 Negotiation and CORS Controls
     # -------------------------------------------------------------------------
     # A. Accept Header 406 Negotiation
@@ -961,4 +1254,5 @@ def run_contract_scenario(ctx: Stage4FixtureContext) -> None:
         "http_boundaries_verified": True,
         "rel_next_traversal_verified": True,
         "accept_and_cors_controls_verified": True,
+        "simplified_list_verified": True,
     }
