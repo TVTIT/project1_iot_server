@@ -13,6 +13,7 @@ import (
 	"iot-platform/internal/auth"
 	"iot-platform/internal/config"
 	"iot-platform/internal/httpapi"
+	"iot-platform/internal/usermanagement"
 )
 
 // ReadinessChecker verifies whether a required dependency is available.
@@ -52,6 +53,11 @@ type RouterDependencies struct {
 	GatewayPatcher             GatewayPatcher
 	SensorPatcher              SensorPatcher
 	TwinMaxBodyBytes           int64
+	UserCreator                usermanagement.UserCreator
+	UserLister                 usermanagement.UserLister
+	UserUpdater                usermanagement.UserUpdater
+	GatewayUserAssigner        usermanagement.GatewayUserAssigner
+	GatewayOwnerTransferer     usermanagement.GatewayOwnerTransferer
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -161,6 +167,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		adminGatewayAuditMiddleware(),
 		ownerSensorCacheMiddleware(),
 		stage4CacheMiddleware(),
+		adminUserManagementCacheMiddleware(),
 		corsMiddleware(deps.CORSAllowedOrigins),
 		httpapi.RecoveryMiddleware(slog.Default()),
 	)
@@ -204,6 +211,11 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	groups.admin.GET("/gateways", listAdminGateways(deps.AdminGatewayLister, deps.AdminInventoryDefaultLimit, deps.AdminInventoryMaxLimit))
 	groups.admin.PUT("/gateways/:gateway_id", provisionGateway(deps.GatewayProvisioner, deps.AdminMaxBodyBytes))
 	groups.admin.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensor(deps.SensorProvisioner, deps.AdminMaxBodyBytes))
+	groups.admin.POST("/users", createUserHandler(deps.UserCreator, deps.AdminMaxBodyBytes))
+	groups.admin.GET("/users", listUsersHandler(deps.UserLister))
+	groups.admin.PATCH("/users/:user_id", updateUserHandler(deps.UserUpdater, deps.AdminMaxBodyBytes))
+	groups.admin.PUT("/gateways/:gateway_id/users/:user_id", assignGatewayUserHandler(deps.GatewayUserAssigner, deps.AdminMaxBodyBytes))
+	groups.admin.PUT("/gateways/:gateway_id/owner", transferGatewayOwnerHandler(deps.GatewayOwnerTransferer, deps.AdminMaxBodyBytes))
 	authenticated := groups.authenticated
 	authenticated.GET("/me/permissions", getMyPermissions(deps.PlatformAdminChecker, deps.AuthorizationTimeout))
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))

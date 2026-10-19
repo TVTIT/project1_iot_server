@@ -19,6 +19,7 @@ import (
 	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/gateway"
 	"iot-platform/internal/telemetry"
+	"iot-platform/internal/usermanagement"
 )
 
 type inertTelemetryHistoryReader struct{}
@@ -206,4 +207,115 @@ func AttachTestStage4Dependencies(deps RouterDependencies) RouterDependencies {
 		deps.SensorPatcher = inertSensorPatcher{}
 	}
 	return deps
+}
+
+type inertReadinessChecker struct{}
+
+func (inertReadinessChecker) Ping(context.Context) error { return nil }
+
+type inertSensorProvisioner struct{}
+
+func (inertSensorProvisioner) ProvisionSensor(context.Context, uuid.UUID, gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error) {
+	return gateway.ProvisionSensorResult{}, gateway.ErrProvisioningInconsistent
+}
+
+type inertOwnerSensorProvisioner struct{}
+
+func (inertOwnerSensorProvisioner) ProvisionSensorForOwner(context.Context, uuid.UUID, gateway.ProvisionSensorInput) (gateway.ProvisionSensorResult, error) {
+	return gateway.ProvisionSensorResult{}, gateway.ErrProvisioningInconsistent
+}
+
+type inertGatewayProvisioner struct{}
+
+func (inertGatewayProvisioner) ProvisionGateway(context.Context, uuid.UUID, gateway.ProvisionGatewayInput) (gateway.ProvisionGatewayResult, error) {
+	return gateway.ProvisionGatewayResult{}, gateway.ErrProvisioningInconsistent
+}
+
+type inertSensorReader struct{}
+
+func (inertSensorReader) ListSensorsForUserAndGateway(context.Context, uuid.UUID, string) ([]gateway.Sensor, error) {
+	return nil, nil
+}
+
+type inertGatewayReader struct{}
+
+func (inertGatewayReader) ListGatewaysForUser(context.Context, uuid.UUID) ([]gateway.Gateway, error) {
+	return nil, nil
+}
+
+type inertAdminGatewayLister struct{}
+
+func (inertAdminGatewayLister) ListAdminGatewayInventory(context.Context, uuid.UUID, gateway.AdminGatewayInventoryQuery) (gateway.AdminGatewayInventoryPage, error) {
+	return gateway.AdminGatewayInventoryPage{Items: []gateway.AdminGateway{}}, nil
+}
+
+type inertGatewayOwnerTransferer struct{}
+
+func (inertGatewayOwnerTransferer) TransferGatewayOwner(context.Context, uuid.UUID, string, uuid.UUID) error {
+	return nil
+}
+
+type inertGatewayUserAssigner struct{}
+
+func (inertGatewayUserAssigner) AssignGatewayUser(context.Context, uuid.UUID, string, uuid.UUID, string) error {
+	return nil
+}
+
+type inertUserUpdater struct{}
+
+func (inertUserUpdater) UpdateUser(context.Context, uuid.UUID, uuid.UUID, usermanagement.UpdateUserInput) (usermanagement.UpdatedUser, error) {
+	return usermanagement.UpdatedUser{}, nil
+}
+
+type inertUserLister struct{}
+
+func (inertUserLister) ListUsers(context.Context, uuid.UUID) ([]usermanagement.UserSummary, error) {
+	return []usermanagement.UserSummary{}, nil
+}
+
+type inertUserCreator struct{}
+
+func (inertUserCreator) CreateUser(context.Context, uuid.UUID, usermanagement.CreateUserInput) (usermanagement.CreatedUser, error) {
+	return usermanagement.CreatedUser{}, nil
+}
+
+// AttachTestUserManagementDependencies populates default user management mock use-cases
+// into a RouterDependencies struct for testing purposes if they are not already set.
+func AttachTestUserManagementDependencies(deps RouterDependencies) RouterDependencies {
+	if deps.UserCreator == nil {
+		deps.UserCreator = inertUserCreator{}
+	}
+	if deps.UserLister == nil {
+		deps.UserLister = inertUserLister{}
+	}
+	if deps.UserUpdater == nil {
+		deps.UserUpdater = inertUserUpdater{}
+	}
+	if deps.GatewayUserAssigner == nil {
+		deps.GatewayUserAssigner = inertGatewayUserAssigner{}
+	}
+	if deps.GatewayOwnerTransferer == nil {
+		deps.GatewayOwnerTransferer = inertGatewayOwnerTransferer{}
+	}
+	return deps
+}
+
+// DefaultTestRouterDependencies returns RouterDependencies populated with inert mocks suitable for testing.
+func DefaultTestRouterDependencies() RouterDependencies {
+	deps := RouterDependencies{
+		ReadinessChecker:           inertReadinessChecker{},
+		ReadinessTimeout:           time.Second,
+		AuthorizationTimeout:       time.Second,
+		AdminMaxBodyBytes:          16384,
+		AdminInventoryDefaultLimit: 100,
+		AdminInventoryMaxLimit:     200,
+		SensorProvisioner:          inertSensorProvisioner{},
+		OwnerSensorProvisioner:     inertOwnerSensorProvisioner{},
+		GatewayProvisioner:         inertGatewayProvisioner{},
+		SensorReader:               inertSensorReader{},
+		GatewayReader:              inertGatewayReader{},
+		AdminGatewayLister:         inertAdminGatewayLister{},
+	}
+	deps = AttachTestStage4Dependencies(deps)
+	return AttachTestUserManagementDependencies(deps)
 }

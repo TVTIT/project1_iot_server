@@ -196,6 +196,9 @@ func run() error {
 	if err := populateStage4Dependencies(&routerDeps, cfg, pool, provisioningService); err != nil {
 		return fmt.Errorf("compose stage 4 dependencies: %w", err)
 	}
+	if err := populateUserManagementDependencies(&routerDeps, cfg, pool); err != nil {
+		return fmt.Errorf("compose user management dependencies: %w", err)
+	}
 	router, err := httpserver.NewRouter(routerDeps)
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)

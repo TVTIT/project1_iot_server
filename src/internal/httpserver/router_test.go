@@ -279,5 +279,6 @@ func testRouterDependencies(readiness ReadinessChecker) RouterDependencies {
 			return true, nil
 		}),
 	}
-	return AttachTestStage4Dependencies(deps)
+	deps = AttachTestStage4Dependencies(deps)
+	return AttachTestUserManagementDependencies(deps)
 }
