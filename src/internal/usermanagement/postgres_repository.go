@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 
 	"github.com/google/uuid"
@@ -24,6 +26,8 @@ var (
 type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
+
+var _ Repository = (*PostgresRepository)(nil)
 
 // NewPostgresRepository creates a PostgresRepository backed by pgxpool.Pool.
 func NewPostgresRepository(pool *pgxpool.Pool) (*PostgresRepository, error) {
@@ -339,6 +343,64 @@ func (r *PostgresRepository) AssignGatewayUser(ctx context.Context, actorID uuid
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit gateway user assignment: %w", err)
+	}
+	return nil
+}
+
+// RemoveGatewayUser serializes with assignment/owner transfer on the parent Gateway.
+// A missing membership commits a no-op; owner membership is never deleted.
+func (r *PostgresRepository) RemoveGatewayUser(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) (resultErr error) {
+	defer func() {
+		var netErr net.Error
+		var pgErr *pgconn.PgError
+		if errors.As(resultErr, &netErr) || errors.Is(resultErr, io.EOF) ||
+			(errors.As(resultErr, &pgErr) && (strings.HasPrefix(pgErr.Code, "08") || pgErr.Code == "57P01" || pgErr.Code == "57P02" || pgErr.Code == "57P03" || pgErr.Code == "53300")) {
+			resultErr = errors.Join(ErrMembershipUnavailable, resultErr)
+		}
+	}()
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: begin membership removal: %w", ErrMembershipUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var admin bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM public.platform_admins WHERE user_id = $1)", actorID).Scan(&admin); err != nil {
+		// Authorization cannot be established; do not treat this as a denial or success.
+		return fmt.Errorf("%w: %w", ErrMembershipUnavailable, err)
+	}
+	if !admin {
+		return ErrActorNotAdmin
+	}
+	var gw string
+	if err := tx.QueryRow(ctx, "SELECT gateway_id FROM public.gateways WHERE gateway_id = $1 FOR UPDATE", gatewayID).Scan(&gw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrGatewayNotFound
+		}
+		return fmt.Errorf("lock removal gateway: %w", err)
+	}
+	var role string
+	err = tx.QueryRow(ctx, "SELECT role FROM public.user_gateways WHERE gateway_id = $1 AND user_id = $2 FOR UPDATE", gatewayID, targetID).Scan(&role)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock removal membership: %w", err)
+	}
+	if err == nil {
+		switch role {
+		case "owner":
+			return ErrOwnerTransferRequired
+		case "operator", "viewer":
+			tag, err := tx.Exec(ctx, `DELETE FROM public.user_gateways WHERE gateway_id = $1 AND user_id = $2 AND role IN ('operator', 'viewer')`, gatewayID, targetID)
+			if err != nil {
+				return fmt.Errorf("delete membership: %w", err)
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf("unexpected membership removal row count")
+			}
+		default:
+			return fmt.Errorf("unexpected membership role")
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit membership removal: %w", err)
 	}
 	return nil
 }

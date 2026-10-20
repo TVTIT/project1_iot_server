@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"iot-platform/internal/gateway"
 )
 
 // Service coordinates admin user management business logic.
@@ -24,6 +26,7 @@ var (
 	_ UserLister             = (*Service)(nil)
 	_ UserUpdater            = (*Service)(nil)
 	_ GatewayUserAssigner    = (*Service)(nil)
+	_ GatewayUserRemover     = (*Service)(nil)
 	_ GatewayOwnerTransferer = (*Service)(nil)
 )
 
@@ -225,6 +228,22 @@ func (s *Service) AssignGatewayUser(ctx context.Context, actorID uuid.UUID, gate
 
 	// 4. Delegate to repository transaction
 	return s.repo.AssignGatewayUser(ctx, actorID, gatewayID, targetID, role)
+}
+
+// RemoveGatewayUser revokes only membership, never the account or global role.
+func (s *Service) RemoveGatewayUser(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) error {
+	if actorID == uuid.Nil || targetID == uuid.Nil || gateway.ValidateGatewayID(gatewayID) != nil || gatewayID == "backend_service" {
+		return ErrInvalidInput
+	}
+	if s.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.repo.RemoveGatewayUser(ctx, actorID, gatewayID, targetID)
 }
 
 // TransferGatewayOwner transfers ownership of a gateway atomically.

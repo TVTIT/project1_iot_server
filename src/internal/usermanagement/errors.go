@@ -8,6 +8,9 @@ import (
 )
 
 var (
+	// ErrMembershipUnavailable means removal could not establish authorization or reach its database.
+	ErrMembershipUnavailable = errors.New("membership service unavailable")
+
 	// ErrInvalidInput indicates validation failed on request fields.
 	ErrInvalidInput = errors.New("invalid input")
 

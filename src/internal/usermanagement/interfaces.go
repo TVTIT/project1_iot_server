@@ -26,6 +26,11 @@ type GatewayUserAssigner interface {
 	AssignGatewayUser(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID, role string) error
 }
 
+// GatewayUserRemover removes only an operator/viewer membership.
+type GatewayUserRemover interface {
+	RemoveGatewayUser(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) error
+}
+
 // GatewayOwnerTransferer transfers ownership of a gateway atomically.
 type GatewayOwnerTransferer interface {
 	TransferGatewayOwner(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) error

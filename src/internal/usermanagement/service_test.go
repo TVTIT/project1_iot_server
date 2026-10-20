@@ -81,6 +81,10 @@ type mockRepository struct {
 	transferFn          func(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) error
 }
 
+func (m *mockRepository) RemoveGatewayUser(context.Context, uuid.UUID, string, uuid.UUID) error {
+	return nil
+}
+
 func (m *mockRepository) VerifyActorIsAdmin(ctx context.Context, actorID uuid.UUID) error {
 	m.verifyAdminCalls++
 	m.lastAdminCtx = ctx
