@@ -157,7 +157,7 @@ func TestComposeUserManagementDependencies_OverridePropagation(t *testing.T) {
 	}
 
 	if deps.UserCreator == nil || deps.UserLister == nil || deps.UserUpdater == nil ||
-		deps.GatewayUserAssigner == nil || deps.GatewayOwnerTransferer == nil {
+		deps.GatewayUserAssigner == nil || deps.GatewayUserRemover == nil || deps.GatewayOwnerTransferer == nil {
 		t.Fatal("expected non-nil handlers with custom overrides")
 	}
 }
@@ -184,6 +184,9 @@ func TestComposeUserManagementDependencies_WithoutServiceRoleKey(t *testing.T) {
 	}
 	if deps.GatewayUserAssigner == nil {
 		t.Fatal("expected non-nil GatewayUserAssigner")
+	}
+	if deps.GatewayUserRemover == nil {
+		t.Fatal("expected non-nil GatewayUserRemover without Auth credentials")
 	}
 	if deps.GatewayOwnerTransferer == nil {
 		t.Fatal("expected non-nil GatewayOwnerTransferer")

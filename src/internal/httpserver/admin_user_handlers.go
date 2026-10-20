@@ -334,6 +334,58 @@ func assignGatewayUserHandler(assigner usermanagement.GatewayUserAssigner, limit
 	}
 }
 
+// DELETE /v1/admin/gateways/:gateway_id/users/:user_id
+func removeGatewayUserHandler(remover usermanagement.GatewayUserRemover) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		p, ok := auth.PrincipalFrom(c)
+		if !ok || p.UserID == uuid.Nil {
+			httpapi.WriteError(c, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if auth.IsNilDependency(remover) {
+			httpapi.WriteError(c, http.StatusServiceUnavailable, "service_unavailable", "service unavailable")
+			return
+		}
+		gatewayID := c.Param("gateway_id")
+		targetID, err := uuid.Parse(c.Param("user_id"))
+		if err != nil || targetID == uuid.Nil || gateway.ValidateGatewayID(gatewayID) != nil || gatewayID == "backend_service" || c.Request.URL.RawQuery != "" || c.Request.URL.ForceQuery {
+			httpapi.WriteError(c, http.StatusBadRequest, "invalid_request", "invalid request")
+			return
+		}
+		// Read at most one byte, rejecting even whitespace and chunked bodies.
+		if c.Request.Body != nil {
+			var one [1]byte
+			n, err := io.ReadFull(c.Request.Body, one[:])
+			if n != 0 || (err != nil && !errors.Is(err, io.EOF)) {
+				httpapi.WriteError(c, http.StatusBadRequest, "invalid_request", "invalid request")
+				return
+			}
+		}
+		if err := remover.RemoveGatewayUser(c.Request.Context(), p.UserID, gatewayID, targetID); err != nil {
+			status, code, message := http.StatusInternalServerError, "internal_error", "internal server error"
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, usermanagement.ErrMembershipUnavailable):
+				status, code, message = http.StatusServiceUnavailable, "service_unavailable", "service unavailable"
+			case errors.Is(err, usermanagement.ErrActorNotAdmin):
+				status, code, message = http.StatusForbidden, "forbidden", "access denied"
+			case errors.Is(err, usermanagement.ErrOwnerTransferRequired):
+				status, code, message = http.StatusConflict, "owner_transfer_required", "owner transfer required"
+			case errors.Is(err, usermanagement.ErrGatewayNotFound):
+				status, code, message = http.StatusNotFound, "not_found", "resource not found"
+			case errors.Is(err, usermanagement.ErrInvalidInput):
+				status, code, message = http.StatusBadRequest, "invalid_request", "invalid request"
+			}
+			slog.ErrorContext(c.Request.Context(), "remove gateway user failed", "request_id", httpapi.RequestIDFrom(c), "actor_id", p.UserID.String(), "gateway_id", gatewayID, "target_id", targetID.String(), "error_code", code)
+			httpapi.WriteError(c, status, code, message)
+			return
+		}
+		slog.InfoContext(c.Request.Context(), "gateway membership revocation completed",
+			"request_id", httpapi.RequestIDFrom(c), "actor_id", p.UserID.String(),
+			"gateway_id", gatewayID, "target_id", targetID.String(), "outcome", "success")
+		c.Status(http.StatusNoContent)
+	}
+}
+
 // PUT /v1/admin/gateways/:gateway_id/owner
 func transferGatewayOwnerHandler(ownerTransferer usermanagement.GatewayOwnerTransferer, limit int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
