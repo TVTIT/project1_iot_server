@@ -1,10 +1,18 @@
 \set ON_ERROR_STOP on
+\if :{?expected_schema_terminal}
+\else
+\set expected_schema_terminal 21
+\endif
+SELECT max(version) = :expected_schema_terminal AS terminal_verified FROM public.schema_migrations \gset
+\if :terminal_verified
+\else
+DO $$ BEGIN RAISE EXCEPTION 'unexpected terminal schema'; END $$;
+\endif
 BEGIN;
 DO $$
 BEGIN
   -- 1. Migration tracking assertion
-  IF NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=21 AND name='admin_user_management')
-     OR (SELECT max(version) FROM public.schema_migrations) <> 21 THEN
+  IF NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=21 AND name='admin_user_management') THEN
     RAISE EXCEPTION 'migration 21 tracking is missing or unexpected';
   END IF;
 
