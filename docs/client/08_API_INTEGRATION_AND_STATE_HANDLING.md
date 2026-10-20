@@ -1,10 +1,11 @@
 # Tài liệu Client — 08: Tích hợp API và Quản lý Trạng thái Giao diện (API Integration and State Handling)
 
-**Cập nhật:** 2026-10-19
+**Cập nhật:** 2026-10-20
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:**
 - [`../../AGENTS.md`](../../AGENTS.md) (Mục 1, 2, 5, 6, 6.5, 10, 16, 18)
 - [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết quản lý User và Gateway Membership)
+- [`../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md`](../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md) (Kế hoạch chi tiết bổ sung DELETE Gateway Membership)
 - [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
 - `docs/protocols/stage4-read-and-entity-api.md` (Hợp đồng Stage 4 Read & Entity API)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
@@ -25,18 +26,23 @@ Tài liệu này cung cấp **danh mục quy chuẩn (checklist) thực tiễn, 
 
 ### 1.2 Tuyên bố hiện thực (No Premature Client Implementation Claims)
 - **Tài liệu này đóng vai trò đặc tả thiết kế và danh mục kiểm thử tích hợp cho Client, KHÔNG khẳng định mã nguồn giao diện Flutter Client đã được hiện thực hoặc kiểm thử hoàn chỉnh.**
-- Giao diện người dùng phải tuân thủ nghiêm ngặt các endpoint đã thực sự tồn tại trong Go Backend (gồm 7 endpoint Stage 4 và các API nghiệp vụ/quản trị hiện hữu) và GoTrue Auth; tuyệt đối không giả định hoặc tự sáng tác các endpoint chưa có.
+- Giao diện người dùng phải tuân thủ nghiêm ngặt các endpoint đã thực sự tồn tại trong Go Backend (gồm 7 endpoint Stage 4, 6 endpoint quản trị tài khoản & quyền thành viên Gateway, và các API nghiệp vụ/quản trị hiện hữu) và GoTrue Auth; tuyệt đối không giả định hoặc tự sáng tác các endpoint chưa có.
 
 ### 1.3 Phân định bằng chứng kiểm thử (Evidence Status)
 - **Bằng chứng kiểm chứng lịch sử (Historical Test Snapshot):** Bộ kiểm thử E2E cô lập đã từng hoàn tất thực nghiệm 27/27 kịch bản (E01–E27) đạt `PASS` trên hạ tầng kiểm thử cục bộ (`scripts/test-stage2-e2e.sh`, ảnh chụp lịch sử ngày 2026-10-05).
 - **Kiểm chứng Tích hợp Backend Stage 4 (Stage 4 Verified Evidence):**
   - Kịch bản tích hợp thực tế `scripts/test-stage4-api.sh --scenario all` đạt `PASS` trên các container dịch vụ thực (PostgreSQL 16.15 / TimescaleDB 2.29.2 schema 20 dưới role `iot_backend_app`, Mosquitto 2.0.18 DynSec TLS).
   - Pipeline GitHub Actions CI từ xa đã được xác thực `PASS` toàn bộ 16/16 jobs tại commit sạch `aa7436d8838a6580c21b30930e2eed992999b11c` (Workflow run `39103564379`), bao gồm `stage4-api-integration`, `stage3-uplink-integration` và `native-compose-smoke`.
+- **Trạng thái Kiểm chứng Triển khai Bổ sung Thu hồi Membership Gateway (Task D1–D4):**
+  - Baseline mã nguồn hiện tại: commit `8f9f984` kèm working diff chưa commit (`dirty`).
+  - Migration 22 (`000022_gateway_membership_revocation.up.sql`) bổ sung quyền `GRANT DELETE ON TABLE public.user_gateways TO iot_backend` đã được áp dụng và kiểm chứng cục bộ đạt `PASS` (Go unit/race/native repository tests, HTTP contract tests, Stage 4 `all` và Compose `--full-http` trên shared TEST PostgreSQL 16.15 / TimescaleDB 2.29.2 schema 22 + GoTrue/Envoy).
+  - **Ranh giới CI và Rollout:** Remote CI trên GitHub Actions và quy trình rollout/restart backend đang chạy CHƯA CHẠY (NOT RUN).
+  - **Cập nhật phạm vi lịch sử:** Các phát biểu lịch sử trước đây ghi nhận "chưa có xóa membership" thuộc phạm vi giai đoạn trước; nay hệ thống đã chính thức bổ sung endpoint thứ sáu `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` dành cho Platform Admin. Các bằng chứng kiểm thử lịch sử cũ tiếp tục được bảo toàn nguyên trạng.
 - **Ngoại lệ Tồn đọng Chuyển tiếp (Deferred Exceptions & Boundaries):**
   - WebSocket (`/v1/ws`) tiếp tục trả về `501 Not Implemented` (chờ Stage 7).
   - Điều khiển thiết bị lâu bền (`desired_state`, downlink commands, transactional outbox) chưa kích hoạt (chờ Stage 5).
   - API Reset credential có giám sát vẫn giữ rào chắn fail-closed `503 Service Unavailable` (`denyOnlyResetPrerequisite{}`).
-*Lưu ý an toàn:* Tuyệt đối không tuyên bố hệ thống sẵn sàng vận hành sản xuất (production-ready) hoặc client Flutter đã hoàn tất khi các cổng nghiệm thu nghiệp vụ và phần cứng thực tế chưa diễn ra.
+*Lưu ý an toàn:* Tuyệt đối không tuyên bố hệ thống sẵn sàng vận hành sản xuất (production-ready) hoặc client Flutter đã hoàn tất khi các cổng nghiệm thu nghiệp vụ và phần cứng thực tế chưa diễn ra. Không suy diễn bất kỳ cập nhật nào trên Flutter Client hay bộ kịch bản Bruno.
 
 ---
 
@@ -204,14 +210,15 @@ Mọi màn hình trên Client phải xử lý đầy đủ các trạng thái sa
 | **`loading`** | Đang thực thi request hoặc làm mới dữ liệu. | Hiển thị hiệu ứng tải (progress indicator/shimmer), khóa tạm thời các thao tác trùng lặp. Cho phép hủy request (`cancel`). |
 | **`success`** | Nhận `200 OK` (hoặc `201 Created` khi tạo mới Sensor/Gateway) với dữ liệu hợp lệ. | - Danh mục Twin: Hiển thị mảng root array `[...]`.<br>- Chi tiết Twin: Hiển thị thông tin thực thể NGSI-LD và đồ thị quan hệ `hasSensor` (`object` array), trích xuất mã đơn vị UN/CEFACT `unitCode`.<br>- Trạng thái Twin: Hiển thị `reported_state` và `reported_version` từ `?format=simplified`.<br>- Lịch sử Temporal: Hiển thị biểu đồ từ mảng `values` (raw) hoặc các mảng triples `avg`, `min`, `max`, `totalCount` (bucket). |
 | **`empty`** | Nhận `200 OK` nhưng mảng rỗng `[]` (List Twin) hoặc lịch sử `values: []`, method arrays rỗng. | Hiển thị thông báo rỗng thân thiện (ví dụ: *"Bạn chưa được phân quyền trên trạm nào"* hoặc *"Không có dữ liệu đo lường trong khoảng thời gian đã chọn"*). Tuyệt đối **không coi đây là lỗi**. |
-| **`no-privacy 404`** | Nhận `404 Not Found` (`code: "not_found"`). | Xảy ra khi truy cập `gateway_id` lạ, `entity_id` không tồn tại, trạm mà người dùng không có quyền trong `user_gateways`, hoặc khi gọi vào các route cũ đã thu hồi (`/v1/telemetry/history`, `/{id}/state`, `/{id}/history`). Đối với PATCH Gateway, mọi tài khoản không phải Admin đều nhận `403 Forbidden` trước. **Nguyên tắc Anti-Enumeration:** Giao diện chỉ hiển thị *"Không tìm thấy tài nguyên"*, không đoán định tài nguyên có tồn tại hay không. |
-| **`400 validation error`** | Nhận `400 Bad Request` (`code: "invalid_bounds"`, `code: "invalid_time_range"`, `code: "invalid_resolution"`, `code: "invalid_urn"`, `code: "invalid_request"`). | Lỗi cú pháp hoặc tham số truy vấn không hợp lệ (ví dụ: `timeAt >= endTimeAt`, sai định dạng RFC3339, duration không thuộc 9 canonical durations, hoặc URN không đúng chuẩn). Hiển thị thông báo cụ thể từ trường `error.message`. |
+| **`204 no content`** | Nhận `204 No Content` khi xóa thành công hoặc no-op (`DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`). | - Phản hồi **hoàn toàn không có body**, Client **TUYỆT ĐỐI KHÔNG phân tích cú pháp JSON body** (không gọi `jsonDecode` hay ép kiểu DTO).<br>- Kích hoạt làm mới (refresh) danh sách quyền qua `GET /v1/admin/users` (cập nhật mảng `gateway_roles`) và các màn hình truy cập trạm bị ảnh hưởng.<br>- Thao tác chỉ xóa đúng dòng quyền trong `public.user_gateways`: không xóa tài khoản Auth, không xóa `public.profiles`, không hạ quyền Platform Admin toàn cục, không ảnh hưởng quyền trên các trạm khác. |
+| **`no-privacy 404`** | Nhận `404 Not Found` (`code: "not_found"`). | Xảy ra khi truy cập `gateway_id` lạ, `entity_id` không tồn tại, trạm mà người dùng không có quyền trong `user_gateways`, hoặc khi gọi vào các route cũ đã thu hồi (`/v1/telemetry/history`, `/{id}/state`, `/{id}/history`). Đối với PATCH Gateway, mọi tài khoản không phải Admin đều nhận `403 Forbidden` trước. Khi gọi `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`, nếu `gateway_id` không tồn tại, server trả `404 Not Found` (ngược lại nếu Gateway tồn tại nhưng user không có membership thì trả `204 No Content` idempotent). **Nguyên tắc Anti-Enumeration:** Giao diện chỉ hiển thị *"Không tìm thấy tài nguyên"*, không đoán định tài nguyên có tồn tại hay không. |
+| **`400 validation error`** | Nhận `400 Bad Request` (`code: "invalid_bounds"`, `code: "invalid_time_range"`, `code: "invalid_resolution"`, `code: "invalid_urn"`, `code: "invalid_request"`). | Lỗi cú pháp hoặc tham số truy vấn không hợp lệ (ví dụ: `timeAt >= endTimeAt`, sai định dạng RFC3339, duration không thuộc 9 canonical durations, URN không đúng chuẩn, UUID nil/sai format, hoặc request bodyless gửi kèm body/query string). Hiển thị thông báo cụ thể từ trường `error.message`. |
 | **`400 raw overflow`** | Nhận `400 Bad Request` (`code: "raw_limit_exceeded"`). | Xảy ra khi truy vấn dữ liệu thô (`temporal`) nhưng số lượng quan sát vượt quá `max_points` (phát hiện bằng giới hạn quét `max_points + 1`; mặc định hợp đồng 1000, tối thiểu 100, chặn trên 2000). Giao diện hiển thị: *"Số điểm dữ liệu thô vượt hạn mức yêu cầu. Vui lòng thu hẹp khoảng thời gian hoặc chỉ định tham số gom nhóm aggrPeriodDuration"*. |
 | **`401 refresh limited`** | Nhận `401 Unauthorized` (`code: "unauthorized"`). | Phiên làm việc hết hạn hoặc token lỗi. Client kích hoạt luồng Refresh Token **giới hạn duy nhất 1 lần (bounded retry)**. Nếu thất bại, xóa session cục bộ và chuyển hướng về màn hình Đăng nhập. Tránh tạo vòng lặp vô hạn. |
-| **`403 forbidden`** | Nhận `403 Forbidden` (`code: "forbidden"`). | - Tài khoản thông thường cố gọi API Quản trị `/v1/admin/*`: *"Thao tác yêu cầu quyền Quản trị viên hệ thống"*.<br>- `operator` hoặc `viewer` gọi tạo/sửa Sensor (`POST /v1/digital-twins`, `PATCH /v1/digital-twins/{id}/attrs`): *"Chỉ Chủ sở hữu trạm (Owner) mới có quyền tạo hoặc chỉnh sửa cảm biến"*.<br>- Mọi tài khoản không phải Platform Admin gọi PATCH Gateway: *"Chỉ Quản trị viên nền tảng mới có quyền sửa thông tin trạm"*.<br>- Origin bị từ chối trong CORS preflight. |
+| **`403 forbidden`** | Nhận `403 Forbidden` (`code: "forbidden"`). | - Tài khoản thông thường cố gọi API Quản trị `/v1/admin/*` (kể cả thao tác xóa membership trạm): *"Thao tác yêu cầu quyền Quản trị viên hệ thống"*.<br>- `operator` hoặc `viewer` gọi tạo/sửa Sensor (`POST /v1/digital-twins`, `PATCH /v1/digital-twins/{id}/attrs`): *"Chỉ Chủ sở hữu trạm (Owner) mới có quyền tạo hoặc chỉnh sửa cảm biến"*.<br>- Mọi tài khoản không phải Platform Admin gọi PATCH Gateway: *"Chỉ Quản trị viên nền tảng mới có quyền sửa thông tin trạm"*.<br>- Origin bị từ chối trong CORS preflight. |
 | **`406 not acceptable`** | Nhận `406 Not Acceptable` (`code: "not_acceptable"`). | Header `Accept` gửi lên không tương thích với media type server phục vụ (ví dụ: yêu cầu text/plain hoặc gán `q=0` cho định dạng server trả về). Client cần cấu hình Accept phù hợp (`application/ld+json` hoặc `application/json`). |
-| **`409 conflict`** | Nhận `409 Conflict` (`code: "conflict"`). | Khi gọi tạo Sensor hoặc Gateway (`POST /v1/digital-twins` hoặc `PUT sensor`) nhưng thực thể đã tồn tại với thông tin khác (`name`, `unit` khác). Hiển thị: *"Thực thể đã tồn tại với thông tin khác. Hệ thống không cho phép ghi đè cấu hình qua lệnh này"*. |
-| **`503 dependency retry`** | Nhận `503 Service Unavailable` (`code: "service_unavailable"`, `code: "dependency_failed"` hoặc `code: "credential_runtime_disabled"`). | Quá thời hạn xử lý cơ sở dữ liệu (`AUTHORIZATION_TIMEOUT`), timeout truy vấn dữ liệu lớn, database tạm thời gián đoạn, rào chắn khởi động chưa xong, hoặc tính năng credential bị tắt. Hiển thị *"Hệ thống bận hoặc dịch vụ tạm thời gián đoạn, vui lòng thử lại sau"*, cung cấp nút Thử lại (Retry) kèm giãn cách số mũ. |
+| **`409 conflict`** | Nhận `409 Conflict` (`code: "conflict"`, `code: "owner_transfer_required"`, `code: "self_admin_demotion_forbidden"` hoặc `code: "user_list_capacity_exceeded"`). | - Khi gọi tạo Sensor hoặc Gateway (`POST /v1/digital-twins` hoặc `PUT sensor`) nhưng thực thể đã tồn tại với thông tin khác (`name`, `unit` khác). Hiển thị: *"Thực thể đã tồn tại với thông tin khác. Hệ thống không cho phép ghi đè cấu hình qua lệnh này"*.<br>- Khi gán vai trò (`PUT .../users/{id}`) hoặc thu hồi quyền (`DELETE .../users/{id}`) mà target user đang là `owner` của Gateway (kể cả do xung đột đổi đồng thời): Server trả `code: "owner_transfer_required"`. Hiển thị: *"Không thể xóa hoặc thay đổi quyền của Chủ sở hữu trạm. Vui lòng chuyển quyền sở hữu (transfer owner) sang người khác trước"*. Client làm mới vai trò trước khi thực hiện thao tác tiếp theo.<br>- Khi admin cố tự hạ quyền của chính mình (`code: "self_admin_demotion_forbidden"`).<br>- Khi danh sách người dùng vượt ngưỡng tải tối đa của server (`code: "user_list_capacity_exceeded"`). |
+| **`503 dependency retry`** | Nhận `503 Service Unavailable` (`code: "service_unavailable"`, `code: "dependency_failed"` hoặc `code: "credential_runtime_disabled"`). | Quá thời hạn xử lý cơ sở dữ liệu (`AUTHORIZATION_TIMEOUT`), timeout truy vấn dữ liệu lớn, database tạm thời gián đoạn, rào chắn khởi động chưa xong, hoặc tính năng credential bị tắt. Hiển thị *"Hệ thống bận hoặc dịch vụ tạm thời gián đoạn, vui lòng thử lại sau"*, cung cấp nút Thử lại (Retry) kèm giãn cách số mũ. Đối với thao tác mutation như xóa membership, tuyệt đối không blind retry; cần đối soát lại danh sách thành viên trước. |
 | **`500 safe / support request_id`** | Nhận `500 Internal Server Error` (`code: "internal_error"`). | Lỗi máy chủ nội bộ. Server không trả về stack trace. Client **bắt buộc đọc `request_id`** (từ `X-Request-ID` header hoặc payload `error.request_id`) để hiển thị thông báo: *"Đã xảy ra sự cố hệ thống. Mã tra cứu hỗ trợ: `<request_id>`"*. |
 | **`501 feature unavailable`** | Nhận `501 Not Implemented` (`code: "not_implemented"`). | Hiện tại **CHỈ CÒN DUY NHẤT** endpoint WebSocket (`GET /v1/ws`) phản hồi 501. Các API Lịch sử đo lường và Bản sao số Digital Twin **ĐÃ HOẠT ĐỘNG HOÀN TOÀN** trong Stage 4, không còn trả về 501. |
 | **`405 developer error`** | Nhận `405 Method Not Allowed` (`code: "method_not_allowed"`). | Lỗi gửi sai phương thức (ví dụ: gửi `PATCH` vào route gốc `/v1/digital-twins/{entity_id}` thay vì `/attrs`). Ghi log lỗi phát triển, không kích hoạt thao tác sai. |
@@ -222,8 +229,10 @@ Mọi màn hình trên Client phải xử lý đầy đủ các trạng thái sa
 
 ### 5.1 Thay đổi quyền cùng một JWT (Same-JWT Membership Change)
 - Khi Quản trị viên thay đổi vai trò (ví dụ: từ `viewer` sang `operator`) hoặc thu hồi quyền truy cập trạm trong CSDL PostgreSQL (`public.user_gateways`), **JWT hiện tại của người dùng không cần cấp phát lại**.
-- Thay đổi này có hiệu lực **ngay lập tức trong lần truy vấn CSDL tiếp theo** tại Go Backend.
-- **Không có cơ chế Push Realtime:** Trong Stage 4, hệ thống chưa có WebSocket hoạt động để tự động đẩy thông báo đổi quyền xuống Client. Client nhận biết quyền mới khi thực hiện thao tác tải lại dữ liệu (Pull-to-refresh hoặc điều hướng lại). Nếu quyền bị thu hồi, các lệnh gọi tiếp theo sẽ lập tức trả về `404 Not Found` hoặc `403 Forbidden`.
+- Thay đổi này có hiệu lực **ngay lập tức trong lần truy vấn CSDL tiếp theo** tại Go Backend sau khi transaction được commit thành công.
+- **Ranh giới thực thi và Không có Push Realtime:**
+  - Trong Stage 4, hệ thống chưa có WebSocket hoạt động (`501 Not Implemented`) để tự động đẩy thông báo đổi quyền xuống Client. Client nhận biết quyền mới khi thực hiện thao tác tải lại dữ liệu (Pull-to-refresh hoặc điều hướng lại). Nếu quyền bị thu hồi, các lệnh gọi tiếp theo sẽ lập tức trả về `404 Not Found` hoặc `403 Forbidden`.
+  - **Không phóng đại việc hủy thực thi (No false execution counts / No instant socket kill):** Việc thu hồi quyền trong CSDL không tự động ngắt kết nối TCP của các request đang bay trong đường truyền và không tự động hủy phiên WebSocket (hiện chưa triển khai). Quyền bị thu hồi được áp dụng chính xác cho các request nghiệp vụ đến sau thời điểm commit. Tuyệt đối không đưa ra các tuyên bố sai lệch về việc hủy tức thời toàn bộ kết nối hay đếm số lượng thực thi không có thật.
 
 ### 5.2 Quản lý Bộ nhớ đệm, Phân trang Header Link và Số nguyên Lớn (Cache, Link Pagination & Precision)
 1. **Chính sách Cache-Control:**
@@ -362,8 +371,8 @@ Khi xây dựng giao diện quản trị dành cho Platform Admin, ứng dụng 
    - Nếu admin cố tình gửi request hạ quyền của chính mình, server sẽ từ chối với mã lỗi `409 Conflict` (`self_admin_demotion_forbidden`) và rollback nguyên tử toàn bộ thay đổi (kể cả phần đổi tên).
    - *Lưu ý về chính sách:* Server không có cơ chế đếm admin cuối cùng (no last-admin count policy). Việc bảo vệ chỉ nhằm ngăn chặn hành vi tự tước quyền của chính caller; tình trạng mất toàn bộ admin vẫn có thể xảy ra nếu hai admin thực hiện hạ quyền chéo đồng thời qua API (`concurrent API cross-demotions`) hoặc do can thiệp trực tiếp ngoài API trên CSDL.
 
-#### C. Hai Luồng Giao diện Phân quyền Gateway Tách biệt Hoàn toàn
-Giao diện quản trị phải chia ranh giới rõ ràng thành 2 nút bấm / biểu mẫu độc lập, không gộp chung vào một luồng:
+#### C. Ba Luồng Giao diện Quản trị Quyền Thành viên Gateway Tách biệt Hoàn toàn
+Giao diện quản trị phải chia ranh giới rõ ràng thành 3 nút bấm / biểu mẫu độc lập, không gộp chung vào một luồng:
 1. **Biểu mẫu Gán Vai trò Thông thường (`PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`):**
    - Hộp thoại gán quyền thành viên chỉ cung cấp 2 lựa chọn: **Operator (Vận hành)** hoặc **Viewer (Xem)**.
    - Tuyệt đối không đưa lựa chọn `Owner` vào danh sách dropdown của biểu mẫu này (gửi `owner` sẽ bị server từ chối `400 Bad Request` với mã `invalid_role`).
@@ -373,9 +382,57 @@ Giao diện quản trị phải chia ranh giới rõ ràng thành 2 nút bấm /
    - **Thông báo xác nhận bắt buộc (Confirmation Dialog):** Phải hiển thị cảnh báo rõ ràng cho quản trị viên:
      > *"Chủ sở hữu hiện tại của trạm sẽ được chuyển thành Viewer (tiếp tục có quyền đọc dữ liệu nhưng mất toàn bộ quyền quản trị cảm biến và cấu hình trạm). Mỗi trạm chỉ có duy nhất một Owner."*
    - Sau khi chuyển owner thành công, nếu có request tạo Gateway cũ gửi lại (`PUT /v1/admin/gateways/{id}`) với owner cũ, server sẽ từ chối `409 Conflict` (đúng logic replay bất biến).
+3. **Thao tác Thu hồi Quyền Thành viên khỏi Gateway (`DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`):**
+   - Nút hành động "Thu hồi quyền truy cập" / "Xóa thành viên" (Remove Access) độc lập cho từng người dùng trên Gateway cụ thể.
+   - Thao tác loại bỏ hoàn toàn bản ghi liên kết của người dùng trong `public.user_gateways` mà không ảnh hưởng tài khoản người dùng hay quyền trên các trạm khác.
 
-#### D. Tuyên bố Hiện thực (No Premature Flutter Implementation Claims)
-Các mô tả biểu mẫu và quy trình trên là đặc tả chuẩn hóa hành vi và hướng dẫn tích hợp giao diện client. Hệ thống **KHÔNG khẳng định mã nguồn giao diện Flutter Web đã được hiện thực hoặc kiểm thử hoàn chỉnh** ở giai đoạn này.
+#### D. Quy chuẩn Tích hợp và Quản lý Trạng thái khi Thu hồi Quyền Thành viên (DELETE Gateway Membership)
+
+Thao tác thu hồi quyền thành viên là endpoint thứ sáu trong bộ API quản trị tài khoản người dùng và quyền thành viên Gateway (`DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`). Client cần tuân thủ các quy tắc tích hợp và quản lý trạng thái giao diện sau:
+
+1. **Thẩm quyền và Định dạng Yêu cầu (Authorization & Bodyless Request):**
+   - **Chỉ dành riêng cho Platform Admin:** Endpoint yêu cầu caller phải có bản ghi trong bảng `public.platform_admins`. Mọi người dùng thông thường (kể cả Gateway Owner) khi gọi đều bị từ chối với mã lỗi `403 Forbidden` (`code: "forbidden"`), không thực hiện bất kỳ mutation nào trong CSDL.
+   - **Hoàn toàn không có Body (Bodyless):** Request `DELETE` không được mang theo body (`len(body) == 0`) và không cần gửi header `Content-Type`. Nếu Client gửi kèm body (kể cả body chỉ chứa khoảng trắng hay `{}`), server sẽ từ chối ngay với mã lỗi `400 Bad Request` (`code: "invalid_request"`).
+   - **Không có Query Parameters:** URL không được chứa query string (kể cả dấu `?` rỗng). Nếu có query string, server trả về `400 Bad Request` (`code: "invalid_request"`).
+   - **Định danh Path Parameters:** `{gateway_id}` là chuỗi định danh trạm hợp lệ; `{user_id}` bắt buộc là chuỗi UUID RFC 4122 chuẩn khác nil (ví dụ: `00000000-0000-4000-8000-000000000001`). Nếu truyền UUID nil hoặc sai định dạng, server trả về `400 Bad Request` (`code: "invalid_request"`).
+
+2. **Ràng buộc Chủ sở hữu và Nguồn Chân lý Máy chủ (Owner Protection & Authoritative Server):**
+   - **Vô hiệu hóa nút trên Giao diện:** Giao diện quản trị phải **vô hiệu hóa (disable) hoặc ẩn nút "Thu hồi quyền" (Remove Access)** đối với người dùng đang mang vai trò `owner` của Gateway đó. Cần hiển thị tooltip hoặc thông báo hướng dẫn: *"Không thể thu hồi quyền của Chủ sở hữu trạm. Vui lòng chuyển quyền sở hữu (transfer owner) sang người khác trước khi xóa quyền thành viên"*.
+   - **Server là nguồn chân lý tối cao (Server Authoritative):** Dù Client có rào chắn trên UI, nếu xảy ra tình huống xung đột đồng thời (concurrent change) — ví dụ một quản trị viên khác vừa thực hiện chuyển quyền sở hữu khiến target user trở thành `owner` ngay trước khi request DELETE được xử lý — transaction tại server sẽ khóa Gateway, phát hiện vai trò `owner` và từ chối với mã lỗi **`409 Conflict`** (`code: "owner_transfer_required"`), rollback và giữ nguyên membership.
+   - **Xử lý khi gặp 409 `owner_transfer_required`:** Client phải hiển thị thông báo lỗi rõ ràng yêu cầu thực hiện chuyển quyền sở hữu trước, đồng thời **bắt buộc làm mới (refresh) danh sách vai trò người dùng** (`GET /v1/admin/users`) để đồng bộ trạng thái thực tế mới nhất trước khi cho phép người vận hành thực hiện thao tác tiếp theo.
+
+3. **Xử lý Phản hồi `204 No Content` và Bảo toàn Phạm vi Tài khoản (Post-204 State Handling):**
+   - **TUYỆT ĐỐI KHÔNG phân tích cú pháp JSON:** Phản hồi HTTP `204 No Content` **hoàn toàn không có body**. Client tuyệt đối không gọi `jsonDecode`, không đọc JSON Stream, và không ép kiểu sang bất kỳ DTO đối tượng nào để tránh lỗi phân tích cú pháp (Parser Exception / Unexpected End of Input).
+   - **Làm mới trạng thái giao diện có chọn lọc:** Ngay sau khi nhận 204 thành công:
+     * Kích hoạt gọi ngầm `GET /v1/admin/users` để làm mới danh sách người dùng và mảng `gateway_roles` liên quan.
+     * Làm mới (refresh) các màn hình hiển thị danh sách quyền truy cập Gateway hoặc màn hình chi tiết thành viên của trạm tương ứng.
+   - **Bảo toàn ranh giới tài khoản (Không tổn hại chéo):** Thao tác DELETE này CHỈ xóa duy nhất dòng liên kết tương ứng trong bảng `public.user_gateways`:
+     * **KHÔNG xóa tài khoản Auth:** Tài khoản người dùng trong Supabase Auth (`auth.users`) vẫn tồn tại nguyên vẹn, người dùng vẫn có thể đăng nhập bình thường.
+     * **KHÔNG xóa hồ sơ:** Bản ghi trong `public.profiles` (bao gồm `full_name`) không bị thay đổi hay xóa bỏ.
+     * **KHÔNG hạ vai trò nền tảng:** Vai trò `platform_role` trong `public.platform_admins` không bị ảnh hưởng. Kể cả khi một Platform Admin tự xóa quyền thành viên (`viewer` hoặc `operator`) của chính mình trên một Gateway cụ thể (`actorID == targetID`), quyền Quản trị viên nền tảng toàn cục của họ vẫn được bảo toàn nguyên trạng.
+     * **KHÔNG ảnh hưởng trạm khác:** Quyền thành viên của người dùng trên các Gateway khác hoàn toàn không bị thay đổi.
+
+4. **Ngữ nghĩa Lũy đẳng Trạng thái và Trường hợp No-op (State Idempotence & Missing Resources):**
+   - **Xóa thành viên không tồn tại (No-op 204):** Nếu `gateway_id` tồn tại trong hệ thống nhưng tài khoản mục tiêu không có quyền thành viên trên trạm đó (hoặc `{user_id}` là một UUID hợp lệ nhưng tài khoản không tồn tại trong hệ thống): Server xác nhận không có dòng nào cần xóa, commit thành công và phản hồi **`204 No Content`**. Điều này bảo đảm ngữ nghĩa lũy đẳng trạng thái (state idempotence): mục tiêu cuối cùng là *"người dùng không còn quyền trên trạm"* đã được thỏa mãn.
+   - **Gateway không tồn tại (404 Not Found):** Nếu `gateway_id` không tồn tại trong CSDL, server phản hồi **`404 Not Found`** (`code: "not_found"`). Client xử lý hiển thị thông báo lỗi không tìm thấy trạm (nhằm phát hiện việc chọn nhầm hoặc xóa nhầm trạm cha).
+   - **Ranh giới tính lũy đẳng trạng thái:** Việc gửi lại request `DELETE` sau khi đã xóa thành công sẽ tiếp tục nhận `204 No Content`. Tuy nhiên, tính lũy đẳng về trạng thái này **KHÔNG ngăn chặn** việc một lệnh DELETE gửi muộn hoặc thử lại chậm vô tình xóa mất một membership mới nếu một quản trị viên khác vừa cấp lại quyền cho người dùng đó giữa hai mốc thời gian.
+
+5. **Xử lý Mã lỗi Chi tiết và Sự cố Bất định Mạng (Error Code Handling & Network Uncertainty):**
+   - **`401 Unauthorized` (`code: "unauthorized"`):** JWT thiếu, hết hạn hoặc không hợp lệ. Kích hoạt luồng làm mới token (giới hạn 1 lần duy nhất) rồi thử lại; nếu thất bại chuyển hướng về màn hình đăng nhập.
+   - **`403 Forbidden` (`code: "forbidden"`):** Người thực thi không có quyền Platform Admin trong `public.platform_admins`. Giao diện hiển thị thông báo từ chối truy cập và đóng thao tác, không thay đổi CSDL.
+   - **`400 Bad Request` (`code: "invalid_request"`):** Vi phạm cú pháp đầu vào (UUID nil, sai định dạng UUID/gateway_id, hoặc client vô tình gửi kèm body/query string). Client cần kiểm tra và sửa đổi logic tạo request.
+   - **`409 Conflict` (`code: "owner_transfer_required"`):** Người dùng mục tiêu là Owner của trạm. Vô hiệu hóa thao tác xóa, yêu cầu chuyển Owner trước và làm mới danh sách vai trò.
+   - **`503 Service Unavailable` hoặc Sự cố Mất kết nối Mạng (Timeout / Socket Drop):**
+     * **TUYỆT ĐỐI KHÔNG tự động thử lại mù quáng (No Blind Retry):** Khi request gặp sự cố mạng quá thời gian hoặc nhận `503`, giao dịch tại server có thể đã commit thành công hoặc chưa. Việc tự động gửi lại ngay lập tức có thể gây xung đột hoặc xóa nhầm dữ liệu nếu có admin khác vừa cấp lại quyền.
+     * **Quy trình đối soát có giám sát (Supervised Reconcile):** Client hiển thị thông báo lỗi mạng bất định kèm nút *"Kiểm tra lại trạng thái"* (Check Status). Thao tác này gọi `GET /v1/admin/users` để đối soát mảng `gateway_roles` thực tế của người dùng: nếu quyền trên trạm đã mất, cập nhật giao diện thành công; nếu quyền vẫn còn, thông báo cho người vận hành quyết định gửi lại lệnh xóa thủ công.
+
+6. **Ranh giới Thực thi và Không Hứa hẹn Cơ chế Tức thời (No False Execution Counts & No Instant Revocation Illusion):**
+   - Thao tác `DELETE` chỉ thực hiện xóa bản ghi trong bảng cơ sở dữ liệu `public.user_gateways`.
+   - Quyền truy cập bị thu hồi có hiệu lực ngay lập tức đối với **mọi yêu cầu nghiệp vụ tiếp theo** được thẩm định sau khi transaction commit thành công (các API đọc dữ liệu như `GET /v1/gateways`, `GET /v1/digital-twins/...` sẽ trả về `200 []` rỗng hoặc `404 Not Found`).
+   - **CẢNH BÁO RANH GIỚI HỆ THỐNG:** Giao diện Client **tuyệt đối không đưa ra các tuyên bố sai lệch** (no false execution counts) rằng hệ thống đã "ngắt kết nối socket phần cứng tức thời", "thu hồi ngay các in-flight HTTP requests đang bay trong đường truyền", hay "hủy phiên WebSocket" (bởi WebSocket `/v1/ws` hiện vẫn đang trả về `501 Not Implemented` và hệ thống chưa có cơ chế push thu hồi realtime).
+
+#### E. Tuyên bố Hiện thực (No Premature Flutter Implementation Claims)
+Các mô tả biểu mẫu, quy trình và hành vi trên là đặc tả chuẩn hóa hành vi và hướng dẫn tích hợp giao diện client. Hệ thống **KHÔNG khẳng định mã nguồn giao diện Flutter Web hay bộ kịch bản Bruno đã được hiện thực hoặc kiểm thử hoàn chỉnh** ở giai đoạn này.
 
 ---
 
@@ -448,6 +505,11 @@ Một ứng dụng HTTP Client thông thường (như trình duyệt Web hoặc 
 | **TC-29: Admin cập nhật thông tin Gateway (PATCH)** | `Platform Admin` | `PATCH /v1/digital-twins/urn:ngsi-ld:Gateway:gw-a/attrs` (body Property fragment) | `200` | Cập nhật thành công siêu dữ liệu trạm (xóa mô tả qua `urn:ngsi-ld:null`) |
 | **TC-30: Người dùng không phải Admin cố PATCH Gateway** | `Owner A` / `Operator` / `Viewer` / `Non-member` | `PATCH /v1/digital-twins/urn:ngsi-ld:Gateway:gw-a/attrs` | `403` | `code: "forbidden"`, `message: "access denied"` (Kiểm tra Admin trước) |
 | **TC-31: Gọi WebSocket chưa triển khai** | Có JWT hợp lệ bất kỳ | `GET /v1/ws` | `501` | `code: "not_implemented"` |
+| **TC-32: Platform Admin xóa membership hợp lệ (Operator/Viewer)** | `Platform Admin` | `DELETE /v1/admin/gateways/gw-a/users/{target_uuid}` | `204` | Không có body (204 No Content), xóa đúng dòng membership trong `user_gateways`; không parse JSON |
+| **TC-33: Platform Admin xóa membership khi target là Owner** | `Platform Admin` | `DELETE /v1/admin/gateways/gw-a/users/{owner_uuid}` | `409` | `code: "owner_transfer_required"`, server từ chối xóa, yêu cầu chuyển owner trước |
+| **TC-34: Platform Admin xóa membership vắng mặt (No-op)** | `Platform Admin` | `DELETE /v1/admin/gateways/gw-a/users/{non_member_uuid}` | `204` | Không có body, no-op thành công vì Gateway tồn tại và target không có membership |
+| **TC-35: Platform Admin xóa membership trên Gateway không tồn tại** | `Platform Admin` | `DELETE /v1/admin/gateways/non-existent-gw/users/{uuid}` | `404` | `code: "not_found"` (Phát hiện chọn sai tài nguyên Gateway) |
+| **TC-36: Người dùng thường cố xóa membership** | `Owner A` / `Operator` / `Viewer` / `Non-member` | `DELETE /v1/admin/gateways/gw-a/users/{target_uuid}` | `403` | `code: "forbidden"`, `message: "access denied"` (Chỉ Platform Admin được xóa) |
 
 ---
 
@@ -713,6 +775,42 @@ class Stage4IntegrationController {
         );
       }
       return TemporalHistoryState(status: ViewStatus.error, errorMessage: e.message);
+    }
+  }
+
+  /// 4. Thu hồi quyền thành viên khỏi Gateway (DELETE /v1/admin/gateways/{id}/users/{id})
+  /// Thao tác chỉ dành riêng cho Platform Admin.
+  /// Request bodyless (không body, không query, không Content-Type).
+  /// Phản hồi 204 No Content: TUYỆT ĐỐI KHÔNG parse JSON body, kích hoạt làm mới gateway_roles.
+  Future<bool> removeGatewayUser({
+    required String gatewayId,
+    required String targetUserId,
+  }) async {
+    try {
+      final resp = await apiClient.delete(
+        '/v1/admin/gateways/$gatewayId/users/$targetUserId',
+        // Request hoàn toàn không body, không query
+      );
+
+      // Phản hồi 204 No Content: TUYỆT ĐỐI KHÔNG parse JSON body!
+      if (resp.statusCode == 204) {
+        // Kích hoạt làm mới danh sách quyền người dùng qua GET /v1/admin/users
+        return true;
+      }
+      return false;
+    } on ConflictException catch (e) {
+      if (e.errorCode == 'owner_transfer_required') {
+        // Target đang là Owner của trạm: Chặn thao tác xóa, yêu cầu chuyển Owner trước
+        // Làm mới vai trò trước khi tiếp tục
+        rethrow;
+      }
+      rethrow;
+    } on NotFoundException {
+      // Gateway không tồn tại (404 not_found)
+      rethrow;
+    } on ServiceUnavailableException {
+      // 503 hoặc timeout mạng: TUYỆT ĐỐI KHÔNG blind retry, cần đối soát GET /v1/admin/users
+      rethrow;
     }
   }
 }

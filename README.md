@@ -7,7 +7,8 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   - **Giai đoạn 2 (Stage 2 Bounded Closeout)**: Đã triển khai xác thực JWT qua Supabase Auth, phân quyền platform admin (`platform_admins`), danh sách trạm/cảm biến (`/v1/gateways*`), provisioning Gateway/Sensor, và chu trình sống Dynamic Security (DynSec) Mosquitto.
   - **Giai đoạn 3 (Stage 3 Telemetry Uplink Pipeline)**: Đã triển khai pipeline thu thập telemetry từ Gateway qua MQTT TLS đến TimescaleDB, khử trùng lặp `processed_messages`, xác nhận commit-before-ACK qua MQTT application ACK, Gateway simulator với outbox SQLite bền vững, và kiểm chứng tích hợp 9 kịch bản uplink trên runner dịch vụ thật.
   - **Giai đoạn 4 (Stage 4 History & Digital Twin API - ETSI GS CIM 009 V1.9.1 Profile)**: Đã triển khai và chuẩn hóa 5 endpoint canonical Digital Twin (`GET /v1/digital-twins`, `POST /v1/digital-twins`, `GET /v1/digital-twins/{id}`, `PATCH /v1/digital-twins/{id}/attrs`, `GET /v1/digital-twins/{id}/temporal` kèm query extension `?format=simplified`).
-  - **Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership - Tasks U0–U8)**: Đã triển khai Migration 21 (`000021_admin_user_management.up.sql`), 5 endpoint quản trị tập trung (`POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`), adapter Supabase Auth Admin (với `email_confirm: true`), cơ chế khóa Gateway cha tuần tự, cấm tự hạ quyền admin (`409 Conflict`), và chuyển giao owner nguyên tử (owner cũ trở thành viewer).
+  - **Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership - Tasks U0–U8 & Follow-up D1–D5)**: Đã triển khai Migration 21 (`000021_admin_user_management.up.sql`), Migration 22 (`000022_gateway_membership_revocation.up.sql`) và 6 endpoint quản trị tập trung (`POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`, `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`), adapter Supabase Auth Admin (với `email_confirm: true`), cơ chế khóa Gateway cha tuần tự, cấm tự hạ quyền admin (`409 Conflict`), chuyển giao owner nguyên tử (owner cũ trở thành viewer), và thu hồi quyền thành viên viewer/operator (hoặc no-op khi không có membership: `204 No Content` body rỗng; cấm xóa owner khi chưa chuyển giao: `409 Conflict` `owner_transfer_required`; Gateway thiếu: `404 Not Found`; tuyệt đối không xóa tài khoản, profile hay global role, không đổi Gateway khác). Chi tiết xem [báo cáo quản trị người dùng & membership](docs/backend/admin-users-and-gateway-membership.md) và [kế hoạch bổ sung DELETE membership](../docs/backend_plan/gateway_membership_delete_detailed_plan.md).
+  - **Tình trạng triển khai & kiểm chứng hiện tại (Current Status)**: Baseline hiện tại là `HEAD 8f9f984` kèm uncommitted diff cho D1–D4 (Go unit/race/vet/lint/build, native PostgreSQL DB/Auth/Envoy HTTP, fresh/upgrade isolated migration, Stage 4 `all`, Compose smoke `--full-http`, và Python suite 898/898 tests đều **PASS**). Migration 22 đã được áp dụng vào shared TEST DB (PostgreSQL 16.15 / TimescaleDB 2.29.2). Container backend đang chạy chưa được rebuild và CI từ xa **CHƯA CHẠY** (NOT RUN) cho uncommitted diff này; các kết quả CI 16/16 thành công trước đó chỉ có phạm vi trên commit lịch sử `35b6136`/`8f9f984`. Hệ thống không tuyên bố hoàn thành production rollout, và chưa cập nhật Flutter Web client hay Bruno collections theo hợp đồng mới.
   - **Kiểm chứng CI từ xa (Remote CI Verification)**: GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` đã hoàn thành thành công toàn bộ **16/16 jobs**, bao gồm `lint-and-test` (job 118127109089), `stage4-api-integration` (job 118127109577), `stage3-uplink-integration` (job 118127109787) và `native-compose-smoke` (job 118129034156).
 - **Mặc định môi trường triển khai & Cổng nghiệm thu riêng (Rollout Gates)**:
   - Trên môi trường triển khai chính (root deployment), tính năng quản lý credential MQTT mặc định bị **vô hiệu hóa** (`MQTT_CREDENTIAL_API_ENABLED=false`, các endpoint trả về HTTP `503 credential_runtime_disabled`).
@@ -275,9 +276,9 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 
 ### 3.3 Áp dụng migration
 
-Hệ thống quản lý schema CSDL thông qua chuỗi **21 migrations** (`000001` đến `000021`):
+Hệ thống quản lý schema CSDL thông qua chuỗi **22 migrations** (`000001` đến `000022`):
 - Các migration `000001` đến `000009` trong `/docker-entrypoint-initdb.d` chỉ tự chạy khi PostgreSQL khởi tạo data volume mới.
-- Từ version 10 trở đi (`000010` đến `000021`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
+- Từ version 10 trở đi (`000010` đến `000022`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
   - `000010`: Bổ sung bảng `platform_admins`, `gateway_mqtt_credentials`, ràng buộc định dạng định danh Gateway/Sensor, và phân quyền tối thiểu (least-privilege) cho role `iot_backend_app`.
   - `000011`: Bổ sung bảng nhật ký audit bất biến `mqtt_credential_events`, quản lý thế hệ `generation` và khóa `idempotency_key`.
   - `000012`: Bổ sung bảng khóa bảo trì toàn cục `mqtt_credential_maintenance`.
@@ -287,6 +288,9 @@ Hệ thống quản lý schema CSDL thông qua chuỗi **21 migrations** (`00000
   - `000016`: Trigger và rào chắn bảo vệ tính bất biến tuyệt đối của nhật ký audit (`mqtt_event_authority_guard`).
   - `000020`: Bổ sung schema telemetry ingestion, hypertable raw samples, deduplication ledger và temporal observations cho Stage 3.
   - `000021`: Bổ sung quyền tối thiểu cho quản trị người dùng (`profiles.full_name`, `platform_admins`), tạo hàm bảo mật `list_admin_users_projection` đọc thông tin định danh an toàn từ `auth.users` cho backend.
+  - `000022`: Cấp quyền `DELETE` trên bảng `public.user_gateways` cho role nhóm `iot_backend` (`000022_gateway_membership_revocation.up.sql`), phục vụ thu hồi membership trong API admin; không thay đổi cấu trúc bảng, ràng buộc hay dữ liệu người dùng.
+
+Trên volume mới chưa có Auth, `application-migrations` dừng phần áp dụng thực tế ở schema 20; migrations `000021` và `000022` được hoãn. Service `supabase-compat-migration` chạy sau GoTrue, thiết lập compatibility bằng migration `000004`, rồi áp dụng `000021` và `000022` theo thứ tự. Không xem việc runner bỏ qua các migration hậu Auth là đã hoàn tất schema 22.
 
 Migration `000009` tạo bảng `schema_migrations` sau khi schema hiện hữu đã được đối chiếu. Trên database hiện hữu, chỉ áp dụng migration này sau khi `000006`–`000008` đã được xác minh; không chạy lại các migration hardening khi constraint đã tồn tại.
 
@@ -447,7 +451,7 @@ Các route này đã được triển khai hoàn chỉnh và kiểm thử tích 
 *Ghi chú về 4 route cũ đã thu hồi:* Sau chuyển đổi V1.9.1, 4 route cũ gồm `GET /v1/telemetry/history` (404), `GET /v1/digital-twins/{entity_id}/state` (404), `GET /v1/digital-twins/{entity_id}/history` (404), và `PATCH /v1/digital-twins/{entity_id}` (405) đã bị thu hồi hoàn toàn.
 
 #### 3. Nhóm Endpoint Quản trị Tài khoản Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership APIs):
-Các route này đã được triển khai hoàn chỉnh theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`), dành riêng cho Platform Admin:
+Các route này đã được triển khai hoàn chỉnh theo Kế hoạch chi tiết, Migration 21 (`000021_admin_user_management.up.sql`) và Migration 22 (`000022_gateway_membership_revocation.up.sql`), dành riêng cho Platform Admin:
 
 | Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
 |---|---|---|---|---|
@@ -456,6 +460,7 @@ Các route này đã được triển khai hoàn chỉnh theo Kế hoạch chi t
 | `PATCH` | `/v1/admin/users/{user_id}` | Bearer JWT + `platform_admins` | Cập nhật nguyên tử tên hiển thị `full_name` (profiles) và/hoặc vai trò `platform_role` (platform_admins) | Đã triển khai: HTTP 200 OK; HTTP 409 nếu tự hạ quyền admin (`self_admin_demotion_forbidden`) |
 | `PUT` | `/v1/admin/gateways/{gateway_id}/users/{user_id}` | Bearer JWT + `platform_admins` | Gán vai trò `operator` hoặc `viewer` cho người dùng trên Gateway trong `user_gateways` | Đã triển khai: HTTP 200 OK; HTTP 400 nếu gán `owner`; HTTP 409 nếu hạ owner hiện tại |
 | `PUT` | `/v1/admin/gateways/{gateway_id}/owner` | Bearer JWT + `platform_admins` | Chuyển giao quyền sở hữu trạm Gateway nguyên tử; owner cũ chuyển thành `viewer` (duy trì quyền đọc) | Đã triển khai: HTTP 200 OK; HTTP 409 nếu trạng thái trạm không có hoặc thừa owner |
+| `DELETE` | `/v1/admin/gateways/{gateway_id}/users/{user_id}` | Bearer JWT + `platform_admins` | Thu hồi quyền thành viên (`operator`/`viewer`) trên Gateway; không có body/query. Thao tác có tính lũy đẳng (idempotent), không xóa tài khoản/profile/global role và không ảnh hưởng Gateway khác | Đã triển khai: HTTP 204 No Content (body rỗng) khi xóa thành công hoặc khi membership không tồn tại; HTTP 409 Conflict (`owner_transfer_required`) nếu target là owner (yêu cầu chuyển owner trước); HTTP 404 Not Found nếu Gateway không tồn tại; HTTP 400 nếu có body/query hoặc ID sai |
 
 #### 4. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
 Hiện tại chỉ còn duy nhất 1 route stub cho WebSocket truyền dữ liệu thời gian thực (thuộc Giai đoạn 7):
@@ -477,7 +482,7 @@ Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ á
 
 *Lưu ý quan trọng về các tuyến đường không tồn tại*:
 - Router Go backend hiện **KHÔNG CÓ** endpoint xem chi tiết Gateway đơn lẻ (`GET /v1/gateways/{gateway_id}`) hay Sensor đơn lẻ (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`). Việc đọc danh sách Sensor được thực hiện thông qua route cha `GET /v1/gateways/{gateway_id}/sensors` hoặc endpoint Digital Twin detail `GET /v1/digital-twins/{entity_id}`.
-- Chức năng quản trị tài khoản và phân quyền thành viên Gateway hiện đã có 5 API quản trị cho Platform Admin (nhóm 3 ở trên). Tuy nhiên, **phạm vi được giới hạn có chủ đích (bounded scope)**: không có API Delete/ban tài khoản, đổi email, đổi/reset mật khẩu, gửi email lời mời, hay xóa membership hoàn toàn.
+- Chức năng quản trị tài khoản và phân quyền thành viên Gateway hiện gồm 6 API quản trị cho Platform Admin (nhóm 3 ở trên). Tuy nhiên, **phạm vi được giới hạn có chủ đích (bounded scope)**: không có API Delete/ban tài khoản, đổi email, đổi/reset mật khẩu, hay gửi email lời mời. Việc xóa/thu hồi quyền thành viên qua `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` chỉ gỡ liên kết trong `user_gateways`, tuyệt đối không xóa tài khoản Auth, hồ sơ `profiles` hay quyền platform admin và không ảnh hưởng tới Gateway khác.
 - **Mã nguồn ứng dụng Flutter Web client và bộ sưu tập Bruno API collections chưa được cập nhật theo hợp đồng mới** trong đợt bàn giao tài liệu này.
 
 #### 6. Danh mục tính năng tạm hoãn ngoài phạm vi MVP (Deferred Features per AGENTS.md §2):

@@ -1,10 +1,11 @@
 # Tài liệu Client — 07: Quy chuẩn Hợp đồng Admin API (Platform Admin API Client Contract)
 
-**Cập nhật:** 2026-10-19
+**Cập nhật:** 2026-10-20
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)  
 **Tài liệu tham chiếu:**  
 - `AGENTS.md` (Mục 0, 5, 6, 6.5, 7, 10, 15, 16, 18; Stage 4 & Admin User Management Progress & Reconciliation)
 - [`docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết quản lý User và Gateway Membership)
+- [`docs/backend_plan/gateway_membership_delete_detailed_plan.md`](../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md) (Kế hoạch chi tiết bổ sung DELETE Gateway membership)
 - [`docs/backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan hệ thống)  
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực người dùng và Quản lý phiên)  
@@ -30,10 +31,11 @@
 - `src/internal/digitaltwin/postgres_sensor_patch.go` (Triển khai Transactional Sensor PATCH)
 - `src/cmd/server/credential.go` (Tầng composition Credential & denyOnlyResetPrerequisite)
 - `migrations/000021_admin_user_management.up.sql` (Migration CSDL cấp quyền và security-definer function)
+- `migrations/000022_gateway_membership_revocation.up.sql` (Migration CSDL cấp quyền DELETE trên `public.user_gateways` cho `iot_backend`)
 - [docs/dynsec/INDEX.md](../dynsec/INDEX.md) (Tổng quan kiến trúc và ma trận bằng chứng DynSec)
 - [docs/dynsec/flows-and-api.md](../dynsec/flows-and-api.md) (Chi tiết các luồng vận hành và hợp đồng HTTP API DynSec)
 - [docs/dynsec/limitations-and-backlog.md](../dynsec/limitations-and-backlog.md) (Hạn chế kỹ thuật và tồn đọng DynSec)
-- **Kiểm chứng Remote CI:** GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` (16/16 jobs hoàn thành thành công, bao gồm `lint-and-test` job 118127109089, `stage4-api-integration` job 118127109577, `stage3-uplink-integration` job 118127109787, và `native-compose-smoke` job 118129034156).
+- **Kiểm chứng Remote CI lịch sử:** GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` (16/16 jobs hoàn thành thành công, bao gồm `lint-and-test` job 118127109089, `stage4-api-integration` job 118127109577, `stage3-uplink-integration` job 118127109787, và `native-compose-smoke` job 118129034156) — *Lưu ý bằng chứng CI này được đóng khung cho phạm vi lịch sử của Stage 4 và Migration 21; mã nguồn bổ sung endpoint DELETE hiện tại dựa trên working diff trên nhánh `develop` (HEAD `8f9f984`), Migration 22 đã hoàn thành và kiểm chứng cục bộ nhưng backend chạy Docker Compose chưa được rebuild/restart và remote CI CHƯA CHẠY cho thao tác DELETE (không đưa ra tuyên bố tuân thủ đầy đủ cho môi trường production trước khi có run CI chính thức)*.
 
 ---
 
@@ -42,7 +44,7 @@
 Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản trị nền tảng (Platform Admin API Client Contract)** chính thức cho:
 1. Bảy (07) endpoint quản trị hạ tầng Stage 2 thuộc tiền tố `/v1/admin/*` đã được hiện thực trong mã nguồn Go backend (`src/cmd/server`, `src/internal/httpserver`), cùng 1 tuyến đường reset có giám sát đã đăng ký cú pháp nhưng áp dụng rào chắn an toàn fail-closed.
 2. Hai (02) endpoint khởi tạo thực thể và biến đổi siêu dữ liệu (Entity Creation & Metadata Mutation) Stage 4 thuộc tiền tố `/v1/digital-twins` (`POST /v1/digital-twins` và `PATCH /v1/digital-twins/{entity_id}/attrs`) có liên quan trực tiếp đến thẩm quyền Platform Admin và Gateway Owner.
-3. Năm (05) endpoint quản trị tài khoản người dùng và quyền thành viên Gateway (Admin User & Gateway Membership Management) mới được hiện thực theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`): `POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, và `PUT /v1/admin/gateways/{gateway_id}/owner`.
+3. Sáu (06) endpoint quản trị tài khoản người dùng và quyền thành viên Gateway (Admin User & Gateway Membership Management): ban đầu gồm 5 endpoint theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`), và endpoint thứ 6 thu hồi quyền thành viên theo Kế hoạch bổ sung và Migration 22 (`000022_gateway_membership_revocation.up.sql`): `POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`, và `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`.
 
 ### 1.1 Danh mục Endpoint Quản trị Hệ thống
 
@@ -69,11 +71,12 @@ Tài liệu này định nghĩa **Hợp đồng giao tiếp HTTP API Quản tr�
 12. `PATCH /v1/admin/users/{user_id}`: Cập nhật nguyên tử trong một transaction tên hiển thị `full_name` (trong `public.profiles`) và/hoặc vai trò nền tảng `platform_role` (cấp/thu hồi `public.platform_admins`), cấm tự hạ quyền admin (`409 Conflict`).
 13. `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`: Gán vai trò thành viên `operator` hoặc `viewer` cho người dùng trên Gateway trong `public.user_gateways`; từ chối gán `owner` qua route này (`400 Bad Request`); nếu người dùng đang là owner thì từ chối (`409 Conflict`).
 14. `PUT /v1/admin/gateways/{gateway_id}/owner`: Chuyển giao quyền sở hữu trạm Gateway nguyên tử trong `public.user_gateways`: người nhận trở thành `owner`, owner cũ được hạ thành `viewer` (bảo toàn quyền đọc, không xóa membership), bảo toàn ràng buộc duy nhất một owner trên trạm.
+15. `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`: Thu hồi vai trò thành viên (`operator` hoặc `viewer`) của người dùng trên trạm Gateway trong `public.user_gateways`; xóa membership thành công hoặc target không có membership (kể cả target UUID hợp lệ nhưng chưa tồn tại trong Auth/profiles) trả về `204 No Content` (body rỗng); từ chối nếu target đang là `owner` (`409 Conflict`, `owner_transfer_required`); Gateway không tồn tại trả về `404 Not Found` (`not_found`).
 
 **Ranh giới phạm vi nghiệp vụ tài khoản (Account CRUD Bounded Scope):**
-Chức năng quản trị tài khoản qua Go Backend được giới hạn nghiêm ngặt theo danh mục 5 endpoint trên:
-- **ĐÃ TRIỂN KHAI:** Tạo tài khoản kèm mật khẩu (auto-confirm), xem danh sách toàn bộ kèm quyền trạm, đổi tên hiển thị, cấp/thu hồi quyền Platform Admin, gán quyền operator/viewer, và chuyển quyền sở hữu trạm Gateway.
-- **NGOÀI PHẠM VI (KHÔNG TRIỂN KHAI):** Xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu người dùng, reset mật khẩu, gửi email lời mời (invitations), tự đăng ký công khai (public signup), hoặc xóa hoàn toàn bản ghi thành viên (`DELETE membership`). Khi cần xử lý các tác vụ ngoài phạm vi này, quản trị viên sử dụng công cụ quản trị hạ tầng (Supabase Studio / CLI) dưới sự giám sát trực tiếp.
+Chức năng quản trị tài khoản và thành viên Gateway qua Go Backend được giới hạn theo danh mục 6 endpoint trên:
+- **ĐÃ TRIỂN KHAI:** Tạo tài khoản kèm mật khẩu (auto-confirm), xem danh sách toàn bộ kèm quyền trạm, đổi tên hiển thị, cấp/thu hồi quyền Platform Admin, gán quyền operator/viewer, chuyển quyền sở hữu trạm Gateway, và thu hồi/xóa quyền thành viên operator/viewer (`DELETE membership`).
+- **NGOÀI PHẠM VI (KHÔNG TRIỂN KHAI):** Xóa tài khoản người dùng cấp Auth (`Delete account`), khóa/ban tài khoản, đổi email, đổi mật khẩu người dùng, reset mật khẩu, gửi email lời mời (invitations), hoặc tự đăng ký công khai (public signup). *(Lưu ý lịch sử: Trong phạm vi ban đầu của Task U0–U8 và Migration 21, việc xóa membership từng được ghi nhận là ngoài phạm vi; ranh giới này đã được mở rộng hợp thức bằng endpoint DELETE theo Migration 22 và Kế hoạch bổ sung `gateway_membership_delete_detailed_plan.md`)*. Khi cần xử lý các tác vụ quản trị tài khoản ngoài phạm vi, quản trị viên sử dụng công cụ quản trị hạ tầng (Supabase Studio / CLI) dưới sự giám sát trực tiếp.
 
 ---
 
@@ -107,9 +110,9 @@ Chức năng quản trị tài khoản qua Go Backend được giới hạn nghi
     - **Platform Admin KHÔNG được tự động bypass bộ lọc này:** Một Platform Admin thực hiện khởi tạo trạm (`POST /v1/digital-twins` hoặc `PUT /v1/admin/gateways/{id}`) và gán cho người khác làm `owner_user_id` thì chính Admin đó **KHÔNG THỂ** đọc dữ liệu viễn trắc, trạng thái hiện thời, hay lịch sử của trạm đó (nhận `404 Not Found`), trừ khi Admin được thêm bản ghi vào `user_gateways` cho trạm tương ứng.
 - **Không sáng tác endpoint tự kiểm tra quyền Admin (No Admin Self-Query Endpoint):** Go backend hiện tại không cung cấp endpoint kiểu `/v1/admin/me` hay `/v1/admin/whoami`. Phía client không được sáng tác hoặc gọi các endpoint giả định này.
 - **Phạm vi API Quản lý Tài khoản & Quyền Thành viên qua Go Backend:**
-  - Khác với giai đoạn trước (khi toàn bộ việc tạo tài khoản phải thực hiện thủ công qua Supabase Studio), Go Backend hiện cung cấp năm (05) endpoint quản trị tài khoản và quyền thành viên dưới `/v1/admin/users` và `/v1/admin/gateways/...` dành riêng cho Platform Admin (thẩm định qua `public.platform_admins`).
+  - Khác với giai đoạn trước (khi toàn bộ việc tạo tài khoản phải thực hiện thủ công qua Supabase Studio), Go Backend hiện cung cấp sáu (06) endpoint quản trị tài khoản và quyền thành viên dưới `/v1/admin/users` và `/v1/admin/gateways/...` dành riêng cho Platform Admin (thẩm định qua `public.platform_admins`).
   - **Khóa hạ tầng đặc quyền `SUPABASE_SERVICE_ROLE_KEY` TUYỆT ĐỐI KHÔNG chia sẻ cho client:** Backend sử dụng khóa này ở tầng server nội bộ để gọi sang Supabase Auth Admin API thông qua Envoy Gateway (`http://supabase-envoy:8000/auth/v1/admin/users`). Human caller chỉ gửi JWT cá nhân (`role: "authenticated"`).
-  - **Ranh giới Bounded CRUD:** Backend chỉ hỗ trợ tạo tài khoản, đọc danh sách, đổi tên/vai trò toàn cục, gán operator/viewer và chuyển owner. Backend **KHÔNG** cung cấp API Delete/ban tài khoản, đổi email, đổi/reset mật khẩu, gửi email lời mời, hay xóa hoàn toàn membership.
+  - **Ranh giới Bounded CRUD:** Backend chỉ hỗ trợ tạo tài khoản, đọc danh sách, đổi tên/vai trò toàn cục, gán operator/viewer, chuyển owner, và thu hồi membership operator/viewer qua DELETE. Backend **KHÔNG** cung cấp API Delete/ban tài khoản người dùng, đổi email, đổi/reset mật khẩu, gửi email lời mời, hay tự đăng ký công khai.
 - **Trạng thái cấu hình Root Docker Compose: Tính năng Credential API mặc định TẮT:**
   - Trong tệp cấu hình triển khai `docker-compose.yml`, biến môi trường được đặt mặc định là:
     ```yaml
@@ -131,7 +134,7 @@ Mọi request gửi tới các endpoint quản trị đều phải trải qua ch
 1. Request ID & Cache Gate Middleware
    - Sinh hoặc xác thực X-Request-ID (1..128 ký tự an toàn)
    - Tuyến đường admin user management (/v1/admin/users, /v1/admin/gateways/.../users, /v1/admin/gateways/.../owner):
-     Gán Cache-Control: no-store trên toàn bộ 5 route; gán thêm Pragma: no-cache trên các mutation (POST, PATCH, PUT)
+     Gán Cache-Control: no-store trên toàn bộ 6 route; gán thêm Pragma: no-cache trên các mutation (POST, PATCH, PUT, DELETE)
    - Tuyến đường admin inventory (GET /v1/admin/gateways) và credential gán: Cache-Control: no-store, Pragma: no-cache
    - Tuyến đường provisioning (PUT) gán: Cache-Control: no-store
        |
@@ -157,7 +160,7 @@ Mọi request gửi tới các endpoint quản trị đều phải trải qua ch
        |
        v
 5. Request Parser & Input Validation
-   - Kiểm tra Query Parameters (cấm query lạ/thừa trên POST/PATCH/PUT/GET /v1/admin/users)
+   - Kiểm tra Query Parameters (cấm query lạ/thừa trên POST/PATCH/PUT/DELETE/GET /v1/admin/users, bao gồm query rỗng hoặc dấu '?' rỗng)
    - Kiểm tra Content-Type (bắt buộc application/json trên mutation body)
    - Giới hạn kích thước Body nghiêm ngặt (ADMIN_MAX_BODY_BYTES)
    - Kiểm tra cú pháp JSON khắt khe (cấm duplicate keys, unknown fields, null values trên non-nullable fields)
@@ -1026,7 +1029,7 @@ Tuyến đường này đã được định tuyến tại `src/internal/httpser
 
 ## 5. Chi tiết Các Endpoint Quản trị Tài khoản Người dùng và Quyền Thành viên Gateway (Admin User & Gateway Membership APIs)
 
-Nhóm 5 endpoint này được hiện thực nhằm đáp ứng năng lực quản trị người dùng và phân quyền Gateway tập trung dành cho Platform Admin theo Kế hoạch chi tiết và Migration 21 (`000021_admin_user_management.up.sql`), giải quyết hoàn toàn hạn chế trước đây khi phải can thiệp thủ công qua Supabase Studio.
+Nhóm 6 endpoint này được hiện thực nhằm đáp ứng năng lực quản trị người dùng và phân quyền Gateway tập trung dành cho Platform Admin (5 endpoint ban đầu theo Kế hoạch chi tiết và Migration 21 `000021_admin_user_management.up.sql`, cùng endpoint thứ 6 thu hồi quyền thành viên theo Kế hoạch bổ sung và Migration 22 `000022_gateway_membership_revocation.up.sql`), giải quyết hoàn toàn hạn chế trước đây khi phải can thiệp thủ công qua Supabase Studio.
 
 ### 5.1 Tạo Tài khoản Người dùng Mới: `POST /v1/admin/users`
 
@@ -1325,23 +1328,100 @@ Endpoint này cho phép Platform Admin chuyển giao quyền chủ sở hữu (`
 
 ---
 
+### 5.6 Thu hồi Quyền Thành viên Operator / Viewer trên Gateway: `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`
+
+Endpoint thứ 6 này cho phép Platform Admin thu hồi vai trò thành viên thông thường (`operator` hoặc `viewer`) của một người dùng trên trạm Gateway cụ thể trong `public.user_gateways`.
+
+- **HTTP Method:** `DELETE`
+- **Đường dẫn:** `/v1/admin/gateways/{gateway_id}/users/{user_id}`
+  - `{gateway_id}`: Định danh Gateway hợp lệ (1..64 ký tự, regex chuẩn, khác `backend_service`).
+  - `{user_id}`: Chuỗi UUID hợp lệ khác nil của người dùng cần thu hồi quyền thành viên (`uuid.Parse`; không giới hạn riêng version 4).
+- **Yêu cầu xác thực & Thẩm quyền (Authentication & Authorization):**
+  - Bearer JWT của người dùng đã xác thực (`role == "authenticated"`).
+  - Tái thẩm định quyền Platform Admin tại tầng cơ sở dữ liệu: Kiểm tra ở middleware `PlatformAdmin` và kiểm tra lại trực tiếp trong giao dịch database (`SELECT EXISTS(SELECT 1 FROM public.platform_admins WHERE user_id = $1)`). Caller không phải admin bị từ chối với mã HTTP `403 Forbidden` (`code: "forbidden"`, `message: "access denied"`). Không xác minh được quyền do lỗi kết nối CSDL hoặc timeout/cancel phản hồi `503 Service Unavailable` (`code: "service_unavailable"`).
+- **Request Headers:**
+  - `Authorization: Bearer <platform_admin_jwt>`
+  - `X-Request-ID: <id>` (tùy chọn nhưng khuyến nghị)
+  - *Không yêu cầu header `Content-Type` do request không có body.*
+- **Response Headers:**
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+- **Quy tắc Kiểm tra Cú pháp & Ranh giới Dữ liệu (Strict Validation):**
+  - **Cấm Request Body không rỗng:** Server đọc tối đa 1 byte (`io.ReadFull`); từ chối body có dữ liệu, kể cả whitespace/newline hoặc dữ liệu gửi bằng chunked encoding, với **`400 Bad Request`** (`code: "invalid_request"`). Chunked encoding tự nó không bị cấm nếu body thực sự rỗng.
+  - **Cấm tuyệt đối Query Parameters:** Bất kỳ query parameter nào hoặc kể cả dấu hỏi chấm rỗng (`?`, `RawQuery != "" || ForceQuery`) đều bị từ chối ngay lập tức với mã HTTP **`400 Bad Request`** (`code: "invalid_request"`).
+  - **Kiểm tra định dạng tham số đường dẫn:** `gateway_id` sai định dạng regex, bằng `"backend_service"`, hoặc `user_id` không parse được thành UUID hay mang giá trị nil (`00000000-0000-0000-0000-000000000000`) đều trả về **`400 Bad Request`** (`code: "invalid_request"`).
+- **Nguyên tắc Giao dịch Nguyên tử & An toàn Dữ liệu (Transactional Invariants):**
+  Thao tác diễn ra trong đúng một transaction PostgreSQL với các bước kiểm soát nghiêm ngặt:
+  1. Tái thẩm định quyền Platform Admin của actor trong transaction bằng câu lệnh `SELECT EXISTS(SELECT 1 FROM public.platform_admins WHERE user_id = $1)`.
+  2. Khóa dòng trạm Gateway mục tiêu trong `public.gateways` bằng `SELECT ... FOR UPDATE` (giữ đúng thứ tự khóa với các thao tác `PUT /users` và `PUT /owner`). Nếu Gateway không tồn tại (`pgx.ErrNoRows`), transaction rollback và trả về mã lỗi **`404 Not Found`** (`code: "not_found"`).
+  3. Đọc vai trò thành viên hiện tại của `(gateway_id, user_id)` trong `public.user_gateways` bằng `SELECT role FROM public.user_gateways WHERE gateway_id = $1 AND user_id = $2 FOR UPDATE`.
+  4. **Xử lý theo vai trò thành viên:**
+     - **Trường hợp không có membership (Absent Membership / No-op):** Khi Gateway tồn tại và target không có membership (kể cả UUID hợp lệ nhưng chưa có account/profile), server commit no-op và trả **`204 No Content`** không body. Đây là tính lũy đẳng về trạng thái, không phải bảo đảm kết quả mọi lần gọi giống nhau nếu có admin khác gán lại membership hoặc chuyển target thành owner giữa các request.
+     - **Trường hợp vai trò `operator` hoặc `viewer`:** Thực hiện lệnh xóa có kiểm soát chặt chẽ bằng parameterized SQL:
+       ```sql
+       DELETE FROM public.user_gateways
+       WHERE gateway_id = $1 AND user_id = $2
+         AND role IN ('operator', 'viewer');
+       ```
+       Xác nhận số dòng bị ảnh hưởng (`RowsAffected`) chính xác bằng 1. Commit transaction thành công và phản hồi mã **`204 No Content`** (body rỗng).
+     - **Trường hợp vai trò `owner` (Owner Protection):** Tuyệt đối không xóa vai trò chủ sở hữu! Server rollback transaction và phản hồi ngay lập tức mã lỗi **`409 Conflict`** (`code: "owner_transfer_required"`, `message: "owner transfer required"`). Để thay đổi owner, quản trị viên bắt buộc phải sử dụng API chuyển quyền sở hữu riêng biệt `PUT /v1/admin/gateways/{gateway_id}/owner`.
+- **Ranh giới Tác động Cô lập (Isolated Boundary Semantics):**
+  - Thao tác **CHỈ thu hồi bản ghi liên kết** trong bảng `public.user_gateways`.
+  - **Tuyệt đối KHÔNG xóa tài khoản** trong Supabase Auth (`auth.users`).
+  - **Tuyệt đối KHÔNG xóa hồ sơ người dùng** trong `public.profiles`.
+  - **Tuyệt đối KHÔNG thay đổi vai trò nền tảng** trong `public.platform_admins`.
+  - **Tuyệt đối KHÔNG ảnh hưởng đến quyền thành viên trên bất kỳ Gateway nào khác**.
+  - **Không can thiệp hay làm biến đổi** Digital Twin, telemetry, desired/reported state hoặc MQTT credentials của Gateway.
+- **Quy tắc Tự Thu hồi Quyền của Admin (Self-Revocation Behavior):**
+  - Platform Admin được phép tự thu hồi quyền `operator` hoặc `viewer` của chính mình trên trạm Gateway (`actor_id == target_id`). Quyền Platform Admin toàn cục của actor vẫn được bảo toàn nguyên vẹn.
+  - Nếu Platform Admin đồng thời đang là `owner` của trạm, yêu cầu tự thu hồi quyền vẫn bị từ chối với mã lỗi `409 Conflict` (`owner_transfer_required`), không có ngoại lệ bypass cho self-owner.
+- **Hiệu lực Quyền Tức thì & Xử lý Request Đang Xử lý (In-flight Requests):**
+  - Việc thu hồi quyền thành viên có hiệu lực ngay lập tức ở lần kiểm tra CSDL tiếp theo cho các request kế tiếp được thẩm định qua CTE SQL `user_gateways`.
+  - Thao tác xóa **không tự động hủy bỏ hay ngắt ngang các request đang bay (in-flight requests)** đã vượt qua khâu kiểm tra quyền trước thời điểm transaction xóa được commit.
+- **Request Mẫu:**
+  ```http
+  DELETE /v1/admin/gateways/gw-001/users/11111111-2222-3333-4444-555555555555 HTTP/1.1
+  Host: api.example.com
+  Authorization: Bearer <platform_admin_jwt>
+  X-Request-ID: 00000000-0000-0000-0000-000000000106
+  ```
+  *(Request không có header Content-Type; Body hoàn toàn rỗng).*
+- **Response Phản hồi Thành công (`204 No Content`):**
+  ```http
+  HTTP/1.1 204 No Content
+  Cache-Control: no-store
+  Pragma: no-cache
+  X-Request-ID: 00000000-0000-0000-0000-000000000106
+  ```
+  *(Phản hồi thành công 204 có body hoàn toàn rỗng, không chứa JSON `{}`, `null`, hay DTO success).*
+- **Các Trường hợp Lỗi Nghiệp vụ:**
+  - `400 Bad Request` (`code: "invalid_request"`): Định dạng `gateway_id` hoặc `user_id` không hợp lệ, UUID nil, URL chứa query string (kể cả `?` rỗng), hoặc request body không rỗng (kể cả khoảng trắng).
+  - `401 Unauthorized` (`code: "unauthorized"`): Thiếu token JWT, token hết hạn, sai chữ ký HS256, hoặc claim `role != "authenticated"`.
+  - `403 Forbidden` (`code: "forbidden"`): Actor đã xác thực nhưng không có quyền Platform Admin trong `public.platform_admins`.
+  - `404 Not Found` (`code: "not_found"`): Không tìm thấy trạm Gateway trong `public.gateways`.
+  - `409 Conflict` (`code: "owner_transfer_required"`): Người dùng mục tiêu đang giữ vai trò `owner` trên trạm Gateway; không thể xóa membership của owner.
+  - `503 Service Unavailable` (`code: "service_unavailable"`): Lỗi kết nối CSDL, transaction timeout/canceled, hoặc lỗi phụ thuộc không thể xác minh quyền.
+  - `500 Internal Server Error` (`code: "internal_error"`): Lỗi SQL bất thường hoặc lỗi hệ thống nội bộ chưa phân loại.
+
+---
+
 ## 6. Bảng Ánh xạ Mã Lỗi Nghiệp vụ Toàn diện (Error Code Mapping Table)
 
 ### 6.1 Mã Lỗi Nghiệp vụ Quản trị Người dùng & Thành viên (User Management Error Codes)
 
-Các endpoint `/v1/admin/users*` và `/v1/admin/gateways/{id}/users*`, `/owner` trả về phong bì lỗi chuẩn (`httpapi.APIErrorEnvelope`) với các mã lỗi nghiệp vụ rõ ràng:
+Các endpoint `/v1/admin/users*`, `/v1/admin/gateways/{id}/users*`, và `/v1/admin/gateways/{id}/owner` trả về phong bì lỗi chuẩn (`httpapi.APIErrorEnvelope`) với các mã lỗi nghiệp vụ rõ ràng:
 
 | Mã lỗi HTTP | Mã lỗi nghiệp vụ (`code`) | Thông báo lỗi (`message`) | Nguyên nhân kích hoạt trong hệ thống | Hướng xử lý phía Client / Administrator |
 |---|---|---|---|---|
-| **400 Bad Request** | `invalid_request` | `invalid request` | Payload sai định dạng, thiếu trường bắt buộc, chứa trường lạ, chứa query string, body quá lớn, tên/mật khẩu sai kích thước. | Kiểm tra kỹ payload JSON theo đúng đặc tả DTO của từng endpoint. |
+| **400 Bad Request** | `invalid_request` | `invalid request` | Payload sai định dạng, thiếu trường bắt buộc, chứa trường lạ, chứa query string (kể cả `?` rỗng), body không rỗng trên DELETE/GET, body quá lớn, tên/mật khẩu sai kích thước, ID/UUID không hợp lệ hoặc nil. | Kiểm tra kỹ payload JSON và tham số URL theo đúng đặc tả của từng endpoint. |
 | **400 Bad Request** | `invalid_role` | `owner role requires owner transfer endpoint` | Gửi `role: "owner"` tới `PUT /v1/admin/gateways/{id}/users/{user_id}`. | Dùng endpoint riêng `PUT /v1/admin/gateways/{id}/owner` để chuyển quyền owner. |
 | **401 Unauthorized** | `unauthorized` | `authentication required` | Thiếu token JWT, token hết hạn, sai chữ ký, hoặc claim `role != "authenticated"`. | Đăng nhập lại qua Supabase Auth để lấy access token mới. |
 | **403 Forbidden** | `forbidden` | `access denied` | Caller không có quyền Platform Admin trong `public.platform_admins`. | Chỉ Platform Admin mới có quyền gọi các API quản trị này. |
-| **404 Not Found** | `not_found` | `resource not found` | Không tìm thấy người dùng mục tiêu trong `public.profiles` hoặc Gateway trong `public.gateways`. | Kiểm tra lại tính tồn tại của UUID người dùng và Gateway ID. |
+| **404 Not Found** | `not_found` | `resource not found` | Không tìm thấy người dùng mục tiêu trong `public.profiles` (hoặc Gateway trong `public.gateways` khi gọi PUT/DELETE membership, hoặc Gateway khi gọi PUT owner). Lưu ý: DELETE membership trả về 204 nếu Gateway tồn tại nhưng target user không có membership. | Kiểm tra lại tính tồn tại của UUID người dùng và Gateway ID. |
 | **409 Conflict** | `user_already_exists` | `user already exists` | Email gửi trong `POST /v1/admin/users` đã tồn tại trong Supabase Auth. | Kiểm tra danh sách người dùng qua `GET /v1/admin/users` hoặc dùng email khác. |
 | **409 Conflict** | `user_list_capacity_exceeded` | `user list capacity exceeded` | Số lượng user, membership hoặc dung lượng JSON vượt quá ngưỡng cấu hình của server. | Nâng ngưỡng `USER_LIST_MAX_USERS`, `USER_LIST_MAX_MEMBERSHIPS` hoặc `USER_LIST_MAX_RESPONSE_BYTES` trên server. |
 | **409 Conflict** | `self_admin_demotion_forbidden` | `self admin demotion forbidden` | Admin tự gửi yêu cầu hạ quyền admin của chính mình (`actorID == targetID` và `platform_role: "user"`). | Một admin khác phải thực hiện thao tác hạ quyền này nếu cần thiết. |
-| **409 Conflict** | `owner_transfer_required` | `owner transfer required` | Cố tình gọi `PUT /users/{id}` để hạ quyền của người dùng hiện đang là `owner`. | Sử dụng `PUT /owner` để chuyển owner cho người khác; người cũ sẽ tự động trở thành `viewer`. |
+| **409 Conflict** | `owner_transfer_required` | `owner transfer required` | Cố tình gọi `PUT /users/{id}` để hạ quyền của người dùng hiện đang là `owner`, hoặc gọi `DELETE /users/{id}` khi người dùng mục tiêu đang là `owner`. | Sử dụng `PUT /owner` để chuyển owner cho người khác; người cũ sẽ tự động trở thành `viewer`. Không thể xóa trực tiếp owner. |
 | **409 Conflict** | `gateway_owner_inconsistent` | `gateway owner inconsistent` | Trạm Gateway hiện tại có 0 owner hoặc nhiều hơn 1 owner trong `public.user_gateways`. | Dữ liệu CSDL không nhất quán; liên hệ kỹ sư CSDL để đối soát, server fail-closed không tự sửa. |
 | **413 Payload Too Large** | `payload_too_large` | `payload too large` | Kích thước body gửi lên vượt quá giới hạn cấu hình `ADMIN_MAX_BODY_BYTES`. | Rút gọn payload trong giới hạn cho phép. |
 | **415 Unsupported Media Type** | `unsupported_media_type` | `unsupported media type` | Header `Content-Type` thiếu hoặc khác `application/json`. | Đính kèm `Content-Type: application/json; charset=utf-8`. |
@@ -1382,8 +1462,8 @@ Theo hiện thực tại `writeCredentialError` (`src/internal/httpserver/admin_
   - *Lưu ý về ranh giới:* Advisory lock cung cấp cơ chế loại trừ tương hỗ (mutual exclusion) cục bộ trong phạm vi Go backend, **không phải là distributed fencing hay chứng minh tĩnh lặng (quiescence) trên toàn bộ broker**.
 - **PostgreSQL Row-level Locks cho User và Gateway Membership:**
   - `PATCH /v1/admin/users/{user_id}`: Khóa dòng `public.profiles` của target bằng `FOR UPDATE`.
-  - `PUT /v1/admin/gateways/{id}/users/{id}` & `PUT /v1/admin/gateways/{id}/owner`: Khóa dòng `public.gateways` của target bằng `FOR UPDATE`.
-  - Thứ tự khóa nhất quán: Khóa Gateway cha trước khi kiểm tra hoặc thao tác trên dòng con `public.user_gateways` (`FOR UPDATE`), ngăn chặn triệt để nguy cơ deadlock hai chiều với các tiến trình provisioning.
+  - `PUT /v1/admin/gateways/{id}/users/{id}`, `DELETE /v1/admin/gateways/{id}/users/{id}`, & `PUT /v1/admin/gateways/{id}/owner`: Khóa dòng `public.gateways` của target bằng `FOR UPDATE`.
+  - Thứ tự khóa nhất quán: Khóa Gateway cha trước khi kiểm tra hoặc thao tác trên dòng con `public.user_gateways` (`FOR UPDATE`), ngăn chặn triệt để nguy cơ deadlock hai chiều với các tiến trình provisioning hoặc mutation song song khác.
 
 ### 7.2 Bảo vệ Khởi động lại Backend (`SimplifiedStartupClassifier`)
 - Khi tiến trình Go backend khởi động lại, thành phần `SimplifiedStartupClassifier` sẽ tự động rà quét các thao tác kiểm toán chưa kết thúc (ở các phase `intent`, `dynsec_mutation`, hoặc `snapshot_readback`) trong bảng `gateway_mqtt_credential_events`.
@@ -1395,7 +1475,16 @@ Căn cứ tài liệu kỹ thuật chuẩn hóa [`docs/dynsec/limitations-and-ba
 1. **Kiểm chứng đĩa sau khởi động lạnh (Cold Restart Acceptance - T10 & ROT2):** Kiểm chứng kiểm tra mật khẩu mới đã ghi bền vững xuống tệp cấu hình trên đĩa (`ROT2`) và kiểm chứng khởi động lạnh E2E cho broker Mosquitto hiện vẫn đang ở phạm vi hoãn lại (deferred).
 2. **Thời điểm bền bỉ đĩa DynSec (Persistence Timing):** Thời điểm plugin Mosquitto DynSec thực hiện flush/fsync dữ liệu xuống đĩa chưa được đo đạc trong mã nguồn, tiềm ẩn nguy cơ rollback cấu hình nếu broker gặp sự cố mất điện đột ngột trước khi ghi đĩa.
 3. **Thu hồi có mục tiêu (Targeted Revocation):** Thao tác `DELETE` ngắt kết nối session active của trạm bị thu hồi và từ chối kết nối mới của trạm đó, trong khi các session của Gateway khác vẫn duy trì kết nối TCP socket.
-4. **Mã phản hồi HTTP:** Nhóm endpoint quản trị chỉ phản hồi các mã HTTP 200, 201 hoặc 4xx/5xx; **tuyệt đối không bao giờ trả về mã HTTP `202 Accepted`**.
+4. **Mã phản hồi HTTP:** Nhóm endpoint quản trị chỉ phản hồi các mã HTTP 200, 201, 204 hoặc 4xx/5xx; **tuyệt đối không bao giờ trả về mã HTTP `202 Accepted`**.
+
+### 7.4 Hiện trạng Triển khai & Kiểm chứng Endpoint Thu hồi Membership (Implementation & Verification Status)
+- **Nguồn mã nguồn (Source Working Diff):** Mã nguồn xử lý endpoint `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` hiện diện dưới dạng working diff trên nhánh `develop` tại commit HEAD `8f9f984`.
+- **Cơ sở dữ liệu & Migration 22:** Migration `000022_gateway_membership_revocation.up.sql` đã được hiện thực và kiểm chứng cục bộ trên CSDL test dùng chung (cấp quyền `GRANT DELETE ON TABLE public.user_gateways TO iot_backend`).
+- **Ranh giới Tiến trình Runtime & CI:**
+  - Tiến trình Go backend chạy nền trong cụm Docker Compose **chưa được rebuild/restart** với binary mới chứa handler DELETE.
+  - Remote CI (GitHub Actions) **CHƯA ĐƯỢC CHẠY** cho thay đổi bổ sung endpoint DELETE.
+  - Bằng chứng kiểm chứng Remote CI tại Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) (commit `35b6136f22c5a1c819afefc12003dba3ba613062`) được bảo toàn nguyên vẹn nhưng chỉ có giá trị chứng minh cho phạm vi lịch sử của Stage 4 và Migration 21.
+  - Tuyệt đối không đưa ra khẳng định tuân thủ đầy đủ (full conformance) hoặc sẵn sàng vận hành sản xuất (production readiness) cho endpoint DELETE trước khi hoàn tất chu trình CI chính thức.
 
 ---
 
@@ -1428,7 +1517,12 @@ Căn cứ tài liệu kỹ thuật chuẩn hóa [`docs/dynsec/limitations-and-ba
    - **Xử lý sự cố mạng khi gọi POST/PATCH:** Không đoán định thành công hay thất bại. Việc đọc lại kiểm tra trạng thái (`GET /v1/digital-twins/{entity_id}`) chỉ khả dụng nếu caller có quyền thành viên trạm (không suy đoán mã 404 là lỗi metadata hay thực thể chưa tồn tại). Nếu không có quyền đọc lại, sử dụng công cụ đối soát có giám sát (supervised reconciliation) hoặc gửi lại có giới hạn với cùng thông tin ban đầu, tuyệt đối không tùy tiện ghi đè metadata. Hệ thống hỗ trợ gửi lại trùng khớp (`200 OK`) cho POST và no-op (`200 OK`, giữ nguyên `updated_at`) cho PATCH an toàn.
    - **Tách biệt với xác thực:** Khởi tạo thực thể Digital Twin qua POST không tạo tài khoản Supabase Auth và không cấp mật khẩu MQTT DynSec.
 5. **Quy tắc tích hợp Quản trị Người dùng & Quyền Thành viên Gateway:**
-   - **Giao diện phân quyền tách biệt:** Phía client tách biệt hoàn toàn hai nút/luồng thao tác: “Gán vai trò operator/viewer” (`PUT /gateways/{id}/users/{id}`) và “Chuyển quyền sở hữu Gateway” (`PUT /gateways/{id}/owner`).
+   - **Giao diện phân quyền tách biệt:** Phía client tách biệt hoàn toàn ba nút/luồng thao tác: “Gán vai trò operator/viewer” (`PUT /gateways/{id}/users/{id}`), “Thu hồi quyền thành viên” (`DELETE /gateways/{id}/users/{id}`), và “Chuyển quyền sở hữu Gateway” (`PUT /gateways/{id}/owner`).
+   - **Tích hợp Thu hồi Quyền thành viên (`DELETE /v1/admin/gateways/{id}/users/{id}`):**
+     - Client phân tách rõ thao tác thu hồi quyền thành viên khỏi thao tác xóa tài khoản; giao diện cần hiển thị rõ ràng nút “Thu hồi quyền thành viên” hoặc “Xóa khỏi trạm” cho các thành viên vai trò `operator` hoặc `viewer`.
+     - Tuyệt đối không hiển thị nút xóa membership trực tiếp cho chủ sở hữu (`owner`) của trạm; nếu người dùng là `owner`, giao diện cần hướng dẫn quản trị viên chuyển quyền sở hữu trạm trước (`PUT /owner`).
+     - Thao tác là lũy quyền (idempotent): Nếu nhận phản hồi `204 No Content`, client cập nhật giao diện xóa người dùng khỏi danh sách thành viên của trạm đó mà không cần phân vân người dùng trước đó đã bị xóa bởi admin khác hay chưa.
+     - Cho phép Admin tự thu hồi quyền operator/viewer của chính mình trên trạm mà không bị mất quyền Platform Admin toàn cục; tuy nhiên nếu Admin là owner thì vẫn bắt buộc chuyển owner trước.
    - **Hiển thị rõ ràng hậu quả chuyển Owner:** Biểu mẫu chuyển owner cần thông báo rõ ràng cho quản trị viên rằng: *“Chủ sở hữu hiện tại sẽ được chuyển thành viewer (tiếp tục có quyền đọc dữ liệu trạm nhưng không thể quản trị cảm biến hay cấu hình trạm)”*.
    - **Cấm tự hạ quyền Admin:** Giao diện cần vô hiệu hóa (disable) hoặc cảnh báo nếu admin đang chỉnh sửa chính tài khoản của mình mà chọn hạ vai trò thành `"user"`, tránh nhận lỗi `409 self_admin_demotion_forbidden`.
    - **Giới hạn danh sách người dùng:** Giao diện gọi `GET /v1/admin/users` cần xử lý trường hợp mã lỗi `409 user_list_capacity_exceeded` để hiển thị thông báo liên hệ quản trị viên nâng ngưỡng cấu hình server, không giả định danh sách luôn có thể tải toàn bộ nếu hệ thống phình to.
