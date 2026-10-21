@@ -220,10 +220,11 @@ services:
     volumes:
       - ./migrations/000004_supabase_compat.up.sql:/migrations/000004_supabase_compat.up.sql:ro
       - ./migrations/000021_admin_user_management.up.sql:/migrations/000021_admin_user_management.up.sql:ro
+      - ./migrations/000022_gateway_membership_revocation.up.sql:/migrations/000022_gateway_membership_revocation.up.sql:ro
     command:
       - /bin/sh
       - -ec
-      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql
     networks:
       - iot_net
 

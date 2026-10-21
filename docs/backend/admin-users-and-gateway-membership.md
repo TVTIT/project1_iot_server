@@ -1,19 +1,22 @@
-# Báo cáo Tổng kết và Nghiệm thu: Quản trị Người dùng và Quyền Thành viên Gateway (Tasks U0–U8)
+# Báo cáo Tổng kết và Nghiệm thu: Quản trị Người dùng và Quyền Thành viên Gateway (Tasks U0–U8 và Bổ sung Follow-up D1–D5)
 
-**Ngày lập:** 19/10/2026
+**Ngày lập:** 19/10/2026 (Cập nhật bổ sung Follow-up Tasks D1–D5: 20/10/2026)
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
-**Trạng thái:** Hoàn thành có giới hạn (Tasks U0–U8 Bounded Complete; mã nguồn và bài kiểm thử U0–U7 đã commit trên `develop` qua `35b6136f22c5a1c819afefc12003dba3ba613062`; Task U8 tài liệu hoàn tất).
-**Baseline khảo sát:** Nhánh `develop`, commit `573abde1c0872e49d4942b47a8c85afe7abf235b`.
-**Commit kiểm chứng CI từ xa:** `35b6136f22c5a1c819afefc12003dba3ba613062` (GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456), hoàn thành thành công **16/16 jobs**).
+**Trạng thái:** Hoàn thành có giới hạn (Tasks U0–U8 Bounded Complete; mã nguồn và bài kiểm thử U0–U7 đã commit trên `develop` qua `35b6136f22c5a1c819afefc12003dba3ba613062`; Task U8 tài liệu hoàn tất; Follow-up Tasks D1–D5 hoàn tất kiểm chứng cục bộ trên baseline `8f9f984` + working diff, chưa tạo commit mới).
+**Baseline khảo sát U0–U8:** Nhánh `develop`, commit `573abde1c0872e49d4942b47a8c85afe7abf235b`.
+**Baseline triển khai Follow-up D1–D5:** Nhánh `develop`, HEAD `8f9f984` + working diff cục bộ (chưa commit/push).
+**Commit kiểm chứng CI từ xa (U0–U8):** `35b6136f22c5a1c819afefc12003dba3ba613062` (GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456), hoàn thành thành công **16/16 jobs**; không chạy CI từ xa cho working diff mới của Follow-up D1–D5).
 **Tài liệu tham chiếu:**
 - [`../../AGENTS.md`](../../AGENTS.md) (Mục 0, 5, 6, 6.5, 7, 10, 15, 16, 18)
 - [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết nghiệp vụ U0–U8)
+- [`../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md`](../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md) (Kế hoạch chi tiết bổ sung DELETE Gateway membership D1–D5)
 - [`../client/07_ADMIN_API_CLIENT_CONTRACT.md`](../client/07_ADMIN_API_CLIENT_CONTRACT.md) (Hợp đồng API Quản trị nền tảng)
 - [`../client/02_AUTHENTICATION_AND_SESSION.md`](../client/02_AUTHENTICATION_AND_SESSION.md) (Xác thực và Phiên làm việc)
 - [`../client/03_USER_GATEWAY_AUTHORIZATION.md`](../client/03_USER_GATEWAY_AUTHORIZATION.md) (Cơ chế phân quyền người dùng và Gateway)
 - [`../client/08_API_INTEGRATION_AND_STATE_HANDLING.md`](../client/08_API_INTEGRATION_AND_STATE_HANDLING.md) (Tích hợp API và Quản lý trạng thái Client)
 - [`../dynsec/limitations-and-backlog.md`](../dynsec/limitations-and-backlog.md) (Danh mục tồn đọng và hạn chế kỹ thuật chung)
-- [`../../migrations/000021_admin_user_management.up.sql`](../../migrations/000021_admin_user_management.up.sql) (Migration CSDL cấp quyền và security-definer function)
+- [`../../migrations/000021_admin_user_management.up.sql`](../../migrations/000021_admin_user_management.up.sql) (Migration CSDL cấp quyền và security-definer function U0–U8)
+- [`../../migrations/000022_gateway_membership_revocation.up.sql`](../../migrations/000022_gateway_membership_revocation.up.sql) (Migration CSDL cấp quyền DELETE membership D1–D5)
 
 ---
 
@@ -29,19 +32,22 @@ Lát cắt Tasks U0–U8 cung cấp năm (05) endpoint canonical trong Go backen
 4. `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`: Gán vai trò thành viên `operator` hoặc `viewer` cho người dùng trên Gateway trong `public.user_gateways`; cấm gán `owner` qua route này (`400 Bad Request`); nếu người dùng đang là owner thì từ chối (`409 Conflict`).
 5. `PUT /v1/admin/gateways/{gateway_id}/owner`: Chuyển giao quyền sở hữu trạm Gateway nguyên tử trong `public.user_gateways`: người nhận trở thành `owner`, owner cũ được hạ thành `viewer` (bảo toàn quyền đọc, không xóa membership), bảo toàn ràng buộc duy nhất một owner trên trạm.
 
+*(Ghi chú bổ sung Follow-up D1–D5: Hệ thống bổ sung endpoint thứ sáu `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` nhằm thu hồi quyền thành viên viewer/operator; chi tiết đặc tả và nghiệm thu xem Mục 8).*
+
 ### 1.2 Ranh giới kiến trúc và bảo mật bất di bất dịch
 - **Khóa hạ tầng đặc quyền (`SUPABASE_SERVICE_ROLE_KEY`):** Khóa này được lưu giữ duy nhất tại biến môi trường nội bộ của server backend. **Tuyệt đối không bao giờ chia sẻ, gửi về client hoặc lưu trữ trong frontend/mobile.** Human caller chỉ gửi JWT cá nhân với claim chuẩn `role: "authenticated"`. Nếu khóa này không được cấu hình, server vẫn khởi động bình thường; 4 endpoint CSDL vẫn hoạt động, chỉ riêng `POST /v1/admin/users` (CreateUser) trả về HTTP 503 `service_unavailable`.
 - **Thẩm quyền Platform Admin dựa trên CSDL (`public.platform_admins`):** Go Backend tự kiểm tra quyền hạn của caller thông qua bảng CSDL `public.platform_admins` trong PostgreSQL. Token JWT của người dùng dù hợp lệ nhưng nếu thiếu bản ghi trong bảng này sẽ bị từ chối ngay với mã HTTP `403 Forbidden`.
 - **Admin không tự động bypass quyền đọc dữ liệu viễn trắc/Digital Twin:** Toàn bộ các API nghiệp vụ đều áp dụng cơ chế lọc theo tư cách thành viên trạm (`user_gateways`). Danh sách trạm (`GET /v1/gateways`) được lọc theo thành viên và trả về `200 OK` với mảng rỗng `{"items":[]}` nếu admin không có membership trên trạm nào; các truy vấn chi tiết thực thể hoặc cảm biến không thuộc quyền (`GET /v1/digital-twins/{id}`, `GET /v1/digital-twins/{id}?format=simplified`, `GET /v1/digital-twins/{id}/temporal`, `GET /v1/gateways/{id}/sensors`) đều trả về `404 Not Found` (không có cơ chế blanket read bypass cho Platform Admin).
 - **Phạm vi CRUD tài khoản được giới hạn có chủ đích (Bounded Account CRUD):**
-  - **ĐÃ TRIỂN KHAI:** Tạo tài khoản kèm mật khẩu (auto-confirm), xem danh sách toàn bộ kèm quyền trạm, đổi tên hiển thị, cấp/thu hồi quyền Platform Admin, gán quyền operator/viewer, và chuyển quyền sở hữu trạm Gateway.
-  - **NGOÀI PHẠM VI (KHÔNG TRIỂN KHAI):** Xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu người dùng, reset mật khẩu, gửi email lời mời (invitations), tự đăng ký công khai (public signup), hoặc xóa hoàn toàn bản ghi thành viên (`DELETE membership`).
+  - **ĐÃ TRIỂN KHAI BAN ĐẦU (Tasks U0–U8):** Tạo tài khoản kèm mật khẩu (auto-confirm), xem danh sách toàn bộ kèm quyền trạm, đổi tên hiển thị, cấp/thu hồi quyền Platform Admin, gán quyền operator/viewer, và chuyển quyền sở hữu trạm Gateway.
+  - **BỔ SUNG FOLLOW-UP (Tasks D1–D5):** Thu hồi vai trò thành viên `operator`/`viewer` hoặc no-op nếu chưa có membership qua `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` (bảo toàn tài khoản, profile, vai trò platform admin, và membership trên trạm khác).
+  - **NGOÀI PHẠM VI (KHÔNG TRIỂN KHAI):** Xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu người dùng, reset mật khẩu, gửi email lời mời (invitations), hoặc tự đăng ký công khai (public signup). *(Lưu ý: Hạn chế lịch sử về việc "chưa có xóa membership" trong báo cáo U0–U8 đã được giải quyết tại D1–D5; việc xóa tài khoản Auth/profile vẫn hoàn toàn nằm ngoài phạm vi).*
 
 ---
 
 ## 2. Thay đổi Cơ sở dữ liệu và Cấu hình
 
-### 2.1 Migration 21: `000021_admin_user_management.up.sql`
+### 2.1 Migration 21: `000021_admin_user_management.up.sql` (Tasks U0–U8)
 - **Khóa tuần tự & Điều kiện tiên quyết:** Sử dụng PostgreSQL advisory lock `pg_advisory_lock(3290, 2)` và `\set ON_ERROR_STOP on`. Kiểm tra bắt buộc migration tiền nhiệm version 20 (`stage3_telemetry_ingestion`) đã được áp dụng.
 - **Xử lý môi trường khởi tạo (Pre-Auth vs Post-Auth):**
   - Nếu bảng `auth.users` chưa tồn tại (khi chạy ở bước khởi tạo đầu của database volume), migration ghi log bỏ qua và **không ghi nhận version 21 vào `schema_migrations`**, tránh làm sai lệch phiên bản trước khi Auth khởi chạy.
@@ -55,7 +61,13 @@ Lát cắt Tasks U0–U8 cung cấp năm (05) endpoint canonical trong Go backen
   - `GRANT UPDATE (full_name) ON TABLE public.profiles TO iot_backend;`: Chỉ cho phép sửa cột `full_name`, không cho phép sửa khóa chính `id`.
   - `GRANT INSERT, DELETE ON TABLE public.platform_admins TO iot_backend;`: Cho phép cấp và gỡ vai trò platform admin.
 
-### 2.2 Cấu hình Môi trường (Environment Knobs)
+### 2.2 Migration 22: `000022_gateway_membership_revocation.up.sql` (Follow-up D1–D5)
+- **Mục tiêu & Cấp quyền tối thiểu:** Bổ sung quyền `GRANT DELETE ON TABLE public.user_gateways TO iot_backend;` để phục vụ endpoint thu hồi membership. Migration 10 trước đây chỉ cấp `SELECT, INSERT, UPDATE` và migration 21 không bổ sung DELETE.
+- **Khóa tuần tự & Ràng buộc phụ thuộc:** Sử dụng khóa advisory lock `pg_advisory_lock(3290, 2)` và `\set ON_ERROR_STOP on`. Bắt buộc migration version 21 (`admin_user_management`) đã được áp dụng trước đó.
+- **Tương thích Post-Auth:** Kiểm tra `to_regclass('auth.users') IS NOT NULL` tương tự migration 21; chỉ hoàn tất và ghi nhận version 22 vào `schema_migrations` khi Auth đã khởi tạo.
+- **Đồng bộ hóa Guards:** Cập nhật các guard kiểm tra phiên bản schema và post-auth trong `scripts/sql/verify-migration-000021.sql`, `scripts/sql/verify-migration-000022.sql`, `scripts/test-stage2-migrations.sh`, `scripts/tests/migration_ci_compat.py`, `scripts/tests/stage4_api_runner.py`, và `scripts/tests/native_compose_smoke.py` để bảo toàn tính toàn vẹn của chuỗi migration.
+
+### 2.3 Cấu hình Môi trường (Environment Knobs)
 Hệ thống bổ sung cấu hình có kiểm tra ranh giới chặt chẽ tại `src/internal/config/usermanagement.go`:
 
 | Biến môi trường | Giá trị mặc định | Dải hợp lệ | Thứ tự ưu tiên & Ý nghĩa |
@@ -169,10 +181,10 @@ Tuân thủ quy định tại `AGENTS.md` Mục 0 và 16, các hạn chế dư�
    - *Cách xử lý:* Quản trị vận hành bằng quy trình con người. Khi cần thiết, kỹ sư hệ thống có thể cấp lại quyền admin trực tiếp bằng lệnh SQL vào `public.platform_admins`.
 2. **Owner cũ trở thành Viewer và giữ nguyên quyền đọc:**
    - Khi chuyển giao quyền sở hữu trạm, owner cũ không bị xóa khỏi trạm mà tự động chuyển thành `viewer`, tiếp tục đọc được dữ liệu viễn trắc và Digital Twin của trạm đó (chỉ bị thu hồi quyền ghi cảm biến).
-   - *Cách xử lý:* Đây là thiết kế chủ động nhằm tránh mất quyền giám sát đột ngột của người bàn giao. Nếu muốn thu hồi hoàn toàn quyền đọc của owner cũ, quản trị viên sử dụng script CSDL nội bộ.
+   - *Cách xử lý:* Đây là thiết kế chủ động nhằm tránh mất quyền giám sát đột ngột của người bàn giao. Sau khi chuyển owner, nếu muốn thu hồi hoàn toàn quyền đọc của owner cũ (nay là viewer), Platform Admin có thể sử dụng endpoint `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` (Follow-up D1–D5).
 3. **Phạm vi quản trị tài khoản có giới hạn (Bounded CRUD Scope):**
-   - Không có API xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu, reset mật khẩu, gửi email lời mời (invitations) hay xóa hoàn toàn membership qua Go Backend.
-   - *Cách xử lý:* Các tác vụ này được thực hiện thông qua Supabase Studio hoặc CLI nội bộ có thẩm định.
+   - Không có API xóa tài khoản (`Delete`), khóa/ban tài khoản, đổi email, đổi mật khẩu, reset mật khẩu, gửi email lời mời (invitations) qua Go Backend.
+   - *Phân định lịch sử và hiện tại:* Hạn chế lịch sử "không có API xóa membership" ghi nhận trong giai đoạn U0–U8 nay đã được giải quyết bởi Follow-up Tasks D1–D5 (`DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` cho vai trò viewer/operator). Các tác vụ quản trị tài khoản Auth/profile sâu hơn vẫn nằm ngoài phạm vi và được thực hiện qua Supabase Studio hoặc CLI nội bộ có thẩm định.
 4. **Danh sách người dùng không phải snapshot liên tục qua nhiều request:**
    - Danh sách trả về từ `GET /v1/admin/users` là kết quả truy vấn tại một thời điểm; hệ thống không hỗ trợ cơ chế phân trang cursor phức tạp hay đảm bảo snapshot nhất quán nếu có các thao tác tạo/sửa user diễn ra đồng thời giữa các lần gọi.
 5. **Không đưa ra cam kết về độ bền phần cứng hay tương tranh tùy ý:**
@@ -180,7 +192,7 @@ Tuân thủ quy định tại `AGENTS.md` Mục 0 và 16, các hạn chế dư�
 
 ---
 
-## 7. Kết luận và Bàn giao Tiếp theo
+## 7. Kết luận và Bàn giao Tiếp theo (Tasks U0–U8)
 
 Lát cắt Tasks U0–U8 về Quản trị Người dùng và Quyền Thành viên Gateway đã hoàn thành có giới hạn theo mục tiêu đề ra, vượt qua các bài kiểm thử đơn vị, kiểm thử tích hợp native E2E kế thừa, và được xác nhận xanh 16/16 jobs trên GitHub Actions Remote CI.
 
@@ -190,3 +202,162 @@ Theo kế hoạch tổng thể của dự án (`Backend_summary_plan.md` và `AG
 - **Giai đoạn 7 (Stage 7):** WebSocket truyền dữ liệu viễn trắc thời gian thực (Realtime telemetry streaming).
 - **Giai đoạn 8 (Stage 8):** Quản lý tải lên hình ảnh qua Supabase Storage.
 - **Giai đoạn 9 (Stage 9):** Nghiệm thu, đo tải và triển khai (Acceptance, workload measurement & deployment).
+
+---
+
+## 8. Bổ sung Thu hồi Thành viên Gateway (Follow-up Tasks D1–D5: DELETE Membership)
+
+### 8.1 Tổng quan và Hợp đồng Endpoint `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`
+Nhằm hoàn thiện khả năng quản trị quyền truy cập trạm mà không vi phạm nguyên tắc an toàn CSDL, Follow-up D1–D5 bổ sung đúng một (01) endpoint canonical:
+
+`DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`
+
+Endpoint này chỉ dành riêng cho **Platform Admin** (xác thực qua JWT và kiểm tra lại vai trò trong `public.platform_admins` bên trong transaction).
+
+- **Đặc tả Request:**
+  - Không có Request Body và không có Query Parameters.
+  - Endpoint kiểm tra nghiêm ngặt: nếu request có body (kể cả chỉ 1 byte khoảng trắng whitespace hay chunked stream) hoặc có query parameters (kể cả ký tự `?` rỗng với `RawQuery != ""` hoặc `ForceQuery`), server lập tức từ chối với HTTP **`400 Bad Request`** (`error.code = "invalid_request"`).
+  - Tương tự, nếu `gateway_id` sai định dạng, là định dạng cấm (`backend_service`), hoặc `user_id` không phải UUID hợp lệ / UUID nil, server trả về **`400 Bad Request`**.
+- **Ma trận Xử lý và Hợp đồng Response:**
+
+| Tình huống / Điều kiện nghiệp vụ | HTTP Status | Response Body | Mã lỗi (`error.code`) & Hành vi hệ thống |
+|---|---|---|---|
+| Target đang là `viewer` hoặc `operator` trên Gateway | **`204 No Content`** | *(Trống)* | Xóa đúng bản ghi trong `public.user_gateways`. Transaction commit thành công. |
+| Gateway tồn tại, target không có membership | **`204 No Content`** | *(Trống)* | Thao tác lũy đẳng (idempotent no-op). Commit transaction không thay đổi dữ liệu, trả 204 body rỗng. |
+| Target là UUID hợp lệ nhưng tài khoản/hồ sơ không tồn tại trong hệ thống | **`204 No Content`** | *(Trống)* | Nếu Gateway tồn tại, hệ thống coi như không có membership để xóa; đảm bảo tính lũy đẳng mà không lộ thông tin. |
+| Target đang là `owner` của Gateway | **`409 Conflict`** | JSON Envelope | `owner_transfer_required`. Cấm xóa owner; quyền sở hữu phải được chuyển giao trước (`PUT /owner`). Self-owner không được phép bypass. |
+| Gateway không tồn tại trong CSDL | **`404 Not Found`** | JSON Envelope | `not_found`. Báo lỗi tài nguyên trạm cha không tồn tại. |
+| Caller thiếu token JWT hoặc token không hợp lệ | **`401 Unauthorized`** | JSON Envelope | `unauthorized`. Chặn từ tầng middleware auth. |
+| Caller có JWT hợp lệ nhưng không có quyền Platform Admin | **`403 Forbidden`** | JSON Envelope | `forbidden`. Kiểm tra từ middleware và recheck trong transaction; không mutation CSDL. |
+| Lỗi mạng, database unavailable, hoặc context timeout/cancellation | **`503 Service Unavailable`** | JSON Envelope | `service_unavailable`. Không trả success giả khi transaction chưa xác nhận commit. |
+| Lỗi CSDL nội bộ khác | **`500 Internal Server Error`** | JSON Envelope | `internal_error`. Thông báo an toàn, ghi log chẩn đoán. |
+
+- **Bảo toàn dữ liệu ngoài phạm vi:**
+  - Xóa membership chỉ tác động duy nhất vào bảng `public.user_gateways` cho đúng cặp `(gateway_id, user_id)`.
+  - Tài khoản Auth (`auth.users`), hồ sơ (`public.profiles`), vai trò nền tảng (`platform_role` / `public.platform_admins`), và quyền thành viên trên tất cả các Gateway khác của target hoàn toàn **KHÔNG THAY ĐỔI**.
+  - Target sau khi bị xóa membership vẫn đăng nhập được bình thường vào hệ thống bằng mật khẩu, nhưng mất toàn bộ quyền đọc/ghi trên Gateway đó (`GET /v1/gateways/{id}`, `GET /v1/digital-twins/{id}` đều trả về `404 Not Found`).
+- **Headers:** Áp dụng `Cache-Control: no-store` và `Pragma: no-cache`. Phương thức DELETE đã nằm sẵn trong danh sách cho phép của middleware CORS.
+
+---
+
+### 8.2 Thiết kế Transaction và Cấp quyền CSDL (Migration 22)
+
+#### 8.2.1 Thứ tự Thực thi Transaction trong `PostgresRepository.RemoveGatewayUser`
+Toàn bộ logic thu hồi quyền thành viên được bọc trong một PostgreSQL transaction duy nhất với cơ chế khóa bi quan (pessimistic locking) chặt chẽ, tuân thủ đúng thứ tự khóa của hệ thống:
+1. **Recheck quyền Platform Admin của Actor trong transaction:**
+   - Thực hiện `SELECT EXISTS(SELECT 1 FROM public.platform_admins WHERE user_id = $1)`.
+   - Nếu xảy ra lỗi kết nối CSDL, hệ thống trả về lỗi kết hợp `ErrMembershipUnavailable` (ánh xạ thành HTTP 503 `service_unavailable`) theo nguyên tắc fail-closed, tuyệt đối không coi lỗi kết nối là từ chối hay thành công giả.
+   - Nếu caller không nằm trong bảng admin, trả về `ErrActorNotAdmin` (HTTP 403 `forbidden`).
+2. **Khóa bản ghi Gateway cha (`gateways FOR UPDATE`):**
+   - Thực hiện `SELECT gateway_id FROM public.gateways WHERE gateway_id = $1 FOR UPDATE`.
+   - Giữ nguyên thứ tự khóa giống hệt hàm `AssignGatewayUser` và `TransferGatewayOwner`, ngăn ngừa tuyệt đối tình trạng deadlock và xung đột tương tranh với thao tác gán quyền hoặc chuyển giao chủ sở hữu.
+   - Nếu không tìm thấy trạm (`pgx.ErrNoRows`), trả về `ErrGatewayNotFound` (HTTP 404 `not_found`).
+3. **Khóa bản ghi Membership của mục tiêu (`user_gateways FOR UPDATE`):**
+   - Thực hiện `SELECT role FROM public.user_gateways WHERE gateway_id = $1 AND user_id = $2 FOR UPDATE`.
+   - Nếu không có dòng nào (`pgx.ErrNoRows`): đây là tình huống no-op hợp lệ, transaction thực hiện `tx.Commit(ctx)` và trả về `nil` (HTTP 204).
+4. **Kiểm tra vai trò và Thực thi Scoped DELETE:**
+   - Nếu `role == 'owner'`: Trả về ngay `ErrOwnerTransferRequired` (HTTP 409), `defer tx.Rollback(ctx)` hủy bỏ transaction, không bao giờ chạy lệnh DELETE.
+   - Nếu `role IN ('operator', 'viewer')`: Thực thi câu lệnh DELETE có tham số hóa với allowlist role an toàn:
+     ```sql
+     DELETE FROM public.user_gateways
+     WHERE gateway_id = $1 AND user_id = $2
+       AND role IN ('operator', 'viewer');
+     ```
+   - Kiểm tra kết quả số dòng bị ảnh hưởng: Bắt buộc `tag.RowsAffected() == 1`. Nếu khác 1, ném lỗi nội bộ bất thường.
+   - Nếu role mang giá trị không xác định khác: fail-closed, từ chối xóa và ném lỗi.
+5. **Xác nhận Commit trước khi trả về thành công:**
+   - Thực thi `tx.Commit(ctx)`. Chỉ khi commit CSDL thành công thì hàm mới trả về `nil`. Nếu commit gặp lỗi, trả về lỗi CSDL và handler không bao giờ phản hồi HTTP 204.
+
+#### 8.2.2 Migration 22: `000022_gateway_membership_revocation.up.sql`
+- **Nội dung cấp quyền:** `GRANT DELETE ON TABLE public.user_gateways TO iot_backend;`.
+- **Ràng buộc:** Bắt buộc migration 21 đã áp dụng và bảng `auth.users` đã sẵn sàng (`auth_ready`). Khóa bằng advisory lock `pg_advisory_lock(3290, 2)`.
+- **Cập nhật Guards:** Các kịch bản kiểm tra `scripts/sql/verify-migration-000021.sql`, `verify-migration-000022.sql`, `scripts/test-stage2-migrations.sh`, `scripts/tests/migration_ci_compat.py`, `scripts/tests/stage4_api_runner.py`, và `scripts/tests/native_compose_smoke.py` đều được đồng bộ lên schema version 22 với các assertion kiểm tra tên và phiên bản chính xác.
+
+---
+
+### 8.3 Bằng chứng Triển khai và Kiểm thử Cục bộ (Tasks D1–D4)
+
+Toàn bộ tiến trình bổ sung Follow-up D1–D5 được thực hiện trên không gian làm việc cục bộ:
+- **Baseline kiểm chứng:** Nhánh `develop`, commit HEAD `8f9f984` kết hợp **working diff** cục bộ (chưa tạo commit mới, chưa push lên remote). Các kết quả CI từ xa 16/16 jobs tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` được lưu giữ nguyên vẹn như bằng chứng lịch sử của đợt U0–U8.
+
+#### 8.3.1 Bằng chứng RED/GREEN Từng Lát cắt
+1. **Lát cắt D1 (Handler & Service Unit Tests):**
+   - Viết các test case cho DELETE endpoint trong `src/internal/httpserver/membership_remove_test.go` và `src/internal/usermanagement/membership_remove_test.go`.
+   - **Ghi nhận RED:** Test ban đầu biên dịch được nhưng thất bại hành vi do router chưa đăng ký route DELETE và service còn stub chưa hiện thực xử lý.
+2. **Lát cắt D2 (Native Repository & Migration Grants):**
+   - Bổ sung `TestPostgresRemoveGatewayUserNative` trong `postgres_repository_test.go`.
+   - **Ghi nhận RED trước khi cấp quyền:** Khi chạy test với runtime non-superuser role `iot_backend_app`, thao tác DELETE bị PostgreSQL từ chối với mã lỗi SQL **`42501`** (`permission denied for table user_gateways`).
+   - **Đạt chuẩn GREEN sau khi cấp quyền:** Áp dụng migration 22 cấp quyền `DELETE` cho role `iot_backend`, các bài test repository native đạt GREEN toàn bộ.
+   - **Kiểm tra Rollback:** Xác nhận rollback thành công cả trong trường hợp lỗi SQL tức thì (immediate trigger error) lẫn lỗi deferred constraint trigger (`DEFERRABLE INITIALLY DEFERRED`), không có dữ liệu nào bị xóa sót.
+   - **Kiểm tra Tương tranh có phối hợp:** Hai connection phối hợp qua `pgx.ConnConfig.Tracer` và quan sát `pg_blocking_pids`: removal chờ khóa Gateway cha của `TransferGatewayOwner`, rồi trả `ErrOwnerTransferRequired` khi target đã thành owner. HTTP mapping của domain error này sang 409 được kiểm tra riêng ở router/native HTTP.
+3. **Lát cắt D3 (Service, Handler Wiring & GREEN HTTP):**
+   - Hiện thực `service.RemoveGatewayUser`, đăng ký handler vào Gin engine qua `groups.admin.DELETE("/gateways/:gateway_id/users/:user_id", ...)`.
+   - Toàn bộ các test D1 chuyển sang **GREEN**, kiểm tra regression các endpoint PUT gán quyền, PUT chuyển owner, cache headers và CORS methods đều đạt chuẩn.
+4. **Lát cắt D4 (Native E2E Integration & System Regression):**
+   - Mở rộng bài test native HTTP E2E (`TestNativeUserManagement_E2EFlow`) trong `src/cmd/server/usermanagement_native_http_test.go`:
+     - Admin tạo user Alice, gán quyền `viewer`/`operator` trên trạm `gwID` và trạm phụ `otherGW`.
+     - Alice truy cập đọc dữ liệu trạm `gwID` thành công (HTTP 200).
+     - Admin gọi `DELETE /v1/admin/gateways/{gwID}/users/{aliceUID}` hai lần liên tiếp (repeat=2): cả hai lần đều trả về `204 No Content` với body rỗng và header `Cache-Control: no-store`.
+     - Kiểm chứng quyền truy cập: Alice lập tức nhận mã `404 Not Found` khi đọc dữ liệu trạm `gwID`, nhưng vẫn đọc bình thường trạm phụ `otherGW` (HTTP 200). Chủ sở hữu trạm (`ownerOrigToken`) vẫn đọc bình thường (HTTP 200).
+     - Kiểm chứng CSDL: `public.user_gateways` xác nhận còn đúng 0 bản ghi (`remaining == 0`) của Alice trên `gwID`.
+     - Kiểm chứng danh sách: `GET /v1/admin/users` phản ánh đúng `gateway_roles` của Alice chỉ còn duy nhất trạm `otherGW`, các trường thông tin tài khoản, tên hiển thị và vai trò nền tảng không thay đổi.
+     - Kiểm chứng tài khoản: Alice thực hiện đăng nhập lại bằng mật khẩu (`loginEndpoint`) thành công, chứng minh tài khoản Auth không bị ảnh hưởng.
+   - **Môi trường kiểm thử dùng chung (Shared Test Environment):** PostgreSQL 16.15 / TimescaleDB 2.29.2 (schema version 22) + GoTrue v2.196.0 qua Envoy v1.39.1. Toàn bộ native DB, service, và native HTTP tests đều PASS.
+   - **Kiểm thử môi trường cô lập (Isolated Environment):** Chạy kiểm tra khởi tạo CSDL mới (fresh database), nâng cấp migration (upgrade 21 -> 22), và compat grants đều PASS.
+   - **Kiểm tra hồi quy toàn diện hệ thống:**
+     - Toàn bộ Go unit test với race detector (`go test -race ./...`) PASS.
+     - Kiểm tra tĩnh: `go vet ./...`, `golangci-lint run ./...`, và `go build ./...` PASS.
+     - Bộ kiểm thử Python: Đạt chuẩn tuyệt đối **898/898 tests PASS**.
+     - Stage 4 Runner: Chạy runner `stage4_api_runner.py` ở chế độ toàn bộ (`all`) và Compose `--full-http` trong môi trường cô lập đạt PASS. Dọn dẹp tài nguyên sở hữu (owned cleanup) được xác minh sạch sẽ.
+   - **Lưu vết Artifacts:**
+     - Nhật ký thực thi: `/tmp/opencode/membership-delete-*.log`.
+     - Báo cáo tóm tắt Stage 4: `/tmp/opencode/membership-delete-stage4.json`.
+
+---
+
+### 8.4 Rà soát Kỹ thuật (Code Review) và Khắc phục Trực tiếp
+
+Quá trình rà soát mã nguồn độc lập chuyên biệt cho Follow-up D1–D5 ghi nhận 2 phát hiện và đã được xử lý trực tiếp trong mã nguồn:
+
+1. **Phát hiện Go Review (WARNING MEDIUM — Context hủy trong hàm Cleanup):**
+   - *Vấn đề:* Trong `postgres_repository_test.go`, hai lệnh `defer exec(...)` xoá trigger/function dùng helper `exec` giữ operation context của test cha. Khi context này hết hạn, lệnh DROP có thể thất bại và để lại object gây lỗi SQL, cản trở cleanup fixture.
+   - *Khắc phục:*
+     - Cập nhật hàm `cleanupMembershipFailureObjects` sử dụng một context mới độc lập có giới hạn thời gian: `ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)`.
+     - Đảm bảo thứ tự dọn dẹp chính xác: xóa trigger trước (`DROP TRIGGER IF EXISTS`), sau đó mới xóa function (`DROP FUNCTION IF EXISTS`).
+     - Sử dụng `t.Errorf` thay vì `t.Fatalf` để khi có lỗi xảy ra thì ghi nhận thất bại nhưng không làm ngắt quãng đột ngột tiến trình dọn dẹp các đối tượng tiếp theo (cho phép test runner tiếp tục thu dọn).
+     - Bổ sung kịch bản kiểm thử riêng biệt `failure objects cleaned after operation cancellation` trong `postgres_repository_test.go` chứng minh các đối tượng trigger/function được dọn dẹp hoàn toàn sạch sẽ ngay cả khi context của thao tác chính bị hủy bỏ.
+2. **Phát hiện Security Review (LOW — Audit Logging cho thao tác thành công):**
+   - *Vấn đề:* Thao tác thu hồi quyền thành viên là một hành động nhạy cảm của quản trị viên nền tảng. Khi repository trả về thành công (`err == nil`), handler trước đây chỉ phản hồi HTTP 204 mà chưa ghi nhật ký audit log có cấu trúc để phục vụ điều tra truy vết.
+   - *Khắc phục:*
+     - Bổ sung lệnh ghi log có cấu trúc `slog.InfoContext` ngay trước khi trả về HTTP 204:
+       ```go
+       slog.InfoContext(c.Request.Context(), "gateway membership revocation completed",
+           "request_id", httpapi.RequestIDFrom(c),
+           "actor_id", p.UserID.String(),
+           "gateway_id", gatewayID,
+           "target_id", targetID.String(),
+           "outcome", "success")
+       ```
+     - Log ghi nhận đầy đủ `request_id`, định danh quản trị viên thực hiện (`actor_id`), trạm mục tiêu (`gateway_id`), người dùng mục tiêu (`target_id`), và kết quả `outcome: "success"`.
+     - *Ngữ nghĩa:* Repository chỉ trả `error`, không trả số row xoá cho handler. Vì vậy `outcome: "success"` dùng chung cho removal và no-op, không khẳng định đã xoá một row. Log không chứa JWT, body hoặc raw SQL errors; không đưa ra bảo đảm chống timing side-channel.
+3. **Tuyên bố Ranh giới Phê duyệt (Approval Boundary Statement):**
+   - Cả hai phát hiện Go Review (MEDIUM) và Security Review (LOW) đã được **khắc phục trực tiếp trong mã nguồn và bài kiểm thử**.
+   - Hệ thống **KHÔNG tuyên bố có đợt tái thẩm định (independent re-approval) độc lập sau cùng**.
+   - Kết quả khắc phục được kiểm chứng qua các lượt chạy fix-check lưu tại `/tmp/opencode/membership-review-*.log`:
+     - Ba package Go bị ảnh hưởng (`internal/usermanagement`, `internal/httpserver`, `cmd/server`) chạy `-race` PASS.
+     - Bài kiểm thử native repository vượt qua toàn bộ các ca kiểm tra dọn dẹp khi cancellation, rollback khi lỗi SQL tức thời/deferred, và khóa phối hợp chuyển owner.
+     - Bài kiểm thử native HTTP E2E PASS.
+     - `go vet`, `golangci-lint`, `go build` và `git diff --check` PASS; working diff vẫn chưa commit, không phải worktree sạch.
+
+---
+
+### 8.5 Trạng thái Vận hành và Ranh giới Thực tế
+
+Để đảm bảo tính trung thực kỹ thuật theo quy định tại `AGENTS.md` Mục 0 và 16:
+- **Trạng thái CSDL và Container:**
+  - Migration 22 đã được áp dụng vào cơ sở dữ liệu test dùng chung (shared test database).
+  - Container Go backend đang chạy trong Docker Compose **CHƯA được rebuild hay restart** để nạp mã nguồn mới.
+- **Ranh giới Phía Client:**
+  - Lát cắt D1–D5 thuần túy là bổ sung phía backend Go. Không ngụ ý hoặc đòi hỏi bất kỳ thay đổi nào đối với giao diện người dùng Frontend hay bộ sưu tập API Bruno trong phạm vi này.
+- **Cam kết Môi trường:**
+  - Mọi kết quả kiểm chứng D1–D5 được thực hiện cục bộ trên baseline `8f9f984` + working diff; không có cam kết về môi trường production hay độ bền phần cứng tùy ý.

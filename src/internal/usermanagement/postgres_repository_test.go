@@ -7,13 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/usermanagement"
 )
 
@@ -93,6 +96,317 @@ func resolveDatabaseURLs(t *testing.T) (string, string) {
 		t.Fatal("native test requested but database configuration is missing")
 	}
 	return setupURL, backendURL
+}
+
+func TestPostgresRemoveGatewayUserNative(t *testing.T) {
+	setupURL, appURL := resolveDatabaseURLs(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	setup, err := pgxpool.New(ctx, setupURL)
+	if err != nil {
+		t.Fatal("setup pool unavailable")
+	}
+	defer setup.Close()
+	appCfg, err := pgxpool.ParseConfig(appURL)
+	if err != nil {
+		t.Fatal("invalid application pool configuration")
+	}
+	trace := &membershipWriteTrace{}
+	appCfg.ConnConfig.Tracer = trace
+	app, err := pgxpool.NewWithConfig(ctx, appCfg)
+	if err != nil {
+		t.Fatal("app pool unavailable")
+	}
+	defer app.Close()
+	var role string
+	var super bool
+	if err := app.QueryRow(ctx, "SELECT current_user, rolsuper FROM pg_roles WHERE rolname=current_user").Scan(&role, &super); err != nil || role != "iot_backend_app" || super {
+		t.Fatal("test requires runtime non-superuser principal")
+	}
+	repo, err := usermanagement.NewPostgresRepository(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
+	actor, owner, target, other := ids[0], ids[1], ids[2], ids[3]
+	gw := "gw_delete_" + uuid.NewString()[:8]
+	gws := []string{gw, gw + "_other"}
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := setup.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		for _, table := range []string{"twin_states", "twin_entities", "user_gateways", "gateways"} {
+			q := "DELETE FROM public." + table + " WHERE gateway_id = ANY($1)"
+			if table == "twin_states" {
+				q = "DELETE FROM public.twin_states WHERE entity_id IN (SELECT id FROM public.twin_entities WHERE gateway_id=ANY($1))"
+			}
+			checkedCleanup(t, setup, cctx, q, gws)
+		}
+		checkedCleanup(t, setup, cctx, "DELETE FROM public.platform_admins WHERE user_id=ANY($1)", ids)
+		checkedCleanup(t, setup, cctx, "DELETE FROM public.profiles WHERE id=ANY($1)", ids)
+		checkedCleanup(t, setup, cctx, "DELETE FROM auth.users WHERE id=ANY($1)", ids)
+		var remaining int
+		if err := setup.QueryRow(cctx, `SELECT (SELECT count(*) FROM public.gateways WHERE gateway_id=ANY($1)) + (SELECT count(*) FROM public.user_gateways WHERE gateway_id=ANY($1) OR user_id=ANY($2)) + (SELECT count(*) FROM public.twin_entities WHERE gateway_id=ANY($1)) + (SELECT count(*) FROM public.profiles WHERE id=ANY($2)) + (SELECT count(*) FROM auth.users WHERE id=ANY($2)) + (SELECT count(*) FROM public.platform_admins WHERE user_id=ANY($2))`, gws, ids).Scan(&remaining); err != nil || remaining != 0 {
+			t.Error("removal fixture cleanup incomplete")
+		}
+	}()
+	for _, id := range ids {
+		exec("INSERT INTO auth.users(id,email,raw_user_meta_data,created_at,aud,role) VALUES($1,$2,'{\"full_name\":\"Delete fixture\"}',now(),'authenticated','authenticated')", id, id.String()+"@example.com")
+	}
+	exec("INSERT INTO public.platform_admins(user_id) VALUES($1),($2)", actor, target)
+	prov, err := gateway.NewPostgresProvisioningRepository(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range gws {
+		if _, err := prov.ProvisionGateway(ctx, actor, gateway.ProvisionGatewayInput{GatewayID: id, Name: "Delete fixture", OwnerUserID: owner}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec("INSERT INTO public.user_gateways(user_id,gateway_id,role) VALUES($1,$3,'viewer'),($2,$4,'operator')", other, target, gw, gws[1])
+	// Full-row snapshots, including private account rows, are compared but never printed.
+	snapshot := func(exclude bool) string {
+		t.Helper()
+		var value string
+		err := setup.QueryRow(ctx, `SELECT jsonb_build_object(
+		'accounts',(SELECT jsonb_agg(to_jsonb(x) ORDER BY id) FROM auth.users x WHERE id=ANY($1)),
+		'profiles',(SELECT jsonb_agg(to_jsonb(x) ORDER BY id) FROM public.profiles x WHERE id=ANY($1)),
+		'admins',(SELECT jsonb_agg(to_jsonb(x) ORDER BY user_id) FROM public.platform_admins x WHERE user_id=ANY($1)),
+		'members',(SELECT jsonb_agg(to_jsonb(x) ORDER BY gateway_id,user_id) FROM public.user_gateways x WHERE gateway_id=ANY($2) AND NOT ($3 AND gateway_id=$4 AND user_id=$5)),
+		'gateways',(SELECT jsonb_agg(to_jsonb(x) ORDER BY gateway_id) FROM public.gateways x WHERE gateway_id=ANY($2)),
+		'entities',(SELECT jsonb_agg(to_jsonb(x) ORDER BY id) FROM public.twin_entities x WHERE gateway_id=ANY($2)),
+		'states',(SELECT jsonb_agg(to_jsonb(x) ORDER BY entity_id) FROM public.twin_states x WHERE entity_id IN (SELECT id FROM public.twin_entities WHERE gateway_id=ANY($2))))::text`, ids, gws, exclude, gw, target).Scan(&value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	for _, membershipRole := range []string{"viewer", "operator"} {
+		t.Run(membershipRole, func(t *testing.T) {
+			exec("INSERT INTO public.user_gateways(user_id,gateway_id,role) VALUES($1,$2,$3)", target, gw, membershipRole)
+			before := snapshot(true)
+			if err := repo.RemoveGatewayUser(ctx, actor, gw, target); err != nil {
+				t.Fatalf("remove %s: %v", membershipRole, err)
+			}
+			var count int
+			if err := setup.QueryRow(ctx, "SELECT count(*) FROM public.user_gateways WHERE gateway_id=$1 AND user_id=$2", gw, target).Scan(&count); err != nil || count != 0 {
+				t.Fatal("target membership not removed")
+			}
+			if snapshot(true) != before {
+				t.Error("unrelated resource/account/membership changed")
+			}
+			if err := repo.RemoveGatewayUser(ctx, actor, gw, target); err != nil {
+				t.Fatal(err)
+			}
+			if snapshot(true) != before {
+				t.Error("repeat delete changed data")
+			}
+		})
+		// A pre-grant run intentionally fails above; reset only this owned target row.
+		exec("DELETE FROM public.user_gateways WHERE gateway_id=$1 AND user_id=$2", gw, target)
+	}
+	for _, tc := range []struct {
+		name   string
+		actor  uuid.UUID
+		gw     string
+		target uuid.UUID
+		want   error
+	}{
+		{"absent membership", actor, gw, target, nil}, {"absent account", actor, gw, uuid.New(), nil},
+		{"missing gateway", actor, gw + "_missing", target, usermanagement.ErrGatewayNotFound},
+		{"owner", actor, gw, owner, usermanagement.ErrOwnerTransferRequired},
+		{"non admin", other, gw, other, usermanagement.ErrActorNotAdmin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := snapshot(false)
+			writes := trace.writes.Load()
+			if err := repo.RemoveGatewayUser(ctx, tc.actor, tc.gw, tc.target); !errors.Is(err, tc.want) {
+				t.Errorf("got %v want %v", err, tc.want)
+			}
+			if snapshot(false) != before {
+				t.Error("denial/no-op changed data")
+			}
+			if trace.writes.Load() != writes {
+				t.Error("denial/no-op executed a mutation statement")
+			}
+		})
+	}
+	// SQL failure after row deletion must roll back. Function/trigger are scoped to this run.
+	for _, deferred := range []bool{false, true} {
+		t.Run(fmt.Sprintf("SQL rollback deferred=%t", deferred), func(t *testing.T) {
+			exec("INSERT INTO public.user_gateways(user_id,gateway_id,role) VALUES($1,$2,'viewer') ON CONFLICT(user_id,gateway_id) DO NOTHING", target, gw)
+			before := snapshot(false)
+			fn := "delete_failure_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+			defer cleanupMembershipFailureObjects(t, setup, fn)
+			exec(fmt.Sprintf(`CREATE FUNCTION public.%s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned delete failure' USING ERRCODE='P0001'; END $$`, fn))
+			triggerKind, timing := "", ""
+			if deferred {
+				triggerKind, timing = "CONSTRAINT ", "DEFERRABLE INITIALLY DEFERRED "
+			}
+			exec(fmt.Sprintf(`CREATE %sTRIGGER %s AFTER DELETE ON public.user_gateways %sFOR EACH ROW WHEN (OLD.gateway_id = '%s') EXECUTE FUNCTION public.%s()`, triggerKind, fn, timing, gw, fn))
+			err := repo.RemoveGatewayUser(ctx, actor, gw, target)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "P0001" {
+				t.Fatalf("expected SQL failure, got %v", err)
+			}
+			if snapshot(false) != before {
+				t.Error("failed DELETE was not rolled back")
+			}
+		})
+	}
+	t.Run("failure objects cleaned after operation cancellation", func(t *testing.T) {
+		fn := "delete_failure_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		// Register before setup, including partial setup failure.
+		defer cleanupMembershipFailureObjects(t, setup, fn)
+		opCtx, opCancel := context.WithCancel(ctx)
+		defer opCancel()
+		if _, err := setup.Exec(opCtx, fmt.Sprintf(`CREATE FUNCTION public.%s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN OLD; END $$`, fn)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := setup.Exec(opCtx, fmt.Sprintf(`CREATE TRIGGER %s AFTER DELETE ON public.user_gateways FOR EACH ROW WHEN (OLD.gateway_id = '%s') EXECUTE FUNCTION public.%s()`, fn, gw, fn)); err != nil {
+			t.Fatal(err)
+		}
+		opCancel()
+		if _, err := setup.Exec(opCtx, "SELECT 1"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("operation context was not cancelled: %v", err)
+		}
+		cleanupMembershipFailureObjects(t, setup, fn)
+		var absent bool
+		if err := setup.QueryRow(ctx, `SELECT to_regprocedure($1) IS NULL AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='public.user_gateways'::regclass AND tgname=$2)`, "public."+fn+"()", fn).Scan(&absent); err != nil || !absent {
+			t.Error("failure-injection objects remain after cancelled-operation cleanup")
+		}
+	})
+	t.Run("owner transfer locks out removal", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		locked, release := make(chan struct{}), make(chan struct{})
+		cfg, err := pgxpool.ParseConfig(appURL)
+		if err != nil {
+			t.Fatal("invalid app pool config")
+		}
+		cfg.ConnConfig.Tracer = membershipTransferBarrier{locked: locked, release: release}
+		transferPool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal("transfer pool unavailable")
+		}
+		// Closing must occur after release, including on assertion failure.
+		defer transferPool.Close()
+		defer close(release)
+		transferRepo, err := usermanagement.NewPostgresRepository(transferPool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transferDone := make(chan error, 1)
+		go func() { transferDone <- transferRepo.TransferGatewayOwner(ctx, actor, gw, target) }()
+		select {
+		case <-locked:
+		case <-ctx.Done():
+			t.Fatal("transfer never acquired parent lock")
+		}
+		deleteCfg, err := pgxpool.ParseConfig(appURL)
+		if err != nil {
+			t.Fatal("invalid delete pool config")
+		}
+		deleteCfg.ConnConfig.RuntimeParams["application_name"] = gw + "_removal"
+		deletePool, err := pgxpool.NewWithConfig(ctx, deleteCfg)
+		if err != nil {
+			t.Fatal("delete pool unavailable")
+		}
+		defer deletePool.Close()
+		// Cancel in-flight calls before pool Close on every exit path.
+		defer cancel()
+		deleteRepo, err := usermanagement.NewPostgresRepository(deletePool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deleteDone := make(chan error, 1)
+		go func() { deleteDone <- deleteRepo.RemoveGatewayUser(ctx, actor, gw, target) }()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			var blocked bool
+			if err := setup.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0)`, gw+"_removal").Scan(&blocked); err != nil {
+				t.Fatal(err)
+			}
+			if blocked {
+				break
+			}
+			select {
+			case err := <-deleteDone:
+				t.Fatalf("removal did not wait on parent lock: %v", err)
+			case <-ticker.C:
+			case <-ctx.Done():
+				t.Fatal("did not observe blocked removal")
+			}
+		}
+		select {
+		case release <- struct{}{}:
+		case <-ctx.Done():
+			t.Fatal("transfer release timed out")
+		}
+		if err := <-transferDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-deleteDone; !errors.Is(err, usermanagement.ErrOwnerTransferRequired) {
+			t.Fatalf("must not delete newly transferred owner: %v", err)
+		}
+		var membership string
+		if err := setup.QueryRow(ctx, "SELECT role FROM public.user_gateways WHERE gateway_id=$1 AND user_id=$2", gw, target).Scan(&membership); err != nil || membership != "owner" {
+			t.Fatal("new owner not preserved")
+		}
+	})
+}
+
+// Cleanup must survive cancellation/expiry of the test operation and continue
+// after individual failures. Names are generated by this fixture, never supplied externally.
+func cleanupMembershipFailureObjects(t *testing.T, pool *pgxpool.Pool, name string) {
+	t.Helper()
+	for _, query := range []string{
+		"DROP TRIGGER IF EXISTS " + name + " ON public.user_gateways",
+		"DROP FUNCTION IF EXISTS public." + name + "()",
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := pool.Exec(ctx, query)
+		cancel()
+		if err != nil {
+			t.Errorf("failure-injection object cleanup failed: %v", err)
+		}
+	}
+}
+
+type membershipTransferQueryKey struct{}
+type membershipWriteTrace struct{ writes atomic.Int64 }
+
+func (r *membershipWriteTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	q := strings.ToUpper(strings.TrimSpace(data.SQL))
+	if strings.HasPrefix(q, "DELETE ") || strings.HasPrefix(q, "INSERT ") || strings.HasPrefix(q, "UPDATE ") {
+		r.writes.Add(1)
+	}
+	return ctx
+}
+func (*membershipWriteTrace) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+type membershipTransferBarrier struct {
+	locked  chan struct{}
+	release chan struct{}
+}
+
+func (b membershipTransferBarrier) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, membershipTransferQueryKey{}, strings.HasPrefix(data.SQL, "SELECT name FROM public.gateways"))
+}
+func (b membershipTransferBarrier) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	if held, _ := ctx.Value(membershipTransferQueryKey{}).(bool); held && data.Err == nil {
+		close(b.locked)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+		}
+	}
 }
 
 func TestPostgresRepositoryNative(t *testing.T) {

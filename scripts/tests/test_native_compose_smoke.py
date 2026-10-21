@@ -343,34 +343,34 @@ class PreparationTests(unittest.TestCase):
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 21);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 22);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("21:admin_user_management", expected)
+        self.assertIn("22:gateway_membership_revocation", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
 
-    def test_stale_schema20_history_rejected(self):
+    def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.replace("21:admin_user_management", "20:stage3_telemetry_ingestion")
+        stale = expected.removesuffix(",22:gateway_membership_revocation")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "21:admin_user_management")
+        missing = ",".join(p for p in expected.split(",") if p != "22:gateway_membership_revocation")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("21:admin_user_management", "21:unexpected_name")
+        wrong = expected.replace("22:gateway_membership_revocation", "22:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
         expected = smoke.expected_schema_history()
-        self.assertFalse(smoke.schema_history_verified(0, expected + ",22:future_migration", expected))
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",23:future_migration", expected))
 
     def test_failed_migration_returncode_rejected(self):
         expected = smoke.expected_schema_history()
@@ -381,8 +381,15 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("21:admin_user_management", "22:future_migration")
+        future = expected.replace("22:gateway_membership_revocation", "23:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
+
+
+def schema_query_result(expected, query):
+    # Pre-Auth startup stops at 20; both 21 and 22 run in the compat phase.
+    if 'WHERE version <= 20' in query:
+        return ','.join(row for row in expected.split(',') if int(row.split(':')[0]) <= 20)
+    return expected
 
 
 class ReceiptTests(unittest.TestCase):
@@ -1311,7 +1318,7 @@ class AllocationTests(unittest.TestCase):
                 def fake_cmd(cmd):
                     if "psql" in cmd:
                         if "SELECT string_agg" in cmd[-1]:
-                            return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                            return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                         if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": image_inspect, "stderr": b""})()
@@ -1430,7 +1437,7 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                     if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": image_inspect, "stderr": b""})()
@@ -1749,7 +1756,7 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                     if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
@@ -1819,7 +1826,7 @@ class AllocationTests(unittest.TestCase):
                 def fake_cmd(cmd):
                     if "psql" in cmd:
                         if "SELECT string_agg" in cmd[-1]:
-                            return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                            return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                         if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
@@ -1987,7 +1994,7 @@ class AllocationTests(unittest.TestCase):
                 def fake_cmd(cmd):
                     if "psql" in cmd:
                         if "SELECT string_agg" in cmd[-1]:
-                            return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                            return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                         if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
@@ -2063,7 +2070,7 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                     if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
@@ -2139,7 +2146,7 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if "psql" in cmd:
                     if "SELECT string_agg" in cmd[-1]:
-                        return type("Res", (), {"returncode": 0, "stdout": (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), "stderr": b""})()
+                        return type("Res", (), {"returncode": 0, "stdout": schema_query_result(expected_schema, cmd[-1]).encode(), "stderr": b""})()
                     if "profiles_id_fkey" in cmd[-1] or "on_auth_user_created" in cmd[-1]:
                         return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                 return type("Res", (), {"returncode": 0, "stdout": img_out, "stderr": b""})()
@@ -2470,7 +2477,7 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if 'psql' in cmd:
                     if 'SELECT string_agg' in cmd[-1]:
-                        return type('Res', (), {'returncode': 0, 'stdout': (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), 'stderr': b''})()
+                        return type('Res', (), {'returncode': 0, 'stdout': schema_query_result(expected_schema, cmd[-1]).encode(), 'stderr': b''})()
                     if 'profiles_id_fkey' in cmd[-1] or 'on_auth_user_created' in cmd[-1]:
                         return type('Res', (), {'returncode': 0, 'stdout': b'1\n', 'stderr': b''})()
                 return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()
@@ -2535,7 +2542,7 @@ class AllocationTests(unittest.TestCase):
             def fake_cmd(cmd):
                 if 'psql' in cmd:
                     if 'SELECT string_agg' in cmd[-1]:
-                        return type('Res', (), {'returncode': 0, 'stdout': (expected_schema.rsplit(',', 1)[0] if 'WHERE version <= 20' in cmd[-1] else expected_schema).encode(), 'stderr': b''})()
+                        return type('Res', (), {'returncode': 0, 'stdout': schema_query_result(expected_schema, cmd[-1]).encode(), 'stderr': b''})()
                     if 'profiles_id_fkey' in cmd[-1] or 'on_auth_user_created' in cmd[-1]:
                         return type('Res', (), {'returncode': 0, 'stdout': b'1\n', 'stderr': b''})()
                 return type('Res', (), {'returncode': 0, 'stdout': img_out, 'stderr': b''})()

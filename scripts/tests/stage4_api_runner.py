@@ -3,7 +3,7 @@
 
 This module provides the reproducible, isolated test fixture for Stage 4
 HTTP and MQTT cross-service integration (Task 4.7.2):
-  - Isolated database (DatabaseFixture with verified TimescaleDB schema terminal 21)
+  - Isolated database (DatabaseFixture with verified TimescaleDB schema terminal 22)
   - Isolated Mosquitto broker (TLS 8883, DynSec per-Gateway ACLs, manager control)
   - Isolated backend container (built from current source target 'backend')
   - Isolated gateway simulator image (built from current source target 'gateway')
@@ -54,7 +54,7 @@ from task26_harness_helpers import RESPONSE  # noqa: E402
 
 # --- Pinned Constants and Timeouts -------------------------------------------
 
-TERMINAL_SCHEMA_VERSION = 21
+TERMINAL_SCHEMA_VERSION = 22
 
 
 def expected_stage4_schema_history() -> list[str]:

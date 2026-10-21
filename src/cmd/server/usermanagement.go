@@ -13,12 +13,13 @@ import (
 	"iot-platform/internal/usermanagement"
 )
 
-// userManagementDependencies holds the five instantiated User Management HTTP dependencies.
+// userManagementDependencies holds the instantiated User Management HTTP dependencies.
 type userManagementDependencies struct {
 	UserCreator            usermanagement.UserCreator
 	UserLister             usermanagement.UserLister
 	UserUpdater            usermanagement.UserUpdater
 	GatewayUserAssigner    usermanagement.GatewayUserAssigner
+	GatewayUserRemover     usermanagement.GatewayUserRemover
 	GatewayOwnerTransferer usermanagement.GatewayOwnerTransferer
 }
 
@@ -31,6 +32,7 @@ func (u userManagementDependencies) apply(deps *httpserver.RouterDependencies) {
 	deps.UserLister = u.UserLister
 	deps.UserUpdater = u.UserUpdater
 	deps.GatewayUserAssigner = u.GatewayUserAssigner
+	deps.GatewayUserRemover = u.GatewayUserRemover
 	deps.GatewayOwnerTransferer = u.GatewayOwnerTransferer
 }
 
@@ -77,7 +79,7 @@ func composeUserManagementDependencies(
 	} else {
 		// When ServiceRoleKey is not provided (e.g. legacy test harnesses without Auth admin credential),
 		// use unavailableAuthAdminClient to fail closed on CreateUser without breaking server startup
-		// or disabling the other 4 membership and list endpoints.
+		// or disabling the database-backed membership and list endpoints.
 		authClient = unavailableAuthAdminClient{}
 	}
 
@@ -92,6 +94,7 @@ func composeUserManagementDependencies(
 		UserLister:             svc,
 		UserUpdater:            svc,
 		GatewayUserAssigner:    svc,
+		GatewayUserRemover:     svc,
 		GatewayOwnerTransferer: svc,
 	}, nil
 }

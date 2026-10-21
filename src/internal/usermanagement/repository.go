@@ -32,5 +32,6 @@ type Repository interface {
 	ListUserGatewayRoles(ctx context.Context, userIDs []uuid.UUID, limit int) ([]UserGatewayRoleRow, error)
 	UpdateUserProfileAndRole(ctx context.Context, actorID, targetID uuid.UUID, fullName *string, platformRole *string) (UpdatedUser, error)
 	AssignGatewayUser(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID, role string) error
+	RemoveGatewayUser(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) error
 	TransferGatewayOwner(ctx context.Context, actorID uuid.UUID, gatewayID string, targetID uuid.UUID) error
 }

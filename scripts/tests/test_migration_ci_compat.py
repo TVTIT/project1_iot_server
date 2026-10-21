@@ -87,7 +87,11 @@ class CompatFixture(unittest.TestCase):
         queries = ' '.join(call.args[0] for call in expect.call_args_list)
         for required in ('pg_policies', 'on_auth_user_created', 'profiles_id_fkey', 'supabase_compat'):
             self.assertIn(required, queries)
-        self.assertEqual([c.args[0] for c in login.call_args_list], ['supabase_auth_admin', 'supabase_storage_admin'])
+        self.assertEqual([c.args[0] for c in login.call_args_list], ['supabase_auth_admin', 'supabase_storage_admin', 'iot_backend_app'])
+        migration22 = (ROOT / 'migrations/000022_gateway_membership_revocation.up.sql').read_text()
+        self.assertEqual(inputs.count(migration22), 2)
+        self.assertIn((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text(), inputs)
+        self.assertIn("DELETE FROM public.user_gateways WHERE false;", inputs)
 
     def test_login_secret_only_protected_stdin(self):
         with patch.object(self.f, 'command', return_value='supabase_auth_admin') as command:

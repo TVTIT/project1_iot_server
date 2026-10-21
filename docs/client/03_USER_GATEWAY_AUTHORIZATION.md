@@ -1,18 +1,20 @@
 # Tài liệu Client — 03: Cơ chế Phân quyền Người dùng và Trạm Gateway (User–Gateway Authorization) trên Flutter Web
 
-**Cập nhật:** 2026-10-19
+**Cập nhật:** 2026-10-20 (Bổ sung đặc tả cơ chế thu hồi thành viên Gateway qua endpoint `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`; baseline `HEAD 8f9f984` + uncommitted code; migration 22 đã kiểm chứng cục bộ, chưa chạy remote CI và chưa rollout trên backend đang chạy)
 **Dự án:** IoT Gateway–Server Platform (Đồ án 1 — ET3290)
 **Tài liệu tham chiếu:**
 - [`../../AGENTS.md`](../../AGENTS.md) (Mục 6, 6.4, 6.5, 10, 16, 18)
-- [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch quản lý User & Gateway Membership)
-- [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
+- [`../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md`](../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md) (Kế hoạch bổ sung DELETE Gateway membership)
+- [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch quản lý User & Gateway Membership gốc)
+- [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8 — lưu giữ bằng chứng lịch sử)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
 - `docs/client/04_REST_API_CLIENT_CONTRACT.md` (Hợp đồng REST API chuẩn)
 - `docs/client/07_ADMIN_API_CLIENT_CONTRACT.md` (Hợp đồng API Quản trị nền tảng)
 - `docs/client/08_API_INTEGRATION_AND_STATE_HANDLING.md` (Tích hợp API và Quản lý trạng thái giao diện)
 - `docs/backend/stage-2-task-2.3-authorization.md` (Đặc tả phân quyền Backend Giai đoạn 2)
-- `migrations/000021_admin_user_management.up.sql` (Migration quản trị người dùng và thành viên)
+- `migrations/000021_admin_user_management.up.sql` (Migration quản trị người dùng và thành viên U0–U8)
+- `migrations/000022_gateway_membership_revocation.up.sql` (Migration cấp quyền DELETE trên user_gateways cho runtime backend principal)
 
 ---
 
@@ -43,12 +45,13 @@ Trong các ứng dụng IoT chuyên dụng, sự nhầm lẫn giữa **Xác th�
 ### Ranh giới bảo mật phía Client Web:
 1. **Không tự suy diễn quyền ở Client Web:** Client không được tự đọc payload của JWT để quyết định mở khóa các chức năng nhạy cảm. Mọi danh sách tài nguyên và quyền thao tác được phép đều bắt nguồn trực tiếp từ dữ liệu phản hồi của Go Backend.
 2. **Không truyền `user_id` trong Request Body hoặc URL Query:** Để triệt tiêu nguy cơ tấn công mạo danh tham chiếu đối tượng trực tiếp (IDOR - Insecure Direct Object References), Go Backend **từ chối tức thì (HTTP 400 Bad Request)** mọi request có chứa query param `user_id`. Backend chỉ trích xuất duy nhất `user_id` từ claim `sub` trong JWT đã được xác minh chữ ký mã hóa.
-3. **Phân quyền động tại thời điểm truy vấn (Same JWT, Next DB Query, No Live Push):** Quyền của người dùng được kiểm tra trực tiếp trên từng truy vấn SQL tại PostgreSQL. Khi dùng cùng một JWT, nếu quản trị viên cập nhật hoặc thu hồi quyền của người dùng trong cơ sở dữ liệu (`user_gateways` hoặc `platform_admins`), hiệu lực sẽ được áp dụng ngay tại lần truy vấn cơ sở dữ liệu tiếp theo (next DB query) của HTTP request kế tiếp. Hệ thống không sử dụng cơ chế đẩy quyền trực tiếp (no live push / no WebSocket permission push).
+3. **Phân quyền động tại thời điểm truy vấn (Same JWT, Next DB Query, No Live Push):** Quyền của người dùng được kiểm tra trực tiếp trên từng truy vấn SQL tại PostgreSQL. Khi dùng cùng một JWT, nếu quản trị viên cập nhật hoặc thu hồi quyền của người dùng trong cơ sở dữ liệu (`user_gateways` hoặc `platform_admins`), hiệu lực sẽ được áp dụng ngay tại lần truy vấn cơ sở dữ liệu tiếp theo (next DB query) của HTTP request kế tiếp được gửi đến sau khi transaction cơ sở dữ liệu đã commit thành công. Hệ thống không tác động đến các request HTTP hay câu lệnh SQL đang trong quá trình thực thi dở dang tại thời điểm commit, và không sử dụng cơ chế đẩy quyền trực tiếp (no live push / no WebSocket permission push).
 4. **Tạo tài khoản không tự động cấp quyền (Account Creation Grants Nothing):** Việc tạo tài khoản người dùng mới trên Supabase Auth (kể cả qua API `POST /v1/admin/users`) chỉ cấp danh tính (JWT hợp lệ), hoàn toàn không gán quyền cho bất kỳ trạm nào. Kết quả gọi `GET /v1/gateways` ban đầu luôn trả về `200 OK` với mảng rỗng `{"items": []}`.
 5. **Tách biệt tuyệt đối giữa Quyền Nền tảng (`platform_admins`) và Quyền Trạm (`user_gateways`):**
-   - Quyền Platform Admin là quyền quản trị hạ tầng toàn hệ thống (cho phép gọi các API `/v1/admin/*`).
+   - Quyền Platform Admin là quyền quản trị hạ tầng toàn hệ thống (cho phép gọi các API `/v1/admin/*`), được xác thực động trực tiếp từ bảng cơ sở dữ liệu `public.platform_admins` trên từng request (DB-backed), tuyệt đối không suy diễn hay tin cậy từ role claim trong JWT.
    - Quyền này **hoàn toàn tách biệt** với quyền thành viên trạm trong `public.user_gateways`.
-   - **Platform Admin KHÔNG có quyền bypass đọc dữ liệu viễn trắc/Digital Twin:** Toàn bộ các API nghiệp vụ đều áp dụng cơ chế lọc theo tư cách thành viên trạm (`user_gateways`). Danh sách trạm (`GET /v1/gateways`) được lọc theo thành viên và trả về `200 OK` với mảng rỗng `{"items": []}` nếu admin không có membership trên trạm nào; các truy vấn chi tiết thực thể hoặc cảm biến không thuộc quyền (`GET /v1/digital-twins/{id}`, `GET /v1/digital-twins/{id}?format=simplified`, `GET /v1/digital-twins/{id}/temporal`, `GET /v1/gateways/{id}/sensors`) đều trả về `404 Not Found` (không có cơ chế blanket read bypass cho Platform Admin).
+   - **Platform Admin KHÔNG BAO GIỜ có quyền bypass đọc dữ liệu viễn trắc/Digital Twin (Never Gains Blanket Read Bypass):** Toàn bộ các API nghiệp vụ đều áp dụng cơ chế lọc theo tư cách thành viên trạm (`user_gateways`). Danh sách trạm (`GET /v1/gateways`) được lọc theo thành viên và trả về `200 OK` với mảng rỗng `{"items": []}` nếu admin không có membership trên trạm nào; các truy vấn chi tiết thực thể hoặc cảm biến không thuộc quyền (`GET /v1/digital-twins/{id}`, `GET /v1/digital-twins/{id}?format=simplified`, `GET /v1/digital-twins/{id}/temporal`, `GET /v1/gateways/{id}/sensors`) đều trả về `404 Not Found` (tuyệt đối không có cơ chế blanket per-Gateway read bypass cho Platform Admin). Kể cả khi Platform Admin chủ động thu hồi quyền `viewer`/`operator` của chính mình trên một trạm, admin đó ngay lập tức mất quyền đọc nghiệp vụ trên trạm đó.
+   - **Quản trị viên tự thu hồi quyền (Self-Removal without Global Demotion):** Platform Admin được phép tự xóa quyền `viewer` hoặc `operator` của chính mình trên trạm mà không bị hạ quyền Quản trị nền tảng toàn cục (`platform_admins` giữ nguyên). Tuy nhiên, nếu admin đang là `owner` của trạm, admin vẫn bị chặn với lỗi `409 Conflict` (`owner_transfer_required`) và không có cơ chế tự miễn trừ (no self-owner bypass).
    - Ngược lại, việc là chủ sở hữu (`owner`) của một trạm không cấp bất kỳ quyền hạn nào để gọi các API quản trị `/v1/admin/*` (nhận `403 Forbidden`).
 
 ---
@@ -115,8 +118,8 @@ CHECK (role IN ('owner', 'operator', 'viewer'))
 >    - `GET /v1/digital-twins/{entity_id}/temporal`: Lịch sử biến thiên chuỗi thời gian cho cảm biến (`attrs=measurement` hoặc `attrs=sample_interval_us`), hỗ trợ cả dạng chuỗi thô (raw tuples) và tổng hợp TimescaleDB `time_bucket` (bucket triples).
 >    - Toàn bộ các API đọc trên đều thẩm định tư cách thành viên qua CTE SQL `user_gateways`. Cả ba vai trò `owner`, `operator`, `viewer` đều có quyền đọc các tài nguyên này trên trạm được phân quyền. Người không phải thành viên nhận HTTP `404 Not Found`.
 >
-> 2. **Hai Cơ chế Phân quyền Quản trị Thành viên Gateway Tập trung:**
->    Việc gán thành viên và chuyển chủ sở hữu trạm do Platform Admin thực thi thông qua 2 endpoint riêng biệt:
+> 2. **Ba Cơ chế Phân quyền Quản trị Thành viên Gateway Tập trung (Platform Admin only, DB-backed):**
+>    Việc gán thành viên, chuyển chủ sở hữu trạm, và thu hồi tư cách thành viên do Platform Admin thực thi thông qua 3 endpoint chuyên dụng (được thẩm định trực tiếp qua cơ sở dữ liệu `public.platform_admins`, không phụ thuộc JWT role):
 >    - **Gán vai trò thông thường (`PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`):**
 >      * Chỉ chấp nhận `{"role": "operator"}` hoặc `{"role": "viewer"}`.
 >      * Cấm gán `owner` qua endpoint này (trả về `400 Bad Request`, `code: "invalid_role"`).
@@ -127,10 +130,25 @@ CHECK (role IN ('owner', 'operator', 'viewer'))
 >      * **Chính sách bảo toàn quyền đọc của owner cũ:** Owner cũ không bị xóa khỏi trạm mà chuyển thành `viewer`, tiếp tục duy trì quyền đọc dữ liệu giám sát và viễn trắc; các quyền ghi và tạo cảm biến bị thu hồi (`403 Forbidden`).
 >      * Hệ thống bắt buộc luôn duy trì **đúng một owner duy nhất** trên mỗi trạm (`gateway_owner_inconsistent` nếu sai lệch).
 >      * **Tác động tới Replay Provisioning:** Sau khi chuyển owner, nếu gửi lại request khởi tạo trạm cũ (`PUT /v1/admin/gateways/{id}`) với thông tin owner cũ, server sẽ phản hồi `409 Conflict` (bảo vệ quyền sở hữu hiện tại).
+>    - **Thu hồi vai trò thành viên trạm (`DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`):**
+>      * **Thẩm quyền thực thi:** Chỉ tài khoản có tên trong bảng `public.platform_admins` tại thời điểm xử lý request (DB-backed verification) mới có quyền gọi. Caller không phải platform admin (kể cả owner của trạm) nhận ngay `403 Forbidden`.
+>      * **Phạm vi thu hồi:** Xóa bỏ tư cách thành viên `operator` hoặc `viewer` của người dùng chỉ định khỏi trạm tương ứng (`DELETE FROM public.user_gateways WHERE gateway_id = $1 AND user_id = $2 AND role IN ('operator', 'viewer')`). Khi commit transaction thành công, server phản hồi **HTTP `204 No Content`** với body rỗng hoàn toàn.
+>      * **Xử lý thành viên không tồn tại (Idempotent No-Op):** Nếu Gateway tồn tại nhưng target user không có bản ghi membership trong `user_gateways` (bao gồm cả trường hợp target UUID hợp lệ nhưng chưa từng được gán trạm, hoặc tài khoản/profile của target không tồn tại trên hệ thống), server thực hiện no-op an toàn và trả về **`204 No Content`** (trạng thái mong muốn "người dùng không còn membership trên trạm" đã được thỏa mãn).
+>      * **Bảo vệ Chủ sở hữu tuyệt đối (Owner Protection — Always 409):** Nếu target user đang giữ vai trò `owner` của trạm, server **LUÔN từ chối với HTTP `409 Conflict`** kèm mã lỗi `owner_transfer_required`; bản ghi membership của owner được bảo toàn nguyên vẹn. Tuyệt đối không cho phép xóa trực tiếp owner, kể cả khi chính Platform Admin tự gọi xóa quyền owner của chính mình (**no self-owner bypass**).
+>      * **Quy trình chuẩn khi cần thu hồi quyền owner:** Bắt buộc phải thực hiện quy trình 2 bước: (1) Gọi `PUT /v1/admin/gateways/{gateway_id}/owner` để chuyển giao quyền sở hữu cho người khác (khi đó owner cũ tự động chuyển thành `viewer`); (2) Gọi `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` để xóa vai trò `viewer` của người đó khỏi trạm.
+>      * **Xử lý Gateway không tồn tại:** Nếu `gateway_id` không tồn tại trong hệ thống, server trả về **HTTP `404 Not Found`** (`code: "not_found"`).
+>      * **Tính cô lập tài nguyên (Resource Isolation):** Thao tác DELETE membership chỉ xóa đúng bản ghi liên kết trên trạm chỉ định. Tuyệt đối **không xóa tài khoản người dùng (`auth.users`)**, không xóa hay sửa đổi hồ sơ cá nhân (`public.profiles`), không ảnh hưởng đến quyền Quản trị nền tảng toàn cục (`public.platform_admins`), và hoàn toàn không ảnh hưởng đến quyền thành viên của người dùng trên bất kỳ Gateway nào khác.
+>      * **Quản trị viên tự thu hồi quyền (Self-Removal):** Platform Admin được phép tự xóa quyền `viewer` hoặc `operator` của chính mình trên trạm mà không làm mất hay suy giảm quyền Quản trị nền tảng toàn cục (`platform_admins` giữ nguyên; không bị global demotion). Tuy nhiên, nếu admin đang là owner của trạm, admin vẫn bị chặn với lỗi `409 Conflict` (không có self-owner bypass).
+>      * **Ranh giới hiệu lực phân quyền:** Việc thu hồi quyền chỉ ảnh hưởng đến việc thẩm định quyền thành viên ở các request HTTP gửi đến sau khi transaction cơ sở dữ liệu đã commit thành công (`Revocation on Next DB Query`). Không ảnh hưởng đến các request đang xử lý dở dang tại thời điểm commit và không phụ thuộc vào cơ chế realtime ngắt socket tức thời nào chưa có.
+>      * **Tuân thủ nguyên tắc không bypass đọc:** Platform Admin sau khi tự thu hồi membership của chính mình (hoặc kể cả khi đang có quyền admin toàn cục) tuyệt đối không có cơ chế blanket per-Gateway read bypass trên các API nghiệp vụ (`GET /v1/gateways`, `GET /v1/gateways/{id}/sensors`, Digital Twin). Các request đọc nghiệp vụ đối với trạm đó sẽ nhận `404 Not Found` hoặc bị loại khỏi danh sách `GET /v1/gateways`.
 >
 > 3. **Quyền Biến đổi Siêu dữ liệu Cảm biến:**
 >    - Vai trò `owner` có quyền tạo cảm biến mới (`PUT /v1/gateways/{id}/sensors/{id}` hoặc `POST /v1/digital-twins`) và sửa tên cảm biến (`PATCH /v1/digital-twins/{entity_id}/attrs`).
 >    - Vai trò `operator` và `viewer` hoàn toàn không có quyền tạo hoặc sửa cảm biến (`403 Forbidden`).
+>
+> 4. **Đối soát hạn chế lịch sử và Tiến độ Hiện thực:**
+>    - Tại giai đoạn bàn giao Task U0–U8 trước đây (migration 21), hệ thống ghi nhận hạn chế lịch sử là *"chưa có endpoint API thu hồi membership Gateway, phải sử dụng script vận hành hoặc can thiệp trực tiếp DB"*. Hạn chế lịch sử này nay đã được giải quyết triệt để bằng endpoint chuẩn hóa `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` và migration 22 (`000022_gateway_membership_revocation.up.sql`).
+>    - Tính năng này đã được kiểm chứng cục bộ đầy đủ (D1–D4: unit/contract/repo/service/integration HTTP tests PASS) trên baseline `HEAD 8f9f984` + uncommitted code; migration 22 đã áp dụng vào DB test cục bộ. Lưu ý: Tính năng này chưa chạy remote CI và chưa rollout trên môi trường backend đang chạy. Các báo cáo và bằng chứng của Task U0–U8 được bảo lưu nguyên vẹn theo đúng revision lịch sử.
 
 ### 3.2. Bảng phân định quyền hạn thực tế và định hướng tương lai
 
@@ -208,8 +226,15 @@ Khác với các tài nguyên nghiệp vụ thông thường, Go Backend đã tr
    - `DELETE /v1/admin/gateways/{gateway_id}/mqtt-credential`: Vô hiệu hóa và thu hồi thông tin xác thực MQTT của trạm (`200 OK` metadata-only; ngắt socket kết nối, không có cơ chế khôi phục secret tự động nhưng cho phép cấp mới lại với key mới).
 5. **Ngoại lệ Tuyến đường Đặt lại Credential Có giám sát (Registered Fail-Closed Reset Route):**
    - `POST /v1/admin/gateways/{gateway_id}/mqtt-credential/reset`: Tuyến đường đã được đăng ký và kiểm tra cú pháp payload lý do (`reason`), nhưng luôn fail-closed với HTTP `503 Service Unavailable` (`service_unavailable` khi API bật, hoặc `credential_runtime_disabled` khi API tắt). Chưa phải quy trình phục hồi khả dụng.
+6. **Bộ Endpoint Quản trị Người dùng và Thành viên Gateway (User & Gateway Membership Management):**
+   - `GET /v1/admin/users`: Truy vấn danh sách người dùng toàn hệ thống kèm thông tin hồ sơ và mảng `gateway_roles: [{"gateway_id": "...", "role": "..."}]`.
+   - `POST /v1/admin/users`: Tạo tài khoản người dùng mới trên Supabase Auth và khởi tạo hồ sơ `public.profiles`. Chỉ cấp danh tính (JWT), hoàn toàn không tự động gán quyền trạm nào.
+   - `PATCH /v1/admin/users/{user_id}`: Cập nhật nguyên tử `full_name` và/hoặc `platform_role`; cấm admin tự hạ quyền toàn cục của chính mình. Không đồng nhất thao tác này với thu hồi membership.
+   - `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`: Gán hoặc cập nhật vai trò thành viên thông thường (`operator`, `viewer`) cho người dùng trên trạm. Cấm gán `owner` (`400 Bad Request`) và cấm hạ quyền trực tiếp của `owner` (`409 Conflict`).
+   - `PUT /v1/admin/gateways/{gateway_id}/owner`: Chuyển giao quyền sở hữu trạm cho người dùng mới; người nhận trở thành `owner`, đồng thời owner cũ được tự động chuyển thành `viewer` trong cùng một transaction.
+   - `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`: Thu hồi vai trò thành viên `operator` hoặc `viewer` của người dùng khỏi trạm (`204 No Content` với body rỗng hoàn toàn). Idempotent no-op (`204 No Content`) nếu membership không tồn tại hoặc target UUID hợp lệ không tồn tại; từ chối `409 Conflict` (`owner_transfer_required`) nếu target user đang là `owner`; trả về `404 Not Found` nếu Gateway không tồn tại.
 
-*(Chi tiết đầy đủ về schema, headers và mã lỗi của 7 endpoint khả dụng và 1 endpoint reset được quy định tại [`docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md))*.
+*(Chi tiết đầy đủ về schema, headers và mã lỗi của các endpoint quản trị khả dụng và endpoint reset được quy định tại [`docs/client/07_ADMIN_API_CLIENT_CONTRACT.md`](07_ADMIN_API_CLIENT_CONTRACT.md))*.
 
 ### 4.2. Các Nguyên tắc Phân quyền Cốt tử giữa Admin và User
 
@@ -217,14 +242,15 @@ Khác với các tài nguyên nghiệp vụ thông thường, Go Backend đã tr
    - Ràng buộc phân quyền trạm (`user_gateways`) và quyền quản trị nền tảng (`platform_admins`) là hai tập thẩm quyền độc lập. Việc nắm giữ một vai trò thành viên trạm (kể cả `owner`) **không tự động cấp quyền quản trị**, nhưng cũng **không tước bỏ quyền quản trị độc lập** nếu người dùng đó đồng thời được cấp quyền trong `platform_admins` (dual-role user).
    - **Trường hợp non-admin owner:** Nếu một người dùng nắm vai trò `owner` của một Gateway nhưng tài khoản không có tên trong bảng `platform_admins`, khi cố tình gửi request đến các route quản trị `/v1/admin/*`, `PlatformAdminMiddleware` sẽ tra cứu cơ sở dữ liệu và từ chối tức thì với mã lỗi **HTTP `403 Forbidden`** (`{"code": "forbidden", "message": "insufficient permissions"}`).
    - **Trường hợp dual-role:** Một người dùng vừa là Platform Admin vừa là `owner` của một trạm có thể thực thi các lệnh `/v1/admin/*` nhờ tư cách admin. Tuy nhiên, khi gọi các API đọc thông thường của người dùng (`GET /v1/gateways`), tài khoản đó vẫn tuân thủ nguyên tắc không bỏ qua phân quyền đọc (No Admin Read Bypass).
+   - **Admin tự xóa quyền thành viên (Self-Removal without Global Demotion):** Platform Admin có thể tự xóa quyền `viewer` hoặc `operator` của chính mình trên trạm qua `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` mà không bị tước hay suy giảm quyền quản trị toàn cục (`platform_admins` giữ nguyên). Tuy nhiên, nếu admin đang là `owner` của trạm, admin vẫn bị chặn với lỗi `409 Conflict` (không có self-owner bypass).
 2. **KHÔNG CÓ cơ chế Admin Read Bypass (No Admin Read Bypass):**
-   - Khi một Platform Admin đăng nhập vào ứng dụng Web Client và gọi các API đọc thông thường của người dùng (`GET /v1/gateways` hoặc `GET /v1/gateways/{gateway_id}/sensors`), Go Backend **tuyệt đối không** tự động bỏ qua điều kiện lọc quyền.
+   - Khi một Platform Admin đăng nhập vào ứng dụng Web Client và gọi các API đọc thông thường của người dùng (`GET /v1/gateways` hoặc `GET /v1/gateways/{gateway_id}/sensors`), Go Backend **tuyệt đối không** tự động bỏ qua điều kiện lọc quyền (never gains blanket per-Gateway read bypass).
    - Câu truy vấn SQL của Backend vẫn lọc nghiêm ngặt theo `WHERE ug.user_id = $1`. Nếu Platform Admin không được gán quyền trực tiếp trong bảng `user_gateways` cho một trạm, Admin cũng chỉ nhận về danh sách rỗng `{"items": []}` hoặc lỗi `404 Not Found`.
    - **Mục đích kiến trúc:** Ngăn ngừa việc vô tình làm rò rỉ dữ liệu hoặc làm tràn ngập màn hình giám sát của Admin bằng hàng trăm trạm không liên quan đến phạm vi kiểm thử hay giám sát trực tiếp của tài khoản đó.
-3. **Công cụ Quản trị Thành viên Chuyên dụng với Cơ chế Bảo vệ Chủ sở hữu (Protected Membership Tool with Owner Protection, No Public API):**
-   - Ngoại trừ việc thiết lập `owner_user_id` ban đầu khi tạo trạm qua `PUT /v1/admin/gateways/{gateway_id}`, việc thêm thành viên mới, chuyển đổi vai trò hoặc thu hồi quyền trong `user_gateways` được thực hiện thông qua **công cụ quản trị thành viên chuyên dụng có ghi nhận nhật ký kiểm toán (như script vận hành quản trị viên `scripts/manage-gateway-membership.sh` hoặc Supabase Studio bởi Platform Admin)**, **tuyệt đối không hướng dẫn chỉnh sửa SQL tùy tiện (no arbitrary SQL guidance)**.
-   - **Cơ chế bảo vệ chủ sở hữu (Owner Protection):** Công cụ quản lý thành viên hỗ trợ các hành động `grant`, `change` và `revoke` dành cho hai vai trò `viewer` và `operator`, đồng thời ngăn chặn nghiêm ngặt việc thu hồi vai trò `owner` hoặc tự ý chỉ định thêm `owner` thông qua luồng chia sẻ quyền thông thường.
-   - Hệ thống **không cung cấp public API** cho người dùng tự gán trạm (no self-claiming), tự mời người khác (no invitation API) hay tự nâng quyền.
+3. **Cơ chế Quản trị Thành viên Chính thức qua HTTP Admin API và Bảo vệ Chủ sở hữu (Protected Membership API with Owner Protection, No Public API):**
+   - **Tiến hóa từ Script sang API chính thức:** Trước đây tại giai đoạn bàn giao Task U0–U8, hệ thống hỗ trợ gán quyền (`PUT .../users/{user_id}`) và chuyển owner (`PUT .../owner`), nhưng việc thu hồi thành viên chưa có endpoint API mà phải thông qua script vận hành quản trị viên `scripts/manage-gateway-membership.sh` hoặc can thiệp trực tiếp DB (hạn chế lịch sử U0–U8). Hiện tại, trên baseline `HEAD 8f9f984` + uncommitted code cùng migration 22 (`000022_gateway_membership_revocation.up.sql`) đã kiểm chứng cục bộ (chưa rollout remote CI / backend đang chạy), hệ thống đã chính thức bổ sung endpoint `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` dành riêng cho Platform Admin để thu hồi thành viên một cách chuẩn hóa, an toàn và có kiểm toán.
+   - **Cơ chế bảo vệ chủ sở hữu (Owner Protection):** Cả hai thao tác PUT và DELETE đều ngăn chặn tuyệt đối việc xóa hoặc giáng cấp trực tiếp vai trò `owner` (`409 Conflict`, `code: "owner_transfer_required"`). Khi cần thay đổi chủ sở hữu, bắt buộc phải sử dụng API chuyển giao quyền sở hữu `PUT /v1/admin/gateways/{gateway_id}/owner` (owner cũ tự động chuyển thành `viewer`), sau đó mới có thể thu hồi quyền `viewer` qua `DELETE`.
+   - **Không cung cấp Public API:** Các endpoint quản lý thành viên chỉ nằm dưới tiền tố `/v1/admin/*`, yêu cầu thẩm định quyền Platform Admin trực tiếp từ CSDL (`public.platform_admins`). Hệ thống **tuyệt đối không cung cấp public API** cho người dùng tự gán trạm (no self-claiming), tự mời người khác (no invitation API) hay tự nâng quyền.
 4. **Tạo Tài khoản Mới KHÔNG CẤP BẤT KỲ QUYỀN NÀO (Account Creation Grants Nothing):**
    - Việc tạo tài khoản trên Supabase Auth chỉ cung cấp định danh hợp lệ (JWT). Người dùng mới tạo chưa được gán bất kỳ trạm nào trong `user_gateways`.
    - Khi gọi `GET /v1/gateways`, Backend trả về `200 OK` với mảng rỗng `{"items": []}`.
@@ -246,10 +272,12 @@ Bảng dưới đây quy định chính xác các mã trạng thái HTTP thực 
 | Mã HTTP | Mã lỗi (`code`) | Thông báo (`message`) | Nguyên nhân phát sinh thực tế tại Backend | Ứng xử chuẩn của Client Web |
 |---|---|---|---|---|
 | `200 OK` | *(không có)* | *(payload JSON)* | Gọi `GET /v1/gateways` hoặc `GET /v1/gateways/{gateway_id}/sensors` thành công. Khi `items: []`, đây là trạng thái rỗng hợp lệ (Empty State). | Hiển thị danh sách dữ liệu hoặc giao diện rỗng thân thiện (`EmptyGatewayView`). Không hiển thị lỗi. |
-| `400 Bad Request` | `invalid_request` | `invalid request` | Request chứa query param bị cấm `?user_id=...` (chống IDOR) hoặc `gateway_id` sai định dạng kiểm tra. | Bắt lỗi an toàn; loại bỏ query param cấm; hiển thị cảnh báo tham số không hợp lệ. |
+| `204 No Content` | *(không có)* | *(response rỗng)* | Gọi `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` thành công: xóa bỏ thành công vai trò `viewer`/`operator`, hoặc membership không tồn tại / target UUID hợp lệ không có liên kết trên trạm (idempotent no-op). | Ghi nhận thao tác thành công, đóng modal/dialog xác nhận, làm mới danh sách thành viên/trạm. Không phân tích body JSON; không yêu cầu header `Content-Length: 0` phải hiện diện. |
+| `400 Bad Request` | `invalid_request` | `invalid request` | Request chứa query param bị cấm `?user_id=...` (chống IDOR), `gateway_id` sai định dạng kiểm tra, hoặc request DELETE chứa body/query không rỗng. | Bắt lỗi an toàn; loại bỏ query param cấm; hiển thị cảnh báo tham số không hợp lệ. |
 | `401 Unauthorized` | `unauthorized` | `authentication required` | Thiếu header `Authorization`, token hết hạn, sai chữ ký JWT hoặc token không đúng định dạng. | Xóa session token trong bộ nhớ, điều hướng người dùng về màn hình đăng nhập (`/login`). |
-| `403 Forbidden` | `forbidden` | `insufficient permissions` hoặc `access denied` | Tài khoản không có trong `platform_admins` cố tình gọi các route quản trị `/v1/admin/*`, hoặc vi phạm quyền provisioning. | Hiển thị thông báo không có thẩm quyền quản trị; chặn hoàn toàn quyền truy cập giao diện admin. |
-| `404 Not Found` | `not_found` | `resource not found` | Người dùng gọi `GET /v1/gateways/{gateway_id}/sensors` đối với trạm không thuộc quyền trong `user_gateways` (foreign gateway defense), trạm không tồn tại, hoặc route sai. | Giữ nguyên URL trên thanh địa chỉ, hiển thị trang lỗi `GatewayNotFoundView` kèm nút "Quay lại danh sách trạm". |
+| `403 Forbidden` | `forbidden` | `insufficient permissions` hoặc `access denied` | Tài khoản không có trong `platform_admins` cố tình gọi các route quản trị `/v1/admin/*` (kể cả owner của Gateway khi gọi DELETE membership), hoặc vi phạm quyền provisioning. | Hiển thị thông báo không có thẩm quyền quản trị; chặn hoàn toàn quyền truy cập giao diện admin. |
+| `404 Not Found` | `not_found` | `resource not found` | Người dùng gọi `GET /v1/gateways/{gateway_id}/sensors` đối với trạm không thuộc quyền trong `user_gateways` (foreign gateway defense), trạm không tồn tại, route sai, hoặc gọi `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` với `gateway_id` không tồn tại. | Giữ nguyên URL trên thanh địa chỉ, hiển thị trang lỗi `GatewayNotFoundView` kèm nút "Quay lại danh sách trạm" (hoặc báo trạm không tồn tại trong luồng admin). |
+| `409 Conflict` | `owner_transfer_required` hoặc `conflict` | `owner transfer required` hoặc `resource conflict` | Cố tình gọi `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` khi target user đang là `owner` của trạm (bắt buộc chuyển owner trước); cố hạ quyền owner qua PUT; hoặc xung đột cấu hình replay provisioning. | Bắt mã lỗi 409; hiển thị thông báo yêu cầu chuyển giao quyền chủ sở hữu trạm trước khi xóa hoặc thay đổi vai trò; không cho phép bypass. |
 | `501 Not Implemented` | `not_implemented` | `endpoint not implemented` | Client gọi các endpoint stub Giai đoạn 2 (`/v1/telemetry/history`, `/v1/ws`, `/v1/digital-twins`). | Bắt lỗi an toàn; thông báo chức năng đang trong lộ trình phát triển của các giai đoạn sau. |
 | `503 Service Unavailable` | `service_unavailable` | `service unavailable` | Kết nối PostgreSQL lỗi, timeout hoặc context cancelled khi kiểm tra quyền/admin, hoặc credential controller chưa sẵn sàng. | Hiển thị thông báo hệ thống tạm thời gián đoạn kèm nút "Thử lại sau" (Retry với exponential backoff). |
 
@@ -403,13 +431,23 @@ Khi người dùng đang mở trang chi tiết một trạm (`https://iot.exampl
 ---
 
 ### 6.3. Xử lý Thu hồi Quyền khi đang mở trang chi tiết (Revocation on Next DB Query)
-Nếu người dùng đang mở xem chi tiết trạm `gw_001`, và Quản trị viên thực hiện xóa hoặc thu hồi quyền của người dùng đó trong cơ sở dữ liệu (`DELETE FROM user_gateways ...`):
-1. **Hiệu lực tức thì tại truy vấn tiếp theo (No Live Push):** Hệ thống không duy trì kết nối WebSocket đẩy sự kiện thu hồi quyền, nhưng ở ngay lần thao tác tiếp theo (ví dụ: bấm nút làm mới danh sách cảm biến, hoặc bộ đếm thời gian tự động đồng bộ):
-   - Client gửi `GET /v1/gateways/gw_001/sensors` kèm cùng một JWT hiện tại.
-   - Go Backend thực thi câu truy vấn SQL trực tiếp trên PostgreSQL, không thấy bản ghi trong `user_gateways` -> trả về ngay **HTTP `404 Not Found`** (`{"code": "not_found", "message": "resource not found"}`).
-2. **Client bắt mã lỗi 404:**
-   - Hiển thị ngay thông báo lỗi (Error Banner / Dialog) cảnh báo quyền truy cập đã bị thu hồi hoặc trạm không còn khả dụng.
-   - Chuyển giao diện sang **Gateway Not Found View** kèm nút điều hướng người dùng quay lại `/gateways`.
+Nếu người dùng đang mở xem chi tiết trạm `gw_001`, và Quản trị viên (Platform Admin) thực hiện thu hồi tư cách thành viên của người dùng đó thông qua endpoint `DELETE /v1/admin/gateways/gw_001/users/{user_id}` (hoặc thao tác quản trị cơ sở dữ liệu):
+1. **Ranh giới hiệu lực phân quyền (Commit-then-Verify, No In-Flight Disruption, No Realtime Push):**
+   - **Chỉ áp dụng cho request sau commit:** Lệnh DELETE xóa bỏ vai trò `operator` hoặc `viewer` trong bảng `public.user_gateways`. Hiệu lực thu hồi quyền chỉ ảnh hưởng đến việc thẩm định quyền thành viên ở các request HTTP gửi đến sau khi transaction cơ sở dữ liệu đã commit thành công (`Revocation on Next DB Query`).
+   - **Không hủy request đang chạy dở dang:** Thao tác thu hồi không can thiệp hay hủy bỏ các request HTTP hoặc câu lệnh SQL đang trong quá trình thực thi tại thời điểm transaction commit.
+   - **Không dựa vào cơ chế realtime chưa có:** Hệ thống không triển khai cơ chế đẩy sự kiện thời gian thực (no WebSocket push / no SSE permission push) để ngắt socket hay đóng phiên của client ngay lập tức.
+2. **Hành vi tại truy vấn kế tiếp (Next DB Query):**
+   - Ở ngay thao tác tiếp theo của client (ví dụ: người dùng bấm nút làm mới danh sách cảm biến, chuyển tab, hoặc bộ đếm thời gian tự động đồng bộ gửi request):
+     * Client gửi request nghiệp vụ (ví dụ `GET /v1/gateways/gw_001/sensors` hoặc `GET /v1/digital-twins/gw_001`) kèm cùng một JWT hiện tại.
+     * Go Backend thực thi câu truy vấn SQL có gắn điều kiện lọc `user_gateways`. Do bản ghi membership đã bị xóa, câu truy vấn không trả về dòng dữ liệu nào.
+     * Backend phản hồi ngay **HTTP `404 Not Found`** (`{"code": "not_found", "message": "resource not found"}`) theo cơ chế phòng thủ chống dò quét tài nguyên (anti-enumeration defense).
+   - Nếu gọi `GET /v1/gateways`: Trạm `gw_001` tự động biến mất khỏi danh sách `items: [...]`. Nếu người dùng không còn membership trên trạm nào khác, danh sách trả về `items: []` (Empty State).
+3. **Hiệu ứng đối với Quản trị viên tự thu hồi quyền (No Admin Read Bypass):**
+   - Nếu chính Platform Admin gọi `DELETE` để tự xóa vai trò `viewer` hoặc `operator` của bản thân trên trạm `gw_001`, tài khoản admin vẫn giữ nguyên quyền quản trị nền tảng toàn cục trong `public.platform_admins`.
+   - Tuy nhiên, do nguyên tắc **Platform Admin không có blanket per-Gateway read bypass**, ở request tiếp theo khi admin gọi `GET /v1/gateways/gw_001/sensors` hay Digital Twin, backend vẫn trả về `404 Not Found`. Admin chỉ có thể xem danh mục kiểm kê trạm toàn hệ thống qua route quản trị riêng biệt `GET /v1/admin/gateways`.
+4. **Client bắt mã lỗi 404 và chuyển đổi giao diện:**
+   - Hiển thị ngay thông báo lỗi (Error Banner / Snackbar) thông báo quyền truy cập vào trạm đã bị thu hồi hoặc trạm không còn khả dụng.
+   - Chuyển giao diện sang **Gateway Not Found View** kèm nút điều hướng người dùng quay lại danh sách trạm (`/gateways`).
 
 ---
 
@@ -945,7 +983,12 @@ Trước khi đóng gói hoặc nghiệm thu ứng dụng Flutter Web, các kị
 | **TC-04** | Deep Link truy cập trạm KHÔNG có quyền | Gõ trực tiếp trên URL: `https://.../gateways/gw_unauthorized`. | Client gọi API, nhận `404 Not Found` -> Giữ nguyên URL, hiển thị `GatewayNotFoundView` kèm nút "Quay lại danh sách trạm". | [ ] |
 | **TC-05** | Nhấn F5 / Reload tại trang chi tiết trạm hợp lệ | Đang ở `/gateways/gw_001`, nhấn F5 trên trình duyệt. | Client gọi `GET /v1/gateways` & `GET /v1/gateways/gw_001/sensors`, nạp lại đầy đủ Tên trạm, Role Badge và Danh sách cảm biến. | [ ] |
 | **TC-06** | Nhấn F5 / Reload tại trang trạm KHÔNG hợp lệ | Đang ở `/gateways/gw_invalid`, nhấn F5 trên trình duyệt. | Client phân giải path parameter, gọi API nhận 404 -> Hiển thị trang lỗi `GatewayNotFoundView`. | [ ] |
-| **TC-07** | Admin thu hồi quyền trong `user_gateways` | Admin xóa bản ghi trong `user_gateways`, user bấm reload cảm biến trên cùng JWT. | Request tiếp theo trả về `404 Not Found` tức thì (Next DB query) -> Client bắt lỗi, chuyển sang thông báo mất quyền / 404. | [ ] |
+| **TC-07** | Admin thu hồi quyền `operator`/`viewer` qua API | Admin gọi `DELETE /v1/admin/gateways/{id}/users/{id}` thu hồi vai trò `operator` hoặc `viewer`. User bị thu hồi bấm reload cảm biến trên cùng JWT. | Backend commit DB, trả về `204 No Content` body rỗng hoàn toàn. Request tiếp theo của user trả về `404 Not Found` (Next DB query) -> Client bắt lỗi, chuyển sang thông báo mất quyền / `GatewayNotFoundView`. | [ ] |
+| **TC-07a** | Admin cố thu hồi vai trò của `owner` qua DELETE | Admin gọi `DELETE /v1/admin/gateways/{id}/users/{id}` khi target user đang là `owner` của trạm (kể cả admin tự xóa chính mình). | Backend từ chối với HTTP `409 Conflict` (`code: "owner_transfer_required"`), bảo vệ owner tuyệt đối (no self-owner bypass). Yêu cầu chuyển owner trước (`PUT .../owner`), sau đó mới thu hồi `viewer`. | [ ] |
+| **TC-07b** | Thu hồi membership không tồn tại (Idempotent No-op) | Admin gọi `DELETE /v1/admin/gateways/{id}/users/{id}` trên trạm tồn tại nhưng target user không có membership (hoặc target UUID hợp lệ không tồn tại). | Backend xử lý no-op an toàn, trả về `204 No Content` với body rỗng hoàn toàn, không gây lỗi và không tạo bản ghi mới. | [ ] |
+| **TC-07c** | Thu hồi thành viên trên Gateway không tồn tại | Admin gọi `DELETE /v1/admin/gateways/invalid_gw/users/{id}` với `gateway_id` không có trong hệ thống. | Backend trả về HTTP `404 Not Found` (`code: "not_found"`), bảo vệ tính toàn vẹn định tuyến tài nguyên cha. | [ ] |
+| **TC-07d** | Non-admin (kể cả Gateway Owner) gọi DELETE membership | Dùng JWT của người dùng không có trong `public.platform_admins` gọi `DELETE /v1/admin/gateways/{id}/users/{id}`. | Backend từ chối tức thì với HTTP `403 Forbidden` (`code: "forbidden"`), chứng minh quyền trạm không thể thay thế quyền Platform Admin. | [ ] |
+| **TC-07e** | Platform Admin tự thu hồi quyền `viewer`/`operator` của chính mình | Admin gọi `DELETE` tự xóa membership của mình trên một trạm; sau đó gọi `GET /v1/gateways/{id}/sensors`. | DELETE trả về `204 No Content`. Quyền Platform Admin toàn cục giữ nguyên (không bị hạ quyền), nhưng request đọc cảm biến trạm trả về `404 Not Found` (tuân thủ nghiêm ngặt nguyên tắc No Admin Read Bypass). | [ ] |
 | **TC-08** | Cố tình chèn query `?user_id=other_uuid` vào URL | Gõ URL kèm tham số `?user_id=...` gọi lên backend. | Backend từ chối `400 Bad Request` (`invalid_request`) -> Client bắt lỗi an toàn, không hiển thị dữ liệu của người khác. | [ ] |
 | **TC-09** | Platform Admin đăng nhập vào Web Dashboard | Đăng nhập bằng tài khoản Platform Admin, gọi `GET /v1/gateways`. | Chỉ nhìn thấy các trạm được phân quyền trong `user_gateways` cho Admin đó; không tự bung danh sách toàn hệ thống (No Admin Read Bypass). | [ ] |
 | **TC-10** | Gateway Owner (non-admin) gọi route quản trị | Dùng JWT của Gateway `owner` gọi bất kỳ route nào dưới `/v1/admin/*`. | Backend từ chối tức thì với mã lỗi `403 Forbidden` (`insufficient permissions`), chứng minh owner không phải là admin. | [ ] |

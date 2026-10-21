@@ -351,8 +351,8 @@ func TestNativeUserManagement_E2EFlow(t *testing.T) {
 
 	t.Logf("Database Target Verified: PostgreSQL Version = %s, TimescaleDB Version = %s, Schema Version = %d",
 		strings.Fields(pgVersion)[1], tsVersion, schemaVersion)
-	if schemaVersion < 21 {
-		t.Fatalf("expected schema version >= 21, got %d", schemaVersion)
+	if schemaVersion < 22 {
+		t.Fatalf("expected schema version >= 22, got %d", schemaVersion)
 	}
 
 	var appUser string
@@ -594,7 +594,7 @@ func TestNativeUserManagement_E2EFlow(t *testing.T) {
 	}
 
 	// -------------------------------------------------------------------------
-	// Step A: Negative / Security Baseline across all 5 admin user endpoints
+	// Step A: Negative / Security Baseline across admin user endpoints
 	// -------------------------------------------------------------------------
 	adminEndpoints := []struct {
 		name   string
@@ -625,6 +625,10 @@ func TestNativeUserManagement_E2EFlow(t *testing.T) {
 			method: http.MethodPut,
 			path:   "/v1/admin/gateways/" + gwID + "/users/" + uuid.New().String(),
 			body:   []byte(`{"role":"viewer"}`),
+		},
+		{
+			name: "remove gateway user", method: http.MethodDelete,
+			path: "/v1/admin/gateways/" + gwID + "/users/" + uuid.NewString(),
 		},
 		{
 			name:   "transfer gateway owner",
@@ -1301,5 +1305,158 @@ func TestNativeUserManagement_E2EFlow(t *testing.T) {
 	_ = corsResp.Body.Close()
 	if corsResp.Header.Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
 		t.Errorf("expected Access-Control-Allow-Origin: http://localhost:3000, got %q", corsResp.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	// Step Q: membership removal does not delete the account or bypass owner policy.
+	otherGW := gwID + "_other"
+	fixtureIDs.GatewayIDs = append(fixtureIDs.GatewayIDs, otherGW)
+	otherBody, err := json.Marshal(map[string]string{"entity_type": "Gateway", "gateway_id": otherGW, "name": "Membership positive control", "owner_user_id": ownerOrigUID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doRequest(http.MethodPost, ts.URL+"/v1/digital-twins", adminAToken, "req-other-gateway", otherBody)
+	if resp.StatusCode != 201 {
+		t.Fatal("other Gateway creation failed")
+	}
+	otherMemberURL := ts.URL + "/v1/admin/gateways/" + otherGW + "/users/" + aliceUID.String()
+	resp, _ = doRequest(http.MethodPut, otherMemberURL, adminAToken, "req-other-membership", assignViewerBody)
+	if resp.StatusCode != 200 {
+		t.Fatal("other membership assignment failed")
+	}
+	memberURL := ts.URL + "/v1/admin/gateways/" + gwID + "/users/" + aliceUID.String()
+	if _, err := setupPool.Exec(ctx, `UPDATE public.twin_states SET reported_state='{"membership_sentinel":"reported"}', desired_state='{"membership_sentinel":"desired"}', reported_version=7, desired_version=3 WHERE entity_id IN(SELECT id FROM public.twin_entities WHERE gateway_id=ANY($1))`, fixtureIDs.GatewayIDs); err != nil {
+		t.Fatal("state sentinel setup failed")
+	}
+	protectedSnapshot := func(excludeTarget bool) string {
+		t.Helper()
+		var snapshot string
+		err := setupPool.QueryRow(ctx, `SELECT jsonb_build_object(
+		'account',(SELECT to_jsonb(x) FROM auth.users x WHERE id=$1),
+		'profile',(SELECT to_jsonb(x) FROM public.profiles x WHERE id=$1),
+		'admins',(SELECT jsonb_agg(to_jsonb(x) ORDER BY user_id) FROM public.platform_admins x WHERE user_id=ANY($3)),
+		'members',(SELECT jsonb_agg(to_jsonb(x) ORDER BY gateway_id,user_id) FROM public.user_gateways x WHERE gateway_id=ANY($2) AND NOT($5 AND gateway_id=$4 AND user_id=$1)),
+		'gateways',(SELECT jsonb_agg(to_jsonb(x) ORDER BY gateway_id) FROM public.gateways x WHERE gateway_id=ANY($2)),
+		'sensors',(SELECT jsonb_agg(to_jsonb(x) ORDER BY gateway_id,sensor_id) FROM public.sensors x WHERE gateway_id=ANY($2)),
+		'entities',(SELECT jsonb_agg(to_jsonb(x) ORDER BY id) FROM public.twin_entities x WHERE gateway_id=ANY($2)),
+		'states',(SELECT jsonb_agg(to_jsonb(x) ORDER BY entity_id) FROM public.twin_states x WHERE entity_id IN(SELECT id FROM public.twin_entities WHERE gateway_id=ANY($2))),
+		'relationships',(SELECT jsonb_agg(to_jsonb(x) ORDER BY source_entity_id,relationship_type,target_entity_id) FROM public.twin_relationships x WHERE source_entity_id IN(SELECT id FROM public.twin_entities WHERE gateway_id=ANY($2))),
+		'raw',(SELECT jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text) FROM public.telemetry x WHERE gateway_id=ANY($2)),
+		'ledger',(SELECT jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text) FROM public.processed_messages x WHERE gateway_id=ANY($2)),
+		'temporal',(SELECT jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text) FROM public.twin_temporal_values x WHERE entity_id IN(SELECT id FROM public.twin_entities WHERE gateway_id=ANY($2))),
+		'commands',(SELECT jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text) FROM public.twin_commands x WHERE entity_id IN(SELECT id FROM public.twin_entities WHERE gateway_id=ANY($2))),
+		'outbox',(SELECT jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text) FROM public.twin_outbox x WHERE command_id IN(SELECT command_id FROM public.twin_commands WHERE entity_id IN(SELECT id FROM public.twin_entities WHERE gateway_id=ANY($2)))),
+		'credential_events',(SELECT jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text) FROM public.gateway_mqtt_credential_events x WHERE gateway_id=ANY($2)),
+		'credentials',(SELECT jsonb_agg(to_jsonb(x) ORDER BY gateway_id) FROM public.gateway_mqtt_credentials x WHERE gateway_id=ANY($2)))::text`, aliceUID, fixtureIDs.GatewayIDs, fixtureIDs.AllUserIDs, gwID, excludeTarget).Scan(&snapshot)
+		if err != nil {
+			t.Fatal("protected snapshot failed")
+		}
+		return snapshot
+	}
+	assertRead := func(gatewayID, token string, status int) {
+		t.Helper()
+		for _, path := range []string{"/v1/gateways/" + gatewayID + "/sensors", "/v1/digital-twins/" + url.PathEscape("urn:ngsi-ld:Gateway:"+gatewayID)} {
+			r, b := doRequest(http.MethodGet, ts.URL+path, token, "req-membership-read", nil)
+			if r.StatusCode != status {
+				t.Fatalf("read after membership operation: status=%d want=%d body=%s", r.StatusCode, status, b)
+			}
+		}
+	}
+	beforeOwner := protectedSnapshot(false)
+	resp, respBytes = doRequest(http.MethodDelete, memberURL, adminAToken, "req-deny-owner-delete", nil)
+	if resp.StatusCode != 409 || !strings.Contains(string(respBytes), `"owner_transfer_required"`) {
+		t.Fatal("owner removal was not blocked")
+	}
+	if protectedSnapshot(false) != beforeOwner {
+		t.Fatal("owner denial changed protected data")
+	}
+	assertRead(gwID, aliceLiveToken, 200)
+	// Transfer first: old owner becomes viewer, then can be removed.
+	transferBack, err := json.Marshal(map[string]string{"user_id": ownerOrigUID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = doRequest(http.MethodPut, ts.URL+"/v1/admin/gateways/"+gwID+"/owner", adminAToken, "req-transfer-before-delete", transferBack)
+	if resp.StatusCode != 200 {
+		t.Fatal("transfer back failed")
+	}
+	for _, membershipRole := range []string{"viewer", "operator"} {
+		roleBody, err := json.Marshal(map[string]string{"role": membershipRole})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, _ = doRequest(http.MethodPut, memberURL, adminAToken, "req-grant-before-delete", roleBody)
+		if resp.StatusCode != 200 {
+			t.Fatal("membership assignment failed")
+		}
+		assertRead(gwID, aliceLiveToken, 200)
+		before := protectedSnapshot(true)
+		for repeat := 0; repeat < 2; repeat++ {
+			resp, respBytes = doRequest(http.MethodDelete, memberURL, adminAToken, "req-remove-membership", nil)
+			if resp.StatusCode != 204 || len(respBytes) != 0 || resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("Pragma") != "no-cache" {
+				t.Fatalf("DELETE %s/repeat=%d: status=%d", membershipRole, repeat, resp.StatusCode)
+			}
+		}
+		if protectedSnapshot(true) != before {
+			t.Fatal("membership DELETE changed account/global role/other Gateway/resource data")
+		}
+		assertRead(gwID, aliceLiveToken, 404)
+		assertRead(otherGW, aliceLiveToken, 200)
+		assertRead(gwID, ownerOrigToken, 200)
+		var remaining int
+		if err := appPool.QueryRow(ctx, "SELECT count(*) FROM public.user_gateways WHERE gateway_id=$1 AND user_id=$2", gwID, aliceUID).Scan(&remaining); err != nil || remaining != 0 {
+			t.Fatal("membership row remains after DELETE")
+		}
+		resp, respBytes = doRequest(http.MethodGet, ts.URL+"/v1/admin/users", adminAToken, "req-revocation-list", nil)
+		var users struct {
+			Items []usermanagement.UserSummary `json:"items"`
+		}
+		if resp.StatusCode != 200 || json.Unmarshal(respBytes, &users) != nil {
+			t.Fatal("admin list readback failed")
+		}
+		found := false
+		for _, u := range users.Items {
+			if u.ID == aliceUID {
+				found = true
+				if u.PlatformRole != "user" || u.Email != aliceEmail || u.FullName == nil || *u.FullName != "Alice Smith Updated" || len(u.GatewayRoles) != 1 || u.GatewayRoles[0].GatewayID != otherGW || u.GatewayRoles[0].Role != "viewer" {
+					t.Error("admin user projection incorrect after removal")
+				}
+			}
+		}
+		if !found {
+			t.Fatal("account disappeared from admin list")
+		}
+	}
+	// A fresh password login still works, not merely a previously issued JWT.
+	loginReq, err = http.NewRequestWithContext(ctx, http.MethodPost, loginEndpoint, bytes.NewReader(loginPayload))
+	if err != nil {
+		t.Fatal("login request creation failed")
+	}
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginReq.Header.Set("apikey", testCfg.AnonKey)
+	loginResp, err = httpClient.Do(loginReq)
+	if err != nil {
+		t.Fatal("post-removal login unavailable")
+	}
+	loginBytes, readErr = readSafeLoginResponse(loginResp.StatusCode, loginResp.Body)
+	_ = loginResp.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if json.Unmarshal(loginBytes, &tokenResp) != nil || tokenResp.User.ID != aliceUID.String() {
+		t.Fatal("post-removal login identity mismatch")
+	}
+	// An admin may revoke their own non-owner membership without losing global authority.
+	selfURL := ts.URL + "/v1/admin/gateways/" + gwID + "/users/" + adminAUID.String()
+	resp, _ = doRequest(http.MethodPut, selfURL, adminAToken, "req-self-grant", assignViewerBody)
+	if resp.StatusCode != 200 {
+		t.Fatal("self assignment failed")
+	}
+	resp, respBytes = doRequest(http.MethodDelete, selfURL, adminAToken, "req-self-remove", nil)
+	if resp.StatusCode != 204 || len(respBytes) != 0 {
+		t.Fatal("self membership removal failed")
+	}
+	resp, _ = doRequest(http.MethodGet, ts.URL+"/v1/admin/users", adminAToken, "req-admin-still-authorized", nil)
+	if resp.StatusCode != 200 {
+		t.Fatal("self removal revoked global admin")
 	}
 }

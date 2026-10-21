@@ -36,7 +36,7 @@ SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
 # of accepting any suffix keeps a missing, extra, renamed, or wrong-version
 # history failing closed; a newly supported migration must update this pin
 # explicitly rather than being silently accepted.
-EXPECTED_SCHEMA_TERMINAL = "21:admin_user_management"
+EXPECTED_SCHEMA_TERMINAL = "22:gateway_membership_revocation"
 
 
 def expected_schema_history(directory=None):
@@ -591,6 +591,7 @@ def validate_effective_model(fixture, model):
         "supabase-compat-migration": {
             str(ROOT / "migrations/000004_supabase_compat.up.sql"): "/migrations/000004_supabase_compat.up.sql",
             str(ROOT / "migrations/000021_admin_user_management.up.sql"): "/migrations/000021_admin_user_management.up.sql",
+            str(ROOT / "migrations/000022_gateway_membership_revocation.up.sql"): "/migrations/000022_gateway_membership_revocation.up.sql",
         },
         "supabase-envoy": {str(ROOT / "config/envoy" / name): target for name, target in (
             ("envoy.yaml", "/etc/envoy/envoy.yaml"), ("cds.yaml", "/etc/envoy/cds.yaml"),
@@ -652,7 +653,7 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_rootfs_rejected")
     commands = {"application-migrations": ["/bin/sh", "/run-migrations.sh"],
                 "supabase-role-provisioner": ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"],
-                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql']}
+                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql']}
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})
@@ -835,8 +836,9 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     if name == 'application-migrations':
                         sql = "SELECT string_agg(version::text || ':' || name, ',' ORDER BY version) FROM schema_migrations WHERE version <= 20"
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
-                        # Auth-dependent migration 21 is applied in the compat phase.
-                        expected = expected_schema_history().rsplit(',', 1)[0]
+                        # Auth-dependent migrations 21/22 are applied in the compat phase.
+                        expected = ','.join(row for row in expected_schema_history().split(',')
+                                            if int(row.split(':')[0]) <= 20)
                         if not schema_history_verified(result.returncode, result.stdout.decode().strip(), expected, terminal='20:stage3_telemetry_ingestion'):
                             raise ValueError('schema_exact_rejected')
                         evidence['schema_pre_auth_exact'] = True
@@ -847,8 +849,8 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', sql])
                         if result.returncode or result.stdout.strip() != b'1':
                             raise ValueError('compat_constraints_rejected')
-                        # Migration 21 runs in the post-Auth compatibility phase; verify that
-                        # trigger prerequisites existed and the exact terminal schema21 is recorded.
+                        # Migrations 21/22 run in the post-Auth compatibility phase; verify that
+                        # trigger prerequisites existed and the exact terminal schema22 is recorded.
                         trigger_sql = "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'auth' AND c.relname = 'users' AND t.tgname = 'on_auth_user_created'"
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', trigger_sql])
                         if result.returncode or result.stdout.strip() != b'1':

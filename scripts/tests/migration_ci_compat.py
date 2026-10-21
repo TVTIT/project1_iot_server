@@ -106,6 +106,14 @@ class Fixture:
         self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text())
         self.expect("SELECT count(*) FROM schema_migrations WHERE version = 21 AND name = 'admin_user_management';", '1')
         print('Migration 21 repeated compatibility, least-privilege grants and verifier passed.', flush=True)
+        self.expect("SELECT has_table_privilege('iot_backend_app', 'public.user_gateways', 'DELETE');", 'f')
+        for _ in range(2):
+            self.sql((ROOT / 'migrations/000022_gateway_membership_revocation.up.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text())
+        self.login('iot_backend_app', self.passwords['BACKEND_DB_PASSWORD'])
+        self.sql('DELETE FROM public.user_gateways WHERE false;', role='iot_backend_app',
+                 password=self.passwords['BACKEND_DB_PASSWORD'])
+        print('Migration 22 repeated compatibility, runtime DELETE and human-role denials passed.', flush=True)
 
     def cleanup(self):
         if self.id is None:

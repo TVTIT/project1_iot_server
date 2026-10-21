@@ -57,6 +57,7 @@ type RouterDependencies struct {
 	UserLister                 usermanagement.UserLister
 	UserUpdater                usermanagement.UserUpdater
 	GatewayUserAssigner        usermanagement.GatewayUserAssigner
+	GatewayUserRemover         usermanagement.GatewayUserRemover
 	GatewayOwnerTransferer     usermanagement.GatewayOwnerTransferer
 }
 
@@ -215,6 +216,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	groups.admin.GET("/users", listUsersHandler(deps.UserLister))
 	groups.admin.PATCH("/users/:user_id", updateUserHandler(deps.UserUpdater, deps.AdminMaxBodyBytes))
 	groups.admin.PUT("/gateways/:gateway_id/users/:user_id", assignGatewayUserHandler(deps.GatewayUserAssigner, deps.AdminMaxBodyBytes))
+	groups.admin.DELETE("/gateways/:gateway_id/users/:user_id", removeGatewayUserHandler(deps.GatewayUserRemover))
 	groups.admin.PUT("/gateways/:gateway_id/owner", transferGatewayOwnerHandler(deps.GatewayOwnerTransferer, deps.AdminMaxBodyBytes))
 	authenticated := groups.authenticated
 	authenticated.GET("/me/permissions", getMyPermissions(deps.PlatformAdminChecker, deps.AuthorizationTimeout))
