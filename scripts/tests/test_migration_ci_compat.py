@@ -91,6 +91,9 @@ class CompatFixture(unittest.TestCase):
         migration22 = (ROOT / 'migrations/000022_gateway_membership_revocation.up.sql').read_text()
         self.assertEqual(inputs.count(migration22), 2)
         self.assertIn((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text(), inputs)
+        migration23 = (ROOT / 'migrations/000023_sensor_control_intent.up.sql').read_text()
+        self.assertEqual(inputs.count(migration23), 2)
+        self.assertIn((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(), inputs)
         self.assertIn("DELETE FROM public.user_gateways WHERE false;", inputs)
 
     def test_login_secret_only_protected_stdin(self):

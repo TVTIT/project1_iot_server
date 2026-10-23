@@ -205,6 +205,15 @@ current observation, reported state becomes value 25.3 / sequence 12503 at
 
 ## Downlink commands
 
+> **Historical draft — not an implemented downlink contract.** This section
+> and “Command execution results” below retain the old Gateway-target /
+> `sampling_interval_seconds` examples for provenance only. Stage 5 targets
+> provisioned **Sensor** URNs, uses integer `sample_interval_us` and string
+> versions, and separates confirmed configuration from telemetry observations.
+> The [Task 5.0 contract](../backend/stage-5-task-5.0-baseline-and-contract.md)
+> supersedes these draft examples for subsequent implementation. Task 5.0 does
+> not implement or verify command publication, application or result ingress.
+
 Commands originate from authorized user requests through the backend and are
 dispatched via the transactional outbox to:
 
@@ -239,6 +248,10 @@ Rules:
   re-publishes the cached result instead of executing the physical action twice.
 
 ## Command execution results
+
+> **Historical draft**, with the same limitations and replacement reference as
+> the preceding downlink section; the following transaction is not a runtime
+> capability claim.
 
 After executing a command, the Gateway publishes the execution result to:
 

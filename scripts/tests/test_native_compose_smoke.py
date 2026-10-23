@@ -343,29 +343,29 @@ class PreparationTests(unittest.TestCase):
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 22);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 23);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("22:gateway_membership_revocation", expected)
+        self.assertIn("23:sensor_control_intent", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",22:gateway_membership_revocation")
+        stale = expected.removesuffix(",23:sensor_control_intent")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "22:gateway_membership_revocation")
+        missing = ",".join(p for p in expected.split(",") if p != "23:sensor_control_intent")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("22:gateway_membership_revocation", "22:unexpected_name")
+        wrong = expected.replace("23:sensor_control_intent", "23:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
@@ -381,7 +381,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("22:gateway_membership_revocation", "23:future_migration")
+        future = expected.replace("23:sensor_control_intent", "24:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 

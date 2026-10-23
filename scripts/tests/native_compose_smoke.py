@@ -36,7 +36,7 @@ SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
 # of accepting any suffix keeps a missing, extra, renamed, or wrong-version
 # history failing closed; a newly supported migration must update this pin
 # explicitly rather than being silently accepted.
-EXPECTED_SCHEMA_TERMINAL = "22:gateway_membership_revocation"
+EXPECTED_SCHEMA_TERMINAL = "23:sensor_control_intent"
 
 
 def expected_schema_history(directory=None):
@@ -592,6 +592,7 @@ def validate_effective_model(fixture, model):
             str(ROOT / "migrations/000004_supabase_compat.up.sql"): "/migrations/000004_supabase_compat.up.sql",
             str(ROOT / "migrations/000021_admin_user_management.up.sql"): "/migrations/000021_admin_user_management.up.sql",
             str(ROOT / "migrations/000022_gateway_membership_revocation.up.sql"): "/migrations/000022_gateway_membership_revocation.up.sql",
+            str(ROOT / "migrations/000023_sensor_control_intent.up.sql"): "/migrations/000023_sensor_control_intent.up.sql",
         },
         "supabase-envoy": {str(ROOT / "config/envoy" / name): target for name, target in (
             ("envoy.yaml", "/etc/envoy/envoy.yaml"), ("cds.yaml", "/etc/envoy/cds.yaml"),
@@ -653,7 +654,7 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_rootfs_rejected")
     commands = {"application-migrations": ["/bin/sh", "/run-migrations.sh"],
                 "supabase-role-provisioner": ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"],
-                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql']}
+                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql']}
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})
@@ -850,7 +851,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         if result.returncode or result.stdout.strip() != b'1':
                             raise ValueError('compat_constraints_rejected')
                         # Migrations 21/22 run in the post-Auth compatibility phase; verify that
-                        # trigger prerequisites existed and the exact terminal schema22 is recorded.
+                        # trigger prerequisites existed and the exact terminal schema23 is recorded.
                         trigger_sql = "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'auth' AND c.relname = 'users' AND t.tgname = 'on_auth_user_created'"
                         result = registry.command(['exec', containers['postgres']['receipt']['id'], 'psql', '-U', 'postgres', '-d', 'smoke', '-At', '-c', trigger_sql])
                         if result.returncode or result.stdout.strip() != b'1':

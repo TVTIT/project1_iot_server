@@ -1038,7 +1038,65 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 	if got := sensorDesired(); got != sensorDesiredBefore {
 		t.Fatalf("Sensor desired state changed across ordering/rollback cases:\n%s", got)
 	}
-	fmt.Println("INTEGRATION CASES PASS: 100 validated rows, retries/conflicts, graph rejection, overlap/adjacent/gap, COPY rollback, same-ID and range concurrency, application role, atomic Sensor reported-state advance + one sample_interval_us temporal per new batch, desired/Gateway preservation, DB ordering (newer/older/equal boot+sequence, legacy provenance), deterministic two-connection Sensor-lock ordering, twin_states/temporal SQL rollback, 2^53 interval round-trip")
+	t.Run("Stage5 configuration survives late old-profile telemetry", func(t *testing.T) {
+		// Fixture-only seed of an already-confirmed configuration. There is no
+		// command/result implementation in Task 5.0. Both batches below were
+		// measured before this configuration was applied, but arrive afterward.
+		configuration := map[string]any{
+			"sample_interval_us": int64(20000),
+			"desired_version":    "9007199254740993",
+			"applied_at":         time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		if _, err := setup.Exec(ctx, `UPDATE twin_states SET reported_state=reported_state || jsonb_build_object('configuration',$1::jsonb), reported_version=reported_version+1 WHERE entity_id=(SELECT id FROM twin_entities WHERE entity_id=$2)`, configuration, sensorEntity); err != nil {
+			t.Fatal(err)
+		}
+		configurationSnapshot := func() string {
+			return snapshotRows(ctx, t, setup, `SELECT (s.reported_state->'configuration')::text FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id='`+sensorEntity+`'`)
+		}
+		stateSnapshot := func() string {
+			return snapshotRows(ctx, t, setup, `SELECT row(s.reported_state,s.reported_version,s.last_reported_at)::text FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id='`+sensorEntity+`'`)
+		}
+		confirmed := configurationSnapshot()
+		beforeVersion := sensorVersion()
+		for i, offset := range []time.Duration{6 * time.Second, 4 * time.Second} {
+			beforeState := stateSnapshot()
+			ledgerBefore, rawBefore, temporalBefore := counts()
+			persistOrder(batchSpec{
+				id:         fmt.Sprintf("60000000-0000-4000-8000-0000000000f%d", i+1),
+				sequence:   int64(10001 + i),
+				bootID:     orderBootNewer,
+				measuredAt: orderBase.Add(offset),
+				intervalUS: 10000,
+				values:     []float64{42.5},
+			})
+			if got := configurationSnapshot(); got != confirmed {
+				t.Fatalf("configuration changed on old-profile telemetry: %s -> %s", confirmed, got)
+			}
+			if i == 0 {
+				// It is newer than the previous observation, despite preceding the
+				// confirmed configuration. Exercise the real SQL merge, not just
+				// the ordering path that skips the update entirely.
+				assertAdvanced("old-profile merge", orderBootNewer, orderBase.Add(offset), 10001, 42.5, beforeVersion+1)
+				var interval string
+				if err := setup.QueryRow(ctx, `SELECT s.reported_state->>'sample_interval_us' FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=$1`, sensorEntity).Scan(&interval); err != nil || interval != "10000" {
+					t.Fatalf("observation interval=%q err=%v; want 10000, not confirmed 20000", interval, err)
+				}
+			} else if got := stateSnapshot(); got != beforeState {
+				t.Fatalf("older observation changed current state: %s -> %s", beforeState, got)
+			}
+			ledgerAfter, rawAfter, temporalAfter := counts()
+			if ledgerAfter != ledgerBefore+1 || rawAfter != rawBefore+1 || temporalAfter != temporalBefore+1 {
+				t.Fatalf("late batch must still append ledger/raw/temporal: before=%d/%d/%d after=%d/%d/%d", ledgerBefore, rawBefore, temporalBefore, ledgerAfter, rawAfter, temporalAfter)
+			}
+		}
+		if got := snapshotRows(ctx, t, setup, `SELECT row(s.desired_state,s.desired_version,s.last_desired_at,s.last_desired_by)::text FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id='`+sensorEntity+`'`); got != sensorDesiredBefore {
+			t.Fatalf("late telemetry changed desired state: %s -> %s", sensorDesiredBefore, got)
+		}
+		if got := snapshotRows(ctx, t, setup, `SELECT row(s.reported_state,s.desired_state,s.reported_version,s.desired_version,s.last_reported_at,s.last_desired_at)::text FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id='`+gatewayEntity+`'`); got != gatewayStateBefore {
+			t.Fatalf("late telemetry changed Gateway state: %s -> %s", gatewayStateBefore, got)
+		}
+	})
+	fmt.Println("INTEGRATION CASES PASS: 100 validated rows, retries/conflicts, graph rejection, overlap/adjacent/gap, COPY rollback, same-ID and range concurrency, application role, atomic Sensor reported-state advance + one sample_interval_us temporal per new batch, desired/Gateway preservation, DB ordering (newer/older/equal boot+sequence, legacy provenance), deterministic two-connection Sensor-lock ordering, twin_states/temporal SQL rollback, 2^53 interval round-trip, Stage5 configuration preservation through late old-profile telemetry")
 }
 
 func mustUUID(s string) uuid.UUID { return uuid.MustParse(s) }

@@ -114,6 +114,11 @@ class Fixture:
         self.sql('DELETE FROM public.user_gateways WHERE false;', role='iot_backend_app',
                  password=self.passwords['BACKEND_DB_PASSWORD'])
         print('Migration 22 repeated compatibility, runtime DELETE and human-role denials passed.', flush=True)
+        for _ in range(2):
+            self.sql((ROOT / 'migrations/000023_sensor_control_intent.up.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text())
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=23 AND name='sensor_control_intent';", '1')
+        print('Migration 23 repeated compatibility, control-intent grants and terminal passed.', flush=True)
 
     def cleanup(self):
         if self.id is None:

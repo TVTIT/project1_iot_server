@@ -13,7 +13,11 @@ DECLARE
     gateway_entity UUID;
     test_gateway_id TEXT;
     test_command UUID;
+    actor_scoped_receipts BOOLEAN := false;
 BEGIN
+    IF to_regclass('public.schema_migrations') IS NOT NULL THEN
+        SELECT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=23 AND name='sensor_control_intent') INTO actor_scoped_receipts;
+    END IF;
     IF NOT EXISTS (
         SELECT 1
         FROM information_schema.columns
@@ -63,8 +67,11 @@ BEGIN
     WHERE schemaname = 'public'
       AND indexname = 'idx_twin_commands_idempotency';
 
-    IF index_definition IS NULL OR position('UNIQUE INDEX' IN index_definition) = 0 THEN
-        RAISE EXCEPTION 'Verification failed: command idempotency index is not unique';
+    IF index_definition IS NULL OR (position('UNIQUE INDEX' IN index_definition)>0)=actor_scoped_receipts THEN
+        RAISE EXCEPTION 'Verification failed: command idempotency index uniqueness does not match schema generation';
+    END IF;
+    IF actor_scoped_receipts AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('public.twin_command_requests') AND contype='p') THEN
+        RAISE EXCEPTION 'Verification failed: actor-scoped receipt uniqueness is missing';
     END IF;
 
     IF NOT EXISTS (
@@ -229,9 +236,12 @@ BEGIN
             '__constraint_test_key',
             now() + INTERVAL '1 hour'
         );
-        RAISE EXCEPTION 'Verification failed: duplicate idempotency key was accepted';
+        IF NOT actor_scoped_receipts THEN
+            RAISE EXCEPTION 'Verification failed: duplicate idempotency key was accepted';
+        END IF;
     EXCEPTION
-        WHEN unique_violation THEN NULL;
+        WHEN unique_violation THEN
+            IF actor_scoped_receipts THEN RAISE EXCEPTION 'Verification failed: legacy entity/key uniqueness still rejects actor-scoped requests'; END IF;
     END;
 
     INSERT INTO twin_outbox (command_id, topic, payload, status)
