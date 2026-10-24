@@ -92,6 +92,7 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 	}
 
 	core, err := mqttingress.New(mqttingress.Options{
+		MetricsEnabled:  cfg.MetricsEnabled,
 		QueueCapacity:   cfg.Ingress.QueueCapacity,
 		WorkerCount:     cfg.Ingress.WorkerCount,
 		MaxPayloadBytes: cfg.Ingress.MaxPayloadBytes,

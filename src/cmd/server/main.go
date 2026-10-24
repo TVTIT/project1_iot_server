@@ -211,6 +211,7 @@ func run() error {
 	if err := populateUserManagementDependencies(&routerDeps, cfg, pool); err != nil {
 		return fmt.Errorf("compose user management dependencies: %w", err)
 	}
+	populateMetricsDependencies(&routerDeps, cfg, pool, ingress, control)
 	router, err := httpserver.NewRouter(routerDeps)
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)

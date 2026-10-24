@@ -26,7 +26,10 @@ func populateStage5Dependencies(deps *httpserver.RouterDependencies, cfg config.
 	if auth.IsNilDependency(pool) {
 		return fmt.Errorf("enabled stage 5 requires a database pool")
 	}
-	repo, err := digitaltwin.NewPostgresControlRepository(pool, cfg.Stage5.Control)
+	if cfg.MetricsEnabled {
+		deps.ControlMetrics = &digitaltwin.ControlMetrics{}
+	}
+	repo, err := digitaltwin.NewPostgresControlRepository(pool, cfg.Stage5.Control, deps.ControlMetrics)
 	if err != nil {
 		return fmt.Errorf("create stage 5 intent repository: %w", err)
 	}

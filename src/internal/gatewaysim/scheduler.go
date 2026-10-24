@@ -108,6 +108,9 @@ type publishResult struct {
 // SchedulerStats is a payload-free snapshot safe to log or print. It never
 // contains an error string, credential or SQLite path.
 type SchedulerStats struct {
+	// Payload byte counts exclude MQTT/TCP/TLS framing. Unique counts cover only
+	// new durable enqueues in this run; attempts also include retries/replay.
+	UniquePayloadBytes, AttemptedPayloadBytes, UniqueSamples int64
 	// UniqueEnqueued counts new batches committed by this run (not replays).
 	UniqueEnqueued int64
 	// PublishAttempts counts every Publish invocation started, including
@@ -220,8 +223,9 @@ type Scheduler struct {
 	generationPaused atomic.Bool
 	completed        atomic.Bool
 
-	uniqueEnqueued  atomic.Int64
-	publishAttempts atomic.Int64
+	uniqueEnqueued                                           atomic.Int64
+	uniquePayloadBytes, attemptedPayloadBytes, uniqueSamples atomic.Int64
+	publishAttempts                                          atomic.Int64
 
 	fatalMu   sync.Mutex
 	fatalErr  error
@@ -593,6 +597,8 @@ func (s *Scheduler) generate(now time.Time) error {
 	}
 
 	s.uniqueEnqueued.Add(1)
+	s.uniquePayloadBytes.Add(int64(len(item.Payload)))
+	s.uniqueSamples.Add(int64(s.cfg.samplesPerBatch))
 	if s.uniqueEnqueued.Load() == 1 && s.latency != nil {
 		s.latency.RecordGenerationStart()
 	}
@@ -615,6 +621,7 @@ func (s *Scheduler) startPublish(e *inflightEntry) {
 	id := e.item.MessageID
 	topic := e.item.Topic
 	payload := e.item.Payload
+	s.attemptedPayloadBytes.Add(int64(len(payload)))
 	go func() {
 		if s.latency != nil {
 			s.latency.RecordFirstPublish(id)
@@ -826,7 +833,8 @@ func (s *Scheduler) publishingCount() int {
 // exposing an error.
 func (s *Scheduler) Stats() SchedulerStats {
 	st := SchedulerStats{
-		UniqueEnqueued:   s.uniqueEnqueued.Load(),
+		UniqueEnqueued:     s.uniqueEnqueued.Load(),
+		UniquePayloadBytes: s.uniquePayloadBytes.Load(), AttemptedPayloadBytes: s.attemptedPayloadBytes.Load(), UniqueSamples: s.uniqueSamples.Load(),
 		PublishAttempts:  s.publishAttempts.Load(),
 		AppAcknowledged:  s.ack.Stats().Acknowledged,
 		Inflight:         int(s.inflightCount.Load()),

@@ -340,6 +340,101 @@ class PreparationTests(unittest.TestCase):
                 smoke.validate_summary(dict(report, status="PASS"))
 
 
+class PaperP1Tests(unittest.TestCase):
+    def test_p1_subscribers_use_existing_literal_filters_and_separate_principals(self):
+        spec = Mock(gateway_id='gateway_a')
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
+            username, password, topic = smoke.paper_p1_subscription_target(fixture, spec, 'gateway-password', 'telemetry')
+            self.assertEqual((username, password, topic), (fixture.values['MQTT_USERNAME'], fixture.values['MQTT_PASSWORD'], 'gateways/+/telemetry/#'))
+            self.assertNotEqual(username, fixture.values['MQTT_DYNSEC_MANAGER_USERNAME'])
+            self.assertEqual(smoke.paper_p1_subscription_target(fixture, spec, 'gateway-password', 'ack'),
+                             ('gateway_a', 'gateway-password', 'gateways/gateway_a/acks/#'))
+            with self.assertRaises(ValueError):
+                smoke.paper_p1_subscription_target(fixture, spec, 'gateway-password', 'control')
+
+    def test_p1_suback_denied_is_never_readiness(self):
+        self.assertFalse(smoke.paper_p1_suback_ready(b'Client received CONNACK (0)'))
+        self.assertTrue(smoke.paper_p1_suback_ready(b'Client received SUBACK\nSubscribed (mid: 1): 1\n'))
+        for code in (0, 128):
+            with self.assertRaisesRegex(ValueError, '^paper_p1_subscription_failed$'):
+                smoke.paper_p1_suback_ready(f'Client received SUBACK\nSubscribed (mid: 1): {code}\n'.encode())
+
+    def test_p1_failed_cleanup_cannot_leave_success_run_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
+            smoke.durable_json(fixture.artifacts / 'run.json', {'schema_version': 1, 'status': 'PASS'})
+            smoke.record_failure_report(fixture, 'cleanup', ValueError('startup_cleanup_unresolved_evidence_retained'),
+                                        cleanup_verified=False, primary_phase='paper_p1',
+                                        primary_error_code='paper_p1_gateway_failed')
+            report = json.loads((fixture.artifacts / 'run.json').read_text())
+            self.assertEqual(report['status'], 'FAIL')
+            self.assertFalse(report['cleanup_verified'])
+            self.assertEqual(report['error'], 'startup_cleanup_unresolved_evidence_retained')
+
+    def test_p1_metrics_off_preserves_p0_profile_and_equivalent_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'off', paper_p1='baseline', metrics_enabled=False)
+            self.assertEqual(fixture.values['METRICS_ENABLED'], 'false')
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(model['services']['backend']['environment']['METRICS_ENABLED'], 'false')
+
+    def test_p1_multiple_batches_keep_shared_last_batch_assertions(self):
+        with patch.object(sys, 'path', [str(MODULE.parent), *sys.path]):
+            from stage3_uplink_runner import build_gateway_assert_sql, default_specs, simulator_envelope
+            base_envelope = simulator_envelope()
+        from dataclasses import replace
+        env = replace(base_envelope, message_id='00000000-0000-4000-8000-000000000001',
+                      first_sequence=1900, expected_reported_version=20)
+        sql = build_gateway_assert_sql(default_specs()[0], env, 'p1_last_batch', expected_messages=20)
+        self.assertIn('IF ledger <> 20', sql)
+        self.assertIn("AND message_id='00000000-0000-4000-8000-000000000001'::uuid", sql)
+        self.assertIn('telemetry rows inconsistent', sql)
+
+    def test_p1_rates_require_same_process_and_no_counter_reset(self):
+        a = {'process_instance': 'a', 'elapsed_seconds': 1, 'ingress': {'Received': 2, 'Committed': 1, 'SamplesNew': 100}}
+        b = {'process_instance': 'a', 'elapsed_seconds': 3, 'ingress': {'Received': 6, 'Committed': 2, 'SamplesNew': 200}}
+        self.assertEqual(smoke.paper_p1_rates(a, b), {'received_delivery_msg_per_s': 2, 'new_committed_msg_per_s': 0.5, 'new_committed_samples_per_s': 50})
+        for bad in (dict(b, process_instance='b'), dict(b, elapsed_seconds=1), dict(b, ingress={'Received': 0, 'Committed': 0, 'SamplesNew': 0})):
+            self.assertTrue(all(v is None for v in smoke.paper_p1_rates(a, bad).values()))
+        self.assertTrue(all(v is None for v in smoke.paper_p1_rates(None, b).values()))
+
+    def test_p1_artifacts_allowlist_and_missing_is_not_zero(self):
+        import csv
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-24T10:00:00Z',
+                      'ingress': {'Received': 3, 'SamplesNew': 100, 'token': 'PRIVATE_SENTINEL'},
+                      'availability': {'command': 'disabled', 'result': 'not_implemented'}, 'password': 'PRIVATE_SENTINEL'}
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'before', 'snapshot': sample}, {'phase': 'running', 'snapshot': None, 'error': 'scrape_failed'}])
+            self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            missing = [r for r in rows if r['error'] == 'scrape_failed']
+            self.assertTrue(missing)
+            self.assertTrue(all(r['value'] == '' for r in missing))
+            unavailable = [r for r in rows if r['availability'] == 'not_implemented']
+            self.assertTrue(unavailable)
+            self.assertTrue(all(r['value'] == '' for r in unavailable))
+
+    def test_p1_profile_reuses_p0_resources_but_keeps_its_own_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in ('baseline', 'optimized'):
+                fixture = smoke.prepare(Path(directory) / mode, paper_p1=mode)
+                self.assertEqual(fixture.paper_p1, mode)
+                self.assertFalse(fixture.paper_p0)
+                self.assertIn('supabase-storage', smoke.fixture_services(fixture))
+                self.assertIn(str(smoke.PAPER_P0_TEMPLATE), smoke.compose_command(fixture, 'config'))
+                self.assertEqual(fixture.values['METRICS_ENABLED'], 'true')
+                self.assertEqual(fixture.values['STAGE5_ENABLED'], 'false')
+                smoke.dry_effective_config(fixture)
+            for mode in ('invalid', 'BASELINE'):
+                with self.assertRaises(ValueError):
+                    smoke.prepare(Path(directory) / mode, paper_p1=mode)
+            with self.assertRaises(ValueError):
+                smoke.prepare(Path(directory) / 'both', paper_p0=True, paper_p1='baseline')
+
+
 class PaperP0Tests(unittest.TestCase):
     def test_p0_git_trust_is_per_command_read_only_and_keeps_private_env(self):
         with tempfile.TemporaryDirectory() as directory:

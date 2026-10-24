@@ -896,7 +896,7 @@ def seed_graph(fixture: DatabaseFixture, specs: list[GatewaySpec]):
     fixture.sql(('\n'.join(stmts)).encode())
 
 
-def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str) -> str:
+def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str, *, expected_messages: int = 1) -> str:
     """Independent SQL state assertion scoped to exactly one Gateway.
 
     Mirrors the Task 3.4 shared assertion but parameterized by ``spec`` so two
@@ -905,6 +905,10 @@ def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str) -> s
     """
     def q(value: str) -> str:
         return "'" + value + "'"
+
+    if not 1 <= expected_messages <= 1000 or expected_messages > 1 and env.message_id is None:
+        raise ValueError('bounded multi-message assertion requires one selected batch')
+    selected_message = " AND message_id=" + q(env.message_id) + "::uuid" if expected_messages > 1 else ""
 
     if env.message_id is not None:
         msg_known = (f"IF msg <> {q(env.message_id)}::uuid THEN "
@@ -967,11 +971,11 @@ def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str) -> s
     BEGIN
       SELECT count(*) INTO ledger FROM public.processed_messages
         WHERE gateway_id={q(spec.gateway_id)} AND sensor_id={q(spec.sensor_id)};
-      IF ledger <> 1 THEN RAISE EXCEPTION 'ledger rows %', ledger; END IF;
+      IF ledger <> {expected_messages} THEN RAISE EXCEPTION 'ledger rows %', ledger; END IF;
       SELECT message_id, boot_id, first_sequence, last_sequence, sample_count, sensor_id, source_topic
         INTO msg, boot, l_first, l_last, l_count, l_sensor, l_topic
         FROM public.processed_messages
-        WHERE gateway_id={q(spec.gateway_id)} AND sensor_id={q(spec.sensor_id)};
+        WHERE gateway_id={q(spec.gateway_id)} AND sensor_id={q(spec.sensor_id)}{selected_message};
       IF l_first <> {env.first_sequence} OR l_last <> {env.last_sequence} OR l_count <> {env.sample_count} THEN
         RAISE EXCEPTION 'ledger envelope first/last/count % % %', l_first, l_last, l_count; END IF;
       IF l_sensor <> {q(spec.sensor_id)} THEN RAISE EXCEPTION 'ledger sensor_id %', l_sensor; END IF;

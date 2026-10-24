@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"iot-platform/internal/metrics"
 	"iot-platform/internal/telemetry"
 )
 
@@ -38,6 +39,7 @@ const (
 
 // Options configures the ingress core. Every value is validated by New.
 type Options struct {
+	MetricsEnabled  bool
 	QueueCapacity   int
 	WorkerCount     int
 	MaxPayloadBytes int
@@ -58,6 +60,7 @@ type item struct {
 	topic      string
 	payload    []byte
 	receivedAt time.Time
+	enqueuedAt time.Time
 }
 
 // Ingress is the bounded admission queue and fixed worker pool. One admitted
@@ -100,7 +103,9 @@ type Ingress struct {
 
 	workers sync.WaitGroup
 
-	counters counters
+	counters                                       counters
+	metricsEnabled                                 bool
+	queueWait, validation, persistence, ackPublish metrics.Histogram
 }
 
 // New builds an ingress core. It rejects a missing dependency or a non-positive
@@ -137,6 +142,7 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 	}
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	return &Ingress{
+		metricsEnabled:  opts.MetricsEnabled,
 		validator:       validator,
 		repository:      repository,
 		publisher:       publisher,
@@ -177,6 +183,10 @@ func (i *Ingress) Start() error {
 // per message and no ACK. It copies the topic (an immutable string) and the
 // payload bytes before returning, so the caller may reuse its buffer.
 func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, retained bool) AdmissionDecision {
+	if i.metricsEnabled {
+		i.counters.received.Add(1)
+		i.counters.receivedBytes.Add(int64(len(payload)))
+	}
 	if !i.started.Load() {
 		i.counters.rejectedNotRunning.Add(1)
 		return AdmissionRejectedNotRunning
@@ -202,8 +212,14 @@ func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, reta
 	}
 
 	it := item{topic: topic, payload: append([]byte(nil), payload...), receivedAt: receivedAt}
+	if i.metricsEnabled {
+		it.enqueuedAt = time.Now()
+	}
 	select {
 	case i.queue <- it:
+		if i.metricsEnabled {
+			i.counters.acceptedBytes.Add(int64(len(payload)))
+		}
 		i.counters.accepted.Add(1)
 		i.recordQueueHighWater(len(i.queue))
 		return AdmissionAccepted
@@ -340,13 +356,20 @@ func (i *Ingress) drainQueue() {
 // over an apparently successful result and suppresses the ACK.
 func (i *Ingress) process(it item) {
 	started := time.Now()
+	if i.metricsEnabled {
+		i.counters.inFlight.Add(1)
+		defer i.counters.inFlight.Add(-1)
+		i.queueWait.Observe(time.Since(it.enqueuedAt))
+	}
 	defer func() {
 		i.counters.processingNanos.Add(time.Since(started).Nanoseconds())
 		i.counters.processingCount.Add(1)
 	}()
 	i.counters.processed.Add(1)
 
+	validationStart := i.metricStart()
 	message, err := i.validator.Validate(it.topic, it.payload, it.receivedAt)
+	i.metricObserve(&i.validation, validationStart)
 	if err != nil {
 		i.counters.validationRejected.Add(1)
 		i.logReject("validate", err)
@@ -354,7 +377,9 @@ func (i *Ingress) process(it item) {
 	}
 
 	persistCtx, cancelPersist := context.WithTimeout(i.runCtx, i.persistTimeout)
+	persistStart := i.metricStart()
 	result, persistErr := i.repository.Persist(persistCtx, message)
+	i.metricObserve(&i.persistence, persistStart)
 	cancelPersist()
 	if persistErr != nil {
 		i.counters.persistFailures.Add(1)
@@ -403,7 +428,9 @@ func (i *Ingress) process(it item) {
 	}
 
 	publishCtx, cancelPublish := context.WithTimeout(i.runCtx, i.publishTimeout)
+	publishStart := i.metricStart()
 	publishErr := i.publisher.Publish(publishCtx, Delivery{Topic: ackTopic, Payload: wire, QoS: 1, Retained: false})
+	i.metricObserve(&i.ackPublish, publishStart)
 	cancelPublish()
 	if publishErr != nil {
 		// The database result is committed and must be kept. A publish timeout
@@ -414,6 +441,19 @@ func (i *Ingress) process(it item) {
 	}
 
 	i.counters.ackPublished.Add(1)
+}
+
+func (i *Ingress) metricStart() time.Time {
+	if i.metricsEnabled {
+		return time.Now()
+	}
+	return time.Time{}
+}
+
+func (i *Ingress) metricObserve(h *metrics.Histogram, start time.Time) {
+	if i.metricsEnabled {
+		h.Observe(time.Since(start))
+	}
 }
 
 // identityMatches verifies that the persisted identity is the same resource and

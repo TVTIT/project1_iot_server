@@ -323,6 +323,8 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		counts.PendingRows, counts.PendingBytes, counts.QuarantinedRows, counts.QuarantinedBytes, stats.Completed)
 
 	if tracker != nil {
+		writef(stdout, "serialization summary: unique_bytes=%d attempted_bytes=%d unique_samples=%d\n",
+			stats.UniquePayloadBytes, stats.AttemptedPayloadBytes, stats.UniqueSamples)
 		snap := tracker.Snapshot()
 		writef(stdout, "%s\n", gatewaysim.FormatMeasurementSummary(snap))
 	}

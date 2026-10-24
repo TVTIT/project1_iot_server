@@ -3,20 +3,23 @@ package mqttingress
 import (
 	"sync/atomic"
 	"time"
+
+	"iot-platform/internal/metrics"
 )
 
 // counters holds bounded-cardinality ingress counters. Every counter is a
 // fixed field (no maps keyed by sender-supplied values), so cardinality cannot
 // grow with input.
 type counters struct {
-	accepted           atomic.Int64
-	rejectedNotRunning atomic.Int64
-	rejectedStopping   atomic.Int64
-	rejectedRetained   atomic.Int64
-	rejectedOversized  atomic.Int64
-	rejectedInvalidTpc atomic.Int64
-	queueFull          atomic.Int64
-	queueHighWater     atomic.Int64
+	received, receivedBytes, acceptedBytes, inFlight atomic.Int64
+	accepted                                         atomic.Int64
+	rejectedNotRunning                               atomic.Int64
+	rejectedStopping                                 atomic.Int64
+	rejectedRetained                                 atomic.Int64
+	rejectedOversized                                atomic.Int64
+	rejectedInvalidTpc                               atomic.Int64
+	queueFull                                        atomic.Int64
+	queueHighWater                                   atomic.Int64
 
 	processed          atomic.Int64
 	validationRejected atomic.Int64
@@ -38,6 +41,8 @@ type counters struct {
 // Snapshot is a point-in-time, bounded view of ingress counters and queue state.
 // It contains no payload, credential or driver error data.
 type Snapshot struct {
+	Received, ReceivedBytes, AcceptedBytes, InFlight int64
+	Durations                                        DurationSnapshot
 	// Admission.
 	Accepted             int64
 	RejectedNotRunning   int64
@@ -87,6 +92,9 @@ type Snapshot struct {
 // Snapshot returns the current counters and queue state.
 func (i *Ingress) Snapshot() Snapshot {
 	return Snapshot{
+		Received: i.counters.received.Load(), ReceivedBytes: i.counters.receivedBytes.Load(),
+		AcceptedBytes: i.counters.acceptedBytes.Load(), InFlight: i.counters.inFlight.Load(),
+		Durations:            DurationSnapshot{QueueWait: i.queueWait.Snapshot(), Validation: i.validation.Snapshot(), Persistence: i.persistence.Snapshot(), ACKPublish: i.ackPublish.Snapshot()},
 		Accepted:             i.counters.accepted.Load(),
 		RejectedNotRunning:   i.counters.rejectedNotRunning.Load(),
 		RejectedStopping:     i.counters.rejectedStopping.Load(),
@@ -115,4 +123,12 @@ func (i *Ingress) Snapshot() Snapshot {
 		QueueCapacity:  cap(i.queue),
 		QueueHighWater: int(i.counters.queueHighWater.Load()),
 	}
+}
+
+// DurationSnapshot records only boundaries actually executed, not SQL-only time.
+type DurationSnapshot struct {
+	QueueWait   metrics.HistogramSnapshot `json:"queue_wait"`
+	Validation  metrics.HistogramSnapshot `json:"validation"`
+	Persistence metrics.HistogramSnapshot `json:"persistence"`
+	ACKPublish  metrics.HistogramSnapshot `json:"ack_publish"`
 }

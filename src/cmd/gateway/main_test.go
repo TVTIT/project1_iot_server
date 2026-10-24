@@ -562,6 +562,9 @@ func TestRun_FiniteBatch_WithMeasure(t *testing.T) {
 	}
 
 	// Output must not contain secrets or payloads
+	if !strings.Contains(stdoutText, "serialization summary: unique_bytes=") || !strings.Contains(stdoutText, "unique_samples=200") {
+		t.Fatalf("missing bounded byte/sample counts: %q", stdoutText)
+	}
 	if strings.Contains(stdoutText, "test-only-gateway-password") || strings.Contains(stdoutText, "payload") {
 		t.Fatalf("stdout leaked credential or payload: %q", stdoutText)
 	}

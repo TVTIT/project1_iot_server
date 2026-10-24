@@ -66,13 +66,14 @@ type Runtime struct {
 	expireOK atomic.Bool
 	ctx      context.Context
 	cancel   context.CancelFunc
-	jobs     chan uuid.UUID
+	jobs     chan dispatchJob
+	metrics  *Metrics
 	done     chan struct{}
 	wg       sync.WaitGroup
 }
 
 // New builds an inert runtime.
-func New(cfg Config, repo Repository, pub Publisher) (*Runtime, error) {
+func New(cfg Config, repo Repository, pub Publisher, observers ...*Metrics) (*Runtime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -80,7 +81,16 @@ func New(cfg Config, repo Repository, pub Publisher) (*Runtime, error) {
 		return nil, errors.New("control dependencies required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Runtime{cfg: cfg, repo: repo, pub: pub, ctx: ctx, cancel: cancel, jobs: make(chan uuid.UUID, cfg.BatchSize), done: make(chan struct{}), inflight: map[uuid.UUID]bool{}}, nil
+	r := &Runtime{cfg: cfg, repo: repo, pub: pub, ctx: ctx, cancel: cancel, jobs: make(chan dispatchJob, cfg.BatchSize), done: make(chan struct{}), inflight: map[uuid.UUID]bool{}}
+	if len(observers) > 0 {
+		r.metrics = observers[0]
+	}
+	return r, nil
+}
+
+type dispatchJob struct {
+	id         uuid.UUID
+	enqueuedAt time.Time
 }
 
 func nilDependency(v any) bool {
@@ -150,15 +160,26 @@ func (r *Runtime) scan() {
 			return
 		}
 		if r.pub.Ready() {
+			var start time.Time
+			if r.metrics != nil {
+				start = time.Now()
+			}
 			ids, err := r.repo.PendingControl(r.ctx, r.cfg.BatchSize)
+			if r.metrics != nil {
+				r.metrics.discovery.Observe(time.Since(start))
+			}
 			r.scanOK.Store(err == nil)
 			if err == nil {
 				for _, id := range ids {
 					r.mu.Lock()
 					if !r.inflight[id] && len(r.inflight) < r.cfg.BatchSize+r.cfg.Workers {
 						r.inflight[id] = true
+						job := dispatchJob{id: id}
+						if r.metrics != nil {
+							job.enqueuedAt = time.Now()
+						}
 						select {
-						case r.jobs <- id:
+						case r.jobs <- job:
 						default:
 							delete(r.inflight, id)
 						}
@@ -180,7 +201,11 @@ func (r *Runtime) worker() {
 		select {
 		case <-r.ctx.Done():
 			return
-		case id := <-r.jobs:
+		case job := <-r.jobs:
+			id := job.id
+			if r.metrics != nil {
+				r.metrics.queueWait.Observe(time.Since(job.enqueuedAt))
+			}
 			if r.ctx.Err() != nil {
 				return
 			}
@@ -190,7 +215,19 @@ func (r *Runtime) worker() {
 				d, err = r.repo.PrepareControl(r.ctx, id)
 				if err == nil && d != nil && r.pub.Ready() {
 					ctx, cancel := context.WithTimeout(r.ctx, r.cfg.PublishTimeout)
+					var start time.Time
+					if r.metrics != nil {
+						start = time.Now()
+					}
 					err = r.pub.Publish(ctx, *d)
+					if r.metrics != nil {
+						r.metrics.publish.Observe(time.Since(start))
+						if err == nil {
+							r.metrics.puback.Add(1)
+						} else {
+							r.metrics.publishFailures.Add(1)
+						}
+					}
 					cancel()
 					if err == nil {
 						err = r.repo.MarkControlPublished(r.ctx, id)

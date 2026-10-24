@@ -17,6 +17,7 @@ import (
 type stage5Runtime struct {
 	transport *mqttcontrol.Transport
 	workers   *mqttcontrol.Runtime
+	metrics   *mqttcontrol.Metrics
 }
 
 func composeStage5Transport(cfg config.Config, pool *pgxpool.Pool) (stage5Runtime, error) {
@@ -54,11 +55,15 @@ func composeStage5Transport(cfg config.Config, pool *pgxpool.Pool) (stage5Runtim
 	if err != nil {
 		return stage5Runtime{}, err
 	}
-	workers, err := mqttcontrol.New(cfg.Stage5.Dispatch, repo, transport)
+	var observer *mqttcontrol.Metrics
+	if cfg.MetricsEnabled {
+		observer = &mqttcontrol.Metrics{}
+	}
+	workers, err := mqttcontrol.New(cfg.Stage5.Dispatch, repo, transport, observer)
 	if err != nil {
 		return stage5Runtime{}, err
 	}
-	return stage5Runtime{transport, workers}, nil
+	return stage5Runtime{transport: transport, workers: workers, metrics: observer}, nil
 }
 func (r stage5Runtime) start() error {
 	if r.transport == nil {

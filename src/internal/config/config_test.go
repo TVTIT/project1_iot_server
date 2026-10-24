@@ -8,6 +8,23 @@ import (
 
 const testJWTSecret = "test-only-jwt-secret-at-least-32-characters"
 
+func TestMetricsFlagDefaultAndValidation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MetricsEnabled {
+		t.Fatal(cfg.MetricsEnabled, err)
+	}
+	values["METRICS_ENABLED"] = "true"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MetricsEnabled {
+		t.Fatal(cfg.MetricsEnabled, err)
+	}
+	values["METRICS_ENABLED"] = "invalid"
+	if _, err = Load(mapLookup(values)); err == nil {
+		t.Fatal("accepted invalid flag")
+	}
+}
+
 func TestMQTTRuntimeOptIn(t *testing.T) {
 	values := validConfigValues()
 	cfg, err := Load(mapLookup(values))

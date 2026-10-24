@@ -12,6 +12,7 @@ import (
 
 	"iot-platform/internal/auth"
 	"iot-platform/internal/config"
+	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/httpapi"
 	"iot-platform/internal/usermanagement"
 )
@@ -23,6 +24,11 @@ type ReadinessChecker interface {
 
 // RouterDependencies contains the mandatory HTTP boundary dependencies.
 type RouterDependencies struct {
+	MetricsEnabled             bool
+	MetricsSnapshot            func() any
+	ControlMetrics             *digitaltwin.ControlMetrics
+	HTTPMetrics                *HTTPMetrics
+	AuthMetrics                *auth.Metrics
 	ControlAPIEnabled          bool
 	ControlRequestTimeout      time.Duration
 	ControlRepository          ControlRepository
@@ -67,6 +73,9 @@ type RouterDependencies struct {
 // NewRouter creates the backend HTTP routes and fails closed when an
 // authentication dependency is absent.
 func NewRouter(deps RouterDependencies) (http.Handler, error) {
+	if deps.MetricsEnabled && deps.MetricsSnapshot == nil {
+		return nil, fmt.Errorf("enabled metrics requires snapshot source")
+	}
 	if err := validateControlDependencies(deps); err != nil {
 		return nil, fmt.Errorf("invalid control API dependencies: %w", err)
 	}
@@ -167,7 +176,16 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 
 	router := gin.New()
+	if deps.HTTPMetrics != nil {
+		router.Use(deps.HTTPMetrics.middleware())
+	}
 	router.HandleMethodNotAllowed = true
+	router.Use(func(c *gin.Context) {
+		if c.Request.URL.Path == "/v1/admin/metrics" {
+			c.Header("Cache-Control", "no-store")
+		}
+		c.Next()
+	})
 	router.Use(
 		httpapi.RequestIDMiddleware(),
 		adminGatewayCacheMiddleware(),
@@ -221,6 +239,13 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		httpapi.WriteError(c, http.StatusNotImplemented, "not_implemented", "endpoint not implemented")
 	}
 	groups := newRouteGroups(router, deps)
+	groups.admin.GET("/metrics", func(c *gin.Context) {
+		if !deps.MetricsEnabled {
+			httpapi.WriteError(c, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		c.JSON(http.StatusOK, deps.MetricsSnapshot())
+	})
 	registerCredentialRoutes(groups.admin, deps)
 	groups.admin.GET("/gateways", listAdminGateways(deps.AdminGatewayLister, deps.AdminInventoryDefaultLimit, deps.AdminInventoryMaxLimit))
 	groups.admin.PUT("/gateways/:gateway_id", provisionGateway(deps.GatewayProvisioner, deps.AdminMaxBodyBytes))
@@ -257,7 +282,7 @@ type routeGroups struct {
 }
 
 func newRouteGroups(router *gin.Engine, deps RouterDependencies) routeGroups {
-	authenticated := router.Group("/v1", auth.AuthenticationMiddleware(deps.TokenVerifier))
+	authenticated := router.Group("/v1", auth.AuthenticationMiddleware(deps.TokenVerifier, deps.AuthMetrics))
 	admin := authenticated.Group("/admin", auth.PlatformAdminMiddleware(deps.PlatformAdminChecker, deps.AuthorizationTimeout, slog.Default()))
 	return routeGroups{authenticated: authenticated, admin: admin}
 }

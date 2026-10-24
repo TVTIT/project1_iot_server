@@ -852,6 +852,13 @@ func TestSchedulerFiniteCompletion(t *testing.T) {
 		t.Fatalf("finite run returned %v, want nil", err)
 	}
 	st := run.sched.Stats()
+	var wantBytes int64
+	for _, it := range items {
+		wantBytes += int64(len(it.Payload))
+	}
+	if st.UniquePayloadBytes != wantBytes || st.AttemptedPayloadBytes != wantBytes || st.UniqueSamples != int64(2*cfg.SamplesPerBatch) {
+		t.Fatalf("payload counts: %+v, want bytes %d", st, wantBytes)
+	}
 	if !st.Completed {
 		t.Fatalf("Completed = false, want true")
 	}

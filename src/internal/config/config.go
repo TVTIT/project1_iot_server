@@ -17,6 +17,7 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
+	MetricsEnabled             bool
 	Stage5                     Stage5Config
 	Credential                 CredentialConfig
 	Ingress                    IngressConfig
@@ -66,6 +67,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	cfg := Config{
 		DatabaseURL: databaseURL,
 		ServerEnv:   valueOrDefault(lookup, "SERVER_ENV", "development"),
+	}
+	if cfg.MetricsEnabled, err = boolValue(lookup, "METRICS_ENABLED", false); err != nil {
+		return Config{}, err
 	}
 
 	jwtSecret, ok := nonEmpty(lookup, "SUPABASE_JWT_SECRET")
