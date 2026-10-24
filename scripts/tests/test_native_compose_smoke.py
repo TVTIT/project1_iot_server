@@ -340,6 +340,136 @@ class PreparationTests(unittest.TestCase):
                 smoke.validate_summary(dict(report, status="PASS"))
 
 
+class PaperP0Tests(unittest.TestCase):
+    def test_p0_git_trust_is_per_command_read_only_and_keeps_private_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            runner = Mock(return_value=Mock(returncode=0, stdout=b'a' * 40 + b'\n', stderr=b''))
+            self.assertEqual(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD', runner=runner), 'a' * 40)
+            self.assertEqual(runner.call_args.args[0], [
+                'git', '--no-optional-locks', '-c', 'safe.directory=' + str(smoke.ROOT),
+                '-C', str(smoke.ROOT), 'rev-parse', 'HEAD'])
+            self.assertEqual(runner.call_args.kwargs['env'], smoke.process_env(fixture))
+            self.assertTrue(runner.call_args.kwargs['capture_output'])
+            self.assertEqual(runner.call_args.kwargs['timeout'], 10)
+            for args in (('config', '--global', '--add', 'safe.directory', '*'), ('reset', '--hard')):
+                with self.assertRaisesRegex(ValueError, 'paper_p0_metadata_failed'):
+                    smoke.paper_p0_git(fixture, *args, runner=runner)
+            self.assertEqual(runner.call_count, 1)
+
+    def test_p0_git_failure_does_not_echo_raw_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            runner = Mock(return_value=Mock(returncode=128, stdout=b'', stderr=b'private diagnostic sentinel'))
+            with self.assertRaisesRegex(ValueError, '^paper_p0_metadata_failed$'):
+                smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD', runner=runner)
+
+    def test_p0_git_real_metadata_works_with_private_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            self.assertRegex(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'), r'^[0-9a-f]{40}$')
+            self.assertTrue(smoke.paper_p0_git(fixture, 'branch', '--show-current'))
+            self.assertIsInstance(smoke.paper_p0_git(fixture, 'status', '--porcelain'), str)
+
+    def test_p0_temporal_query_uses_backend_utc_z_contract(self):
+        from urllib.parse import parse_qs
+        query = parse_qs(smoke.paper_p0_temporal_query(
+            '2026-10-24T10:00:00.123456+00:00',
+            '2026-10-24T10:00:01.113456+00:00'))
+        self.assertEqual(query, {
+            'attrs': ['measurement'], 'timerel': ['between'],
+            'timeAt': ['2026-10-24T09:59:59.123456Z'],
+            'endTimeAt': ['2026-10-24T10:00:02.113456Z']})
+        # Same instant, different input offset: still send canonical UTC Z.
+        other = parse_qs(smoke.paper_p0_temporal_query(
+            '2026-10-24T17:00:00.123456+07:00',
+            '2026-10-24T17:00:01.113456+07:00'))
+        self.assertEqual(other, query)
+
+    def test_p0_temporal_query_rejects_ambiguous_naive_time(self):
+        with self.assertRaisesRegex(ValueError, 'paper_p0_read_failed'):
+            smoke.paper_p0_temporal_query('2026-10-24T10:00:00', '2026-10-24T10:00:01')
+
+    def test_effective_p0_model_rejects_flag_quota_mount_and_port_drift(self):
+        import copy
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(len(model['services']), 10)
+            self.assertEqual(str(model['services']['backend']['mem_limit']), '4294967296')
+            self.assertEqual(model['services']['supabase-storage']['volumes'][0]['source'], 'storage_data')
+            for key, value in [('MQTT_INGRESS_ENABLED', 'false'), ('STAGE5_ENABLED', 'true'),
+                               ('DATABASE_MAX_CONNS', '5'), ('MQTT_MAX_PAYLOAD_BYTES', '1048576'),
+                               ('MQTT_CREDENTIAL_RUNTIME_ENABLED', 'true')]:
+                bad = copy.deepcopy(model)
+                bad['services']['backend']['environment'][key] = value
+                with self.assertRaisesRegex(ValueError, 'paper_p0_profile_rejected'):
+                    smoke.validate_effective_model(fixture, bad)
+            for key, value in [('cpus', 0), ('mem_limit', 4000000000)]:
+                bad = copy.deepcopy(model)
+                bad['services']['backend'][key] = value
+                with self.assertRaisesRegex(ValueError, 'paper_p0_profile_rejected'):
+                    smoke.validate_effective_model(fixture, bad)
+            bad = copy.deepcopy(model)
+            bad['services']['supabase-storage']['volumes'][0]['source'] = 'postgres_data'
+            with self.assertRaisesRegex(ValueError, 'effective_mounts_rejected'):
+                smoke.validate_effective_model(fixture, bad)
+            bad = copy.deepcopy(model)
+            bad['services']['mosquitto']['ports'] = [{'target': 8883, 'published': '8883'}]
+            with self.assertRaisesRegex(ValueError, 'effective_ports_rejected'):
+                smoke.validate_effective_model(fixture, bad)
+            bad = copy.deepcopy(model)
+            bad['volumes']['storage_data']['name'] = 'deployment_storage_data'
+            with self.assertRaisesRegex(ValueError, 'effective_names_rejected'):
+                smoke.validate_effective_model(fixture, bad)
+
+    def test_p0_partial_evidence_cannot_be_accepted(self):
+        with self.assertRaisesRegex(ValueError, 'paper_p0_acceptance_incomplete'):
+            smoke.validate_paper_p0_evidence({'checks': {'raw_samples': 200}})
+
+    def test_p0_profile_is_opt_in_and_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = smoke.prepare(Path(directory) / 'old')
+            p0 = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            self.assertEqual(old.values['MQTT_INGRESS_ENABLED'], 'false')
+            self.assertEqual(old.values['DATABASE_MAX_CONNS'], '5')
+            self.assertNotIn('supabase-storage', smoke.fixture_services(old))
+            self.assertIn('supabase-storage', smoke.fixture_services(p0))
+            for key, value in {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'false',
+                               'DATABASE_MAX_CONNS': '10', 'MQTT_QUEUE_CAPACITY': '256',
+                               'MQTT_WORKER_COUNT': '4', 'MQTT_MAX_PAYLOAD_BYTES': '65536'}.items():
+                self.assertEqual(p0.values[key], value)
+            self.assertNotEqual(old.project, p0.project)
+            self.assertNotEqual(old.values['JWT_SECRET'], p0.values['JWT_SECRET'])
+            text = p0.override.read_text()
+            self.assertNotIn('supabase-storage: !reset', text)
+            self.assertEqual(text.count('container_name: !reset null'), 10)
+            command = smoke.compose_command(p0, 'up')
+            self.assertIn(str(smoke.PAPER_P0_TEMPLATE), command)
+            self.assertEqual(command[-10:], list(smoke.fixture_services(p0)))
+            self.assertNotIn('rathole', command)
+            self.assertNotIn('cloudflared', command)
+
+    def test_p0_quota_requires_effective_runtime_limit(self):
+        for host in ({'NanoCpus': 2000000000, 'Memory': 4294967296},
+                     {'NanoCpus': 0, 'CpuQuota': 200000, 'CpuPeriod': 100000,
+                      'Memory': 4294967296}):
+            self.assertEqual(smoke.paper_p0_quota(host), {'cpus': 2, 'memory_bytes': 4294967296})
+        for host in ({'NanoCpus': 0, 'Memory': 4294967296},
+                     {'NanoCpus': 2000000000, 'Memory': 4000000000}):
+            with self.assertRaisesRegex(ValueError, 'paper_p0_quota_rejected'):
+                smoke.paper_p0_quota(host)
+
+    def test_p0_mode_exposed_and_fragment_has_no_public_ports_or_secrets(self):
+        self.assertIn('--paper-p0', smoke.cli_arguments())
+        text = smoke.PAPER_P0_TEMPLATE.read_text()
+        self.assertIn('cpus: 2', text)
+        self.assertIn('mem_limit: 4294967296', text)
+        self.assertIn('storage_data:', text)
+        self.assertNotIn('ports:', text)
+        self.assertNotIn('password', text.lower())
+
+
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 

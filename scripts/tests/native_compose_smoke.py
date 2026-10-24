@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import http.client
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -27,6 +29,7 @@ import urllib.parse
 ROOT = Path(__file__).resolve().parents[2]
 ROOT_COMPOSE = ROOT / "docker-compose.yml"
 TEMPLATE = Path(__file__).with_suffix(".override.yml")
+PAPER_P0_TEMPLATE = Path(__file__).with_name("compose.paper-p0.override.yml")
 SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
             "supabase-auth", "supabase-compat-migration", "mosquitto",
             "backend", "supabase-envoy", "nginx")
@@ -134,6 +137,13 @@ class Fixture:
     values: dict[str, str]
     artifacts_dev: int = 0
     artifacts_ino: int = 0
+    paper_p0: bool = False
+
+
+def fixture_services(fixture):
+    if fixture.paper_p0:
+        return SERVICES[:-2] + ('supabase-storage',) + SERVICES[-2:]
+    return SERVICES
 
 
 def private_write(path, text):
@@ -495,7 +505,7 @@ def jwt(secret, role):
     return data + "." + signature
 
 
-def prepare(base):
+def prepare(base, paper_p0=False):
     # Reject ambiguous env-file syntax and symlinked parents before writing.
     base = Path(base).absolute()
     if any(p.is_symlink() for p in (base, *base.parents)) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(base)):
@@ -506,6 +516,9 @@ def prepare(base):
         path.mkdir(mode=0o700)
     project = "ncs_" + secrets.token_hex(6)
     values = dict(DEFAULTS)
+    if paper_p0:
+        values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
+                      MQTT_MAX_PAYLOAD_BYTES='65536')
     for key in ("POSTGRES_PASSWORD", "AUTH_DB_PASSWORD", "STORAGE_DB_PASSWORD",
                 "BACKEND_DB_PASSWORD", "JWT_SECRET", "MQTT_PASSWORD",
                 "MQTT_DYNSEC_MANAGER_PASSWORD", "DASHBOARD_PASSWORD"):
@@ -527,8 +540,11 @@ def prepare(base):
     extras = template[template.index("  nginx:"):resource_offset]
     blocks = re.split(r"(?m)^  ([a-z][a-z-]+):\n", extras)
     extra_by_service = dict(zip(blocks[1::2], blocks[2::2]))
-    stanzas = ["services:\n  rathole: !reset null\n  supabase-storage: !reset null\n  cloudflared: !reset null\n"]
-    for service in SERVICES:
+    stanzas = ["services:\n  rathole: !reset null\n  cloudflared: !reset null\n"]
+    if not paper_p0:
+        stanzas.append("  supabase-storage: !reset null\n")
+    services = SERVICES[:-2] + ('supabase-storage',) + SERVICES[-2:] if paper_p0 else SERVICES
+    for service in services:
         stanzas.append(f"  {service}:\n    container_name: !reset null\n    restart: 'no'\n")
         if service != "nginx":
             stanzas.append("    ports: !override []\n")
@@ -539,7 +555,7 @@ def prepare(base):
     private_write(private / "mosquitto.conf", (ROOT / "config/mosquitto/mosquitto.conf").read_text())
     art_stat = artifacts.stat()
     return Fixture(base, private, artifacts, env_file, override, project, values,
-                   art_stat.st_dev, art_stat.st_ino)
+                   art_stat.st_dev, art_stat.st_ino, paper_p0)
 
 
 def process_env(fixture):
@@ -557,9 +573,11 @@ def compose_command(fixture, action):
     # Returned commands are deferred plans, not permission to execute them.
     prefix = ["docker", "compose", "--project-directory", str(ROOT), "--project-name", fixture.project,
               "--env-file", str(fixture.env_file), "-f", str(ROOT_COMPOSE), "-f", str(fixture.override)]
+    if fixture.paper_p0:
+        prefix += ['-f', str(PAPER_P0_TEMPLATE)]
     options = {"config": ["config", "--format", "json"],
                "build": ["build", "backend"],
-               "up": ["up", "--detach", "--no-deps", *SERVICES]}
+                "up": ["up", "--detach", "--no-deps", *fixture_services(fixture)]}
     if action not in options:
         raise ValueError("unsupported_compose_action")
     return prefix + options[action]
@@ -581,7 +599,7 @@ def validate_effective_model(fixture, model):
     Versioned upstream tags below are the root's selected pins (not latest).
     """
     services = model.get("services", {})
-    if set(services) != set(SERVICES):
+    if set(services) != set(fixture_services(fixture)):
         raise ValueError("effective_services_rejected")
     expected_images = {
         "postgres": "timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
@@ -619,6 +637,12 @@ def validate_effective_model(fixture, model):
         "backend": {"postgres": "service_healthy", "mosquitto": "service_started", "application-migrations": "service_completed_successfully", "supabase-compat-migration": "service_completed_successfully"},
         "supabase-envoy": {"supabase-auth": "service_healthy"},
         "nginx": {"backend": "service_started", "supabase-envoy": "service_started"}}
+    if fixture.paper_p0:
+        expected_images['supabase-storage'] = 'supabase/storage-api:v1.74.0'
+        binds['supabase-storage'] = {}
+        volume_mounts['supabase-storage'] = {('storage_data', '/var/lib/storage', False)}
+        dependencies['supabase-storage'] = {'supabase-role-provisioner': 'service_completed_successfully'}
+        dependencies['supabase-envoy']['supabase-storage'] = 'service_healthy'
     for name, service in services.items():
         if (service.get("container_name") or service.get("restart") != "no"
                 or service.get("privileged") or service.get("devices") or service.get("cap_add")
@@ -651,6 +675,15 @@ def validate_effective_model(fixture, model):
                 or len(service.get("volumes", [])) != len(actual_binds) + len(actual_volumes)):
             raise ValueError("effective_mounts_rejected")
     backend = services["backend"]
+    if fixture.paper_p0:
+        env = backend.get('environment', {})
+        expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'false',
+                    'MQTT_CREDENTIAL_RUNTIME_ENABLED': 'false', 'MQTT_CREDENTIAL_API_ENABLED': 'true',
+                    'DATABASE_MAX_CONNS': '10', 'MQTT_QUEUE_CAPACITY': '256',
+                    'MQTT_WORKER_COUNT': '4', 'MQTT_MAX_PAYLOAD_BYTES': '65536'}
+        if (any(str(env.get(k)).lower() != v for k, v in expected.items())
+                or backend.get('cpus') != 2 or str(backend.get('mem_limit')) != '4294967296'):
+            raise ValueError('paper_p0_profile_rejected')
     if backend.get("build", {}).get("context") != str(ROOT / "src") or backend["build"].get("dockerfile") != "Dockerfile" or backend["build"].get("target") != "backend":
         raise ValueError("effective_build_rejected")
     for name in ("backend", "mosquitto"):
@@ -665,9 +698,13 @@ def validate_effective_model(fixture, model):
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})
-    if set(volumes) != {"postgres_data", "mosquitto_data", "mosquitto_dynsec"} or set(model.get("networks", {})) != {"iot_net"}:
+    expected_volumes = {'postgres_data', 'mosquitto_data', 'mosquitto_dynsec'}
+    if fixture.paper_p0:
+        expected_volumes.add('storage_data')
+    if set(volumes) != expected_volumes or set(model.get("networks", {})) != {"iot_net"}:
         raise ValueError("effective_resources_rejected")
-    for name, role in (("postgres_data", "postgres_data"), ("mosquitto_data", "mosquitto_data"), ("mosquitto_dynsec", "store")):
+    for name in sorted(expected_volumes):
+        role = 'store' if name == 'mosquitto_dynsec' else name
         volume = volumes[name]
         if volume.get("name") != fixture.project + "_" + role:
             raise ValueError("effective_names_rejected")
@@ -769,6 +806,20 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         if result.returncode:
             raise ValueError('backend_build_image_unresolved')
         images['backend'] = json.loads(result.stdout)[0]['Id']
+        if fixture.paper_p0:
+            # Same Dockerfile builder, but the real Gateway target, not a host binary.
+            fd = os.open(fixture.private / 'gateway-build-output.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as stream:
+                result = subprocess.run(['docker', 'build', '--target', 'gateway', '-t',
+                    fixture.project + '-gateway', '-f', str(ROOT / 'src/Dockerfile'), str(ROOT / 'src')],
+                    stdout=stream, stderr=subprocess.STDOUT, timeout=BUDGETS['build'],
+                    env=process_env(fixture), check=False)
+            if result.returncode:
+                raise ValueError('native_dockerfile_build_blocked')
+            result = registry.command(['image', 'inspect', fixture.project + '-gateway'])
+            if result.returncode:
+                raise ValueError('backend_build_image_unresolved')
+            images['gateway'] = json.loads(result.stdout)[0]['Id']
 
         with lifecycle.cancellation_scope() as state:
             try:
@@ -810,7 +861,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     covered = {m[0] for m in item['expectation']['mounts']} | set(item['expectation']['tmpfs'])
                     if set(img.get('Config', {}).get('Volumes') or {}) - covered:
                         raise ValueError('anonymous_volume_prevention_failed')
-                for name in SERVICES:
+                for name in fixture_services(fixture):
                     phase = name
                     state.checkpoint()
                     for item in registry.items:
@@ -834,7 +885,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         obj = registry.resolve(containers[name])
                         if obj is None:
                             raise ValueError('phase_container_absent')
-                        ready = startup_state(name, obj['State']) if name in JOBS or name in ('postgres', 'supabase-auth', 'backend') else probe_startup(registry, name, obj)
+                        ready = startup_state(name, obj['State']) if name in JOBS or name in ('postgres', 'supabase-auth', 'backend', 'supabase-storage') else probe_startup(registry, name, obj)
                         if ready:
                             evidence[name] = {'image_id': obj['Image'], 'id': obj['Id'], 'exit': obj['State'].get('ExitCode'), 'health': obj['State'].get('Health', {}).get('Status', 'probe_ready')}
                             break
@@ -877,6 +928,11 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     raise ValueError('mapped_endpoint_rejected')
                 endpoint = 'http://127.0.0.1:' + ports[0]['HostPort']
                 evidence['endpoint'] = endpoint
+                if fixture.paper_p0:
+                    phase = 'paper_p0'
+                    state.checkpoint()
+                    evidence['paper_p0'] = run_paper_p0(fixture, registry, endpoint, containers, images, state)
+                    durable_json(fixture.private / 'paper-p0-progress.json', evidence['paper_p0'])
                 if positive_http or role_http or full_http:
                     phase = 'positive_http'
                     state.checkpoint()
@@ -972,7 +1028,15 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         raise FailureDiagnostic(fail_report, cause=failure) from failure
 
     try:
-        if full_http:
+        if fixture.paper_p0:
+            report = {'schema_version': 1, 'status': 'PAPER_P0_ACCEPTED',
+                      'project': fixture.project, 'services': list(fixture_services(fixture)),
+                      'native_executed': True, 'exact_cleanup_verified': True,
+                      'cleanup_counts': cleanup_counts, 'evidence': evidence}
+            if cleanup_counts != {'container': 15, 'network': 1, 'volume': 6}:
+                raise ValueError('cleanup_acceptance_incomplete')
+            validate_paper_p0_evidence(evidence['paper_p0'])
+        elif full_http:
             report = full_http_summary(fixture, evidence, cleanup_counts)
             report['backend_image_id'] = images['backend']
             report['phase'] = phase
@@ -1191,7 +1255,7 @@ def assert_safe_data(data):
 ALLOWED_FAILURE_STATUSES = {"STARTUP_FAILED"}
 ALLOWED_FAILURE_PHASES = {
     "prepare", "preflight", "build", "bootstrap",
-    *SERVICES,
+    *SERVICES, 'supabase-storage', 'paper_p0',
     "positive_http", "role_http", "jwt_http",
     "cleanup", "report_validation"
 }
@@ -1200,6 +1264,9 @@ ALLOWED_FAILURE_ERROR_TYPES = {
     "RunnerInterrupted", "IncompleteCleanup", "Exception"
 }
 ALLOWED_FAILURE_ERROR_CODES = {
+    'paper_p0_profile_rejected', 'paper_p0_quota_rejected', 'paper_p0_stats_failed',
+    'paper_p0_gateway_failed', 'paper_p0_storage_failed', 'paper_p0_seed_failed',
+    'paper_p0_read_failed', 'paper_p0_acceptance_incomplete', 'paper_p0_metadata_failed',
     "unsafe_fixture_path", "compose_override_version_unsupported",
     "unsupported_compose_action", "missing_interpolation",
     "compose_preflight_failed", "effective_json_rejected",
@@ -1914,8 +1981,279 @@ def full_http_summary(fixture, evidence, cleanup_counts):
             "role_case_count": 14, "auth_denial_case_count": 9}, "cleanup_counts": cleanup_counts}
 
 
+def paper_p0_quota(host):
+    nano = host.get('NanoCpus', 0)
+    period, quota = host.get('CpuPeriod', 0), host.get('CpuQuota', 0)
+    if (not (nano == 2000000000 or nano == 0 and period > 0 and quota == 2 * period)
+            or host.get('Memory') != 4294967296):
+        raise ValueError('paper_p0_quota_rejected')
+    return {'cpus': 2, 'memory_bytes': 4294967296}
+
+
+def paper_p0_stats(registry, containers, phase):
+    roles = [n for n in fixture_services(registry.fixture) if n not in JOBS]
+    started = datetime.now(timezone.utc).isoformat()
+    ids = [containers[n]['receipt']['id'] for n in roles]
+    result = registry.command(['stats', '--no-stream', '--format', '{{json .}}', *ids])
+    if result.returncode:
+        raise ValueError('paper_p0_stats_failed')
+    rows = [json.loads(line) for line in result.stdout.splitlines()]
+    if len(rows) != len(roles):
+        raise ValueError('paper_p0_stats_failed')
+    by_name = {r['Name']: r for r in rows}
+    return {'phase': phase, 'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
+            'services': {n: {k: by_name[containers[n]['name']][k]
+                             for k in ('CPUPerc', 'MemUsage', 'MemPerc')}
+                         for n in roles}}
+
+
+def paper_p0_gateway_cli(fixture, registry, image, volume, env_file, ca_file, tag, args,
+                         state, during=None):
+    """Finite Gateway CLI under the existing exact-owned registry, no --rm leaks."""
+    labels = {'test.task': 'native-compose-startup', 'test.run': fixture.project}
+    item = registry.intent('container', fixture.project + '-gateway-' + tag, image, labels)
+    if registry.resolve(item) is not None:
+        raise ValueError('resource_collision')
+    mounts = [('/data/outbox', 'volume', volume['name'], True),
+              ('/data/ca/ca.crt', 'bind', str(ca_file), False)]
+    tmpfs = {p: 'rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=1883,gid=1883'
+             for p in ('/tmp', '/mosquitto/data', '/mosquitto/log')}
+    item['expectation'] = {'mounts': mounts, 'tmpfs': tmpfs, 'user': '1883:1883',
+        'readonly': True, 'cap_drop': ['ALL'], 'security_opt': ['no-new-privileges:true'],
+        'network': fixture.project + '_iot_net'}
+    registry.save(item)
+    command = ['create', '--pull=never', '--name', item['name'], '--network', fixture.project + '_iot_net',
+               '--user', '1883:1883', '--read-only', '--cap-drop', 'ALL',
+               '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file)]
+    for key, value in labels.items():
+        command += ['--label', key + '=' + value]
+    for path, options in tmpfs.items():
+        command += ['--tmpfs', path + ':' + options]
+    command += ['--mount', 'type=volume,src=' + volume['name'] + ',dst=/data/outbox',
+                '--mount', 'type=bind,src=' + str(ca_file) + ',dst=/data/ca/ca.crt,readonly', image, *args]
+    registry.allocating(item)
+    result = registry.command(command)
+    obj = registry.resolve(item)
+    if result.returncode or obj is None or result.stdout.decode().strip() != obj['Id']:
+        raise ValueError('helper_allocation_unresolved')
+    if registry.command(['start', obj['Id']]).returncode:
+        raise ValueError('paper_p0_gateway_failed')
+    if during:
+        during()
+    deadline = time.monotonic() + 45
+    while True:
+        state.checkpoint()
+        obj = registry.resolve(item)
+        if not obj['State']['Running']:
+            break
+        if time.monotonic() >= deadline:
+            raise ValueError('paper_p0_gateway_failed')
+        time.sleep(0.2)
+    output = registry.command(['logs', obj['Id']])
+    private_write(fixture.private / ('gateway-' + tag + '.log'),
+                  (output.stdout + output.stderr).decode(errors='replace'))
+    if obj['State']['ExitCode'] or output.returncode:
+        raise ValueError('paper_p0_gateway_failed')
+    return output.stdout.decode()
+
+
+def validate_paper_p0_evidence(evidence):
+    if (evidence.get('checks') != {'login_users': 3, 'gateway_graphs': 2, 'raw_samples': 200,
+            'ledgers': 2, 'temporal_observations': 2, 'application_acks': 2,
+            'empty_outboxes': 2, 'cross_gateway_status': 404, 'positive_bracket': [200, 200],
+            'http_raw_points': 100, 'storage_status': 200}
+            or evidence.get('backend_quota') != {'cpus': 2, 'memory_bytes': 4294967296}
+            or len(evidence.get('snapshots', [])) != 4):
+        raise ValueError('paper_p0_acceptance_incomplete')
+
+
+def paper_p0_git(fixture, *args, runner=subprocess.run):
+    """Read metadata from this trusted source root, never change Git config."""
+    if args not in {('rev-parse', 'HEAD'), ('branch', '--show-current'), ('status', '--porcelain')}:
+        raise ValueError('paper_p0_metadata_failed')
+    command = ['git', '--no-optional-locks', '-c', 'safe.directory=' + str(ROOT),
+               '-C', str(ROOT), *args]
+    try:
+        result = runner(command, capture_output=True, timeout=10,
+                        env=process_env(fixture), check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError('paper_p0_metadata_failed') from None
+    if result.returncode:
+        raise ValueError('paper_p0_metadata_failed')
+    return result.stdout.decode().strip()
+
+
+def paper_p0_temporal_query(first, last):
+    """Match the existing /temporal UTC-Z input contract, without changing Go."""
+    start = datetime.fromisoformat(first) - timedelta(seconds=1)
+    end = datetime.fromisoformat(last) + timedelta(seconds=1)
+    if start.utcoffset() is None or end.utcoffset() is None:
+        raise ValueError('paper_p0_read_failed')
+    def utc_z(value):
+        return value.astimezone(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+    return urllib.parse.urlencode({'attrs': 'measurement', 'timerel': 'between',
+                                  'timeAt': utc_z(start), 'endTimeAt': utc_z(end)})
+
+
+def run_paper_p0(fixture, registry, endpoint, containers, images, state):
+    # Reuse the Stage 3 synthetic profile and independent SQL oracle on THIS DB.
+    # No other runner/main is invoked and no sentinel desired/config is seeded.
+    from stage3_uplink_runner import (default_specs, gateway_env, simulator_envelope,
+                                     build_gateway_assert_sql, synthetic_value)
+    from stage3_mqtt_ingress_runner import parse_run_summary
+
+    pg = containers['postgres']['receipt']['id']
+    backend = registry.resolve(containers['backend'])
+    quota = paper_p0_quota(backend['HostConfig'])
+    effective = json.loads((fixture.private / 'effective.json').read_text())
+    service_resources = {}
+    for name, item in containers.items():
+        if name in JOBS:
+            continue
+        host = registry.resolve(item)['HostConfig']
+        service_resources[name] = {k: host.get(k, 0) for k in
+                                  ('NanoCpus', 'CpuQuota', 'CpuPeriod', 'Memory')}
+    durable_json(fixture.private / 'paper-p0-resources.json',
+                 {'backend_quota': quota, 'service_resources': service_resources})
+    storage_status, _, storage_body = http_request(endpoint, 'GET', '/storage/v1/bucket',
+        token=fixture.values['SERVICE_ROLE_KEY'], api_key=fixture.values['SERVICE_ROLE_KEY'])
+    if storage_status != 200 or not isinstance(storage_body, list):
+        raise ValueError('paper_p0_storage_failed')
+    if http_request(endpoint, 'GET', '/readyz')[0] != 200:
+        raise ValueError('health_failed')
+
+    users, tokens = {}, {}
+    for role in ('admin', 'a', 'b'):
+        state.checkpoint()
+        email, password = role + '_' + secrets.token_hex(6) + '@example.invalid', secrets.token_urlsafe(24)
+        users[role] = create_user_via_admin_api(endpoint, fixture.values['SERVICE_ROLE_KEY'], email, password)
+        tokens[role] = login_user_for_token(endpoint, fixture.values['ANON_KEY'], email, password)
+    db_psql(registry, pg, "INSERT INTO platform_admins(user_id) VALUES (:'uid');", {'uid': users['admin']})
+    specs = [replace(s, gateway_id='gw_p0_' + role + '_' + secrets.token_hex(4),
+                     gateway_reported={}, gateway_desired={}, gateway_reported_version=0,
+                     gateway_desired_version=0, sensor_desired={}, sensor_desired_version=0)
+             for role, s in zip(('a', 'b'), default_specs())]
+    passwords = []
+    for role, spec in zip(('a', 'b'), specs):
+        state.checkpoint()
+        status, _, body = http_request(endpoint, 'POST', '/v1/digital-twins', token=tokens['admin'],
+            body={'entity_type': 'Gateway', 'gateway_id': spec.gateway_id,
+                  'name': spec.gateway_name, 'owner_user_id': users[role]})
+        if status != 201 or body.get('entity_id') != spec.gateway_urn:
+            raise ValueError('paper_p0_seed_failed')
+        status, _, body = http_request(endpoint, 'PUT',
+            f'/v1/gateways/{spec.gateway_id}/sensors/{spec.sensor_id}', token=tokens[role],
+            body={'name': spec.sensor_name, 'unit': spec.sensor_unit})
+        if status != 201 or body.get('entity_id') != spec.sensor_urn:
+            raise ValueError('paper_p0_seed_failed')
+        status, headers, body = http_request(endpoint, 'POST',
+            f'/v1/admin/gateways/{spec.gateway_id}/mqtt-credential', token=tokens['admin'],
+            headers={'Idempotency-Key': secrets.token_hex(16)}, timeout=40)
+        if (status != 201 or headers.get('Cache-Control') != 'no-store'
+                or body.get('status') != 'active' or body.get('username') != spec.gateway_id
+                or not body.get('password')):
+            raise ValueError('paper_p0_seed_failed')
+        passwords.append(body['password'])
+    sensor_path = '/v1/digital-twins/' + urllib.parse.quote(specs[0].sensor_urn, safe=':')
+    status, _, body = http_request(endpoint, 'GET', sensor_path, token=tokens['a'])
+    durable_json(fixture.private / 'paper-p0-read-progress.json',
+                 {'step': 'initial_sensor_detail', 'http_status': status})
+    if status != 200 or body.get('id') != specs[0].sensor_urn:
+        raise ValueError('paper_p0_read_failed')
+
+    snapshots = [paper_p0_stats(registry, containers, 'ready_before_uplink')]
+    durable_json(fixture.private / 'paper-p0-observations.json', snapshots)
+    messages = []
+    for role, spec, password in zip(('a', 'b'), specs, passwords):
+        state.checkpoint()
+        labels = {'test.task': 'native-compose-startup', 'test.run': fixture.project}
+        volume = registry.intent('volume', fixture.project + '_outbox_' + role, None, labels)
+        if registry.resolve(volume) is not None:
+            raise ValueError('resource_collision')
+        registry.allocating(volume)
+        result = registry.command(['volume', 'create', '--label', 'test.task=' + labels['test.task'],
+                                   '--label', 'test.run=' + fixture.project, volume['name']])
+        if result.returncode or registry.resolve(volume) is None:
+            raise ValueError('helper_allocation_unresolved')
+        env = gateway_env(spec.gateway_id, password)
+        env['GATEWAY_MQTT_BROKER_URL'] = 'ssl://mosquitto:8883'
+        env_file = fixture.private / ('gateway-' + role + '.env')
+        private_write(env_file, ''.join(k + '=' + v + '\n' for k, v in env.items()))
+        out = paper_p0_gateway_cli(fixture, registry, images['gateway'], volume, env_file,
+            fixture.private / 'certs/ca.crt', role, ['run', '--batches', '1', '--completion-timeout', '30s'], state,
+            during=lambda: snapshots.append(paper_p0_stats(registry, containers, 'gateway_' + role + '_run')))
+        durable_json(fixture.private / 'paper-p0-observations.json', snapshots)
+        summary = parse_run_summary(out)
+        expected_summary = {'completed': 'true', 'enqueued': '1', 'app_acknowledged': '1',
+                            'pending_rows': '0', 'pending_bytes': '0', 'quarantined_rows': '0', 'quarantined_bytes': '0'}
+        if any(summary.get(k) != v for k, v in expected_summary.items()):
+            raise ValueError('paper_p0_gateway_failed')
+        count = paper_p0_gateway_cli(fixture, registry, images['gateway'], volume, env_file,
+            fixture.private / 'certs/ca.crt', role + '-count', ['count'], state)
+        if count.strip() != 'pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0':
+            raise ValueError('paper_p0_gateway_failed')
+        # The shared assertion verifies per-message raw provenance, values,
+        # sample timestamps, ledger, temporal and reported/desired versions.
+        db_psql(registry, pg, build_gateway_assert_sql(spec, simulator_envelope(), 'paper_p0_batch'))
+        info = json.loads(db_psql(registry, pg, """
+SELECT json_build_object('gateway_id', gateway_id, 'message_id', message_id,
+ 'sample_count', sample_count, 'boot_id', boot_id) FROM processed_messages WHERE gateway_id=:'gw';
+""", {'gw': spec.gateway_id}).strip())
+        messages.append(info)
+    snapshots.append(paper_p0_stats(registry, containers, 'drained'))
+    durable_json(fixture.private / 'paper-p0-observations.json', snapshots)
+    # Prove that no setup or uplink write manufactured Stage 5 confirmation.
+    durable_json(fixture.private / 'paper-p0-read-progress.json', {'step': 'reported_configuration_absent'})
+    if db_psql(registry, pg, "SELECT count(*) FROM twin_states WHERE reported_state ? 'configuration';").strip() != '0':
+        raise ValueError('paper_p0_read_failed')
+    times = json.loads(db_psql(registry, pg, """
+SELECT json_build_object('first', min(measured_at), 'last', max(measured_at))
+FROM telemetry WHERE gateway_id=:'gw';
+""", {'gw': specs[0].gateway_id}).strip())
+    query = paper_p0_temporal_query(times['first'], times['last'])
+    durable_json(fixture.private / 'paper-p0-read-progress.json', {'step': 'temporal_measurement'})
+    status, _, body = http_request(endpoint, 'GET', sensor_path + '/temporal?' + query, token=tokens['a'])
+    points = body.get('measurement', {}).get('values', [])
+    # Only allowlisted counters/statuses; never persist a response body or token.
+    durable_json(fixture.private / 'paper-p0-read-progress.json',
+                 {'step': 'temporal_measurement', 'http_status': status, 'point_count': len(points)})
+    if (status != 200 or len(points) != 100
+            or any(abs(float(p[0]) - synthetic_value(i)) > 1e-9 for i, p in enumerate(points))):
+        raise ValueError('paper_p0_read_failed')
+    bracket = []
+    for target in (specs[0], specs[1], specs[0]):
+        status, _, body = http_request(endpoint, 'GET', '/v1/digital-twins/' + target.sensor_urn, token=tokens['a'])
+        bracket.append(status)
+        durable_json(fixture.private / 'paper-p0-read-progress.json',
+                     {'step': 'cross_gateway_bracket', 'http_statuses': bracket})
+        if status == 200 and body.get('id') != specs[0].sensor_urn:
+            raise ValueError('paper_p0_read_failed')
+        if status == 404 and body.get('error', {}).get('code') != 'not_found':
+            raise ValueError('paper_p0_read_failed')
+    if bracket != [200, 404, 200]:
+        raise ValueError('paper_p0_read_failed')
+    durable_json(fixture.private / 'paper-p0-read-progress.json', {'step': 'git_metadata'})
+    mem = next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:'))
+    evidence = {'backend_quota': quota, 'service_resources': service_resources, 'snapshots': snapshots,
+        'messages': messages, 'revision': paper_p0_git(fixture, 'rev-parse', 'HEAD'),
+        'branch': paper_p0_git(fixture, 'branch', '--show-current'),
+        'dirty': bool(paper_p0_git(fixture, 'status', '--porcelain')), 'tools': {
+            'docker_engine': registry.command(['version', '--format', '{{.Server.Version}}']).stdout.decode().strip(),
+            'compose': registry.command(['compose', 'version', '--short']).stdout.decode().strip(),
+            'python': sys.version.split()[0]}, 'host': {'kernel': os.uname().release,
+            'architecture': os.uname().machine, 'logical_cpus': os.cpu_count(), 'memory_bytes': int(mem) * 1024},
+        'images': {n: {'reference': effective['services'][n].get('image', 'source:src/Dockerfile#backend'), 'id': images[n]}
+                   for n in fixture_services(fixture)}, 'gateway_image_id': images['gateway'],
+        'checks': {'login_users': 3, 'gateway_graphs': 2, 'raw_samples': 200, 'ledgers': 2,
+            'temporal_observations': 2, 'application_acks': 2, 'empty_outboxes': 2,
+            'cross_gateway_status': bracket[1], 'positive_bracket': [bracket[0], bracket[2]],
+            'http_raw_points': len(points), 'storage_status': storage_status}}
+    validate_paper_p0_evidence(evidence)
+    return evidence
+
+
 def cli_arguments():
-    return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http")
+    return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http", "--paper-p0")
 
 
 def provision_role_identities(fixture, registry, endpoint, postgres_cid, gw_id, other_gw_id, existing_sensor):
@@ -2034,10 +2372,13 @@ def main():
     parser.add_argument('--positive-http-only', action='store_true', help='Phased stack startup and positive HTTP login/admin/owner sensor test only')
     parser.add_argument('--role-http-only', action='store_true', help='Phased startup, positive slice, and bounded role denials; JWT acceptance remains false')
     parser.add_argument('--full-http', action='store_true', help='Phased startup, positive proofs, role and JWT denials, and exact cleanup acceptance')
+    parser.add_argument('--paper-p0', action='store_true', help='Isolated P0 quota, Storage, Auth/API and two-Gateway uplink smoke')
     args = parser.parse_args()
+    if args.paper_p0 and any((args.startup_only, args.positive_http_only, args.role_http_only, args.full_http)):
+        parser.error('--paper-p0 cannot be combined with other execution modes')
     fixture = None
     try:
-        fixture = prepare(args.prepare)
+        fixture = prepare(args.prepare, paper_p0=True) if args.paper_p0 else prepare(args.prepare)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -2062,6 +2403,15 @@ def main():
         return 1
 
     try:
+        if args.paper_p0:
+            report = startup_only(fixture)
+            # Only this new mode removes its own generated secret inputs after
+            # successful owned-resource cleanup; failure inputs remain private.
+            if not is_fixture_verified(fixture):
+                raise ValueError('unsafe_fixture_path')
+            shutil.rmtree(fixture.private)
+            print(json.dumps(report))
+            return 0
         if args.startup_only:
             report = startup_only(fixture)
             print(json.dumps(report))
