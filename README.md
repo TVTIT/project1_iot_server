@@ -34,6 +34,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 - **Gateway Simulator (Stage 3, Task 3.5)** — công cụ phát triển phát telemetry tổng hợp qua MQTT/TLS với outbox SQLite bền vững và lệnh `run`/`pending`/`count`/`quarantine`: xem [hướng dẫn Gateway Simulator](docs/backend/stage-3-task-3.5-gateway-simulator.md).
 - **P0 — testbed paper local (24/10/2026): PASS** trên fixture riêng: Auth/API/Storage, schema 23, hai Gateway/200 mẫu/commit ACK/outbox drain và denial chéo Gateway; backend quota 2 vCPU/4 GiB. Chạy từ repo root bằng `sh scripts/test-paper-p0.sh` (tự tạo fixture mới, smoke rồi cleanup). Xem [baseline, số đo và lịch sử FAIL/PASS P0](docs/backend/paper-p0-baseline-and-testbed.md). Không đổi backend/API, không nghiệm thu production/benchmark, không tự mở P1 hoặc Stage 5.
 - **P1 — metrics và bộ ghi baseline (24/10/2026): PASS** trên fixture riêng: endpoint `/v1/admin/metrics` bảo vệ bằng JWT platform-admin, xuất `run.json`, `metrics.csv`, `resources.csv`; 2 Gateway × 20 batch (40 message / 4.000 samples) đối chiếu khớp DB; đo payload thực 1.066,2 B/msg; 1 replay byte-exact không tăng dữ liệu; cặp kiểm chứng `--metrics-off` PASS. Chạy từ repo root bằng `sh scripts/test-paper-p1.sh --mode baseline <NEW_DIR>`. Xem [báo cáo metrics và baseline P1](docs/backend/paper-p1-metrics-and-baseline.md). Không đổi Stage 5 (vẫn tắt), không tự mở P2.
+- **P2 — RS256/JWKS và HTTP perimeter (24/10/2026): PASS** trên fixture riêng: Auth cấp RS256 user token kèm legacy verify-only key, Go public JWKS verifier, Nginx client-to-gateway HTTPS kết hợp xác thực ngoại vi `auth_request` qua Unix socket nội bộ trong cùng tiến trình Go; Storage xác thực bằng public JWKS tĩnh và giữ URL signing HMAC; kiểm chứng rotation K1/K2 overlap, retry Storage bounded phân loại 503, fail-closed khi upstream gián đoạn; 2 Gateway × 20 batch (40 message / 4.000 samples) + 1 replay byte-exact, DB đối chiếu khớp, đọc temporal 199 điểm qua HTTPS; dọn dẹp chính xác 19 containers/1 network/7 volumes. Chạy từ repo root bằng `sh scripts/test-paper-p2.sh [NEW_RUN_DIRECTORY]`. Xem [báo cáo RS256 và HTTP perimeter P2](docs/backend/paper-p2-auth-and-http-perimeter.md). Giữ mặc định deployment là HS256/HTTP; không tự mở P3; Stage 5 tiếp tục giữ `STAGE5_ENABLED=false` (dừng sau 5.4); không xác nhận production hoặc zero-downtime.
 
 ---
 
@@ -351,7 +352,7 @@ Xem thêm quy trình Task 2.1, backend role và bootstrap platform admin tại [
 
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
-Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.2**, hiện bao gồm **10 jobs CI độc lập**:
+Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.3**, hiện bao gồm **10 jobs CI độc lập**:
 
 1. **`lint-and-test`**:
    - Kiểm tra định dạng code Go với `gofmt`.

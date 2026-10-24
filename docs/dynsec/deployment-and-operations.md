@@ -22,7 +22,7 @@ Hệ thống bắt buộc sử dụng các phiên bản container và định da
 | Dịch Vụ | Tham Chiếu Phiên Bản / Image Tag Đã Ghim | Mục Đích Sử Dụng |
 |---|---|---|
 | **Mosquitto Broker** | `eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9` (Phiên bản Mosquitto `2.0.18`) | Broker MQTT và plugin Dynamic Security (`/usr/lib/mosquitto_dynamic_security.so`). |
-| **Go Backend** | Xây dựng từ `src/Dockerfile` (Base builder: `golang:1.27.1-alpine`, Runtime: Mosquitto base) | Dịch vụ backend đơn khối (Modular Monolith) chạy dưới danh tính `1883:1883`. |
+| **Go Backend** | Xây dựng từ `src/Dockerfile` (Base builder: `golang:1.27.3-alpine`, Runtime: Mosquitto base) | Dịch vụ backend đơn khối (Modular Monolith) chạy dưới danh tính `1883:1883`. |
 | **Nginx Ingress** | `nginx:1.25-alpine` | Reverse proxy biên, định tuyến HTTP và WebSocket. |
 | **Supabase Envoy** | `envoyproxy/envoy:v1.39.1` | API Gateway nội bộ của Supabase, định tuyến `/auth/v1/*` và `/storage/v1/*`. |
 | **GoTrue Engine** | `supabase/gotrue:v2.196.0` | Động cơ xác thực người dùng Supabase Auth. |
