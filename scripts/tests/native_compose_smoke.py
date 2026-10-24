@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -120,6 +121,9 @@ DEFAULTS = dict(
     STAGE5_SUBSCRIBE_TIMEOUT="3s", STAGE5_RECONNECT_MAX_INTERVAL="30s",
     TWIN_RELATIONSHIP_DEFAULT_LIMIT="50", TWIN_RELATIONSHIP_MAX_LIMIT="200",
     SUPABASE_JWT_CLOCK_SKEW="30s", CLOUDFLARE_TUNNEL_TOKEN="fixture-unused-not-a-token",
+    SUPABASE_JWT_MODE="hs256", SUPABASE_JWKS_URL="", SUPABASE_JWKS_CACHE_TTL="60s",
+    AUTH_UNIX_SOCKET_PATH="",
+    SUPABASE_JWKS_HTTP_TIMEOUT="2s", SUPABASE_JWKS_REFRESH_COOLDOWN="5s",
     # User Management & Auth Admin bounds
     AUTH_ADMIN_BASE_URL="http://supabase-envoy:8000",
     AUTH_ADMIN_TIMEOUT="10s", AUTH_ADMIN_MAX_BODY_BYTES="16384",
@@ -140,10 +144,16 @@ class Fixture:
     artifacts_ino: int = 0
     paper_p0: bool = False
     paper_p1: str | None = None
+    paper_p2_spike: bool = False
+    paper_p2: bool = False
 
 
 def fixture_services(fixture):
-    if fixture.paper_p0 or fixture.paper_p1:
+    if fixture.paper_p2:
+        return ('postgres', 'supabase-role-provisioner', 'application-migrations', 'supabase-auth',
+                'supabase-compat-migration', 'mosquitto', 'supabase-storage', 'supabase-envoy',
+                'auth-socket-init', 'backend', 'nginx')
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike:
         return SERVICES[:-2] + ('supabase-storage',) + SERVICES[-2:]
     return SERVICES
 
@@ -507,10 +517,21 @@ def jwt(secret, role):
     return data + "." + signature
 
 
-def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True):
+def paper_p2_support():
+    spec = importlib.util.spec_from_file_location('paper_p2_support', Path(__file__).with_name('paper_p2_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False, paper_p2=False):
+    if paper_p2 and (paper_p0 or paper_p1 or paper_p2_spike):
+        raise ValueError('paper_p2_mode_rejected')
+    if paper_p2_spike and (paper_p0 or paper_p1):
+        raise ValueError('paper_p2_mode_rejected')
     if paper_p1 not in (None, 'baseline', 'optimized') or paper_p0 and paper_p1:
         raise ValueError('paper_p1_mode_rejected')
-    paper_profile = paper_p0 or paper_p1 is not None
+    paper_profile = paper_p0 or paper_p1 is not None or paper_p2_spike or paper_p2
     # Reject ambiguous env-file syntax and symlinked parents before writing.
     base = Path(base).absolute()
     if any(p.is_symlink() for p in (base, *base.parents)) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(base)):
@@ -524,7 +545,12 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True):
     if paper_profile:
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
                       MQTT_MAX_PAYLOAD_BYTES='65536')
-    values['METRICS_ENABLED'] = 'true' if paper_p1 and metrics_enabled else 'false'
+    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2) and metrics_enabled else 'false'
+    if paper_p2:
+        values.update(SUPABASE_JWT_MODE='rs256', SUPABASE_JWKS_URL='http://supabase-envoy:8000/auth/v1/.well-known/jwks.json',
+                      AUTH_UNIX_SOCKET_PATH='/run/iot-auth/auth.sock', GOTRUE_JWT_ISSUER='https://localhost/auth/v1',
+                      SUPABASE_PUBLIC_URL='https://localhost', GOTRUE_SITE_URL='https://localhost',
+                      CORS_ALLOWED_ORIGINS='https://client.example.test')
     for key in ("POSTGRES_PASSWORD", "AUTH_DB_PASSWORD", "STORAGE_DB_PASSWORD",
                 "BACKEND_DB_PASSWORD", "JWT_SECRET", "MQTT_PASSWORD",
                 "MQTT_DYNSEC_MANAGER_PASSWORD", "DASHBOARD_PASSWORD"):
@@ -562,8 +588,13 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True):
     # Copy only the reviewed broker config, never deployment certificates.
     private_write(private / "mosquitto.conf", (ROOT / "config/mosquitto/mosquitto.conf").read_text())
     art_stat = artifacts.stat()
-    return Fixture(base, private, artifacts, env_file, override, project, values,
-                   art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1)
+    fixture = Fixture(base, private, artifacts, env_file, override, project, values,
+                      art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2)
+    if paper_p2_spike or paper_p2:
+        paper_p2_support().prepare_spike(sys.modules[__name__], fixture)
+    if paper_p2:
+        paper_p2_support().prepare_perimeter(sys.modules[__name__], fixture)
+    return fixture
 
 
 def process_env(fixture):
@@ -581,8 +612,10 @@ def compose_command(fixture, action):
     # Returned commands are deferred plans, not permission to execute them.
     prefix = ["docker", "compose", "--project-directory", str(ROOT), "--project-name", fixture.project,
               "--env-file", str(fixture.env_file), "-f", str(ROOT_COMPOSE), "-f", str(fixture.override)]
-    if fixture.paper_p0 or fixture.paper_p1:
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2:
         prefix += ['-f', str(PAPER_P0_TEMPLATE)]
+    if fixture.paper_p2_spike or fixture.paper_p2:
+        prefix += ['-f', str(fixture.private / 'compose.p2.yml')]
     options = {"config": ["config", "--format", "json"],
                "build": ["build", "backend"],
                 "up": ["up", "--detach", "--no-deps", *fixture_services(fixture)]}
@@ -614,6 +647,8 @@ def validate_effective_model(fixture, model):
         "mosquitto": DEFAULTS["MQTT_DYNSEC_IMAGE_REFERENCE"],
         "nginx": "nginx:1.25-alpine", "supabase-auth": "supabase/gotrue:v2.196.0",
         "supabase-envoy": "envoyproxy/envoy:v1.39.1"}
+    if fixture.paper_p2:
+        expected_images['auth-socket-init'] = DEFAULTS['MQTT_DYNSEC_IMAGE_REFERENCE']
     for role in ("supabase-role-provisioner", "application-migrations", "supabase-compat-migration"):
         expected_images[role] = expected_images["postgres"]
     binds = {
@@ -645,12 +680,21 @@ def validate_effective_model(fixture, model):
         "backend": {"postgres": "service_healthy", "mosquitto": "service_started", "application-migrations": "service_completed_successfully", "supabase-compat-migration": "service_completed_successfully"},
         "supabase-envoy": {"supabase-auth": "service_healthy"},
         "nginx": {"backend": "service_started", "supabase-envoy": "service_started"}}
-    if fixture.paper_p0 or fixture.paper_p1:
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2:
         expected_images['supabase-storage'] = 'supabase/storage-api:v1.74.0'
         binds['supabase-storage'] = {}
         volume_mounts['supabase-storage'] = {('storage_data', '/var/lib/storage', False)}
         dependencies['supabase-storage'] = {'supabase-role-provisioner': 'service_completed_successfully'}
         dependencies['supabase-envoy']['supabase-storage'] = 'service_healthy'
+    if fixture.paper_p2:
+        binds['auth-socket-init'] = {}
+        binds['nginx'] = {str(ROOT / 'config/nginx/paper-p2.conf.template'): '/etc/nginx/templates/default.conf.template',
+                          str(fixture.private / 'p2-tls'): '/etc/nginx/p2-tls'}
+        volume_mounts['auth-socket-init'] = {('auth_socket', '/run/iot-auth', False)}
+        volume_mounts['backend'].add(('auth_socket', '/run/iot-auth', False))
+        volume_mounts['nginx'] = {('auth_socket', '/run/iot-auth', True)}
+        dependencies['auth-socket-init'] = {}
+        dependencies['backend'].update({'supabase-envoy': 'service_started', 'auth-socket-init': 'service_completed_successfully'})
     for name, service in services.items():
         if (service.get("container_name") or service.get("restart") != "no"
                 or service.get("privileged") or service.get("devices") or service.get("cap_add")
@@ -666,7 +710,7 @@ def validate_effective_model(fixture, model):
         ports = service.get("ports", [])
         if name == "nginx":
             if (len(ports) != 1 or ports[0].get("host_ip") != "127.0.0.1"
-                    or str(ports[0].get("published")) != "0" or ports[0].get("target") != 80
+                    or str(ports[0].get("published")) != "0" or ports[0].get("target") != (443 if fixture.paper_p2 else 80)
                     or ports[0].get("protocol") != "tcp"):
                 raise ValueError("effective_ports_rejected")
         elif ports:
@@ -683,7 +727,7 @@ def validate_effective_model(fixture, model):
                 or len(service.get("volumes", [])) != len(actual_binds) + len(actual_volumes)):
             raise ValueError("effective_mounts_rejected")
     backend = services["backend"]
-    if fixture.paper_p0 or fixture.paper_p1:
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2:
         env = backend.get('environment', {})
         expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'false',
                     'MQTT_CREDENTIAL_RUNTIME_ENABLED': 'false', 'MQTT_CREDENTIAL_API_ENABLED': 'true',
@@ -694,6 +738,8 @@ def validate_effective_model(fixture, model):
             raise ValueError('paper_p0_profile_rejected')
         if fixture.paper_p1 and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
             raise ValueError('paper_p1_profile_rejected')
+        if fixture.paper_p2:
+            paper_p2_support().validate_perimeter(fixture, services)
     if backend.get("build", {}).get("context") != str(ROOT / "src") or backend["build"].get("dockerfile") != "Dockerfile" or backend["build"].get("target") != "backend":
         raise ValueError("effective_build_rejected")
     for name in ("backend", "mosquitto"):
@@ -709,8 +755,10 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})
     expected_volumes = {'postgres_data', 'mosquitto_data', 'mosquitto_dynsec'}
-    if fixture.paper_p0 or fixture.paper_p1:
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2:
         expected_volumes.add('storage_data')
+    if fixture.paper_p2:
+        expected_volumes.add('auth_socket')
     if set(volumes) != expected_volumes or set(model.get("networks", {})) != {"iot_net"}:
         raise ValueError("effective_resources_rejected")
     for name in sorted(expected_volumes):
@@ -757,7 +805,7 @@ def execute_native(fixture, gate=None):
     raise RuntimeError("native_execution_deferred")
 
 
-JOBS = {'supabase-role-provisioner', 'application-migrations', 'supabase-compat-migration'}
+JOBS = {'supabase-role-provisioner', 'application-migrations', 'supabase-compat-migration', 'auth-socket-init'}
 
 
 def startup_state(service, state):
@@ -816,7 +864,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         if result.returncode:
             raise ValueError('backend_build_image_unresolved')
         images['backend'] = json.loads(result.stdout)[0]['Id']
-        if fixture.paper_p0 or fixture.paper_p1:
+        if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2:
             # Same Dockerfile builder, but the real Gateway target, not a host binary.
             fd = os.open(fixture.private / 'gateway-build-output.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'wb') as stream:
@@ -895,7 +943,10 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         obj = registry.resolve(containers[name])
                         if obj is None:
                             raise ValueError('phase_container_absent')
-                        ready = startup_state(name, obj['State']) if name in JOBS or name in ('postgres', 'supabase-auth', 'backend', 'supabase-storage') else probe_startup(registry, name, obj)
+                        if name == 'nginx' and fixture.paper_p2:
+                            ready = registry.command(['exec', obj['Id'], 'nginx', '-t']).returncode == 0
+                        else:
+                            ready = startup_state(name, obj['State']) if name in JOBS or name in ('postgres', 'supabase-auth', 'backend', 'supabase-storage') else probe_startup(registry, name, obj)
                         if ready:
                             evidence[name] = {'image_id': obj['Image'], 'id': obj['Id'], 'exit': obj['State'].get('ExitCode'), 'health': obj['State'].get('Health', {}).get('Status', 'probe_ready')}
                             break
@@ -933,12 +984,22 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         evidence['schema_exact'] = True
                     durable_json(fixture.private / 'startup-progress.json', {'phase': phase, 'evidence': evidence})
                 obj = registry.resolve(containers['nginx'])
-                ports = obj['NetworkSettings']['Ports'].get('80/tcp') or []
+                ports = obj['NetworkSettings']['Ports'].get('443/tcp' if fixture.paper_p2 else '80/tcp') or []
                 if len(ports) != 1 or ports[0]['HostIp'] != '127.0.0.1' or not 0 < int(ports[0]['HostPort']) < 65536:
                     raise ValueError('mapped_endpoint_rejected')
-                endpoint = 'http://127.0.0.1:' + ports[0]['HostPort']
-                evidence['endpoint'] = endpoint
-                if fixture.paper_p1:
+                url = ('https' if fixture.paper_p2 else 'http') + '://127.0.0.1:' + ports[0]['HostPort']
+                endpoint = HTTPSEndpoint(url, fixture.private / 'p2-ca.crt') if fixture.paper_p2 else url
+                evidence['endpoint'] = url
+                if fixture.paper_p2:
+                    phase = 'paper_p2'
+                    evidence['paper_p2'] = paper_p2_support().run_full(sys.modules[__name__], fixture,
+                        registry, endpoint, containers, images, state)
+                elif fixture.paper_p2_spike:
+                    phase = 'paper_p2_spike'
+                    state.checkpoint()
+                    evidence['paper_p2_spike'] = paper_p2_support().run_spike(
+                        sys.modules[__name__], fixture, registry, endpoint, containers, images)
+                elif fixture.paper_p1:
                     phase = 'paper_p1'
                     state.checkpoint()
                     evidence['paper_p1'] = run_paper_p1(fixture, registry, endpoint, containers, images, state)
@@ -1037,7 +1098,13 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         failure = exc
 
     cleanup_counts = {k: sum(i['kind'] == k and i.get('removed', False) for i in registry.items) for k in ('container', 'network', 'volume')}
-    if fixture.paper_p1:
+    if fixture.paper_p2_spike:
+        path = fixture.artifacts / 'spike.json'
+        result = json.loads(path.read_text()) if path.exists() else {'schema_version': 1}
+        result.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
+                      cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts)
+        durable_json(path, result)
+    if fixture.paper_p1 or fixture.paper_p2:
         path = fixture.artifacts / 'run.json'
         run = json.loads(path.read_text()) if path.exists() else {'schema_version': 1, 'run_id': fixture.project, 'mode': fixture.paper_p1}
         run.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
@@ -1049,7 +1116,17 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         raise FailureDiagnostic(fail_report, cause=failure) from failure
 
     try:
-        if fixture.paper_p1:
+        if fixture.paper_p2:
+            if cleanup_counts != {'container': 19, 'network': 1, 'volume': 7} or not evidence['paper_p2'].get('full_p2_accepted'):
+                raise ValueError('cleanup_acceptance_incomplete')
+            report = {'schema_version': 1, 'status': 'PAPER_P2_ACCEPTED', 'project': fixture.project,
+                      'native_executed': True, 'full_p2_accepted': True,
+                      'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts}
+        elif fixture.paper_p2_spike:
+            report = {'schema_version': 1, 'status': 'PAPER_P2_SPIKE_ACCEPTED', 'project': fixture.project,
+                      'native_executed': True, 'full_p2_accepted': False,
+                      'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts}
+        elif fixture.paper_p1:
             if cleanup_counts != {'container': 15, 'network': 1, 'volume': 6}:
                 raise ValueError('cleanup_acceptance_incomplete')
             report = {'schema_version': 1, 'status': 'PAPER_P1_ACCEPTED', 'project': fixture.project,
@@ -1281,7 +1358,7 @@ def assert_safe_data(data):
 ALLOWED_FAILURE_STATUSES = {"STARTUP_FAILED"}
 ALLOWED_FAILURE_PHASES = {
     "prepare", "preflight", "build", "bootstrap",
-    *SERVICES, 'supabase-storage', 'paper_p0', 'paper_p1',
+    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2',
     "positive_http", "role_http", "jwt_http",
     "cleanup", "report_validation"
 }
@@ -1290,6 +1367,8 @@ ALLOWED_FAILURE_ERROR_TYPES = {
     "RunnerInterrupted", "IncompleteCleanup", "Exception"
 }
 ALLOWED_FAILURE_ERROR_CODES = {
+    'paper_p2_mode_rejected', 'paper_p2_spike_failed', 'paper_p2_perimeter_failed',
+    'paper_p2_rotation_failed', 'paper_p2_acceptance_failed',
     'paper_p1_mode_rejected', 'paper_p1_profile_rejected', 'paper_p1_snapshot_rejected',
     'paper_p1_resources_rejected', 'paper_p1_subscription_failed', 'paper_p1_scrape_failed',
     'paper_p1_auth_failed', 'paper_p1_gateway_failed', 'paper_p1_reconciliation_failed',
@@ -1614,7 +1693,7 @@ def record_failure_report(
     if is_fixture_verified(fixture):
         try:
             durable_json(fixture.artifacts / "smoke-failure.json", report)
-            if fixture.paper_p1:
+            if fixture.paper_p1 or fixture.paper_p2:
                 path = fixture.artifacts / 'run.json'
                 run = json.loads(path.read_text()) if path.exists() else {
                     'schema_version': 1, 'run_id': fixture.project, 'mode': fixture.paper_p1}
@@ -1713,12 +1792,22 @@ def validate_summary(report):
         assert_safe_data(report.get("evidence", {}))
 
 
-def http_request(base_url: str, method: str, path: str, *, token: str = "", api_key: str = "",
+@dataclass(frozen=True)
+class HTTPSEndpoint:
+    url: str
+    ca_file: Path
+
+
+def http_request(base_url: str | HTTPSEndpoint, method: str, path: str, *, token: str = "", api_key: str = "",
                  headers: dict | None = None, body: dict | None = None, timeout: float = 10.0) -> tuple[int, dict, dict | str]:
-    parsed_url = urllib.parse.urlparse(base_url)
+    parsed_url = urllib.parse.urlparse(base_url.url if isinstance(base_url, HTTPSEndpoint) else base_url)
     host = parsed_url.hostname or "127.0.0.1"
     port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    if parsed_url.scheme == 'https':
+        context = ssl.create_default_context(cafile=str(base_url.ca_file)) if isinstance(base_url, HTTPSEndpoint) else ssl.create_default_context()
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
     req_headers = {"Content-Type": "application/json"}
     if headers:
         req_headers.update(headers)
@@ -1734,7 +1823,10 @@ def http_request(base_url: str, method: str, path: str, *, token: str = "", api_
         if len(raw) > 65536:
             raise ValueError("http_body_too_large")
         resp_headers = dict(response.getheaders())
-        parsed_body = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+        try:
+            parsed_body = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+        except json.JSONDecodeError:
+            parsed_body = raw.decode('utf-8', errors='replace')
         return response.status, resp_headers, parsed_body
     except (OSError, http.client.HTTPException) as exc:
         raise ValueError(f"http_request_failed: {type(exc).__name__}") from None
@@ -2081,6 +2173,19 @@ def paper_p1_metrics_csv(path, samples):
                     row('auth', name, 'counter', 'count', auth[name])
             if 'verify' in auth:
                 histograms.append(('auth', 'verify', auth['verify']))
+            unix = snap.get('unix_auth') or {}
+            for name in ('allow', 'deny'):
+                if name in unix:
+                    row('unix_auth', name, 'counter', 'count', unix[name])
+            if 'verify' in unix:
+                histograms.append(('unix_auth', 'verify', unix['verify']))
+            for name in ('unix_auth_handler', 'client_https'):
+                if snap.get(name) is not None:
+                    histograms.append((name, 'duration', snap[name]))
+            cache = snap.get('jwks_cache') or {}
+            for name in ('hits', 'misses', 'refresh_success', 'refresh_failure'):
+                if name in cache:
+                    row('jwks_cache', name, 'counter', 'count', cache[name])
             for route in snap.get('http', []):
                 # Export only router templates, never a sender-supplied URI.
                 key = route['route']
@@ -2483,7 +2588,7 @@ SELECT json_build_object('ledger', (SELECT count(*) FROM processed_messages),
 """).strip())
 
 
-def run_paper_p1(fixture, registry, endpoint, containers, images, state):
+def run_paper_p1(fixture, registry, endpoint, containers, images, state, *, extra=None, before_workload=None):
     from stage3_uplink_runner import (gateway_env, simulator_envelope, synthetic_value, SIM_BASE, SIM_PERIOD,
                                      build_gateway_assert_sql, parse_ingress_summary)
     from stage3_mqtt_ingress_runner import parse_run_summary, verify_ack
@@ -2508,8 +2613,12 @@ def run_paper_p1(fixture, registry, endpoint, containers, images, state):
         'host': {'kernel': os.uname().release, 'architecture': os.uname().machine, 'logical_cpus': os.cpu_count(),
                  'memory_bytes': int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:'))) * 1024,
                  'db_load_generator_same_host': True}}
+    if extra is not None:
+        run.update(extra)
+        run['status'] = 'FAIL'
     durable_json(fixture.artifacts / 'run.json', run)
-    samples, snapshots, gateway_results = [], [], []
+    auth_samples = before_workload(pg, tokens, specs, sensor_path, run) if before_workload is not None else []
+    samples, snapshots, gateway_results = auth_samples, [], []
     last_scrape = 0
 
     def scrape(phase, required=False):
@@ -2816,16 +2925,26 @@ def main():
     parser.add_argument('--full-http', action='store_true', help='Phased startup, positive proofs, role and JWT denials, and exact cleanup acceptance')
     parser.add_argument('--paper-p0', action='store_true', help='Isolated P0 quota, Storage, Auth/API and two-Gateway uplink smoke')
     parser.add_argument('--paper-p1', action='store_true', help='Bounded metrics and artifact workload, same isolated lifecycle as P0')
+    parser.add_argument('--paper-p2-spike', action='store_true', help='P2.1 compatibility only; not P2 acceptance')
+    parser.add_argument('--paper-p2', action='store_true', help='P2 isolated HTTPS/Unix perimeter checks')
     parser.add_argument('--mode', choices=('baseline', 'optimized'))
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
     args = parser.parse_args()
+    if args.paper_p2 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.startup_only,
+                             args.positive_http_only, args.role_http_only, args.full_http, args.mode, args.metrics_off)):
+        parser.error('P2 cannot be combined with other execution modes')
+    if args.paper_p2_spike and any((args.paper_p0, args.paper_p1, args.startup_only,
+                                  args.positive_http_only, args.role_http_only, args.full_http,
+                                  args.mode, args.metrics_off)):
+        parser.error('P2 spike cannot be combined with other execution modes')
     if (args.paper_p0 or args.paper_p1) and (any((args.startup_only, args.positive_http_only, args.role_http_only, args.full_http)) or args.paper_p0 and args.paper_p1):
         parser.error('paper mode cannot be combined with other execution modes')
     if args.paper_p1 != (args.mode is not None) or args.metrics_off and not args.paper_p1:
         parser.error('--paper-p1 requires --mode; --mode/--metrics-off require --paper-p1')
     fixture = None
     try:
-        fixture = prepare(args.prepare, paper_p0=args.paper_p0, paper_p1=args.mode, metrics_enabled=not args.metrics_off)
+        fixture = prepare(args.prepare, paper_p0=args.paper_p0, paper_p1=args.mode,
+                          metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike, paper_p2=args.paper_p2)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -2850,7 +2969,7 @@ def main():
         return 1
 
     try:
-        if args.paper_p0 or args.paper_p1:
+        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2:
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.

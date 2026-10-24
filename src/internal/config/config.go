@@ -46,6 +46,12 @@ type Config struct {
 	SupabaseJWTIssuer          string
 	SupabaseJWTAudience        string
 	SupabaseJWTClockSkew       time.Duration
+	SupabaseJWTMode            string
+	SupabaseJWKSURL            string
+	JWKSCacheTTL               time.Duration
+	JWKSHTTPTimeout            time.Duration
+	JWKSRefreshCooldown        time.Duration
+	AuthUnixSocketPath         string
 }
 
 // LoadFromEnvironment loads configuration from the process environment.
@@ -72,14 +78,13 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 
-	jwtSecret, ok := nonEmpty(lookup, "SUPABASE_JWT_SECRET")
-	if !ok {
-		return Config{}, fmt.Errorf("SUPABASE_JWT_SECRET is required")
+	if err := loadJWTMode(lookup, &cfg); err != nil {
+		return Config{}, err
 	}
-	if len(jwtSecret) < 32 {
-		return Config{}, fmt.Errorf("SUPABASE_JWT_SECRET must be at least 32 characters")
+	cfg.AuthUnixSocketPath, _ = nonEmpty(lookup, "AUTH_UNIX_SOCKET_PATH")
+	if cfg.AuthUnixSocketPath != "" && (!strings.HasPrefix(cfg.AuthUnixSocketPath, "/") || len(cfg.AuthUnixSocketPath) > 100 || strings.ContainsAny(cfg.AuthUnixSocketPath, "\x00\r\n")) {
+		return Config{}, fmt.Errorf("AUTH_UNIX_SOCKET_PATH must be an absolute short path")
 	}
-	cfg.SupabaseJWTSecret = jwtSecret
 
 	jwtIssuer, ok := nonEmpty(lookup, "SUPABASE_JWT_ISSUER")
 	if !ok {

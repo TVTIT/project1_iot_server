@@ -10,6 +10,7 @@ import (
 	"iot-platform/internal/config"
 	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/httpserver"
+	"iot-platform/internal/metrics"
 	"iot-platform/internal/mqttcontrol"
 	"iot-platform/internal/mqttingress"
 )
@@ -35,6 +36,9 @@ type processMetrics struct {
 	Ingress          *mqttingress.Snapshot               `json:"ingress"`
 	HTTP             []httpserver.HTTPMetricSnapshot     `json:"http"`
 	Auth             auth.MetricsSnapshot                `json:"auth"`
+	UnixAuth         *auth.MetricsSnapshot               `json:"unix_auth,omitempty"`
+	UnixAuthHandler  *metrics.HistogramSnapshot          `json:"unix_auth_handler,omitempty"`
+	JWKSCache        *auth.JWKSCacheSnapshot             `json:"jwks_cache,omitempty"`
 	DB               poolMetrics                         `json:"db"`
 	CommandAdmission *digitaltwin.ControlMetricsSnapshot `json:"command_admission"`
 	CommandDispatch  *mqttcontrol.MetricsSnapshot        `json:"command_dispatch"`
@@ -52,12 +56,24 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 	deps.MetricsEnabled = true
 	deps.HTTPMetrics = httpserver.NewHTTPMetrics()
 	deps.AuthMetrics = &auth.Metrics{}
+	if cfg.AuthUnixSocketPath != "" {
+		deps.UnixAuthMetrics = &auth.Metrics{}
+		deps.UnixAuthDuration = &metrics.Histogram{}
+	}
 	started, instance := time.Now(), uuid.NewString()
 	deps.MetricsSnapshot = func() any {
 		now := time.Now()
 		s := processMetrics{SchemaVersion: 1, ProcessInstance: instance, StartedAt: started.UTC(), ObservedAt: now.UTC(), ElapsedSeconds: now.Sub(started).Seconds(),
 			Availability: map[string]string{"ingress": "disabled", "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "batch_wait": "not_implemented", "websocket": "not_implemented"},
 			HTTP:         deps.HTTPMetrics.Snapshot(), Auth: deps.AuthMetrics.Snapshot()}
+		if deps.UnixAuthMetrics != nil {
+			a, h := deps.UnixAuthMetrics.Snapshot(), deps.UnixAuthDuration.Snapshot()
+			s.UnixAuth, s.UnixAuthHandler = &a, &h
+		}
+		if v, ok := deps.TokenVerifier.(interface{ CacheSnapshot() auth.JWKSCacheSnapshot }); ok {
+			c := v.CacheSnapshot()
+			s.JWKSCache = &c
+		}
 		if ingress.ingress != nil {
 			v := ingress.ingress.Snapshot()
 			s.Ingress = &v

@@ -1,0 +1,110 @@
+# Opt-in P2 only. The default HTTP deployment template is unchanged.
+upstream backend_api {
+    server backend:8080;
+}
+upstream auth_verifier {
+    server unix:/run/iot-auth/auth.sock;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${API_DOMAIN};
+    ssl_certificate /etc/nginx/p2-tls/server.crt;
+    ssl_certificate_key /etc/nginx/p2-tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 16k;
+    client_header_timeout 5s;
+    client_body_timeout 15s;
+    send_timeout 15s;
+    keepalive_timeout 30s;
+    proxy_connect_timeout 2s;
+    proxy_send_timeout 15s;
+    proxy_read_timeout 55s;
+    # Fixed fields only: never URI/query, Authorization, token or identity.
+    access_log off;
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    set $supabase_upstream http://kong:8000;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Forwarded "";
+    proxy_set_header X-User-ID "";
+    proxy_set_header X-Authenticated-User "";
+    proxy_set_header X-Role "";
+    proxy_set_header X-Forwarded-User "";
+    proxy_set_header X-Forwarded-Roles "";
+    proxy_set_header Authorization $http_authorization;
+
+    location = /_p2_auth {
+        internal;
+        proxy_pass http://auth_verifier/internal/auth/verify;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_pass_request_headers off;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Content-Length "";
+        proxy_connect_timeout 1s;
+        proxy_send_timeout 3s;
+        proxy_read_timeout 3s;
+    }
+
+    # Auth and Storage retain their own API-key/JWT/policy verification.
+    # Public JWKS must be reachable without a JWT; login/refresh are not looped.
+    location /auth/v1/ {
+        proxy_pass $supabase_upstream;
+        proxy_http_version 1.1;
+    }
+    location /storage/v1/ {
+        client_max_body_size 50m;
+        proxy_pass $supabase_upstream;
+        proxy_http_version 1.1;
+    }
+    location = /healthz {
+        return 200 'OK';
+    }
+    location = /readyz {
+        proxy_pass http://backend_api;
+    }
+    location = /v1/health {
+        proxy_pass http://backend_api;
+    }
+
+    # OPTIONS goes to the existing Go CORS validator, not an unconditional 204.
+    # A named location is inaccessible by a client URI.
+    location @business_preflight {
+        proxy_pass http://backend_api;
+    }
+    location = /v1/ws {
+        error_page 418 = @business_preflight;
+        if ($request_method = OPTIONS) { return 418; }
+        auth_request /_p2_auth;
+        proxy_pass http://backend_api;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        # Child proxy_set_header directives suppress parent inheritance.
+        proxy_set_header Host $host;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-User-ID "";
+        proxy_set_header X-Authenticated-User "";
+        proxy_set_header X-Role "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header X-Forwarded-Roles "";
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-Host $host;
+    }
+    location /v1/ {
+        error_page 418 = @business_preflight;
+        if ($request_method = OPTIONS) { return 418; }
+        auth_request /_p2_auth;
+        proxy_pass http://backend_api;
+    }
+    location / {
+        return 404;
+    }
+}

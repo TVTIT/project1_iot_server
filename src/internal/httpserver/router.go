@@ -14,6 +14,7 @@ import (
 	"iot-platform/internal/config"
 	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/httpapi"
+	"iot-platform/internal/metrics"
 	"iot-platform/internal/usermanagement"
 )
 
@@ -29,6 +30,8 @@ type RouterDependencies struct {
 	ControlMetrics             *digitaltwin.ControlMetrics
 	HTTPMetrics                *HTTPMetrics
 	AuthMetrics                *auth.Metrics
+	UnixAuthMetrics            *auth.Metrics
+	UnixAuthDuration           *metrics.Histogram
 	ControlAPIEnabled          bool
 	ControlRequestTimeout      time.Duration
 	ControlRepository          ControlRepository
@@ -176,6 +179,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 
 	router := gin.New()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		return nil, fmt.Errorf("disable untrusted proxy headers: %w", err)
+	}
 	if deps.HTTPMetrics != nil {
 		router.Use(deps.HTTPMetrics.middleware())
 	}

@@ -47,15 +47,8 @@ func NewHS256Verifier(cfg VerifierConfig) (Verifier, error) {
 	if len(strings.TrimSpace(cfg.Secret)) < 32 {
 		return nil, fmt.Errorf("JWT secret must be at least 32 characters")
 	}
-	issuer, err := url.Parse(cfg.Issuer)
-	if err != nil || !issuer.IsAbs() || (issuer.Scheme != "http" && issuer.Scheme != "https") || issuer.Host == "" || issuer.User != nil {
-		return nil, fmt.Errorf("JWT issuer must be an absolute HTTP(S) URL without user information")
-	}
-	if cfg.Audience != "authenticated" {
-		return nil, fmt.Errorf("JWT audience must be authenticated")
-	}
-	if cfg.ClockSkew < 0 || cfg.ClockSkew > 5*time.Minute {
-		return nil, fmt.Errorf("JWT clock skew must be between 0s and 5m0s")
+	if err := validateTokenContract(cfg); err != nil {
+		return nil, err
 	}
 
 	secret := append([]byte(nil), cfg.Secret...)
@@ -71,6 +64,21 @@ func NewHS256Verifier(cfg VerifierConfig) (Verifier, error) {
 			jwt.WithStrictDecoding(),
 		),
 	}, nil
+}
+
+func validateTokenContract(cfg VerifierConfig) error {
+	issuer, err := url.Parse(cfg.Issuer)
+	if err != nil || !issuer.IsAbs() || (issuer.Scheme != "http" && issuer.Scheme != "https") || issuer.Host == "" || issuer.User != nil {
+		return fmt.Errorf("JWT issuer must be an absolute HTTP(S) URL without user information")
+	}
+	if cfg.Audience != "authenticated" {
+		return fmt.Errorf("JWT audience must be authenticated")
+	}
+	if cfg.ClockSkew < 0 || cfg.ClockSkew > 5*time.Minute {
+		return fmt.Errorf("JWT clock skew must be between 0s and 5m0s")
+	}
+
+	return nil
 }
 
 func (v *hs256Verifier) Verify(ctx context.Context, rawToken string) (Principal, error) {

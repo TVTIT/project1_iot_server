@@ -68,6 +68,8 @@ func run() error {
 		serverReady  bool
 		ingress      ingressRuntime
 		control      stage5Runtime
+		authSocket   *auth.UnixAuthServer
+		closeAuth    = func() {}
 	)
 	shutdown := func() error {
 		shutdownOnce.Do(func() {
@@ -101,6 +103,10 @@ func run() error {
 					shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown HTTP server: %w", err))
 				}
 			}
+			if authSocket != nil {
+				shutdownErr = errors.Join(shutdownErr, authSocket.Close(ctx))
+			}
+			closeAuth()
 			if err := credentials.closeContext(ctx); err != nil {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("credential shutdown close unconfirmed: %w", err))
 			}
@@ -128,15 +134,11 @@ func run() error {
 		return fmt.Errorf("check MQTT credential runtime: %w", err)
 	}
 
-	tokenVerifier, err := auth.NewHS256Verifier(auth.VerifierConfig{
-		Secret:    cfg.SupabaseJWTSecret,
-		Issuer:    cfg.SupabaseJWTIssuer,
-		Audience:  cfg.SupabaseJWTAudience,
-		ClockSkew: cfg.SupabaseJWTClockSkew,
-	})
+	tokenVerifier, closeVerifier, err := composeTokenVerifier(rootCtx, cfg)
 	if err != nil {
 		return fmt.Errorf("create JWT verifier: %w", err)
 	}
+	closeAuth = closeVerifier
 
 	adminChecker, err := auth.NewPostgresPlatformAdminChecker(pool)
 	if err != nil {
@@ -225,6 +227,15 @@ func run() error {
 		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       cfg.HTTPIdleTimeout,
 	}
+	var authSocketErrors <-chan error
+	if cfg.AuthUnixSocketPath != "" {
+		authSocket, err = auth.ListenUnixAuth(cfg.AuthUnixSocketPath,
+			auth.NewInternalAuthHandler(tokenVerifier, routerDeps.UnixAuthMetrics, routerDeps.UnixAuthDuration))
+		if err != nil {
+			return fmt.Errorf("start auth socket: %w", err)
+		}
+		authSocketErrors = authSocket.Errors()
+	}
 
 	if err := ingress.start(); err != nil {
 		return fmt.Errorf("start MQTT telemetry ingress: %w", err)
@@ -241,6 +252,11 @@ func run() error {
 	}()
 
 	select {
+	case err := <-authSocketErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("auth socket server stopped")
+		}
+		return nil
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("serve HTTP: %w", err)

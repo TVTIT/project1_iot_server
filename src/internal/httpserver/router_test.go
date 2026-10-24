@@ -107,6 +107,7 @@ func TestUnknownRouteAndMethodUseSafeErrorContract(t *testing.T) {
 		wantCode   string
 	}{
 		{method: http.MethodGet, path: "/missing", wantStatus: http.StatusNotFound, wantCode: "not_found"},
+		{method: http.MethodGet, path: "/internal/auth/verify", wantStatus: http.StatusNotFound, wantCode: "not_found"},
 		{method: http.MethodPost, path: "/healthz", wantStatus: http.StatusMethodNotAllowed, wantCode: "method_not_allowed"},
 	}
 
