@@ -4,6 +4,20 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
+## P1 metrics — nghiệm thu local baseline và bộ ghi đo (24/10/2026)
+
+Xem [report P1](../backend/paper-p1-metrics-and-baseline.md): lượt baseline và lượt đối chứng
+`metrics-off` đều PASS (`PAPER_P1_ACCEPTED`), cleanup verified 15 containers / 1 network / 6 volumes.
+Lượt FAIL lịch sử do runner đăng ký sai credential telemetry được giữ nguyên. Không suy P1 thành
+benchmark năng lực tối đa hay rollout production.
+
+| Giới hạn / quyết định | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Lượt đầu FAIL do subscriber capture dùng sai credential Gateway — **ĐÃ SỬA THEO DUYỆT** | Lượt đầu vẫn FAIL lịch sử (`paper_p1_subscription_failed`); lượt sau đã PASS 40 messages/4.000 samples | Đã sửa subscriber sang data principal backend với filter `gateways/+/telemetry/#` có sẵn; giữ credential Gateway cho replay/ACK, thêm guard | Đã xử lý; giữ regression |
+| Khối lượng workload ngắn (40 batch) trên cùng host 12 vCPU khiến chênh lệch overhead nhỏ hơn nhiễu đo lường | Chưa đo được overhead tách biệt của instrumentation; wall window (~40,2s vs ~40,5s) và drain window (<3ms) dao động ngẫu nhiên | Ghi nhận "chưa kết luận được overhead", không tuyên bố zero overhead; giữ cặp lệnh `--metrics-off` để so sánh | Khi chạy benchmark tải cao ở P8 |
+| Percentile từ Histogram của backend có độ phân giải hữu hạn (Fixed Buckets) | Không thể suy diễn p50/p95/p99 thành một số mili-giây chính xác duy nhất | Báo cáo theo khoảng bucket chứa percentile (ví dụ Persist p50 trong `(10; 25] ms`); Gateway ACK giữ nearest-rank từ mẫu | Khi cần profiling chi tiết ở phase tối ưu |
+| Command dispatch E2E, result confirmation và WebSocket chưa có runtime | Không có số đo trễ toàn tuyến cho command và realtime ở P1 | Đánh dấu `not_implemented` (giá trị `null`) và `disabled` (command); giữ `STAGE5_ENABLED=false` | Khi P3/P6/P7 được giao thực hiện |
+
 ## P0 testbed — nghiệm thu local có giới hạn (24/10/2026)
 
 Xem [report P0](../backend/paper-p0-baseline-and-testbed.md): lượt cuối

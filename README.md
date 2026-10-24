@@ -33,6 +33,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
 - **Gateway Simulator (Stage 3, Task 3.5)** — công cụ phát triển phát telemetry tổng hợp qua MQTT/TLS với outbox SQLite bền vững và lệnh `run`/`pending`/`count`/`quarantine`: xem [hướng dẫn Gateway Simulator](docs/backend/stage-3-task-3.5-gateway-simulator.md).
 - **P0 — testbed paper local (24/10/2026): PASS** trên fixture riêng: Auth/API/Storage, schema 23, hai Gateway/200 mẫu/commit ACK/outbox drain và denial chéo Gateway; backend quota 2 vCPU/4 GiB. Chạy từ repo root bằng `sh scripts/test-paper-p0.sh` (tự tạo fixture mới, smoke rồi cleanup). Xem [baseline, số đo và lịch sử FAIL/PASS P0](docs/backend/paper-p0-baseline-and-testbed.md). Không đổi backend/API, không nghiệm thu production/benchmark, không tự mở P1 hoặc Stage 5.
+- **P1 — metrics và bộ ghi baseline (24/10/2026): PASS** trên fixture riêng: endpoint `/v1/admin/metrics` bảo vệ bằng JWT platform-admin, xuất `run.json`, `metrics.csv`, `resources.csv`; 2 Gateway × 20 batch (40 message / 4.000 samples) đối chiếu khớp DB; đo payload thực 1.066,2 B/msg; 1 replay byte-exact không tăng dữ liệu; cặp kiểm chứng `--metrics-off` PASS. Chạy từ repo root bằng `sh scripts/test-paper-p1.sh --mode baseline <NEW_DIR>`. Xem [báo cáo metrics và baseline P1](docs/backend/paper-p1-metrics-and-baseline.md). Không đổi Stage 5 (vẫn tắt), không tự mở P2.
 
 ---
 

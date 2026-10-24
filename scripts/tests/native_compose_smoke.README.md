@@ -1,6 +1,25 @@
 # Native Compose smoke preparation
 
-## Hiện hành — P0 paper testbed (24/10/2026)
+## Hiện hành — P1 metrics và baseline (24/10/2026)
+
+P1 đã PASS cục bộ qua wrapper `test-paper-p1.sh` và runner `--paper-p1 --mode baseline|optimized`.
+Source terminal là **23**.
+
+```sh
+sh scripts/test-paper-p1.sh --mode baseline /tmp/opencode/NEW-P1-DIRECTORY
+sh scripts/test-paper-p1.sh --mode baseline /tmp/opencode/NEW-P1-OFF-DIRECTORY --metrics-off
+```
+
+- Kế thừa toàn bộ lifecycle, topology 10 service (7 dài hạn + 3 init jobs), quota backend 2 vCPU/4 GiB của P0.
+- Bật công tắc `METRICS_ENABLED=true` khi chạy mode P1 thông thường; cờ `--metrics-off` tắt instrumentation và scraper cho lượt đối chứng overhead.
+- Bảo vệ endpoint `/v1/admin/metrics` bằng JWT platform-admin qua Nginx (401/403/200).
+- Chạy 2 Gateway CLI × 20 batch = 40 message / 4.000 samples, 1 replay byte-exact, đối chiếu khớp chính xác DB (ledger, raw, temporal).
+- Xuất 3 artifacts an toàn: `run.json`, `metrics.csv`, `resources.csv` (không chứa secrets/payloads).
+- Lượt baseline cuối: `/tmp/opencode/paper-p1-baseline-20261024-approved`, exit 0, `PAPER_P1_ACCEPTED`.
+- Lượt đối chứng cuối: `/tmp/opencode/paper-p1-metrics-off-20261024`, exit 0, `PAPER_P1_ACCEPTED`.
+- Chi tiết xem [báo cáo metrics và baseline P1](../../docs/backend/paper-p1-metrics-and-baseline.md).
+
+## Checkpoint trước — P0 paper testbed (24/10/2026)
 
 P0 đã PASS cục bộ qua wrapper sau sửa runner được duyệt; các checkpoint phía dưới
 là lịch sử, không mô tả schema/mode hiện tại. Source terminal là **23**.
