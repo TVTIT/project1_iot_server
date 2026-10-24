@@ -1,6 +1,47 @@
 # Native Compose smoke preparation
 
-## Latest phased startup result (supersedes historical preparation status)
+## Hiện hành — P0 paper testbed (24/10/2026)
+
+P0 đã PASS cục bộ qua wrapper sau sửa runner được duyệt; các checkpoint phía dưới
+là lịch sử, không mô tả schema/mode hiện tại. Source terminal là **23**.
+
+Từ repo root, với Docker/Compose >= 2.24.4, Python3, OpenSSL, `setfacl` và upstream
+images đã có trong Docker cache:
+
+```sh
+sh scripts/test-paper-p0.sh /tmp/opencode/NEW-P0-DIRECTORY
+```
+
+Thư mục phải mới; bỏ đối số để wrapper tạo tên ngẫu nhiên. Wrapper gọi
+`native_compose_smoke.py --prepare <new-directory> --paper-p0`, giữ exit status,
+không đổi thiếu Docker/lỗi thành PASS. `--paper-p0` không kết hợp mode khác.
+
+- Reuse lifecycle/registry/Compose root, thêm fragment `compose.paper-p0.override.yml`.
+  Mười service (7 dài hạn + 3 init jobs); Storage chỉ thêm trong P0. Hai Gateway CLI
+  chạy hữu hạn cùng mạng với outbox riêng; không có backend thứ hai hoặc tunnel.
+- Backend quota 2 vCPU/4 GiB, ingress bật, queue 256/workers 4/payload 65.536 byte,
+  DB max pool 10; legacy credential runtime và Stage 5 tắt. Credential API bật
+  trong fixture để setup. Không đổi default hoặc assertions của các mode cũ.
+- HTTP loopback Nginx → Go hoặc Envoy → GoTrue/Storage; MQTT TLS + DynSec trên mạng
+  riêng. Chỉ Nginx có cổng host động/loopback. Không đọc/source deployment `.env`.
+- Ba login thật, provisioning A/B, 200 raw/2 ledger/2 temporal, hai commit ACK và
+  SQLite outbox drain; canonical temporal 100 điểm và denial bracket 200/404/200.
+  `/temporal` backend không đổi: runner gửi timestamp UTC hậu tố `Z` đúng contract.
+- Metadata Git dùng private HOME và trust đúng ROOT chỉ trong ba lệnh đọc, thêm
+  `--no-optional-locks`; không sửa global config, owner hay trust wildcard.
+- Success `PAPER_P0_ACCEPTED` chỉ sau cleanup đúng 15 containers/1 network/6 volumes;
+  private env/TLS/store/logs/receipts được xóa sau thành công. Failure giữ private
+  diagnostics để chẩn đoán, **không upload**; cleanup lỗi không được coi là PASS.
+  Build images/cache được giữ lại, không prune.
+- Giữ summary an toàn `artifacts/startup-summary.json`; không upload cả fixture.
+  Bốn snapshot Docker stats chỉ là smoke, không phải benchmark/peak/capacity.
+
+Lượt cuối: `/tmp/opencode/paper-p0-20261024-final`, exit 0; **205 guard tests PASS**.
+Xem [report P0 và hai FAIL lịch sử](../../docs/backend/paper-p0-baseline-and-testbed.md)
+để có image IDs, quota/host/snapshot, phạm vi NOT RUN và backlog. Không tự triển
+khai P1, WebSocket, media workflow hoặc Stage 5.5–5.8.
+
+## Historical phased startup result (2026-10-13)
 
 `--startup-only` now executes real phased startup, while `execute_native()` and
 HTTP acceptance remain closed. Latest evidence:

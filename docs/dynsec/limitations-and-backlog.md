@@ -4,6 +4,21 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
+## P0 testbed — nghiệm thu local có giới hạn (24/10/2026)
+
+Xem [report P0](../backend/paper-p0-baseline-and-testbed.md): lượt cuối
+`PAPER_P0_ACCEPTED`, 205 guards PASS, cleanup verified. Hai FAIL lịch sử giữ nguyên;
+không suy P0 thành benchmark, full CI hoặc rollout production.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Lượt đầu FAIL `paper_p0_read_failed` do runner tạo timezone `+00:00` thay vì contract `Z` — **ĐÃ SỬA THEO DUYỆT** | Lượt đầu vẫn FAIL lịch sử; lượt hai đã qua HTTP temporal 100 điểm và bracket 200/404/200 | Chỉ sửa serialization runner/test, không đổi parser/response API; xem report P0 | Đã xử lý trong runner; giữ regression |
+| Lượt hai FAIL ở Git `dubious ownership` với private HOME — **ĐÃ SỬA THEO DUYỆT** | Lượt hai vẫn exit 1 lịch sử; lượt cuối đã có revision/branch/dirty và summary đầy đủ | Chỉ trust đúng ROOT trong từng lệnh Git đọc, `--no-optional-locks`; không sửa global config/owner, không wildcard hoặc bỏ metadata. Lượt cuối exit 0 | Đã xử lý; giữ regression private HOME |
+| Snapshot chỉ là bốn cửa sổ stats rất ngắn | CPU làm tròn 0,00% không chứng minh không tốn CPU; chưa đo peak/throughput/tail latency | Bốn snapshot cuối đã lưu, tách service/quota và timestamp trong report; không dùng làm benchmark | Khi phase đo workload được giao |
+| Profile P0 dùng HTTP loopback, tất cả dịch vụ cùng Docker host | Không chứng minh HTTPS public hoặc topology nhiều máy/capacity mục tiêu paper | Chỉ user/token fixture dùng một lần, không tunnel; mô tả đúng mạng và tranh chấp host, giữ MQTT TLS/DynSec | HTTPS ở P2; tài nguyên/workload ở phase đo được giao |
+| Backend có quota 2 vCPU/4 GiB, DB/broker/Supabase chưa có quota riêng | Có tranh chấp host; không tương đương máy DB 4 core/8 GB và máy sinh tải 8 core/16 GB độc lập | Report công bố inspect thực và host 12 logical CPUs/16.681.447.424 byte RAM; giữ một backend, không suy hiệu năng từ snapshot | Khi chốt testbed cho workload ở phase đo được giao |
+| Một số upstream refs là version tags, không phải digest immutable | Rebuild tương lai có thể không bit-for-bit giống lượt P0 nếu tag đổi | Ghi exact image IDs/references trong report; không tự upgrade/pull, kiểm lại IDs và baseline trước khi so sánh | Trước lượt đo mới hoặc khi đổi image/toolchain |
+
 ## Mốc Stage 5 tạm dừng sau Task 5.4 — 24/10/2026
 
 Task 5.0–5.4 đã hoàn thành theo phạm vi duyệt; 5.5–5.8 hoãn lại, không tự triển
