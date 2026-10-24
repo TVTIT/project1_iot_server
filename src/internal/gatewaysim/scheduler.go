@@ -620,9 +620,13 @@ func (s *Scheduler) startPublish(e *inflightEntry) {
 			s.latency.RecordFirstPublish(id)
 		}
 		err := s.pub.Publish(s.ctx, topic, payload)
+		// Run still consumes completion results while draining after cancellation.
+		// Dropping one on ctx.Done leaves a phantom publishing entry until the
+		// drain deadline. Only abandon delivery once the scheduler has returned;
+		// this also releases a late publisher if the bounded drain timed out.
 		select {
 		case s.pubResults <- publishResult{messageID: id, err: err}:
-		case <-s.ctx.Done():
+		case <-s.done:
 		}
 	}()
 }

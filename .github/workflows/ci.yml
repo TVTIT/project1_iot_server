@@ -332,15 +332,11 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_stage2_mqtt_credentials.py'
           python3 -m unittest discover -s scripts/tests -p 'test_task2612_standalone.py'
-      - name: Legacy credential execution deferred notice
+      - name: Current simplified credential acceptance
         run: |
-          notice=$(printf '%s\n' \
-            "legacy-execution-deferred: mosquitto-credential-integration" \
-            "Omitted native scenario: legacy credential lifecycle and controller standalone integration." \
-            "Known unresolved failure: standalone controller gate mismatch source-proven (cmd/server does not call legacy OpenVerified); gate closed." \
-            "Current replacement verification jobs: dynsec-native-integration and native-compose-smoke.")
-          printf '%s\n' "$notice"
-          printf '%s\n' "$notice" >> "$GITHUB_STEP_SUMMARY"
+          sh scripts/test-stage2-mqtt-credentials.sh
+          echo "current-simplified-acceptance: TLS/auth/ACL, API/readiness/shutdown; no global gate guarantee" >> "$GITHUB_STEP_SUMMARY"
+          echo "Retained gate/controller tests are LEGACY COMPONENT-ONLY: sh scripts/test-legacy-mqtt-controller.sh (not deployment acceptance)." >> "$GITHUB_STEP_SUMMARY"
       - name: Lint credentials
         uses: golangci/golangci-lint-action@v9
         with:

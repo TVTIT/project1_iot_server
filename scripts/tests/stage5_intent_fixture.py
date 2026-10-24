@@ -44,8 +44,9 @@ def native(fixture, binary):
         'CONTROL_TEST_BACKEND_URL="postgres://iot_backend_app:${BACKEND_DB_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"; '
         'exec /tmp/control.test -test.v -test.timeout 120s -test.coverprofile=/tmp/control.cover -test.run "^TestNativeControl"'], timeout=150)
     text = output.decode()
-    required = re.findall(r'^func (TestNativeControl\w+)\(',
-        (ROOT / 'src/internal/digitaltwin/postgres_control_integration_test.go').read_text(), re.M)
+    required = []
+    for path in (ROOT / 'src/internal/digitaltwin').glob('postgres_control*integration_test.go'):
+        required.extend(re.findall(r'^func (TestNativeControl\w+)\(', path.read_text(), re.M))
     if not required or '--- SKIP:' in text or any(
             f'=== RUN   {name}\n' not in text or f'--- PASS: {name} (' not in text
             for name in required):

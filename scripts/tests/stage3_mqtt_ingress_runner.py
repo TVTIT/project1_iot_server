@@ -739,7 +739,7 @@ def docker_available() -> bool:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Task 3.4/3.5 bounded real integration smoke')
-    parser.add_argument('--mode', choices=('ingress', 'simulator'), default='ingress',
+    parser.add_argument('--mode', choices=('ingress', 'simulator', 'control'), default='ingress',
                         help='ingress: Task 3.4 Python producer; simulator: actual cmd/gateway CLI')
     opts = parser.parse_args(argv)
     mode = opts.mode
@@ -789,9 +789,14 @@ def main(argv=None) -> int:
         docker(['network', 'connect', '--alias', 'database', net_name, fixture.container_id], timeout=30)
 
         print('stage=migrate-000020', flush=True)
-        bootstrap_to_9(fixture)
-        run_existing_migration_runner(fixture, 20)
-        seed_graph(fixture)
+        if mode == 'control':
+            from stage5_intent_fixture import migrate, verify
+            migrate(fixture, 23)
+            verify(fixture)
+        else:
+            bootstrap_to_9(fixture)
+            run_existing_migration_runner(fixture, 20)
+            seed_graph(fixture)
 
         print('stage=bootstrap-dynsec', flush=True)
         dynsec_volume = bootstrap_dynsec(work, manager_password, backend_password)
@@ -817,6 +822,11 @@ def main(argv=None) -> int:
         docker(['start', broker_cid], timeout=CONTAINER_START_TIMEOUT)
         broker_port = mapped_port(broker_cid, '8883/tcp')
         wait_tcp(broker_port, BROKER_READY_TIMEOUT)
+
+        if mode == 'control':
+            from stage5_mqtt_fixture import exercise
+            exercise(fixture, work, broker_cid, broker_port, manager_password, backend_password, gateway_password, server, net_name)
+            return 0
 
         print('stage=dynsec-control', flush=True)
         manager = connect_manager(broker_port, work, manager_password)

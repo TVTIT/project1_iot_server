@@ -886,6 +886,35 @@ func TestSchedulerFiniteBudgetExpiryIsNotCompleted(t *testing.T) {
 	}
 }
 
+func TestSchedulerCancelledPublishesStillCompleteDrain(t *testing.T) {
+	// Cancellation stops production, not completion accounting. Every invocation
+	// below returns immediately with cancellation; none may leave a phantom
+	// statePublishing entry for the shutdown drain to wait on.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	clock := newFakeClock()
+	const count = 32
+	s := &Scheduler{
+		ctx: ctx, clock: clock, pub: newFakePublisher(clock),
+		cfg:        schedulerConfig{shutdownTimeout: time.Second, retryMin: time.Second, retryMax: time.Second},
+		randFloat:  func() float64 { return 0.5 },
+		inflight:   make(map[uuid.UUID]*inflightEntry),
+		pubResults: make(chan publishResult, count),
+		done:       make(chan struct{}),
+	}
+	defer close(s.done)
+	for i := 0; i < count; i++ {
+		id := seqUUID(uint64(i + 1))
+		e := &inflightEntry{item: Item{MessageID: id}}
+		s.inflight[id] = e
+		s.startPublish(e)
+	}
+	s.waitPublishes()
+	if got := s.publishingCount(); got != 0 {
+		t.Fatalf("%d completed publishes lost their results during cancellation", got)
+	}
+}
+
 // TestSchedulerPublishDrainBudgetSharesDeadline proves the composition's single
 // shutdown deadline bounds the scheduler's own publish drain, so teardown never
 // serializes a second full ShutdownTimeout on top of the shared budget.

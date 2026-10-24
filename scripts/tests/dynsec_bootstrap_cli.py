@@ -565,6 +565,10 @@ def readback_and_verify_store(volume_name, image_id, expected_manager, expected_
         {'acltype': 'subscribeLiteral', 'topic': EXPECTED_TELEMETRY_PATTERN, 'allow': True, 'priority': 0},
         {'acltype': 'unsubscribeLiteral', 'topic': EXPECTED_TELEMETRY_PATTERN, 'allow': True, 'priority': 0},
         {'acltype': 'publishClientSend', 'topic': EXPECTED_ACKS_PATTERN, 'allow': True, 'priority': 0},
+        {'acltype': 'publishClientSend', 'topic': 'gateways/+/commands/#', 'allow': True, 'priority': 0},
+        {'acltype': 'publishClientReceive', 'topic': 'gateways/+/responses/#', 'allow': True, 'priority': 0},
+        {'acltype': 'subscribeLiteral', 'topic': 'gateways/+/responses/#', 'allow': True, 'priority': 0},
+        {'acltype': 'unsubscribeLiteral', 'topic': 'gateways/+/responses/#', 'allow': True, 'priority': 0},
     ]
     if backend_acls != expected_backend_acls:
         raise RunnerError('backend role ACL literals mismatch')

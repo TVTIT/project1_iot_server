@@ -48,6 +48,12 @@ class ReadinessTests(unittest.TestCase):
         with patch.object(harness.time, 'sleep'):
             self.assertEqual(harness.wait_ready(lambda timeout: next(results)), (True, 'http:200'))
 
+    def test_unready_startup_requires_503_not_proxy_failure_or_success(self):
+        results = iter([502, 200, 503])
+        with patch.object(harness.time, 'sleep'):
+            self.assertEqual(harness.wait_ready(lambda timeout: next(results), expected_status=503),
+                             (True, 'http:503'))
+
     def test_diagnosis_separates_proxy_direct_and_container_state(self):
         def docker(args, **kwargs):
             command = args[1]
@@ -118,6 +124,15 @@ class StartupEnvironmentTests(unittest.TestCase):
         self.assertEqual(mqtt_keys, [], f"Disabled environment must omit all MQTT_ variables, got {mqtt_keys}")
         self.assertEqual(env['DATABASE_URL'], payload['AppDSN'])
         self.assertEqual(env['SUPABASE_JWT_SECRET'], 'test_jwt_secret')
+
+    def test_current_environment_has_no_controller_dependency(self):
+        spike = MagicMock()
+        spike.passwords = {'admin': 'admin_pass', 'backend': 'backend_pass'}
+        env = harness.build_standalone_environment({'AppDSN': 'fixture'}, 'jwt', spike, current=True)
+        self.assertNotIn('MQTT_CONTROLLER_DIR', env)
+        self.assertEqual(env['MQTT_INTERNAL_MANAGEMENT_URL'], 'ssl://broker:8883')
+        self.assertEqual(env['MQTT_CREDENTIAL_RUNTIME_ENABLED'], 'false')
+        self.assertEqual(env['MQTT_CREDENTIAL_API_ENABLED'], 'true')
 
 
 if __name__ == '__main__':

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Actual cmd/server process lane. No test handler or production fault switch."""
+"""Actual cmd/server process lane. No test handler or production fault switch.
+
+current=True is simplified deployment acceptance with a direct TLS broker.
+The default retains historical gated lifecycle scenarios, NOT current acceptance.
+"""
 import base64
 import hashlib
 import hmac
@@ -22,7 +26,7 @@ CONFIG_ID = 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf2
 PLATFORM = 'linux/amd64'
 
 
-def build_standalone_environment(payload, jwt_secret, spike, enabled=True):
+def build_standalone_environment(payload, jwt_secret, spike, enabled=True, current=False):
     env = dict(DATABASE_URL=payload['AppDSN'], SUPABASE_JWT_SECRET=jwt_secret,
                SUPABASE_JWT_ISSUER='https://fixture.invalid/auth/v1',
                SUPABASE_JWT_AUDIENCE='authenticated', SERVER_ENV='production',
@@ -34,6 +38,10 @@ def build_standalone_environment(payload, jwt_secret, spike, enabled=True):
                MQTT_DYNSEC_WRITER_UID='1883', MQTT_DYNSEC_IMAGE_REFERENCE=IMAGE,
                MQTT_DYNSEC_IMAGE_CONFIG_ID=CONFIG_ID, MQTT_DYNSEC_PLATFORM=PLATFORM,
                MQTT_CONTROLLER_DIR='/control', MQTT_CREDENTIAL_RECONCILE_TIMEOUT='30s')
+    if current:
+        env.pop('MQTT_CONTROLLER_DIR')
+        env['MQTT_INTERNAL_MANAGEMENT_URL'] = 'ssl://broker:8883'
+        env['MQTT_CREDENTIAL_RUNTIME_ENABLED'] = 'false'
     if not enabled:
         env = {k: v for k, v in env.items() if not k.startswith('MQTT_')}
     return env
@@ -53,14 +61,14 @@ def readiness_status(port, tls, timeout):
         connection.close()
 
 
-def wait_ready(probe, startup_timeout=40):
+def wait_ready(probe, startup_timeout=40, expected_status=200):
     deadline = time.monotonic() + startup_timeout
     last = 'not-probed'
     while (remaining := deadline - time.monotonic()) > 0:
         try:
             status = probe(min(2, remaining))
             last = f'http:{status}'
-            if status == 200:
+            if status == expected_status:
                 return True, last
         except (OSError, ValueError, http.client.HTTPException) as error:
             # Exception messages can contain URLs or response data.
@@ -110,7 +118,44 @@ def startup_diagnosis(backend, proxy, network, last, secrets_to_redact):
     return '\n'.join(sections)
 
 
-def acceptance(directory, spike, database, backend, proxy, network, mounts, payload):
+def current_broker_security(spike, gateway, password):
+    """Real positive delivery and explicit TLS/auth/namespace denial controls."""
+    from stage2_mosquitto_runtime import mqtt_connection
+
+    spike.probe(gateway, password)
+    spike.probe(gateway, 'incorrect-fixture-password', accepted=False)
+    try:
+        connection = mqtt_connection(spike.port, spike.d / 'wrong-ca.crt', gateway, password)
+    except ssl.SSLCertVerificationError:
+        pass
+    else:
+        connection.close()
+        raise RuntimeError('current wrong CA accepted')
+    tls = ssl.create_default_context(cafile=str(spike.d / 'ca.crt'))
+    try:
+        with socket.create_connection(('127.0.0.1', spike.port), timeout=2) as raw:
+            with tls.wrap_socket(raw, server_hostname='outside-fixture-san.invalid'):
+                raise RuntimeError('current wrong SAN accepted')
+    except ssl.SSLCertVerificationError:
+        pass
+    device = spike.connect(gateway, password)
+    data = spike.connect('backend_service', spike.passwords['backend'])
+    try:
+        device.subscribe('gateways/' + gateway + '/commands/#')
+        device.subscribe('gateways/other_fixture/commands/#', allowed=False)
+        device.subscribe('$CONTROL/dynamic-security/#', allowed=False)
+        data.subscribe('gateways/+/telemetry/#')
+        data.subscribe('$CONTROL/dynamic-security/#', allowed=False)
+        spike.delivery(data, device, 'gateways/' + gateway + '/commands/fixture', True)
+        spike.delivery(device, data, 'gateways/' + gateway + '/telemetry/fixture', True)
+        spike.delivery(device, data, 'gateways/other_fixture/telemetry/fixture', False)
+    finally:
+        device.close()
+        data.close()
+    print('PASS current native TLS CA/SAN, password denial, own subscription/delivery, cross-namespace and control subscription denial', flush=True)
+
+
+def acceptance(directory, spike, database, backend, proxy, network, mounts, payload, current=False):
     run(['go', '-C', str(ROOT / 'src'), 'build', '-o', str(directory / 'server'), './cmd/server'],
         env=dict(ENV, CGO_ENABLED='0'), timeout=120)
     (directory / 'server').chmod(0o755)
@@ -130,12 +175,15 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
 
     sql(f"INSERT INTO profiles(id) VALUES('{actor}'); INSERT INTO platform_admins(user_id) VALUES('{actor}'); "
         f"INSERT INTO gateways(gateway_id,name) VALUES('{gateway}','standalone fixture');")
-    environment = build_standalone_environment(payload, jwt_secret, spike)
+    environment = build_standalone_environment(payload, jwt_secret, spike, current=current)
     env_file = directory / 'server.env'
 
-    def start(enabled=True):
+    def start(enabled=True, bad_auth=False):
         run(['docker', 'rm', '-f', backend], capture=True) if exists() else None
-        values = build_standalone_environment(payload, jwt_secret, spike, enabled=enabled)
+        values = build_standalone_environment(payload, jwt_secret, spike, enabled=enabled, current=current)
+        if bad_auth:
+            require(current and enabled, 'bad auth is current isolated startup control only')
+            values['MQTT_DYNSEC_MANAGER_PASSWORD'] = spike.passwords['new']
         env_file.write_text(''.join(k + '=' + v + '\n' for k, v in values.items()))
         env_file.chmod(0o600)
         args = ['docker', 'run', '-d', '--name', backend, '--network', network,
@@ -143,12 +191,15 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
                 '--env-file', str(env_file), '--mount', f'type=bind,src={directory}/server,dst=/server,readonly']
         if enabled:
             args += ['--mount', f'type=bind,src={directory}/ca.crt,dst=/ca.crt,readonly',
-                     '--mount', 'type=volume,src=' + mounts['/control'] + ',dst=/control',
                      '--mount', 'type=volume,src=' + mounts['/security'] + ',dst=/security,readonly']
+            if not current:
+                args += ['--mount', 'type=volume,src=' + mounts['/control'] + ',dst=/control']
         run(args + ['--entrypoint', '/server', IMAGE], capture=True)
-        ready, last = wait_ready(lambda timeout: readiness_status(port, tls, timeout))
+        ready, last = wait_ready(lambda timeout: readiness_status(port, tls, timeout),
+                                 expected_status=503 if bad_auth else 200)
         if ready:
-            print('PASS standalone startup ' + ('enabled' if enabled else 'disabled without credential mounts/config'), flush=True)
+            print('PASS standalone startup ' + ('unready with rejected manager credentials' if bad_auth else
+                  ('enabled' if enabled else 'disabled without credential mounts/config')), flush=True)
             return
         print(startup_diagnosis(backend, proxy, network, last,
                                [jwt_secret, payload['AppDSN'], payload['AdminDSN'],
@@ -222,7 +273,8 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
         return sql('SELECT count(*) FROM gateway_mqtt_credential_events;')
 
     start()
-    gate(True)
+    if not current:
+        gate(True)
     broker_name = spike.command('ps', '-q', 'broker', capture=True).decode().strip()
     broker_name = json.loads(run(['docker', 'inspect', broker_name], capture=True))[0]['Name'].lstrip('/')
     for port_number in ('18884', '1883'):
@@ -246,13 +298,20 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
     key = str(uuid.uuid4())
     first = call('POST', want=201, key=key)
     require(first.get('secret_returned') is True and len(first.get('password', '')) == 43, 'standalone provision secret')
+    if current:
+        current_broker_security(spike, gateway, first['password'])
     before = count()
     replay = call('POST', want=201, key=key)
     require(replay.get('password') is None and replay.get('secret_returned') is False and count() == before, 'standalone replay no second secret/mutation')
     call('GET')
     rotated = call('POST', base + '/rotate')
     require(rotated.get('credential_version') == 2, 'standalone rotation generation')
+    if current:
+        spike.probe(gateway, rotated['password'])
+        spike.probe(gateway, first['password'], accepted=False)
     require(call('DELETE').get('status') == 'revoked', 'standalone revoke')
+    if current:
+        spike.probe(gateway, rotated['password'], accepted=False)
     print('PASS standalone four routes, real JWT/admin SQL, role denials, provision/rotate/revoke, replay and no-store', flush=True)
 
     # Actual per-request authorization query error. No global DB-loss policy.
@@ -263,6 +322,35 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
     sql('GRANT SELECT ON platform_admins TO iot_backend;')
     require(count() == before, 'checker error has no credential mutation')
     print('PASS standalone per-request database checker fail-closed', flush=True)
+
+    if current:
+        # The deployed backend owns API/DB work, NOT the independent broker.
+        # No global MQTT gate closure on backend failure/shutdown is promised.
+        stop()
+        spike.probe('admin')
+        before = count()
+        start(bad_auth=True)
+        for method, path in routes:
+            call(method, path, 503)
+        require(count() == before, 'unready credential API has no mutation')
+        stop()
+        start()
+        require(call('GET').get('status') == 'revoked', 'current restart retained revoked metadata')
+        stop()
+        spike.command('stop', 'broker')
+        start(enabled=False)
+        for method, path in routes:
+            call(method, path, 503)
+        stop()
+        rows = sql('SELECT row_to_json(e)::text FROM gateway_mqtt_credential_events e '
+                   'UNION ALL SELECT row_to_json(m)::text FROM gateway_mqtt_credentials m;')
+        require(not any(value in rows for value in observed_secrets), 'standalone database secret exclusion')
+        logs = subprocess.run(['docker', 'logs', proxy], env=ENV, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, check=True, timeout=10).stdout
+        require(not any(v.encode() in logs for v in [jwt_secret, *spike.passwords.values(), *observed_secrets]),
+                'standalone proxy log secrecy')
+        print('PASS current simplified acceptance: real process readiness, JWT/admin denials, provision/replay/rotate/revoke, TLS/auth/ACL, retained metadata, graceful shutdown, disabled routes without broker; no global gate guarantee', flush=True)
+        return True
 
     # Native filesystem save uncertainty through the real HTTP boundary.
     spike.setup('chmod 500 /security')

@@ -1,6 +1,7 @@
 """Task 2.6.12 fixture guards; never run side effects here."""
 import re
 import unittest
+from unittest.mock import patch
 
 import stage2_mqtt_credentials as harness
 
@@ -30,6 +31,15 @@ def assert_credential_job_contract(job: str) -> None:
         raise AssertionError("job must retain golangci-lint check")
     if 'docker build --target backend' not in job or 'docker build --target credential-controller' not in job:
         raise AssertionError("job must retain legacy Docker build command targets (backend and credential-controller)")
+
+    if 'current-simplified-acceptance:' in job:
+        if 'sh scripts/test-stage2-mqtt-credentials.sh' not in job:
+            raise AssertionError('current acceptance must execute the native entrypoint')
+        if 'LEGACY COMPONENT-ONLY' not in job or 'no global gate guarantee' not in job:
+            raise AssertionError('current acceptance must state the gate boundary')
+        if marker in job or 'mosquitto-credential-coverage' in job:
+            raise AssertionError('current acceptance must not claim legacy execution/coverage')
+        return
 
     if marker in job:
         run_blocks = re.findall(r'(?m)^\s*run:\s*\|?\n(.*?)(?=\n\s*(?:uses:|name:|env:|with:|if:|id:|\Z))',
@@ -71,6 +81,16 @@ def assert_credential_job_contract(job: str) -> None:
 
 
 class CredentialHarnessTests(unittest.TestCase):
+    def test_current_entrypoint_does_not_select_legacy_gate_composition(self):
+        with patch('task266_provision.main', return_value=True) as fixture:
+            harness.main()
+        fixture.assert_called_once_with(current=True)
+
+    def test_current_entrypoint_rejects_missing_completion(self):
+        with patch('task266_provision.main', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'no skips allowed'):
+                harness.main()
+
     def test_selector_requires_actual_pass(self):
         for output in (b'PASS\n', b'--- SKIP: TestCredentialHTTPIsolated\nPASS\n',
                        b'--- PASS: TestOther\nPASS\n'):
@@ -85,6 +105,14 @@ class CredentialHarnessTests(unittest.TestCase):
         self.assertIn('mosquitto-runtime-integration:', workflow)
         job = extract_job_section(workflow, 'mosquitto-credential-integration')
         assert_credential_job_contract(job)
+
+    def test_current_job_requires_native_execution_and_honest_scope(self):
+        workflow = (harness.ROOT / '.github/workflows/ci.yml').read_text()
+        job = extract_job_section(workflow, 'mosquitto-credential-integration')
+        for removed in ('sh scripts/test-stage2-mqtt-credentials.sh',
+                        'LEGACY COMPONENT-ONLY', 'no global gate guarantee'):
+            with self.subTest(removed=removed), self.assertRaises(AssertionError):
+                assert_credential_job_contract(job.replace(removed, 'removed'))
 
     def test_deferred_workflow_contract_and_mutations(self):
         valid_deferred = '''  mosquitto-credential-integration:
@@ -240,7 +268,15 @@ class CredentialHarnessTests(unittest.TestCase):
         self.assertIn("if not k.startswith('MQTT_')", source)
         self.assertIn('checker error has no credential mutation', source)
         self.assertIn('valid=1s', (harness.ROOT / 'scripts/tests/stage2_mqtt_credentials.py').read_text())
-        self.assertIn('fixture(standalone=True)', (harness.ROOT / 'scripts/tests/stage2_mqtt_credentials.py').read_text())
+        self.assertIn('fixture(current=True)', (harness.ROOT / 'scripts/tests/stage2_mqtt_credentials.py').read_text())
+
+    def test_legacy_controller_is_component_only(self):
+        source = (harness.ROOT / 'scripts/test-legacy-mqtt-controller.sh').read_text()
+        self.assertIn('LEGACY COMPONENT-ONLY', source)
+        self.assertIn('task265b_lifecycle.py', source)
+        current = (harness.ROOT / 'scripts/tests/stage2_mqtt_credentials.py').read_text()
+        self.assertNotIn('fixture(standalone=True)', current)
+        self.assertNotIn('fixture(http=True)', current)
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
+	Stage5                     Stage5Config
 	Credential                 CredentialConfig
 	Ingress                    IngressConfig
 	MQTTCredentialRuntime      mqttcredential.StartupConfig
@@ -171,6 +172,24 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if cfg.UserManagement, err = loadUserManagement(lookup, cfg.AdminMaxBodyBytes); err != nil {
 		return Config{}, err
+	}
+	if cfg.Stage5, err = loadStage5(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.Stage5.Enabled {
+		workers := cfg.Stage5.Dispatch.Workers + 1
+		if cfg.Ingress.Enabled {
+			workers += cfg.Ingress.WorkerCount
+			if cfg.Stage5.Data.ClientID == cfg.Ingress.ClientID {
+				return Config{}, fmt.Errorf("stage 5 and telemetry MQTT client IDs must differ")
+			}
+		}
+		if err = checkIngressPoolReservation(workers, cfg.DatabaseMaxConns, cfg.Credential.Enabled); err != nil {
+			return Config{}, err
+		}
+		if cfg.ShutdownTimeout < cfg.Stage5.Control.DBTimeout+cfg.Stage5.Dispatch.PublishTimeout {
+			return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must cover stage 5 DB and publish budgets")
+		}
 	}
 	return cfg, nil
 }

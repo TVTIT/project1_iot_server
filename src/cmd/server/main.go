@@ -67,6 +67,7 @@ func run() error {
 		server       *http.Server
 		serverReady  bool
 		ingress      ingressRuntime
+		control      stage5Runtime
 	)
 	shutdown := func() error {
 		shutdownOnce.Do(func() {
@@ -77,6 +78,7 @@ func run() error {
 			// while holding the current connection open so workers can still
 			// publish post-commit ACKs during the drain.
 			ingress.stopIntake()
+			control.stop()
 
 			httpErrors := make(chan error, 1)
 			if serverReady {
@@ -90,6 +92,9 @@ func run() error {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("telemetry ingress shutdown: %w", err))
 			}
 			ingress.logSummary()
+			if err := control.close(ctx); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("stage 5 shutdown: %w", err))
+			}
 			if serverReady {
 				if err := <-httpErrors; err != nil {
 					_ = server.Close()
@@ -113,6 +118,9 @@ func run() error {
 	}()
 
 	if ingress, err = composeIngress(cfg, pool); err != nil {
+		return err
+	}
+	if control, err = composeStage5Transport(cfg, pool); err != nil {
 		return err
 	}
 
@@ -172,6 +180,7 @@ func run() error {
 		return fmt.Errorf("create admin gateway service: %w", err)
 	}
 	readiness := ingressReadinessChecker(pool, cfg.ReadinessTimeout, ingress)
+	readiness = stage5ReadinessChecker(readiness, control)
 	routerDeps := httpserver.RouterDependencies{
 		CredentialAPIEnabled:       cfg.Credential.Enabled,
 		CredentialRequestTimeout:   cfg.Credential.RequestTimeout,
@@ -196,6 +205,9 @@ func run() error {
 	if err := populateStage4Dependencies(&routerDeps, cfg, pool, provisioningService); err != nil {
 		return fmt.Errorf("compose stage 4 dependencies: %w", err)
 	}
+	if err := populateStage5Dependencies(&routerDeps, cfg, pool); err != nil {
+		return fmt.Errorf("compose stage 5 dependencies: %w", err)
+	}
 	if err := populateUserManagementDependencies(&routerDeps, cfg, pool); err != nil {
 		return fmt.Errorf("compose user management dependencies: %w", err)
 	}
@@ -215,6 +227,9 @@ func run() error {
 
 	if err := ingress.start(); err != nil {
 		return fmt.Errorf("start MQTT telemetry ingress: %w", err)
+	}
+	if err := control.start(); err != nil {
+		return fmt.Errorf("start stage 5 transport: %w", err)
 	}
 
 	serverErrors := make(chan error, 1)

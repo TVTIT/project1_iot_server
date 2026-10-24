@@ -409,7 +409,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual({a['topic'] for a in roles['bootstrap_manager']},
                          {'$CONTROL/dynamic-security/v1', '$CONTROL/dynamic-security/v1/response'})
         self.assertEqual({a['topic'] for a in roles['bootstrap_backend']},
-                         {'gateways/+/telemetry/#', 'gateways/+/acks/#'})
+                         {'gateways/+/telemetry/#', 'gateways/+/acks/#',
+                          'gateways/+/commands/#', 'gateways/+/responses/#'})
+        self.assertEqual({(a['acltype'], a['topic'], a['allow'], a['priority'])
+                          for a in roles['bootstrap_backend']},
+                         {(k, f'gateways/+/{suffix}/#', True, 0)
+                          for suffix in ('telemetry', 'responses')
+                          for k in ('publishClientReceive', 'subscribeLiteral', 'unsubscribeLiteral')} |
+                         {('publishClientSend', f'gateways/+/{suffix}/#', True, 0)
+                          for suffix in ('acks', 'commands')})
         self.assertNotIn('admin', json.dumps(store))
         self.assertEqual(store['clients'][0]['password'], clients[0]['password'])
 

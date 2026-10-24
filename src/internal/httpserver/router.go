@@ -23,6 +23,9 @@ type ReadinessChecker interface {
 
 // RouterDependencies contains the mandatory HTTP boundary dependencies.
 type RouterDependencies struct {
+	ControlAPIEnabled          bool
+	ControlRequestTimeout      time.Duration
+	ControlRepository          ControlRepository
 	ReadinessChecker           ReadinessChecker
 	ReadinessTimeout           time.Duration
 	AuthorizationTimeout       time.Duration
@@ -64,6 +67,9 @@ type RouterDependencies struct {
 // NewRouter creates the backend HTTP routes and fails closed when an
 // authentication dependency is absent.
 func NewRouter(deps RouterDependencies) (http.Handler, error) {
+	if err := validateControlDependencies(deps); err != nil {
+		return nil, fmt.Errorf("invalid control API dependencies: %w", err)
+	}
 	if auth.IsNilDependency(deps.ReadinessChecker) {
 		return nil, fmt.Errorf("readiness checker is required")
 	}
@@ -168,6 +174,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		adminGatewayAuditMiddleware(),
 		ownerSensorCacheMiddleware(),
 		stage4CacheMiddleware(),
+		controlCacheMiddleware(),
 		adminUserManagementCacheMiddleware(),
 		corsMiddleware(deps.CORSAllowedOrigins),
 		httpapi.RecoveryMiddleware(slog.Default()),
@@ -185,6 +192,12 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		c.String(http.StatusOK, "OK")
 	})
 	router.GET("/readyz", func(c *gin.Context) {
+		// Enabled credentials must complete their existing startup/ownership
+		// prerequisite. This does not supervise or close the independent broker.
+		if deps.CredentialAPIEnabled && !deps.CredentialStartupReadiness.Ready() {
+			httpapi.WriteError(c, http.StatusServiceUnavailable, "service_unavailable", "service unavailable")
+			return
+		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), deps.ReadinessTimeout)
 		defer cancel()
 		if err := deps.ReadinessChecker.Ping(ctx); err != nil {
@@ -229,6 +242,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	authenticated.GET("/digital-twins/:entity_id", getDigitalTwinDetail(deps.TwinDetailReader, deps.TwinStateReader, deps.TwinQueryParser))
 	authenticated.PATCH("/digital-twins/:entity_id/attrs", patchDigitalTwin(deps.GatewayPatcher, deps.SensorPatcher, deps.TwinMaxBodyBytes))
 	authenticated.GET("/digital-twins/:entity_id/temporal", getDigitalTwinTemporal(deps.TwinHistoryReader, deps.HistoryQueryParser))
+	authenticated.PATCH("/digital-twins/:entity_id/desired-state", controlHandler(deps, "admit"))
+	authenticated.GET("/digital-twins/:entity_id/commands", controlHandler(deps, "list"))
+	authenticated.GET("/digital-twins/:entity_id/commands/:command_id", controlHandler(deps, "detail"))
 
 	return router, nil
 }

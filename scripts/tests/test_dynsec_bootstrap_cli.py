@@ -72,6 +72,10 @@ def create_fake_store(mgr_user='mgr_user', be_user='be_user'):
         {'acltype': 'subscribeLiteral', 'topic': 'gateways/+/telemetry/#', 'allow': True, 'priority': 0},
         {'acltype': 'unsubscribeLiteral', 'topic': 'gateways/+/telemetry/#', 'allow': True, 'priority': 0},
         {'acltype': 'publishClientSend', 'topic': 'gateways/+/acks/#', 'allow': True, 'priority': 0},
+        {'acltype': 'publishClientSend', 'topic': 'gateways/+/commands/#', 'allow': True, 'priority': 0},
+        {'acltype': 'publishClientReceive', 'topic': 'gateways/+/responses/#', 'allow': True, 'priority': 0},
+        {'acltype': 'subscribeLiteral', 'topic': 'gateways/+/responses/#', 'allow': True, 'priority': 0},
+        {'acltype': 'unsubscribeLiteral', 'topic': 'gateways/+/responses/#', 'allow': True, 'priority': 0},
     ]
     # Native client hashes (base64 64 bytes password, 12 bytes salt, positive int iterations)
     pw_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="

@@ -215,8 +215,11 @@ class TestCIFeatureJobs(unittest.TestCase):
         legacy = self._extract_job_section('legacy-runtime-image-build')
         self.assertIn('target: auth-init', legacy)
         self.assertIn('target: reloader', legacy)
-        for old in ('stage2-e2e', 'mosquitto-credential-integration', 'mosquitto-runtime-integration'):
+        for old in ('stage2-e2e', 'mosquitto-runtime-integration'):
             self.assertIn(f'legacy-execution-deferred: {old}', self._extract_job_section(old))
+        current = self._extract_job_section('mosquitto-credential-integration')
+        self.assertIn('current-simplified-acceptance:', current)
+        self.assertIn('sh scripts/test-stage2-mqtt-credentials.sh', current)
 
     def test_legacy_deferred_jobs_contracts_and_routing(self):
         """Verifies job IDs, deferred routing, retained units/builds, and markers."""
@@ -235,7 +238,9 @@ class TestCIFeatureJobs(unittest.TestCase):
 
         # Check explicit deferred markers in job definitions
         self.assertIn("legacy-execution-deferred: stage2-e2e", stage2_job)
-        self.assertIn("legacy-execution-deferred: mosquitto-credential-integration", cred_job)
+        self.assertIn('current-simplified-acceptance:', cred_job)
+        self.assertIn('LEGACY COMPONENT-ONLY', cred_job)
+        self.assertIn('no global gate guarantee', cred_job)
         self.assertIn("legacy-execution-deferred: mosquitto-runtime-integration", runtime_job)
 
         # Execute reviewed contract assertions

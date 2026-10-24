@@ -4,6 +4,20 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
+## Mốc Stage 5 tạm dừng sau Task 5.4 — 24/10/2026
+
+Task 5.0–5.4 đã hoàn thành theo phạm vi duyệt; 5.5–5.8 hoãn lại, không tự triển
+khai tiếp. Đây là cập nhật hiện hành cho Stage 5 và security contract, supersede
+các mô tả Stage 5 còn hoàn toàn chưa làm hoặc global gate bên dưới nếu mâu thuẫn;
+các kết quả cũ vẫn là lịch sử. Xem [bàn giao mốc 5.4](../backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
+
+| Giới hạn / quyết định | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Chưa có Gateway apply/durable dedup/result (5.5) và result transaction (5.6) | REST nhận intent và publisher có thể chuyển published, nhưng không chứng minh đổi tần số hoặc cập nhật configuration; raw response queue chưa có consumer | Giữ `STAGE5_ENABLED=false` trên shared/live, không bật điều khiển client; không gọi PUBACK là succeeded; không rollback desired khi timeout | Khi có yêu cầu tiếp tục Stage 5 từ 5.5 |
+| Mosquitto trực tiếp, không global gate theo backend lifecycle | Backend lỗi/dừng không đóng broker; test gate legacy không phải bảo vệ deployment | TLS/auth/ACL broker và API/readiness fail-closed là contract được duyệt; component gate giữ riêng, không khôi phục supervisor chỉ để test xanh | Khi có yêu cầu nghiệp vụ mới về global isolation |
+| ACL verifier dùng manager có quyền quản trị | Đường code chỉ đọc không làm credential thành chỉ-đọc; readback theo connection lifetime không bảo đảm ACL không bị admin đổi giữa phiên | Tách data/manager principal, bảo vệ secret/private listener, phối hợp thay đổi ACL; runtime không tự sửa ACL | Trước rollout hoặc khi thay đổi chính sách quản trị broker |
+| Migration 23 và evidence chỉ trên fixture local | Có table locks; chưa chứng minh thời gian migration trên DB lớn, chưa migrate live hay remote CI/Stage 5 E2E/board | Preflight/backup/window trước deployment; lưu phạm vi PASS/NOT RUN tại handoff, không tự mở thêm ma trận sự cố tổng quát cho mốc này | Khi được yêu cầu rollout hoặc tiếp tục 5.7 |
+
 ## Cập nhật Task 3.0 — giới hạn chuyển đổi schema telemetry (15/10/2026)
 
 Các kết quả và ưu tiên DynSec lịch sử bên dưới được giữ nguyên; policy hiện hành

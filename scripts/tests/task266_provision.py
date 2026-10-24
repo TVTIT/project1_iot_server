@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Real app-role PostgreSQL latest schema + pinned broker PID1/private IPC proof."""
+"""Owned latest-schema PostgreSQL + pinned broker fixtures.
+
+current=True runs the simplified deployment directly; other modes retain legacy
+PID1/private IPC component/service scenarios, not current deployment acceptance.
+"""
 import json
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import secrets
@@ -115,40 +120,53 @@ def cleanup_container(owned):
         raise RuntimeError('owned container cleanup failed') from None
 
 
-def main(rotate=False, revoke=False, startup=False, composition=False, http=False, standalone=False):
+def main(rotate=False, revoke=False, startup=False, composition=False, http=False, standalone=False, current=False):
     task = 'task2612' if http or standalone else ('task2611' if composition else ('task269' if startup else ('task268' if revoke else ('task267' if rotate else 'task266'))))
     directory = Path(tempfile.mkdtemp(prefix=task + '-', dir='/tmp/opencode'))
     directory.chmod(0o700)
     spike = Spike(directory)
-    spike.compose[-1] = str(Path(__file__).with_name('compose.task265b-lifecycle.yml'))
+    if not current:
+        spike.compose[-1] = str(Path(__file__).with_name('compose.task265b-lifecycle.yml'))
     database = 'task266-pg-' + secrets.token_hex(8)
     test_container = 'task266-service-' + secrets.token_hex(8)
     proxy = 'task2612-nginx-' + secrets.token_hex(8)
     try:
-        spike.prepare()
-        run(['go', '-C', str(ROOT / 'src'), 'build', '-o', str(directory / 'controller'),
-             './cmd/mosquitto-credential-controller'], env=dict(ENV, CGO_ENABLED='0'))
-        run(['go', '-C', str(ROOT / 'src'), 'test', '-c', '-cover', '-coverpkg=./cmd/server,./internal/mqttcredential,./internal/httpserver,./internal/auth,./internal/gateway', '-o', str(directory / 'client-tests'),
-             './cmd/server' if composition or http else './internal/mqttcredential'], env=dict(ENV, CGO_ENABLED='0'))
-        for name in ('controller', 'client-tests'):
+        if current:
+            spike.prepare(broker_san=True)
+        else:
+            spike.prepare()
+        if not current:
+            run(['go', '-C', str(ROOT / 'src'), 'build', '-o', str(directory / 'controller'),
+                 './cmd/mosquitto-credential-controller'], env=dict(ENV, CGO_ENABLED='0'))
+            run(['go', '-C', str(ROOT / 'src'), 'test', '-c', '-cover', '-coverpkg=./cmd/server,./internal/mqttcredential,./internal/httpserver,./internal/auth,./internal/gateway', '-o', str(directory / 'client-tests'),
+                 './cmd/server' if composition or http else './internal/mqttcredential'], env=dict(ENV, CGO_ENABLED='0'))
+        for name in (() if current else ('controller', 'client-tests')):
             (directory / name).chmod(0o755)
         (directory / 'ca.crt').chmod(0o644)
-        spike.setup("sed -i 's/listener 8883/listener 18884 127.0.0.1/' /fixture/broker.conf; "
+        if not current:
+            spike.setup("sed -i 's/listener 8883/listener 18884 127.0.0.1/' /fixture/broker.conf; "
                     'mkdir -p /control; chmod 700 /control; chown 1883:1883 /control')
         config = {'Lifecycle': {'Executable': '/usr/sbin/mosquitto', 'Args': ['-c', '/fixture/broker.conf'],
                   'PublicAddresses': ['0.0.0.0:8883', '0.0.0.0:8884'], 'BrokerAddress': '127.0.0.1:18884',
                   'MaxConnections': 8, 'DialTimeout': 1000000000, 'StopTimeout': 2000000000},
                   'Controller': {'ControlDir': '/control', 'UID': 1883, 'Timeout': 10000000000,
                   'MaxFrameBytes': 2048, 'MaxInflight': 8, 'ManagementAddress': '127.0.0.1:18884'}}
-        spike.setup('cat > /fixture/startup.json; chmod 600 /fixture/startup.json; chown 1883:1883 /fixture/startup.json', json.dumps(config).encode())
-        if composition or http or standalone:
+        if not current:
+            spike.setup('cat > /fixture/startup.json; chmod 600 /fixture/startup.json; chown 1883:1883 /fixture/startup.json', json.dumps(config).encode())
+        if composition or http or standalone or current:
             # Offline native test-only bootstrap; never write plaintext/hash to DB.
             password = spike.passwords['backend']
             spike.setup('umask 077; mosquitto_ctrl dynsec init /security/backend.json backend_service >/dev/null',
                         (password + '\n' + password + '\n').encode())
             original = json.loads(spike.setup('cat /security/dynsec.json'))
             backend = json.loads(spike.setup('cat /security/backend.json'))
-            original['clients'].extend(backend['clients'])
+            if current:
+                spec = importlib.util.spec_from_file_location('mqtt_bootstrap', ROOT / 'scripts/mqtt-bootstrap.py')
+                bootstrap = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(bootstrap)
+                original = bootstrap.compose_store(original, backend)
+            else:
+                original['clients'].extend(backend['clients'])
             spike.setup('cat > /security/dynsec.json; chmod 600 /security/dynsec.json; chown 1883:1883 /security/dynsec.json; rm /security/backend.json',
                         json.dumps(original).encode())
         spike.command('up', '-d', 'broker')
@@ -156,10 +174,18 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
         inspected = json.loads(run(['docker', 'inspect', container], capture=True))[0]
         mounts = {m['Destination']: m['Name'] for m in inspected['Mounts'] if m['Type'] == 'volume'}
         network = next(iter(inspected['NetworkSettings']['Networks']))
-        if http or standalone:
+        if http or standalone or current:
             from stage2_mqtt_credentials import start_proxy, qualify_network
-            qualify_network(spike, inspected)
-            start_proxy(directory, network, proxy, test_container, publish=standalone)
+            if not current:
+                qualify_network(spike, inspected)
+            else:
+                bindings = inspected['HostConfig']['PortBindings']
+                require(set(bindings) == {'8883/tcp'} and
+                        all(b['HostIp'] == '127.0.0.1' for values in bindings.values() for b in values),
+                        'current fixture exposes only loopback TLS')
+                require('/control' not in mounts, 'current fixture must not mount legacy controller')
+                spike.port = int(spike.command('port', 'broker', '8883', capture=True).decode().strip().rsplit(':', 1)[1])
+            start_proxy(directory, network, proxy, test_container, publish=standalone or current)
         admin_password, app_password = secrets.token_hex(32), secrets.token_hex(32)
         env_file = directory / 'database.env'
         env_file.write_text('POSTGRES_USER=fixture_admin\nPOSTGRES_DB=fixture_service\nPOSTGRES_PASSWORD=' + admin_password + '\nBACKEND_DB_PASSWORD=' + app_password + '\nAUTH_DB_PASSWORD=' + secrets.token_hex(32) + '\nSTORAGE_DB_PASSWORD=' + secrets.token_hex(32) + '\n')
@@ -205,6 +231,9 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
                        Broker=inspected['Name'].lstrip('/'),
                        AppDSN=f'postgres://iot_backend_app:{app_password}@{database}:5432/fixture_service?sslmode=disable',
                        AdminDSN=f'postgres://fixture_admin:{admin_password}@{database}:5432/fixture_service?sslmode=disable')
+        if current:
+            from task2612_standalone import acceptance
+            return acceptance(directory, spike, database, test_container, proxy, network, mounts, payload, current=True)
         if standalone:
             from task2612_standalone import acceptance
             acceptance(directory, spike, database, test_container, proxy, network, mounts, payload)

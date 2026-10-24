@@ -241,6 +241,9 @@ def compose_store(manager, backend):
     telemetry = [acl(k, 'gateways/+/telemetry/#') for k in
                  ('publishClientReceive', 'subscribeLiteral', 'unsubscribeLiteral')]
     telemetry.append(acl('publishClientSend', 'gateways/+/acks/#'))
+    telemetry.append(acl('publishClientSend', 'gateways/+/commands/#'))
+    telemetry.extend(acl(k, 'gateways/+/responses/#') for k in
+                     ('publishClientReceive', 'subscribeLiteral', 'unsubscribeLiteral'))
     return {'clients': clients, 'roles': [
         {'rolename': 'bootstrap_manager', 'acls': management},
         {'rolename': 'bootstrap_backend', 'acls': telemetry}],

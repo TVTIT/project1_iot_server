@@ -29,6 +29,10 @@ type controlFixture struct {
 }
 
 func newControlFixture(t *testing.T) *controlFixture {
+	return newControlFixtureGateway(t, "")
+}
+
+func newControlFixtureGateway(t *testing.T, gateway string) *controlFixture {
 	t.Helper()
 	if os.Getenv("CONTROL_TEST_ISOLATED") != "1" {
 		t.Skip("requires owned native PostgreSQL fixture")
@@ -36,6 +40,9 @@ func newControlFixture(t *testing.T) *controlFixture {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)
 	f := &controlFixture{ctx: ctx, owner: uuid.New(), operator: uuid.New(), viewer: uuid.New(), outsider: uuid.New(), gw: "c" + strings.ReplaceAll(uuid.NewString(), "-", "")}
+	if gateway != "" {
+		f.gw = gateway
+	}
 	var err error
 	f.admin, err = pgxpool.New(ctx, os.Getenv("CONTROL_TEST_SETUP_URL"))
 	if err != nil {

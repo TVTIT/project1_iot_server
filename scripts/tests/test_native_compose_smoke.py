@@ -526,6 +526,13 @@ class AssertionTests(unittest.TestCase):
         self.assertEqual(admin[0][4], 404)
         self.assertEqual(set(smoke.SENSOR_PAYLOAD), {"name", "unit"})
 
+    def test_stage5_intent_flag_defaults_off_in_owned_fixture(self):
+        self.assertEqual(smoke.DEFAULTS["STAGE5_ENABLED"], "false")
+        self.assertEqual(smoke.DEFAULTS["STAGE5_REQUEST_TIMEOUT"], "5s")
+        self.assertEqual(smoke.DEFAULTS["STAGE5_COMMAND_TTL"], "60s")
+        self.assertEqual(smoke.DEFAULTS["STAGE5_MAX_PENDING_OUTBOX"], "10000")
+        self.assertEqual(smoke.DEFAULTS["STAGE5_MAX_RECEIPTS"], "100000")
+
     def test_denial_snapshot_preserves_full_rows_not_just_counts(self):
         before = {"sensors": [{"gateway_id": "gw", "sensor_id": "s", "name": "old", "unit": "C"}],
                   "twin_entities": [{"id": "id", "entity_id": "urn:ngsi-ld:Sensor:gw:s", "attributes": {"unit": "C"}}],

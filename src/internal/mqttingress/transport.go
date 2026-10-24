@@ -71,11 +71,16 @@ type Admitter interface {
 // construction. The unexported fields are test seams and are left zero in
 // production.
 type TransportOptions struct {
-	BrokerURL string
-	ClientID  string
-	Username  string
-	Password  string
-	CAFile    string
+	// VerifyConnection is an optional bounded prerequisite, rerun for every
+	// connection lifetime before it can subscribe or become ready.
+	VerifyConnection func(context.Context) error
+	// RequireQoS1 rejects a downgraded SUBACK when a control subscription needs QoS 1.
+	RequireQoS1 bool
+	BrokerURL   string
+	ClientID    string
+	Username    string
+	Password    string
+	CAFile      string
 
 	// Filter is the exact MQTT topic filter to subscribe to. Empty uses
 	// DefaultTelemetryFilter.
@@ -675,6 +680,14 @@ func (t *Transport) supervise(ctx context.Context) {
 // SUBSCRIBE at QoS 1, and a positive SUBACK check. On any failure it tears the
 // partial lifetime down before returning.
 func (t *Transport) connectOnce(ctx context.Context) (*lifetime, error) {
+	if t.opts.VerifyConnection != nil {
+		verifyCtx, cancel := context.WithTimeout(ctx, t.opts.ConnectTimeout)
+		err := t.opts.VerifyConnection(verifyCtx)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+	}
 	lt := newLifetime(t.allocEpoch())
 
 	attemptCtx, cancelAttempt := context.WithTimeout(ctx, t.opts.ConnectTimeout)
@@ -724,6 +737,10 @@ func (t *Transport) connectOnce(ctx context.Context) (*lifetime, error) {
 		t.counters.subscribeFailed.Add(1)
 		t.closeLifetime(lt, 0)
 		return nil, err
+	}
+	if t.opts.RequireQoS1 && subToken.Result()[t.opts.Filter] != 1 {
+		t.closeLifetime(lt, 0)
+		return nil, errors.New("mqtt control: QoS 1 subscription required")
 	}
 	if lt.failed.Load() {
 		// A connection loss (or an explicit failure) arrived before install.

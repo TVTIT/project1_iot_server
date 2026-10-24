@@ -1532,7 +1532,7 @@ func TestStage4Headers_CORSAndCacheBoundaries(t *testing.T) {
 	})
 }
 
-func TestStage4Headers_ExactlyFiveRoutesAndOldRoutesGone(t *testing.T) {
+func TestStage4Headers_ExactTwinRoutesAndOldRoutesGone(t *testing.T) {
 	deps := testRouterDependencies(readinessCheckerFunc(func(context.Context) error { return nil }))
 	deps.TwinListReader = &mockTwinListReader{}
 	deps.TwinDetailReader = &mockTwinDetailReader{}
@@ -1569,6 +1569,9 @@ func TestStage4Headers_ExactlyFiveRoutesAndOldRoutesGone(t *testing.T) {
 		"GET /v1/digital-twins/:entity_id",
 		"PATCH /v1/digital-twins/:entity_id/attrs",
 		"GET /v1/digital-twins/:entity_id/temporal",
+		"PATCH /v1/digital-twins/:entity_id/desired-state",
+		"GET /v1/digital-twins/:entity_id/commands",
+		"GET /v1/digital-twins/:entity_id/commands/:command_id",
 	}
 
 	if len(twinRoutes) != len(expectedTwinRoutes) {
