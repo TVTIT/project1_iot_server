@@ -4,6 +4,28 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
+## P3 Sensor control loop — nghiệm thu local MVP và giới hạn kỹ thuật (25/10/2026)
+
+Xem [báo cáo P3](../backend/paper-p3-sensor-control-loop.md).
+**Sau review:** Hai lỗi HIGH (panic khi result observer nil và bỏ delivery trước SUBACK/install) đã sửa, có regression RED → GREEN. Native mới `ncs_64809f03cce5` PASS 6 command (5 metrics-on + 1 metrics-off), cleanup exact 17 containers / 1 network / 7 volumes; Go race 8 packages và Python 224 tests PASS. Lượt bổ sung đầu `ncs_375e9aebcede` FAIL tại startup backend thay thế, cleanup verified; giữ nguyên lịch sử trong báo cáo. Các số liệu lượt nghiệm thu ban đầu dưới đây không được gán lại cho lượt mới.
+Vòng điều khiển Sensor tối thiểu đã hoàn tất và kiểm chứng E2E trên simulator qua profile HTTPS/RS256 cô lập: `PATCH desired-state` → intent transaction → MQTT command → Gateway apply/readback/dedup → MQTT result → result transaction → `reported.configuration` → REST reading.
+Lượt native E2E đầy đủ `ncs_79ba9068cca0` đạt PASS (`PAPER_P3_ACCEPTED`, `full_p3_accepted: true`, `exact_cleanup_verified: true`, dọn sạch 15 containers / 1 network / 7 volumes). Toàn bộ 5 commands (100 Hz, 100 Hz trên Sensor thứ hai cùng Gateway, 1.5 Hz decimal, 0.1 Hz có lỗi DB tạm thời phục hồi bằng resend, và 60 Hz có controlled restart/reopen) đều hoàn tất và đối chiếu đúng.
+Lỗi guard kiểm tra schema-hardening (Timescale chunk constraint copies) và thiếu công cụ hệ thống `setfacl`/`getfacl` đã được xử lý và ghi nhận đầy đủ lịch sử.
+Bàn giao P3 mức Local MVP hoàn tất sau khi rà soát đầy đủ 8 điều kiện hoàn thành. Deployment mặc định tiếp tục `STAGE5_ENABLED=false` do live rollout nằm ngoài phạm vi P3; remote CI và board HIL (AM5728) tiếp tục giữ trạng thái NOT RUN (được ghi nhận riêng tại checkpoint P8). Không tự mở P6 hay Stage 6.
+
+| Vướng mắc / Giới hạn | Ảnh hưởng | Xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Buffer delivery startup hữu hạn (sau sửa review P3) | Burst trước SUBACK/install vượt 32 messages, payload quá 8 KiB hoặc topic quá 256 bytes làm transport fail-closed; Paho có thể đã auto-ACK nên không hứa phục hồi delivery bằng reconnect | Buffer riêng từng lifetime, chỉ drain sau xác nhận subscription và install; overflow báo lỗi fatal, dừng reconnect. Downstream command/ACK queues vẫn có giới hạn riêng; không claim exactly-once hoặc lossless khi quá tải | Khi cần thay đổi capacity hoặc thiết kế recovery theo một yêu cầu riêng, không tự mở Stage 6 |
+| Lỗi guard hardening do Timescale chunk constraint copies — **ĐÃ SỬA THEO DUYỆT** | Lượt chạy trước FAIL tại `verify-schema-hardening.sql` do đếm conname trên toàn DB thấy 11 thay vì 9; inventory xác nhận 2 constraint phụ thuộc Timescale chunks | Sửa guard kiểm đúng 9 cặp (bảng cha + tên constraint) trong schema public; thêm negative test xác minh từ chối nếu thiếu cặp bắt buộc kể cả có constraint cùng tên ở bảng khác, rollback verified | Đã giải quyết; giữ regression trong intent fixture |
+| Thiếu gói hệ thống `acl` (`setfacl`/`getfacl`) trên host — **ĐÃ GIẢI QUYẾT** | Python guard TLS thất bại khi phân quyền khóa broker UID 1883; preflight E2E bị chặn | Người dùng đã cài gói `acl` (v2.3.2) trên host; 141 tests Python PASS, không nới lỏng quyền đọc khóa | Đã giải quyết |
+| Timeout sau apply có thể xảy ra khi mạng/DB gián đoạn kéo dài | Nếu kết quả không về kịp trước deadline (TTL 60s), command chuyển `timeout` tại DB dù Gateway có thể đã áp dụng cấu hình trên phần cứng | Backend giữ nguyên `timeout` không đi lùi và không rollback `desired_state`; late result (nếu về sau) được lưu tối đa một bản chứng cứ `late_result_bytes` không ghi đè cấu hình mới | Khi triển khai reconciliation tổng quát ở Stage 6 |
+| Cửa sổ retry và retention của Gateway có giới hạn | Gateway lưu receipt và resend có backoff (1–30s) trong thời hạn deadline gốc; sau retention (24h) dữ liệu cũ bị dọn dẹp | Command cũ không thể áp dụng đè lên cấu hình mới hơn; Gateway duy trì watermark `desired_version` đã cam kết trong `sensor_configuration` | Khi thiết kế giao thức hội tụ offline dài hạn |
+| Dữ liệu đo lường trễ toàn tuyến (D_dispatch / D_e2e) trong cùng tiến trình | Correlation bảng nhớ chỉ lưu trong cùng tiến trình Go backend; nếu backend restart giữa chừng, mốc bắt đầu HTTP bị mất | Đánh dấu `missing_origin` / `missing_dispatch` / `missing_result` tường minh trong metrics, không điền 0 giả mạo hoặc trừ đồng hồ hai máy khác nhau | Khi xây dựng distributed tracing toàn tuyến |
+| Dữ liệu cảm biến trên simulator là chuỗi sóng tam giác tổng hợp (Synthetic Data) | Chưa chứng minh thay đổi tốc độ chuyển đổi vật lý bên trong chip cảm biến thật | Simulator áp dụng chu kỳ timer thật cho nhịp đọc/lấy mẫu, phân định rõ ràng synthetic telemetry với cảm biến thật; board AM5728/HIL ghi NOT RUN | Khi kiểm nghiệm trên phần cứng thật tại checkpoint P8 |
+| Triển khai mặc định tiếp tục tắt điều khiển (`STAGE5_ENABLED=false`) | Live client chưa thể điều khiển tần số trên shared deployment | Giữ nguyên cờ tắt mặc định; chỉ bật trong fixture kiểm thử P3 riêng biệt; bảo đảm an toàn hệ thống đang chạy | Khi có kế hoạch rollout chính thức Stage 5 |
+
+---
+
 ## P2 Auth/perimeter — nghiệm thu local MVP và giới hạn kỹ thuật (24/10/2026)
 
 Xem [checkpoint P2](../backend/paper-p2-auth-and-http-perimeter.md).
@@ -54,16 +76,15 @@ không suy P0 thành benchmark, full CI hoặc rollout production.
 | Backend có quota 2 vCPU/4 GiB, DB/broker/Supabase chưa có quota riêng | Có tranh chấp host; không tương đương máy DB 4 core/8 GB và máy sinh tải 8 core/16 GB độc lập | Report công bố inspect thực và host 12 logical CPUs/16.681.447.424 byte RAM; giữ một backend, không suy hiệu năng từ snapshot | Khi chốt testbed cho workload ở phase đo được giao |
 | Một số upstream refs là version tags, không phải digest immutable | Rebuild tương lai có thể không bit-for-bit giống lượt P0 nếu tag đổi | Ghi exact image IDs/references trong report; không tự upgrade/pull, kiểm lại IDs và baseline trước khi so sánh | Trước lượt đo mới hoặc khi đổi image/toolchain |
 
-## Mốc Stage 5 tạm dừng sau Task 5.4 — 24/10/2026
+## Mốc Stage 5 tạm dừng sau Task 5.4 — 24/10/2026 (Lịch sử)
 
-Task 5.0–5.4 đã hoàn thành theo phạm vi duyệt; 5.5–5.8 hoãn lại, không tự triển
-khai tiếp. Đây là cập nhật hiện hành cho Stage 5 và security contract, supersede
-các mô tả Stage 5 còn hoàn toàn chưa làm hoặc global gate bên dưới nếu mâu thuẫn;
-các kết quả cũ vẫn là lịch sử. Xem [bàn giao mốc 5.4](../backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
+> **Ghi chú phân định lịch sử:** Đây là checkpoint lịch sử tại thời điểm kết thúc Task 5.4 (24/10/2026). Sau đó, kế hoạch Paper **P3 (25/10/2026)** đã hoàn tất triển khai Task 5.5 (Gateway apply/dedup/result) và Task 5.6 (result consumer/transaction) trên simulator (xem mục P3 phía trên). Tuy nhiên, Stage 5 gốc vẫn chưa hoàn tất toàn bộ do phần board AM5728/HIL, full CI requirement lane và live rollout chưa thực hiện.
+
+Task 5.0–5.4 đã hoàn thành theo phạm vi duyệt tại mốc 24/10; các mục bên dưới phản ánh giới hạn lịch sử ở mốc bàn giao 5.4 trước khi P3 được thực hiện. Xem [bàn giao mốc 5.4](../backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
 
 | Giới hạn / quyết định | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
 | --- | --- | --- | --- |
-| Chưa có Gateway apply/durable dedup/result (5.5) và result transaction (5.6) | REST nhận intent và publisher có thể chuyển published, nhưng không chứng minh đổi tần số hoặc cập nhật configuration; raw response queue chưa có consumer | Giữ `STAGE5_ENABLED=false` trên shared/live, không bật điều khiển client; không gọi PUBACK là succeeded; không rollback desired khi timeout | Khi có yêu cầu tiếp tục Stage 5 từ 5.5 |
+| Chưa có Gateway apply/durable dedup/result (5.5) và result transaction (5.6) tại mốc 5.4 | REST nhận intent và publisher có thể chuyển published, nhưng chưa chứng minh đổi tần số hoặc cập nhật configuration; raw response queue chưa có consumer tại mốc 5.4 | Đã được giải quyết trên simulator qua P3; trên deployment chung tiếp tục giữ `STAGE5_ENABLED=false` do live rollout nằm ngoài phạm vi P3 | Khi triển khai live rollout Stage 5 |
 | Mosquitto trực tiếp, không global gate theo backend lifecycle | Backend lỗi/dừng không đóng broker; test gate legacy không phải bảo vệ deployment | TLS/auth/ACL broker và API/readiness fail-closed là contract được duyệt; component gate giữ riêng, không khôi phục supervisor chỉ để test xanh | Khi có yêu cầu nghiệp vụ mới về global isolation |
 | ACL verifier dùng manager có quyền quản trị | Đường code chỉ đọc không làm credential thành chỉ-đọc; readback theo connection lifetime không bảo đảm ACL không bị admin đổi giữa phiên | Tách data/manager principal, bảo vệ secret/private listener, phối hợp thay đổi ACL; runtime không tự sửa ACL | Trước rollout hoặc khi thay đổi chính sách quản trị broker |
 | Migration 23 và evidence chỉ trên fixture local | Có table locks; chưa chứng minh thời gian migration trên DB lớn, chưa migrate live hay remote CI/Stage 5 E2E/board | Preflight/backup/window trước deployment; lưu phạm vi PASS/NOT RUN tại handoff, không tự mở thêm ma trận sự cố tổng quát cho mốc này | Khi được yêu cầu rollout hoặc tiếp tục 5.7 |

@@ -1,5 +1,7 @@
 # Task 5.4 — publisher, backend ACL and bounded expiry handoff
 
+> **Thông báo quan trọng về trạng thái:** Tài liệu này là báo cáo bàn giao tại checkpoint kết thúc Task 5.4 (ngày 24/10/2026). Các phát biểu bên dưới như "chưa có Task 5.5/5.6 runtime", "Stage 5 TẠM DỪNG" hoặc "STOP after 5.4" phản ánh hiện trạng lịch sử tại mốc bàn giao đó. Vòng điều khiển khép kín trên simulator (Task 5.5–5.6) sau đó đã được triển khai và nghiệm thu Local MVP qua kế hoạch **P3 (25/10/2026)**; xem [Báo cáo nghiệm thu P3](paper-p3-sensor-control-loop.md). Tuy nhiên, Stage 5 gốc vẫn chưa hoàn tất toàn bộ do phần board AM5728/HIL, full CI requirement lane và live rollout chưa thực hiện. Toàn bộ nhật ký, bằng chứng và quyết định kiểm thử lịch sử của mốc 5.4 dưới đây được giữ nguyên vẹn.
+
 **Mốc chốt 24/10/2026: hoàn thành đến Task 5.4; Stage 5 TẠM DỪNG theo thay đổi kế hoạch của người dùng.**
 Các kiểm tra local cần thiết đã PASS theo hợp đồng current-composition được duyệt.
 Đây là tài liệu bàn giao chính cho mốc dừng, không phải nghiệm thu toàn bộ Stage 5.
