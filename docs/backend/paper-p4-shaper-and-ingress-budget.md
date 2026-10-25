@@ -363,4 +363,6 @@ test ! -e "$run_dir" && sh scripts/test-paper-p4.sh baseline "$run_dir" >"$log" 
 
 Đổi `baseline` thành `optimized` để bật `mqtt_shaper`; không dùng deployment `.env`/credentials cho fixture. Lệnh trên là ví dụ cú pháp, không phải lần chạy trong handoff này.
 
+Tiếp theo P4, lát cắt P5a Local MVP đã hoàn tất. Runner dùng wrapper riêng `scripts/test-paper-p5a.sh`; bốn profile off/on × 100/1 sample, shutdown smoke, cách tạo run directory mới/log ngoài và rollback `off` được hướng dẫn trong [báo cáo P5a](paper-p5a-microbatch-persistence.md). P5a không thay đổi các lệnh/flags P4 ở trên.
+
 **Kết luận:** P4 Local MVP hoàn tất, nhưng finite smoke không chứng minh capacity/soak, fairness, RSS cap hay global broker memory. Giữ các limitation trong backlog. Dừng ở P4; không tự triển khai P5/P6/Stage 6, không rollout.

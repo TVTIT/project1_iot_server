@@ -45,6 +45,23 @@ full/remote CI, HIL/board và rollout NOT RUN/ngoài phạm vi. FAIL lịch sử
 
 ---
 
+## P5a Microbatch persistence — nghiệm thu Local MVP và giới hạn kỹ thuật (25/10/2026)
+
+Xem [báo cáo P5a](../backend/paper-p5a-microbatch-persistence.md) để biết checklist, command/result/shutdown evidence, lịch sử FAIL và artifacts. Bốn workload off/on × 100/1 samples/message cùng các native regressions đại diện PASS trên fixture riêng; source dirty qualification được ghi rõ trong report. Microbatch mặc định off, độc lập với shaper/Stage 5. Không gọi đây là production certification hoặc proof mọi interleaving.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Batch wait đổi lấy ACK latency (đã quan sát) | Trong workload hữu hạn này on có ACK p50/p95 và generation+drain cao hơn off ở cả hai profiles; group wait tối đa 1s và flush thấp tải tạo thêm độ trễ. Operation giảm 24→20 tx/COPY ở 100 samples/message và 24→8 ở 1 sample/message, không đồng nghĩa throughput tổng cao hơn | Giữ `MQTT_MICROBATCH_ENABLED=false` deployment default; dùng `off` làm rollback/ablation. Nếu bật trong fixture, công bố wait/caps và đo ACK latency; không tune bằng cách đổi offered workload | Khi có mục tiêu ACK latency/workload paper đại diện; so sánh timer/caps với cùng workload và profile |
+| Group transaction giữ nhiều resource locks cùng lúc | Group có thể kéo dài thời gian khóa và tăng contention với telemetry/control/provisioning; concurrency cases representative PASS nhưng không chứng minh mọi interleaving hoặc fairness | Transaction chỉ mở khi group sẵn sàng flush; khóa resources theo thứ tự ổn định; cap nhóm và worker hữu hạn; microbatch tắt nếu có contention không chấp nhận được | Khi workload contention thực tế/latency DB tăng hoặc trước profile tải lớn hơn; xem lock-wait cụ thể thay vì mở proof matrix tổng quát |
+| Rollback rồi per-message fallback làm tăng chi phí persistence | Business/provenance conflict có thể trả chi phí transaction nhóm rollback cộng transaction fallback cho member; DB/timeout/commit-unconfirmed không bulk-fallback và không ACK chưa xác nhận | Giữ fallback hữu hạn theo members/deadline, metrics/counters thật; fallback=0 trong bốn workload compare. Dùng per-message mode để rollback feature nếu lỗi hoặc độ trễ không phù hợp | Khi fallback count/rollback rate xuất hiện trong workload đại diện hoặc cần điều chỉnh policy theo yêu cầu nghiệp vụ |
+| Raw-payload bytes không bao gồm decoded sample/metadata overhead | RSS/worker footprint thực lớn hơn payload byte accounting; `resources.csv` có snapshot thưa, không đo peak/continuous hoặc hard RSS ceiling | Giữ rows/messages/bytes/worker bounds và ingress total budget; diễn giải sampled CPU/RAM đúng snapshot, không gọi payload bytes là RSS | Khi có memory pressure hoặc cần hard process-memory target; làm profiling riêng trước khi đổi bounds |
+| Workload/simulator hữu hạn, tất cả service cùng host | 24 messages/profile trên simulator không chứng minh capacity, long soak, broker-wide memory, physical sensor behavior, AM5728/HIL hay môi trường đa máy; CPU/RAM 4–5 snapshots không bắt peak | Chỉ claim correctness/operation counts trong fixture/schema 23/Auth/TLS/ACL; giữ NOT RUN cho full/remote CI, HIL/AM5728, physical sensor và rollout | Tại P8/integration checkpoint nếu được giao, với workload/board/topology được xác định; không suy ngoại suy từ lượt hiện tại |
+| DB Tier-2 timestamp/index chưa làm | P5a tiếp tục dùng ledger/guard hiện hành; kế hoạch đích unique timestamp/index chưa được hiện thực, nên P5 tổng thể chưa hoàn tất | Không migration P5a và không bỏ guard `(gateway_id,message_id)`; backlog item này vẫn thuộc P5b/P5, phải xử lý provenance/backfill trước schema change | Cùng khi P5b được yêu cầu/thiết kế; không đánh dấu complete P5 hoặc drop index requirement |
+
+`P5b` RAM dedup/Tier-2 timestamp-index, `P6`, Stage 6 và live rollout không được triển khai trong lát cắt này. Giữ `STAGE5_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false` deployment defaults. Không có migration hoặc dependency change.
+
+---
+
 ## P2 Auth/perimeter — nghiệm thu local MVP và giới hạn kỹ thuật (24/10/2026)
 
 Xem [checkpoint P2](../backend/paper-p2-auth-and-http-perimeter.md).

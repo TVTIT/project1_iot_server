@@ -51,7 +51,29 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   test ! -e "$run_dir" && sh scripts/test-paper-p4.sh baseline "$run_dir" >"$log" 2>&1
   # Chế độ shaped: đổi baseline thành optimized
   ```
-  Xem [báo cáo P4, so sánh, giới hạn và artifacts](docs/backend/paper-p4-shaper-and-ingress-budget.md). Kết quả không phải benchmark capacity/fairness/RSS/broker-wide; full/remote CI, board/HIL và live rollout NOT RUN. Giữ `STAGE5_ENABLED=false`, `MQTT_SHAPER_ENABLED=false` deployment defaults; dừng tại P4, không tự mở P5/P6/Stage 6.
+  Xem [báo cáo P4, so sánh, giới hạn và artifacts](docs/backend/paper-p4-shaper-and-ingress-budget.md). Kết quả không phải benchmark capacity/fairness/RSS/broker-wide; full/remote CI, board/HIL và live rollout NOT RUN.
+- **P5a — Microbatch persistence (25/10/2026): PASS, Local MVP** trên fixture cô lập. Bốn lượt off/on × 100/1 sample-message PASS; raw, temporal, per-message application ACK và outbox drain khớp. Transaction/COPY thật là 24→20 (100 samples/message) và 24→8 (1 sample/message), nhưng ACK latency và thời gian hoàn tất cao hơn khi microbatch bật ở các workload hữu hạn này. Regression command/result/configuration preservation và shutdown partial-group recheck PASS. Source/artifact qualification, FAIL lịch sử, hạn chế và exact metrics nằm trong [báo cáo P5a](docs/backend/paper-p5a-microbatch-persistence.md); backlog duy nhất ở [limitations-and-backlog](docs/dynsec/limitations-and-backlog.md).
+  - Chạy từ repo root, mỗi profile dùng thư mục chưa tồn tại và log ngoài run directory; các flags độc lập, deployment defaults vẫn off:
+    ```sh
+    set -e
+    base=/var/tmp/opencode/paper-p5a
+    mkdir -p "$base"
+    run_profile() {
+      mode=$1 dataset=$2 name=$3
+      stamp="$(date +%Y%m%d-%H%M%S)-$$"
+      run_dir="$base/$name-$stamp"; log="$base/$name-$stamp.log"
+      test ! -e "$run_dir" && sh scripts/test-paper-p5a.sh "$mode" "$dataset" "$run_dir" >"$log" 2>&1
+    }
+    run_profile off 100 off-100
+    run_profile on 100 on-100
+    run_profile off 1 off-1
+    run_profile on 1 on-1
+    # Chỉ shutdown smoke on/1:
+    stamp="$(date +%Y%m%d-%H%M%S)-$$"
+    run_dir="$base/shutdown-$stamp"; log="$base/shutdown-$stamp.log"
+    test ! -e "$run_dir" && sh scripts/test-paper-p5a.sh on 1 "$run_dir" --shutdown-smoke >"$log" 2>&1
+    ```
+  - `off` là rollback/ablation sang persistence từng message; protocol telemetry và ACK từng message không đổi. `STAGE5_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false` là deployment defaults, độc lập nhau. P5b (RAM dedup/Tier-2 index), P6, Stage 6, full/remote CI, HIL/AM5728/physical sensor và live rollout chưa làm/NOT RUN. Không suy workload hữu hạn thành capacity/soak/fairness/production proof; dừng tại P5a.
 
 ---
 
