@@ -44,6 +44,14 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   - *Follow-up sửa hai lỗi HIGH sau review*: Đã sửa panic khi result observer nil và bỏ lỡ delivery trước SUBACK/install (có regression RED → GREEN). Lượt native E2E mới `ncs_64809f03cce5` đạt PASS (`PAPER_P3_ACCEPTED`, `full_p3_accepted: true`, cleanup exact 17 containers / 1 network / 7 volumes) với 6 commands (5 metrics-on + 1 metrics-off 50 Hz); Go race 8 packages PASS, Python 224 tests PASS. Lượt native bổ sung đầu `ncs_375e9aebcede` FAIL health_failed tại startup backend thay thế, cleanup verified (16 containers / 1 network / 7 volumes); helper sau đó đã thêm graceful-stop và protected startup diagnostics. Giữ nguyên lịch sử FAIL trong báo cáo.
   - *Đường dẫn artifacts*: Lượt mới tại `/var/tmp/opencode/p3-review-fixes-EblFYP/native-02/artifacts/`; lượt ban đầu tại `/tmp/opencode/paper-p3-e2e-after-acl-20261025-07/artifacts/`.
   - *Ranh giới vận hành*: Chạy từ repo root bằng `sh scripts/test-paper-p3.sh [NEW_RUN_DIRECTORY]`. Xem chi tiết tại [báo cáo P3](docs/backend/paper-p3-sensor-control-loop.md). Deployment mặc định tiếp tục `STAGE5_ENABLED=false`; không tự mở P6 hay Stage 6; remote CI và board HIL (AM5728) giữ NOT RUN.
+- **P4 — Shaper và ingress budget (25/10/2026): PASS, Local MVP** trên fixture riêng. Baseline shaper-off `ncs_4e31bc6aa1b1` và optimized `ncs_bd005abcca19` đều PASS với cleanup exact 18 containers / 1 network / 7 volumes; workload hữu hạn có 59 unique batches / 4.010 samples, B rate rejects/retry khi shaper bật, A tiếp tục commit và 4 pending rows được drain byte-hash exact sau reopen. P3 regression mới `ncs_705f0713b225` PASS, cleanup 17 / 1 / 7. Chạy từ repo root với **thư mục mới chưa tồn tại** và log ngoài thư mục:
+  ```sh
+  run_dir="/var/tmp/opencode/paper-p4/my-baseline-$(date +%Y%m%d-%H%M%S)"
+  log="/var/tmp/opencode/paper-p4/my-baseline-$(date +%Y%m%d-%H%M%S).log"
+  test ! -e "$run_dir" && sh scripts/test-paper-p4.sh baseline "$run_dir" >"$log" 2>&1
+  # Chế độ shaped: đổi baseline thành optimized
+  ```
+  Xem [báo cáo P4, so sánh, giới hạn và artifacts](docs/backend/paper-p4-shaper-and-ingress-budget.md). Kết quả không phải benchmark capacity/fairness/RSS/broker-wide; full/remote CI, board/HIL và live rollout NOT RUN. Giữ `STAGE5_ENABLED=false`, `MQTT_SHAPER_ENABLED=false` deployment defaults; dừng tại P4, không tự mở P5/P6/Stage 6.
 
 ---
 

@@ -26,6 +26,25 @@ Bàn giao P3 mức Local MVP hoàn tất sau khi rà soát đầy đủ 8 điề
 
 ---
 
+## P4 Shaper và ingress budget — Local MVP hoàn tất, giới hạn kỹ thuật (25/10/2026)
+
+Xem [báo cáo P4](../backend/paper-p4-shaper-and-ingress-budget.md). Native baseline
+off `ncs_4e31bc6aa1b1`, optimized `ncs_bd005abcca19` và P3 regression mới
+`ncs_705f0713b225` đều PASS, cleanup exact; Python final 228 tests PASS, Go affected
+race/build/vet/lint/format/ARMv7 checks PASS. P4 được bàn giao Local MVP;
+full/remote CI, HIL/board và rollout NOT RUN/ngoài phạm vi. FAIL lịch sử được giữ.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Token-bucket state chỉ nằm trong RAM | Backend restart reset quota/burst; không phải quota bền vững qua restart/process | Dùng một backend active, giữ `MQTT_SHAPER_ENABLED` opt-in và chấp nhận quota reset trong profile MVP; không suy ra distributed enforcement | Nếu có yêu cầu quota xuyên restart hoặc nhiều backend |
+| Token bucket không cam kết hard fairness hoặc global quota | Gateway chỉ bị rate-limited theo bucket/profile; scheduling/interleaving không bảo đảm mọi Gateway nhận cùng thông lượng, và từng process không chia sẻ quota | Cấu hình per-Gateway `r/b` theo workload; đo A progress trong fixture; không tuyên bố hard fairness/cross-process cap | Khi có yêu cầu fairness SLA hoặc multi-instance |
+| Gateway durable outbox có capacity hữu hạn (5.000 rows / 64 MiB theo profile hiện tại) | Khi shaper/backpressure kéo dài, pending rows có thể đầy; retry không thể bảo đảm drain vô hạn | Giữ workload hữu hạn, theo dõi pending rows/bytes, giảm offered load để drain; không xóa pending dữ liệu | Khi workload thực tế tiến gần quota hoặc cần capacity planning |
+| Broker/Paho có thể allocate/queue trước ingress shaper | Shaper chỉ thấy delivery sau broker/client receive; không chặn inbound network/broker memory, nhiều client cũng nhân per-client queue limits | Giữ packet/payload/inflight/queued bounds explicit và TLS/ACL; không gọi chúng là broker-wide memory ceiling | Khi cần broker-wide memory proof hoặc thay đổi topology/connection fan-in |
+| Payload budget không phải RSS cap | Payload copy cap không tính topic/metadata, decoded samples, Paho/network buffers, shaper state, worker-local memory và allocator overhead; Go maps/backing slices có thể giữ historical allocator capacity sau logical eviction | Giữ queue count cap và `MQTT_INGRESS_BUFFERED_BYTES`; tách logical accounting khỏi RSS, dùng snapshot chỉ như quan sát | Khi cần hard process memory ceiling hoặc có bằng chứng memory pressure |
+| Resource snapshots thưa và finite workload nhỏ | CPU/RAM samples không bắt peak tức thời/continuous behavior; 59 batches / 4.010 samples không chứng minh capacity/long soak | Báo cáo đúng cửa sổ, không nội suy peak hay năng lực; lặp lại cùng fixture khi có request đo mới | Khi capacity/soak target được xác định |
+
+---
+
 ## P2 Auth/perimeter — nghiệm thu local MVP và giới hạn kỹ thuật (24/10/2026)
 
 Xem [checkpoint P2](../backend/paper-p2-auth-and-http-perimeter.md).
