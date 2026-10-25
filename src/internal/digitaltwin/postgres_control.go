@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"iot-platform/internal/metrics"
 )
 
 // ErrControlCapacity indicates a bounded durable-intent store is full. No intent
@@ -35,10 +37,14 @@ func DefaultControlConfig() ControlConfig {
 
 // PostgresControlRepository persists intent; it performs no network publication.
 type PostgresControlRepository struct {
-	db      TxDatabase
-	config  ControlConfig
-	metrics *ControlMetrics
+	db       TxDatabase
+	config   ControlConfig
+	metrics  *ControlMetrics
+	timeline *metrics.ControlTimeline
 }
+
+// SetControlTimeline installs a shared process-local observer before runtime starts.
+func (r *PostgresControlRepository) SetControlTimeline(t *metrics.ControlTimeline) { r.timeline = t }
 
 // NewPostgresControlRepository constructs a bounded intent repository.
 func NewPostgresControlRepository(db TxDatabase, config ControlConfig, observers ...*ControlMetrics) (*PostgresControlRepository, error) {
@@ -216,6 +222,9 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 	outcome = "accepted"
 	if unchanged {
 		outcome = "noop"
+	}
+	if !unchanged && r.timeline != nil {
+		r.timeline.Register(ctx, *response.CommandID)
 	}
 	return response, nil
 }

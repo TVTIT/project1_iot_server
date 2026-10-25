@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"iot-platform/internal/digitaltwin"
+	"iot-platform/internal/metrics"
 )
 
 func TestControlRoutesAuthenticationAndCache(t *testing.T) {
@@ -38,6 +39,41 @@ type controlRepositoryStub struct {
 	admit     func(context.Context, uuid.UUID, string, digitaltwin.DesiredRequest) (digitaltwin.RequestReceipt, error)
 	list      func(context.Context, uuid.UUID, string, int, string) (digitaltwin.ControlCommandPage, error)
 	get       func(context.Context, uuid.UUID, string, string) (digitaltwin.ControlCommandView, error)
+}
+
+func TestControlHTTPEntrySurvivesAuthorizationAndEarlyEvents(t *testing.T) {
+	m, err := metrics.NewControlTimeline(8, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := testRouterDependencies(readinessCheckerFunc(func(context.Context) error { return nil }))
+	deps.ControlAPIEnabled = true
+	deps.ControlTimeline = m
+	deps.ControlRequestTimeout = time.Second
+	id := "00000000-0000-4000-8000-000000000001"
+	deps.ControlRepository = &controlRepositoryStub{
+		authorize: func(context.Context, uuid.UUID, string, bool) error { return nil },
+		admit: func(ctx context.Context, _ uuid.UUID, _ string, _ digitaltwin.DesiredRequest) (digitaltwin.RequestReceipt, error) {
+			m.PUBACK(id, time.Now())
+			m.ResultCommit(id, "succeeded", time.Now())
+			m.Register(ctx, id)
+			return digitaltwin.RequestReceipt{StatusCode: 202, CommandID: &id, Response: []byte(`{"status":"pending"}`)}, nil
+		},
+	}
+	router, err := NewRouter(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Sensor:gw:s1/desired-state", strings.NewReader(`{"frequency_hz":1,"expected_desired_version":"0"}`))
+	r.Header.Set("Authorization", "Bearer token")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Idempotency-Key", "timeline-entry")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+	s := m.Snapshot()
+	if w.Code != 202 || s.Dispatch.Count != 1 || s.Succeeded.Count != 1 || s.MissingOrigin != 0 {
+		t.Fatalf("HTTP origin lost: status=%d metrics=%+v", w.Code, s)
+	}
 }
 
 func (s *controlRepositoryStub) AuthorizeControlTarget(ctx context.Context, id uuid.UUID, urn string, mutation bool) error {

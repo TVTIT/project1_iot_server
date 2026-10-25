@@ -207,12 +207,16 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	var (
 		processor *gatewaysim.ACKProcessor
 		transport simTransport
+		control   *gatewaysim.ControlRuntime
 	)
 	// closeAll tears down every resource opened so far within one bounded
 	// budget. It is safe once, on any startup failure after the outbox opened.
 	closeAll := func() {
 		tctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
+		if control != nil {
+			_ = control.Close(tctx)
+		}
 		if processor != nil {
 			_ = processor.Stop(tctx)
 		}
@@ -230,7 +234,13 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	}
 	processor = createdProcessor
 
-	createdTransport, err := buildTransport(cfg, processor)
+	var admit gatewaysim.ACKAdmitter = processor
+	var commands *gatewaysim.CommandInbox
+	if cfg.ControlEnabled {
+		commands = gatewaysim.NewCommandInbox(cfg.GatewayID, processor)
+		admit = commands
+	}
+	createdTransport, err := buildTransport(cfg, admit)
 	if err != nil {
 		writef(stderr, "error: could not create the MQTT transport: %s\n", transportErrorMessage(err))
 		closeAll()
@@ -246,12 +256,32 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		FiniteBatch:      batches,
 		CompletionBudget: completionBudget,
 		Latency:          tracker,
+		RuntimeSampling:  cfg.ControlEnabled,
 		Logger:           slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	})
 	if err != nil {
 		writeln(stderr, "error: could not create the scheduler")
 		closeAll()
 		return 1
+	}
+	if cfg.ControlEnabled {
+		controller, err := gatewaysim.NewController(outbox, scheduler)
+		if err != nil {
+			writeln(stderr, "error: could not create control owner")
+			closeAll()
+			return 1
+		}
+		control, err = gatewaysim.NewControlRuntime(controller, commands, transport, cfg.PublishTimeout)
+		if err != nil {
+			writeln(stderr, "error: could not create control workers")
+			closeAll()
+			return 1
+		}
+		if err := control.Start(ctx); err != nil {
+			writeln(stderr, "error: control recovery failed; supervised reopen required")
+			closeAll()
+			return 1
+		}
 	}
 
 	processor.Start()
@@ -277,10 +307,15 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 
 	schedulerDone := make(chan error, 1)
 	go func() { schedulerDone <- scheduler.Run(ctx) }()
+	var controlFatal <-chan struct{}
+	if control != nil {
+		controlFatal = control.FatalSignal()
+	}
 
 	select {
 	case <-ctx.Done():
 	case <-scheduler.Done():
+	case <-controlFatal:
 	}
 
 	// One shutdown budget for every teardown step. The scheduler's own publish
@@ -290,6 +325,11 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	if deadline, ok := shutCtx.Deadline(); ok {
 		scheduler.BeginShutdown(deadline)
 	}
+	if control != nil {
+		if err := control.Close(shutCtx); err != nil {
+			writeln(stderr, "warning: control workers did not join within shutdown budget")
+		}
+	}
 	scheduler.Stop()
 
 	var schedErr error
@@ -297,6 +337,11 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	case schedErr = <-schedulerDone:
 	case <-shutCtx.Done():
 		schedErr = shutCtx.Err()
+	}
+	select {
+	case <-controlFatal:
+		schedErr = gatewaysim.ErrControlUnconfirmed
+	default:
 	}
 
 	if err := processor.Stop(shutCtx); err != nil {
@@ -327,6 +372,10 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 			stats.UniquePayloadBytes, stats.AttemptedPayloadBytes, stats.UniqueSamples)
 		snap := tracker.Snapshot()
 		writef(stdout, "%s\n", gatewaysim.FormatMeasurementSummary(snap))
+	}
+	if control != nil {
+		cs := control.Stats()
+		writef(stdout, "control summary: rejected=%d queue_full=%d ignored=%d conflict=%d result_puback=%d result_publish_error=%d active_interval_us=%d\n", cs.Rejected, cs.QueueFull, cs.Ignored, cs.Conflict, cs.PublishOK, cs.PublishError, scheduler.ActiveSampleInterval())
 	}
 
 	switch {

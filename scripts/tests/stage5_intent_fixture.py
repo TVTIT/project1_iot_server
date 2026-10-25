@@ -36,6 +36,33 @@ def verify(fixture):
         print(output.decode(), flush=True)
 
 
+def verify_hardening_parent_scope(fixture):
+    """A same-name constraint elsewhere must not hide a missing parent pair.
+
+    Rename, rather than drop, the fixture FK so enforcement remains intact.
+    The psql connection rolls this transaction back on the expected error;
+    the verifier also rolls back if a broken guard incorrectly succeeds.
+    """
+    guard = (ROOT / 'scripts/sql/verify-schema-hardening.sql').read_bytes()
+    _, output = fixture.sql(b"""BEGIN;
+        ALTER TABLE public.twin_entities RENAME CONSTRAINT
+            fk_twin_entities_gateway TO p3_guard_hidden_gateway_fk;
+        CREATE TABLE public.p3_guard_wrong_parent (
+            id integer CONSTRAINT fk_twin_entities_gateway CHECK(id > 0));
+        """ + guard, expect=False)
+    if b'expected 9 hardening constraints, found 8' not in output:
+        raise RuntimeError('hardening verifier did not reject missing parent pair')
+    fixture.sql(b"""DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conrelid='public.twin_entities'::regclass
+                         AND conname='fk_twin_entities_gateway')
+           OR to_regclass('public.p3_guard_wrong_parent') IS NOT NULL THEN
+            RAISE EXCEPTION 'Hardening negative check did not roll back';
+        END IF;
+    END $$;""")
+    print('Hardening parent-pair refusal with same-name decoy: PASS; rollback verified', flush=True)
+
+
 def native(fixture, binary):
     docker_cp(fixture, binary, '/tmp/control.test')
     output = docker_exec(fixture, ['sh', '-c',
@@ -105,6 +132,7 @@ def scenario(kind, binary):
         if kind == 'fresh':
             migrate(fixture, 23)
             verify(fixture)
+            verify_hardening_parent_scope(fixture)
             native(fixture, binary)
             run_existing_migration_runner(fixture, 23)
             verify(fixture)

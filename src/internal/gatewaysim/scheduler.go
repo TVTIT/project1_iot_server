@@ -153,6 +153,10 @@ type SchedulerOptions struct {
 	// measurement with zero allocations.
 	Latency LatencyRecorder
 
+	// RuntimeSampling opts control fixtures into timer-driven sampling. The old
+	// finite telemetry profiles retain their bootstrap behavior when disabled.
+	RuntimeSampling bool
+
 	// Test seams.
 	clock     Clock
 	randFloat func() float64
@@ -183,11 +187,14 @@ type Scheduler struct {
 	ack AckObserver
 	out *Outbox
 
-	clock     Clock
-	randFloat func() float64
-	newUUID   func() (uuid.UUID, error)
-	bootID    uuid.UUID
-	latency   LatencyRecorder
+	clock           Clock
+	randFloat       func() float64
+	newUUID         func() (uuid.UUID, error)
+	bootID          uuid.UUID
+	latency         LatencyRecorder
+	sampling        *samplingState
+	activeInterval  atomic.Int64
+	intervalUpdates chan intervalUpdate
 
 	finiteTarget     int
 	completionBudget time.Duration
@@ -298,7 +305,7 @@ func NewScheduler(opts SchedulerOptions) (*Scheduler, error) {
 		return nil, errors.New("gatewaysim: generated boot id is invalid")
 	}
 
-	return &Scheduler{
+	s := &Scheduler{
 		cfg: schedulerConfig{
 			gatewayID:        cfg.GatewayID,
 			sensorID:         cfg.SensorID,
@@ -326,7 +333,34 @@ func NewScheduler(opts SchedulerOptions) (*Scheduler, error) {
 		inflight:         make(map[uuid.UUID]*inflightEntry),
 		pubResults:       make(chan publishResult, cfg.MaxInflight),
 		fatalCh:          make(chan struct{}),
-	}, nil
+	}
+	s.activeInterval.Store(cfg.SampleIntervalUS)
+	stored, found, err := opts.Outbox.Configuration(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		s.activeInterval.Store(stored.SampleIntervalUS)
+	}
+	if !opts.RuntimeSampling {
+		receipts, err := opts.Outbox.ControlReceipts(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range receipts {
+			if len(r.Result) == 0 {
+				return nil, ErrControlUnconfirmed
+			}
+		}
+	}
+	if opts.RuntimeSampling || found {
+		if s.ActiveSampleInterval() < 10000 || s.ActiveSampleInterval() > 1<<53 {
+			return nil, errors.New("gatewaysim: control bootstrap interval outside protocol bounds")
+		}
+		s.sampling = &samplingState{}
+		s.intervalUpdates = make(chan intervalUpdate, 1)
+	}
+	return s, nil
 }
 
 // BootID returns the process-wide boot UUID used for new batches.
@@ -365,7 +399,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	s.timer = s.clock.NewTimer(parkDuration)
 	s.nextGenAt = s.clock.Now().UTC()
 
-	return s.loop()
+	defer close(s.done)
+	err := s.loop()
+	if s.sampling != nil && s.sampling.count > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), s.publishDrainBudget())
+		defer cancel()
+		err = errors.Join(err, s.flushSamples(ctx))
+	}
+	return err
 }
 
 // Stop cancels the run context so Run returns and stops generation. It is safe
@@ -399,7 +440,6 @@ func (s *Scheduler) BeginShutdown(deadline time.Time) {
 
 // loop is the single scheduler goroutine.
 func (s *Scheduler) loop() error {
-	defer close(s.done)
 	for {
 		// A cancelled context is a normal supervised stop, not a fatal error: a
 		// bounded DB read that fails because the run context ended must not be
@@ -445,6 +485,8 @@ func (s *Scheduler) loop() error {
 		case <-s.ack.FatalSignal():
 			return s.fail(s.ack.Fatal())
 		case <-s.timer.C():
+		case update := <-s.intervalUpdates:
+			update.done <- s.changeInterval(update.ctx, update.interval)
 		case <-s.ack.Notify():
 			s.syncInflight()
 		case res := <-s.pubResults:
@@ -459,6 +501,11 @@ func (s *Scheduler) loop() error {
 // generates at most one new batch when the cadence is due. Admission runs before
 // generation so a restart replay always takes slots before new generation.
 func (s *Scheduler) reconcile() error {
+	if s.sampling != nil {
+		if err := s.collectDueSamples(s.ctx); err != nil {
+			return err
+		}
+	}
 	ready := s.pub.Ready()
 	// Deduce the generation-eligibility snapshot before genReady is read by
 	// armTimer, then publish the readiness observation for the loop's edge check.
@@ -479,6 +526,10 @@ func (s *Scheduler) reconcile() error {
 		return err
 	}
 	free := s.cfg.maxInflight - len(s.inflight)
+	if s.sampling != nil {
+		s.genReady = false
+		return nil
+	}
 	s.genReady = !s.genDone && !s.generationPaused.Load() && free > 0 && !more
 	if s.genReady && !now.Before(s.nextGenAt) {
 		return s.generate(now)
@@ -700,7 +751,7 @@ func (s *Scheduler) rowStillPending(id uuid.UUID) (bool, error) {
 // timed work that can actually proceed, so a paused, unready or slot-starved
 // scheduler parks instead of spinning.
 func (s *Scheduler) armTimer() {
-	if !s.pub.Ready() {
+	if !s.pub.Ready() && s.sampling == nil {
 		s.resetTimer(parkDuration)
 		return
 	}
@@ -713,13 +764,19 @@ func (s *Scheduler) armTimer() {
 			next = t
 		}
 	}
-	if s.genReady || (!s.genDone && !s.generationPaused.Load() && s.cfg.maxInflight-len(s.inflight) > 0) {
+	if s.sampling != nil && !s.genDone {
+		consider(s.sampling.next)
+		consider(s.sampling.flushAt)
+	} else if s.sampling == nil && (s.genReady || (!s.genDone && !s.generationPaused.Load() && s.cfg.maxInflight-len(s.inflight) > 0)) {
 		consider(s.nextGenAt)
 	}
 	if s.finiteTarget > 0 && s.genDone && !s.completionDeadline.IsZero() {
 		consider(s.completionDeadline)
 	}
 	for _, e := range s.inflight {
+		if !s.pub.Ready() {
+			break
+		}
 		if e.state == stateAwaitAck || e.state == stateBackoff {
 			consider(e.nextAt)
 		}

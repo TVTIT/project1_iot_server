@@ -115,7 +115,7 @@ DEFAULTS = dict(
     STAGE5_ENABLED="false", STAGE5_REQUEST_TIMEOUT="5s", STAGE5_COMMAND_TTL="60s",
     STAGE5_MAX_PENDING_OUTBOX="10000", STAGE5_MAX_RECEIPTS="100000",
     STAGE5_MQTT_CLIENT_ID="backend_control", STAGE5_PUBLISH_WORKERS="1",
-    STAGE5_SCAN_BATCH="32", STAGE5_RESULT_QUEUE="128", STAGE5_PAYLOAD_BYTES="8192",
+    STAGE5_SCAN_BATCH="32", STAGE5_RESULT_QUEUE="128", STAGE5_RESULT_WORKERS="2", STAGE5_PAYLOAD_BYTES="8192",
     STAGE5_SCAN_INTERVAL="1s", STAGE5_EXPIRE_INTERVAL="1s", STAGE5_RETRY_BACKOFF="1s",
     STAGE5_PUBLISH_TIMEOUT="3s", STAGE5_ACL_TIMEOUT="5s", STAGE5_CONNECT_TIMEOUT="5s",
     STAGE5_SUBSCRIBE_TIMEOUT="3s", STAGE5_RECONNECT_MAX_INTERVAL="30s",
@@ -146,6 +146,7 @@ class Fixture:
     paper_p1: str | None = None
     paper_p2_spike: bool = False
     paper_p2: bool = False
+    paper_p3: bool = False
 
 
 def fixture_services(fixture):
@@ -524,7 +525,11 @@ def paper_p2_support():
     return module
 
 
-def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False, paper_p2=False):
+def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False, paper_p2=False, paper_p3=False):
+    if paper_p3:
+        if paper_p0 or paper_p1 or paper_p2_spike or paper_p2 or not metrics_enabled:
+            raise ValueError('paper_p3_mode_rejected')
+        paper_p2 = True  # Reuse the P2 Auth/HTTPS/socket topology, not its workload.
     if paper_p2 and (paper_p0 or paper_p1 or paper_p2_spike):
         raise ValueError('paper_p2_mode_rejected')
     if paper_p2_spike and (paper_p0 or paper_p1):
@@ -551,6 +556,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       AUTH_UNIX_SOCKET_PATH='/run/iot-auth/auth.sock', GOTRUE_JWT_ISSUER='https://localhost/auth/v1',
                       SUPABASE_PUBLIC_URL='https://localhost', GOTRUE_SITE_URL='https://localhost',
                       CORS_ALLOWED_ORIGINS='https://client.example.test')
+    if paper_p3:
+        values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
     for key in ("POSTGRES_PASSWORD", "AUTH_DB_PASSWORD", "STORAGE_DB_PASSWORD",
                 "BACKEND_DB_PASSWORD", "JWT_SECRET", "MQTT_PASSWORD",
                 "MQTT_DYNSEC_MANAGER_PASSWORD", "DASHBOARD_PASSWORD"):
@@ -589,7 +596,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     private_write(private / "mosquitto.conf", (ROOT / "config/mosquitto/mosquitto.conf").read_text())
     art_stat = artifacts.stat()
     fixture = Fixture(base, private, artifacts, env_file, override, project, values,
-                      art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2)
+                      art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p3)
     if paper_p2_spike or paper_p2:
         paper_p2_support().prepare_spike(sys.modules[__name__], fixture)
     if paper_p2:
@@ -729,9 +736,9 @@ def validate_effective_model(fixture, model):
     backend = services["backend"]
     if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2:
         env = backend.get('environment', {})
-        expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'false',
+        expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'true' if fixture.paper_p3 else 'false',
                     'MQTT_CREDENTIAL_RUNTIME_ENABLED': 'false', 'MQTT_CREDENTIAL_API_ENABLED': 'true',
-                    'DATABASE_MAX_CONNS': '10', 'MQTT_QUEUE_CAPACITY': '256',
+                    'DATABASE_MAX_CONNS': '12' if fixture.paper_p3 else '10', 'MQTT_QUEUE_CAPACITY': '256',
                     'MQTT_WORKER_COUNT': '4', 'MQTT_MAX_PAYLOAD_BYTES': '65536'}
         if (any(str(env.get(k)).lower() != v for k, v in expected.items())
                 or backend.get('cpus') != 2 or str(backend.get('mem_limit')) != '4294967296'):
@@ -990,7 +997,12 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 url = ('https' if fixture.paper_p2 else 'http') + '://127.0.0.1:' + ports[0]['HostPort']
                 endpoint = HTTPSEndpoint(url, fixture.private / 'p2-ca.crt') if fixture.paper_p2 else url
                 evidence['endpoint'] = url
-                if fixture.paper_p2:
+                if fixture.paper_p3:
+                    phase = 'paper_p3'
+                    import paper_p3_support
+                    evidence['paper_p3'] = paper_p3_support.run(sys.modules[__name__], fixture,
+                        registry, endpoint, containers, images, state)
+                elif fixture.paper_p2:
                     phase = 'paper_p2'
                     evidence['paper_p2'] = paper_p2_support().run_full(sys.modules[__name__], fixture,
                         registry, endpoint, containers, images, state)
@@ -1116,7 +1128,13 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         raise FailureDiagnostic(fail_report, cause=failure) from failure
 
     try:
-        if fixture.paper_p2:
+        if fixture.paper_p3:
+            if not evidence['paper_p3'].get('full_p3_accepted'):
+                raise ValueError('cleanup_acceptance_incomplete')
+            report = {'schema_version': 1, 'status': 'PAPER_P3_ACCEPTED', 'project': fixture.project,
+                      'native_executed': True, 'full_p3_accepted': True,
+                      'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts}
+        elif fixture.paper_p2:
             if cleanup_counts != {'container': 19, 'network': 1, 'volume': 7} or not evidence['paper_p2'].get('full_p2_accepted'):
                 raise ValueError('cleanup_acceptance_incomplete')
             report = {'schema_version': 1, 'status': 'PAPER_P2_ACCEPTED', 'project': fixture.project,
@@ -1358,7 +1376,7 @@ def assert_safe_data(data):
 ALLOWED_FAILURE_STATUSES = {"STARTUP_FAILED"}
 ALLOWED_FAILURE_PHASES = {
     "prepare", "preflight", "build", "bootstrap",
-    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2',
+    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2', 'paper_p3',
     "positive_http", "role_http", "jwt_http",
     "cleanup", "report_validation"
 }
@@ -1369,6 +1387,7 @@ ALLOWED_FAILURE_ERROR_TYPES = {
 ALLOWED_FAILURE_ERROR_CODES = {
     'paper_p2_mode_rejected', 'paper_p2_spike_failed', 'paper_p2_perimeter_failed',
     'paper_p2_rotation_failed', 'paper_p2_acceptance_failed',
+    'paper_p3_mode_rejected', 'paper_p3_acceptance_failed',
     'paper_p1_mode_rejected', 'paper_p1_profile_rejected', 'paper_p1_snapshot_rejected',
     'paper_p1_resources_rejected', 'paper_p1_subscription_failed', 'paper_p1_scrape_failed',
     'paper_p1_auth_failed', 'paper_p1_gateway_failed', 'paper_p1_reconciliation_failed',
@@ -2167,6 +2186,23 @@ def paper_p1_metrics_csv(path, samples):
                 row('ingress', name, 'rate', 'samples/s' if 'samples' in name else 'messages/s', value)
             histograms = [('ingress', key, value) for key, value in ing.get('Durations', {}).items()
                           if key in ('queue_wait', 'validation', 'persistence', 'ack_publish')]
+            for group, counters, durations in (
+                    ('command_admission', ('accepted', 'replay', 'noop', 'rejected'), ('admission',)),
+                    ('command_dispatch', ('puback', 'publish_failures'), ('discovery', 'queue_wait', 'publish')),
+                    ('command_result', ('accepted', 'duplicate', 'late', 'rejected', 'db_error', 'queue_full'), ('processing',)),
+                    ('command_timeline', ('missing_origin', 'missing_dispatch', 'missing_result', 'overflow'),
+                     ('d_dispatch', 'd_e2e_succeeded', 'd_e2e_failed'))):
+                control = snap.get(group) or {}
+                for key in counters:
+                    if key in control:
+                        row(group, key, 'counter', 'count', control[key])
+                if group == 'command_timeline':
+                    for key in ('entries', 'capacity', 'pending_origins', 'ttl_seconds'):
+                        if key in control:
+                            row(group, key, 'gauge', 'seconds' if key == 'ttl_seconds' else 'count', control[key])
+                for key in durations:
+                    if key in control:
+                        histograms.append((group, key, control[key]))
             auth = snap.get('auth', {})
             for name in ('allow', 'deny'):
                 if name in auth:
@@ -2927,9 +2963,14 @@ def main():
     parser.add_argument('--paper-p1', action='store_true', help='Bounded metrics and artifact workload, same isolated lifecycle as P0')
     parser.add_argument('--paper-p2-spike', action='store_true', help='P2.1 compatibility only; not P2 acceptance')
     parser.add_argument('--paper-p2', action='store_true', help='P2 isolated HTTPS/Unix perimeter checks')
+    parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
     parser.add_argument('--mode', choices=('baseline', 'optimized'))
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
     args = parser.parse_args()
+    if args.paper_p3 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
+                             args.startup_only, args.positive_http_only, args.role_http_only,
+                             args.full_http, args.mode, args.metrics_off)):
+        parser.error('P3 cannot be combined with other execution modes')
     if args.paper_p2 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.startup_only,
                              args.positive_http_only, args.role_http_only, args.full_http, args.mode, args.metrics_off)):
         parser.error('P2 cannot be combined with other execution modes')
@@ -2944,7 +2985,7 @@ def main():
     fixture = None
     try:
         fixture = prepare(args.prepare, paper_p0=args.paper_p0, paper_p1=args.mode,
-                          metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike, paper_p2=args.paper_p2)
+                          metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike, paper_p2=args.paper_p2, paper_p3=args.paper_p3)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -2969,7 +3010,7 @@ def main():
         return 1
 
     try:
-        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2:
+        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3:
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.

@@ -42,6 +42,8 @@ type processMetrics struct {
 	DB               poolMetrics                         `json:"db"`
 	CommandAdmission *digitaltwin.ControlMetricsSnapshot `json:"command_admission"`
 	CommandDispatch  *mqttcontrol.MetricsSnapshot        `json:"command_dispatch"`
+	CommandResult    *mqttcontrol.ResultMetricsSnapshot  `json:"command_result,omitempty"`
+	CommandTimeline  *metrics.ControlTimelineSnapshot    `json:"command_timeline,omitempty"`
 	DispatchE2E      *float64                            `json:"dispatch_e2e_seconds"`
 	ResultE2E        *float64                            `json:"result_e2e_seconds"`
 	BatchWait        *float64                            `json:"batch_wait_seconds"`
@@ -87,6 +89,16 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 		if control.metrics != nil {
 			v := control.metrics.Snapshot()
 			s.CommandDispatch = &v
+		}
+		if control.resultMetrics != nil {
+			v := control.resultMetrics.Snapshot()
+			s.CommandResult = &v
+			s.Availability["result"] = "available"
+		}
+		if control.timeline != nil {
+			v := control.timeline.Snapshot()
+			s.CommandTimeline = &v
+			s.Availability["dispatch_e2e"] = "available"
 		}
 		p := pool.Stat()
 		s.DB = poolMetrics{p.AcquiredConns(), p.IdleConns(), p.TotalConns(), p.MaxConns(), p.AcquireCount(), p.EmptyAcquireCount(), p.CanceledAcquireCount(), p.AcquireDuration().Seconds()}

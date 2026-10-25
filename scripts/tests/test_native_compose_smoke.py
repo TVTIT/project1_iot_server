@@ -417,6 +417,44 @@ class PaperP1Tests(unittest.TestCase):
             self.assertTrue(unavailable)
             self.assertTrue(all(r['value'] == '' for r in unavailable))
 
+    def test_p3_control_csv_reuses_fixed_groups_without_identity_labels(self):
+        import csv
+        hist = {'count': 3, 'sum_seconds': 0.04, 'overflow': 0,
+                'upper_seconds': [0.1], 'buckets': [3]}
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1,
+                  'observed_at': '2026-10-25T10:00:00Z',
+                  'command_result': {'accepted': 3, 'db_error': 1, 'processing': hist,
+                                     'command_id': 'PRIVATE_SENTINEL'},
+                  'command_timeline': {'d_dispatch': hist, 'd_e2e_succeeded': hist,
+                                       'missing_result': 1, 'capacity': 1024,
+                                       'command_id': 'PRIVATE_SENTINEL'}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'control', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertTrue(any(r['group'] == 'command_timeline' and
+                                r['metric'] == 'd_dispatch.count' and r['value'] == '3'
+                                for r in rows))
+            self.assertTrue(any(r['group'] == 'command_result' and
+                                r['metric'] == 'db_error' and r['value'] == '1'
+                                for r in rows))
+            self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
+
+    def test_p3_profile_reuses_p2_but_enables_only_isolated_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p3', paper_p3=True)
+            self.assertTrue(fixture.paper_p3)
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['STAGE5_ENABLED'], 'true')
+            self.assertEqual(fixture.values['STAGE5_RESULT_WORKERS'], '2')
+            self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '12')
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_ENABLED'], 'true')
+            self.assertEqual(model['services']['backend']['environment']['SUPABASE_JWT_MODE'], 'rs256')
+            ordinary = smoke.prepare(Path(directory) / 'p2', paper_p2=True)
+            self.assertEqual(ordinary.values['STAGE5_ENABLED'], 'false')
+
     def test_p1_profile_reuses_p0_resources_but_keeps_its_own_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             for mode in ('baseline', 'optimized'):

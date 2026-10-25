@@ -66,3 +66,30 @@ func TestStage5TransportConfiguration(t *testing.T) {
 		t.Fatalf("independent stage 5 config %v", err)
 	}
 }
+
+func TestStage5ResultWorkersAndPoolReservation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.Stage5.ResultWorkers != 2 {
+		t.Fatalf("result worker default: %d/%v", cfg.Stage5.ResultWorkers, err)
+	}
+	for _, value := range []string{"0", "17", "invalid"} {
+		values["STAGE5_RESULT_WORKERS"] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatalf("invalid workers %s", value)
+		}
+	}
+	values["STAGE5_RESULT_WORKERS"] = "2"
+	values["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		values[k] = v
+	}
+	values["DATABASE_MAX_CONNS"] = "5"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("result workers were omitted from DB pool reservation")
+	}
+	values["DATABASE_MAX_CONNS"] = "6"
+	if _, err := Load(mapLookup(values)); err != nil {
+		t.Fatal(err)
+	}
+}

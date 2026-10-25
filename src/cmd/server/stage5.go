@@ -34,5 +34,6 @@ func populateStage5Dependencies(deps *httpserver.RouterDependencies, cfg config.
 		return fmt.Errorf("create stage 5 intent repository: %w", err)
 	}
 	deps.ControlRepository = repo
+	repo.SetControlTimeline(deps.ControlTimeline)
 	return nil
 }

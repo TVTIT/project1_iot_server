@@ -186,7 +186,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Stage5.Enabled {
-		workers := cfg.Stage5.Dispatch.Workers + 1
+		workers := cfg.Stage5.Dispatch.Workers + cfg.Stage5.ResultWorkers + 1
 		if cfg.Ingress.Enabled {
 			workers += cfg.Ingress.WorkerCount
 			if cfg.Stage5.Data.ClientID == cfg.Ingress.ClientID {

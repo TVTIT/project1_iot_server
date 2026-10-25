@@ -14,11 +14,12 @@ import (
 
 // Stage5Config keeps data traffic separate from bounded ACL inspection credentials.
 type Stage5Config struct {
-	Enabled    bool
-	Control    digitaltwin.ControlConfig
-	Dispatch   mqttcontrol.Config
-	Data       mqttingress.TransportOptions
-	Management mqttcredential.DynSecConfig
+	ResultWorkers int
+	Enabled       bool
+	Control       digitaltwin.ControlConfig
+	Dispatch      mqttcontrol.Config
+	Data          mqttingress.TransportOptions
+	Management    mqttcredential.DynSecConfig
 }
 
 // String redacts data and privileged management credentials.
@@ -30,6 +31,9 @@ func (c Stage5Config) GoString() string { return c.String() }
 func loadStage5(lookup LookupFunc) (Stage5Config, error) {
 	cfg := Stage5Config{Control: digitaltwin.DefaultControlConfig(), Dispatch: mqttcontrol.DefaultConfig()}
 	var err error
+	if cfg.ResultWorkers, err = integer(lookup, "STAGE5_RESULT_WORKERS", 2, 1, 16); err != nil {
+		return cfg, err
+	}
 	if cfg.Enabled, err = boolValue(lookup, "STAGE5_ENABLED", false); err != nil {
 		return cfg, err
 	}

@@ -44,18 +44,23 @@ BEGIN
 
     SELECT count(*)
     INTO constraint_count
-    FROM pg_constraint
-    WHERE conname = ANY (ARRAY[
-        'fk_twin_entities_gateway',
-        'fk_twin_states_last_desired_by',
-        'fk_processed_messages_gateway',
-        'fk_telemetry_sensor',
-        'chk_user_gateways_role',
-        'chk_twin_commands_status',
-        'chk_twin_outbox_status',
-        'chk_twin_temporal_exactly_one_value',
-        'uq_twin_outbox_command_id'
-    ]);
+    -- Timescale copies some parent constraints onto chunks after real writes.
+    -- Count the nine required parent/name pairs, not every same-name constraint
+    -- in the database. A copy or a constraint on another table cannot replace
+    -- a missing parent constraint.
+    FROM (VALUES
+        ('public.twin_entities', 'fk_twin_entities_gateway'),
+        ('public.twin_states', 'fk_twin_states_last_desired_by'),
+        ('public.processed_messages', 'fk_processed_messages_gateway'),
+        ('public.telemetry', 'fk_telemetry_sensor'),
+        ('public.user_gateways', 'chk_user_gateways_role'),
+        ('public.twin_commands', 'chk_twin_commands_status'),
+        ('public.twin_outbox', 'chk_twin_outbox_status'),
+        ('public.twin_temporal_values', 'chk_twin_temporal_exactly_one_value'),
+        ('public.twin_outbox', 'uq_twin_outbox_command_id')
+    ) AS required(parent_table, constraint_name)
+    JOIN pg_constraint c ON c.conrelid = to_regclass(required.parent_table)
+                        AND c.conname = required.constraint_name;
 
     IF constraint_count <> 9 THEN
         RAISE EXCEPTION 'Verification failed: expected 9 hardening constraints, found %', constraint_count;

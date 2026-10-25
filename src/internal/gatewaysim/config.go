@@ -66,8 +66,9 @@ const (
 // Config is the validated Gateway simulator configuration. It contains only
 // Gateway-side values; it never carries database or Supabase settings.
 type Config struct {
-	GatewayID string
-	SensorID  string
+	ControlEnabled bool
+	GatewayID      string
+	SensorID       string
 
 	BrokerURL string
 	ClientID  string
@@ -116,6 +117,12 @@ func Load(lookup LookupFunc) (Config, error) {
 	var c Config
 	var ok bool
 	var err error
+	if value, exists := lookup("GATEWAY_CONTROL_ENABLED"); exists {
+		c.ControlEnabled, err = strconv.ParseBool(value)
+		if err != nil {
+			return c, fmt.Errorf("GATEWAY_CONTROL_ENABLED must be a boolean")
+		}
+	}
 
 	gatewayID, ok := nonEmpty(lookup, "GATEWAY_ID")
 	if !ok {

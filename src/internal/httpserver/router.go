@@ -28,6 +28,7 @@ type RouterDependencies struct {
 	MetricsEnabled             bool
 	MetricsSnapshot            func() any
 	ControlMetrics             *digitaltwin.ControlMetrics
+	ControlTimeline            *metrics.ControlTimeline
 	HTTPMetrics                *HTTPMetrics
 	AuthMetrics                *auth.Metrics
 	UnixAuthMetrics            *auth.Metrics
@@ -179,6 +180,14 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 
 	router := gin.New()
+	if deps.ControlTimeline != nil {
+		router.Use(func(c *gin.Context) {
+			if c.Request.Method == http.MethodPatch && c.FullPath() == "/v1/digital-twins/:entity_id/desired-state" {
+				c.Request = c.Request.WithContext(metrics.WithControlHTTPEntry(c.Request.Context(), time.Now()))
+			}
+			c.Next()
+		})
+	}
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return nil, fmt.Errorf("disable untrusted proxy headers: %w", err)
 	}

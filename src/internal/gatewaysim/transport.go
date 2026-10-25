@@ -47,6 +47,12 @@ const (
 	defaultPublishStopGrace = 250 * time.Millisecond
 	// maxCABytes bounds the CA file the transport reads at startup.
 	maxCABytes = 1 << 20
+	// Startup delivery staging is bounded independently of downstream queues.
+	// 32 payloads of at most 8 KiB cover ACKs and control commands without
+	// allocating from an untrusted MQTT payload length.
+	startupDeliveryCapacity = 32
+	startupPayloadBytes     = 8 << 10
+	startupTopicBytes       = 256
 
 	// ackSubscribeQoS is the QoS requested for the single own-ACK subscription.
 	// The granted SUBACK code must be a valid QoS no higher than this.
@@ -72,6 +78,9 @@ var (
 	// invocation stayed wedged after its socket close. The transport stops
 	// reconnecting and stays not ready until a supervised restart.
 	ErrTransportStuck = errors.New("gatewaysim: transport teardown unconfirmed; supervised restart required")
+	// ErrTransportStartupOverflow is fatal: Paho may already have auto-ACKed
+	// excess startup deliveries, so reconnect is not a lossless recovery claim.
+	ErrTransportStartupOverflow = errors.New("gatewaysim: startup delivery limit exceeded; supervised restart required")
 )
 
 // ACKAdmitter accepts one raw inbound ACK callback. *ACKProcessor satisfies it;
@@ -86,6 +95,8 @@ type ACKAdmitter interface {
 // at construction so startup fails clearly. The unexported fields are test
 // seams and stay zero in production.
 type TransportOptions struct {
+	// ControlEnabled requires both own ACK and command subscriptions before ready.
+	ControlEnabled bool
 	// GatewayID is the configured Gateway identity. It must equal Username and
 	// is used to derive the exact own ACK subscription filter.
 	GatewayID string
@@ -125,6 +136,7 @@ type TransportOptions struct {
 // to NewTransport.
 func TransportOptionsFromConfig(cfg Config) TransportOptions {
 	return TransportOptions{
+		ControlEnabled:       cfg.ControlEnabled,
 		GatewayID:            cfg.GatewayID,
 		BrokerURL:            cfg.BrokerURL,
 		ClientID:             cfg.ClientID,
@@ -151,6 +163,11 @@ type lifetime struct {
 	subscribed atomic.Bool
 	failed     atomic.Bool
 
+	// Protected by Transport.mu, which also serializes install/drain with
+	// callbacks. An installed lifetime must never return to staging when stale.
+	installed bool
+	staged    []startupDelivery
+
 	mu     sync.Mutex
 	conn   net.Conn
 	closed bool
@@ -164,6 +181,12 @@ type lifetime struct {
 	// completed, and must never be treated as teardown confirmation.
 	wake     chan struct{}
 	wakeOnce sync.Once
+}
+
+type startupDelivery struct {
+	topic    string
+	payload  []byte
+	retained bool
 }
 
 func newLifetime(epoch uint64) *lifetime {
@@ -535,6 +558,8 @@ func (t *Transport) WaitReady(ctx context.Context) error {
 		}
 		select {
 		case <-ch:
+		case <-t.fatalCh:
+			return t.Fatal()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -765,13 +790,23 @@ func (t *Transport) connectOnce(ctx context.Context) (*lifetime, error) {
 
 	subCtx, cancelSub := context.WithTimeout(ctx, t.opts.SubscribeTimeout)
 	defer cancelSub()
-	subToken := client.Subscribe(t.filter, ackSubscribeQoS, func(topic string, payload []byte, retained bool) {
-		t.onMessage(lt, topic, payload, retained)
-	})
-	if err := waitSubscribeToken(subCtx, subToken, t.filter); err != nil {
-		t.counters.subscribeFailed.Add(1)
-		t.closeLifetime(lt, 0)
-		return nil, err
+	filters := []string{t.filter}
+	if t.opts.ControlEnabled {
+		filters = append(filters, "gateways/"+t.opts.GatewayID+"/commands/#")
+	}
+	for _, filter := range filters {
+		subToken := client.Subscribe(filter, ackSubscribeQoS, func(topic string, payload []byte, retained bool) {
+			t.onMessage(lt, topic, payload, retained)
+		})
+		err := waitSubscribeToken(subCtx, subToken, filter)
+		if err == nil && t.opts.ControlEnabled && subToken.Result()[filter] != 1 {
+			err = errors.New("gatewaysim: control requires QoS 1 subscriptions")
+		}
+		if err != nil {
+			t.counters.subscribeFailed.Add(1)
+			t.closeLifetime(lt, 0)
+			return nil, err
+		}
 	}
 	if lt.failed.Load() {
 		// A connection loss (or explicit failure) arrived before install. Do not
@@ -834,16 +869,36 @@ func awaitToken(ctx context.Context, token waitToken) error {
 	}
 }
 
-// onMessage runs in Paho's ordered router goroutine. It admits the delivery
-// only when this lifetime is still current and usable; otherwise the stale
-// callback is dropped. It never blocks, decodes JSON, touches SQLite or spawns
-// a goroutine: Admit copies the payload into the bounded ACK queue.
+// onMessage runs in Paho's ordered router goroutine. Before install it stages
+// bounded copies: MQTT permits delivery before SUBACK. After install only the
+// current usable lifetime may admit messages. The same lock serializes staging,
+// install/drain and live delivery, so a live callback cannot overtake the buffer.
+// Admit is contractually only a bounded check/copy/enqueue; no JSON, SQLite,
+// network calls or per-message goroutines may run while holding this lock.
 func (t *Transport) onMessage(lt *lifetime, topic string, payload []byte, retained bool) {
-	if !lt.usable() || t.currentLifetime() != lt {
+	t.mu.Lock()
+	if t.closed || lt.failed.Load() || (lt.installed && t.current != lt) {
 		t.counters.staleDropped.Add(1)
+		t.mu.Unlock()
+		return
+	}
+	if !lt.installed {
+		if len(lt.staged) >= startupDeliveryCapacity || len(topic) > startupTopicBytes || len(payload) > startupPayloadBytes {
+			lt.markFailed()
+			lt.staged = nil
+			t.mu.Unlock()
+			t.setFatal(ErrTransportStartupOverflow)
+			t.log.Error("gatewaysim startup delivery limit exceeded", "event", "startup_delivery_overflow")
+			t.StopReconnect()
+			lt.signalWake()
+			return
+		}
+		lt.staged = append(lt.staged, startupDelivery{topic: topic, payload: append([]byte(nil), payload...), retained: retained})
+		t.mu.Unlock()
 		return
 	}
 	t.admit.Admit(topic, payload, retained)
+	t.mu.Unlock()
 }
 
 // onLost is the Paho connection-lost callback. It immediately makes readiness
@@ -881,6 +936,9 @@ func (t *Transport) closeLifetime(lt *lifetime, wait time.Duration) bool {
 		return true
 	}
 	lt.markFailed()
+	t.mu.Lock()
+	lt.staged = nil
+	t.mu.Unlock()
 	lt.closeSocket()
 	if lt.client != nil {
 		lt.client.Disconnect(0)
@@ -990,16 +1048,29 @@ func (t *Transport) currentLifetime() *lifetime {
 func (t *Transport) installCurrent(lt *lifetime) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if !lt.usable() {
+	if t.closed || t.reconnectStopped || !lt.usable() {
+		lt.staged = nil
 		return false
 	}
 	t.current = lt
+	lt.installed = true
+	for _, delivery := range lt.staged {
+		if lt.failed.Load() {
+			break
+		}
+		t.admit.Admit(delivery.topic, delivery.payload, delivery.retained)
+	}
+	lt.staged = nil
+	if lt.failed.Load() {
+		t.current = nil
+	}
 	t.notifyStateLocked()
-	return true
+	return t.current == lt
 }
 
 func (t *Transport) clearCurrent(lt *lifetime) {
 	t.mu.Lock()
+	lt.staged = nil
 	if t.current == lt {
 		t.current = nil
 		t.notifyStateLocked()

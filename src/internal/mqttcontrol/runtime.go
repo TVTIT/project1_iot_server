@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"iot-platform/internal/digitaltwin"
+	"iot-platform/internal/metrics"
 
 	"github.com/google/uuid"
 )
@@ -68,9 +69,13 @@ type Runtime struct {
 	cancel   context.CancelFunc
 	jobs     chan dispatchJob
 	metrics  *Metrics
+	timeline *metrics.ControlTimeline
 	done     chan struct{}
 	wg       sync.WaitGroup
 }
+
+// SetControlTimeline installs a shared observer before fixed workers start.
+func (r *Runtime) SetControlTimeline(t *metrics.ControlTimeline) { r.timeline = t }
 
 // New builds an inert runtime.
 func New(cfg Config, repo Repository, pub Publisher, observers ...*Metrics) (*Runtime, error) {
@@ -220,6 +225,9 @@ func (r *Runtime) worker() {
 						start = time.Now()
 					}
 					err = r.pub.Publish(ctx, *d)
+					if err == nil && r.timeline != nil {
+						r.timeline.PUBACK(id.String(), time.Now())
+					}
 					if r.metrics != nil {
 						r.metrics.publish.Observe(time.Since(start))
 						if err == nil {
