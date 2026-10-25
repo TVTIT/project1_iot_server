@@ -39,6 +39,11 @@ type counters struct {
 
 	processingNanos atomic.Int64
 	processingCount atomic.Int64
+
+	groupCount, groupMembers, groupRows, groupPayloadBytes      atomic.Int64
+	groupMaxMembers                                             atomic.Int64
+	flushMessages, flushRows, flushBytes, flushTimer, flushStop atomic.Int64
+	standaloneOversized                                         atomic.Int64
 }
 
 // Snapshot is a point-in-time, bounded view of ingress counters and queue state.
@@ -46,6 +51,7 @@ type counters struct {
 type Snapshot struct {
 	Received, ReceivedBytes, AcceptedBytes, InFlight int64
 	Durations                                        DurationSnapshot
+	Microbatch                                       MicrobatchSnapshot `json:"microbatch"`
 	// Admission.
 	Accepted                      int64
 	RejectedNotRunning            int64
@@ -81,7 +87,9 @@ type Snapshot struct {
 	ACKPublished       int64
 	ACKPublishFailures int64
 
-	// Processing latency aggregate over processed items.
+	// Processing latency sums completed delivery lifetimes from worker dequeue
+	// through release (including batch wait, persistence and ACK), not SQL time.
+	// These legacy aggregates remain populated even when MetricsEnabled is false.
 	ProcessingLatencyTotal time.Duration
 	ProcessingCount        int64
 
@@ -108,7 +116,8 @@ func (i *Ingress) Snapshot() Snapshot {
 	return Snapshot{
 		Received: i.counters.received.Load(), ReceivedBytes: i.counters.receivedBytes.Load(),
 		AcceptedBytes: i.counters.acceptedBytes.Load(), InFlight: i.counters.inFlight.Load(),
-		Durations:                     DurationSnapshot{QueueWait: i.queueWait.Snapshot(), Validation: i.validation.Snapshot(), Persistence: i.persistence.Snapshot(), ACKPublish: i.ackPublish.Snapshot()},
+		Durations:                     DurationSnapshot{QueueWait: i.queueWait.Snapshot(), Validation: i.validation.Snapshot(), Persistence: i.persistence.Snapshot(), ACKPublish: i.ackPublish.Snapshot(), BatchWait: i.batchWait.Snapshot(), GroupPersistence: i.groupPersistence.Snapshot()},
+		Microbatch:                    MicrobatchSnapshot{Enabled: i.microbatch.Enabled, MaxMessages: i.microbatch.MaxMessages, MaxRows: i.microbatch.MaxRows, MaxPayloadBytes: i.microbatch.MaxPayloadBytes, MaxWait: i.microbatch.MaxWait, Groups: i.counters.groupCount.Load(), Members: i.counters.groupMembers.Load(), Rows: i.counters.groupRows.Load(), PayloadBytes: i.counters.groupPayloadBytes.Load(), MaxMembers: i.counters.groupMaxMembers.Load(), FlushMessages: i.counters.flushMessages.Load(), FlushRows: i.counters.flushRows.Load(), FlushBytes: i.counters.flushBytes.Load(), FlushTimer: i.counters.flushTimer.Load(), FlushStop: i.counters.flushStop.Load(), StandaloneOversized: i.counters.standaloneOversized.Load()},
 		Accepted:                      i.counters.accepted.Load(),
 		RejectedNotRunning:            i.counters.rejectedNotRunning.Load(),
 		RejectedStopping:              i.counters.rejectedStopping.Load(),
@@ -150,9 +159,33 @@ func (i *Ingress) Snapshot() Snapshot {
 }
 
 // DurationSnapshot records only boundaries actually executed, not SQL-only time.
+// Persistence is retained as per-delivery observations. GroupPersistence is a
+// distinct per-group series and therefore observes one duration per SQL batch.
 type DurationSnapshot struct {
-	QueueWait   metrics.HistogramSnapshot `json:"queue_wait"`
-	Validation  metrics.HistogramSnapshot `json:"validation"`
-	Persistence metrics.HistogramSnapshot `json:"persistence"`
-	ACKPublish  metrics.HistogramSnapshot `json:"ack_publish"`
+	QueueWait        metrics.HistogramSnapshot `json:"queue_wait"`
+	Validation       metrics.HistogramSnapshot `json:"validation"`
+	Persistence      metrics.HistogramSnapshot `json:"persistence"`
+	ACKPublish       metrics.HistogramSnapshot `json:"ack_publish"`
+	BatchWait        metrics.HistogramSnapshot `json:"batch_wait"`
+	GroupPersistence metrics.HistogramSnapshot `json:"group_persistence"`
+}
+
+// MicrobatchSnapshot reports effective group bounds and fixed-cardinality counters.
+type MicrobatchSnapshot struct {
+	Enabled             bool          `json:"enabled"`
+	MaxMessages         int           `json:"max_messages"`
+	MaxRows             int           `json:"max_rows"`
+	MaxPayloadBytes     int64         `json:"max_payload_bytes"`
+	MaxWait             time.Duration `json:"max_wait_ns"`
+	Groups              int64         `json:"groups"`
+	Members             int64         `json:"members"`
+	Rows                int64         `json:"rows"`
+	PayloadBytes        int64         `json:"payload_bytes"`
+	MaxMembers          int64         `json:"max_members"`
+	FlushMessages       int64         `json:"flush_messages"`
+	FlushRows           int64         `json:"flush_rows"`
+	FlushBytes          int64         `json:"flush_bytes"`
+	FlushTimer          int64         `json:"flush_timer"`
+	FlushStop           int64         `json:"flush_stop"`
+	StandaloneOversized int64         `json:"standalone_oversized_members"`
 }

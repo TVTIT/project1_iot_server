@@ -76,6 +76,26 @@ class PaperP4SupportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, '^paper_p4_profile_rejected$'):
                     p4.validate_effective_environment(Fixture(), tampered['services']['backend']['environment'])
 
+    def test_microbatch_deployment_mapping_is_opt_in_and_keeps_control_defaults(self):
+        root = Path(__file__).resolve().parents[2]
+        env_example = (root / '.env.example').read_text()
+        compose = (root / 'docker-compose.yml').read_text()
+        expected = {
+            'MQTT_MICROBATCH_ENABLED': 'false',
+            'MQTT_MICROBATCH_MAX_MESSAGES': '32',
+            'MQTT_MICROBATCH_MAX_ROWS': '500',
+            'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
+            'MQTT_MICROBATCH_MAX_WAIT': '1s',
+        }
+        for key, default in expected.items():
+            with self.subTest(key=key):
+                self.assertIn(f'{key}={default}', env_example)
+                self.assertIn(f'{key}: ${{{key}:-{default}}}', compose)
+        self.assertIn('STAGE5_ENABLED=false', env_example)
+        self.assertIn('STAGE5_ENABLED: ${STAGE5_ENABLED:-false}', compose)
+        self.assertIn('MQTT_SHAPER_ENABLED=false', env_example)
+        self.assertIn('MQTT_SHAPER_ENABLED: ${MQTT_SHAPER_ENABLED:-false}', compose)
+
     def test_broker_config_limits_are_pinned_and_leave_packet_overhead(self):
         text = '\n'.join(f'{name} {value}' for name, value in p4.BROKER_PROFILE.items())
         self.assertEqual(p4.validate_broker_profile(text), p4.BROKER_PROFILE)

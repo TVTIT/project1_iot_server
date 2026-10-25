@@ -413,6 +413,19 @@ func TestNoACKOnErrorUnconfirmedOrMismatch(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "mismatched boot identity suppresses the ACK",
+			onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
+				r := committedResult(m)
+				r.Identity.BootID = uuid.New()
+				return r, nil
+			},
+			assertSnap: func(t *testing.T, s Snapshot) {
+				if s.IdentityMismatch != 1 || s.ACKPublished != 0 {
+					t.Fatalf("snapshot = %+v", s)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -434,6 +447,25 @@ func TestNoACKOnErrorUnconfirmedOrMismatch(t *testing.T) {
 			}
 			tt.assertSnap(t, ing.Snapshot())
 		})
+	}
+}
+
+func TestConfirmedCountersAreIndependentOfACKPublish(t *testing.T) {
+	pub := &fakePublisher{onPublish: func(context.Context, Delivery) error {
+		return errors.New("broker unavailable")
+	}}
+	ing := newIngress(t, defaultOptions(), newValidator(t), &fakeRepo{}, pub)
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 2)
+	if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+		t.Fatalf("Admit = %v, want accepted", got)
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain = %v", err)
+	}
+	snap := ing.Snapshot()
+	if snap.Committed != 1 || snap.SamplesNew != 2 || snap.ACKPublished != 0 || snap.ACKPublishFailures != 1 {
+		t.Fatalf("confirmed result counters must survive ACK failure: %+v", snap)
 	}
 }
 

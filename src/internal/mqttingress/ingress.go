@@ -55,6 +55,9 @@ type Options struct {
 	// Shaper enables bounded delivery-attempt shaping per Gateway. Zero value
 	// remains disabled for callers that predate shaping.
 	Shaper ShaperOptions
+	// Microbatch enables bounded per-worker grouping. Disabled mode exclusively
+	// uses Repository.Persist.
+	Microbatch MicrobatchOptions
 	// PersistTimeout bounds connection acquisition, locks, SQL and commit of
 	// one Repository.Persist call.
 	PersistTimeout time.Duration
@@ -63,6 +66,15 @@ type Options struct {
 	// Logger receives reason-coded, payload-free structured events. Nil uses
 	// slog.Default().
 	Logger *slog.Logger
+}
+
+// MicrobatchOptions contains finite per-worker collection caps.
+type MicrobatchOptions struct {
+	Enabled         bool
+	MaxMessages     int
+	MaxRows         int
+	MaxPayloadBytes int64
+	MaxWait         time.Duration
 }
 
 // item is one admitted delivery. topic is an immutable string; payload is a
@@ -76,6 +88,18 @@ type item struct {
 	reservedBytes int64
 }
 
+// validatedDelivery carries one admitted item through persistence and its ACK.
+// The payload reservation follows this value until its ACK attempt is complete.
+type validatedDelivery struct {
+	original        item
+	message         *telemetry.Message
+	dequeuedAt      time.Time
+	validatedAt     time.Time
+	confirmedAt     time.Time
+	ownsReservation bool
+	processing      bool
+}
+
 // Ingress is the bounded admission queue and fixed worker pool. One admitted
 // item traverses Validator.Validate -> Repository.Persist -> post-commit ACK
 // exactly once.
@@ -85,6 +109,9 @@ type Ingress struct {
 	publisher  Publisher
 
 	workerCount                  int
+	microbatch                   MicrobatchOptions
+	batchRepository              telemetry.BatchRepository
+	clock                        ingressClock
 	maxPayloadBytes              int
 	bufferedPayloadCapacityBytes int64
 	persistTimeout               time.Duration
@@ -117,15 +144,15 @@ type Ingress struct {
 
 	workers sync.WaitGroup
 
-	counters                                       counters
-	shaper                                         *Shaper
-	metricsEnabled                                 bool
-	queueWait, validation, persistence, ackPublish metrics.Histogram
+	counters                                                                    counters
+	shaper                                                                      *Shaper
+	metricsEnabled                                                              bool
+	queueWait, validation, persistence, ackPublish, batchWait, groupPersistence metrics.Histogram
 }
 
 // New builds an ingress core. It rejects a missing dependency or a non-positive
 // bound rather than allocating an unbounded queue or workers.
-func New(opts Options, validator Validator, repository Repository, publisher Publisher) (*Ingress, error) {
+func New(opts Options, validator Validator, repository Repository, publisher Publisher, batchRepositories ...telemetry.BatchRepository) (*Ingress, error) {
 	shaper, err := NewShaper(opts.Shaper)
 	if err != nil {
 		return nil, err
@@ -161,6 +188,19 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 	if isNilInterface(publisher) {
 		return nil, errors.New("mqttingress: publisher is required")
 	}
+	var batchRepository telemetry.BatchRepository
+	if opts.Microbatch.Enabled {
+		if len(batchRepositories) != 1 || isNilInterface(batchRepositories[0]) {
+			return nil, errors.New("mqttingress: enabled microbatch requires exactly one batch repository")
+		}
+		if opts.Microbatch.MaxMessages < 1 || opts.Microbatch.MaxMessages > 1024 || opts.Microbatch.MaxRows < 1 || opts.Microbatch.MaxRows > 100_000 || opts.Microbatch.MaxPayloadBytes < 1 || opts.Microbatch.MaxPayloadBytes > 256<<20 || opts.Microbatch.MaxWait < time.Millisecond || opts.Microbatch.MaxWait > 5*time.Second {
+			return nil, errors.New("mqttingress: invalid microbatch bounds")
+		}
+		if opts.Microbatch.MaxPayloadBytes > bufferedPayloadBytes/int64(opts.WorkerCount) {
+			return nil, errors.New("mqttingress: microbatch payload budget exceeds per-worker buffered payload budget")
+		}
+		batchRepository = batchRepositories[0]
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -183,6 +223,9 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 		runCtx:                       runCtx,
 		cancelRun:                    cancelRun,
 		shaper:                       shaper,
+		microbatch:                   opts.Microbatch,
+		batchRepository:              batchRepository,
+		clock:                        realIngressClock{},
 	}, nil
 }
 
@@ -407,6 +450,10 @@ func (i *Ingress) Drain(ctx context.Context) error {
 // worker takes one item at a time until admission stops and the queue is empty.
 func (i *Ingress) worker() {
 	defer i.workers.Done()
+	if i.microbatch.Enabled {
+		i.microbatchWorker()
+		return
+	}
 	for {
 		select {
 		case it := <-i.queue:
@@ -414,6 +461,291 @@ func (i *Ingress) worker() {
 		case <-i.stop:
 			i.drainQueue()
 			return
+		}
+	}
+}
+
+type ingressTimer interface {
+	C() <-chan time.Time
+	Stop()
+}
+type ingressClock interface {
+	NewTimer(time.Duration) ingressTimer
+	Now() time.Time
+}
+type realIngressClock struct{}
+type realIngressTimer struct{ t *time.Timer }
+
+func (realIngressClock) NewTimer(d time.Duration) ingressTimer {
+	return realIngressTimer{time.NewTimer(d)}
+}
+func (realIngressClock) Now() time.Time        { return time.Now() }
+func (t realIngressTimer) C() <-chan time.Time { return t.t.C }
+func (t realIngressTimer) Stop() {
+	if !t.t.Stop() {
+		select {
+		case <-t.t.C:
+		default:
+		}
+	}
+}
+
+func (i *Ingress) microbatchWorker() {
+	var timer ingressTimer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		// Cancellation owns every item still in the shared queue; no unconfirmed
+		// item is acknowledged and each reservation is released once.
+		for {
+			select {
+			case it := <-i.queue:
+				i.releasePayloadBytes(it.reservedBytes)
+			default:
+				return
+			}
+		}
+	}()
+	var group []*validatedDelivery
+	var rows int
+	var bytes int64
+	var deadline time.Time
+	flush := func(ctx context.Context, reason int) {
+		if len(group) == 0 {
+			return
+		}
+		members := group
+		if i.metricsEnabled {
+			i.counters.groupCount.Add(1)
+			i.counters.groupMembers.Add(int64(len(members)))
+			i.counters.groupRows.Add(int64(rows))
+			i.counters.groupPayloadBytes.Add(bytes)
+			for {
+				old := i.counters.groupMaxMembers.Load()
+				if int64(len(members)) <= old || i.counters.groupMaxMembers.CompareAndSwap(old, int64(len(members))) {
+					break
+				}
+			}
+			switch reason {
+			case 1:
+				i.counters.flushMessages.Add(1)
+			case 2:
+				i.counters.flushRows.Add(1)
+			case 3:
+				i.counters.flushBytes.Add(1)
+			case 4:
+				i.counters.flushTimer.Add(1)
+			case 5:
+				i.counters.flushStop.Add(1)
+			}
+		}
+		group = nil
+		rows = 0
+		bytes = 0
+		deadline = time.Time{}
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
+		i.persistGroup(ctx, members)
+	}
+	process := func(it item) {
+		d := &validatedDelivery{original: it, ownsReservation: true}
+		if i.runCtx.Err() != nil {
+			i.releaseDelivery(d)
+			return
+		}
+		i.startDelivery(d)
+		i.counters.processed.Add(1)
+		if !i.validateDelivery(d) {
+			i.releaseDelivery(d)
+			return
+		}
+		d.validatedAt = i.clock.Now()
+		memberRows := d.message.SampleCount()
+		if memberRows > i.microbatch.MaxRows || int64(len(it.payload)) > i.microbatch.MaxPayloadBytes {
+			// Attribute a preceding group's flush to the standalone member's
+			// exceeded cap (rows before bytes if both are exceeded).
+			reason := 3
+			if memberRows > i.microbatch.MaxRows {
+				reason = 2
+			}
+			flush(i.runCtx, reason)
+			if i.metricsEnabled {
+				i.counters.standaloneOversized.Add(1)
+			}
+			i.persistStandaloneBatch(i.runCtx, d)
+			return
+		}
+		if len(group) > 0 && (len(group) >= i.microbatch.MaxMessages || rows+memberRows > i.microbatch.MaxRows || bytes+it.reservedBytes > i.microbatch.MaxPayloadBytes) {
+			// Simultaneous cap precedence: messages > rows > bytes.
+			reason := 3
+			if len(group) >= i.microbatch.MaxMessages {
+				reason = 1
+			} else if rows+memberRows > i.microbatch.MaxRows {
+				reason = 2
+			}
+			flush(i.runCtx, reason)
+		}
+		if len(group) == 0 {
+			deadline = i.clock.Now().Add(i.microbatch.MaxWait)
+			timer = i.clock.NewTimer(i.microbatch.MaxWait)
+		}
+		group = append(group, d)
+		rows += memberRows
+		bytes += it.reservedBytes
+		if len(group) >= i.microbatch.MaxMessages || rows >= i.microbatch.MaxRows || bytes >= i.microbatch.MaxPayloadBytes {
+			reason := 3
+			if len(group) >= i.microbatch.MaxMessages {
+				reason = 1
+			} else if rows >= i.microbatch.MaxRows {
+				reason = 2
+			}
+			flush(i.runCtx, reason)
+		}
+	}
+	for {
+		var timerC <-chan time.Time
+		if timer != nil {
+			timerC = timer.C()
+		}
+		select {
+		case it := <-i.queue:
+			process(it)
+		case <-timerC:
+			flush(i.runCtx, 4)
+		case <-i.stop:
+			flush(i.runCtx, 5)
+			for {
+				select {
+				case it := <-i.queue:
+					process(it)
+				default:
+					flush(i.runCtx, 5)
+					return
+				}
+			}
+		case <-i.runCtx.Done():
+			for n, d := range group {
+				i.releaseDelivery(d)
+				group[n] = nil
+			}
+			group = nil
+			return
+		}
+		if !deadline.IsZero() && !i.clock.Now().Before(deadline) {
+			flush(i.runCtx, 4)
+		}
+	}
+}
+
+func (i *Ingress) persistStandaloneBatch(ctx context.Context, d *validatedDelivery) {
+	defer i.releaseDelivery(d)
+	// Target caps never split an otherwise-valid message; use the existing
+	// single-message persistence contract without revalidation or reshaping.
+	confirmed, ok := i.persistDeliveryContext(ctx, d)
+	if ok {
+		i.publishACK(d, confirmed)
+	}
+}
+
+func (i *Ingress) persistGroup(ctx context.Context, members []*validatedDelivery) {
+	i.persistValidatedGroup(ctx, members)
+}
+
+func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validatedDelivery) {
+	defer func() {
+		for n, d := range members {
+			i.releaseDelivery(d)
+			members[n] = nil
+		}
+	}()
+	msgs := make([]*telemetry.Message, len(members))
+	for n, d := range members {
+		msgs[n] = d.message
+	}
+	pctx, cancel := context.WithTimeout(ctx, i.persistTimeout)
+	defer cancel()
+	groupStart := i.metricStart()
+	if i.metricsEnabled {
+		for _, d := range members {
+			i.batchWait.Observe(time.Since(d.validatedAt))
+		}
+	}
+	results := i.batchRepository.PersistBatch(pctx, msgs)
+	if i.metricsEnabled {
+		elapsed := time.Since(groupStart)
+		i.groupPersistence.Observe(elapsed)
+		// Preserve the historical per-delivery Persistence series while exposing
+		// the actual once-per-group SQL duration separately above.
+		for range members {
+			i.persistence.Observe(elapsed)
+		}
+	}
+	if len(results) != len(members) {
+		i.counters.persistFailures.Add(int64(len(members)))
+		i.logReject("batch_result", &telemetry.ReasonError{Code: telemetry.ReasonCommitUnconfirmed})
+		return
+	}
+	confirmed := make([]confirmedDelivery, len(members))
+	valid := make([]bool, len(members))
+	seen := make([]bool, len(members))
+	for _, r := range results {
+		if r.InputIndex < 0 || r.InputIndex >= len(members) || seen[r.InputIndex] {
+			i.counters.persistFailures.Add(int64(len(members)))
+			return
+		}
+		seen[r.InputIndex] = true
+	}
+	for _, ok := range seen {
+		if !ok {
+			i.counters.persistFailures.Add(int64(len(members)))
+			return
+		}
+	}
+	// Validate every success claim and its complete identity before associating
+	// any result with a delivery or publishing any member ACK.
+	for _, r := range results {
+		if r.Err != nil {
+			continue
+		}
+		if r.Outcome != telemetry.CommitOutcomeCommitted && r.Outcome != telemetry.CommitOutcomeDuplicateCommitted {
+			i.counters.commitUnconfirmed.Add(1)
+			return
+		}
+		d := members[r.InputIndex]
+		if !identityMatches(d.message, r.Identity) || r.SamplesSaved < 0 {
+			i.counters.identityMismatch.Add(1)
+			return
+		}
+	}
+	for _, r := range results {
+		if r.Err != nil {
+			i.counters.persistFailures.Add(1)
+			i.logReject("persist", r.Err)
+			continue
+		}
+		confirmed[r.InputIndex] = confirmedDelivery{result: telemetry.PersistResult{Identity: r.Identity, Outcome: r.Outcome, SamplesSaved: r.SamplesSaved}, confirmedAt: i.clock.Now().UTC()}
+		valid[r.InputIndex] = true
+	}
+	for n, ok := range valid {
+		if ok {
+			r := confirmed[n].result
+			if r.Outcome == telemetry.CommitOutcomeCommitted {
+				i.counters.committed.Add(1)
+				i.counters.samplesNew.Add(int64(r.SamplesSaved))
+			} else {
+				i.counters.duplicateCommitted.Add(1)
+			}
+		}
+	}
+	for n, ok := range valid {
+		if ok {
+			if ctx.Err() != nil {
+				return
+			}
+			i.publishACK(members[n], confirmed[n])
 		}
 	}
 }
@@ -434,54 +766,106 @@ func (i *Ingress) drainQueue() {
 // process runs the single-item pipeline. Any error or unconfirmed outcome wins
 // over an apparently successful result and suppresses the ACK.
 func (i *Ingress) process(it item) {
-	defer i.releasePayloadBytes(it.reservedBytes)
-	started := time.Now()
-	if i.metricsEnabled {
-		i.counters.inFlight.Add(1)
-		defer i.counters.inFlight.Add(-1)
-		i.queueWait.Observe(time.Since(it.enqueuedAt))
-	}
-	defer func() {
-		i.counters.processingNanos.Add(time.Since(started).Nanoseconds())
-		i.counters.processingCount.Add(1)
-	}()
+	delivery := &validatedDelivery{original: it, ownsReservation: true}
+	i.startDelivery(delivery)
+	defer i.releaseDelivery(delivery)
 	i.counters.processed.Add(1)
 
+	if !i.validateDelivery(delivery) {
+		return
+	}
+
+	confirmed, ok := i.persistDelivery(delivery)
+	if !ok {
+		return
+	}
+	i.publishACK(delivery, confirmed)
+}
+
+// startDelivery starts the per-delivery lifecycle at worker dequeue, excluding
+// queue wait. Collection, persistence and ACK work remain active until release.
+func (i *Ingress) startDelivery(delivery *validatedDelivery) {
+	delivery.dequeuedAt = i.clock.Now()
+	delivery.processing = true
+	if i.metricsEnabled {
+		i.counters.inFlight.Add(1)
+		i.queueWait.Observe(delivery.dequeuedAt.Sub(delivery.original.enqueuedAt))
+	}
+}
+
+func (i *Ingress) releaseDelivery(delivery *validatedDelivery) {
+	if delivery.ownsReservation {
+		delivery.original.payload = nil
+		i.releasePayloadBytes(delivery.original.reservedBytes)
+		delivery.ownsReservation = false
+	}
+	if delivery.processing {
+		// Legacy aggregates are unconditional, in delivery-nanoseconds and
+		// completed deliveries, not independent SQL-operation duration samples.
+		i.counters.processingNanos.Add(i.clock.Now().Sub(delivery.dequeuedAt).Nanoseconds())
+		i.counters.processingCount.Add(1)
+		if i.metricsEnabled {
+			i.counters.inFlight.Add(-1)
+		}
+		delivery.processing = false
+	}
+}
+
+// validateDelivery records dequeue/validation observations and keeps the exact
+// validator receipt timestamp from the admitted item.
+func (i *Ingress) validateDelivery(delivery *validatedDelivery) bool {
+	it := delivery.original
 	validationStart := i.metricStart()
 	message, err := i.validator.Validate(it.topic, it.payload, it.receivedAt)
 	i.metricObserve(&i.validation, validationStart)
 	if err != nil {
 		i.counters.validationRejected.Add(1)
 		i.logReject("validate", err)
-		return
+		return false
 	}
+	delivery.message = message
+	delivery.validatedAt = time.Now()
+	return true
+}
 
-	persistCtx, cancelPersist := context.WithTimeout(i.runCtx, i.persistTimeout)
+type confirmedDelivery struct {
+	result      telemetry.PersistResult
+	confirmedAt time.Time
+}
+
+// persistDelivery validates the persistence result and records confirmed
+// counters before any ACK work begins.
+func (i *Ingress) persistDelivery(delivery *validatedDelivery) (confirmedDelivery, bool) {
+	return i.persistDeliveryContext(i.runCtx, delivery)
+}
+
+func (i *Ingress) persistDeliveryContext(parent context.Context, delivery *validatedDelivery) (confirmedDelivery, bool) {
+	persistCtx, cancelPersist := context.WithTimeout(parent, i.persistTimeout)
 	persistStart := i.metricStart()
-	result, persistErr := i.repository.Persist(persistCtx, message)
+	result, persistErr := i.repository.Persist(persistCtx, delivery.message)
 	i.metricObserve(&i.persistence, persistStart)
 	cancelPersist()
 	if persistErr != nil {
 		i.counters.persistFailures.Add(1)
 		i.logReject("persist", persistErr)
-		return
+		return confirmedDelivery{}, false
 	}
 	if result.Outcome != telemetry.CommitOutcomeCommitted && result.Outcome != telemetry.CommitOutcomeDuplicateCommitted {
 		i.counters.commitUnconfirmed.Add(1)
 		i.logReject("commit", &telemetry.ReasonError{Code: telemetry.ReasonCommitUnconfirmed})
-		return
+		return confirmedDelivery{}, false
 	}
-	if !identityMatches(message, result.Identity) {
+	if !identityMatches(delivery.message, result.Identity) {
 		i.counters.identityMismatch.Add(1)
 		i.logReject("identity", &telemetry.ReasonError{Code: telemetry.ReasonMessageConflict})
-		return
+		return confirmedDelivery{}, false
 	}
 
 	// confirmedAt is the core's own UTC receipt of the confirmed commit, taken
 	// after Persist returned. It is not the measurement time and not an exact
 	// PostgreSQL commit timestamp; a retry may report a different value for the
 	// same message_id/status.
-	confirmedAt := time.Now().UTC()
+	delivery.confirmedAt = time.Now().UTC()
 
 	// The database result is final: record the confirmed commit regardless of
 	// whether the ACK publish below succeeds.
@@ -492,9 +876,19 @@ func (i *Ingress) process(it item) {
 		i.counters.duplicateCommitted.Add(1)
 	}
 
+	return confirmedDelivery{result: result, confirmedAt: delivery.confirmedAt}, true
+}
+
+// publishACK constructs and publishes one application ACK. It deliberately
+// has no in-process retry: the Gateway's durable outbox owns retries.
+func (i *Ingress) publishACK(delivery *validatedDelivery, confirmed confirmedDelivery) {
+	if i.runCtx.Err() != nil {
+		return
+	}
+	message := delivery.message
 	topic := message.Topic()
 	batch := message.Batch()
-	ackTopic, ack, buildErr := telemetry.NewCommitACK(topic.GatewayID, batch.MessageID, result.Outcome, confirmedAt)
+	ackTopic, ack, buildErr := telemetry.NewCommitACK(topic.GatewayID, batch.MessageID, confirmed.result.Outcome, confirmed.confirmedAt)
 	if buildErr != nil {
 		i.counters.ackBuildFailures.Add(1)
 		i.logReject("ack_build", buildErr)
@@ -539,11 +933,7 @@ func (i *Ingress) metricObserve(h *metrics.Histogram, start time.Time) {
 // identityMatches verifies that the persisted identity is the same resource and
 // message the validated input described. A mismatch suppresses the ACK.
 func identityMatches(message *telemetry.Message, identity telemetry.MessageIdentity) bool {
-	topic := message.Topic()
-	batch := message.Batch()
-	return identity.GatewayID == topic.GatewayID &&
-		identity.SensorID == topic.SensorID &&
-		identity.MessageID == batch.MessageID
+	return message.Identity() == identity
 }
 
 // logReject emits a payload-free, secret-free reason-coded event. It never logs

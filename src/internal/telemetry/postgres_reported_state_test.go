@@ -119,7 +119,7 @@ func TestApplySensorReportedStateAdvancesUnderLock(t *testing.T) {
 	message := reportedStateTestMessage(t, "2026-08-21T10:15:00Z", 12501, decodeTestBootID, []float64{25.1, 25.2, 25.3})
 	earlier := reportedStateTestCandidateTime().Add(-time.Second)
 	tx := &telemetryFakeTx{
-		sensorState:        []byte(fmt.Sprintf(`{"temperature":21.5,"boot_id":%q,"sequence_num":9000}`, decodeTestBootID)),
+		sensorState:        []byte(fmt.Sprintf(`{"temperature":21.5,"configuration":{"sample_interval_us":25000},"boot_id":%q,"sequence_num":9000}`, decodeTestBootID)),
 		sensorVersion:      7,
 		sensorLastReported: &earlier,
 		execRows:           1,
@@ -151,6 +151,9 @@ func TestApplySensorReportedStateAdvancesUnderLock(t *testing.T) {
 	}
 	if tx.execArgs[3] != int64(7) {
 		t.Fatalf("version arg = %#v; want locked version 7", tx.execArgs[3])
+	}
+	if _, overwritesConfiguration := merged["configuration"]; overwritesConfiguration || !strings.Contains(sensorReportedStateAdvanceSQL, "reported_state = reported_state ||") {
+		t.Fatalf("telemetry merge must preserve existing reported.configuration: merge=%#v SQL=%q", merged, sensorReportedStateAdvanceSQL)
 	}
 }
 

@@ -46,9 +46,11 @@ func (a *lateAdmitter) set(inner mqttingress.Admitter) {
 // reads the CA, so an HTTP-only deployment is unaffected. It is inert and safe
 // to stop even when it was never started.
 type ingressRuntime struct {
-	enabled   bool
-	transport *mqttingress.Transport
-	ingress   *mqttingress.Ingress
+	enabled    bool
+	transport  *mqttingress.Transport
+	ingress    *mqttingress.Ingress
+	repository telemetry.Repository
+	metrics    *telemetry.PersistenceMetrics
 }
 
 func mqttIngressOptions(cfg config.Config) mqttingress.Options {
@@ -67,6 +69,11 @@ func mqttIngressOptions(cfg config.Config) mqttingress.Options {
 		},
 		PersistTimeout: cfg.Ingress.DBTimeout,
 		PublishTimeout: cfg.Ingress.PublishTimeout,
+		Microbatch: mqttingress.MicrobatchOptions{
+			Enabled: cfg.Ingress.MicrobatchEnabled, MaxMessages: cfg.Ingress.MicrobatchMaxMessages,
+			MaxRows: cfg.Ingress.MicrobatchMaxRows, MaxPayloadBytes: cfg.Ingress.MicrobatchMaxPayloadBytes,
+			MaxWait: cfg.Ingress.MicrobatchMaxWait,
+		},
 	}
 }
 
@@ -87,7 +94,27 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry validator: %w", err)
 	}
-	repository, err := telemetry.NewPostgresRepository(pool, cfg.Ingress.DBTimeout)
+	var persistenceMetrics *telemetry.PersistenceMetrics
+	if cfg.MetricsEnabled {
+		persistenceMetrics = &telemetry.PersistenceMetrics{}
+	}
+	var repository telemetry.Repository
+	var batchRepository telemetry.BatchRepository
+	if cfg.Ingress.MicrobatchEnabled {
+		batchRepository, err = telemetry.NewPostgresBatchRepositoryWithMetrics(pool, cfg.Ingress.DBTimeout, cfg.Ingress.MicrobatchMaxMessages, persistenceMetrics)
+		if err != nil {
+			return ingressRuntime{}, fmt.Errorf("create telemetry batch repository: %w", err)
+		}
+		var ok bool
+		repository, ok = batchRepository.(telemetry.Repository)
+		if !ok {
+			return ingressRuntime{}, errors.New("telemetry batch repository does not support baseline persistence")
+		}
+	} else if persistenceMetrics != nil {
+		repository, err = telemetry.NewPostgresRepositoryWithMetrics(pool, cfg.Ingress.DBTimeout, persistenceMetrics)
+	} else {
+		repository, err = telemetry.NewPostgresRepository(pool, cfg.Ingress.DBTimeout)
+	}
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry repository: %w", err)
 	}
@@ -110,13 +137,18 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 		return ingressRuntime{}, fmt.Errorf("create MQTT telemetry transport: %w", err)
 	}
 
-	core, err := mqttingress.New(mqttIngressOptions(cfg), validator, repository, transport)
+	var core *mqttingress.Ingress
+	if cfg.Ingress.MicrobatchEnabled {
+		core, err = mqttingress.New(mqttIngressOptions(cfg), validator, repository, transport, batchRepository)
+	} else {
+		core, err = mqttingress.New(mqttIngressOptions(cfg), validator, repository, transport)
+	}
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry ingress: %w", err)
 	}
 	admitter.set(core)
 
-	return ingressRuntime{enabled: true, transport: transport, ingress: core}, nil
+	return ingressRuntime{enabled: true, transport: transport, ingress: core, repository: repository, metrics: persistenceMetrics}, nil
 }
 
 // start launches the transport supervisor and then the fixed worker pool. If the

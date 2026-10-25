@@ -60,7 +60,7 @@ def compile_integration_binary(directory):
     return binary
 
 
-def run_go_integration(fixture, binary, *, late_chunk=False, legacy=False, legacy_history=False):
+def run_go_integration(fixture, binary, *, late_chunk=False, legacy=False, legacy_history=False, grouped=False):
     docker_cp(fixture, binary, '/tmp/telemetry.test')
     test_run = '^TestNativeTelemetryHistoryUpgradedLegacyProvenance$' if legacy_history else '^TestPostgresTelemetryIntegration$'
     command = [
@@ -68,13 +68,14 @@ def run_go_integration(fixture, binary, *, late_chunk=False, legacy=False, legac
         'export TELEMETRY_TEST_ISOLATED=1 ' +
         ('TELEMETRY_TEST_LATE_CHUNK=1 ' if late_chunk else '') +
         ('TELEMETRY_TEST_LEGACY=1 ' if legacy else '') +
+        ('TELEMETRY_TEST_GROUP=1 ' if grouped else '') +
         ('TELEMETRY_TEST_LEGACY_HISTORY=1 ' if legacy_history else '') +
         'TELEMETRY_TEST_SETUP_URL="postgres://fixture_admin:${POSTGRES_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable" '
         'TELEMETRY_TEST_BACKEND_URL="postgres://iot_backend_app:${BACKEND_DB_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"; '
         f'exec /tmp/telemetry.test -test.v -test.run \'{test_run}\'',
     ]
     output = docker_exec(fixture, command, timeout=90)
-    marker = b'INTEGRATION CASE PASS:' if late_chunk or legacy or legacy_history else b'INTEGRATION CASES PASS:'
+    marker = b'GROUP INTEGRATION PASS:' if grouped else (b'INTEGRATION CASE PASS:' if late_chunk or legacy or legacy_history else b'INTEGRATION CASES PASS:')
     test_func = b'TestNativeTelemetryHistoryUpgradedLegacyProvenance' if legacy_history else b'TestPostgresTelemetryIntegration'
     if b'=== RUN   ' + test_func not in output or marker not in output or b'--- PASS: ' + test_func not in output:
         clean = sanitize_output(output.decode('utf-8', errors='replace'), fixture.passwords)
@@ -245,6 +246,22 @@ def run_normal_fixture(integration_binary):
         finish_fixture(fixture, primary_error)
 
 
+def run_group_fixture(integration_binary):
+    fixture = new_fixture()
+    primary_error = None
+    try:
+        bootstrap_to_9(fixture)
+        apply_20(fixture)
+        common_graph_seed(fixture)
+        run_go_integration(fixture, integration_binary, grouped=True)
+        print('GROUPED PERSISTENCE FIXTURE: isolated PostgreSQL grouped transaction acceptance PASS', flush=True)
+    except Exception as exc:
+        primary_error = exc
+        raise
+    finally:
+        finish_fixture(fixture, primary_error)
+
+
 def run_upgrade_fixture(integration_binary):
     fixture = new_fixture()
     primary_error = None
@@ -339,7 +356,7 @@ def run_rollback_fixture():
 
 def main():
     parser = argparse.ArgumentParser(description='Database-only migration 020 rehearsal on isolated pinned Timescale fixtures.')
-    parser.add_argument('--fixture', choices=['all', 'normal', 'upgrade', 'rollback'], default='all',
+    parser.add_argument('--fixture', choices=['all', 'normal', 'group', 'upgrade', 'rollback'], default='all',
                         help='Fixture to run (default: all)')
     args = parser.parse_args()
 
@@ -350,6 +367,8 @@ def main():
         binary = compile_integration_binary(work)
         if args.fixture in ('all', 'normal'):
             run_normal_fixture(binary)
+        if args.fixture == 'group':
+            run_group_fixture(binary)
         if args.fixture in ('all', 'upgrade'):
             run_upgrade_fixture(binary)
         if args.fixture in ('all', 'rollback'):

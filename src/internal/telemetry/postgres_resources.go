@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -21,10 +22,72 @@ type resolvedTelemetryResource struct {
 	Unit      *string
 }
 
-// resolveTelemetryResource confirms that a validated message targets an
-// existing Gateway and locks only its Sensor row for the rest of the caller's
-// transaction. It verifies the provisioned Twin graph without creating or
-// changing any entity, state, relationship, or temporal value.
+type telemetryResourceKey struct{ gatewayID, sensorID string }
+
+// prepareTelemetryResources acquires parent and child locks in separate stable
+// phases. Call only after the complete batch is ready to persist.
+func prepareTelemetryResources(ctx context.Context, tx pgx.Tx, messages []*Message) (map[telemetryResourceKey]resolvedTelemetryResource, error) {
+	gateways := make(map[string]struct{})
+	sensorSet := make(map[telemetryResourceKey]struct{})
+	for _, message := range messages {
+		if message == nil || message.Topic().GatewayID == "" || message.Topic().SensorID == "" {
+			return nil, &ReasonError{Code: ReasonInvalidPayload, Field: "message"}
+		}
+		topic := message.Topic()
+		gateways[topic.GatewayID] = struct{}{}
+		sensorSet[telemetryResourceKey{topic.GatewayID, topic.SensorID}] = struct{}{}
+	}
+	gatewayIDs := make([]string, 0, len(gateways))
+	for id := range gateways {
+		gatewayIDs = append(gatewayIDs, id)
+	}
+	sort.Strings(gatewayIDs)
+	for _, id := range gatewayIDs {
+		if err := lockTelemetryGatewayShare(ctx, tx, id); err != nil {
+			return nil, err
+		}
+	}
+	keys := make([]telemetryResourceKey, 0, len(sensorSet))
+	for key := range sensorSet {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].gatewayID != keys[j].gatewayID {
+			return keys[i].gatewayID < keys[j].gatewayID
+		}
+		return keys[i].sensorID < keys[j].sensorID
+	})
+	units := make(map[telemetryResourceKey]*string, len(keys))
+	for _, key := range keys {
+		unit, err := lockTelemetrySensor(ctx, tx, key.gatewayID, key.sensorID)
+		if err != nil {
+			return nil, err
+		}
+		units[key] = unit
+	}
+	resources := make(map[telemetryResourceKey]resolvedTelemetryResource, len(keys))
+	for _, key := range keys {
+		resource, err := verifyTelemetryGraph(ctx, tx, key.gatewayID, key.sensorID, units[key])
+		if err != nil {
+			return nil, err
+		}
+		resources[key] = resource
+	}
+	for _, key := range keys {
+		if err := lockTelemetrySensorEntity(ctx, tx, resources[key]); err != nil {
+			return nil, err
+		}
+	}
+	for _, key := range keys {
+		if err := lockTelemetrySensorState(ctx, tx, resources[key]); err != nil {
+			return nil, err
+		}
+	}
+	return resources, nil
+}
+
+// resolveTelemetryResource keeps the single-message path on the same
+// parent-first lock contract as the grouped path.
 func resolveTelemetryResource(ctx context.Context, tx pgx.Tx, message *Message) (resolvedTelemetryResource, error) {
 	if message == nil {
 		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonInvalidPayload, Field: "message"}
@@ -33,54 +96,65 @@ func resolveTelemetryResource(ctx context.Context, tx pgx.Tx, message *Message) 
 	if topic.GatewayID == "" || topic.SensorID == "" {
 		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonInvalidPayload, Field: "message"}
 	}
-
-	var gatewayExists bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM public.gateways WHERE gateway_id = $1
-	)`, topic.GatewayID).Scan(&gatewayExists)
+	if err := lockTelemetryGatewayShare(ctx, tx, topic.GatewayID); err != nil {
+		return resolvedTelemetryResource{}, err
+	}
+	unit, err := lockTelemetrySensor(ctx, tx, topic.GatewayID, topic.SensorID)
 	if err != nil {
-		return resolvedTelemetryResource{}, dependencyError("check telemetry Gateway", err)
+		return resolvedTelemetryResource{}, err
 	}
-	if !gatewayExists {
-		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonUnknownGateway, Field: "gateway_id"}
+	resource, err := verifyTelemetryGraph(ctx, tx, topic.GatewayID, topic.SensorID, unit)
+	if err != nil {
+		return resolvedTelemetryResource{}, err
 	}
+	if err := lockTelemetrySensorEntity(ctx, tx, resource); err != nil {
+		return resolvedTelemetryResource{}, err
+	}
+	if err := lockTelemetrySensorState(ctx, tx, resource); err != nil {
+		return resolvedTelemetryResource{}, err
+	}
+	return resource, nil
+}
 
-	var unit *string
-	err = tx.QueryRow(ctx, `SELECT unit
-		FROM public.sensors
-		WHERE gateway_id = $1 AND sensor_id = $2
-		FOR UPDATE`, topic.GatewayID, topic.SensorID).Scan(&unit)
+func lockTelemetryGatewayShare(ctx context.Context, tx pgx.Tx, gatewayID string) error {
+	var locked string
+	err := tx.QueryRow(ctx, `SELECT gateway_id FROM public.gateways WHERE gateway_id = $1 FOR SHARE`, gatewayID).Scan(&locked)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonUnknownSensor, Field: "sensor_id"}
+		return &ReasonError{Code: ReasonUnknownGateway, Field: "gateway_id"}
 	}
 	if err != nil {
-		return resolvedTelemetryResource{}, dependencyError("lock telemetry Sensor", err)
+		return dependencyError("lock telemetry Gateway", err)
 	}
+	return nil
+}
 
-	var gatewayEntityID uuid.UUID
-	var sensorEntityID uuid.UUID
+func lockTelemetrySensor(ctx context.Context, tx pgx.Tx, gatewayID, sensorID string) (*string, error) {
+	var unit *string
+	err := tx.QueryRow(ctx, `SELECT unit FROM public.sensors WHERE gateway_id = $1 AND sensor_id = $2 FOR UPDATE`, gatewayID, sensorID).Scan(&unit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, &ReasonError{Code: ReasonUnknownSensor, Field: "sensor_id"}
+	}
+	if err != nil {
+		return nil, dependencyError("lock telemetry Sensor", err)
+	}
+	return unit, nil
+}
+
+func verifyTelemetryGraph(ctx context.Context, tx pgx.Tx, gatewayID, sensorID string, unit *string) (resolvedTelemetryResource, error) {
+	var gatewayEntityID, sensorEntityID uuid.UUID
 	var sensorStatePresent bool
-	err = tx.QueryRow(ctx, `SELECT gateway_entity.id, sensor_entity.id,
+	err := tx.QueryRow(ctx, `SELECT gateway_entity.id, sensor_entity.id,
 		(sensor_state.entity_id IS NOT NULL)
 		FROM public.twin_entities AS gateway_entity
 	JOIN public.twin_entities AS sensor_entity
-		ON sensor_entity.entity_id = $2
-		AND sensor_entity.entity_type = 'Sensor'
-		AND sensor_entity.gateway_id = $3
-	LEFT JOIN public.twin_states AS gateway_state
-		ON gateway_state.entity_id = gateway_entity.id
-	LEFT JOIN public.twin_states AS sensor_state
-		ON sensor_state.entity_id = sensor_entity.id
-	WHERE gateway_entity.entity_id = $1
-		AND gateway_entity.entity_type = 'Gateway'
-		AND gateway_entity.gateway_id = $3
-		AND gateway_state.entity_id IS NOT NULL
-		AND EXISTS (
-			SELECT 1 FROM public.twin_relationships AS relationship
-			WHERE relationship.source_entity_id = gateway_entity.id
-				AND relationship.target_entity_id = sensor_entity.id
-				AND relationship.relationship_type = 'hasSensor'
-		)`, mapper.GatewayEntityID(topic.GatewayID), mapper.SensorEntityID(topic.GatewayID, topic.SensorID), topic.GatewayID).
+		ON sensor_entity.entity_id = $2 AND sensor_entity.entity_type = 'Sensor' AND sensor_entity.gateway_id = $3
+	LEFT JOIN public.twin_states AS gateway_state ON gateway_state.entity_id = gateway_entity.id
+	LEFT JOIN public.twin_states AS sensor_state ON sensor_state.entity_id = sensor_entity.id
+	WHERE gateway_entity.entity_id = $1 AND gateway_entity.entity_type = 'Gateway'
+		AND gateway_entity.gateway_id = $3 AND gateway_state.entity_id IS NOT NULL
+		AND EXISTS (SELECT 1 FROM public.twin_relationships AS relationship
+			WHERE relationship.source_entity_id = gateway_entity.id AND relationship.target_entity_id = sensor_entity.id
+			AND relationship.relationship_type = 'hasSensor')`, mapper.GatewayEntityID(gatewayID), mapper.SensorEntityID(gatewayID, sensorID), gatewayID).
 		Scan(&gatewayEntityID, &sensorEntityID, &sensorStatePresent)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_graph"}
@@ -91,13 +165,31 @@ func resolveTelemetryResource(ctx context.Context, tx pgx.Tx, message *Message) 
 	if gatewayEntityID == uuid.Nil || sensorEntityID == uuid.Nil || !sensorStatePresent {
 		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_graph"}
 	}
+	return resolvedTelemetryResource{GatewayID: gatewayID, SensorID: sensorID, EntityID: sensorEntityID, Unit: unit}, nil
+}
 
-	return resolvedTelemetryResource{
-		GatewayID: topic.GatewayID,
-		SensorID:  topic.SensorID,
-		EntityID:  sensorEntityID,
-		Unit:      unit,
-	}, nil
+func lockTelemetrySensorEntity(ctx context.Context, tx pgx.Tx, resource resolvedTelemetryResource) error {
+	var id uuid.UUID
+	err := tx.QueryRow(ctx, `SELECT id FROM public.twin_entities WHERE entity_id = $1 AND entity_type = 'Sensor' AND gateway_id = $2 FOR UPDATE`, mapper.SensorEntityID(resource.GatewayID, resource.SensorID), resource.GatewayID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_graph"}
+	}
+	if err != nil {
+		return dependencyError("lock telemetry Sensor entity", err)
+	}
+	return nil
+}
+
+func lockTelemetrySensorState(ctx context.Context, tx pgx.Tx, resource resolvedTelemetryResource) error {
+	var id uuid.UUID
+	err := tx.QueryRow(ctx, `SELECT entity_id FROM public.twin_states WHERE entity_id = $1 FOR UPDATE`, resource.EntityID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_state"}
+	}
+	if err != nil {
+		return dependencyError("lock telemetry Sensor state", err)
+	}
+	return nil
 }
 
 func dependencyError(operation string, err error) error {

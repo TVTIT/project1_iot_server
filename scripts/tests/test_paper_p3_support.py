@@ -84,5 +84,32 @@ class MetricsOffReplacementTests(unittest.TestCase):
         self.registry.allocating.assert_not_called()
 
 
+class MicrobatchRegressionContractTests(unittest.TestCase):
+    def test_acceptance_requires_confirmed_command_and_both_real_acknowledged_messages(self):
+        accepted = {
+            'microbatch_enabled': True,
+            'command_result_confirmed': True,
+            'operation_evidence': True,
+            'traffic_source': runner.MICROBATCH_REGRESSION_TRAFFIC_LABEL,
+            'messages': [
+                {'kind': 'old', 'persisted': True, 'acknowledged': True, 'state_preserved': True},
+                {'kind': 'new', 'persisted': True, 'acknowledged': True, 'state_preserved': True},
+            ],
+        }
+        self.assertTrue(runner.microbatch_regression_accepted(accepted))
+        for mutation in (
+                {'microbatch_enabled': False},
+                {'command_result_confirmed': False},
+                {'messages': accepted['messages'][:1]},
+                {'messages': [accepted['messages'][0], dict(accepted['messages'][1], acknowledged=False)]},
+                {'messages': [accepted['messages'][0], dict(accepted['messages'][1], state_preserved=False)]}):
+            candidate = dict(accepted, **mutation)
+            self.assertFalse(runner.microbatch_regression_accepted(candidate))
+
+    def test_traffic_label_is_not_misrepresented_as_gateway_generation(self):
+        label = runner.MICROBATCH_REGRESSION_TRAFFIC_LABEL
+        self.assertEqual(label, 'fixture_mqtt_publish_not_gateway_generation')
+
+
 if __name__ == '__main__':
     unittest.main()

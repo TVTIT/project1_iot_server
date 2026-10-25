@@ -13,6 +13,7 @@ import (
 	"iot-platform/internal/metrics"
 	"iot-platform/internal/mqttcontrol"
 	"iot-platform/internal/mqttingress"
+	"iot-platform/internal/telemetry"
 )
 
 type poolMetrics struct {
@@ -27,27 +28,28 @@ type poolMetrics struct {
 }
 
 type processMetrics struct {
-	SchemaVersion    int                                 `json:"schema_version"`
-	ProcessInstance  string                              `json:"process_instance"`
-	StartedAt        time.Time                           `json:"started_at"`
-	ObservedAt       time.Time                           `json:"observed_at"`
-	ElapsedSeconds   float64                             `json:"elapsed_seconds"`
-	Availability     map[string]string                   `json:"availability"`
-	Ingress          *mqttingress.Snapshot               `json:"ingress"`
-	HTTP             []httpserver.HTTPMetricSnapshot     `json:"http"`
-	Auth             auth.MetricsSnapshot                `json:"auth"`
-	UnixAuth         *auth.MetricsSnapshot               `json:"unix_auth,omitempty"`
-	UnixAuthHandler  *metrics.HistogramSnapshot          `json:"unix_auth_handler,omitempty"`
-	JWKSCache        *auth.JWKSCacheSnapshot             `json:"jwks_cache,omitempty"`
-	DB               poolMetrics                         `json:"db"`
-	CommandAdmission *digitaltwin.ControlMetricsSnapshot `json:"command_admission"`
-	CommandDispatch  *mqttcontrol.MetricsSnapshot        `json:"command_dispatch"`
-	CommandResult    *mqttcontrol.ResultMetricsSnapshot  `json:"command_result,omitempty"`
-	CommandTimeline  *metrics.ControlTimelineSnapshot    `json:"command_timeline,omitempty"`
-	DispatchE2E      *float64                            `json:"dispatch_e2e_seconds"`
-	ResultE2E        *float64                            `json:"result_e2e_seconds"`
-	BatchWait        *float64                            `json:"batch_wait_seconds"`
-	WebSocket        *float64                            `json:"websocket_seconds"`
+	SchemaVersion    int                                   `json:"schema_version"`
+	ProcessInstance  string                                `json:"process_instance"`
+	StartedAt        time.Time                             `json:"started_at"`
+	ObservedAt       time.Time                             `json:"observed_at"`
+	ElapsedSeconds   float64                               `json:"elapsed_seconds"`
+	Availability     map[string]string                     `json:"availability"`
+	Ingress          *mqttingress.Snapshot                 `json:"ingress"`
+	HTTP             []httpserver.HTTPMetricSnapshot       `json:"http"`
+	Auth             auth.MetricsSnapshot                  `json:"auth"`
+	UnixAuth         *auth.MetricsSnapshot                 `json:"unix_auth,omitempty"`
+	UnixAuthHandler  *metrics.HistogramSnapshot            `json:"unix_auth_handler,omitempty"`
+	JWKSCache        *auth.JWKSCacheSnapshot               `json:"jwks_cache,omitempty"`
+	DB               poolMetrics                           `json:"db"`
+	Persistence      *telemetry.PersistenceMetricsSnapshot `json:"persistence,omitempty"`
+	CommandAdmission *digitaltwin.ControlMetricsSnapshot   `json:"command_admission"`
+	CommandDispatch  *mqttcontrol.MetricsSnapshot          `json:"command_dispatch"`
+	CommandResult    *mqttcontrol.ResultMetricsSnapshot    `json:"command_result,omitempty"`
+	CommandTimeline  *metrics.ControlTimelineSnapshot      `json:"command_timeline,omitempty"`
+	DispatchE2E      *float64                              `json:"dispatch_e2e_seconds"`
+	ResultE2E        *float64                              `json:"result_e2e_seconds"`
+	BatchWait        *float64                              `json:"batch_wait_seconds"`
+	WebSocket        *float64                              `json:"websocket_seconds"`
 }
 
 // Sources are read-only, bounded memory/pool snapshots; never SQL or environment.
@@ -65,8 +67,12 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 	started, instance := time.Now(), uuid.NewString()
 	deps.MetricsSnapshot = func() any {
 		now := time.Now()
+		batchAvailability := "disabled"
+		if cfg.Ingress.MicrobatchEnabled {
+			batchAvailability = "unavailable"
+		}
 		s := processMetrics{SchemaVersion: 1, ProcessInstance: instance, StartedAt: started.UTC(), ObservedAt: now.UTC(), ElapsedSeconds: now.Sub(started).Seconds(),
-			Availability: map[string]string{"ingress": "disabled", "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "batch_wait": "not_implemented", "websocket": "not_implemented"},
+			Availability: map[string]string{"ingress": "disabled", "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "persistence": "unavailable", "group_persistence": batchAvailability, "batch_wait": batchAvailability, "websocket": "not_implemented"},
 			HTTP:         deps.HTTPMetrics.Snapshot(), Auth: deps.AuthMetrics.Snapshot()}
 		if deps.UnixAuthMetrics != nil {
 			a, h := deps.UnixAuthMetrics.Snapshot(), deps.UnixAuthDuration.Snapshot()
@@ -80,6 +86,18 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 			v := ingress.ingress.Snapshot()
 			s.Ingress = &v
 			s.Availability["ingress"] = "available"
+			if !v.Microbatch.Enabled {
+				s.Availability["group_persistence"] = "disabled"
+				s.Availability["batch_wait"] = "disabled"
+			} else if cfg.MetricsEnabled && ingress.metrics != nil {
+				s.Availability["group_persistence"] = "available"
+				s.Availability["batch_wait"] = "available"
+			}
+		}
+		if ingress.metrics != nil {
+			v := ingress.metrics.Snapshot()
+			s.Persistence = &v
+			s.Availability["persistence"] = "available"
 		}
 		if deps.ControlMetrics != nil {
 			v := deps.ControlMetrics.Snapshot()

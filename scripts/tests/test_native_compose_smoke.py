@@ -158,6 +158,24 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn(f"{key}={value}\n", env_text)
             self.assertNotIn("deployment-value-must-not-leak", env_text)
 
+    def test_p5a_microbatch_defaults_are_explicit_and_default_off(self):
+        expected = {
+            "MQTT_MICROBATCH_ENABLED": "false",
+            "MQTT_MICROBATCH_MAX_MESSAGES": "32",
+            "MQTT_MICROBATCH_MAX_ROWS": "500",
+            "MQTT_MICROBATCH_MAX_PAYLOAD_BYTES": "4194304",
+            "MQTT_MICROBATCH_MAX_WAIT": "1s",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
     def test_p4_broker_configs_keep_packet_overhead_and_control_bounds(self):
         root_config = smoke.ROOT / "config/mosquitto/mosquitto.conf"
         text = root_config.read_text()
@@ -596,6 +614,92 @@ class PaperP1Tests(unittest.TestCase):
             self.assertEqual(fields['ShaperPassed']['availability'], 'available')
             self.assertEqual(fields['ShaperPassed']['value'], '0')
 
+    def test_p5a_metrics_csv_exports_actual_persistence_and_microbatch_operations(self):
+        import csv
+        h = {'count': 2, 'sum_seconds': 0.03, 'overflow': 0,
+             'upper_seconds': [0.01, 0.1], 'buckets': [1, 2]}
+        sample = {'process_instance': 'instance-a', 'elapsed_seconds': 10,
+                  'observed_at': '2026-10-25T10:00:00Z',
+                  'availability': {'persistence': 'available', 'group_persistence': 'available',
+                                   'batch_wait': 'available'},
+                  'persistence': {'single_attempts': 5, 'group_attempts': 3, 'group_members': 8,
+                                  'group_rows': 800, 'fallback_attempts': 1, 'begin_attempts': 9,
+                                  'confirmed_commits': 8, 'confirmed_rollbacks': 1,
+                                  'copy_calls': 4, 'copy_returned_rows': 700, 'confirmed_new_rows': 650},
+                  'ingress': {'Received': 8, 'SamplesNew': 650,
+                              'microbatch': {'enabled': True, 'max_messages': 32, 'max_rows': 500,
+                                  'max_payload_bytes': 4194304, 'max_wait_ns': 1000000000,
+                                  'groups': 3, 'members': 8, 'rows': 800, 'payload_bytes': 4200,
+                                  'flush_messages': 2, 'flush_rows': 1, 'flush_bytes': 0,
+                                  'flush_timer': 0, 'flush_stop': 0,
+                                  'standalone_oversized_members': 0},
+                              'Durations': {'batch_wait': h, 'group_persistence': h}}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'after', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        values = {(r['group'], r['metric']): (r['value'], r['availability']) for r in rows}
+        self.assertEqual(values[('persistence', 'copy_calls')], ('4', 'available'))
+        self.assertEqual(values[('persistence', 'copy_returned_rows')], ('700', 'available'))
+        self.assertEqual(values[('persistence', 'group_members')], ('8', 'available'))
+        self.assertEqual(values[('ingress_microbatch', 'flush_messages')], ('2', 'available'))
+        self.assertEqual(values[('ingress_microbatch', 'max_rows')], ('500', 'available'))
+        self.assertEqual(values[('ingress_durations', 'batch_wait.count')], ('2', 'available'))
+        self.assertEqual(values[('ingress_durations', 'group_persistence.sum')], ('0.03', 'available'))
+        # Operation counts are not inferred from group rows or target row limits.
+        self.assertEqual(values[('persistence', 'copy_calls')][0], '4')
+
+    def test_p5a_metrics_missing_sources_are_unavailable_and_keep_instance_delta_rules(self):
+        import csv
+        a = {'process_instance': 'same', 'elapsed_seconds': 1, 'observed_at': 't1',
+             'persistence': {'copy_calls': 2}, 'ingress': {'microbatch': {'groups': 1}}}
+        b = {'process_instance': 'same', 'elapsed_seconds': 3, 'observed_at': 't2',
+             'persistence': {'copy_calls': 5}, 'ingress': {'microbatch': {'groups': 3}}}
+        missing = {'process_instance': 'same', 'elapsed_seconds': 4, 'observed_at': 't3', 'ingress': {}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'a', 'snapshot': a},
+                                                {'phase': 'b', 'snapshot': b},
+                                                {'phase': 'missing', 'snapshot': missing}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        copy_rows = [r for r in rows if r['group'] == 'persistence' and r['metric'] == 'copy_calls']
+        self.assertEqual([(r['value'], r['delta']) for r in copy_rows[:2]], [('2', ''), ('5', '3')])
+        missing_fields = {(r['group'], r['metric']): r for r in rows if r['availability'] == 'unavailable'}
+        for key in (('persistence', 'copy_calls'), ('ingress_microbatch', 'groups'),
+                    ('ingress_microbatch', 'enabled'), ('ingress_durations', 'batch_wait.count')):
+            self.assertEqual(missing_fields[key]['value'], '')
+
+    def test_p5a_profiles_only_change_microbatch_and_keep_cache_disabled(self):
+        support = smoke.paper_p5a_support()
+        for dataset, samples in (('100', 100), ('1', 1)):
+            off = support.profile('off', dataset)
+            on = support.profile('on', dataset)
+            self.assertEqual(off['MQTT_MICROBATCH_ENABLED'], 'false')
+            self.assertEqual(on['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual({k: v for k, v in off.items() if k != 'MQTT_MICROBATCH_ENABLED'},
+                             {k: v for k, v in on.items() if k != 'MQTT_MICROBATCH_ENABLED'})
+            for mode in ('off', 'on'):
+                meta = support.run_metadata(mode, dataset,
+                    backend_quota={'cpus': 2, 'memory_bytes': 4294967296},
+                    effective_environment=support.profile(mode, dataset))
+                self.assertEqual(meta['dataset']['samples_per_message'], samples)
+                self.assertEqual(meta['effective_profile'], support.profile(mode, dataset))
+                self.assertEqual(meta['backend_quota'], {'cpus': 2, 'memory_bytes': 4294967296})
+                self.assertEqual(meta['offered_pattern']['status'], 'configured_not_run')
+                self.assertEqual(meta['auth_tls_acl'], {
+                    'auth_mode': 'rs256', 'https': True, 'mqtt_tls': True, 'acl_enforced': True})
+                self.assertEqual(meta['ram_cache'], {'enabled': False, 'status': 'not_implemented'})
+                self.assertEqual(meta['mode'], mode)
+                self.assertEqual(meta['effective_profile_source'], 'validated_compose_environment')
+                self.assertEqual(meta['effective_profile']['MQTT_MICROBATCH_ENABLED'],
+                                 'true' if mode == 'on' else 'false')
+        with self.assertRaises(ValueError):
+            support.profile('invalid', '100')
+        with self.assertRaises(ValueError):
+            support.profile('off', '10')
+
     def test_p4_rate_delta_is_same_process_positive_interval_and_not_shaper_accepted(self):
         a = {'process_instance': 'a', 'elapsed_seconds': 2,
              'ingress': {'Received': 4, 'Committed': 1, 'SamplesNew': 10, 'ShaperPassed': 8}}
@@ -662,6 +766,58 @@ class PaperP1Tests(unittest.TestCase):
             ordinary = smoke.prepare(Path(directory) / 'p2', paper_p2=True)
             self.assertEqual(ordinary.values['STAGE5_ENABLED'], 'false')
 
+    def test_p3_microbatch_variant_is_explicit_opt_in_and_keeps_default_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ordinary = smoke.prepare(Path(directory) / 'ordinary', paper_p3=True)
+            variant = smoke.prepare(Path(directory) / 'microbatch', paper_p3=True,
+                                    paper_p3_microbatch=True)
+            self.assertFalse(ordinary.paper_p3_microbatch)
+            self.assertEqual(ordinary.values['MQTT_MICROBATCH_ENABLED'], 'false')
+            self.assertTrue(variant.paper_p3_microbatch)
+            self.assertTrue(variant.paper_p3)
+            self.assertTrue(variant.paper_p2)
+            self.assertEqual(variant.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(variant.values['STAGE5_ENABLED'], 'true')
+            model = smoke.dry_effective_config(variant)
+            env = model['services']['backend']['environment']
+            self.assertEqual(env['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(env['METRICS_ENABLED'], 'true')
+
+    def test_p3_microbatch_variant_rejects_other_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, '^paper_p3_microbatch_mode_rejected$'):
+                smoke.prepare(Path(directory) / 'bad', paper_p3_microbatch=True)
+
+    def test_p3_microbatch_cli_routes_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P3_FIXTURE_ONLY'}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'cli'),
+                    '--paper-p3', '--p5a-control-regression']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            fixture = captured['fixture']
+            self.assertTrue(fixture.paper_p3_microbatch)
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertIn('--p5a-control-regression', smoke.cli_arguments())
+
+    def test_p3_microbatch_acceptance_label_requires_regression_and_exact_cleanup(self):
+        evidence = {'full_p3_accepted': True, 'microbatch_control_regression_accepted': True}
+        good = smoke.paper_p3_acceptance_report('fixture', evidence, True, True,
+                                                {'container': 1, 'network': 1, 'volume': 1})
+        self.assertEqual(good['status'], 'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED')
+        self.assertEqual(good['effective_optimizations'], ['mqtt_microbatch'])
+        self.assertTrue(good['exact_cleanup_verified'])
+        for cleanup, candidate in ((False, evidence), (True, {'full_p3_accepted': True,
+                                                               'microbatch_control_regression_accepted': False})):
+            report = smoke.paper_p3_acceptance_report('fixture', candidate, cleanup, True)
+            self.assertEqual(report['status'], 'FAIL')
+            if not cleanup:
+                self.assertFalse(report['exact_cleanup_verified'])
+
     def test_p4_profiles_are_comparable_and_use_real_shaper_switch(self):
         expected = {
             'MQTT_SHAPER_RATE_PER_SECOND': '2', 'MQTT_SHAPER_BURST': '4',
@@ -678,6 +834,7 @@ class PaperP1Tests(unittest.TestCase):
                 self.assertEqual(fixture.paper_p4_mode, 'baseline' if enabled == 'false' else 'optimized')
                 self.assertTrue(fixture.paper_p2)
                 self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], enabled)
+                self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'false')
                 for key, value in expected.items():
                     self.assertEqual(fixture.values[key], value, key)
                 self.assertIn('auth_socket:', (fixture.private / 'compose.p2.yml').read_text())
@@ -743,6 +900,23 @@ class PaperP1Tests(unittest.TestCase):
             registry.items[-1]['removed'] = False
             self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
 
+    def test_p5a_workload_acceptance_is_separate_and_exact_cleanup_gated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p5a', paper_p5a=('on', '1'))
+            labels = {'io.iot.native-smoke.run': fixture.project}
+            item = {'kind': 'volume', 'name': fixture.project + '_outbox', 'run': fixture.project,
+                    'task': 'native-compose-allocation', 'allocation_attempted': True, 'removed': True,
+                    'labels': labels, 'receipt': {'id': fixture.project + '_outbox',
+                    'created': '2026-10-25T08:00:00Z', 'labels': dict(labels)}}
+            registry = Mock(items=[item])
+            counts = {'container': 0, 'network': 0, 'volume': 1}
+            self.assertFalse(smoke.paper_p5a_cleanup_acceptance(fixture,
+                {'full_p5a_workload_accepted': False}, counts, True, registry))
+            self.assertFalse(smoke.paper_p5a_cleanup_acceptance(fixture,
+                {'full_p5a_workload_accepted': True}, counts, False, registry))
+            self.assertTrue(smoke.paper_p5a_cleanup_acceptance(fixture,
+                {'full_p5a_workload_accepted': True}, counts, True, registry))
+
     def test_p4_cli_dispatch_and_wrapper_are_explicit(self):
         self.assertIn('--paper-p4', smoke.cli_arguments())
         wrapper = (smoke.ROOT / 'scripts/test-paper-p4.sh').read_text()
@@ -765,6 +939,72 @@ class PaperP1Tests(unittest.TestCase):
             self.assertIsNone(fixture.paper_p1)
             self.assertEqual(fixture.paper_p4_mode, 'optimized')
             self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'true')
+
+    def test_p5a_prepares_off_on_profiles_for_both_datasets_without_execution_claim(self):
+        support = smoke.paper_p5a_support()
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in ('off', 'on'):
+                for dataset in ('100', '1'):
+                    fixture = smoke.prepare(Path(directory) / f'{mode}-{dataset}',
+                                            paper_p5a=(mode, dataset))
+                    self.assertTrue(fixture.paper_p5a)
+                    self.assertEqual((fixture.paper_p5a_mode, fixture.paper_p5a_dataset), (mode, dataset))
+                    self.assertTrue(fixture.paper_p2)
+                    self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true' if mode == 'on' else 'false')
+                    self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'false')
+                    self.assertEqual(fixture.values['STAGE5_ENABLED'], 'false')
+                    self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '10')
+                    self.assertEqual(fixture.values['MQTT_WORKER_COUNT'], '4')
+                    self.assertEqual(fixture.values['MQTT_QUEUE_CAPACITY'], '256')
+                    self.assertEqual(fixture.values['SUPABASE_JWT_MODE'], 'rs256')
+                    support.validate_effective_profile(fixture.values, mode, dataset)
+                    env = dict(fixture.values)
+                    env['MQTT_MICROBATCH_ENABLED'] = 'false' if mode == 'on' else 'true'
+                    with self.assertRaisesRegex(ValueError, '^paper_p5a_profile_rejected$'):
+                        support.validate_effective_profile(env, mode, dataset)
+                    metadata = support.run_metadata(mode, dataset,
+                        effective_environment=fixture.values)
+                    self.assertEqual(metadata['offered_pattern']['status'], 'configured_not_run')
+                    self.assertEqual(metadata['backend_quota'], {'cpus': 2, 'memory_bytes': 4294967296})
+                    self.assertNotIn('password', json.dumps(metadata).lower())
+                    self.assertNotIn('secret', json.dumps(metadata).lower())
+                    artifact = json.loads((fixture.artifacts / 'run.json').read_text())
+                    self.assertEqual(artifact['status'], 'PREPARED_NOT_EXECUTED')
+                    self.assertIs(artifact['native_executed'], False)
+                    self.assertNotIn('full_p5a_accepted', artifact)
+
+    def test_p5a_rejects_conflicting_or_invalid_fixture_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for kwargs in (
+                {'paper_p5a': ('off', '100'), 'paper_p3': True},
+                {'paper_p5a': ('on', '1'), 'paper_p4': 'baseline'},
+                {'paper_p5a': ('on', '10')},
+                {'paper_p5a': ('invalid', '100')},
+                {'paper_p5a': ('off', '100'), 'metrics_enabled': False},
+            ):
+                with self.assertRaises(ValueError):
+                    smoke.prepare(Path(directory) / (str(len(kwargs)) + str(kwargs)), **kwargs)
+
+    def test_p5a_dispatch_is_explicitly_pending_and_cli_routes_only_p5a(self):
+        support = smoke.paper_p5a_support()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p5a', paper_p5a=('on', '1'))
+            with self.assertRaisesRegex(ValueError, '^paper_p5a_fixture_required$'):
+                support.run(smoke, fixture, None, None, None, None, None)
+            captured = {}
+            def startup(value):
+                captured['fixture'] = value
+                return {'status': 'P5A_FIXTURE_ONLY', 'native_executed': False}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'cli'),
+                    '--paper-p5a', '--mode', 'off', '--dataset', '100']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            self.assertTrue(captured['fixture'].paper_p5a)
+            self.assertEqual(captured['fixture'].paper_p5a_dataset, '100')
+            self.assertIn('--paper-p5a', smoke.cli_arguments())
+            wrapper = (smoke.ROOT / 'scripts/test-paper-p5a.sh').read_text()
+            self.assertIn('--paper-p5a', wrapper)
 
     def test_p1_profile_reuses_p0_resources_but_keeps_its_own_mode(self):
         with tempfile.TemporaryDirectory() as directory:

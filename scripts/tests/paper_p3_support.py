@@ -5,7 +5,24 @@ import secrets
 import sqlite3
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+
+MICROBATCH_REGRESSION_TRAFFIC_LABEL = 'fixture_mqtt_publish_not_gateway_generation'
+
+
+def microbatch_regression_accepted(result):
+    return (type(result) is dict and result.get('microbatch_enabled') is True
+            and result.get('command_result_confirmed') is True
+            and result.get('operation_evidence') is True
+            and result.get('traffic_source') == MICROBATCH_REGRESSION_TRAFFIC_LABEL
+            and type(result.get('messages')) is list and len(result['messages']) == 2
+            and all(type(message) is dict and message.get('persisted') is True
+                    and message.get('acknowledged') is True and message.get('state_preserved') is True
+                    for message in result['messages'])
+            and [message.get('kind') for message in result['messages']] == ['old', 'new'])
 
 
 @dataclass(frozen=True)
@@ -80,7 +97,10 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
     primary = SensorTarget(specs[0].gateway_id, specs[0].sensor_id, specs[0].sensor_unit)
     secondary = SensorTarget(specs[0].gateway_id, 'sensor_p3_secondary', specs[0].sensor_unit)
     run = {'schema_version': 1, 'run_id': fixture.project, 'status': 'FAIL',
-           'full_p3_accepted': False, 'mode': 'baseline', 'effective_optimizations': [],
+           'full_p3_accepted': False,
+           'mode': 'microbatch_control_regression' if fixture.paper_p3_microbatch else 'baseline',
+           'effective_optimizations': ['mqtt_microbatch'] if fixture.paper_p3_microbatch else [],
+           'effective_flags': {'MQTT_MICROBATCH_ENABLED': fixture.values['MQTT_MICROBATCH_ENABLED']},
            'revision': smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'),
            'branch': smoke.paper_p0_git(fixture, 'branch', '--show-current'),
            'dirty': bool(smoke.paper_p0_git(fixture, 'status', '--porcelain')),
@@ -90,7 +110,7 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
            'gateway_image_id': images['gateway'],
            'config': {key: fixture.values[key] for key in (
                'DATABASE_MAX_CONNS', 'MQTT_WORKER_COUNT', 'MQTT_QUEUE_CAPACITY',
-               'STAGE5_COMMAND_TTL', 'STAGE5_RESULT_QUEUE', 'STAGE5_RESULT_WORKERS',
+               'MQTT_MICROBATCH_ENABLED', 'STAGE5_COMMAND_TTL', 'STAGE5_RESULT_QUEUE', 'STAGE5_RESULT_WORKERS',
                'STAGE5_SCAN_INTERVAL', 'STAGE5_PUBLISH_WORKERS')},
            'checks': {}, 'commands': [], 'cleanup_verified': False}
     samples, private_control = [], {}
@@ -168,6 +188,9 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         check('confirmed_' + str(interval), status == 200 and view.get('parameters', {}).get('sample_interval_us') == interval
               and config.get('sample_interval_us') == interval and config.get('desired_version') == command['desired_version']
               and body.get('reported_state', {}).get('configuration') == config)
+        private_control['confirmed_configuration'] = {
+            'desired_version': command['desired_version'], 'sample_interval_us': interval,
+            'command_status': view.get('status')}
         return view
 
     def interval_batches(interval, one_sample=False):
@@ -187,6 +210,152 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
             '-u "$user" -P "$password" -q 1 -t "$topic" -s'],
             input=(username + '\n' + password + '\n' + topic + '\n').encode() + payload)
         check('cached_mqtt_publish', result.returncode == 0)
+
+    def run_microbatch_configuration_regression():
+        """Publish two fixture messages after the real command path is idle."""
+        from stage3_mqtt_ingress_runner import verify_ack
+        from stage3_uplink_runner import build_probe_batch, synthetic_value
+
+        before_operations = scrape('microbatch_control_before')
+        current = json.loads(sql("""SELECT json_build_object(
+          'boot_id', boot_id, 'last_sequence', max(sequence_num),
+          'measured_at', to_char(max(measured_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
+          FROM telemetry WHERE gateway_id=:'gw' AND sensor_id=:'sensor' GROUP BY boot_id
+          ORDER BY max(measured_at) DESC LIMIT 1;""", gw=primary.gateway_id, sensor=primary.sensor_id))
+        current_time = datetime.fromisoformat(current['measured_at'].replace('Z', '+00:00'))
+        old_time = (current_time - timedelta(seconds=1)).astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        current_measured_at = current_time.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        first_sequence = int(current['last_sequence']) + 1
+        messages = [
+            {'kind': 'old', 'message_id': str(uuid.uuid4()), 'sequence': first_sequence,
+             'measured_at': old_time, 'advances_current': False},
+            {'kind': 'new', 'message_id': str(uuid.uuid4()), 'sequence': first_sequence + 1,
+             'measured_at': current_measured_at, 'advances_current': True},
+        ]
+        status, _, initial_api = smoke.http_request(endpoint, 'GET',
+            sensor_path(primary) + '?format=simplified', token=tokens['a'])
+        initial_db = json.loads(sql("""SELECT json_build_object(
+          'reported_state', s.reported_state, 'desired_state', s.desired_state,
+          'reported_version', s.reported_version, 'desired_version', s.desired_version)
+          FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn';""",
+          urn=primary.sensor_urn))
+        confirmed_config = private_control.get('confirmed_configuration', {})
+        api_state_matches = initial_api.get('reported_state') == initial_db['reported_state']
+        api_desired_matches = initial_api.get('desired_state') == initial_db['desired_state']
+        command_succeeded = confirmed_config.get('command_status') == 'succeeded'
+        reported_configuration = initial_db['reported_state'].get('configuration')
+        config_matches_command = (isinstance(reported_configuration, dict)
+            and reported_configuration.get('desired_version') == confirmed_config.get('desired_version')
+            and reported_configuration.get('sample_interval_us') == confirmed_config.get('sample_interval_us')
+            and isinstance(reported_configuration.get('applied_at'), str)
+            and bool(reported_configuration['applied_at']))
+        check('microbatch_control_initial_snapshot', status == 200 and api_state_matches
+              and api_desired_matches and command_succeeded and config_matches_command,
+              http_status=status, api_state_matches_db=api_state_matches,
+              api_desired_matches_db=api_desired_matches, command_succeeded=command_succeeded,
+              configuration_matches_command=config_matches_command,
+              reported_configuration=initial_db['reported_state'].get('configuration'),
+              confirmed_configuration={key: confirmed_config.get(key) for key in
+                                       ('desired_version', 'sample_interval_us', 'command_status')})
+        check('microbatch_control_time_ordering',
+              datetime.fromisoformat(initial_db['reported_state']['observed_at'].replace('Z', '+00:00'))
+                  == current_time
+              and current_time <= datetime.now(timezone.utc)
+              and datetime.fromisoformat(old_time.replace('Z', '+00:00')) < current_time
+              and datetime.fromisoformat(current_measured_at.replace('Z', '+00:00')) <= datetime.now(timezone.utc),
+              old_is_late=True, new_is_current=True, future_timestamps=False)
+        ack_observer = smoke.paper_p1_subscriber(fixture, registry,
+            containers['mosquitto']['receipt']['id'], primary, passwords[0],
+            'p5a-control-regression-ack', message_count=2, message_timeout=30, subscription_kind='ack')
+        accepted_messages = []
+        try:
+            for entry in messages:
+                payload = build_probe_batch(primary, entry['message_id'], current['boot_id'], entry['sequence'],
+                    sample_count=1, sample_interval_us=12345, measured_at=entry['measured_at'])
+                topic = 'gateways/' + primary.gateway_id + '/telemetry/' + primary.sensor_id
+                mqtt_publish(topic, payload, primary.gateway_id, passwords[0])
+                ack_topic = 'gateways/' + primary.gateway_id + '/acks/' + entry['message_id']
+                ack_payload = smoke.paper_p1_capture_subscription(ack_observer, ack_topic, timeout=20)
+                check('microbatch_control_application_ack_' + entry['kind'], ack_payload is not None)
+                verify_ack(entry['message_id'], ack_payload)
+                raw_result = json.loads(sql("""SELECT json_build_object(
+                  'ledger', (SELECT count(*) FROM processed_messages WHERE gateway_id=:'gw' AND message_id=:'id'),
+                  'raw', (SELECT count(*) FROM telemetry WHERE gateway_id=:'gw' AND message_id=:'id'),
+                  'raw_match', (SELECT count(*)=1 FROM telemetry t JOIN processed_messages p
+                    ON p.gateway_id=t.gateway_id AND p.message_id=t.message_id
+                    WHERE t.gateway_id=:'gw' AND t.message_id=:'id' AND t.sensor_id=:'sensor'
+                      AND t.boot_id=:'boot'::uuid AND t.sequence_num=:'seq'::bigint
+                      AND t.sample_index=0 AND t.measured_at=:'measured'::timestamptz
+                      AND abs(t.value-:'value'::double precision)<1e-9
+                      AND p.first_sequence=:'seq'::bigint AND p.last_sequence=:'seq'::bigint
+                      AND p.sample_count=1 AND p.source_topic=:'topic' AND p.payload_hash=:'hash'),
+                  'temporal', (SELECT count(*) FROM twin_temporal_values v JOIN twin_entities e ON e.id=v.entity_id
+                    WHERE e.entity_id=:'urn' AND v.message_id=:'id' AND v.property_name='sample_interval_us'
+                      AND v.value_number=12345 AND v.observed_at=:'measured'::timestamptz
+                      AND v.metadata->>'source'='telemetry_batch' AND v.metadata->>'boot_id'=:'boot'));""",
+                  gw=primary.gateway_id, id=entry['message_id'], sensor=primary.sensor_id,
+                  boot=current['boot_id'], seq=str(entry['sequence']), measured=entry['measured_at'],
+                  value=str(synthetic_value(entry['sequence'])), topic=topic,
+                  hash=hashlib.sha256(payload).hexdigest(), urn=primary.sensor_urn))
+                check('microbatch_control_message_persisted_' + entry['kind'],
+                      raw_result == {'ledger': 1, 'raw': 1, 'raw_match': True, 'temporal': 1},
+                      persisted=raw_result, sequence=entry['sequence'], measured_at=entry['measured_at'],
+                      sample_interval_us=12345)
+                status, _, after_api = smoke.http_request(endpoint, 'GET',
+                    sensor_path(primary) + '?format=simplified', token=tokens['a'])
+                after_db = json.loads(sql("""SELECT json_build_object(
+                  'reported_state', s.reported_state, 'desired_state', s.desired_state,
+                  'reported_version', s.reported_version, 'desired_version', s.desired_version)
+                  FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn';""",
+                  urn=primary.sensor_urn))
+                config_preserved = (after_db['reported_state'].get('configuration')
+                                    == initial_db['reported_state'].get('configuration'))
+                desired_preserved = (after_db['desired_state'] == initial_db['desired_state']
+                                     and after_db['desired_version'] == initial_db['desired_version'])
+                if entry['advances_current']:
+                    state_ok = (after_db['reported_version'] == initial_db['reported_version'] + 1
+                                and datetime.fromisoformat(after_db['reported_state']['observed_at'].replace('Z', '+00:00'))
+                                    == datetime.fromisoformat(entry['measured_at'].replace('Z', '+00:00'))
+                                and after_db['reported_state'].get('sequence_num') == entry['sequence'])
+                else:
+                    state_ok = (after_db['reported_version'] == initial_db['reported_version']
+                                and after_db['reported_state'] == initial_db['reported_state'])
+                check('microbatch_control_state_' + entry['kind'], status == 200
+                      and after_api.get('reported_state') == after_db['reported_state']
+                      and after_api.get('desired_state') == after_db['desired_state']
+                      and config_preserved and desired_preserved and state_ok,
+                      reported_version=after_db['reported_version'], desired_version=after_db['desired_version'],
+                      configuration_preserved=config_preserved, desired_preserved=desired_preserved,
+                      old_measurement_did_not_rollback=state_ok if not entry['advances_current'] else None,
+                      new_measurement_advanced=state_ok if entry['advances_current'] else None)
+                accepted_messages.append({'kind': entry['kind'], 'persisted': True,
+                    'acknowledged': True, 'state_preserved': config_preserved and desired_preserved and state_ok,
+                    'sequence': entry['sequence'], 'measured_at': entry['measured_at']})
+        finally:
+            smoke.paper_p1_stop_subscription(ack_observer)
+        after_operations = scrape('microbatch_control_after')
+        before_mb = before_operations['ingress']['microbatch']
+        after_mb = after_operations['ingress']['microbatch']
+        group_attempt_delta = (after_operations['persistence']['group_attempts']
+                               - before_operations['persistence']['group_attempts'])
+        group_member_delta = after_mb['members'] - before_mb['members']
+        operation_evidence = (before_mb.get('enabled') is True and after_mb.get('enabled') is True
+                              and group_attempt_delta > 0 and group_member_delta >= 2)
+        check('microbatch_control_operation_evidence', operation_evidence,
+              group_attempt_delta=group_attempt_delta, group_member_delta=group_member_delta,
+              enabled_before=before_mb.get('enabled'), enabled_after=after_mb.get('enabled'))
+        outcome = {'microbatch_enabled': fixture.values['MQTT_MICROBATCH_ENABLED'] == 'true',
+                   'command_result_confirmed': (private_control.get('confirmed_configuration', {}).get('command_status')
+                                                == 'succeeded'),
+                   'messages': accepted_messages,
+                   'operation_evidence': operation_evidence,
+                   'traffic_source': MICROBATCH_REGRESSION_TRAFFIC_LABEL,
+                   'confirmed_configuration': initial_db['reported_state'].get('configuration'),
+                   'desired_version': initial_db['desired_version']}
+        check('microbatch_configuration_preservation', microbatch_regression_accepted(outcome),
+              traffic_source=outcome['traffic_source'], messages=accepted_messages,
+              effective_microbatch_flag=fixture.values['MQTT_MICROBATCH_ENABLED'])
+        return outcome
 
     def signal(tag):
         item = next(i for i in registry.items if i['name'] == fixture.project + '-gateway-' + tag)
@@ -318,6 +487,10 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         # Preserve the five-command, single-process timing sample before the
         # supplementary metrics-disabled regression restarts this owned backend.
         run.update(metrics_enabled_command_count=5, durations=timeline, result_outcomes=final['command_result'])
+        if fixture.paper_p3_microbatch:
+            run['microbatch_control_regression'] = run_microbatch_configuration_regression()
+            run['microbatch_control_regression_accepted'] = microbatch_regression_accepted(
+                run['microbatch_control_regression'])
         persist()
         replace_backend_without_metrics(smoke, fixture, registry, containers, state)
         check('metrics_disabled_readback', smoke.paper_p2_support().direct_go(

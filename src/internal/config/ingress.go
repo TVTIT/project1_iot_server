@@ -23,6 +23,19 @@ const (
 	defaultMQTTWorkerCount   = 4
 	maxMQTTWorkerCount       = 10_000
 
+	defaultMicrobatchMessages = 32
+	maxMicrobatchMessages     = 1024
+	defaultMicrobatchRows     = 500
+	maxMicrobatchRows         = 100_000
+	defaultMicrobatchBytes    = 4 << 20
+	maxMicrobatchBytes        = 256 << 20
+	defaultMicrobatchWait     = time.Second
+	maxMicrobatchWait         = 5 * time.Second
+	// Conservative accounting bounds for decoded rows and per-delivery metadata.
+	// These are sizing guards, not estimates of Go RSS.
+	microbatchDecodedRowBudgetBytes int64 = 256
+	microbatchDeliveryBudgetBytes   int64 = 4096
+
 	// MQTT_MAX_PAYLOAD_BYTES is the application-level per-message payload limit.
 	// The demo/default profile is 64 KiB; the supported maximum is 1 MiB, which
 	// is also the value the broker packet bound is derived from.
@@ -79,6 +92,12 @@ type IngressConfig struct {
 	MaxBatchDuration     time.Duration
 	MaxFutureSkew        time.Duration
 	DBTimeout            time.Duration
+
+	MicrobatchEnabled         bool
+	MicrobatchMaxMessages     int
+	MicrobatchMaxRows         int
+	MicrobatchMaxPayloadBytes int64
+	MicrobatchMaxWait         time.Duration
 }
 
 // String redacts every value so diagnostics never reveal credentials or paths.
@@ -156,6 +175,27 @@ func loadIngress(lookup LookupFunc, databaseMaxConns int32, credentialEnabled bo
 	if c.DBTimeout, err = boundedDuration(lookup, "TELEMETRY_DB_TIMEOUT", 5*time.Second, time.Millisecond, time.Minute); err != nil {
 		return c, err
 	}
+	if c.MicrobatchEnabled, err = boolValue(lookup, "MQTT_MICROBATCH_ENABLED", false); err != nil {
+		return c, err
+	}
+	if c.MicrobatchMaxMessages, err = integer(lookup, "MQTT_MICROBATCH_MAX_MESSAGES", defaultMicrobatchMessages, 1, maxMicrobatchMessages); err != nil {
+		return c, err
+	}
+	if c.MicrobatchMaxRows, err = integer(lookup, "MQTT_MICROBATCH_MAX_ROWS", defaultMicrobatchRows, 1, maxMicrobatchRows); err != nil {
+		return c, err
+	}
+	if c.MicrobatchMaxPayloadBytes, err = boundedInt64(lookup, "MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", defaultMicrobatchBytes, 1, maxMicrobatchBytes); err != nil {
+		return c, err
+	}
+	if c.MicrobatchMaxWait, err = boundedDuration(lookup, "MQTT_MICROBATCH_MAX_WAIT", defaultMicrobatchWait, time.Millisecond, maxMicrobatchWait); err != nil {
+		return c, err
+	}
+	if c.MicrobatchEnabled {
+		if err = checkMicrobatchWorkerMemory(c.WorkerCount, c.MicrobatchMaxMessages, c.MicrobatchMaxRows,
+			c.MicrobatchMaxPayloadBytes, c.MaxPayloadBytes, c.MaxSamplesPerMessage); err != nil {
+			return c, err
+		}
+	}
 
 	if !c.Enabled {
 		return c, nil
@@ -192,10 +232,82 @@ func loadIngress(lookup LookupFunc, databaseMaxConns int32, credentialEnabled bo
 	if err = checkIngressPoolReservation(c.WorkerCount, databaseMaxConns, credentialEnabled); err != nil {
 		return c, err
 	}
-	if shutdownTimeout < c.DBTimeout+c.PublishTimeout {
+	shutdownRequired := c.DBTimeout + c.PublishTimeout
+	if c.MicrobatchEnabled {
+		shutdownRequired += c.MicrobatchMaxWait
+	}
+	if shutdownTimeout < shutdownRequired {
+		if c.MicrobatchEnabled {
+			return c, fmt.Errorf("SHUTDOWN_TIMEOUT must cover MQTT_MICROBATCH_MAX_WAIT + TELEMETRY_DB_TIMEOUT + MQTT_PUBLISH_TIMEOUT when MQTT ingress and microbatch are enabled")
+		}
 		return c, fmt.Errorf("SHUTDOWN_TIMEOUT must cover TELEMETRY_DB_TIMEOUT + MQTT_PUBLISH_TIMEOUT when MQTT_INGRESS_ENABLED is true")
 	}
 	return c, nil
+}
+
+func boundedInt64(lookup LookupFunc, key string, fallback, min, max int64) (int64, error) {
+	raw, ok := nonEmpty(lookup, key)
+	if !ok {
+		return fallback, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < min || value > max {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, min, max)
+	}
+	return value, nil
+}
+
+// checkMicrobatchWorkerMemory bounds group payload, decoded samples, metadata,
+// and one carried maximum-size message per worker. Raw payload is not RSS; the
+// explicit decoded/metadata allowances are conservative bounds, not RSS claims.
+func checkMicrobatchWorkerMemory(workers, messages, rows int, groupBytes int64, maxPayload, maxSamples int) error {
+	groupDecoded, ok := checkedProduct(int64(rows), microbatchDecodedRowBudgetBytes)
+	if !ok {
+		return fmt.Errorf("microbatch decoded-row budget overflows")
+	}
+	groupMetadata, ok := checkedProduct(int64(messages), microbatchDeliveryBudgetBytes)
+	if !ok {
+		return fmt.Errorf("microbatch delivery-metadata budget overflows")
+	}
+	carryDecoded, ok := checkedProduct(int64(maxSamples), microbatchDecodedRowBudgetBytes)
+	if !ok {
+		return fmt.Errorf("microbatch carried-message decoded budget overflows")
+	}
+	group, ok := checkedSum(groupBytes, groupDecoded, groupMetadata)
+	if !ok {
+		return fmt.Errorf("microbatch group memory budget overflows")
+	}
+	carry, ok := checkedSum(int64(maxPayload), carryDecoded, microbatchDeliveryBudgetBytes)
+	if !ok {
+		return fmt.Errorf("microbatch carried-message memory budget overflows")
+	}
+	perWorker, ok := checkedSum(group, carry)
+	if !ok {
+		return fmt.Errorf("microbatch worker memory budget overflows")
+	}
+	total, ok := checkedProduct(int64(workers), perWorker)
+	if !ok || total > MaxIngressQueueMemoryBytes {
+		return fmt.Errorf("MQTT_MICROBATCH worker group + carried-message budget must not exceed %d bytes", MaxIngressQueueMemoryBytes)
+	}
+	return nil
+}
+
+func checkedProduct(a, b int64) (int64, bool) {
+	if a < 0 || b < 0 || (b != 0 && a > math.MaxInt64/b) {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func checkedSum(values ...int64) (int64, bool) {
+	var total int64
+	for _, value := range values {
+		if value < 0 || total > math.MaxInt64-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
 }
 
 func ingressByteBudget(lookup LookupFunc, maxPayload int) (int64, error) {

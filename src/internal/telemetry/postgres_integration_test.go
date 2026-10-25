@@ -72,6 +72,10 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 	}
 	const sensorEntity = "urn:ngsi-ld:Sensor:fixture_gw:fixture_sensor"
 	const gatewayEntity = "urn:ngsi-ld:Gateway:fixture_gw"
+	if os.Getenv("TELEMETRY_TEST_GROUP") == "1" {
+		runPostgresGroupAcceptance(ctx, t, setup, app, validator)
+		return
+	}
 	// Sensor desired state, its version, and its audit timestamps/actor must
 	// survive a reported-state advance untouched, and the Gateway Twin must stay
 	// untouched. Capture both before any persist result can influence them.
@@ -1100,6 +1104,374 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 }
 
 func mustUUID(s string) uuid.UUID { return uuid.MustParse(s) }
+
+// runPostgresGroupAcceptance exercises the real PostgreSQL group transaction on
+// the same isolated migration-20 fixture as the per-message regression suite.
+func runPostgresGroupAcceptance(ctx context.Context, t *testing.T, setup, app *pgxpool.Pool, validator *Validator) {
+	t.Helper()
+	metrics := &PersistenceMetrics{}
+	repo, err := NewPostgresBatchRepositoryWithMetrics(app, 5*time.Second, 8, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Millisecond)
+	const boot = "70000000-0000-4000-8000-000000000001"
+	makeMessage := func(id, gw, sensor string, first int64, at time.Time, values ...float64) *Message {
+		t.Helper()
+		payload, marshalErr := json.Marshal(BatchDTO{ProtocolVersion: 1, MessageID: mustUUID(id), MessageType: "telemetry_batch", GatewayID: gw, SensorID: sensor, BootID: mustUUID(boot), FirstSequence: first, SampleCount: int32(len(values)), MeasuredAt: at.Format(time.RFC3339Nano), SampleIntervalUS: 10000, Samples: values})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		message, validateErr := validator.Validate("gateways/"+gw+"/telemetry/"+sensor, payload, time.Now().UTC())
+		if validateErr != nil {
+			t.Fatal(validateErr)
+		}
+		return message
+	}
+	count := func(query string) int {
+		t.Helper()
+		var n int
+		if err := setup.QueryRow(ctx, query).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	assertMetricsDelta := func(phase string, before PersistenceMetricsSnapshot, want PersistenceMetricsSnapshot) PersistenceMetricsSnapshot {
+		t.Helper()
+		after := metrics.Snapshot()
+		delta := PersistenceMetricsSnapshot{
+			SingleAttempts:     after.SingleAttempts - before.SingleAttempts,
+			GroupAttempts:      after.GroupAttempts - before.GroupAttempts,
+			GroupMembers:       after.GroupMembers - before.GroupMembers,
+			GroupRows:          after.GroupRows - before.GroupRows,
+			GroupPayloadBytes:  after.GroupPayloadBytes - before.GroupPayloadBytes,
+			FallbackAttempts:   after.FallbackAttempts - before.FallbackAttempts,
+			BeginAttempts:      after.BeginAttempts - before.BeginAttempts,
+			BeginSucceeded:     after.BeginSucceeded - before.BeginSucceeded,
+			ConfirmedCommits:   after.ConfirmedCommits - before.ConfirmedCommits,
+			RollbackAttempts:   after.RollbackAttempts - before.RollbackAttempts,
+			ConfirmedRollbacks: after.ConfirmedRollbacks - before.ConfirmedRollbacks,
+			CommitUnconfirmed:  after.CommitUnconfirmed - before.CommitUnconfirmed,
+			CopyCalls:          after.CopyCalls - before.CopyCalls,
+			CopyReturnedRows:   after.CopyReturnedRows - before.CopyReturnedRows,
+			ConfirmedNewRows:   after.ConfirmedNewRows - before.ConfirmedNewRows,
+		}
+		t.Logf("group phase %s metrics delta: %+v", phase, delta)
+		if delta != want {
+			t.Fatalf("group phase %s metrics delta: got %+v want %+v", phase, delta, want)
+		}
+		return after
+	}
+	messages := []*Message{
+		makeMessage("71000000-0000-4000-8000-000000000001", "fixture_gw", "fixture_sensor", 80001, base, 1, 2),
+		makeMessage("71000000-0000-4000-8000-000000000002", "fixture_gw", "fixture_sensor", 80003, base.Add(time.Second), 3),
+		makeMessage("71000000-0000-4000-8000-000000000003", "fixture_gw2", "fixture_sensor", 1, base.Add(2*time.Second), 4, 5, 6),
+	}
+	groupPayloadBytes := uint64(len(messages[0].rawPayload) + len(messages[1].rawPayload) + len(messages[2].rawPayload))
+	initialMetrics := metrics.Snapshot()
+	results := repo.PersistBatch(ctx, messages)
+	for i, result := range results {
+		if result.Err != nil || result.InputIndex != i || result.Outcome != CommitOutcomeCommitted || result.SamplesSaved != len(messages[i].samples) {
+			t.Fatalf("group result[%d]=%+v", i, result)
+		}
+	}
+	if got := count("SELECT count(*) FROM processed_messages"); got != 3 {
+		t.Fatalf("group ledger count=%d want 3", got)
+	}
+	if got := count("SELECT count(*) FROM telemetry"); got != 6 {
+		t.Fatalf("group raw count=%d want 6", got)
+	}
+	if got := count("SELECT count(*) FROM twin_temporal_values"); got != 3 {
+		t.Fatalf("group temporal count=%d want 3", got)
+	}
+	var seqs string
+	if err := setup.QueryRow(ctx, `SELECT string_agg(sequence_num::text, ',' ORDER BY sample_id) FROM telemetry WHERE message_id IN ($1,$2,$3)`, mustUUID("71000000-0000-4000-8000-000000000001"), mustUUID("71000000-0000-4000-8000-000000000002"), mustUUID("71000000-0000-4000-8000-000000000003")).Scan(&seqs); err != nil || seqs != "80001,80002,80003,1,2,3" {
+		t.Fatalf("group raw ordering=%q err=%v", seqs, err)
+	}
+	firstMetrics := metrics.Snapshot()
+	if firstMetrics.GroupAttempts != 1 || firstMetrics.BeginAttempts != 1 || firstMetrics.ConfirmedCommits != 1 || firstMetrics.CopyCalls != 1 || firstMetrics.CopyReturnedRows != 6 || firstMetrics.ConfirmedNewRows != 6 {
+		t.Fatalf("actual grouped persistence metrics=%+v", firstMetrics)
+	}
+	assertMetricsDelta("new_group", initialMetrics, PersistenceMetricsSnapshot{
+		GroupAttempts: 1, GroupMembers: 3, GroupRows: 6, GroupPayloadBytes: groupPayloadBytes,
+		BeginAttempts: 1, BeginSucceeded: 1, ConfirmedCommits: 1,
+		CopyCalls: 1, CopyReturnedRows: 6, ConfirmedNewRows: 6,
+	})
+	// A DB duplicate group commits as duplicate without a second COPY or state/history write.
+	results = repo.PersistBatch(ctx, messages)
+	for i, result := range results {
+		if result.Err != nil || result.Outcome != CommitOutcomeDuplicateCommitted || result.InputIndex != i {
+			t.Fatalf("DB duplicate[%d]=%+v", i, result)
+		}
+	}
+	if got := metrics.Snapshot(); got.CopyCalls != 1 || got.ConfirmedCommits != 2 || got.ConfirmedNewRows != 6 {
+		t.Fatalf("duplicate operation metrics=%+v", got)
+	}
+	duplicateMetrics := assertMetricsDelta("db_duplicates", firstMetrics, PersistenceMetricsSnapshot{
+		GroupAttempts: 1, GroupMembers: 3, GroupRows: 6, GroupPayloadBytes: groupPayloadBytes,
+		BeginAttempts: 1, BeginSucceeded: 1, ConfirmedCommits: 1,
+	})
+
+	// Altered payload/provenance forces bounded per-message fallback; the valid member still commits.
+	changed := makeMessage("71000000-0000-4000-8000-000000000001", "fixture_gw", "fixture_sensor", 80001, base, 1.25, 2)
+	valid := makeMessage("71000000-0000-4000-8000-000000000004", "fixture_gw", "fixture_sensor", 80004, base.Add(3*time.Second), 7)
+	results = repo.PersistBatch(ctx, []*Message{changed, valid})
+	if results[0].Err == nil || results[0].Outcome != 0 || results[1].Err != nil || results[1].Outcome != CommitOutcomeCommitted {
+		t.Fatalf("mixed conflict fallback=%+v", results)
+	}
+	if got := count("SELECT count(*) FROM processed_messages"); got != 4 {
+		t.Fatalf("mixed ledger count=%d want 4", got)
+	}
+	if got := count("SELECT count(*) FROM telemetry"); got != 7 {
+		t.Fatalf("mixed raw count=%d want 7", got)
+	}
+	if got := count("SELECT count(*) FROM twin_temporal_values"); got != 4 {
+		t.Fatalf("mixed temporal count=%d want 4", got)
+	}
+	fallbackMetrics := assertMetricsDelta("mixed_conflict_fallback", duplicateMetrics, PersistenceMetricsSnapshot{
+		SingleAttempts: 2, GroupAttempts: 1, GroupMembers: 2, GroupRows: 3,
+		GroupPayloadBytes: uint64(len(changed.rawPayload) + len(valid.rawPayload)), FallbackAttempts: 2,
+		BeginAttempts: 3, BeginSucceeded: 3, ConfirmedCommits: 1,
+		RollbackAttempts: 2, ConfirmedRollbacks: 2,
+		CopyCalls: 1, CopyReturnedRows: 1, ConfirmedNewRows: 1,
+	})
+
+	// A COPY error after ledger insertion rolls the entire group back.
+	_, err = setup.Exec(ctx, `CREATE FUNCTION public.p5a_fail_copy() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.message_id='71000000-0000-4000-8000-000000000005'::uuid THEN RAISE EXCEPTION 'p5a injected COPY failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER p5a_fail_copy BEFORE INSERT ON telemetry FOR EACH ROW EXECUTE FUNCTION public.p5a_fail_copy()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeLedger, beforeRaw, beforeTemporal := count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")
+	failingMessages := []*Message{
+		makeMessage("71000000-0000-4000-8000-000000000005", "fixture_gw", "fixture_sensor", 80005, base.Add(4*time.Second), 8),
+		makeMessage("71000000-0000-4000-8000-000000000006", "fixture_gw", "fixture_sensor", 80006, base.Add(5*time.Second), 9),
+	}
+	failed := repo.PersistBatch(ctx, failingMessages)
+	_, dropErr := setup.Exec(ctx, `DROP TRIGGER p5a_fail_copy ON telemetry; DROP FUNCTION public.p5a_fail_copy()`)
+	if dropErr != nil {
+		t.Fatal(dropErr)
+	}
+	if failed[0].Err == nil || failed[1].Err == nil || count("SELECT count(*) FROM processed_messages") != beforeLedger || count("SELECT count(*) FROM telemetry") != beforeRaw || count("SELECT count(*) FROM twin_temporal_values") != beforeTemporal {
+		t.Fatalf("COPY failure did not rollback group: results=%+v", failed)
+	}
+	assertMetricsDelta("injected_copy_failure", fallbackMetrics, PersistenceMetricsSnapshot{
+		GroupAttempts: 1, GroupMembers: 2, GroupRows: 2,
+		GroupPayloadBytes: uint64(len(failingMessages[0].rawPayload) + len(failingMessages[1].rawPayload)),
+		BeginAttempts:     1, BeginSucceeded: 1, RollbackAttempts: 1, ConfirmedRollbacks: 1,
+		CopyCalls: 1,
+	})
+
+	// An exact duplicate repeated within one input group has two per-input
+	// outcomes, but commits one ledger/raw/state/temporal dataset.
+	withinGroup := makeMessage("71000000-0000-4000-8000-000000000007", "fixture_gw", "fixture_sensor", 80007, base.Add(6*time.Second), 10)
+	withinBeforeMetrics := metrics.Snapshot()
+	withinBeforeLedger, withinBeforeRaw, withinBeforeTemporal := count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")
+	withinBeforeVersion := groupSensorVersion(ctx, t, setup, "fixture_sensor")
+	withinResults := repo.PersistBatch(ctx, []*Message{withinGroup, withinGroup})
+	if len(withinResults) != 2 {
+		t.Fatalf("within-group duplicate result count=%d want 2", len(withinResults))
+	}
+	if withinResults[0].InputIndex != 0 || withinResults[0].Identity != identityFromMessage(withinGroup) || withinResults[0].Outcome != CommitOutcomeCommitted || withinResults[0].Err != nil || withinResults[0].SamplesSaved != 1 {
+		t.Fatalf("within-group new result=%+v", withinResults[0])
+	}
+	if withinResults[1].InputIndex != 1 || withinResults[1].Identity != identityFromMessage(withinGroup) || withinResults[1].Outcome != CommitOutcomeDuplicateCommitted || withinResults[1].Err != nil || withinResults[1].SamplesSaved != 0 {
+		t.Fatalf("within-group duplicate result=%+v", withinResults[1])
+	}
+	if got := [3]int{count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")}; got != [3]int{withinBeforeLedger + 1, withinBeforeRaw + 1, withinBeforeTemporal + 1} {
+		t.Fatalf("within-group duplicate ledger/raw/temporal delta=%v want [1 1 1]", got)
+	}
+	if got := groupSensorVersion(ctx, t, setup, "fixture_sensor"); got != withinBeforeVersion+1 {
+		t.Fatalf("within-group duplicate reported version=%d want %d", got, withinBeforeVersion+1)
+	}
+	assertMetricsDelta("within_group_exact_duplicate", withinBeforeMetrics, PersistenceMetricsSnapshot{
+		GroupAttempts: 1, GroupMembers: 2, GroupRows: 2, GroupPayloadBytes: uint64(2 * len(withinGroup.rawPayload)),
+		BeginAttempts: 1, BeginSucceeded: 1, ConfirmedCommits: 1, CopyCalls: 1, CopyReturnedRows: 1, ConfirmedNewRows: 1,
+	})
+
+	// Inclusive range overlap with distinct message IDs must roll back the
+	// group, then bounded fallback may commit only the first non-conflicting ID.
+	overlapFirst := makeMessage("71000000-0000-4000-8000-000000000008", "fixture_gw", "fixture_sensor", 80010, base.Add(7*time.Second), 11, 12)
+	overlapSecond := makeMessage("71000000-0000-4000-8000-000000000009", "fixture_gw", "fixture_sensor", 80011, base.Add(8*time.Second), 13, 14)
+	overlapBeforeMetrics := metrics.Snapshot()
+	overlapBeforeLedger, overlapBeforeRaw, overlapBeforeTemporal := count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")
+	overlapBeforeVersion := groupSensorVersion(ctx, t, setup, "fixture_sensor")
+	overlapResults := repo.PersistBatch(ctx, []*Message{overlapFirst, overlapSecond})
+	if len(overlapResults) != 2 || overlapResults[0].InputIndex != 0 || overlapResults[0].Identity != identityFromMessage(overlapFirst) || overlapResults[0].Outcome != CommitOutcomeCommitted || overlapResults[0].Err != nil || overlapResults[0].SamplesSaved != 2 || overlapResults[1].InputIndex != 1 || overlapResults[1].Identity != identityFromMessage(overlapSecond) || overlapResults[1].Outcome != 0 || overlapResults[1].Err == nil || overlapResults[1].SamplesSaved != 0 {
+		t.Fatalf("overlapping-range fallback results=%+v", overlapResults)
+	}
+	var overlapRaw int
+	if err := setup.QueryRow(ctx, `SELECT count(*) FROM telemetry WHERE message_id IN ($1,$2)`, mustUUID("71000000-0000-4000-8000-000000000008"), mustUUID("71000000-0000-4000-8000-000000000009")).Scan(&overlapRaw); err != nil || overlapRaw != 2 {
+		t.Fatalf("overlap raw rows=%d err=%v want only first message's 2 samples", overlapRaw, err)
+	}
+	if got := [3]int{count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")}; got != [3]int{overlapBeforeLedger + 1, overlapBeforeRaw + 2, overlapBeforeTemporal + 1} {
+		t.Fatalf("overlap ledger/raw/temporal delta=%v want [1 2 1]", got)
+	}
+	if got := groupSensorVersion(ctx, t, setup, "fixture_sensor"); got != overlapBeforeVersion+1 {
+		t.Fatalf("overlap reported version=%d want %d", got, overlapBeforeVersion+1)
+	}
+	assertMetricsDelta("inclusive_overlap_fallback", overlapBeforeMetrics, PersistenceMetricsSnapshot{
+		SingleAttempts: 2, GroupAttempts: 1, GroupMembers: 2, GroupRows: 4,
+		GroupPayloadBytes: uint64(len(overlapFirst.rawPayload) + len(overlapSecond.rawPayload)), FallbackAttempts: 2,
+		BeginAttempts: 3, BeginSucceeded: 3, ConfirmedCommits: 1, RollbackAttempts: 2, ConfirmedRollbacks: 2,
+		CopyCalls: 1, CopyReturnedRows: 2, ConfirmedNewRows: 2,
+	})
+
+	// Force two independent batch transactions to queue on the same real Sensor
+	// row lock. Observe both PostgreSQL lock waits before releasing the holder;
+	// the second group repeats the same ID while each group carries one unrelated
+	// member for fixture_sensor2.
+	shared := makeMessage("71000000-0000-4000-8000-00000000000a", "fixture_gw", "fixture_sensor", 80020, base.Add(9*time.Second), 15)
+	otherA := makeMessage("71000000-0000-4000-8000-00000000000b", "fixture_gw", "fixture_sensor2", 81001, base.Add(9*time.Second), 16)
+	otherB := makeMessage("71000000-0000-4000-8000-00000000000c", "fixture_gw", "fixture_sensor2", 81002, base.Add(9*time.Second), 17)
+	connA, err := app.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connA.Release()
+	connB, err := app.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connB.Release()
+	var pidA, pidB int32
+	if err := connA.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidA); err != nil {
+		t.Fatal(err)
+	}
+	if err := connB.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidB); err != nil {
+		t.Fatal(err)
+	}
+	repoA, err := NewPostgresBatchRepositoryWithMetrics(connA, 5*time.Second, 8, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoB, err := NewPostgresBatchRepositoryWithMetrics(connB, 5*time.Second, 8, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockTx, err := setup.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockOpen := true
+	defer func() {
+		if blockOpen {
+			_ = blockTx.Rollback(context.Background())
+		}
+	}()
+	var locked int
+	if err := blockTx.QueryRow(ctx, `SELECT 1 FROM sensors WHERE gateway_id='fixture_gw' AND sensor_id='fixture_sensor' FOR UPDATE`).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	waitForGroupLock := func(pid int32) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var waiting bool
+			if err := setup.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out observing grouped persistence lock wait for backend pid %d", pid)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	type groupAnswer struct{ results []BatchPersistResult }
+	answerA, answerB := make(chan groupAnswer, 1), make(chan groupAnswer, 1)
+	concurrentBeforeMetrics := metrics.Snapshot()
+	concurrentBeforeLedger, concurrentBeforeRaw, concurrentBeforeTemporal := count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")
+	concurrentBeforeVersion := groupSensorVersion(ctx, t, setup, "fixture_sensor")
+	concurrentBeforeOtherVersion := groupSensorVersion(ctx, t, setup, "fixture_sensor2")
+	go func() { answerA <- groupAnswer{results: repoA.PersistBatch(ctx, []*Message{shared, otherA})} }()
+	waitForGroupLock(pidA)
+	go func() { answerB <- groupAnswer{results: repoB.PersistBatch(ctx, []*Message{shared, otherB})} }()
+	waitForGroupLock(pidB)
+	if err := blockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blockOpen = false
+	concurrentResultsA, concurrentResultsB := (<-answerA).results, (<-answerB).results
+	if len(concurrentResultsA) != 2 || len(concurrentResultsB) != 2 {
+		t.Fatalf("concurrent result counts=%d/%d want 2/2", len(concurrentResultsA), len(concurrentResultsB))
+	}
+	assertConcurrentResults := func(label string, results []BatchPersistResult, sharedOutcome CommitOutcome, unrelated *Message) {
+		t.Helper()
+		if len(results) != 2 || results[0].InputIndex != 0 || results[0].Identity != identityFromMessage(shared) || results[0].Outcome != sharedOutcome || results[0].Err != nil || results[0].SamplesSaved != map[CommitOutcome]int{CommitOutcomeCommitted: 1, CommitOutcomeDuplicateCommitted: 0}[sharedOutcome] {
+			t.Fatalf("%s repeated-ID result=%+v", label, results)
+		}
+		if results[1].InputIndex != 1 || results[1].Identity != identityFromMessage(unrelated) || results[1].Outcome != CommitOutcomeCommitted || results[1].Err != nil || results[1].SamplesSaved != 1 {
+			t.Fatalf("%s unrelated result=%+v", label, results)
+		}
+	}
+	sharedOutcomeA, sharedOutcomeB := concurrentResultsA[0].Outcome, concurrentResultsB[0].Outcome
+	validSharedOutcomes := (sharedOutcomeA == CommitOutcomeCommitted && sharedOutcomeB == CommitOutcomeDuplicateCommitted) ||
+		(sharedOutcomeA == CommitOutcomeDuplicateCommitted && sharedOutcomeB == CommitOutcomeCommitted)
+	if !validSharedOutcomes {
+		t.Fatalf("concurrent repeated-ID outcomes=%+v/%+v want one committed and one duplicate", concurrentResultsA[0], concurrentResultsB[0])
+	}
+	assertConcurrentResults("concurrent group A", concurrentResultsA, sharedOutcomeA, otherA)
+	assertConcurrentResults("concurrent group B", concurrentResultsB, sharedOutcomeB, otherB)
+	if got := [3]int{count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values")}; got != [3]int{concurrentBeforeLedger + 3, concurrentBeforeRaw + 3, concurrentBeforeTemporal + 3} {
+		t.Fatalf("concurrent duplicate ledger/raw/temporal delta=%v want [3 3 3]", got)
+	}
+	var concurrentSharedRaw, concurrentSharedLedger, concurrentSharedTemporal int
+	if err := setup.QueryRow(ctx, `SELECT (SELECT count(*) FROM telemetry WHERE message_id=$1), (SELECT count(*) FROM processed_messages WHERE message_id=$1), (SELECT count(*) FROM twin_temporal_values WHERE message_id=$1)`, mustUUID("71000000-0000-4000-8000-00000000000a")).Scan(&concurrentSharedRaw, &concurrentSharedLedger, &concurrentSharedTemporal); err != nil {
+		t.Fatal(err)
+	}
+	if concurrentSharedRaw != 1 || concurrentSharedLedger != 1 || concurrentSharedTemporal != 1 {
+		t.Fatalf("concurrent shared dataset raw/ledger/temporal=%d/%d/%d want 1/1/1", concurrentSharedRaw, concurrentSharedLedger, concurrentSharedTemporal)
+	}
+	if got := groupSensorVersion(ctx, t, setup, "fixture_sensor"); got != concurrentBeforeVersion+1 {
+		t.Fatalf("concurrent shared reported version=%d want %d", got, concurrentBeforeVersion+1)
+	}
+	// The shared-ID winner identifies which whole transaction acquired the first
+	// Sensor lock. If A wins, its lower sequence advances state before B (+2); if
+	// B wins, A is late and does not advance the version (+1).
+	wantOtherVersionDelta := int64(2)
+	if sharedOutcomeB == CommitOutcomeCommitted {
+		wantOtherVersionDelta = 1
+	}
+	var otherReportedState []byte
+	var otherReportedVersion int64
+	if err := setup.QueryRow(ctx, `SELECT s.reported_state, s.reported_version FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=$1`, "urn:ngsi-ld:Sensor:fixture_gw:fixture_sensor2").Scan(&otherReportedState, &otherReportedVersion); err != nil {
+		t.Fatal(err)
+	}
+	var currentOther struct {
+		Sequence int64   `json:"sequence_num"`
+		Value    float64 `json:"value"`
+	}
+	if err := json.Unmarshal(otherReportedState, &currentOther); err != nil {
+		t.Fatalf("decode concurrent unrelated reported state: %v", err)
+	}
+	if currentOther.Sequence != 81002 || currentOther.Value != 17 {
+		t.Fatalf("concurrent unrelated current state=%+v want sequence=81002 value=17", currentOther)
+	}
+	if got := otherReportedVersion; got != concurrentBeforeOtherVersion+wantOtherVersionDelta {
+		t.Fatalf("concurrent unrelated reported version=%d want %d (delta %d from confirmed winner)", got, concurrentBeforeOtherVersion+wantOtherVersionDelta, wantOtherVersionDelta)
+	}
+	assertMetricsDelta("concurrent_same_id_groups", concurrentBeforeMetrics, PersistenceMetricsSnapshot{
+		GroupAttempts: 2, GroupMembers: 4, GroupRows: 4,
+		GroupPayloadBytes: uint64(len(shared.rawPayload)*2 + len(otherA.rawPayload) + len(otherB.rawPayload)),
+		BeginAttempts:     2, BeginSucceeded: 2, ConfirmedCommits: 2, CopyCalls: 2, CopyReturnedRows: 3, ConfirmedNewRows: 3,
+	})
+	finalMetrics := metrics.Snapshot()
+	if finalMetrics.GroupAttempts != 8 || finalMetrics.CopyCalls != 7 || finalMetrics.ConfirmedRollbacks != 5 || finalMetrics.FallbackAttempts != 4 {
+		t.Fatalf("final actual persistence metrics=%+v", finalMetrics)
+	}
+	fmt.Printf("GROUP INTEGRATION PASS: ledger=%d raw=%d temporal=%d metrics=%+v\n", count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values"), finalMetrics)
+}
+
+func groupSensorVersion(ctx context.Context, t *testing.T, setup *pgxpool.Pool, sensorID string) int64 {
+	t.Helper()
+	var version int64
+	if err := setup.QueryRow(ctx, `SELECT s.reported_version FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=$1`, "urn:ngsi-ld:Sensor:fixture_gw:"+sensorID).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	return version
+}
 
 func snapshotRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool, query string) string {
 	t.Helper()

@@ -405,6 +405,78 @@ func TestIngressOperationalDefaults(t *testing.T) {
 	}
 }
 
+func TestIngressMicrobatchConfiguration(t *testing.T) {
+	t.Run("defaults off with finite caps", func(t *testing.T) {
+		cfg, err := Load(mapLookup(validConfigValues()))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		got := cfg.Ingress
+		if got.MicrobatchEnabled || got.MicrobatchMaxMessages != 32 || got.MicrobatchMaxRows != 500 ||
+			got.MicrobatchMaxPayloadBytes != 4<<20 || got.MicrobatchMaxWait != time.Second {
+			t.Fatalf("microbatch defaults: enabled=%v messages=%d rows=%d bytes=%d wait=%s",
+				got.MicrobatchEnabled, got.MicrobatchMaxMessages, got.MicrobatchMaxRows,
+				got.MicrobatchMaxPayloadBytes, got.MicrobatchMaxWait)
+		}
+	})
+	t.Run("independent opt in", func(t *testing.T) {
+		values := validConfigValues()
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		cfg, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.Ingress.MicrobatchEnabled || cfg.Ingress.Enabled || cfg.Ingress.ShaperEnabled {
+			t.Fatalf("microbatch must be independent: ingress=%v shaper=%v microbatch=%v", cfg.Ingress.Enabled, cfg.Ingress.ShaperEnabled, cfg.Ingress.MicrobatchEnabled)
+		}
+	})
+}
+
+func TestIngressMicrobatchBoundsUnconditional(t *testing.T) {
+	for _, tt := range []struct{ key, value string }{
+		{"MQTT_MICROBATCH_ENABLED", "sometimes"},
+		{"MQTT_MICROBATCH_MAX_MESSAGES", "0"}, {"MQTT_MICROBATCH_MAX_MESSAGES", "1025"},
+		{"MQTT_MICROBATCH_MAX_ROWS", "0"}, {"MQTT_MICROBATCH_MAX_ROWS", "100001"},
+		{"MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", "0"}, {"MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", "268435457"},
+		{"MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", "9223372036854775808"},
+		{"MQTT_MICROBATCH_MAX_WAIT", "0s"}, {"MQTT_MICROBATCH_MAX_WAIT", "6s"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			values := validConfigValues()
+			values[tt.key] = tt.value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted invalid %s=%q", tt.key, tt.value)
+			}
+		})
+	}
+}
+
+func TestIngressMicrobatchAggregateBounds(t *testing.T) {
+	t.Run("aggregate worker memory bounded", func(t *testing.T) {
+		values := ingressValues()
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		values["MQTT_WORKER_COUNT"] = "8"
+		values["MQTT_MICROBATCH_MAX_MESSAGES"] = "1024"
+		values["MQTT_MICROBATCH_MAX_ROWS"] = "100000"
+		values["MQTT_MICROBATCH_MAX_PAYLOAD_BYTES"] = "268435456"
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatal("accepted aggregate microbatch worker memory above bound")
+		}
+	})
+	t.Run("enabled shutdown includes one shared batch wait", func(t *testing.T) {
+		values := ingressValues()
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		values["SHUTDOWN_TIMEOUT"] = "8s"
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatal("accepted shutdown shorter than wait + persistence + publish budget")
+		}
+		values["SHUTDOWN_TIMEOUT"] = "9s"
+		if _, err := Load(mapLookup(values)); err != nil {
+			t.Fatalf("exact shared deadline: %v", err)
+		}
+	})
+}
+
 func TestIngressShaperAndBufferedByteDefaults(t *testing.T) {
 	cfg, err := Load(mapLookup(validConfigValues()))
 	if err != nil {

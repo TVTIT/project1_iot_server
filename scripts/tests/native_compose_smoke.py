@@ -102,6 +102,11 @@ DEFAULTS = dict(
     MQTT_SHAPER_ENABLED="false", MQTT_SHAPER_RATE_PER_SECOND="2",
     MQTT_SHAPER_BURST="4", MQTT_SHAPER_MAX_GATEWAYS="4096",
     MQTT_SHAPER_IDLE_RETENTION="10m", MQTT_INGRESS_BUFFERED_BYTES="16777216",
+    # P5a microbatch values are explicit fixture inputs matching the root
+    # Compose defaults; the isolated fixture remains opt-in/default-off.
+    MQTT_MICROBATCH_ENABLED="false", MQTT_MICROBATCH_MAX_MESSAGES="32",
+    MQTT_MICROBATCH_MAX_ROWS="500", MQTT_MICROBATCH_MAX_PAYLOAD_BYTES="4194304",
+    MQTT_MICROBATCH_MAX_WAIT="1s",
     MQTT_DYNSEC_MANAGER_USERNAME="credential_manager",
     MQTT_DYNSEC_JSON_PATH="/mosquitto/dynsec/dynamic-security.json",
     MQTT_DYNSEC_WRITER_UID="1883",
@@ -155,6 +160,11 @@ class Fixture:
     paper_p3: bool = False
     paper_p4: bool = False
     paper_p4_mode: str | None = None
+    paper_p5a: bool = False
+    paper_p5a_mode: str | None = None
+    paper_p5a_dataset: str | None = None
+    paper_p3_microbatch: bool = False
+    paper_p5a_shutdown: bool = False
 
 
 def fixture_services(fixture):
@@ -540,7 +550,26 @@ def paper_p4_support():
     return module
 
 
-def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False, paper_p2=False, paper_p3=False, paper_p4=None):
+def paper_p5a_support():
+    spec = importlib.util.spec_from_file_location('paper_p5a_support', Path(__file__).with_name('paper_p5a_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False,
+            paper_p2=False, paper_p3=False, paper_p4=None, paper_p5a=None,
+            paper_p3_microbatch=False, paper_p5a_shutdown=False):
+    if paper_p3_microbatch and (not paper_p3 or not metrics_enabled or paper_p4 or paper_p5a):
+        raise ValueError('paper_p3_microbatch_mode_rejected')
+    if paper_p5a is not None:
+        if (not isinstance(paper_p5a, tuple) or len(paper_p5a) != 2 or not metrics_enabled
+                or paper_p0 or paper_p1 or paper_p2_spike or paper_p2 or paper_p3 or paper_p4):
+            raise ValueError('paper_p5a_mode_rejected')
+        mode, dataset = paper_p5a
+        # Validate the complete selector before allocating any fixture paths.
+        paper_p5a_support().profile(mode, dataset, shutdown_smoke=paper_p5a_shutdown)
+        paper_p2 = True  # Reuse P2's HTTPS/Unix and TLS/DynSec topology.
     if paper_p4 is not None:
         if (paper_p4 not in ('baseline', 'optimized') or not metrics_enabled or paper_p0 or paper_p1
                 or paper_p2_spike or paper_p2 or paper_p3):
@@ -570,7 +599,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     if paper_profile:
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
                       MQTT_MAX_PAYLOAD_BYTES='65536')
-    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4) and metrics_enabled else 'false'
+    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4 or paper_p5a) and metrics_enabled else 'false'
     if paper_p2:
         values.update(SUPABASE_JWT_MODE='rs256', SUPABASE_JWKS_URL='http://supabase-envoy:8000/auth/v1/.well-known/jwks.json',
                       AUTH_UNIX_SOCKET_PATH='/run/iot-auth/auth.sock', GOTRUE_JWT_ISSUER='https://localhost/auth/v1',
@@ -578,10 +607,14 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       CORS_ALLOWED_ORIGINS='https://client.example.test')
     if paper_p3:
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
+        if paper_p3_microbatch:
+            values['MQTT_MICROBATCH_ENABLED'] = 'true'
     if paper_p4:
         values.update(paper_p4_support().profile(paper_p4))
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10', MQTT_MAX_PAYLOAD_BYTES='65536',
-                      MQTT_QUEUE_CAPACITY='256', MQTT_WORKER_COUNT='4', STAGE5_ENABLED='false')
+                       MQTT_QUEUE_CAPACITY='256', MQTT_WORKER_COUNT='4', STAGE5_ENABLED='false')
+    if paper_p5a:
+        values.update(paper_p5a_support().profile(mode, dataset, shutdown_smoke=paper_p5a_shutdown))
     for key in ("POSTGRES_PASSWORD", "AUTH_DB_PASSWORD", "STORAGE_DB_PASSWORD",
                 "BACKEND_DB_PASSWORD", "JWT_SECRET", "MQTT_PASSWORD",
                 "MQTT_DYNSEC_MANAGER_PASSWORD", "DASHBOARD_PASSWORD"):
@@ -618,7 +651,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     private_write(override, "".join(stanzas) + template[resource_offset:])
     # Copy only the reviewed broker config, never deployment certificates.
     broker_config = (ROOT / "config/mosquitto/mosquitto.conf").read_text()
-    if paper_p4 and 'log_type debug' not in broker_config:
+    if (paper_p4 or paper_p5a) and 'log_type debug' not in broker_config:
         # Mosquitto 2.0.18 emits the broker-side Denied PUBLISH audit line only
         # at debug level. This is confined to the disposable acceptance fixture.
         broker_config = broker_config.rstrip() + '\nlog_type debug\n'
@@ -626,11 +659,19 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     art_stat = artifacts.stat()
     fixture = Fixture(base, private, artifacts, env_file, override, project, values,
                       art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p3,
-                      paper_p4 is not None, paper_p4)
+                      paper_p4 is not None, paper_p4, paper_p5a is not None,
+                      mode if paper_p5a else None, dataset if paper_p5a else None,
+                      paper_p3_microbatch, paper_p5a_shutdown)
     if paper_p2_spike or paper_p2:
         paper_p2_support().prepare_spike(sys.modules[__name__], fixture)
     if paper_p2:
         paper_p2_support().prepare_perimeter(sys.modules[__name__], fixture)
+    if paper_p5a:
+        metadata = paper_p5a_support().run_metadata(mode, dataset, shutdown_smoke=paper_p5a_shutdown,
+                                                    effective_environment=fixture.values)
+        metadata.update(schema_version=1, run_id=fixture.project, status='PREPARED_NOT_EXECUTED',
+                        native_executed=False)
+        durable_json(fixture.artifacts / 'run.json', metadata)
     return fixture
 
 
@@ -668,6 +709,25 @@ def verify_bootstrap_result(fixture, result):
     if (result != expected or result.get("fresh_volume") is not True
             or result.get("store_created") is not True):
         raise ValueError("bootstrap_contract_rejected")
+
+
+def paper_p3_acceptance_report(project, evidence, cleanup_verified, microbatch_enabled=False,
+                               cleanup_counts=None):
+    p3_ok = cleanup_verified is True and evidence.get('full_p3_accepted') is True
+    regression_ok = (not microbatch_enabled or
+                     evidence.get('microbatch_control_regression_accepted') is True)
+    accepted = p3_ok and regression_ok
+    return {'schema_version': 1,
+            'status': ('PAPER_P5A_CONTROL_REGRESSION_ACCEPTED' if microbatch_enabled else 'PAPER_P3_ACCEPTED')
+                      if accepted else 'FAIL',
+            'project': project, 'native_executed': True,
+            'full_p3_accepted': evidence.get('full_p3_accepted') is True,
+            'microbatch_enabled': microbatch_enabled,
+            'microbatch_control_regression_accepted': (evidence.get('microbatch_control_regression_accepted')
+                                                        if microbatch_enabled else None),
+            'effective_optimizations': ['mqtt_microbatch'] if microbatch_enabled else [],
+            'exact_cleanup_verified': cleanup_verified is True,
+            'cleanup_counts': cleanup_counts or {}}
 
 
 def validate_effective_model(fixture, model):
@@ -773,12 +833,17 @@ def validate_effective_model(fixture, model):
         if (any(str(env.get(k)).lower() != v for k, v in expected.items())
                 or backend.get('cpus') != 2 or str(backend.get('mem_limit')) != '4294967296'):
             raise ValueError('paper_p0_profile_rejected')
-        if (fixture.paper_p1 or fixture.paper_p4) and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
+        if fixture.paper_p3_microbatch and str(env.get('MQTT_MICROBATCH_ENABLED')).lower() != 'true':
+            raise ValueError('paper_p3_microbatch_profile_rejected')
+        if (fixture.paper_p1 or fixture.paper_p4 or fixture.paper_p5a) and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
             raise ValueError('paper_p1_profile_rejected')
         if fixture.paper_p2:
             paper_p2_support().validate_perimeter(fixture, services)
         if fixture.paper_p4:
             paper_p4_support().validate_effective_environment(fixture, env)
+        if fixture.paper_p5a:
+            paper_p5a_support().validate_effective_profile(env, fixture.paper_p5a_mode,
+                fixture.paper_p5a_dataset, shutdown_smoke=fixture.paper_p5a_shutdown)
     if backend.get("build", {}).get("context") != str(ROOT / "src") or backend["build"].get("dockerfile") != "Dockerfile" or backend["build"].get("target") != "backend":
         raise ValueError("effective_build_rejected")
     for name in ("backend", "mosquitto"):
@@ -1029,7 +1094,11 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 url = ('https' if fixture.paper_p2 else 'http') + '://127.0.0.1:' + ports[0]['HostPort']
                 endpoint = HTTPSEndpoint(url, fixture.private / 'p2-ca.crt') if fixture.paper_p2 else url
                 evidence['endpoint'] = url
-                if fixture.paper_p4:
+                if fixture.paper_p5a:
+                    phase = 'paper_p5a'
+                    evidence['paper_p5a'] = paper_p5a_support().run(
+                        sys.modules[__name__], fixture, endpoint, registry, containers, images, state)
+                elif fixture.paper_p4:
                     phase = 'paper_p4'
                     evidence['paper_p4'] = paper_p4_support().run(sys.modules[__name__], fixture,
                                                                   endpoint, registry, containers, images, state)
@@ -1152,24 +1221,48 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         result.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
                       cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts)
         durable_json(path, result)
-    if fixture.paper_p1 or fixture.paper_p2 or fixture.paper_p4:
+    if fixture.paper_p1 or fixture.paper_p2 or fixture.paper_p3 or fixture.paper_p4 or fixture.paper_p5a:
         path = fixture.artifacts / 'run.json'
         run = json.loads(path.read_text()) if path.exists() else {
             'schema_version': 1, 'run_id': fixture.project,
-            'mode': fixture.paper_p4_mode if fixture.paper_p4 else fixture.paper_p1}
+            'mode': (fixture.paper_p5a_mode if fixture.paper_p5a else
+                     fixture.paper_p4_mode if fixture.paper_p4 else fixture.paper_p1)}
         run.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                    error=sanitize_failure_code(failure) if failure else None)
         if fixture.paper_p4:
             run.update(effective_optimizations=(['mqtt_shaper']
                        if fixture.values['MQTT_SHAPER_ENABLED'] == 'true' else []))
+        if fixture.paper_p5a:
+            accepted = (not failure and cleanup_verified and
+                        evidence.get('paper_p5a', {}).get('full_p5a_workload_accepted') is True and
+                        paper_p5a_cleanup_acceptance(fixture, evidence['paper_p5a'],
+                                                     cleanup_counts, cleanup_verified, registry))
+            run.update(status='PAPER_P5A_WORKLOAD_ACCEPTED' if accepted else 'FAIL',
+                       native_executed=True, cleanup_verified=cleanup_verified,
+                        exact_cleanup_verified=accepted, cleanup_counts=cleanup_counts,
+                        error=sanitize_failure_code(failure) if failure else None)
+        if fixture.paper_p3:
+            accepted = (not failure and cleanup_verified and
+                        run.get('full_p3_accepted') is True and
+                        (not fixture.paper_p3_microbatch or
+                         run.get('microbatch_control_regression_accepted') is True))
+            run.update(status=('PAPER_P5A_CONTROL_REGRESSION_ACCEPTED' if fixture.paper_p3_microbatch
+                               and accepted else 'PAPER_P3_ACCEPTED' if accepted else 'FAIL'),
+                       native_executed=True, full_p3_accepted=run.get('full_p3_accepted') is True,
+                       microbatch_enabled=fixture.values['MQTT_MICROBATCH_ENABLED'] == 'true',
+                       microbatch_control_regression_accepted=(run.get('microbatch_control_regression_accepted')
+                                                               if fixture.paper_p3_microbatch else None),
+                       exact_cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                       error=sanitize_failure_code(failure) if failure else None)
         durable_json(path, run)
     if failure:
-        if fixture.paper_p4:
+        if fixture.paper_p4 or fixture.paper_p5a:
             # Keep the diagnostic private and structural: exception text and
             # frame locals can contain MQTT credentials or telemetry payloads.
             frames = traceback.extract_tb(failure.__traceback__)
-            durable_json(fixture.private / "p4-failure-stack.json", {
+            name = 'p5a-failure-stack.json' if fixture.paper_p5a else 'p4-failure-stack.json'
+            durable_json(fixture.private / name, {
                 "exception_type": type(failure).__name__,
                 "frames": [{"file": Path(frame.filename).name,
                             "function": frame.name, "line": frame.lineno}
@@ -1179,7 +1272,16 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         raise FailureDiagnostic(fail_report, cause=failure) from failure
 
     try:
-        if fixture.paper_p4:
+        if fixture.paper_p5a:
+            if not paper_p5a_cleanup_acceptance(fixture, evidence.get('paper_p5a', {}),
+                                                cleanup_counts, cleanup_verified, registry):
+                raise ValueError('paper_p5a_acceptance_incomplete')
+            report = {'schema_version': 1, 'status': 'PAPER_P5A_WORKLOAD_ACCEPTED',
+                      'project': fixture.project, 'mode': fixture.paper_p5a_mode,
+                      'dataset': fixture.paper_p5a_dataset, 'native_executed': True,
+                      'full_p5a_accepted': False, 'workload_accepted': True,
+                      'exact_cleanup_verified': True, 'cleanup_counts': cleanup_counts}
+        elif fixture.paper_p4:
             if not paper_p4_cleanup_acceptance(fixture, evidence.get('paper_p4', {}),
                                                cleanup_counts, cleanup_verified, registry):
                 raise ValueError('paper_p4_acceptance_incomplete')
@@ -1189,11 +1291,10 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                       ['mqtt_shaper'] if fixture.values['MQTT_SHAPER_ENABLED'] == 'true' else [],
                       'exact_cleanup_verified': True, 'cleanup_counts': cleanup_counts}
         elif fixture.paper_p3:
-            if not evidence['paper_p3'].get('full_p3_accepted'):
+            report = paper_p3_acceptance_report(fixture.project, evidence['paper_p3'], cleanup_verified,
+                fixture.paper_p3_microbatch, cleanup_counts)
+            if report['status'] == 'FAIL':
                 raise ValueError('cleanup_acceptance_incomplete')
-            report = {'schema_version': 1, 'status': 'PAPER_P3_ACCEPTED', 'project': fixture.project,
-                      'native_executed': True, 'full_p3_accepted': True,
-                      'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts}
         elif fixture.paper_p2:
             if cleanup_counts != {'container': 19, 'network': 1, 'volume': 7} or not evidence['paper_p2'].get('full_p2_accepted'):
                 raise ValueError('cleanup_acceptance_incomplete')
@@ -1436,7 +1537,7 @@ def assert_safe_data(data):
 ALLOWED_FAILURE_STATUSES = {"STARTUP_FAILED"}
 ALLOWED_FAILURE_PHASES = {
     "prepare", "preflight", "build", "bootstrap",
-    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2', 'paper_p3', 'paper_p4',
+    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2', 'paper_p3', 'paper_p4', 'paper_p5a',
     "positive_http", "role_http", "jwt_http",
     "cleanup", "report_validation"
 }
@@ -1447,7 +1548,8 @@ ALLOWED_FAILURE_ERROR_TYPES = {
 ALLOWED_FAILURE_ERROR_CODES = {
     'paper_p2_mode_rejected', 'paper_p2_spike_failed', 'paper_p2_perimeter_failed',
     'paper_p2_rotation_failed', 'paper_p2_acceptance_failed',
-    'paper_p3_mode_rejected', 'paper_p3_acceptance_failed',
+    'paper_p3_mode_rejected', 'paper_p3_acceptance_failed', 'paper_p3_microbatch_mode_rejected',
+    'paper_p3_microbatch_profile_rejected',
     'paper_p4_mode_rejected', 'paper_p4_profile_rejected', 'paper_p4_fixture_required',
     'paper_p4_metrics_unavailable', 'paper_p4_stats_failed', 'paper_p4_acceptance_failed',
     'paper_p4_broker_profile_rejected',
@@ -1457,6 +1559,17 @@ ALLOWED_FAILURE_ERROR_CODES = {
     'paper_p4_observer_capture_failed',
     'paper_p4_deadline_exceeded', 'paper_p4_accounting_rejected', 'paper_p4_artifact_rejected',
     'paper_p4_namespace_payload_unavailable', 'paper_p4_acceptance_incomplete',
+    'paper_p5a_mode_rejected', 'paper_p5a_dataset_rejected', 'paper_p5a_profile_rejected',
+    'paper_p5a_quota_rejected', 'paper_p5a_fixture_required', 'paper_p5a_acceptance_failed',
+    'paper_p5a_acceptance_incomplete', 'paper_p5a_accounting_rejected',
+    'paper_p5a_artifact_rejected', 'paper_p5a_metrics_unavailable',
+    'paper_p5a_gateway_summary_rejected', 'paper_p5a_observer_capture_failed',
+    'paper_p5a_duplicate_replay_failed', 'paper_p5a_read_regression_failed',
+    'paper_p5a_shutdown_profile_rejected', 'paper_p5a_shutdown_publish_failed',
+    'paper_p5a_shutdown_partial_group_unproven', 'paper_p5a_shutdown_signal_failed',
+    'paper_p5a_shutdown_deadline_failed', 'paper_p5a_shutdown_persistence_failed',
+    'paper_p5a_shutdown_bytes_not_drained',
+    'paper_p5a_deadline_exceeded',
     'paper_p1_mode_rejected', 'paper_p1_profile_rejected', 'paper_p1_snapshot_rejected',
     'paper_p1_resources_rejected', 'paper_p1_subscription_failed', 'paper_p1_scrape_failed',
     'paper_p1_auth_failed', 'paper_p1_gateway_failed', 'paper_p1_reconciliation_failed',
@@ -2208,6 +2321,28 @@ P1_GAUGES = ('QueueDepth', 'QueueCapacity', 'QueueHighWater', 'InFlight',
 P4_INGRESS_FIELDS = frozenset(('ByteBudgetFull', 'ShaperPassed', 'ShaperRateLimited', 'ShaperStateCapacity',
     'BufferedPayloadBytes', 'BufferedPayloadCapacityBytes', 'BufferedPayloadHighWaterBytes',
     'ShaperEnabled', 'ShaperEntries', 'ShaperCapacity'))
+P5A_PERSISTENCE_FIELDS = {
+    'single_attempts': ('counter', 'operations'), 'group_attempts': ('counter', 'operations'),
+    'group_members': ('counter', 'messages'), 'group_rows': ('counter', 'samples'),
+    'group_payload_bytes': ('counter', 'bytes'), 'fallback_attempts': ('counter', 'operations'),
+    'begin_attempts': ('counter', 'operations'), 'begin_succeeded': ('counter', 'operations'),
+    'confirmed_commits': ('counter', 'operations'), 'rollback_attempts': ('counter', 'operations'),
+    'confirmed_rollbacks': ('counter', 'operations'), 'commit_unconfirmed': ('counter', 'operations'),
+    'copy_calls': ('counter', 'operations'), 'copy_returned_rows': ('counter', 'rows'),
+    'confirmed_new_rows': ('counter', 'rows'),
+}
+P5A_MICROBATCH_FIELDS = {
+    'enabled': ('gauge', 'boolean'), 'max_messages': ('gauge', 'messages'),
+    'max_rows': ('gauge', 'samples'), 'max_payload_bytes': ('gauge', 'bytes'),
+    'max_wait_ns': ('gauge', 'ns'), 'groups': ('counter', 'operations'),
+    'members': ('counter', 'messages'), 'rows': ('counter', 'samples'),
+    'payload_bytes': ('counter', 'bytes'), 'max_members': ('gauge', 'messages'),
+    'flush_messages': ('counter', 'operations'), 'flush_rows': ('counter', 'operations'),
+    'flush_bytes': ('counter', 'operations'), 'flush_timer': ('counter', 'operations'),
+    'flush_stop': ('counter', 'operations'), 'standalone_oversized_members': ('counter', 'messages'),
+}
+P5A_MICROBATCH_CONFIG_FIELDS = frozenset((
+    'enabled', 'max_messages', 'max_rows', 'max_payload_bytes', 'max_wait_ns'))
 P1_RATES = {'received_delivery_msg_per_s': 'Received', 'new_committed_msg_per_s': 'Committed',
             'new_committed_samples_per_s': 'SamplesNew'}
 
@@ -2219,6 +2354,11 @@ def paper_p1_rates(before, after):
     elapsed = after['elapsed_seconds'] - before['elapsed_seconds']
     if (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed <= 0
             or not before.get('ingress') or not after.get('ingress')):
+        return rates
+    if any(field not in before['ingress'] or field not in after['ingress']
+           or type(before['ingress'][field]) not in (int, float)
+           or type(after['ingress'][field]) not in (int, float)
+           for field in P1_RATES.values()):
         return rates
     delta = {key: after['ingress'][field] - before['ingress'][field] for key, field in P1_RATES.items()}
     if any(value < 0 for value in delta.values()):
@@ -2252,6 +2392,9 @@ def paper_p1_metrics_csv(path, samples):
                     raise ValueError('paper_p1_snapshot_rejected')
                 writer.writerow(dict(base, group=group, metric=metric, kind=kind, unit=unit,
                                      value=value, availability='available', **extra))
+            def unavailable(group, metric, kind, unit):
+                writer.writerow(dict(base, group=group, metric=metric, kind=kind, unit=unit,
+                                     availability='unavailable'))
             ing = snap.get('ingress') or {}
             for name in P1_COUNTERS + P1_GAUGES:
                 if name not in ing:
@@ -2273,10 +2416,60 @@ def paper_p1_metrics_csv(path, samples):
                 row('ingress', name, 'counter' if name in P1_COUNTERS else 'gauge',
                     'bytes' if name.endswith('Bytes') else 'boolean' if name == 'ShaperEnabled' else 'count', ing[name], delta=delta,
                     rate_per_s=delta / (snap['elapsed_seconds'] - previous['elapsed_seconds']) if delta is not None and delta >= 0 else None)
+            persistence = snap.get('persistence')
+            previous_persistence = previous.get('persistence') if previous else None
+            persistence_delta_valid = (previous is not None
+                and snap.get('process_instance') == previous.get('process_instance')
+                and type(snap.get('elapsed_seconds')) in (int, float)
+                and type(previous.get('elapsed_seconds')) in (int, float)
+                and snap['elapsed_seconds'] > previous['elapsed_seconds'])
+            for name, (kind, unit) in P5A_PERSISTENCE_FIELDS.items():
+                if not isinstance(persistence, dict) or type(persistence.get(name)) not in (int, float):
+                    unavailable('persistence', name, kind, unit)
+                    continue
+                value = persistence[name]
+                delta = None
+                if persistence_delta_valid and isinstance(previous_persistence, dict):
+                    old = previous_persistence.get(name)
+                    if type(old) in (int, float) and value >= old:
+                        delta = value - old
+                row('persistence', name, kind, unit, value, delta=delta)
+
+            microbatch = ing.get('microbatch')
+            microbatch_availability = snap.get('availability', {}).get('group_persistence')
+            if microbatch_availability not in ('available', 'disabled'):
+                microbatch_availability = 'available' if isinstance(microbatch, dict) else 'unavailable'
+            previous_microbatch = ((previous.get('ingress') or {}).get('microbatch')
+                                   if previous and isinstance(previous.get('ingress'), dict) else None)
+            microbatch_delta_valid = (persistence_delta_valid and previous is not None
+                                      and snap.get('process_instance') == previous.get('process_instance'))
+            for name, (kind, unit) in P5A_MICROBATCH_FIELDS.items():
+                value = microbatch.get(name) if isinstance(microbatch, dict) else None
+                config_value_available = (microbatch_availability == 'disabled'
+                                          and name in P5A_MICROBATCH_CONFIG_FIELDS)
+                if ((microbatch_availability != 'available' and not config_value_available)
+                        or type(value) not in (int, float, bool)):
+                    status = microbatch_availability if microbatch_availability == 'disabled' else 'unavailable'
+                    writer.writerow(dict(base, group='ingress_microbatch', metric=name, kind=kind, unit=unit,
+                                         availability=status))
+                    continue
+                delta = None
+                if kind == 'counter' and microbatch_delta_valid and isinstance(previous_microbatch, dict):
+                    old = previous_microbatch.get(name)
+                    if type(old) in (int, float) and value >= old:
+                        delta = value - old
+                row('ingress_microbatch', name, kind, unit, value, delta=delta)
             for name, value in rates.items():
                 row('ingress', name, 'rate', 'samples/s' if 'samples' in name else 'messages/s', value)
             histograms = [('ingress', key, value) for key, value in ing.get('Durations', {}).items()
                           if key in ('queue_wait', 'validation', 'persistence', 'ack_publish')]
+            for key in ('batch_wait', 'group_persistence'):
+                histogram = (ing.get('Durations') or {}).get(key)
+                if microbatch_availability == 'available' and isinstance(histogram, dict):
+                    histograms.append(('ingress_durations', key, histogram))
+                else:
+                    for suffix, unit in (('count', 'count'), ('sum', 'seconds'), ('overflow', 'count')):
+                        unavailable('ingress_durations', key + '.' + suffix, 'histogram', unit)
             for group, counters, durations in (
                     ('command_admission', ('accepted', 'replay', 'noop', 'rejected'), ('admission',)),
                     ('command_dispatch', ('puback', 'publish_failures'), ('discovery', 'queue_wait', 'publish')),
@@ -2330,7 +2523,8 @@ def paper_p1_metrics_csv(path, samples):
             for key in ('acquired', 'idle', 'total', 'max', 'acquire_count', 'empty_acquire_count', 'canceled_acquire_count', 'acquire_seconds'):
                 if key in snap.get('db', {}):
                     row('db', key, 'pool_stat', 'seconds' if key.endswith('seconds') else 'count', snap['db'][key])
-            for key in ('ingress', 'http', 'auth', 'db', 'command', 'dispatch_e2e', 'result', 'batch_wait', 'websocket'):
+            for key in ('ingress', 'http', 'auth', 'db', 'command', 'dispatch_e2e', 'result',
+                        'persistence', 'group_persistence', 'batch_wait', 'websocket'):
                 status = snap.get('availability', {}).get(key)
                 if status in ('available', 'disabled', 'not_implemented'):
                     writer.writerow(dict(base, group=key, metric='availability', availability=status))
@@ -2627,7 +2821,9 @@ FROM telemetry WHERE gateway_id=:'gw';
 
 
 def cli_arguments():
-    return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http", "--paper-p0", "--paper-p1", "--paper-p4", "--mode")
+    return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http",
+            "--paper-p0", "--paper-p1", "--paper-p3", "--p5a-control-regression",
+            "--paper-p4", "--paper-p5a", "--mode", "--dataset")
 
 
 def paper_p4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
@@ -2660,6 +2856,13 @@ def paper_p4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verif
             and cleanup_counts == removed and removed == registered)
 
 
+def paper_p5a_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    """The workload marker is intentionally narrower than full P5a acceptance."""
+    return (evidence.get('full_p5a_workload_accepted') is True and cleanup_verified is True
+            and paper_p4_cleanup_acceptance(
+                fixture, {'full_p4_accepted': True}, cleanup_counts, cleanup_verified, registry))
+
+
 def paper_p1_resources_csv(path, snapshots, limits):
     import csv
     units = {'B': 1, 'kB': 1000, 'MB': 1000000, 'GB': 1000000000,
@@ -2681,12 +2884,13 @@ def paper_p1_resources_csv(path, snapshots, limits):
                     'memory_limit_bytes': limits.get(service, {}).get('Memory')})
 
 
-def paper_p1_subscription_target(fixture, spec, password, tag):
+def paper_p1_subscription_target(fixture, spec, password, tag, *, kind=None):
     # subscribeLiteral permits these exact existing filters, not arbitrary
     # narrower filters. Never broaden either principal's broker policy.
-    if tag == 'telemetry':
+    selection = tag if kind is None else kind
+    if selection == 'telemetry':
         return fixture.values['MQTT_USERNAME'], fixture.values['MQTT_PASSWORD'], 'gateways/+/telemetry/#'
-    if tag == 'ack':
+    if selection == 'ack':
         return spec.gateway_id, password, 'gateways/' + spec.gateway_id + '/acks/#'
     raise ValueError('paper_p1_subscription_failed')
 
@@ -2745,7 +2949,7 @@ def paper_p1_send_credentials_after_ready(proc, path, master_fd, username, passw
 
 
 def paper_p1_subscriber(fixture, registry, broker, spec, password, tag, *, message_count=1,
-                        message_timeout=60):
+                        message_timeout=60, subscription_kind=None):
     """Use the existing broker CLI, TLS/DynSec and private bounded debug output.
 
     A pseudo-tty makes CLI debug lines line-buffered so SUBACK can be observed
@@ -2753,7 +2957,8 @@ def paper_p1_subscriber(fixture, registry, broker, spec, password, tag, *, messa
     disabled; each observer gets a distinct client ID from the ingress client.
     No new port, resource registry or MQTT implementation.
     """
-    username, subscription_password, topic = paper_p1_subscription_target(fixture, spec, password, tag)
+    username, subscription_password, topic = paper_p1_subscription_target(
+        fixture, spec, password, tag, kind=subscription_kind)
     path = fixture.private / ('p1-sub-' + tag + '.log')
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     stream = os.fdopen(fd, 'wb')
@@ -3219,14 +3424,22 @@ def main():
     parser.add_argument('--paper-p2-spike', action='store_true', help='P2.1 compatibility only; not P2 acceptance')
     parser.add_argument('--paper-p2', action='store_true', help='P2 isolated HTTPS/Unix perimeter checks')
     parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
+    parser.add_argument('--p5a-control-regression', action='store_true',
+                        help='With --paper-p3, opt in to microbatch and run the focused command/result preservation regression')
     parser.add_argument('--paper-p4', action='store_true', help='P4 isolated finite two-Gateway ingress workload')
-    parser.add_argument('--mode', choices=('baseline', 'optimized'))
+    parser.add_argument('--paper-p5a', action='store_true', help='Run the finite isolated P5a MQTT/Gateway workload')
+    parser.add_argument('--paper-p5a-shutdown-smoke', action='store_true',
+                        help='Add one isolated on/1 partial-group SIGTERM drain smoke')
+    parser.add_argument('--mode', choices=('baseline', 'optimized', 'off', 'on'))
+    parser.add_argument('--dataset', choices=('100', '1'))
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
     args = parser.parse_args()
     if args.paper_p3 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
                               args.startup_only, args.positive_http_only, args.role_http_only,
-                              args.full_http, args.paper_p4, args.mode, args.metrics_off)):
+                              args.full_http, args.paper_p4, args.paper_p5a, args.mode, args.dataset, args.metrics_off)):
         parser.error('P3 cannot be combined with other execution modes')
+    if args.p5a_control_regression and not args.paper_p3:
+        parser.error('--p5a-control-regression requires --paper-p3')
     if args.paper_p2 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.startup_only,
                              args.positive_http_only, args.role_http_only, args.full_http, args.mode, args.metrics_off)):
         parser.error('P2 cannot be combined with other execution modes')
@@ -3237,15 +3450,25 @@ def main():
     if (args.paper_p0 or args.paper_p1) and (any((args.startup_only, args.positive_http_only, args.role_http_only, args.full_http)) or args.paper_p0 and args.paper_p1):
         parser.error('paper mode cannot be combined with other execution modes')
     if args.paper_p4 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
-                              args.paper_p3, args.startup_only, args.positive_http_only,
-                              args.role_http_only, args.full_http, args.metrics_off)):
+                              args.paper_p3, args.paper_p5a, args.startup_only, args.positive_http_only,
+                              args.role_http_only, args.full_http, args.paper_p5a, args.dataset, args.metrics_off)):
         parser.error('P4 cannot be combined with other execution modes or metrics-off')
+    if args.paper_p5a and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
+                               args.paper_p3, args.paper_p4, args.startup_only, args.positive_http_only,
+                               args.role_http_only, args.full_http, args.metrics_off)):
+        parser.error('P5a cannot be combined with other execution modes or metrics-off')
     if args.paper_p1 and args.mode is None:
         parser.error('--paper-p1 requires --mode')
     if args.paper_p4 and args.mode is None:
         parser.error('--paper-p4 requires --mode')
-    if args.mode is not None and not args.paper_p1 and not args.paper_p4:
-        parser.error('--mode requires --paper-p1 or --paper-p4')
+    if args.paper_p5a and (args.mode not in ('off', 'on') or args.dataset is None):
+        parser.error('--paper-p5a requires --mode off|on and --dataset 100|1')
+    if args.paper_p5a_shutdown_smoke and not (args.paper_p5a and args.mode == 'on' and args.dataset == '1'):
+        parser.error('--paper-p5a-shutdown-smoke requires --paper-p5a --mode on --dataset 1')
+    if args.dataset is not None and not args.paper_p5a:
+        parser.error('--dataset requires --paper-p5a')
+    if args.mode is not None and not args.paper_p1 and not args.paper_p4 and not args.paper_p5a:
+        parser.error('--mode requires --paper-p1, --paper-p4 or --paper-p5a')
     if args.metrics_off and not args.paper_p1:
         parser.error('--metrics-off requires --paper-p1')
     fixture = None
@@ -3253,8 +3476,11 @@ def main():
         fixture = prepare(args.prepare, paper_p0=args.paper_p0,
                           paper_p1=args.mode if args.paper_p1 else None,
                           metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike,
-                          paper_p2=args.paper_p2, paper_p3=args.paper_p3,
-                          paper_p4=args.mode if args.paper_p4 else None)
+                           paper_p2=args.paper_p2, paper_p3=args.paper_p3,
+                           paper_p3_microbatch=args.p5a_control_regression,
+                           paper_p4=args.mode if args.paper_p4 else None,
+                            paper_p5a=(args.mode, args.dataset) if args.paper_p5a else None,
+                            paper_p5a_shutdown=args.paper_p5a_shutdown_smoke)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -3279,7 +3505,7 @@ def main():
         return 1
 
     try:
-        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3 or args.paper_p4:
+        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3 or args.paper_p4 or args.paper_p5a:
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.

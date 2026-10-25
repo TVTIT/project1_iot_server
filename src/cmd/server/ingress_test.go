@@ -23,7 +23,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"iot-platform/internal/config"
+	"iot-platform/internal/httpserver"
 	"iot-platform/internal/mqttingress"
+	"iot-platform/internal/telemetry"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -113,6 +115,97 @@ func TestMQTTIngressOptionsWireConfiguredByteBudgetAndShaper(t *testing.T) {
 	want := (mqttingress.ShaperOptions{Enabled: true, RatePerSecond: 7, Burst: 9, MaxGateways: 11, IdleRetention: 3 * time.Minute})
 	if got.Shaper != want {
 		t.Errorf("Shaper options = %+v, want %+v", got.Shaper, want)
+	}
+}
+
+func TestMQTTIngressOptionsWireEveryMicrobatchLimit(t *testing.T) {
+	cfg := ingressTestConfig("unused")
+	cfg.Ingress.MicrobatchEnabled = true
+	cfg.Ingress.MicrobatchMaxMessages = 7
+	cfg.Ingress.MicrobatchMaxRows = 91
+	cfg.Ingress.MicrobatchMaxPayloadBytes = 12345
+	cfg.Ingress.MicrobatchMaxWait = 250 * time.Millisecond
+
+	got := mqttIngressOptions(cfg).Microbatch
+	want := mqttingress.MicrobatchOptions{Enabled: true, MaxMessages: 7, MaxRows: 91, MaxPayloadBytes: 12345, MaxWait: 250 * time.Millisecond}
+	if got != want {
+		t.Fatalf("Microbatch options = %+v, want %+v", got, want)
+	}
+}
+
+func TestComposeIngressUsesConfiguredRepositoryModeAndSharedMetrics(t *testing.T) {
+	t.Run("default off keeps baseline path and no collector", func(t *testing.T) {
+		cfg := ingressTestConfig(writeIngressTestCA(t))
+		runtime, err := composeIngress(cfg, testPool(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.metrics != nil {
+			t.Fatal("metrics collector exists while metrics are disabled")
+		}
+		if runtime.ingress.Snapshot().Microbatch.Enabled {
+			t.Fatal("default-off composition did not remain on baseline Persist path")
+		}
+	})
+	t.Run("enabled requires same batch repository and shared collector", func(t *testing.T) {
+		cfg := ingressTestConfig(writeIngressTestCA(t))
+		cfg.MetricsEnabled = true
+		cfg.Ingress.MicrobatchEnabled = true
+		cfg.Ingress.MicrobatchMaxMessages = 3
+		cfg.Ingress.MicrobatchMaxRows = 17
+		cfg.Ingress.MicrobatchMaxPayloadBytes = 8192
+		cfg.Ingress.MicrobatchMaxWait = 125 * time.Millisecond
+		runtime, err := composeIngress(cfg, testPool(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.metrics == nil {
+			t.Fatal("metrics collector missing")
+		}
+		batch, ok := runtime.repository.(telemetry.BatchRepository)
+		if !ok || batch == nil {
+			t.Fatal("enabled composition did not use a BatchRepository")
+		}
+		if runtime.repository == nil {
+			t.Fatal("baseline repository missing")
+		}
+		if !runtime.ingress.Snapshot().Microbatch.Enabled || runtime.ingress.Snapshot().Microbatch.MaxMessages != 3 {
+			t.Fatalf("effective batching options = %+v", runtime.ingress.Snapshot().Microbatch)
+		}
+		deps := &httpserver.RouterDependencies{}
+		populateMetricsDependencies(deps, cfg, testPool(t), runtime, stage5Runtime{})
+		process := deps.MetricsSnapshot().(processMetrics)
+		if process.Persistence == nil || process.Availability["persistence"] != "available" || process.Availability["group_persistence"] != "available" || process.Availability["batch_wait"] != "available" {
+			t.Fatalf("metrics snapshot missing actual persistence sources: %+v", process)
+		}
+		if process.Ingress == nil || process.Ingress.Durations.BatchWait.Count != 0 {
+			t.Fatalf("batch-wait histogram not preserved in ingress snapshot: %+v", process.Ingress)
+		}
+	})
+}
+
+func TestProcessMetricsReportsPersistenceAndBatchAvailabilityHonestly(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		cfg                        config.Config
+		wantPersistence, wantBatch string
+	}{
+		{name: "disabled", cfg: config.Config{MetricsEnabled: true}, wantPersistence: "unavailable", wantBatch: "disabled"},
+		{name: "enabled without metrics source", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{Enabled: true, MicrobatchEnabled: true}}, wantPersistence: "unavailable", wantBatch: "unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := &httpserver.RouterDependencies{}
+			pool := testPool(t)
+			runtime := ingressRuntime{}
+			if tc.cfg.Ingress.Enabled {
+				runtime = ingressRuntime{enabled: true}
+			}
+			populateMetricsDependencies(deps, tc.cfg, pool, runtime, stage5Runtime{})
+			got := deps.MetricsSnapshot().(processMetrics)
+			if got.Availability["persistence"] != tc.wantPersistence || got.Availability["group_persistence"] != tc.wantBatch || got.Availability["batch_wait"] != tc.wantBatch {
+				t.Fatalf("availability = %#v", got.Availability)
+			}
+		})
 	}
 }
 
@@ -375,7 +468,7 @@ func TestProcessMetricsIngressSnapshotExportsOnlyFixedP4Fields(t *testing.T) {
 			t.Errorf("serialized ingress %s = %#v, want %#v", field, ingress[field], expected)
 		}
 	}
-	for _, forbidden := range []string{"Gateway", "Sensor", "payload"} {
+	for _, forbidden := range []string{"Gateway", "Sensor", `"payload"`} {
 		if strings.Contains(string(payload), forbidden) {
 			t.Errorf("serialized metrics contain forbidden %q: %s", forbidden, payload)
 		}
