@@ -405,6 +405,67 @@ func TestIngressOperationalDefaults(t *testing.T) {
 	}
 }
 
+func TestIngressShaperAndBufferedByteDefaults(t *testing.T) {
+	cfg, err := Load(mapLookup(validConfigValues()))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	got := cfg.Ingress
+	if got.ShaperEnabled || got.ShaperRatePerSecond != 2 || got.ShaperBurst != 4 ||
+		got.ShaperMaxGateways != 4096 || got.ShaperIdleRetention != 10*time.Minute ||
+		got.BufferedPayloadBytes != 16<<20 {
+		t.Fatalf("shaper/buffer defaults: enabled=%v rate=%d burst=%d gateways=%d retention=%s bytes=%d",
+			got.ShaperEnabled, got.ShaperRatePerSecond, got.ShaperBurst, got.ShaperMaxGateways,
+			got.ShaperIdleRetention, got.BufferedPayloadBytes)
+	}
+}
+
+func TestIngressShaperAndBufferedByteBoundsUnconditional(t *testing.T) {
+	tests := []struct{ key, value string }{
+		{"MQTT_SHAPER_ENABLED", "sometimes"},
+		{"MQTT_SHAPER_RATE_PER_SECOND", "0"},
+		{"MQTT_SHAPER_RATE_PER_SECOND", "10001"},
+		{"MQTT_SHAPER_BURST", "-1"},
+		{"MQTT_SHAPER_BURST", "100001"},
+		{"MQTT_SHAPER_MAX_GATEWAYS", "0"},
+		{"MQTT_SHAPER_MAX_GATEWAYS", "100001"},
+		{"MQTT_SHAPER_IDLE_RETENTION", "59s"},
+		{"MQTT_SHAPER_IDLE_RETENTION", "24h1m"},
+		{"MQTT_INGRESS_BUFFERED_BYTES", "65535"},
+		{"MQTT_INGRESS_BUFFERED_BYTES", "268435457"},
+		{"MQTT_INGRESS_BUFFERED_BYTES", "9223372036854775808"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			values := validConfigValues() // ingress and shaper both disabled
+			values[tt.key] = tt.value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted invalid %s=%q while disabled", tt.key, tt.value)
+			}
+		})
+	}
+}
+
+func TestIngressShaperAndBufferedByteConfiguration(t *testing.T) {
+	values := ingressValues()
+	for k, v := range map[string]string{
+		"MQTT_SHAPER_ENABLED": "true", "MQTT_SHAPER_RATE_PER_SECOND": "10000",
+		"MQTT_SHAPER_BURST": "100000", "MQTT_SHAPER_MAX_GATEWAYS": "100000",
+		"MQTT_SHAPER_IDLE_RETENTION": "24h", "MQTT_INGRESS_BUFFERED_BYTES": "268435456",
+	} {
+		values[k] = v
+	}
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Ingress.ShaperEnabled || cfg.Ingress.ShaperRatePerSecond != 10000 ||
+		cfg.Ingress.ShaperBurst != 100000 || cfg.Ingress.ShaperMaxGateways != 100000 ||
+		cfg.Ingress.ShaperIdleRetention != 24*time.Hour || cfg.Ingress.BufferedPayloadBytes != 256<<20 {
+		t.Fatalf("unexpected parsed shaper config: %+v", cfg.Ingress)
+	}
+}
+
 func TestIngressRedaction(t *testing.T) {
 	cfg, err := Load(mapLookup(ingressValues()))
 	if err != nil {

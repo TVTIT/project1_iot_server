@@ -140,6 +140,50 @@ class PreparationTests(unittest.TestCase):
                 self.assertEqual(fixture.values[key], value)
                 self.assertIn(f"{key}={value}\n", fixture.env_file.read_text())
 
+    def test_p4_shaper_interpolations_are_private_synthetic_defaults(self):
+        expected = {
+            "MQTT_SHAPER_ENABLED": "false",
+            "MQTT_SHAPER_RATE_PER_SECOND": "2",
+            "MQTT_SHAPER_BURST": "4",
+            "MQTT_SHAPER_MAX_GATEWAYS": "4096",
+            "MQTT_SHAPER_IDLE_RETENTION": "10m",
+            "MQTT_INGRESS_BUFFERED_BYTES": "16777216",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
+    def test_p4_broker_configs_keep_packet_overhead_and_control_bounds(self):
+        root_config = smoke.ROOT / "config/mosquitto/mosquitto.conf"
+        text = root_config.read_text()
+        settings = {name: int(value) for name, value in re.findall(
+            r"(?m)^(max_packet_size|message_size_limit|max_inflight_messages|"
+            r"max_inflight_bytes|max_queued_messages|max_queued_bytes) (\d+)\s*$", text)}
+        self.assertEqual(settings, {
+            "max_packet_size": 2097152,
+            "message_size_limit": 1048576,
+            "max_inflight_messages": 20,
+            "max_inflight_bytes": 1048576,
+            "max_queued_messages": 256,
+            "max_queued_bytes": 16777216,
+        })
+        # Leave at least 1 KiB for topic, fixed/variable headers and properties
+        # above the supported 1 MiB publish payload ceiling.
+        self.assertGreaterEqual(settings["max_packet_size"], settings["message_size_limit"] + 1024)
+        self.assertEqual(smoke.DEFAULTS["STAGE5_PAYLOAD_BYTES"], "8192")
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            generated = (fixture.private / "mosquitto.conf").read_text()
+            self.assertEqual(generated, text)
+            self.assertIn("require_certificate false", generated)
+            self.assertIn("plugin /usr/lib/mosquitto_dynamic_security.so", generated)
+            self.assertIn("allow_anonymous false", generated)
+
     def test_user_management_and_auth_admin_defaults_explicit(self):
         expected = {
             "AUTH_ADMIN_BASE_URL": "http://supabase-envoy:8000",
@@ -360,6 +404,118 @@ class PaperP1Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '^paper_p1_subscription_failed$'):
                 smoke.paper_p1_suback_ready(f'Client received SUBACK\nSubscribed (mid: 1): {code}\n'.encode())
 
+    def test_p1_subscription_parser_correlates_topics_and_payloads(self):
+        log = (b"Client received PUBLISH (d0, q1, r0, m1, 'gateways/a/telemetry/s', ... (len 7))\n"
+               b'{"message_id":"one"}\n'
+               b"Client received PUBLISH (d0, q1, r0, m2, 'gateways/b/telemetry/s', ... (len 7))\n"
+               b'{"message_id":"two"}\n')
+        self.assertEqual(smoke.paper_p1_subscription_messages(log), [
+            ('gateways/a/telemetry/s', b'{"message_id":"one"}'),
+            ('gateways/b/telemetry/s', b'{"message_id":"two"}')])
+
+    def test_p1_subscriber_credentials_are_sent_on_stdin_not_host_argv(self):
+        class FakeProcess:
+            def __init__(self, stdout):
+                import io
+                self.stdin = io.BytesIO()
+                self.stdout = stdout
+                self.returncode = None
+                self.stopped = False
+            def poll(self):
+                return self.returncode
+            def terminate(self):
+                self.stopped = True
+                self.returncode = 0
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
+            calls = []
+            def popen(args, **kwargs):
+                calls.append(args)
+                kwargs['stdout'].write(b'OBSERVER_READY\nClient received SUBACK\nSubscribed (mid: 1): 1\n')
+                kwargs['stdout'].flush()
+                return FakeProcess(kwargs['stdout'])
+            with patch.object(smoke.subprocess, 'Popen', side_effect=popen):
+                subscription = smoke.paper_p1_subscriber(fixture, Mock(), 'broker-id',
+                    Mock(gateway_id='gw_a'), 'sensitive-password', 'ack')
+                smoke.paper_p1_stop_subscription(subscription)
+            rendered = repr(calls[0])
+            self.assertNotIn('sensitive-password', rendered)
+            self.assertNotIn(fixture.values['MQTT_PASSWORD'], rendered)
+            self.assertIn('gateways/gw_a/acks/#', rendered)
+
+    def test_p1_subscriber_uses_echo_disabled_tty_and_distinct_client_id(self):
+        command = smoke.paper_p1_subscription_command(
+            'broker-id', 'telemetry', 'gateways/+/telemetry/#',
+            message_count=2, message_timeout=30)
+        self.assertEqual(command[:4], ['docker', 'exec', '-it', 'broker-id'])
+        self.assertIn('stty -echo', command[6])
+        self.assertLess(command[6].index('stty -echo'), command[6].index('OBSERVER_READY'))
+        self.assertLess(command[6].index('OBSERVER_READY'), command[6].index('read -r password'))
+        self.assertIn('-i p1-observer-telemetry-', command[6])
+        self.assertIn('"$user"', command[6])
+        self.assertIn('"$password"', command[6])
+        self.assertNotIn('backend_service', command[6])
+        self.assertNotIn('smoke_backend', command[6])
+        self.assertIn('gateways/+/telemetry/#', command[6])
+
+    def test_p1_pty_handshake_sends_secrets_only_after_ready_without_echo(self):
+        import subprocess
+        import termios
+        script = (
+            "import os,select,sys,termios,time\n"
+            "a=termios.tcgetattr(0); a[3] &= ~termios.ECHO; termios.tcsetattr(0,termios.TCSANOW,a)\n"
+            "time.sleep(0.15)\n"
+            "if select.select([0],[],[],0)[0]: print('PREMATURE_INPUT',flush=True)\n"
+            "print('OBSERVER_READY',flush=True)\n"
+            "u=sys.stdin.readline().rstrip('\\n'); p=sys.stdin.readline().rstrip('\\n')\n"
+            "print('CREDENTIALS_RECEIVED',flush=True)\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observer.log'
+            path.touch(mode=0o600)
+            with path.open('wb') as stream:
+                master_fd, slave_fd = smoke.paper_p1_open_echo_disabled_pty()
+                proc = None
+                try:
+                    self.assertFalse(termios.tcgetattr(slave_fd)[3] & termios.ECHO)
+                    proc = subprocess.Popen([sys.executable, '-c', script], stdin=slave_fd,
+                                             stdout=stream, stderr=subprocess.STDOUT)
+                    os.close(slave_fd)
+                    slave_fd = -1
+                    smoke.paper_p1_send_credentials_after_ready(
+                        proc, path, master_fd, 'observer-user', 'observer-password', timeout=3)
+                    self.assertEqual(proc.wait(timeout=3), 0)
+                    stream.flush()
+                    output = path.read_bytes()
+                    self.assertIn(b'OBSERVER_READY', output)
+                    self.assertIn(b'CREDENTIALS_RECEIVED', output)
+                    self.assertNotIn(b'PREMATURE_INPUT', output)
+                    self.assertNotIn(b'observer-user', output)
+                    self.assertNotIn(b'observer-password', output)
+                finally:
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    if slave_fd >= 0:
+                        os.close(slave_fd)
+                    os.close(master_fd)
+
+    def test_p1_resource_export_marks_unknown_gateway_limits_unavailable(self):
+        import csv
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'resources.csv'
+            smoke.paper_p1_resources_csv(target, [{'phase': 'burst', 'started_at': 't0', 'finished_at': 't1',
+                'services': {'backend': {'CPUPerc': '1.0%', 'MemUsage': '2MiB / 4GiB', 'MemPerc': '1%'},
+                             'gateway-p4-b': {'CPUPerc': '2.0%', 'MemUsage': '3MiB / 4GiB', 'MemPerc': '2%'}}}],
+                {'backend': {'NanoCpus': 2000000000, 'Memory': 4294967296}, 'gateway-p4-b': {}})
+            with target.open() as stream:
+                rows = {row['service']: row for row in csv.DictReader(stream)}
+            self.assertEqual(rows['backend']['cpu_limit_nanocpus'], '2000000000')
+            self.assertEqual(rows['gateway-p4-b']['cpu_limit_nanocpus'], '')
+            self.assertEqual(rows['gateway-p4-b']['memory_limit_bytes'], '')
+
     def test_p1_failed_cleanup_cannot_leave_success_run_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
@@ -398,6 +554,57 @@ class PaperP1Tests(unittest.TestCase):
         for bad in (dict(b, process_instance='b'), dict(b, elapsed_seconds=1), dict(b, ingress={'Received': 0, 'Committed': 0, 'SamplesNew': 0})):
             self.assertTrue(all(v is None for v in smoke.paper_p1_rates(a, bad).values()))
         self.assertTrue(all(v is None for v in smoke.paper_p1_rates(None, b).values()))
+
+    def test_p4_metrics_csv_exports_fixed_ingress_budget_and_shaper_fields(self):
+        import csv
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'ingress': {'BufferedPayloadBytes': 12, 'BufferedPayloadCapacityBytes': 100,
+                              'BufferedPayloadHighWaterBytes': 80, 'ByteBudgetFull': 2,
+                              'ShaperEnabled': True, 'ShaperEntries': 3, 'ShaperCapacity': 10,
+                              'ShaperPassed': 7, 'ShaperRateLimited': 4, 'ShaperStateCapacity': 1,
+                              'GatewayID': 'PRIVATE_SENTINEL', 'payload': 'PRIVATE_SENTINEL'}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'shaped', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            actual = {(r['metric'], r['value'], r['availability']) for r in rows if r['group'] == 'ingress'}
+            expected = {('BufferedPayloadBytes', '12', 'available'),
+                        ('BufferedPayloadCapacityBytes', '100', 'available'),
+                        ('BufferedPayloadHighWaterBytes', '80', 'available'),
+                        ('ByteBudgetFull', '2', 'available'),
+                        ('ShaperEnabled', 'True', 'available'),
+                        ('ShaperEntries', '3', 'available'), ('ShaperCapacity', '10', 'available'),
+                        ('ShaperPassed', '7', 'available'), ('ShaperRateLimited', '4', 'available'),
+                        ('ShaperStateCapacity', '1', 'available')}
+            self.assertTrue(expected.issubset(actual))
+            self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
+
+    def test_p4_metrics_csv_marks_missing_or_null_fixed_fields_unavailable(self):
+        import csv
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'ingress': {'BufferedPayloadBytes': None, 'ShaperPassed': 0}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'old', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            fields = {r['metric']: r for r in rows if r['group'] == 'ingress'}
+            for name in ('BufferedPayloadBytes', 'BufferedPayloadCapacityBytes', 'ShaperEnabled'):
+                self.assertEqual(fields[name]['availability'], 'unavailable')
+                self.assertEqual(fields[name]['value'], '')
+            self.assertEqual(fields['ShaperPassed']['availability'], 'available')
+            self.assertEqual(fields['ShaperPassed']['value'], '0')
+
+    def test_p4_rate_delta_is_same_process_positive_interval_and_not_shaper_accepted(self):
+        a = {'process_instance': 'a', 'elapsed_seconds': 2,
+             'ingress': {'Received': 4, 'Committed': 1, 'SamplesNew': 10, 'ShaperPassed': 8}}
+        b = {'process_instance': 'a', 'elapsed_seconds': 4,
+             'ingress': {'Received': 8, 'Committed': 3, 'SamplesNew': 30, 'ShaperPassed': 20}}
+        self.assertEqual(smoke.paper_p1_rates(a, b), {
+            'received_delivery_msg_per_s': 2, 'new_committed_msg_per_s': 1, 'new_committed_samples_per_s': 10})
+        for bad in (dict(b, process_instance='b'), dict(b, elapsed_seconds=2)):
+            self.assertTrue(all(value is None for value in smoke.paper_p1_rates(a, bad).values()))
 
     def test_p1_artifacts_allowlist_and_missing_is_not_zero(self):
         import csv
@@ -454,6 +661,110 @@ class PaperP1Tests(unittest.TestCase):
             self.assertEqual(model['services']['backend']['environment']['SUPABASE_JWT_MODE'], 'rs256')
             ordinary = smoke.prepare(Path(directory) / 'p2', paper_p2=True)
             self.assertEqual(ordinary.values['STAGE5_ENABLED'], 'false')
+
+    def test_p4_profiles_are_comparable_and_use_real_shaper_switch(self):
+        expected = {
+            'MQTT_SHAPER_RATE_PER_SECOND': '2', 'MQTT_SHAPER_BURST': '4',
+            'MQTT_SHAPER_MAX_GATEWAYS': '4096', 'MQTT_SHAPER_IDLE_RETENTION': '10m',
+            'MQTT_INGRESS_BUFFERED_BYTES': '16777216', 'MQTT_QUEUE_CAPACITY': '256',
+            'MQTT_MAX_PAYLOAD_BYTES': '65536', 'MQTT_WORKER_COUNT': '4',
+            'DATABASE_MAX_CONNS': '10', 'STAGE5_ENABLED': 'false', 'METRICS_ENABLED': 'true',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = smoke.prepare(Path(directory) / 'baseline', paper_p4='baseline')
+            optimized = smoke.prepare(Path(directory) / 'optimized', paper_p4='optimized')
+            for fixture, enabled in ((baseline, 'false'), (optimized, 'true')):
+                self.assertTrue(fixture.paper_p4)
+                self.assertEqual(fixture.paper_p4_mode, 'baseline' if enabled == 'false' else 'optimized')
+                self.assertTrue(fixture.paper_p2)
+                self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], enabled)
+                for key, value in expected.items():
+                    self.assertEqual(fixture.values[key], value, key)
+                self.assertIn('auth_socket:', (fixture.private / 'compose.p2.yml').read_text())
+                self.assertIn(str(smoke.PAPER_P0_TEMPLATE), smoke.compose_command(fixture, 'config'))
+                self.assertIn(str(fixture.private / 'compose.p2.yml'), smoke.compose_command(fixture, 'config'))
+                effective = {'services': {'backend': {'environment': dict(fixture.values)}}}
+                self.assertTrue(smoke.paper_p4_support().validate_effective_profile(fixture, effective))
+                for key in smoke.paper_p4_support().profile(fixture.paper_p4_mode):
+                    tampered = {'services': {'backend': {'environment': dict(fixture.values)}}}
+                    tampered['services']['backend']['environment'][key] = 'tampered'
+                    with self.assertRaisesRegex(ValueError, '^paper_p4_profile_rejected$'):
+                        smoke.paper_p4_support().validate_effective_profile(fixture, tampered)
+            self.assertNotEqual(baseline.values['MQTT_SHAPER_ENABLED'], optimized.values['MQTT_SHAPER_ENABLED'])
+
+    def test_p4_override_does_not_replace_root_metrics_environment_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p4', paper_p4='baseline')
+            backend = re.search(r'(?ms)^  backend:\n(.*?)(?=^  [a-z0-9_-]+:|^volumes:)',
+                                fixture.override.read_text())
+            self.assertIsNotNone(backend)
+            self.assertNotIn('METRICS_ENABLED', backend.group(1))
+            self.assertIn('METRICS_ENABLED: ${METRICS_ENABLED:-false}', smoke.ROOT_COMPOSE.read_text())
+
+    def test_p4_rejects_incompatible_or_metrics_off_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for kwargs in (
+                {'paper_p4': 'optimized', 'metrics_enabled': False},
+                {'paper_p4': 'invalid'},
+                {'paper_p4': 'baseline', 'paper_p3': True},
+                {'paper_p4': 'baseline', 'paper_p1': 'baseline'},
+            ):
+                with self.assertRaises(ValueError):
+                    smoke.prepare(Path(directory) / ('mode-' + str(len(kwargs)) + str(kwargs)), **kwargs)
+
+    def test_p4_lifecycle_requires_fixture_and_cleanup_veto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p4', paper_p4='baseline')
+            with self.assertRaisesRegex(ValueError, '^paper_p4_fixture_required$'):
+                smoke.paper_p4_support().run(smoke, fixture, None, None, None, None, None)
+            labels = {'io.iot.native-smoke.run': fixture.project}
+            def owned_item(kind, identity):
+                return {'kind': kind, 'name': identity, 'run': fixture.project,
+                        'task': 'native-compose-allocation', 'allocation_attempted': True,
+                        'removed': True, 'labels': labels,
+                        'receipt': {'id': identity if kind == 'volume' else 'a' * 64,
+                                    'created': '2026-10-25T08:00:00Z', 'labels': dict(labels)}}
+            registry = Mock(items=[owned_item('container', 'backend'),
+                                   owned_item('network', 'network'),
+                                   owned_item('volume', fixture.project + '_store')])
+            counts = {'container': 1, 'network': 1, 'volume': 1}
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                                               {'container': 0, 'network': 0, 'volume': 0}, True,
+                                                               Mock(items=[])))
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True,
+                                                               Mock(items=[owned_item('container', 'backend')])))
+            missing_receipt = owned_item('container', 'backend')
+            missing_receipt['receipt'] = None
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                                               counts, True, Mock(items=[missing_receipt])))
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, False, registry))
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': False}, counts, True, registry))
+            self.assertTrue(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
+            registry.items[-1]['removed'] = False
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
+
+    def test_p4_cli_dispatch_and_wrapper_are_explicit(self):
+        self.assertIn('--paper-p4', smoke.cli_arguments())
+        wrapper = (smoke.ROOT / 'scripts/test-paper-p4.sh').read_text()
+        self.assertIn('native_compose_smoke.py', wrapper)
+        self.assertIn('--paper-p4', wrapper)
+
+    def test_p4_cli_passes_mode_only_to_p4_and_never_runs_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P4_FIXTURE_ONLY'}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'p4'),
+                    '--paper-p4', '--mode', 'optimized']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            fixture = captured['fixture']
+            self.assertTrue(fixture.paper_p4)
+            self.assertIsNone(fixture.paper_p1)
+            self.assertEqual(fixture.paper_p4_mode, 'optimized')
+            self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'true')
 
     def test_p1_profile_reuses_p0_resources_but_keeps_its_own_mode(self):
         with tempfile.TemporaryDirectory() as directory:

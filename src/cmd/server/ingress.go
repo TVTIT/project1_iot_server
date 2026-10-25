@@ -51,6 +51,25 @@ type ingressRuntime struct {
 	ingress   *mqttingress.Ingress
 }
 
+func mqttIngressOptions(cfg config.Config) mqttingress.Options {
+	return mqttingress.Options{
+		MetricsEnabled:       cfg.MetricsEnabled,
+		QueueCapacity:        cfg.Ingress.QueueCapacity,
+		WorkerCount:          cfg.Ingress.WorkerCount,
+		MaxPayloadBytes:      cfg.Ingress.MaxPayloadBytes,
+		BufferedPayloadBytes: cfg.Ingress.BufferedPayloadBytes,
+		Shaper: mqttingress.ShaperOptions{
+			Enabled:       cfg.Ingress.ShaperEnabled,
+			RatePerSecond: cfg.Ingress.ShaperRatePerSecond,
+			Burst:         cfg.Ingress.ShaperBurst,
+			MaxGateways:   cfg.Ingress.ShaperMaxGateways,
+			IdleRetention: cfg.Ingress.ShaperIdleRetention,
+		},
+		PersistTimeout: cfg.Ingress.DBTimeout,
+		PublishTimeout: cfg.Ingress.PublishTimeout,
+	}
+}
+
 // composeIngress builds the telemetry validator, repository, ingress core and
 // data transport only when MQTT_INGRESS_ENABLED is true. An invalid CA or
 // broker configuration fails here, at startup, before any worker runs.
@@ -91,14 +110,7 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 		return ingressRuntime{}, fmt.Errorf("create MQTT telemetry transport: %w", err)
 	}
 
-	core, err := mqttingress.New(mqttingress.Options{
-		MetricsEnabled:  cfg.MetricsEnabled,
-		QueueCapacity:   cfg.Ingress.QueueCapacity,
-		WorkerCount:     cfg.Ingress.WorkerCount,
-		MaxPayloadBytes: cfg.Ingress.MaxPayloadBytes,
-		PersistTimeout:  cfg.Ingress.DBTimeout,
-		PublishTimeout:  cfg.Ingress.PublishTimeout,
-	}, validator, repository, transport)
+	core, err := mqttingress.New(mqttIngressOptions(cfg), validator, repository, transport)
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry ingress: %w", err)
 	}
@@ -175,6 +187,16 @@ func (r ingressRuntime) logSummary() {
 		"queue_depth", snap.QueueDepth,
 		"queue_capacity", snap.QueueCapacity,
 		"queue_high_water", snap.QueueHighWater,
+		"buffered_payload_bytes", snap.BufferedPayloadBytes,
+		"buffered_payload_capacity_bytes", snap.BufferedPayloadCapacityBytes,
+		"buffered_payload_high_water_bytes", snap.BufferedPayloadHighWaterBytes,
+		"byte_budget_full", snap.ByteBudgetFull,
+		"shaper_enabled", snap.ShaperEnabled,
+		"shaper_entries", snap.ShaperEntries,
+		"shaper_capacity", snap.ShaperCapacity,
+		"shaper_passed", snap.ShaperPassed,
+		"shaper_rate_limited", snap.ShaperRateLimited,
+		"shaper_state_capacity", snap.ShaperStateCapacity,
 	)
 }
 

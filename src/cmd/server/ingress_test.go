@@ -8,6 +8,7 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"iot-platform/internal/config"
+	"iot-platform/internal/mqttingress"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -94,6 +96,26 @@ func ingressTestConfig(caFile string) config.Config {
 	}
 }
 
+func TestMQTTIngressOptionsWireConfiguredByteBudgetAndShaper(t *testing.T) {
+	cfg := ingressTestConfig("unused")
+	cfg.MetricsEnabled = false
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
+
+	got := mqttIngressOptions(cfg)
+	if got.BufferedPayloadBytes != 2<<20 {
+		t.Errorf("BufferedPayloadBytes = %d, want %d", got.BufferedPayloadBytes, 2<<20)
+	}
+	want := (mqttingress.ShaperOptions{Enabled: true, RatePerSecond: 7, Burst: 9, MaxGateways: 11, IdleRetention: 3 * time.Minute})
+	if got.Shaper != want {
+		t.Errorf("Shaper options = %+v, want %+v", got.Shaper, want)
+	}
+}
+
 // TestComposeIngressDisabledIsInert verifies that a disabled flag composes no
 // transport, reads no CA (an unusable path is not touched) and that every
 // lifecycle call is a safe no-op.
@@ -124,12 +146,25 @@ func TestComposeIngressEnabledInvalidCAFailsStartup(t *testing.T) {
 
 func TestComposeIngressEnabledComposesAndCleansUpFinite(t *testing.T) {
 	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
 	runtime, err := composeIngress(cfg, testPool(t))
 	if err != nil {
 		t.Fatalf("composeIngress(enabled) = %v", err)
 	}
 	if !runtime.enabled || runtime.transport == nil || runtime.ingress == nil {
 		t.Fatalf("enabled ingress missing components: %+v", runtime)
+	}
+	snapshot := runtime.ingress.Snapshot()
+	if snapshot.BufferedPayloadCapacityBytes != cfg.Ingress.BufferedPayloadBytes {
+		t.Fatalf("buffered payload capacity = %d, want configured %d", snapshot.BufferedPayloadCapacityBytes, cfg.Ingress.BufferedPayloadBytes)
+	}
+	if !snapshot.ShaperEnabled || snapshot.ShaperCapacity != cfg.Ingress.ShaperMaxGateways {
+		t.Fatalf("shaper snapshot = enabled %v capacity %d, want enabled capacity %d", snapshot.ShaperEnabled, snapshot.ShaperCapacity, cfg.Ingress.ShaperMaxGateways)
 	}
 
 	// Never started: stopIntake and drainAndClose must stay inert and finite.
@@ -254,6 +289,12 @@ func TestLogSummaryDisabledIsInert(_ *testing.T) {
 
 func TestLogSummaryEnabledEmitsStructuredSummary(t *testing.T) {
 	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
 	runtime, err := composeIngress(cfg, testPool(t))
 	if err != nil {
 		t.Fatalf("composeIngress = %v", err)
@@ -276,14 +317,67 @@ func TestLogSummaryEnabledEmitsStructuredSummary(t *testing.T) {
 		"committed=0",
 		"queue_capacity=256",
 		"queue_high_water=0",
+		"buffered_payload_bytes=0",
+		"buffered_payload_capacity_bytes=2097152",
+		"buffered_payload_high_water_bytes=0",
+		"byte_budget_full=0",
+		"shaper_enabled=true",
+		"shaper_entries=0",
+		"shaper_capacity=11",
+		"shaper_passed=0",
+		"shaper_rate_limited=0",
+		"shaper_state_capacity=0",
 	} {
 		if !strings.Contains(out, expectedField) {
 			t.Fatalf("logSummary output missing field %q; full log:\n%s", expectedField, out)
 		}
 	}
-	for _, forbidden := range []string{"password", "secret", "token", "payload"} {
+	for _, forbidden := range []string{"password", "secret", "token", "payload="} {
 		if strings.Contains(strings.ToLower(out), forbidden) {
 			t.Fatalf("logSummary output contains forbidden sensitive key %q; full log:\n%s", forbidden, out)
+		}
+	}
+}
+
+func TestProcessMetricsIngressSnapshotExportsOnlyFixedP4Fields(t *testing.T) {
+	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
+	runtime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatalf("composeIngress = %v", err)
+	}
+	snapshot := runtime.ingress.Snapshot()
+	payload, err := json.Marshal(processMetrics{Ingress: &snapshot})
+	if err != nil {
+		t.Fatalf("marshal ingress metrics: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal ingress metrics: %v", err)
+	}
+	ingress, ok := decoded["ingress"].(map[string]any)
+	if !ok {
+		t.Fatalf("serialized ingress metrics missing: %s", payload)
+	}
+	want := map[string]any{
+		"BufferedPayloadBytes": float64(0), "BufferedPayloadCapacityBytes": float64(2 << 20),
+		"BufferedPayloadHighWaterBytes": float64(0), "ByteBudgetFull": float64(0),
+		"ShaperEnabled": true, "ShaperEntries": float64(0), "ShaperCapacity": float64(11),
+		"ShaperPassed": float64(0), "ShaperRateLimited": float64(0), "ShaperStateCapacity": float64(0),
+	}
+	for field, expected := range want {
+		if ingress[field] != expected {
+			t.Errorf("serialized ingress %s = %#v, want %#v", field, ingress[field], expected)
+		}
+	}
+	for _, forbidden := range []string{"Gateway", "Sensor", "payload"} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Errorf("serialized metrics contain forbidden %q: %s", forbidden, payload)
 		}
 	}
 }

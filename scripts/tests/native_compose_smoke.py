@@ -26,6 +26,7 @@ import ssl
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +97,11 @@ DEFAULTS = dict(
     MQTT_RECONNECT_MAX_INTERVAL="30s", TELEMETRY_MAX_SAMPLES_PER_MESSAGE="1000",
     TELEMETRY_MAX_BATCH_DURATION="60s", TELEMETRY_MAX_FUTURE_SKEW="2m",
     TELEMETRY_DB_TIMEOUT="5s",
+    # P4 shaper values are private synthetic inputs for the isolated fixture;
+    # do not inherit these (or any other values) from the caller environment.
+    MQTT_SHAPER_ENABLED="false", MQTT_SHAPER_RATE_PER_SECOND="2",
+    MQTT_SHAPER_BURST="4", MQTT_SHAPER_MAX_GATEWAYS="4096",
+    MQTT_SHAPER_IDLE_RETENTION="10m", MQTT_INGRESS_BUFFERED_BYTES="16777216",
     MQTT_DYNSEC_MANAGER_USERNAME="credential_manager",
     MQTT_DYNSEC_JSON_PATH="/mosquitto/dynsec/dynamic-security.json",
     MQTT_DYNSEC_WRITER_UID="1883",
@@ -147,6 +153,8 @@ class Fixture:
     paper_p2_spike: bool = False
     paper_p2: bool = False
     paper_p3: bool = False
+    paper_p4: bool = False
+    paper_p4_mode: str | None = None
 
 
 def fixture_services(fixture):
@@ -525,7 +533,19 @@ def paper_p2_support():
     return module
 
 
-def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False, paper_p2=False, paper_p3=False):
+def paper_p4_support():
+    spec = importlib.util.spec_from_file_location('paper_p4_support', Path(__file__).with_name('paper_p4_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False, paper_p2=False, paper_p3=False, paper_p4=None):
+    if paper_p4 is not None:
+        if (paper_p4 not in ('baseline', 'optimized') or not metrics_enabled or paper_p0 or paper_p1
+                or paper_p2_spike or paper_p2 or paper_p3):
+            raise ValueError('paper_p4_mode_rejected')
+        paper_p2 = True  # Reuse P2's isolated perimeter topology, not its workload.
     if paper_p3:
         if paper_p0 or paper_p1 or paper_p2_spike or paper_p2 or not metrics_enabled:
             raise ValueError('paper_p3_mode_rejected')
@@ -550,7 +570,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     if paper_profile:
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
                       MQTT_MAX_PAYLOAD_BYTES='65536')
-    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2) and metrics_enabled else 'false'
+    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4) and metrics_enabled else 'false'
     if paper_p2:
         values.update(SUPABASE_JWT_MODE='rs256', SUPABASE_JWKS_URL='http://supabase-envoy:8000/auth/v1/.well-known/jwks.json',
                       AUTH_UNIX_SOCKET_PATH='/run/iot-auth/auth.sock', GOTRUE_JWT_ISSUER='https://localhost/auth/v1',
@@ -558,6 +578,10 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       CORS_ALLOWED_ORIGINS='https://client.example.test')
     if paper_p3:
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
+    if paper_p4:
+        values.update(paper_p4_support().profile(paper_p4))
+        values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10', MQTT_MAX_PAYLOAD_BYTES='65536',
+                      MQTT_QUEUE_CAPACITY='256', MQTT_WORKER_COUNT='4', STAGE5_ENABLED='false')
     for key in ("POSTGRES_PASSWORD", "AUTH_DB_PASSWORD", "STORAGE_DB_PASSWORD",
                 "BACKEND_DB_PASSWORD", "JWT_SECRET", "MQTT_PASSWORD",
                 "MQTT_DYNSEC_MANAGER_PASSWORD", "DASHBOARD_PASSWORD"):
@@ -593,10 +617,16 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             stanzas.append('    environment:\n      METRICS_ENABLED: ${METRICS_ENABLED:?required}\n')
     private_write(override, "".join(stanzas) + template[resource_offset:])
     # Copy only the reviewed broker config, never deployment certificates.
-    private_write(private / "mosquitto.conf", (ROOT / "config/mosquitto/mosquitto.conf").read_text())
+    broker_config = (ROOT / "config/mosquitto/mosquitto.conf").read_text()
+    if paper_p4 and 'log_type debug' not in broker_config:
+        # Mosquitto 2.0.18 emits the broker-side Denied PUBLISH audit line only
+        # at debug level. This is confined to the disposable acceptance fixture.
+        broker_config = broker_config.rstrip() + '\nlog_type debug\n'
+    private_write(private / "mosquitto.conf", broker_config)
     art_stat = artifacts.stat()
     fixture = Fixture(base, private, artifacts, env_file, override, project, values,
-                      art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p3)
+                      art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p3,
+                      paper_p4 is not None, paper_p4)
     if paper_p2_spike or paper_p2:
         paper_p2_support().prepare_spike(sys.modules[__name__], fixture)
     if paper_p2:
@@ -743,10 +773,12 @@ def validate_effective_model(fixture, model):
         if (any(str(env.get(k)).lower() != v for k, v in expected.items())
                 or backend.get('cpus') != 2 or str(backend.get('mem_limit')) != '4294967296'):
             raise ValueError('paper_p0_profile_rejected')
-        if fixture.paper_p1 and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
+        if (fixture.paper_p1 or fixture.paper_p4) and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
             raise ValueError('paper_p1_profile_rejected')
         if fixture.paper_p2:
             paper_p2_support().validate_perimeter(fixture, services)
+        if fixture.paper_p4:
+            paper_p4_support().validate_effective_environment(fixture, env)
     if backend.get("build", {}).get("context") != str(ROOT / "src") or backend["build"].get("dockerfile") != "Dockerfile" or backend["build"].get("target") != "backend":
         raise ValueError("effective_build_rejected")
     for name in ("backend", "mosquitto"):
@@ -997,7 +1029,11 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 url = ('https' if fixture.paper_p2 else 'http') + '://127.0.0.1:' + ports[0]['HostPort']
                 endpoint = HTTPSEndpoint(url, fixture.private / 'p2-ca.crt') if fixture.paper_p2 else url
                 evidence['endpoint'] = url
-                if fixture.paper_p3:
+                if fixture.paper_p4:
+                    phase = 'paper_p4'
+                    evidence['paper_p4'] = paper_p4_support().run(sys.modules[__name__], fixture,
+                                                                  endpoint, registry, containers, images, state)
+                elif fixture.paper_p3:
                     phase = 'paper_p3'
                     import paper_p3_support
                     evidence['paper_p3'] = paper_p3_support.run(sys.modules[__name__], fixture,
@@ -1116,19 +1152,43 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         result.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
                       cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts)
         durable_json(path, result)
-    if fixture.paper_p1 or fixture.paper_p2:
+    if fixture.paper_p1 or fixture.paper_p2 or fixture.paper_p4:
         path = fixture.artifacts / 'run.json'
-        run = json.loads(path.read_text()) if path.exists() else {'schema_version': 1, 'run_id': fixture.project, 'mode': fixture.paper_p1}
+        run = json.loads(path.read_text()) if path.exists() else {
+            'schema_version': 1, 'run_id': fixture.project,
+            'mode': fixture.paper_p4_mode if fixture.paper_p4 else fixture.paper_p1}
         run.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                    error=sanitize_failure_code(failure) if failure else None)
+        if fixture.paper_p4:
+            run.update(effective_optimizations=(['mqtt_shaper']
+                       if fixture.values['MQTT_SHAPER_ENABLED'] == 'true' else []))
         durable_json(path, run)
     if failure:
+        if fixture.paper_p4:
+            # Keep the diagnostic private and structural: exception text and
+            # frame locals can contain MQTT credentials or telemetry payloads.
+            frames = traceback.extract_tb(failure.__traceback__)
+            durable_json(fixture.private / "p4-failure-stack.json", {
+                "exception_type": type(failure).__name__,
+                "frames": [{"file": Path(frame.filename).name,
+                            "function": frame.name, "line": frame.lineno}
+                           for frame in frames[-20:]],
+            })
         fail_report = record_failure_report(fixture, phase=phase, exc=failure, cleanup_verified=cleanup_verified)
         raise FailureDiagnostic(fail_report, cause=failure) from failure
 
     try:
-        if fixture.paper_p3:
+        if fixture.paper_p4:
+            if not paper_p4_cleanup_acceptance(fixture, evidence.get('paper_p4', {}),
+                                               cleanup_counts, cleanup_verified, registry):
+                raise ValueError('paper_p4_acceptance_incomplete')
+            report = {'schema_version': 1, 'status': 'PAPER_P4_ACCEPTED', 'project': fixture.project,
+                      'mode': fixture.paper_p4_mode, 'native_executed': True,
+                      'full_p4_accepted': True, 'effective_optimizations':
+                      ['mqtt_shaper'] if fixture.values['MQTT_SHAPER_ENABLED'] == 'true' else [],
+                      'exact_cleanup_verified': True, 'cleanup_counts': cleanup_counts}
+        elif fixture.paper_p3:
             if not evidence['paper_p3'].get('full_p3_accepted'):
                 raise ValueError('cleanup_acceptance_incomplete')
             report = {'schema_version': 1, 'status': 'PAPER_P3_ACCEPTED', 'project': fixture.project,
@@ -1376,7 +1436,7 @@ def assert_safe_data(data):
 ALLOWED_FAILURE_STATUSES = {"STARTUP_FAILED"}
 ALLOWED_FAILURE_PHASES = {
     "prepare", "preflight", "build", "bootstrap",
-    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2', 'paper_p3',
+    *SERVICES, 'supabase-storage', 'auth-socket-init', 'paper_p0', 'paper_p1', 'paper_p2_spike', 'paper_p2', 'paper_p3', 'paper_p4',
     "positive_http", "role_http", "jwt_http",
     "cleanup", "report_validation"
 }
@@ -1388,6 +1448,15 @@ ALLOWED_FAILURE_ERROR_CODES = {
     'paper_p2_mode_rejected', 'paper_p2_spike_failed', 'paper_p2_perimeter_failed',
     'paper_p2_rotation_failed', 'paper_p2_acceptance_failed',
     'paper_p3_mode_rejected', 'paper_p3_acceptance_failed',
+    'paper_p4_mode_rejected', 'paper_p4_profile_rejected', 'paper_p4_fixture_required',
+    'paper_p4_metrics_unavailable', 'paper_p4_stats_failed', 'paper_p4_acceptance_failed',
+    'paper_p4_broker_profile_rejected',
+    'paper_p4_gateway_summary_rejected', 'paper_p4_outbox_not_drained',
+    'paper_p4_snapshot_not_stopped', 'paper_p4_pending_snapshot_failed',
+    'paper_p4_duplicate_replay_failed', 'paper_p4_metrics_window_rejected',
+    'paper_p4_observer_capture_failed',
+    'paper_p4_deadline_exceeded', 'paper_p4_accounting_rejected', 'paper_p4_artifact_rejected',
+    'paper_p4_namespace_payload_unavailable', 'paper_p4_acceptance_incomplete',
     'paper_p1_mode_rejected', 'paper_p1_profile_rejected', 'paper_p1_snapshot_rejected',
     'paper_p1_resources_rejected', 'paper_p1_subscription_failed', 'paper_p1_scrape_failed',
     'paper_p1_auth_failed', 'paper_p1_gateway_failed', 'paper_p1_reconciliation_failed',
@@ -2130,9 +2199,15 @@ def full_http_summary(fixture, evidence, cleanup_counts):
 
 P1_COUNTERS = ('Received', 'ReceivedBytes', 'AcceptedBytes', 'Accepted', 'RejectedNotRunning',
     'RejectedStopping', 'RejectedRetained', 'RejectedOversized', 'RejectedInvalidTopic', 'QueueFull',
+    'ByteBudgetFull', 'ShaperPassed', 'ShaperRateLimited', 'ShaperStateCapacity',
     'Processed', 'ValidationRejected', 'PersistFailures', 'CommitUnconfirmed', 'IdentityMismatch',
     'ACKBuildFailures', 'Committed', 'DuplicateCommitted', 'SamplesNew', 'ACKPublished', 'ACKPublishFailures')
-P1_GAUGES = ('QueueDepth', 'QueueCapacity', 'QueueHighWater', 'InFlight')
+P1_GAUGES = ('QueueDepth', 'QueueCapacity', 'QueueHighWater', 'InFlight',
+    'BufferedPayloadBytes', 'BufferedPayloadCapacityBytes', 'BufferedPayloadHighWaterBytes',
+    'ShaperEnabled', 'ShaperEntries', 'ShaperCapacity')
+P4_INGRESS_FIELDS = frozenset(('ByteBudgetFull', 'ShaperPassed', 'ShaperRateLimited', 'ShaperStateCapacity',
+    'BufferedPayloadBytes', 'BufferedPayloadCapacityBytes', 'BufferedPayloadHighWaterBytes',
+    'ShaperEnabled', 'ShaperEntries', 'ShaperCapacity'))
 P1_RATES = {'received_delivery_msg_per_s': 'Received', 'new_committed_msg_per_s': 'Committed',
             'new_committed_samples_per_s': 'SamplesNew'}
 
@@ -2142,7 +2217,8 @@ def paper_p1_rates(before, after):
     if not before or not after or before['process_instance'] != after['process_instance']:
         return rates
     elapsed = after['elapsed_seconds'] - before['elapsed_seconds']
-    if elapsed <= 0 or not before.get('ingress') or not after.get('ingress'):
+    if (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed <= 0
+            or not before.get('ingress') or not after.get('ingress')):
         return rates
     delta = {key: after['ingress'][field] - before['ingress'][field] for key, field in P1_RATES.items()}
     if any(value < 0 for value in delta.values()):
@@ -2170,17 +2246,32 @@ def paper_p1_metrics_csv(path, samples):
             rates = paper_p1_rates(previous, snap)
             valid_delta = all(v is not None for v in rates.values())
             def row(group, metric, kind, unit, value, **extra):
-                if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
+                if value is not None and type(value) not in (int, float, bool):
+                    raise ValueError('paper_p1_snapshot_rejected')
+                if type(value) in (int, float) and not math.isfinite(value):
                     raise ValueError('paper_p1_snapshot_rejected')
                 writer.writerow(dict(base, group=group, metric=metric, kind=kind, unit=unit,
                                      value=value, availability='available', **extra))
             ing = snap.get('ingress') or {}
             for name in P1_COUNTERS + P1_GAUGES:
                 if name not in ing:
+                    if name in P4_INGRESS_FIELDS:
+                        writer.writerow(dict(base, group='ingress', metric=name,
+                                             kind='counter' if name in P1_COUNTERS else 'gauge',
+                                             unit='bytes' if name.endswith('Bytes') else
+                                             'boolean' if name == 'ShaperEnabled' else 'count',
+                                             availability='unavailable'))
+                    continue
+                if ing[name] is None and name in P4_INGRESS_FIELDS:
+                    writer.writerow(dict(base, group='ingress', metric=name,
+                                         kind='counter' if name in P1_COUNTERS else 'gauge',
+                                         unit='bytes' if name.endswith('Bytes') else
+                                         'boolean' if name == 'ShaperEnabled' else 'count',
+                                         availability='unavailable'))
                     continue
                 delta = ing[name] - previous['ingress'][name] if valid_delta and name in previous['ingress'] and name in P1_COUNTERS else None
                 row('ingress', name, 'counter' if name in P1_COUNTERS else 'gauge',
-                    'bytes' if name.endswith('Bytes') else 'count', ing[name], delta=delta,
+                    'bytes' if name.endswith('Bytes') else 'boolean' if name == 'ShaperEnabled' else 'count', ing[name], delta=delta,
                     rate_per_s=delta / (snap['elapsed_seconds'] - previous['elapsed_seconds']) if delta is not None and delta >= 0 else None)
             for name, value in rates.items():
                 row('ingress', name, 'rate', 'samples/s' if 'samples' in name else 'messages/s', value)
@@ -2273,7 +2364,7 @@ def paper_p0_stats(registry, containers, phase):
 
 
 def paper_p0_gateway_cli(fixture, registry, image, volume, env_file, ca_file, tag, args,
-                         state, during=None, tick=None, timeout=45):
+                         state, during=None, tick=None, timeout=45, allow_incomplete=False):
     """Finite Gateway CLI under the existing exact-owned registry, no --rm leaks."""
     labels = {'test.task': 'native-compose-startup', 'test.run': fixture.project}
     item = registry.intent('container', fixture.project + '-gateway-' + tag, image, labels)
@@ -2303,9 +2394,11 @@ def paper_p0_gateway_cli(fixture, registry, image, volume, env_file, ca_file, ta
         raise ValueError('helper_allocation_unresolved')
     if registry.command(['start', obj['Id']]).returncode:
         raise ValueError('paper_p0_gateway_failed')
+    deadline = time.monotonic() + timeout
     if during:
         during()
-    deadline = time.monotonic() + timeout
+        if time.monotonic() >= deadline:
+            raise ValueError('paper_p0_gateway_failed')
     while True:
         state.checkpoint()
         obj = registry.resolve(item)
@@ -2320,7 +2413,15 @@ def paper_p0_gateway_cli(fixture, registry, image, volume, env_file, ca_file, ta
     private_write(fixture.private / ('gateway-' + tag + '.log'),
                   (output.stdout + output.stderr).decode(errors='replace'))
     if obj['State']['ExitCode'] or output.returncode:
-        raise ValueError('paper_p0_gateway_failed')
+        if not allow_incomplete:
+            raise ValueError('paper_p0_gateway_failed')
+        from stage3_mqtt_ingress_runner import parse_run_summary
+        try:
+            incomplete = parse_run_summary(output.stdout.decode(errors='replace'))
+        except RuntimeError:
+            raise ValueError('paper_p0_gateway_failed') from None
+        if incomplete.get('completed') != 'false' or int(incomplete.get('pending_rows', '0')) <= 0:
+            raise ValueError('paper_p0_gateway_failed')
     return output.stdout.decode()
 
 
@@ -2526,7 +2627,37 @@ FROM telemetry WHERE gateway_id=:'gw';
 
 
 def cli_arguments():
-    return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http", "--paper-p0", "--paper-p1", "--mode")
+    return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http", "--paper-p0", "--paper-p1", "--paper-p4", "--mode")
+
+
+def paper_p4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    """P4 cleanup is exact against this run's owned registry, not guessed totals."""
+    items = list(registry.items)
+    kinds = ('container', 'network', 'volume')
+    if not items:
+        return False
+    for item in items:
+        receipt = item.get('receipt')
+        if (item.get('kind') not in kinds or item.get('run') != fixture.project
+                or item.get('task') != 'native-compose-allocation'
+                or item.get('allocation_attempted') is not True or item.get('removed') is not True
+                or not isinstance(receipt, dict) or set(receipt) != {'id', 'created', 'labels'}
+                or not isinstance(receipt.get('created'), str) or not receipt['created']
+                or not isinstance(receipt.get('labels'), dict)
+                or any(receipt['labels'].get(key) != value for key, value in item.get('labels', {}).items())):
+            return False
+        identity = receipt.get('id')
+        if item['kind'] == 'volume':
+            if identity != item.get('name'):
+                return False
+        elif not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9]{64}', identity):
+            return False
+    registered = {kind: sum(item.get('kind') == kind for item in items)
+                  for kind in kinds}
+    removed = {kind: sum(item.get('kind') == kind and item.get('removed') is True for item in items)
+               for kind in kinds}
+    return (evidence.get('full_p4_accepted') is True and cleanup_verified is True
+            and cleanup_counts == removed and removed == registered)
 
 
 def paper_p1_resources_csv(path, snapshots, limits):
@@ -2535,7 +2666,7 @@ def paper_p1_resources_csv(path, snapshots, limits):
              'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3}
     with path.open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=('schema_version', 'phase', 'started_at', 'finished_at',
-            'service', 'cpu_percent', 'memory_used_bytes', 'cpu_limit_nanocpus', 'memory_limit_bytes'))
+                    'service', 'cpu_percent', 'memory_used_bytes', 'cpu_limit_nanocpus', 'memory_limit_bytes'))
         writer.writeheader()
         for snapshot in snapshots:
             for service, stats in snapshot['services'].items():
@@ -2546,7 +2677,8 @@ def paper_p1_resources_csv(path, snapshots, limits):
                     'started_at': snapshot['started_at'], 'finished_at': snapshot['finished_at'], 'service': service,
                     'cpu_percent': float(stats['CPUPerc'].rstrip('%')),
                     'memory_used_bytes': int(float(match[1]) * units[match[2]]),
-                    'cpu_limit_nanocpus': limits[service]['NanoCpus'], 'memory_limit_bytes': limits[service]['Memory']})
+                    'cpu_limit_nanocpus': limits.get(service, {}).get('NanoCpus'),
+                    'memory_limit_bytes': limits.get(service, {}).get('Memory')})
 
 
 def paper_p1_subscription_target(fixture, spec, password, tag):
@@ -2568,52 +2700,177 @@ def paper_p1_suback_ready(data):
     return True
 
 
-def paper_p1_subscriber(fixture, registry, broker, spec, password, tag):
+def paper_p1_subscription_command(broker, tag, topic, *, message_count, message_timeout):
+    client_id = 'p1-observer-' + tag + '-' + str(os.getpid())
+    script = ('stty -echo; printf \'OBSERVER_READY\\n\'; '
+              'IFS= read -r user; IFS= read -r password; '
+              'mosquitto_sub -d -h mosquitto -p 8883 '
+              '--cafile /mosquitto/config/certs/ca.crt -u "$user" -P "$password" '
+              '-i ' + client_id + ' -q 1 -t ' + topic + ' -C ' + str(message_count) +
+              ' -W ' + str(message_timeout))
+    return ['docker', 'exec', '-it', broker, 'sh', '-ec', script]
+
+
+def paper_p1_open_echo_disabled_pty():
+    import pty
+    import termios
+    master_fd, slave_fd = pty.openpty()
+    try:
+        terminal = termios.tcgetattr(slave_fd)
+        terminal[3] &= ~termios.ECHO
+        termios.tcsetattr(slave_fd, termios.TCSANOW, terminal)
+        return master_fd, slave_fd
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+
+
+def paper_p1_send_credentials_after_ready(proc, path, master_fd, username, password,
+                                         *, timeout=5, max_bytes=131072):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data = path.read_bytes()
+        if len(data) > max_bytes:
+            raise ValueError('paper_p1_subscription_failed')
+        if b'OBSERVER_READY' in data:
+            view = memoryview((username + '\n' + password + '\n').encode())
+            while view:
+                view = view[os.write(master_fd, view):]
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    raise ValueError('paper_p1_subscription_failed')
+
+
+def paper_p1_subscriber(fixture, registry, broker, spec, password, tag, *, message_count=1,
+                        message_timeout=60):
     """Use the existing broker CLI, TLS/DynSec and private bounded debug output.
 
     A pseudo-tty makes CLI debug lines line-buffered so SUBACK can be observed
-    before publishing. No new port, resource registry or MQTT implementation.
+    before publishing. Credential input is sent only after terminal echo is
+    disabled; each observer gets a distinct client ID from the ingress client.
+    No new port, resource registry or MQTT implementation.
     """
     username, subscription_password, topic = paper_p1_subscription_target(fixture, spec, password, tag)
     path = fixture.private / ('p1-sub-' + tag + '.log')
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     stream = os.fdopen(fd, 'wb')
-    command = ['docker', 'exec', '-t', broker, 'mosquitto_sub', '-d', '-h', 'mosquitto', '-p', '8883',
-        '--cafile', '/mosquitto/config/certs/ca.crt', '-u', username, '-P', subscription_password,
-        '-q', '1', '-t', topic, '-C', '1', '-W', '60']
-    proc = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, env=process_env(fixture))
+    if type(message_count) is not int or not 1 <= message_count <= 100:
+        stream.close()
+        raise ValueError('paper_p1_subscription_failed')
+    if type(message_timeout) is not int or not 1 <= message_timeout <= 90:
+        stream.close()
+        raise ValueError('paper_p1_subscription_failed')
+    command = paper_p1_subscription_command(broker, tag, topic,
+                                             message_count=message_count,
+                                             message_timeout=message_timeout)
+    master_fd, slave_fd = paper_p1_open_echo_disabled_pty()
     try:
+        proc = subprocess.Popen(command, stdin=slave_fd, stdout=stream, stderr=subprocess.STDOUT,
+                                env=process_env(fixture))
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        stream.close()
+        raise
+    os.close(slave_fd)
+    try:
+        paper_p1_send_credentials_after_ready(proc, path, master_fd, username, subscription_password)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             data = path.read_bytes()
             if paper_p1_suback_ready(data):
-                return proc, stream, path
+                return proc, stream, path, master_fd
             if proc.poll() is not None or len(data) > 131072:
                 break
             time.sleep(0.05)
         raise ValueError('paper_p1_subscription_failed')
     except BaseException:
-        proc.terminate()
-        proc.wait(timeout=5)
-        stream.close()
+        paper_p1_stop_subscription((proc, stream, path, master_fd))
         raise
 
 
+def paper_p1_subscription_messages(data):
+    """Extract bounded payload/topic pairs from the existing mosquitto_sub CLI log."""
+    messages = []
+    topic = None
+    for line in data.splitlines():
+        match = re.search(rb'received PUBLISH .*\'([^\']+)\'', line)
+        if match:
+            topic = match.group(1).decode('utf-8', errors='strict')
+        elif topic is not None and line.lstrip().startswith(b'{'):
+            payload = line.lstrip()
+            messages.append((topic, payload))
+            topic = None
+            if len(messages) > 100:
+                raise ValueError('paper_p1_subscription_failed')
+    return messages
+
+
+def paper_p1_capture_subscription(subscription, expected_topic, *, timeout=5, max_bytes=131072):
+    proc, _, path = subscription[:3]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.stat().st_size > max_bytes:
+            raise ValueError('paper_p1_subscription_failed')
+        messages = paper_p1_subscription_messages(path.read_bytes())
+        for topic, payload in messages:
+            if topic == expected_topic:
+                if not payload or len(payload) > 65536:
+                    raise ValueError('paper_p1_subscription_failed')
+                return payload
+        if proc.poll() is not None:
+            return None
+        time.sleep(0.05)
+    return None
+
+
+def paper_p1_subscription_log_messages(subscription, *, max_bytes=131072):
+    _, _, path = subscription[:3]
+    if path.stat().st_size > max_bytes:
+        raise ValueError('paper_p1_subscription_failed')
+    return paper_p1_subscription_messages(path.read_bytes())
+
+
+def paper_p1_stop_subscription(subscription):
+    proc, stream, _, *terminal = subscription
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        if proc.stdin is not None and not proc.stdin.closed:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        if not stream.closed:
+            stream.close()
+        for fd in terminal:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def paper_p1_read_subscription(subscription):
-    proc, stream, path = subscription
+    proc, stream, path = subscription[:3]
     try:
         proc.wait(timeout=8)
         if proc.returncode or path.stat().st_size > 131072:
             raise ValueError('paper_p1_subscription_failed')
-        payloads = [line.strip() for line in path.read_bytes().splitlines() if line.startswith(b'{')]
+        payloads = [payload for _, payload in paper_p1_subscription_messages(path.read_bytes())]
         if len(payloads) != 1:
             raise ValueError('paper_p1_subscription_failed')
         return payloads[0]
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
-        stream.close()
+        paper_p1_stop_subscription(subscription)
 
 
 def paper_p1_count_db(registry, pg):
@@ -2726,8 +2983,8 @@ def run_paper_p1(fixture, registry, endpoint, containers, images, state, *, extr
             if subscription:
                 captured = paper_p1_read_subscription(subscription)
         finally:
-            if subscription and subscription[0].poll() is None:
-                subscription[0].terminate(); subscription[0].wait(timeout=5); subscription[1].close()
+            if subscription:
+                paper_p1_stop_subscription(subscription)
         summary = parse_run_summary(out)
         if any(summary.get(k) != v for k, v in {'enqueued': '20', 'app_acknowledged': '20', 'completed': 'true',
                 'pending_rows': '0', 'pending_bytes': '0', 'quarantined_rows': '0', 'quarantined_bytes': '0'}.items()):
@@ -2786,9 +3043,7 @@ WHERE p.message_id IS NULL OR t.sensor_id<>p.sensor_id OR t.boot_id<>p.boot_id
             '-q', '1', '-t', specs[0].telemetry_topic, '-s'], input=captured)
         ack = paper_p1_read_subscription(subscription)
     finally:
-        if subscription[0].poll() is None:
-            subscription[0].terminate(); subscription[0].wait(timeout=5)
-        subscription[1].close()
+        paper_p1_stop_subscription(subscription)
     if pub.returncode:
         raise ValueError('paper_p1_replay_failed')
     verify_ack(msg['message_id'], ack)
@@ -2964,12 +3219,13 @@ def main():
     parser.add_argument('--paper-p2-spike', action='store_true', help='P2.1 compatibility only; not P2 acceptance')
     parser.add_argument('--paper-p2', action='store_true', help='P2 isolated HTTPS/Unix perimeter checks')
     parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
+    parser.add_argument('--paper-p4', action='store_true', help='P4 isolated finite two-Gateway ingress workload')
     parser.add_argument('--mode', choices=('baseline', 'optimized'))
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
     args = parser.parse_args()
     if args.paper_p3 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
-                             args.startup_only, args.positive_http_only, args.role_http_only,
-                             args.full_http, args.mode, args.metrics_off)):
+                              args.startup_only, args.positive_http_only, args.role_http_only,
+                              args.full_http, args.paper_p4, args.mode, args.metrics_off)):
         parser.error('P3 cannot be combined with other execution modes')
     if args.paper_p2 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.startup_only,
                              args.positive_http_only, args.role_http_only, args.full_http, args.mode, args.metrics_off)):
@@ -2980,12 +3236,25 @@ def main():
         parser.error('P2 spike cannot be combined with other execution modes')
     if (args.paper_p0 or args.paper_p1) and (any((args.startup_only, args.positive_http_only, args.role_http_only, args.full_http)) or args.paper_p0 and args.paper_p1):
         parser.error('paper mode cannot be combined with other execution modes')
-    if args.paper_p1 != (args.mode is not None) or args.metrics_off and not args.paper_p1:
-        parser.error('--paper-p1 requires --mode; --mode/--metrics-off require --paper-p1')
+    if args.paper_p4 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
+                              args.paper_p3, args.startup_only, args.positive_http_only,
+                              args.role_http_only, args.full_http, args.metrics_off)):
+        parser.error('P4 cannot be combined with other execution modes or metrics-off')
+    if args.paper_p1 and args.mode is None:
+        parser.error('--paper-p1 requires --mode')
+    if args.paper_p4 and args.mode is None:
+        parser.error('--paper-p4 requires --mode')
+    if args.mode is not None and not args.paper_p1 and not args.paper_p4:
+        parser.error('--mode requires --paper-p1 or --paper-p4')
+    if args.metrics_off and not args.paper_p1:
+        parser.error('--metrics-off requires --paper-p1')
     fixture = None
     try:
-        fixture = prepare(args.prepare, paper_p0=args.paper_p0, paper_p1=args.mode,
-                          metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike, paper_p2=args.paper_p2, paper_p3=args.paper_p3)
+        fixture = prepare(args.prepare, paper_p0=args.paper_p0,
+                          paper_p1=args.mode if args.paper_p1 else None,
+                          metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike,
+                          paper_p2=args.paper_p2, paper_p3=args.paper_p3,
+                          paper_p4=args.mode if args.paper_p4 else None)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -3010,7 +3279,7 @@ def main():
         return 1
 
     try:
-        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3:
+        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3 or args.paper_p4:
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.

@@ -11,15 +11,18 @@ import (
 // fixed field (no maps keyed by sender-supplied values), so cardinality cannot
 // grow with input.
 type counters struct {
-	received, receivedBytes, acceptedBytes, inFlight atomic.Int64
-	accepted                                         atomic.Int64
-	rejectedNotRunning                               atomic.Int64
-	rejectedStopping                                 atomic.Int64
-	rejectedRetained                                 atomic.Int64
-	rejectedOversized                                atomic.Int64
-	rejectedInvalidTpc                               atomic.Int64
-	queueFull                                        atomic.Int64
-	queueHighWater                                   atomic.Int64
+	received, receivedBytes, acceptedBytes, inFlight     atomic.Int64
+	bufferedPayloadBytes, bufferedPayloadHighWaterBytes  atomic.Int64
+	accepted                                             atomic.Int64
+	rejectedNotRunning                                   atomic.Int64
+	rejectedStopping                                     atomic.Int64
+	rejectedRetained                                     atomic.Int64
+	rejectedOversized                                    atomic.Int64
+	rejectedInvalidTpc                                   atomic.Int64
+	queueFull                                            atomic.Int64
+	byteBudgetFull                                       atomic.Int64
+	shaperPassed, shaperRateLimited, shaperStateCapacity atomic.Int64
+	queueHighWater                                       atomic.Int64
 
 	processed          atomic.Int64
 	validationRejected atomic.Int64
@@ -44,13 +47,23 @@ type Snapshot struct {
 	Received, ReceivedBytes, AcceptedBytes, InFlight int64
 	Durations                                        DurationSnapshot
 	// Admission.
-	Accepted             int64
-	RejectedNotRunning   int64
-	RejectedStopping     int64
-	RejectedRetained     int64
-	RejectedOversized    int64
-	RejectedInvalidTopic int64
-	QueueFull            int64
+	Accepted                      int64
+	RejectedNotRunning            int64
+	RejectedStopping              int64
+	RejectedRetained              int64
+	RejectedOversized             int64
+	RejectedInvalidTopic          int64
+	QueueFull                     int64
+	BufferedPayloadBytes          int64
+	BufferedPayloadCapacityBytes  int64
+	BufferedPayloadHighWaterBytes int64
+	ByteBudgetFull                int64
+	ShaperPassed                  int64
+	ShaperRateLimited             int64
+	ShaperStateCapacity           int64
+	ShaperEnabled                 bool
+	ShaperEntries                 int
+	ShaperCapacity                int
 
 	// Worker outcomes.
 	Processed          int64
@@ -91,17 +104,28 @@ type Snapshot struct {
 
 // Snapshot returns the current counters and queue state.
 func (i *Ingress) Snapshot() Snapshot {
+	shaperEntries, shaperCapacity := i.shaper.EntriesAndCap()
 	return Snapshot{
 		Received: i.counters.received.Load(), ReceivedBytes: i.counters.receivedBytes.Load(),
 		AcceptedBytes: i.counters.acceptedBytes.Load(), InFlight: i.counters.inFlight.Load(),
-		Durations:            DurationSnapshot{QueueWait: i.queueWait.Snapshot(), Validation: i.validation.Snapshot(), Persistence: i.persistence.Snapshot(), ACKPublish: i.ackPublish.Snapshot()},
-		Accepted:             i.counters.accepted.Load(),
-		RejectedNotRunning:   i.counters.rejectedNotRunning.Load(),
-		RejectedStopping:     i.counters.rejectedStopping.Load(),
-		RejectedRetained:     i.counters.rejectedRetained.Load(),
-		RejectedOversized:    i.counters.rejectedOversized.Load(),
-		RejectedInvalidTopic: i.counters.rejectedInvalidTpc.Load(),
-		QueueFull:            i.counters.queueFull.Load(),
+		Durations:                     DurationSnapshot{QueueWait: i.queueWait.Snapshot(), Validation: i.validation.Snapshot(), Persistence: i.persistence.Snapshot(), ACKPublish: i.ackPublish.Snapshot()},
+		Accepted:                      i.counters.accepted.Load(),
+		RejectedNotRunning:            i.counters.rejectedNotRunning.Load(),
+		RejectedStopping:              i.counters.rejectedStopping.Load(),
+		RejectedRetained:              i.counters.rejectedRetained.Load(),
+		RejectedOversized:             i.counters.rejectedOversized.Load(),
+		RejectedInvalidTopic:          i.counters.rejectedInvalidTpc.Load(),
+		QueueFull:                     i.counters.queueFull.Load(),
+		BufferedPayloadBytes:          i.counters.bufferedPayloadBytes.Load(),
+		BufferedPayloadCapacityBytes:  i.bufferedPayloadCapacityBytes,
+		BufferedPayloadHighWaterBytes: i.counters.bufferedPayloadHighWaterBytes.Load(),
+		ByteBudgetFull:                i.counters.byteBudgetFull.Load(),
+		ShaperPassed:                  i.counters.shaperPassed.Load(),
+		ShaperRateLimited:             i.counters.shaperRateLimited.Load(),
+		ShaperStateCapacity:           i.counters.shaperStateCapacity.Load(),
+		ShaperEnabled:                 i.shaper.options.Enabled,
+		ShaperEntries:                 shaperEntries,
+		ShaperCapacity:                shaperCapacity,
 
 		Processed:          i.counters.processed.Load(),
 		ValidationRejected: i.counters.validationRejected.Load(),

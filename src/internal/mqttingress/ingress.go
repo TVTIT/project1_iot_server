@@ -35,6 +35,12 @@ const (
 	AdmissionRejectedInvalidTopic
 	// AdmissionRejectedQueueFull means the bounded queue had no free slot.
 	AdmissionRejectedQueueFull
+	// AdmissionRejectedByteBudget means the bounded raw-payload budget was full.
+	AdmissionRejectedByteBudget
+	// AdmissionRejectedRateLimit means this Gateway exhausted its attempt tokens.
+	AdmissionRejectedRateLimit
+	// AdmissionRejectedShaperCapacity means no bounded Gateway bucket could be allocated.
+	AdmissionRejectedShaperCapacity
 )
 
 // Options configures the ingress core. Every value is validated by New.
@@ -43,6 +49,12 @@ type Options struct {
 	QueueCapacity   int
 	WorkerCount     int
 	MaxPayloadBytes int
+	// BufferedPayloadBytes bounds raw payload copies held through worker completion.
+	// Zero selects the backward-compatible 16 MiB default.
+	BufferedPayloadBytes int64
+	// Shaper enables bounded delivery-attempt shaping per Gateway. Zero value
+	// remains disabled for callers that predate shaping.
+	Shaper ShaperOptions
 	// PersistTimeout bounds connection acquisition, locks, SQL and commit of
 	// one Repository.Persist call.
 	PersistTimeout time.Duration
@@ -57,10 +69,11 @@ type Options struct {
 // private copy taken during admission so a transport callback may reuse its
 // receive buffer immediately after Admit returns.
 type item struct {
-	topic      string
-	payload    []byte
-	receivedAt time.Time
-	enqueuedAt time.Time
+	topic         string
+	payload       []byte
+	receivedAt    time.Time
+	enqueuedAt    time.Time
+	reservedBytes int64
 }
 
 // Ingress is the bounded admission queue and fixed worker pool. One admitted
@@ -71,11 +84,12 @@ type Ingress struct {
 	repository Repository
 	publisher  Publisher
 
-	workerCount     int
-	maxPayloadBytes int
-	persistTimeout  time.Duration
-	publishTimeout  time.Duration
-	logger          *slog.Logger
+	workerCount                  int
+	maxPayloadBytes              int
+	bufferedPayloadCapacityBytes int64
+	persistTimeout               time.Duration
+	publishTimeout               time.Duration
+	logger                       *slog.Logger
 
 	queue chan item
 	// stop is closed once by StopAdmission to tell workers to drain and exit.
@@ -104,6 +118,7 @@ type Ingress struct {
 	workers sync.WaitGroup
 
 	counters                                       counters
+	shaper                                         *Shaper
 	metricsEnabled                                 bool
 	queueWait, validation, persistence, ackPublish metrics.Histogram
 }
@@ -111,6 +126,10 @@ type Ingress struct {
 // New builds an ingress core. It rejects a missing dependency or a non-positive
 // bound rather than allocating an unbounded queue or workers.
 func New(opts Options, validator Validator, repository Repository, publisher Publisher) (*Ingress, error) {
+	shaper, err := NewShaper(opts.Shaper)
+	if err != nil {
+		return nil, err
+	}
 	if opts.QueueCapacity < 1 {
 		return nil, errors.New("mqttingress: queue capacity must be positive")
 	}
@@ -119,6 +138,13 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 	}
 	if opts.MaxPayloadBytes < 1 {
 		return nil, errors.New("mqttingress: max payload bytes must be positive")
+	}
+	bufferedPayloadBytes := opts.BufferedPayloadBytes
+	if bufferedPayloadBytes == 0 {
+		bufferedPayloadBytes = 16 << 20
+	}
+	if bufferedPayloadBytes < 0 || bufferedPayloadBytes < int64(opts.MaxPayloadBytes) || bufferedPayloadBytes > 256<<20 {
+		return nil, errors.New("mqttingress: buffered payload bytes must be at least max payload bytes and no more than 256 MiB")
 	}
 	if opts.PersistTimeout <= 0 {
 		return nil, errors.New("mqttingress: persist timeout must be positive")
@@ -142,19 +168,21 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 	}
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	return &Ingress{
-		metricsEnabled:  opts.MetricsEnabled,
-		validator:       validator,
-		repository:      repository,
-		publisher:       publisher,
-		workerCount:     opts.WorkerCount,
-		maxPayloadBytes: opts.MaxPayloadBytes,
-		persistTimeout:  opts.PersistTimeout,
-		publishTimeout:  opts.PublishTimeout,
-		logger:          logger,
-		queue:           make(chan item, opts.QueueCapacity),
-		stop:            make(chan struct{}),
-		runCtx:          runCtx,
-		cancelRun:       cancelRun,
+		metricsEnabled:               opts.MetricsEnabled,
+		validator:                    validator,
+		repository:                   repository,
+		publisher:                    publisher,
+		workerCount:                  opts.WorkerCount,
+		maxPayloadBytes:              opts.MaxPayloadBytes,
+		bufferedPayloadCapacityBytes: bufferedPayloadBytes,
+		persistTimeout:               opts.PersistTimeout,
+		publishTimeout:               opts.PublishTimeout,
+		logger:                       logger,
+		queue:                        make(chan item, opts.QueueCapacity),
+		stop:                         make(chan struct{}),
+		runCtx:                       runCtx,
+		cancelRun:                    cancelRun,
+		shaper:                       shaper,
 	}, nil
 }
 
@@ -206,12 +234,30 @@ func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, reta
 		i.counters.rejectedOversized.Add(1)
 		return AdmissionRejectedOversized
 	}
-	if _, err := telemetry.ParseTopic(topic); err != nil {
+	parsedTopic, err := telemetry.ParseTopic(topic)
+	if err != nil {
 		i.counters.rejectedInvalidTpc.Add(1)
 		return AdmissionRejectedInvalidTopic
 	}
+	switch i.shaper.Allow(parsedTopic.GatewayID) {
+	case ShaperRateLimited:
+		i.counters.shaperRateLimited.Add(1)
+		return AdmissionRejectedRateLimit
+	case ShaperStateCapacity:
+		i.counters.shaperStateCapacity.Add(1)
+		return AdmissionRejectedShaperCapacity
+	case ShaperPass:
+		if i.shaper.options.Enabled {
+			i.counters.shaperPassed.Add(1)
+		}
+	}
 
-	it := item{topic: topic, payload: append([]byte(nil), payload...), receivedAt: receivedAt}
+	reservedBytes := int64(len(payload))
+	if !i.reservePayloadBytes(reservedBytes) {
+		i.counters.byteBudgetFull.Add(1)
+		return AdmissionRejectedByteBudget
+	}
+	it := item{topic: topic, payload: append([]byte(nil), payload...), receivedAt: receivedAt, reservedBytes: reservedBytes}
 	if i.metricsEnabled {
 		it.enqueuedAt = time.Now()
 	}
@@ -224,11 +270,44 @@ func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, reta
 		i.recordQueueHighWater(len(i.queue))
 		return AdmissionAccepted
 	default:
+		i.releasePayloadBytes(reservedBytes)
 		// Queue full: drop the delivery from RAM. The library MQTT PUBACK (if
 		// any) is only transport receipt; the Gateway retries from its durable
 		// outbox. No application ACK is emitted.
 		i.counters.queueFull.Add(1)
 		return AdmissionRejectedQueueFull
+	}
+}
+
+// reservePayloadBytes atomically reserves a bounded amount before payload copy.
+func (i *Ingress) reservePayloadBytes(bytes int64) bool {
+	for {
+		current := i.counters.bufferedPayloadBytes.Load()
+		if bytes > i.bufferedPayloadCapacityBytes-current {
+			return false
+		}
+		if i.counters.bufferedPayloadBytes.CompareAndSwap(current, current+bytes) {
+			i.recordBufferedPayloadHighWater(current + bytes)
+			return true
+		}
+	}
+}
+
+func (i *Ingress) releasePayloadBytes(bytes int64) {
+	if bytes > 0 {
+		i.counters.bufferedPayloadBytes.Add(-bytes)
+	}
+}
+
+func (i *Ingress) recordBufferedPayloadHighWater(observed int64) {
+	for {
+		current := i.counters.bufferedPayloadHighWaterBytes.Load()
+		if observed <= current {
+			return
+		}
+		if i.counters.bufferedPayloadHighWaterBytes.CompareAndSwap(current, observed) {
+			return
+		}
 	}
 }
 
@@ -355,6 +434,7 @@ func (i *Ingress) drainQueue() {
 // process runs the single-item pipeline. Any error or unconfirmed outcome wins
 // over an apparently successful result and suppresses the ACK.
 func (i *Ingress) process(it item) {
+	defer i.releasePayloadBytes(it.reservedBytes)
 	started := time.Now()
 	if i.metricsEnabled {
 		i.counters.inFlight.Add(1)

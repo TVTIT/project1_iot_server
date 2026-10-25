@@ -63,6 +63,13 @@ type IngressConfig struct {
 	WorkerCount     int
 	MaxPayloadBytes int
 
+	ShaperEnabled        bool
+	ShaperRatePerSecond  int
+	ShaperBurst          int
+	ShaperMaxGateways    int
+	ShaperIdleRetention  time.Duration
+	BufferedPayloadBytes int64
+
 	ConnectTimeout       time.Duration
 	SubscribeTimeout     time.Duration
 	PublishTimeout       time.Duration
@@ -103,6 +110,24 @@ func loadIngress(lookup LookupFunc, databaseMaxConns int32, credentialEnabled bo
 		return c, err
 	}
 	if err = checkQueueMemoryBound(c.QueueCapacity, c.MaxPayloadBytes); err != nil {
+		return c, err
+	}
+	if c.ShaperEnabled, err = boolValue(lookup, "MQTT_SHAPER_ENABLED", false); err != nil {
+		return c, err
+	}
+	if c.ShaperRatePerSecond, err = integer(lookup, "MQTT_SHAPER_RATE_PER_SECOND", 2, 1, 10_000); err != nil {
+		return c, err
+	}
+	if c.ShaperBurst, err = integer(lookup, "MQTT_SHAPER_BURST", 4, 1, 100_000); err != nil {
+		return c, err
+	}
+	if c.ShaperMaxGateways, err = integer(lookup, "MQTT_SHAPER_MAX_GATEWAYS", 4096, 1, 100_000); err != nil {
+		return c, err
+	}
+	if c.ShaperIdleRetention, err = boundedDuration(lookup, "MQTT_SHAPER_IDLE_RETENTION", 10*time.Minute, time.Minute, 24*time.Hour); err != nil {
+		return c, err
+	}
+	if c.BufferedPayloadBytes, err = ingressByteBudget(lookup, c.MaxPayloadBytes); err != nil {
 		return c, err
 	}
 
@@ -171,6 +196,19 @@ func loadIngress(lookup LookupFunc, databaseMaxConns int32, credentialEnabled bo
 		return c, fmt.Errorf("SHUTDOWN_TIMEOUT must cover TELEMETRY_DB_TIMEOUT + MQTT_PUBLISH_TIMEOUT when MQTT_INGRESS_ENABLED is true")
 	}
 	return c, nil
+}
+
+func ingressByteBudget(lookup LookupFunc, maxPayload int) (int64, error) {
+	const key = "MQTT_INGRESS_BUFFERED_BYTES"
+	raw, ok := nonEmpty(lookup, key)
+	if !ok {
+		raw = strconv.FormatInt(16<<20, 10)
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < int64(maxPayload) || value > MaxIngressQueueMemoryBytes {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, maxPayload, MaxIngressQueueMemoryBytes)
+	}
+	return value, nil
 }
 
 // validateTLSBrokerURL accepts only an ssl:// URL with an explicit host and
