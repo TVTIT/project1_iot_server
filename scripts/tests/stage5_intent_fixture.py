@@ -36,6 +36,36 @@ def verify(fixture):
         print(output.decode(), flush=True)
 
 
+def verify_schema_24(fixture):
+    fixture.sql(b"""DO $$ BEGIN
+        IF (SELECT max(version) FROM public.schema_migrations) <> 24
+           OR NOT EXISTS (SELECT 1 FROM public.schema_migrations
+                          WHERE version=24 AND name='telemetry_ledger_timestamp') THEN
+            RAISE EXCEPTION 'Migration 24 is not the exact schema terminal';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema='public' AND table_name='processed_messages'
+                         AND column_name='timestamp' AND data_type='timestamp with time zone') THEN
+            RAISE EXCEPTION 'Migration 24 processed_messages.timestamp guard missing';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conrelid='public.processed_messages'::regclass
+                         AND conname='processed_messages_pkey' AND contype='p'
+                         AND pg_get_constraintdef(oid)='PRIMARY KEY (gateway_id, message_id)') THEN
+            RAISE EXCEPTION 'Migration 24 ID guard missing';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_index i
+                       JOIN pg_class c ON c.oid=i.indexrelid
+                       WHERE c.oid='public.processed_messages_gateway_sensor_message_timestamp'::regclass
+                         AND i.indisunique AND i.indisvalid
+                         AND pg_get_indexdef(i.indexrelid) LIKE
+                           '%(gateway_id, sensor_id, message_id, "timestamp")%') THEN
+            RAISE EXCEPTION 'Migration 24 Tier-2 timestamp index guard missing';
+        END IF;
+    END $$;""")
+    print('Migration 24 terminal/timestamp/ID/Tier-2 guards: PASS', flush=True)
+
+
 def verify_hardening_parent_scope(fixture):
     """A same-name constraint elsewhere must not hide a missing parent pair.
 
@@ -133,9 +163,13 @@ def scenario(kind, binary):
             migrate(fixture, 23)
             verify(fixture)
             verify_hardening_parent_scope(fixture)
+            # Keep the migration-23 verifier and historical assertions on their
+            # original terminal; the current telemetry writer requires schema 24.
+            run_existing_migration_runner(fixture, 24)
+            verify_schema_24(fixture)
             native(fixture, binary)
             run_existing_migration_runner(fixture, 23)
-            verify(fixture)
+            verify_schema_24(fixture)
         else:
             migrate(fixture, 22)
             seed_legacy(fixture)

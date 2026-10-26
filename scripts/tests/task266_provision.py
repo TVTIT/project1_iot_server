@@ -13,6 +13,7 @@ import secrets
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -323,13 +324,23 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
                     cleanup_backend_if_present(owned)
                 else:
                     cleanup_container(owned)
-            except RuntimeError:
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
                 cleanup_failed = True
-        spike.setup(f'chown -R {os.getuid()}:{os.getgid()} /fixture; chmod 700 /fixture')
-        spike.cleanup()
+                print(f'cleanup failed for {owned}: {type(error).__name__}', file=sys.stderr, flush=True)
+        try:
+            spike.setup(f'chown -R {os.getuid()}:{os.getgid()} /fixture; chmod 700 /fixture')
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
+            cleanup_failed = True
+            print(f'fixture permission cleanup failed: {type(error).__name__}', file=sys.stderr, flush=True)
+        try:
+            spike.cleanup()
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
+            cleanup_failed = True
+            print(f'fixture cleanup failed: {type(error).__name__}', file=sys.stderr, flush=True)
         if not cleanup_failed:
             shutil.rmtree(directory)
-        require(not cleanup_failed, 'owned container cleanup failed')
+        if cleanup_failed and sys.exc_info()[0] is None:
+            raise RuntimeError('owned container cleanup failed')
 
 
 if __name__ == '__main__':
