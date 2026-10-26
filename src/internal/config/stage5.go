@@ -37,6 +37,9 @@ func loadStage5(lookup LookupFunc) (Stage5Config, error) {
 	if cfg.Enabled, err = boolValue(lookup, "STAGE5_ENABLED", false); err != nil {
 		return cfg, err
 	}
+	if cfg.Dispatch.WakeupEnabled, err = boolValue(lookup, "STAGE5_WAKEUP_ENABLED", false); err != nil {
+		return cfg, err
+	}
 	if cfg.Control.DBTimeout, err = boundedDuration(lookup, "STAGE5_REQUEST_TIMEOUT", cfg.Control.DBTimeout, time.Millisecond, time.Minute); err != nil {
 		return cfg, err
 	}
@@ -59,6 +62,7 @@ func loadStage5(lookup LookupFunc) (Stage5Config, error) {
 	}{
 		{"STAGE5_PUBLISH_WORKERS", &cfg.Dispatch.Workers, 1, 1, 16},
 		{"STAGE5_SCAN_BATCH", &cfg.Dispatch.BatchSize, 32, 1, 1024},
+		{"STAGE5_PUBLISH_QUEUE_CAPACITY", &cfg.Dispatch.QueueCapacity, 32, 1, 4096},
 		{"STAGE5_RESULT_QUEUE", &cfg.Dispatch.ResultQueueCapacity, 128, 1, 4096},
 		{"STAGE5_PAYLOAD_BYTES", &cfg.Dispatch.MaxPayloadBytes, 8192, 8192, 8192},
 	} {

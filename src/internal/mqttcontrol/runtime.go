@@ -17,13 +17,14 @@ import (
 
 // Config bounds per-process dispatch and expiry work; one backend is active.
 type Config struct {
-	Workers, BatchSize, ResultQueueCapacity, MaxPayloadBytes   int
-	ScanInterval, ExpireInterval, RetryBackoff, PublishTimeout time.Duration
+	Workers, BatchSize, QueueCapacity, ResultQueueCapacity, MaxPayloadBytes int
+	ScanInterval, ExpireInterval, RetryBackoff, PublishTimeout              time.Duration
+	WakeupEnabled                                                           bool
 }
 
 // Validate rejects unbounded or inconsistent work settings.
 func (c Config) Validate() error {
-	if c.Workers < 1 || c.Workers > 16 || c.BatchSize < 1 || c.BatchSize > 1024 || c.ResultQueueCapacity < 1 || c.ResultQueueCapacity > 4096 || c.MaxPayloadBytes != digitaltwin.MaxControlPayloadBytes {
+	if c.Workers < 1 || c.Workers > 16 || c.BatchSize < 1 || c.BatchSize > 1024 || c.QueueCapacity < 1 || c.QueueCapacity > 4096 || c.ResultQueueCapacity < 1 || c.ResultQueueCapacity > 4096 || c.MaxPayloadBytes != digitaltwin.MaxControlPayloadBytes {
 		return errors.New("invalid control bounds")
 	}
 	for _, d := range []time.Duration{c.ScanInterval, c.ExpireInterval, c.RetryBackoff, c.PublishTimeout} {
@@ -36,7 +37,7 @@ func (c Config) Validate() error {
 
 // DefaultConfig supplies conservative starting bounds, not a capacity claim.
 func DefaultConfig() Config {
-	return Config{1, 32, 128, 8192, time.Second, time.Second, time.Second, 3 * time.Second}
+	return Config{Workers: 1, BatchSize: 32, QueueCapacity: 32, ResultQueueCapacity: 128, MaxPayloadBytes: 8192, ScanInterval: time.Second, ExpireInterval: time.Second, RetryBackoff: time.Second, PublishTimeout: 3 * time.Second}
 }
 
 // Repository never holds a SQL transaction across a Publisher call.
@@ -68,6 +69,7 @@ type Runtime struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	jobs     chan dispatchJob
+	wakeup   chan struct{}
 	metrics  *Metrics
 	timeline *metrics.ControlTimeline
 	done     chan struct{}
@@ -86,11 +88,32 @@ func New(cfg Config, repo Repository, pub Publisher, observers ...*Metrics) (*Ru
 		return nil, errors.New("control dependencies required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &Runtime{cfg: cfg, repo: repo, pub: pub, ctx: ctx, cancel: cancel, jobs: make(chan dispatchJob, cfg.BatchSize), done: make(chan struct{}), inflight: map[uuid.UUID]bool{}}
+	r := &Runtime{cfg: cfg, repo: repo, pub: pub, ctx: ctx, cancel: cancel, jobs: make(chan dispatchJob, cfg.QueueCapacity), wakeup: make(chan struct{}, 1), done: make(chan struct{}), inflight: map[uuid.UUID]bool{}}
 	if len(observers) > 0 {
 		r.metrics = observers[0]
+		if r.metrics != nil {
+			r.metrics.queueCapacity.Store(int64(cap(r.jobs)))
+		}
 	}
 	return r, nil
+}
+
+// Notify requests a bounded, coalesced discovery pass. It is intentionally
+// inert until wake-up dispatch consumption is enabled; no channel is closed.
+func (r *Runtime) Notify() {
+	if r == nil || !r.cfg.WakeupEnabled || !r.running.Load() {
+		return
+	}
+	select {
+	case r.wakeup <- struct{}{}:
+		if r.metrics != nil {
+			r.metrics.notifications.Add(1)
+		}
+	default:
+		if r.metrics != nil {
+			r.metrics.coalesced.Add(1)
+		}
+	}
 }
 
 type dispatchJob struct {
@@ -115,6 +138,9 @@ func (r *Runtime) Start() error {
 	}
 	r.started = true
 	r.running.Store(true)
+	if r.metrics != nil {
+		r.metrics.queueCapacity.Store(int64(cap(r.jobs)))
+	}
 	r.wg.Add(r.cfg.Workers + 2)
 	for i := 0; i < r.cfg.Workers; i++ {
 		go r.worker()
@@ -145,6 +171,22 @@ func (r *Runtime) Close(ctx context.Context) error {
 	}
 	select {
 	case <-r.done:
+		r.mu.Lock()
+		for {
+			select {
+			case <-r.jobs:
+			default:
+				goto drained
+			}
+		}
+	drained:
+		clear(r.inflight)
+		if r.metrics != nil {
+			r.metrics.liveWorkers.Store(0)
+			r.metrics.inFlight.Store(0)
+			r.metrics.queueDepth.Store(int64(len(r.jobs)))
+		}
+		r.mu.Unlock()
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -164,49 +206,86 @@ func (r *Runtime) scan() {
 		if r.ctx.Err() != nil {
 			return
 		}
-		if r.pub.Ready() {
-			var start time.Time
-			if r.metrics != nil {
-				start = time.Now()
-			}
-			ids, err := r.repo.PendingControl(r.ctx, r.cfg.BatchSize)
-			if r.metrics != nil {
-				r.metrics.discovery.Observe(time.Since(start))
-			}
-			r.scanOK.Store(err == nil)
-			if err == nil {
-				for _, id := range ids {
-					r.mu.Lock()
-					if !r.inflight[id] && len(r.inflight) < r.cfg.BatchSize+r.cfg.Workers {
-						r.inflight[id] = true
-						job := dispatchJob{id: id}
-						if r.metrics != nil {
-							job.enqueuedAt = time.Now()
-						}
-						select {
-						case r.jobs <- job:
-						default:
-							delete(r.inflight, id)
-						}
-					}
-					r.mu.Unlock()
-				}
-			}
-		}
+		r.discover()
 		select {
 		case <-r.ctx.Done():
 			return
 		case <-timer.C:
+		case <-r.wakeup:
 		}
+	}
+}
+
+// discover is called only by the single scan goroutine for startup, timer, and
+// notifier hints. Durable rows are always re-read; hints carry no dispatch data.
+func (r *Runtime) discover() {
+	if !r.pub.Ready() {
+		return
+	}
+	var start time.Time
+	if r.metrics != nil {
+		start = time.Now()
+		r.metrics.scans.Add(1)
+	}
+	ids, err := r.repo.PendingControl(r.ctx, r.cfg.BatchSize)
+	if r.metrics != nil {
+		r.metrics.discovery.Observe(time.Since(start))
+	}
+	r.scanOK.Store(err == nil)
+	if err != nil && r.metrics != nil {
+		r.metrics.scanErrors.Add(1)
+	}
+	if err != nil {
+		return
+	}
+	discoveredAt := time.Now()
+	for _, id := range ids {
+		if r.timeline != nil {
+			r.timeline.Discovered(id.String(), discoveredAt)
+		}
+		r.mu.Lock()
+		if !r.inflight[id] && len(r.inflight) < r.cfg.QueueCapacity+r.cfg.Workers {
+			r.inflight[id] = true
+			job := dispatchJob{id: id}
+			if r.metrics != nil {
+				job.enqueuedAt = time.Now()
+			}
+			select {
+			case r.jobs <- job:
+				if r.metrics != nil {
+					r.metrics.enqueued.Add(1)
+					r.metrics.queueDepth.Store(int64(len(r.jobs)))
+					r.metrics.inFlight.Store(int64(len(r.inflight)))
+				}
+				if r.timeline != nil {
+					r.timeline.Enqueued(id.String(), time.Now())
+				}
+			default:
+				delete(r.inflight, id)
+				if r.metrics != nil {
+					r.metrics.queueFull.Add(1)
+					r.metrics.queueDepth.Store(int64(len(r.jobs)))
+					r.metrics.inFlight.Store(int64(len(r.inflight)))
+				}
+			}
+		}
+		r.mu.Unlock()
 	}
 }
 func (r *Runtime) worker() {
 	defer r.wg.Done()
+	if r.metrics != nil {
+		r.metrics.liveWorkers.Add(1)
+		defer r.metrics.liveWorkers.Add(-1)
+	}
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
 		case job := <-r.jobs:
+			if r.metrics != nil {
+				r.metrics.queueDepth.Store(int64(len(r.jobs)))
+			}
 			id := job.id
 			if r.metrics != nil {
 				r.metrics.queueWait.Observe(time.Since(job.enqueuedAt))
@@ -217,7 +296,11 @@ func (r *Runtime) worker() {
 			var err error
 			if r.pub.Ready() {
 				var d *digitaltwin.ControlDispatch
+				prepareStart := time.Now()
 				d, err = r.repo.PrepareControl(r.ctx, id)
+				if r.metrics != nil {
+					r.metrics.prepare.Observe(time.Since(prepareStart))
+				}
 				if err == nil && d != nil && r.pub.Ready() {
 					ctx, cancel := context.WithTimeout(r.ctx, r.cfg.PublishTimeout)
 					var start time.Time
@@ -238,7 +321,16 @@ func (r *Runtime) worker() {
 					}
 					cancel()
 					if err == nil {
+						markStart := time.Now()
 						err = r.repo.MarkControlPublished(r.ctx, id)
+						if r.metrics != nil {
+							r.metrics.mark.Observe(time.Since(markStart))
+							if err == nil {
+								r.metrics.markSuccessCalls.Add(1)
+							} else {
+								r.metrics.markErrors.Add(1)
+							}
+						}
 					}
 				}
 			}
@@ -252,7 +344,19 @@ func (r *Runtime) worker() {
 			}
 			r.mu.Lock()
 			delete(r.inflight, id)
+			if r.metrics != nil {
+				r.metrics.inFlight.Store(int64(len(r.inflight)))
+			}
 			r.mu.Unlock()
+			// Once the bounded retry delay has elapsed, one coalesced pass can
+			// refill a batch whose durable pending prefix was previously in-flight.
+			// Disabled wake-up retains timer-only polling behavior.
+			if r.cfg.WakeupEnabled {
+				select {
+				case r.wakeup <- struct{}{}:
+				default:
+				}
+			}
 		}
 	}
 }

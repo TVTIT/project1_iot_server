@@ -15,36 +15,40 @@ func WithControlHTTPEntry(ctx context.Context, at time.Time) context.Context {
 }
 
 type commandTiming struct {
-	start, puback, commit, seen time.Time
-	outcome                     string
-	dispatchDone, resultDone    bool
+	start, puback, commit, admissionCommit, discovery, enqueue, seen time.Time
+	outcome                                                          string
+	dispatchDone, resultDone, discoveryDone, enqueueDone             bool
 }
 
 // ControlTimeline is a bounded, process-local correlation table, never a registry
 // of metric labels. It tolerates a PUBACK/result racing post-commit registration.
 type ControlTimeline struct {
-	mu                                                      sync.Mutex
-	capacity                                                int
-	ttl                                                     time.Duration
-	entries                                                 map[string]*commandTiming
-	now                                                     func() time.Time
-	dispatch, succeeded, failed                             Histogram
-	missingOrigin, missingDispatch, missingResult, overflow int64
+	mu                                                                                        sync.Mutex
+	capacity                                                                                  int
+	ttl                                                                                       time.Duration
+	entries                                                                                   map[string]*commandTiming
+	now                                                                                       func() time.Time
+	dispatch, succeeded, failed, commitToDiscovery, commitToEnqueue                           Histogram
+	missingOrigin, missingDispatch, missingResult, missingDiscovery, missingEnqueue, overflow int64
 }
 
 // ControlTimelineSnapshot exposes counts/histograms only, with no command IDs.
 type ControlTimelineSnapshot struct {
-	Dispatch        HistogramSnapshot `json:"d_dispatch"`
-	Succeeded       HistogramSnapshot `json:"d_e2e_succeeded"`
-	Failed          HistogramSnapshot `json:"d_e2e_failed"`
-	MissingOrigin   int64             `json:"missing_origin"`
-	MissingDispatch int64             `json:"missing_dispatch"`
-	MissingResult   int64             `json:"missing_result"`
-	Overflow        int64             `json:"overflow"`
-	PendingOrigins  int               `json:"pending_origins"`
-	Entries         int               `json:"entries"`
-	Capacity        int               `json:"capacity"`
-	TTLSeconds      float64           `json:"ttl_seconds"`
+	Dispatch          HistogramSnapshot `json:"d_dispatch"`
+	Succeeded         HistogramSnapshot `json:"d_e2e_succeeded"`
+	Failed            HistogramSnapshot `json:"d_e2e_failed"`
+	CommitToDiscovery HistogramSnapshot `json:"commit_to_first_discovery"`
+	CommitToEnqueue   HistogramSnapshot `json:"commit_to_first_enqueue"`
+	MissingOrigin     int64             `json:"missing_origin"`
+	MissingDispatch   int64             `json:"missing_dispatch"`
+	MissingResult     int64             `json:"missing_result"`
+	MissingDiscovery  int64             `json:"missing_commit_to_discovery"`
+	MissingEnqueue    int64             `json:"missing_commit_to_enqueue"`
+	Overflow          int64             `json:"overflow"`
+	PendingOrigins    int               `json:"pending_origins"`
+	Entries           int               `json:"entries"`
+	Capacity          int               `json:"capacity"`
+	TTLSeconds        float64           `json:"ttl_seconds"`
 }
 
 // NewControlTimeline requires finite bounds independent of traffic identifiers.
@@ -57,6 +61,17 @@ func NewControlTimeline(capacity int, ttl time.Duration) (*ControlTimeline, erro
 
 // Register is called only for a new, committed intent, never replay/no-op/reject.
 func (m *ControlTimeline) Register(ctx context.Context, id string) {
+	m.register(ctx, id, time.Time{})
+}
+
+// RegisterCommitted records the request origin and confirmed commit immediately
+// after a new admission transaction returns success. Earlier dispatcher events
+// remain in the bounded entry and are resolved here.
+func (m *ControlTimeline) RegisterCommitted(ctx context.Context, id string, committedAt time.Time) {
+	m.register(ctx, id, committedAt)
+}
+
+func (m *ControlTimeline) register(ctx context.Context, id string, committedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expire()
@@ -76,6 +91,33 @@ func (m *ControlTimeline) Register(ctx context.Context, id string) {
 	}
 	if e.start.IsZero() {
 		e.start = start
+	}
+	if !committedAt.IsZero() && e.admissionCommit.IsZero() {
+		e.admissionCommit = committedAt
+	}
+	m.observe(e)
+}
+
+// Discovered records the first successful scan result for the command.
+func (m *ControlTimeline) Discovered(id string, at time.Time) { m.observeAdmissionStage(id, at, true) }
+
+// Enqueued records the first successful insertion into the bounded jobs queue.
+func (m *ControlTimeline) Enqueued(id string, at time.Time) { m.observeAdmissionStage(id, at, false) }
+
+func (m *ControlTimeline) observeAdmissionStage(id string, at time.Time, discovery bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.expire()
+	e := m.entry(id)
+	if e == nil {
+		return
+	}
+	if discovery {
+		if e.discovery.IsZero() {
+			e.discovery = at
+		}
+	} else if e.enqueue.IsZero() {
+		e.enqueue = at
 	}
 	m.observe(e)
 }
@@ -127,7 +169,7 @@ func (m *ControlTimeline) Snapshot() ControlTimelineSnapshot {
 			pending++
 		}
 	}
-	return ControlTimelineSnapshot{Dispatch: m.dispatch.Snapshot(), Succeeded: m.succeeded.Snapshot(), Failed: m.failed.Snapshot(), MissingOrigin: m.missingOrigin, MissingDispatch: m.missingDispatch, MissingResult: m.missingResult, Overflow: m.overflow, PendingOrigins: pending, Entries: len(m.entries), Capacity: m.capacity, TTLSeconds: m.ttl.Seconds()}
+	return ControlTimelineSnapshot{Dispatch: m.dispatch.Snapshot(), Succeeded: m.succeeded.Snapshot(), Failed: m.failed.Snapshot(), CommitToDiscovery: m.commitToDiscovery.Snapshot(), CommitToEnqueue: m.commitToEnqueue.Snapshot(), MissingOrigin: m.missingOrigin, MissingDispatch: m.missingDispatch, MissingResult: m.missingResult, MissingDiscovery: m.missingDiscovery, MissingEnqueue: m.missingEnqueue, Overflow: m.overflow, PendingOrigins: pending, Entries: len(m.entries), Capacity: m.capacity, TTLSeconds: m.ttl.Seconds()}
 }
 
 func (m *ControlTimeline) entry(id string) *commandTiming {
@@ -158,6 +200,12 @@ func (m *ControlTimeline) expire() {
 		if !e.resultDone && (!e.start.IsZero() || !e.commit.IsZero()) {
 			m.missingResult++
 		}
+		if !e.discoveryDone && !e.admissionCommit.IsZero() {
+			m.missingDiscovery++
+		}
+		if !e.enqueueDone && !e.admissionCommit.IsZero() {
+			m.missingEnqueue++
+		}
 		if e.start.IsZero() {
 			m.missingOrigin++
 		}
@@ -185,6 +233,22 @@ func (m *ControlTimeline) observe(e *commandTiming) {
 			m.succeeded.Observe(e.commit.Sub(e.start))
 		} else {
 			m.failed.Observe(e.commit.Sub(e.start))
+		}
+	}
+	if !e.discoveryDone && !e.discovery.IsZero() && !e.admissionCommit.IsZero() {
+		e.discoveryDone = true
+		if e.discovery.Before(e.admissionCommit) {
+			m.missingDiscovery++
+		} else {
+			m.commitToDiscovery.Observe(e.discovery.Sub(e.admissionCommit))
+		}
+	}
+	if !e.enqueueDone && !e.enqueue.IsZero() && !e.admissionCommit.IsZero() {
+		e.enqueueDone = true
+		if e.enqueue.Before(e.admissionCommit) {
+			m.missingEnqueue++
+		} else {
+			m.commitToEnqueue.Observe(e.enqueue.Sub(e.admissionCommit))
 		}
 	}
 }

@@ -20,23 +20,25 @@ type ResultRepository interface {
 // ResultMetrics uses fixed counters and local processing durations only.
 type ResultMetrics struct {
 	accepted, duplicate, late, rejected, dbError, queueFull atomic.Int64
-	processing                                              metrics.Histogram
+	processing, queueWait, receivedToCommit                 metrics.Histogram
 }
 
 // ResultMetricsSnapshot distinguishes application commit from broker PUBACK.
 type ResultMetricsSnapshot struct {
-	Accepted   int64                     `json:"accepted"`
-	Duplicate  int64                     `json:"duplicate"`
-	Late       int64                     `json:"late"`
-	Rejected   int64                     `json:"rejected"`
-	DBError    int64                     `json:"db_error"`
-	QueueFull  int64                     `json:"queue_full"`
-	Processing metrics.HistogramSnapshot `json:"processing"`
+	Accepted                  int64                     `json:"accepted"`
+	Duplicate                 int64                     `json:"duplicate"`
+	Late                      int64                     `json:"late"`
+	Rejected                  int64                     `json:"rejected"`
+	DBError                   int64                     `json:"db_error"`
+	QueueFull                 int64                     `json:"queue_full"`
+	Processing                metrics.HistogramSnapshot `json:"processing"`
+	QueueWait                 metrics.HistogramSnapshot `json:"queue_wait"`
+	ReceivedToConfirmedCommit metrics.HistogramSnapshot `json:"received_to_confirmed_commit"`
 }
 
 // Snapshot contains no payload, credential or command/device/user identifiers.
 func (m *ResultMetrics) Snapshot() ResultMetricsSnapshot {
-	return ResultMetricsSnapshot{Accepted: m.accepted.Load(), Duplicate: m.duplicate.Load(), Late: m.late.Load(), Rejected: m.rejected.Load(), DBError: m.dbError.Load(), QueueFull: m.queueFull.Load(), Processing: m.processing.Snapshot()}
+	return ResultMetricsSnapshot{Accepted: m.accepted.Load(), Duplicate: m.duplicate.Load(), Late: m.late.Load(), Rejected: m.rejected.Load(), DBError: m.dbError.Load(), QueueFull: m.queueFull.Load(), Processing: m.processing.Snapshot(), QueueWait: m.queueWait.Snapshot(), ReceivedToConfirmedCommit: m.receivedToCommit.Snapshot()}
 }
 
 // ResultConsumer owns a fixed worker set and joins within one caller budget.
@@ -135,6 +137,9 @@ func (r *ResultConsumer) process(raw RawResult) {
 	if r.metrics != nil {
 		start := time.Now()
 		defer func() { r.metrics.processing.Observe(time.Since(start)) }()
+		if !raw.QueuedAt.IsZero() {
+			r.metrics.queueWait.Observe(start.Sub(raw.QueuedAt))
+		}
 	}
 	_, err := digitaltwin.ParseMQTTResult(raw.Topic, raw.Payload, false)
 	if err != nil || raw.ReceivedAt.IsZero() {
@@ -145,6 +150,14 @@ func (r *ResultConsumer) process(raw RawResult) {
 	}
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
+	if r.metrics != nil && !raw.ReceivedAt.IsZero() {
+		ctx = digitaltwin.WithControlResultCommitObserver(ctx, func(committedAt time.Time) {
+			d := committedAt.Sub(raw.ReceivedAt)
+			if d >= 0 {
+				r.metrics.receivedToCommit.Observe(d)
+			}
+		})
+	}
 	outcome, err := r.repo.AcceptControlResult(ctx, raw.Topic, raw.Payload, raw.ReceivedAt)
 	if err != nil {
 		slog.Error("result consumer accept error", "error", err, "topic", raw.Topic)

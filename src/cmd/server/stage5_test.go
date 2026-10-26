@@ -30,3 +30,15 @@ func TestStage5CompositionFlagAndDependencies(t *testing.T) {
 		t.Fatal("nil destination")
 	}
 }
+
+func TestStage5RuntimeReadinessIncludesBrokerTransport(t *testing.T) {
+	if stage5RuntimeReadiness(false, true, true) {
+		t.Fatal("control runtime reported ready while MQTT transport was disconnected")
+	}
+	if !stage5RuntimeReadiness(true, true, true) {
+		t.Fatal("fully started control runtime should be ready")
+	}
+	if stage5RuntimeReadiness(true, false, true) || stage5RuntimeReadiness(true, true, false) {
+		t.Fatal("control runtime reported ready without workers or result consumer")
+	}
+}

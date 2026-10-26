@@ -208,7 +208,11 @@ func run() error {
 		return fmt.Errorf("compose stage 4 dependencies: %w", err)
 	}
 	routerDeps.ControlTimeline = control.timeline
-	if err := populateStage5Dependencies(&routerDeps, cfg, pool); err != nil {
+	var admissionNotifier func()
+	if control.workers != nil {
+		admissionNotifier = control.workers.Notify
+	}
+	if err := populateStage5Dependencies(&routerDeps, cfg, pool, admissionNotifier); err != nil {
 		return fmt.Errorf("compose stage 5 dependencies: %w", err)
 	}
 	if err := populateUserManagementDependencies(&routerDeps, cfg, pool); err != nil {

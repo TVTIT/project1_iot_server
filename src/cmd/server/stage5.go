@@ -13,7 +13,7 @@ import (
 
 // populateStage5Dependencies wires only durable intent/query HTTP dependencies.
 // No broker connection, publisher, result receiver or expiry worker is started.
-func populateStage5Dependencies(deps *httpserver.RouterDependencies, cfg config.Config, pool *pgxpool.Pool) error {
+func populateStage5Dependencies(deps *httpserver.RouterDependencies, cfg config.Config, pool *pgxpool.Pool, notifier ...func()) error {
 	if deps == nil {
 		return fmt.Errorf("router dependencies are required")
 	}
@@ -35,5 +35,8 @@ func populateStage5Dependencies(deps *httpserver.RouterDependencies, cfg config.
 	}
 	deps.ControlRepository = repo
 	repo.SetControlTimeline(deps.ControlTimeline)
+	if cfg.Stage5.Dispatch.WakeupEnabled && len(notifier) > 0 {
+		repo.SetAdmissionNotifier(notifier[0])
+	}
 	return nil
 }

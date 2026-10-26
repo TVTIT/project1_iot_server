@@ -124,7 +124,12 @@ func (r stage5Runtime) close(ctx context.Context) error {
 }
 
 func (r stage5Runtime) Ready() bool {
-	return r.workers != nil && r.results != nil && r.workers.Ready() && r.results.Ready()
+	return stage5RuntimeReadiness(r.transport != nil && r.transport.Ready(),
+		r.workers != nil && r.workers.Ready(), r.results != nil && r.results.Ready())
+}
+
+func stage5RuntimeReadiness(transportReady, workersReady, resultsReady bool) bool {
+	return transportReady && workersReady && resultsReady
 }
 
 type stage5Readiness struct {

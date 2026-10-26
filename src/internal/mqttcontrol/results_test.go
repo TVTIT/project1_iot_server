@@ -44,6 +44,7 @@ func waitResult(t *testing.T, what string, f func() bool) {
 func TestResultConsumerRealWorkersValidateAndClassify(t *testing.T) {
 	m := &ResultMetrics{}
 	q := make(chan RawResult, 16)
+	queuedAt := time.Now().Add(-20 * time.Millisecond)
 	var calls atomic.Int64
 	repo := resultRepoFunc(func(ctx context.Context, _ string, _ []byte, _ time.Time) (digitaltwin.ControlResultOutcome, error) {
 		if _, ok := ctx.Deadline(); !ok {
@@ -82,9 +83,12 @@ func TestResultConsumerRealWorkersValidateAndClassify(t *testing.T) {
 	waitResult(t, "workers did not start", c.Ready)
 	bad := validRawResult(t)
 	bad.Payload = []byte("malformed")
+	bad.QueuedAt = queuedAt
 	q <- bad
 	for i := 0; i < 5; i++ {
-		q <- validRawResult(t)
+		result := validRawResult(t)
+		result.QueuedAt = queuedAt
+		q <- result
 	}
 	waitResult(t, "result outcomes not consumed", func() bool {
 		s := m.Snapshot()
@@ -92,6 +96,9 @@ func TestResultConsumerRealWorkersValidateAndClassify(t *testing.T) {
 	})
 	if calls.Load() != 5 {
 		t.Fatal("malformed entered transaction")
+	}
+	if snapshot := m.Snapshot(); snapshot.QueueWait.Count != 6 || snapshot.Processing.Count != 6 || snapshot.ReceivedToConfirmedCommit.Count != 0 {
+		t.Fatalf("timings = %+v; fake repo does not prove commit point", snapshot)
 	}
 }
 

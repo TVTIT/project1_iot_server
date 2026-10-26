@@ -21,6 +21,67 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_gateway_cli_captures_owned_diagnostics_before_callback_error(self):
+        writes = []
+        class Registry:
+            def __init__(self):
+                self.item = {'name': 'run-gateway-p6-a-steady', 'receipt': {'id': 'owned-id'}}
+                self.obj = {'Id': 'owned-id', 'State': {'Running': True, 'Status': 'running'}}
+                self.created = False
+                self.commands = []
+            def intent(self, *args): return self.item
+            def resolve(self, item): return self.obj if self.created else None
+            def save(self, item): pass
+            def allocating(self, item): pass
+            def command(self, args):
+                self.commands.append(args)
+                if args[0] == 'create':
+                    self.created = True
+                    return Mock(returncode=0, stdout=b'owned-id')
+                if args[0] == 'start': return Mock(returncode=0)
+                if args[0] == 'logs':
+                    return Mock(returncode=0, stdout=b'bounded log', stderr=b'')
+                raise AssertionError(args)
+        fixture = type('Fixture', (), {'project': 'run', 'private': Path('/private')})()
+        registry = Registry()
+        error = RuntimeError('original callback error')
+        with patch.object(smoke, 'private_write', side_effect=lambda path, data: writes.append((path, data))):
+            with self.assertRaises(RuntimeError) as raised:
+                smoke.paper_p0_gateway_cli(fixture, registry, 'image', {'name': 'vol'},
+                    Path('/secret/env'), Path('/private/ca'), 'p6-a-steady', ['run'],
+                    type('State', (), {'checkpoint': lambda self: None})(),
+                    during=lambda: (_ for _ in ()).throw(error))
+        self.assertIs(raised.exception, error)
+        self.assertTrue(any('diagnostic.log' in str(path) and data == 'bounded log'
+                            for path, data in writes))
+        self.assertTrue(any('diagnostic.json' in str(path) and 'callback_exception' in data
+                            for path, data in writes))
+        self.assertIn(['logs', '--tail', '1000', 'owned-id'], registry.commands)
+
+    def test_gateway_cli_diagnostic_failure_does_not_mask_timeout(self):
+        class Registry:
+            def __init__(self):
+                self.item = {'name': 'run-gateway-p6-a-steady', 'receipt': {'id': 'owned-id'}}
+                self.obj = {'Id': 'owned-id', 'State': {'Running': True, 'Status': 'running'}}
+                self.created = False
+            def intent(self, *args): return self.item
+            def resolve(self, item): return self.obj if self.created else None
+            def save(self, item): pass
+            def allocating(self, item): pass
+            def command(self, args):
+                if args[0] == 'create':
+                    self.created = True
+                    return Mock(returncode=0, stdout=b'owned-id')
+                if args[0] == 'start': return Mock(returncode=0)
+                raise AssertionError(args)
+        fixture = type('Fixture', (), {'project': 'run', 'private': Path('/private')})()
+        with patch.object(smoke, 'private_write', side_effect=OSError('disk failure')), \
+             patch.object(smoke.time, 'monotonic', side_effect=[0.0, 2.0, 2.0, 2.0]):
+            with self.assertRaisesRegex(ValueError, 'paper_p0_gateway_failed'):
+                smoke.paper_p0_gateway_cli(fixture, Registry(), 'image', {'name': 'vol'},
+                    Path('/secret/env'), Path('/private/ca'), 'p6-a-steady', ['run'],
+                    type('State', (), {'checkpoint': lambda self: None})(), timeout=1)
+
     def test_startup_migration_failure_blocks_next_phase(self):
         with self.assertRaisesRegex(ValueError, 'migration_nonzero'):
             smoke.startup_state('application-migrations', {'Running': False, 'ExitCode': 1})
@@ -848,6 +909,98 @@ class PaperP1Tests(unittest.TestCase):
                                 for r in rows))
             self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
 
+    def test_p6_control_csv_exports_fixed_dispatch_and_result_decomposition(self):
+        import csv
+        hist = {'count': 3, 'sum_seconds': 0.06, 'overflow': 0,
+                'upper_seconds': [0.01, 0.1], 'buckets': [1, 2]}
+        sample = {'process_instance': 'p', 'elapsed_seconds': 4, 'observed_at': 'now',
+                  'availability': {'command': 'available', 'dispatch_e2e': 'available', 'result': 'available'},
+                  'command_admission': {'accepted': 2, 'admission': hist},
+                  'command_dispatch': {'live_publish_workers': 2, 'published_mark_successful_calls': 5,
+                                       'queue_depth': 3, 'queue_capacity': 32, 'in_flight': 4,
+                                       'notification_signals_accepted': 7,
+                                       'notification_signals_coalesced': 2, 'prepare_db_recheck': hist,
+                                       'published_mark': hist},
+                  'command_result': {'queue_wait': hist, 'received_to_confirmed_commit': hist,
+                                     'accepted': 1},
+                  'command_timeline': {'commit_to_first_discovery': hist,
+                                       'commit_to_first_enqueue': hist,
+                                       'missing_commit_to_discovery': 2,
+                                       'missing_commit_to_enqueue': 3}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            next_sample = dict(sample, elapsed_seconds=5, observed_at='later',
+                               command_dispatch=dict(sample['command_dispatch'],
+                                                     prepare_db_recheck={
+                                                         'count': 5, 'sum_seconds': 0.1, 'overflow': 1,
+                                                         'upper_seconds': [0.01, 0.1], 'buckets': [2, 2]}))
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'control', 'snapshot': sample},
+                                                {'phase': 'control', 'snapshot': next_sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        indexed = {(r['group'], r['metric']): r for r in rows}
+        for group, metric, unit in (
+                ('command_dispatch', 'live_publish_workers', 'count'),
+                ('command_dispatch', 'published_mark_successful_calls', 'count'),
+                ('command_dispatch', 'queue_depth', 'count'),
+                ('command_dispatch', 'queue_capacity', 'count'),
+                ('command_dispatch', 'in_flight', 'count'),
+                ('command_dispatch', 'notification_signals_coalesced', 'count'),
+                ('command_dispatch', 'prepare_db_recheck.count', 'count'),
+                ('command_dispatch', 'published_mark.count', 'count'),
+                ('command_result', 'queue_wait.count', 'count'),
+                ('command_result', 'received_to_confirmed_commit.count', 'count'),
+                ('command_timeline', 'commit_to_first_discovery.count', 'count'),
+                ('command_timeline', 'commit_to_first_enqueue.count', 'count'),
+                ('command_timeline', 'missing_commit_to_discovery', 'count')):
+            self.assertEqual(indexed[(group, metric)]['unit'], unit)
+            self.assertEqual(indexed[(group, metric)]['availability'], 'available')
+        self.assertEqual(indexed[('command_result', 'received_to_confirmed_commit.sum')]['unit'], 'seconds')
+        self.assertEqual(indexed[('command_dispatch', 'prepare_db_recheck.window.p95_seconds')]['value'], 'infinity')
+        self.assertEqual(indexed[('command_dispatch', 'prepare_db_recheck.window.percentile_method')]['value'],
+                         'upper_bucket_approximation')
+
+    def test_p6_histogram_window_delta_and_percentiles_are_process_local_and_bucket_bounded(self):
+        hist1 = {'count': 4, 'sum_seconds': 0.2, 'overflow': 0,
+                 'upper_seconds': [0.01, 0.1, 1.0], 'buckets': [1, 2, 1]}
+        hist2 = {'count': 7, 'sum_seconds': 0.8, 'overflow': 1,
+                 'upper_seconds': [0.01, 0.1, 1.0], 'buckets': [2, 3, 1]}
+        before = {'process_instance': 'same', 'availability': {'dispatch_e2e': 'available'},
+                  'command_dispatch': {'prepare_db_recheck': hist1}}
+        after = {'process_instance': 'same', 'availability': {'dispatch_e2e': 'available'},
+                 'command_dispatch': {'prepare_db_recheck': hist2}}
+        window = smoke.paper_p1_histogram_window(before, after, 'command_dispatch', 'prepare_db_recheck')
+        self.assertEqual(window['availability'], 'available')
+        self.assertEqual(window['count'], 3)
+        self.assertEqual(window['overflow'], 1)
+        self.assertEqual(window['buckets'], [1, 1, 0])
+        self.assertEqual(window['p50_seconds'], 0.1)
+        self.assertEqual(window['p95_seconds'], 'infinity')
+        self.assertEqual(window['percentile_method'], 'upper_bucket_approximation')
+        for bad_before, bad_after in (
+                (before, dict(after, process_instance='restarted')),
+                (None, after),
+                (before, {'process_instance': 'same', 'availability': {'dispatch_e2e': 'available'},
+                          'command_dispatch': {'prepare_db_recheck': dict(hist2, count=3)}}),
+                (before, {'process_instance': 'same', 'availability': {'dispatch_e2e': 'unavailable'},
+                          'command_dispatch': {'prepare_db_recheck': hist2}})):
+            self.assertNotEqual(smoke.paper_p1_histogram_window(
+                bad_before, bad_after, 'command_dispatch', 'prepare_db_recheck')['availability'], 'available')
+
+    def test_p6_histogram_window_marks_disabled_missing_and_non_cumulative_bucket_data(self):
+        hist = {'count': 2, 'sum_seconds': 0.3, 'overflow': 0,
+                'upper_seconds': [0.01, 0.1, 1.0], 'buckets': [1, 0, 1]}
+        disabled = {'process_instance': 'p', 'availability': {'dispatch_e2e': 'disabled'}}
+        available = {'process_instance': 'p', 'availability': {'dispatch_e2e': 'available'},
+                     'command_dispatch': {'prepare_db_recheck': hist}}
+        self.assertEqual(smoke.paper_p1_histogram_window(
+            disabled, available, 'command_dispatch', 'prepare_db_recheck')['availability'], 'disabled')
+        invalid = dict(hist, buckets=[2, 1, 0])
+        corrupt = {'process_instance': 'p', 'availability': {'dispatch_e2e': 'available'},
+                   'command_dispatch': {'prepare_db_recheck': invalid}}
+        self.assertEqual(smoke.paper_p1_histogram_window(
+            available, corrupt, 'command_dispatch', 'prepare_db_recheck')['availability'], 'unavailable')
+
     def test_p3_profile_reuses_p2_but_enables_only_isolated_control(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = smoke.prepare(Path(directory) / 'p3', paper_p3=True)
@@ -855,9 +1008,13 @@ class PaperP1Tests(unittest.TestCase):
             self.assertTrue(fixture.paper_p2)
             self.assertEqual(fixture.values['STAGE5_ENABLED'], 'true')
             self.assertEqual(fixture.values['STAGE5_RESULT_WORKERS'], '2')
+            self.assertEqual(fixture.values['STAGE5_WAKEUP_ENABLED'], 'false')
+            self.assertEqual(fixture.values['STAGE5_PUBLISH_QUEUE_CAPACITY'], '32')
             self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '12')
             model = smoke.dry_effective_config(fixture)
             self.assertEqual(model['services']['backend']['environment']['STAGE5_ENABLED'], 'true')
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_WAKEUP_ENABLED'], 'false')
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_PUBLISH_QUEUE_CAPACITY'], '32')
             self.assertEqual(model['services']['backend']['environment']['SUPABASE_JWT_MODE'], 'rs256')
             ordinary = smoke.prepare(Path(directory) / 'p2', paper_p2=True)
             self.assertEqual(ordinary.values['STAGE5_ENABLED'], 'false')
@@ -1325,6 +1482,15 @@ class PaperP0Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'effective_names_rejected'):
                 smoke.validate_effective_model(fixture, bad)
 
+    def test_effective_p6_profile_accepts_stage5_pool_and_metrics_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p6=('polling', '100'))
+            model = smoke.dry_effective_config(fixture)
+            environment = model['services']['backend']['environment']
+            self.assertEqual(environment['STAGE5_ENABLED'], 'true')
+            self.assertEqual(environment['DATABASE_MAX_CONNS'], '12')
+            self.assertEqual(environment['METRICS_ENABLED'], 'true')
+
     def test_p0_partial_evidence_cannot_be_accepted(self):
         with self.assertRaisesRegex(ValueError, 'paper_p0_acceptance_incomplete'):
             smoke.validate_paper_p0_evidence({'checks': {'raw_samples': 200}})
@@ -1384,6 +1550,16 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertIn("24:telemetry_ledger_timestamp", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
+
+    def test_historical_schema23_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history23 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 23)
+        self.assertTrue(history23.endswith("23:sensor_control_intent"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history23, history23, terminal="23:sensor_control_intent"))
+        # The default verifier remains pinned to current terminal 24.
+        self.assertFalse(smoke.schema_history_verified(0, history23, history23))
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()

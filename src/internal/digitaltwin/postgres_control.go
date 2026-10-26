@@ -41,10 +41,15 @@ type PostgresControlRepository struct {
 	config   ControlConfig
 	metrics  *ControlMetrics
 	timeline *metrics.ControlTimeline
+	notify   func()
 }
 
 // SetControlTimeline installs a shared process-local observer before runtime starts.
 func (r *PostgresControlRepository) SetControlTimeline(t *metrics.ControlTimeline) { r.timeline = t }
+
+// SetAdmissionNotifier installs a nonblocking post-commit signal before requests
+// are served. The callback must not perform I/O or wait for downstream work.
+func (r *PostgresControlRepository) SetAdmissionNotifier(notify func()) { r.notify = notify }
 
 // NewPostgresControlRepository constructs a bounded intent repository.
 func NewPostgresControlRepository(db TxDatabase, config ControlConfig, observers ...*ControlMetrics) (*PostgresControlRepository, error) {
@@ -219,12 +224,16 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 	if err = tx.Commit(ctx); err != nil {
 		return RequestReceipt{}, controlCommitError(err)
 	}
+	committedAt := time.Now()
 	outcome = "accepted"
 	if unchanged {
 		outcome = "noop"
 	}
 	if !unchanged && r.timeline != nil {
-		r.timeline.Register(ctx, *response.CommandID)
+		r.timeline.RegisterCommitted(ctx, *response.CommandID, committedAt)
+	}
+	if !unchanged && r.notify != nil {
+		r.notify()
 	}
 	return response, nil
 }

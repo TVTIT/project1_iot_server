@@ -61,3 +61,20 @@ func TestControlTimelineBoundExpiryAndMissingNeverZeroSamples(t *testing.T) {
 		t.Fatalf("orphan expired: %+v", s)
 	}
 }
+
+func TestControlTimelineCommitToFirstDiscoveryAndEnqueue(t *testing.T) {
+	base := time.Now()
+	m, _ := NewControlTimeline(8, time.Minute)
+	ctx := WithControlHTTPEntry(context.Background(), base)
+	m.Discovered("racing", base.Add(20*time.Millisecond))
+	m.Enqueued("racing", base.Add(25*time.Millisecond))
+	m.RegisterCommitted(ctx, "racing", base.Add(10*time.Millisecond))
+	m.PUBACK("racing", base.Add(30*time.Millisecond))
+	m.ResultCommit("racing", "succeeded", base.Add(40*time.Millisecond))
+	m.Discovered("racing", base.Add(50*time.Millisecond))
+	m.Enqueued("racing", base.Add(60*time.Millisecond))
+	s := m.Snapshot()
+	if s.CommitToDiscovery.Count != 1 || s.CommitToEnqueue.Count != 1 || s.CommitToDiscovery.SumSeconds != .010 || s.CommitToEnqueue.SumSeconds != .015 || s.Dispatch.Count != 1 || s.Dispatch.SumSeconds != .030 || s.Succeeded.Count != 1 || s.Succeeded.SumSeconds != .040 {
+		t.Fatalf("first event timing incorrect: %+v", s)
+	}
+}

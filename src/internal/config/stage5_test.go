@@ -9,6 +9,7 @@ func TestStage5EnvironmentBounds(t *testing.T) {
 	for key, value := range map[string]string{
 		"STAGE5_ENABLED": "maybe", "STAGE5_REQUEST_TIMEOUT": "0s",
 		"STAGE5_COMMAND_TTL": "25h", "STAGE5_MAX_PENDING_OUTBOX": "0", "STAGE5_MAX_RECEIPTS": "1000001",
+		"STAGE5_WAKEUP_ENABLED": "maybe", "STAGE5_PUBLISH_QUEUE_CAPACITY": "0",
 	} {
 		t.Run(key, func(t *testing.T) {
 			values := validConfigValues()
@@ -17,6 +18,27 @@ func TestStage5EnvironmentBounds(t *testing.T) {
 				t.Fatalf("accepted %s=%s", key, value)
 			}
 		})
+	}
+}
+
+func TestStage5DispatchConfigDefaultsAndMappings(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stage5.Dispatch.WakeupEnabled || cfg.Stage5.Dispatch.QueueCapacity != 32 || cfg.Stage5.Dispatch.BatchSize != 32 || cfg.Stage5.Dispatch.Workers != 1 {
+		t.Fatalf("unexpected dispatch defaults: %+v", cfg.Stage5.Dispatch)
+	}
+	values["STAGE5_WAKEUP_ENABLED"] = "true"
+	values["STAGE5_PUBLISH_QUEUE_CAPACITY"] = "7"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.Stage5.Dispatch.WakeupEnabled || cfg.Stage5.Dispatch.QueueCapacity != 7 {
+		t.Fatalf("dispatch mapping: %+v err=%v", cfg.Stage5.Dispatch, err)
+	}
+	values["STAGE5_PUBLISH_QUEUE_CAPACITY"] = "4097"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("accepted queue capacity above 4096")
 	}
 }
 

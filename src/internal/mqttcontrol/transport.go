@@ -21,6 +21,7 @@ type RawResult struct {
 	Topic      string
 	Payload    []byte
 	ReceivedAt time.Time
+	QueuedAt   time.Time
 }
 type dataWire interface {
 	Publish(context.Context, mqttingress.Delivery) error
@@ -99,7 +100,7 @@ func (t *Transport) Admit(topic string, payload []byte, at time.Time, retained b
 		return mqttingress.AdmissionRejectedNotRunning
 	}
 	select {
-	case t.queue <- RawResult{topic, append([]byte(nil), payload...), at}:
+	case t.queue <- RawResult{Topic: topic, Payload: append([]byte(nil), payload...), ReceivedAt: at, QueuedAt: time.Now()}:
 		return mqttingress.AdmissionAccepted
 	default:
 		if t.resultMetrics != nil {

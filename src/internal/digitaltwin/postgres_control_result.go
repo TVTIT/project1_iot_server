@@ -16,6 +16,13 @@ import (
 // ErrControlResultConflict rejects conflicting terminal evidence without overwrite.
 var ErrControlResultConflict = errors.New("control_result_conflict")
 
+type resultCommitObserverKey struct{}
+
+// WithControlResultCommitObserver observes only after the result transaction is confirmed.
+func WithControlResultCommitObserver(ctx context.Context, observe func(time.Time)) context.Context {
+	return context.WithValue(ctx, resultCommitObserverKey{}, observe)
+}
+
 // ControlResultOutcome classifies a committed result operation, not MQTT receipt.
 type ControlResultOutcome string
 
@@ -166,8 +173,14 @@ func (r *PostgresControlRepository) AcceptControlResult(ctx context.Context, top
 	if !found {
 		return "", ErrNotFound
 	}
-	if outcome == ControlResultAccepted && r.timeline != nil {
-		r.timeline.ResultCommit(result.CommandID, string(result.Status), time.Now())
+	if outcome == ControlResultAccepted {
+		committedAt := time.Now()
+		if r.timeline != nil {
+			r.timeline.ResultCommit(result.CommandID, string(result.Status), committedAt)
+		}
+		if observe, ok := ctx.Value(resultCommitObserverKey{}).(func(time.Time)); ok && observe != nil {
+			observe(committedAt)
+		}
 	}
 	return outcome, nil
 }
