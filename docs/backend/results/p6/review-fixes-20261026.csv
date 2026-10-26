@@ -1,0 +1,5 @@
+arm,run_id,status,measured_messages,measured_raw,command_messages,command_raw,db_ledger,db_raw,db_temporal,cli_offered,cli_attempts,cli_application_acks,commands_succeeded,commands_done_s,first_stop_requested_s,both_stopped_s,measured_finished_s,drain_start_s,drain_end_s,cleanup_containers,cleanup_networks,cleanup_volumes
+polling-100,ncs_7c96a0fcb410,PASS,96,9600,33,1460,129,11060,129,129,162,129,6,18.284,18.307,18.597,63.771,64.990,81.135,25,1,9
+wake-up-100,ncs_1f5c396db083,PASS,96,9600,32,1512,128,11112,128,128,158,128,6,17.532,17.554,17.858,63.864,65.039,76.643,25,1,9
+polling-1,ncs_34fd4958cd1d,PASS,96,96,33,80,129,176,129,129,159,129,6,19.217,19.238,19.548,63.798,64.984,76.696,25,1,9
+wake-up-1,ncs_21a719fa5e83,PASS,96,96,30,74,126,170,126,126,153,126,6,17.537,17.560,17.866,63.859,65.117,76.892,25,1,9

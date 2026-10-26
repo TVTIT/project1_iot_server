@@ -1,9 +1,9 @@
 # MQTT Application Protocol v1
 
 > Stage 3 uplink contract finalized on 2026-10-15 (Task 3.0). These are
-> requirements for subsequent implementation, not evidence that telemetry
-> ingestion, Twin writes or application ACKs already run. Downlink/status
-> sections remain separate contracts outside this task.
+> protocol contracts, not by themselves evidence of runtime behavior. Downlink
+> payload/endpoint rules below remain unchanged; for current Stage 5/P6 runtime
+> evidence see the [P6 Local MVP report](../backend/paper-p6-dispatch-and-mixed-load.md).
 
 ## Identity and topics
 
@@ -204,6 +204,37 @@ current observation, reported state becomes value 25.3 / sequence 12503 at
 `.020000Z`; the temporal interval value is 10000 us at the same time.
 
 ## Downlink commands
+
+### Dispatcher operation (P6; no payload or endpoint change)
+
+The backend may be configured to wake its existing dispatcher after a confirmed
+command-admission commit. This is an internal hint, not an MQTT client behavior
+or a change to the command contract:
+
+- `STAGE5_WAKEUP_ENABLED` is read from the backend process environment and is
+  mapped by Compose; its default is `false`. With it off, startup and periodic
+  polling continue as before. With it on, a bounded/coalescing notification
+  prompts discovery sooner, while startup and periodic scans remain recovery
+  paths for missed hints and process restarts.
+- `STAGE5_PUBLISH_QUEUE_CAPACITY` defaults to `32` (accepted range 1–4096).
+  `STAGE5_SCAN_BATCH` independently defaults to `32` (range 1–1024), and
+  `STAGE5_PUBLISH_WORKERS` defaults to `1` (range 1–16). The P6 tested profile
+  is therefore scan batch 32, pending-job queue 32, and one publisher worker;
+  it was not capacity-tuned. A full in-memory publish queue leaves the durable
+  outbox intent pending for a later scan; queue-full is not successful
+  publication. Worker-local jobs are bounded by worker count and payload size
+  is capped by the configured Stage 5 8 KiB limit. The separate result queue
+  defaults to 128 (range 1–4096), with result workers defaulting to 2
+  (range 1–16).
+- Status meanings do not change: `pending` is committed intent,
+  `published` means broker PUBACK only (not execution), and `succeeded` requires
+  a valid result accepted by the backend result transaction. Stable command
+  bytes and normal TTL/terminal-state checks remain in force.
+- Set `STAGE5_WAKEUP_ENABLED=false` to return to polling-only dispatch. This is
+  not a rollback of schema migration 24. Deployment defaults for Stage 5 and
+  wake-up remain disabled; check the P6 report and operations runbook before
+  any isolated fixture exercise. Clients must not publish commands directly
+  to MQTT, and this note does not broaden authorization or ACL scope.
 
 Commands originate from authorized user requests through the backend and are
 dispatched via the transactional outbox to:

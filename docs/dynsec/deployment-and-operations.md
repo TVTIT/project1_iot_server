@@ -227,6 +227,13 @@ Nếu một thao tác gặp sự cố giữa chừng và trả về lỗi `503 S
 
 ### 2.5 Xử Lý Sự Cố Khi Subscribe Bị Từ Chối (`All subscription requests were denied`)
 
+> **Ghi chú lịch sử:** Cảnh báo downlink trong phần dưới mô tả trạng thái
+> credential/ACL của checkpoint DynSec cũ, không phải trạng thái hiện hành của
+> Stage 5. P6 dùng quyền data-principal hiện hành để dispatch/nhận result theo
+> TLS/auth/ACL đã cấu hình; tham khảo [protocol MQTT](../protocols/mqtt-v1.md)
+> và [báo cáo P6](../backend/paper-p6-dispatch-and-mixed-load.md). Không tự cấp
+> thêm quyền hoặc thay ACL dựa trên đoạn lịch sử này.
+
 Nếu một client MQTT (như công cụ kiểm thử `mosquitto_sub` sử dụng tài khoản `backend_service`) kết nối TLS thành công (xác thực mật khẩu hợp lệ) nhưng lệnh đăng ký topic lập tức bị từ chối với thông báo:
 ```text
 All subscription requests were denied.
@@ -243,5 +250,62 @@ All subscription requests were denied.
      ```
    - Nhập mật khẩu qua prompt an toàn hoặc qua file, tránh dùng `-P <password>` lộ mật khẩu ra process list.
 3. **Cảnh báo về quyền điều khiển thiết bị (Downlink Commands):**
-   - Hiện tại tài khoản `backend_service` **chưa có quyền publish** lên `gateways/+/commands/#` và chưa có quyền subscribe `gateways/+/status`, `gateways/+/responses/#`.
-   - Mọi thao tác phát lệnh điều khiển từ `backend_service` sẽ bị broker từ chối cho đến khi lát cắt điều khiển Digital Twin được cấu hình và kiểm chứng bổ sung ở giai đoạn tiếp theo.
+   - Tại checkpoint lịch sử của tài liệu này, tài khoản `backend_service` được ghi nhận là chưa có quyền publish `gateways/+/commands/#` hoặc subscribe `gateways/+/responses/#`; nhận định đó đã được supersede bởi Stage 5/P3–P6 hiện hành.
+   - Các ví dụ probe ACL bên trên chỉ kiểm tra subscription telemetry; chúng không phải hướng dẫn sửa ACL Stage 5 hiện hành.
+
+### 2.6 Phục hồi startup Stage 5 khi broker vắng mặt (P6 Local MVP evidence)
+
+Phần này ghi lại quy trình đã được kiểm chứng trong **fixture cô lập** với
+credential API bật; đây không phải ủy quyền chạy lệnh điều khiển trên shared/live
+deployment. Tham khảo [báo cáo P6](../backend/paper-p6-dispatch-and-mixed-load.md)
+và [artifact rollup đã loại dữ liệu nhạy cảm](../backend/results/p6/summary.json).
+
+Khi backend khởi động trong lúc broker chưa sẵn sàng, kiểm tra readiness của
+credential runtime có thể thất bại đóng và `/readyz` trả HTTP 503. Trong lần
+được thử nghiệm, broker đã trở lại khỏe mạnh nhưng backend vẫn readiness 503;
+không có automatic retry/readiness recovery được chứng minh, và không giả định
+thay đổi semantics. Recovery được chấp nhận là run `ncs_ce2eb3785586`: giữ broker
+khỏe liên tục rồi restart **chỉ backend**. `p6-recovery.json` là artifact có thẩm
+quyền cho acceptance; `run.json` cùng chế độ chỉ là metadata
+`PREPARED_NOT_EXECUTED`, không phải execution evidence. Các recovery attempts
+FAIL trước đó vẫn được giữ trong report.
+
+#### Quy trình operator trong phạm vi đã thử nghiệm
+
+1. Trước khi restart, xác nhận broker healthy và các điều kiện TLS certificate/CA,
+   authentication, data ACL và manager ACL/readback đang đúng; backend Stage 5
+   cần cấu hình hợp lệ. Không tắt TLS, sửa ACL tự động hoặc dùng principal khác
+   để làm readiness xanh. Giữ broker hoạt động ổn định trong toàn bộ recovery.
+2. Nếu credential API đang bật và startup xảy ra khi broker mất kết nối, kiểm tra
+   `/readyz`. Sau khi broker đã khỏe, nếu backend vẫn trả 503, không chờ một
+   automatic retry chưa được xác nhận và không restart broker. Dùng đúng tên
+   service Compose do operator sở hữu; ví dụ minh họa, không phải lệnh cho
+   deployment cụ thể:
+   ```sh
+   docker compose restart <backend-service>
+   ```
+   Không restart DB, broker, proxy hay Gateway trong quy trình đã nghiệm thu.
+3. Chờ readiness của backend trả HTTP 200 (`/readyz`). Nếu Nginx trả 504,
+   đó là proxy/upstream timeout và cần phân biệt với HTTP 503 do Go readiness;
+   nếu recreate backend làm đổi địa chỉ upstream động, operator quản lý proxy
+   có thể cần reload cấu hình Nginx của chính họ. Không reload proxy như một
+   cách chữa Go readiness 503.
+4. Tra command hiện có qua API/DB, kiểm tra nó đi tới trạng thái terminal đúng
+   deadline gốc, rồi đối chiếu `reported.configuration` trong DB và REST sau
+   khi valid result transaction commit. TTL có thể hết hạn trong outage; command
+   timeout phải giữ terminal, và late result không được phép ghi đè
+   configuration. Không gia hạn/reset deadline, không tạo lại command đã
+   published để thay cho command cũ, không sửa state thủ công.
+5. Xác nhận bounded Gateway outbox drain và receipt/configuration watermark
+   trong evidence phù hợp. Native run dừng và kiểm tra SQLite receipt; điều này
+   không chứng minh số lần physical apply hoặc exactly-once execution.
+
+**Evidence qualification:** `ncs_ce2eb3785586` xác nhận broker stable
+`ID`/`startTime`, readiness 200 sau restart backend-only, pending command giữ
+cùng ID/payload hash và thành `succeeded`, DB/REST configuration agreement,
+stopped SQLite receipt/config watermark và bounded outbox drain; cleanup exact
+20 containers / 1 network / 7 volumes. Sau restart, process-local latency origin
+bị mất và được ghi missing, không bịa latency 0. Bằng chứng chỉ thuộc
+credential-enabled startup prerequisite và fixture này; không chứng minh mọi
+kiểu MQTT reconnect, tự phục hồi readiness, physical apply count, exactly-once,
+hay live recovery.
