@@ -65,9 +65,16 @@ def run():
           WHERE entity_id='urn:ngsi-ld:Sensor:p5a_sql_gateway_a:sensor'
           UNION ALL SELECT now(), id, 'measurement', 2 FROM twin_entities
           WHERE entity_id='urn:ngsi-ld:Sensor:p5a_sql_gateway_a:sensor'
-          UNION ALL SELECT now(), id, 'measurement', 3 FROM twin_entities
-          WHERE entity_id='urn:ngsi-ld:Sensor:p5a_sql_gateway_b:sensor';
-        """)
+           UNION ALL SELECT now(), id, 'measurement', 3 FROM twin_entities
+           WHERE entity_id='urn:ngsi-ld:Sensor:p5a_sql_gateway_b:sensor';
+          INSERT INTO twin_states(entity_id,reported_version)
+          SELECT id, 17 FROM twin_entities
+          WHERE entity_id='urn:ngsi-ld:Sensor:p5a_sql_gateway_a:sensor';
+          ALTER TABLE processed_messages ADD COLUMN timestamp timestamptz;
+          UPDATE processed_messages SET timestamp='2026-01-02T03:04:05Z'
+          WHERE gateway_id='p5a_sql_gateway_a'
+            AND message_id='00000000-0000-4000-8000-000000000001';
+         """)
 
         # Preserve the failure evidence: each pre-fix statement must fail at
         # PostgreSQL's nested-aggregate validation, not an unrelated SQL error.
@@ -109,7 +116,32 @@ def run():
             {'ua': 'urn:ngsi-ld:Sensor:absent:a', 'ub': 'urn:ngsi-ld:Sensor:absent:b'})
         if json.loads(empty_gateway) != [] or json.loads(empty_temporal) != []:
             raise RuntimeError('p5a_sql_empty_result_not_empty_array')
-        print('PASS P5A_POSTGRES_SQL_REGRESSION: grouped JSON summaries, deterministic ordering, exact counts, empty arrays', flush=True)
+
+        version_code, version_output = run_query(fixture, p5a.VERSION_SNAPSHOT_SQL,
+            {'urn': 'urn:ngsi-ld:Sensor:p5a_sql_gateway_a:sensor'})
+        if version_code or version_output != '17':
+            raise RuntimeError('p5b_version_snapshot_result_mismatch')
+        _, state_output = run_query(fixture, p5a.STATE_FINGERPRINT_SQL,
+            {'urn': 'urn:ngsi-ld:Sensor:p5a_sql_gateway_a:sensor'})
+        if json.loads(state_output).get('reported_version') != 17:
+            raise RuntimeError('p5b_state_fingerprint_result_mismatch')
+
+        guard_vars = {
+            'gw': 'p5a_sql_gateway_a', 'mid': '00000000-0000-4000-8000-000000000001',
+            'hash': 'different-hash', 'sensor': 'moved-sensor',
+            'boot': '00000000-0000-4000-8000-000000000010',
+            'timestamp': '2026-01-02T03:04:06Z', 'first': '0', 'last': '1',
+        }
+        for case_name in ('same_id_changed_payload', 'same_id_moved_sensor_time_key',
+                          'same_ram_key_different_id', 'different_first_sequence_overlap'):
+            variables = dict(guard_vars)
+            if case_name in ('same_ram_key_different_id', 'different_first_sequence_overlap'):
+                variables['mid'] = '00000000-0000-4000-8000-000000000002'
+                variables['sensor'] = 'sensor'
+            _, guard_output = run_query(fixture, p5a.conflict_guard_query(case_name), variables)
+            if guard_output != 't':
+                raise RuntimeError('p5b_conflict_guard_result_mismatch:' + case_name)
+        print('PASS P5A_POSTGRES_SQL_REGRESSION: summaries plus P5b UUID/text version join and four conflict-precheck queries', flush=True)
     except Exception as exc:
         primary_error = exc
         raise

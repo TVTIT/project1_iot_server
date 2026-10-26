@@ -432,6 +432,57 @@ func TestIngressMicrobatchConfiguration(t *testing.T) {
 	})
 }
 
+func TestIngressRAMDedupConfiguration(t *testing.T) {
+	t.Run("defaults off with finite independent caps", func(t *testing.T) {
+		cfg, err := Load(mapLookup(validConfigValues()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := cfg.Ingress
+		if got.RAMDedupEnabled || got.RAMDedupMaxEntries != 100_000 || got.RAMDedupMaxBytes != 64<<20 {
+			t.Fatalf("RAM dedup defaults: enabled=%v entries=%d bytes=%d", got.RAMDedupEnabled, got.RAMDedupMaxEntries, got.RAMDedupMaxBytes)
+		}
+	})
+	t.Run("enabled independently of ingress shaper and microbatch", func(t *testing.T) {
+		values := validConfigValues()
+		values["MQTT_RAM_DEDUP_ENABLED"] = "true"
+		cfg, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Ingress.RAMDedupEnabled || cfg.Ingress.Enabled || cfg.Ingress.ShaperEnabled || cfg.Ingress.MicrobatchEnabled {
+			t.Fatalf("RAM dedup flags are coupled: ingress=%v shaper=%v microbatch=%v cache=%v", cfg.Ingress.Enabled, cfg.Ingress.ShaperEnabled, cfg.Ingress.MicrobatchEnabled, cfg.Ingress.RAMDedupEnabled)
+		}
+	})
+	t.Run("disabled cache does not follow other opt-ins", func(t *testing.T) {
+		values := validConfigValues()
+		values["MQTT_SHAPER_ENABLED"] = "true"
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		values["METRICS_ENABLED"] = "true"
+		cfg, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Ingress.RAMDedupEnabled || !cfg.Ingress.ShaperEnabled || !cfg.Ingress.MicrobatchEnabled || !cfg.MetricsEnabled {
+			t.Fatalf("RAM dedup must remain independent: cache=%v shaper=%v microbatch=%v metrics=%v", cfg.Ingress.RAMDedupEnabled, cfg.Ingress.ShaperEnabled, cfg.Ingress.MicrobatchEnabled, cfg.MetricsEnabled)
+		}
+	})
+	for _, tt := range []struct{ key, value string }{
+		{"MQTT_RAM_DEDUP_ENABLED", "sometimes"},
+		{"MQTT_RAM_DEDUP_MAX_ENTRIES", "0"}, {"MQTT_RAM_DEDUP_MAX_ENTRIES", "1000001"},
+		{"MQTT_RAM_DEDUP_MAX_BYTES", "0"}, {"MQTT_RAM_DEDUP_MAX_BYTES", "268435457"},
+		{"MQTT_RAM_DEDUP_MAX_BYTES", "9223372036854775808"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			values := validConfigValues()
+			values[tt.key] = tt.value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted invalid %s=%q", tt.key, tt.value)
+			}
+		})
+	}
+}
+
 func TestIngressMicrobatchBoundsUnconditional(t *testing.T) {
 	for _, tt := range []struct{ key, value string }{
 		{"MQTT_MICROBATCH_ENABLED", "sometimes"},

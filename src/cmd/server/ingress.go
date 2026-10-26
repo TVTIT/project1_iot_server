@@ -74,6 +74,9 @@ func mqttIngressOptions(cfg config.Config) mqttingress.Options {
 			MaxRows: cfg.Ingress.MicrobatchMaxRows, MaxPayloadBytes: cfg.Ingress.MicrobatchMaxPayloadBytes,
 			MaxWait: cfg.Ingress.MicrobatchMaxWait,
 		},
+		RAMDedup: mqttingress.DedupCacheOptions{
+			Enabled: cfg.Ingress.RAMDedupEnabled, MaxEntries: int64(cfg.Ingress.RAMDedupMaxEntries), MaxBytes: cfg.Ingress.RAMDedupMaxBytes,
+		},
 	}
 }
 

@@ -122,7 +122,7 @@ def cleanup_container(owned):
 
 def main(rotate=False, revoke=False, startup=False, composition=False, http=False, standalone=False, current=False):
     task = 'task2612' if http or standalone else ('task2611' if composition else ('task269' if startup else ('task268' if revoke else ('task267' if rotate else 'task266'))))
-    directory = Path(tempfile.mkdtemp(prefix=task + '-', dir='/tmp/opencode'))
+    directory = Path(tempfile.mkdtemp(prefix=task + '-', dir='/var/tmp/opencode'))
     directory.chmod(0o700)
     spike = Spike(directory)
     if not current:
@@ -318,12 +318,17 @@ def main(rotate=False, revoke=False, startup=False, composition=False, http=Fals
         cleanup_failed = False
         for owned in (test_container + '-readiness', test_container, database, proxy):
             try:
-                cleanup_container(owned)
+                if owned == test_container and (current or standalone):
+                    from task2612_standalone import cleanup_backend_if_present
+                    cleanup_backend_if_present(owned)
+                else:
+                    cleanup_container(owned)
             except RuntimeError:
                 cleanup_failed = True
         spike.setup(f'chown -R {os.getuid()}:{os.getgid()} /fixture; chmod 700 /fixture')
         spike.cleanup()
-        shutil.rmtree(directory)
+        if not cleanup_failed:
+            shutil.rmtree(directory)
         require(not cleanup_failed, 'owned container cleanup failed')
 
 

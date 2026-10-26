@@ -35,6 +35,7 @@ type processMetrics struct {
 	ElapsedSeconds   float64                               `json:"elapsed_seconds"`
 	Availability     map[string]string                     `json:"availability"`
 	Ingress          *mqttingress.Snapshot                 `json:"ingress"`
+	RAMDedup         *mqttingress.DedupCacheSnapshot       `json:"ram_dedup,omitempty"`
 	HTTP             []httpserver.HTTPMetricSnapshot       `json:"http"`
 	Auth             auth.MetricsSnapshot                  `json:"auth"`
 	UnixAuth         *auth.MetricsSnapshot                 `json:"unix_auth,omitempty"`
@@ -71,8 +72,12 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 		if cfg.Ingress.MicrobatchEnabled {
 			batchAvailability = "unavailable"
 		}
+		dedupAvailability := "disabled"
+		if cfg.Ingress.Enabled && cfg.Ingress.RAMDedupEnabled {
+			dedupAvailability = "unavailable"
+		}
 		s := processMetrics{SchemaVersion: 1, ProcessInstance: instance, StartedAt: started.UTC(), ObservedAt: now.UTC(), ElapsedSeconds: now.Sub(started).Seconds(),
-			Availability: map[string]string{"ingress": "disabled", "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "persistence": "unavailable", "group_persistence": batchAvailability, "batch_wait": batchAvailability, "websocket": "not_implemented"},
+			Availability: map[string]string{"ingress": "disabled", "ram_dedup": dedupAvailability, "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "persistence": "unavailable", "group_persistence": batchAvailability, "batch_wait": batchAvailability, "websocket": "not_implemented"},
 			HTTP:         deps.HTTPMetrics.Snapshot(), Auth: deps.AuthMetrics.Snapshot()}
 		if deps.UnixAuthMetrics != nil {
 			a, h := deps.UnixAuthMetrics.Snapshot(), deps.UnixAuthDuration.Snapshot()
@@ -86,6 +91,13 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 			v := ingress.ingress.Snapshot()
 			s.Ingress = &v
 			s.Availability["ingress"] = "available"
+			cache := v.RAMDedup
+			s.RAMDedup = &cache
+			if cache.Enabled {
+				s.Availability["ram_dedup"] = "available"
+			} else {
+				s.Availability["ram_dedup"] = "disabled"
+			}
 			if !v.Microbatch.Enabled {
 				s.Availability["group_persistence"] = "disabled"
 				s.Availability["batch_wait"] = "disabled"

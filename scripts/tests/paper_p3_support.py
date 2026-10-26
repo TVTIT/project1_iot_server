@@ -36,13 +36,18 @@ class SensorTarget:
         return f'urn:ngsi-ld:Sensor:{self.gateway_id}:{self.sensor_id}'
 
 
-def replace_backend_without_metrics(smoke, fixture, registry, containers, state):
+def replace_backend_without_metrics(smoke, fixture, registry, containers, state, preserve_ram_dedup=False):
     """One backend at a time; same exact-owned replacement pattern as P2 rotation."""
     old = containers['backend']
     name = fixture.project + '-backend-metrics-off'
     fragment = fixture.private / 'compose.metrics-off.yml'
+    environment = '      METRICS_ENABLED: "false"\n'
+    if preserve_ram_dedup:
+        environment += ('      MQTT_RAM_DEDUP_ENABLED: "true"\n'
+                        '      MQTT_RAM_DEDUP_MAX_ENTRIES: "100000"\n'
+                        '      MQTT_RAM_DEDUP_MAX_BYTES: "67108864"\n')
     smoke.private_write(fragment, 'services:\n  backend:\n    container_name: ' + name
-                        + '\n    environment:\n      METRICS_ENABLED: "false"\n')
+                        + '\n    environment:\n' + environment)
     # Let the Unix auth listener unlink its socket before removing the old
     # container. Forced removal alone leaves a stale socket on the owned volume.
     if registry.command(['stop', '--time', '20', old['receipt']['id']]).returncode:
@@ -83,6 +88,10 @@ def replace_backend_without_metrics(smoke, fixture, registry, containers, state)
         raise
     if 'METRICS_ENABLED=false' not in obj['Config']['Env']:
         raise ValueError('paper_p3_acceptance_failed')
+    if preserve_ram_dedup and any(value not in obj['Config']['Env'] for value in (
+            'MQTT_RAM_DEDUP_ENABLED=true', 'MQTT_RAM_DEDUP_MAX_ENTRIES=100000',
+            'MQTT_RAM_DEDUP_MAX_BYTES=67108864')):
+        raise ValueError('paper_p3_acceptance_failed')
     # Nginx may retain the former container IP in its upstream configuration.
     if registry.command(['exec', containers['nginx']['receipt']['id'], 'nginx', '-s', 'reload']).returncode:
         raise ValueError('paper_p3_acceptance_failed')
@@ -98,9 +107,14 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
     secondary = SensorTarget(specs[0].gateway_id, 'sensor_p3_secondary', specs[0].sensor_unit)
     run = {'schema_version': 1, 'run_id': fixture.project, 'status': 'FAIL',
            'full_p3_accepted': False,
-           'mode': 'microbatch_control_regression' if fixture.paper_p3_microbatch else 'baseline',
-           'effective_optimizations': ['mqtt_microbatch'] if fixture.paper_p3_microbatch else [],
-           'effective_flags': {'MQTT_MICROBATCH_ENABLED': fixture.values['MQTT_MICROBATCH_ENABLED']},
+           'mode': ('p5b_cache_control_regression' if fixture.paper_p5b_control_regression else
+                    'microbatch_control_regression' if fixture.paper_p3_microbatch else 'baseline'),
+           'effective_optimizations': (['mqtt_microbatch', 'mqtt_ram_dedup'] if fixture.paper_p5b_control_regression
+                                      else ['mqtt_microbatch'] if fixture.paper_p3_microbatch else []),
+           'effective_flags': {'MQTT_MICROBATCH_ENABLED': fixture.values['MQTT_MICROBATCH_ENABLED'],
+                               'MQTT_RAM_DEDUP_ENABLED': fixture.values['MQTT_RAM_DEDUP_ENABLED'],
+                               'MQTT_RAM_DEDUP_MAX_ENTRIES': fixture.values['MQTT_RAM_DEDUP_MAX_ENTRIES'],
+                               'MQTT_RAM_DEDUP_MAX_BYTES': fixture.values['MQTT_RAM_DEDUP_MAX_BYTES']},
            'revision': smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'),
            'branch': smoke.paper_p0_git(fixture, 'branch', '--show-current'),
            'dirty': bool(smoke.paper_p0_git(fixture, 'status', '--porcelain')),
@@ -217,6 +231,12 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         from stage3_uplink_runner import build_probe_batch, synthetic_value
 
         before_operations = scrape('microbatch_control_before')
+        cache_before = before_operations.get('ingress', {}).get('ram_dedup', {})
+        cache_profile_ok = (not fixture.paper_p5b_control_regression or
+                            cache_before.get('enabled') is True)
+        check('p5b_cache_enabled_during_command_regression', cache_profile_ok,
+              cache_enabled=cache_before.get('enabled'),
+              effective_flag=fixture.values['MQTT_RAM_DEDUP_ENABLED'])
         current = json.loads(sql("""SELECT json_build_object(
           'boot_id', boot_id, 'last_sequence', max(sequence_num),
           'measured_at', to_char(max(measured_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
@@ -334,6 +354,10 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         finally:
             smoke.paper_p1_stop_subscription(ack_observer)
         after_operations = scrape('microbatch_control_after')
+        cache_after = after_operations.get('ingress', {}).get('ram_dedup', {})
+        if fixture.paper_p5b_control_regression:
+            check('p5b_cache_enabled_after_telemetry', cache_after.get('enabled') is True,
+                  cache_enabled=cache_after.get('enabled'))
         before_mb = before_operations['ingress']['microbatch']
         after_mb = after_operations['ingress']['microbatch']
         group_attempt_delta = (after_operations['persistence']['group_attempts']
@@ -491,8 +515,19 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
             run['microbatch_control_regression'] = run_microbatch_configuration_regression()
             run['microbatch_control_regression_accepted'] = microbatch_regression_accepted(
                 run['microbatch_control_regression'])
+            if fixture.paper_p5b_control_regression:
+                run['p5b_control_configuration_preservation_accepted'] = (
+                    run['microbatch_control_regression_accepted'] is True
+                    and fixture.values['MQTT_RAM_DEDUP_ENABLED'] == 'true')
+                run['effective_optimizations'] = ['mqtt_microbatch', 'mqtt_ram_dedup']
         persist()
-        replace_backend_without_metrics(smoke, fixture, registry, containers, state)
+        replace_backend_without_metrics(smoke, fixture, registry, containers, state,
+                                        preserve_ram_dedup=fixture.paper_p5b_control_regression)
+        if fixture.paper_p5b_control_regression:
+            replacement_env = registry.resolve(containers['backend'])['Config']['Env']
+            check('metrics_off_ram_dedup_effective_flags', all(value in replacement_env for value in (
+                'MQTT_RAM_DEDUP_ENABLED=true', 'MQTT_RAM_DEDUP_MAX_ENTRIES=100000',
+                'MQTT_RAM_DEDUP_MAX_BYTES=67108864')))
         check('metrics_disabled_readback', smoke.paper_p2_support().direct_go(
             smoke, registry, containers, tokens['admin'])[0] == 404)
         poll('metrics_off_https_ready', lambda: smoke.http_request(
@@ -517,7 +552,9 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
             smoke, registry, containers, tokens['a'], sensor_path(primary))[0] == 200)
         check('raw_samples_match_after_metrics_off', sql("""SELECT count(*) FROM processed_messages p WHERE
           (SELECT count(*) FROM telemetry t WHERE t.gateway_id=p.gateway_id AND t.message_id=p.message_id)<>p.sample_count;""") == '0')
-        run.update(full_p3_accepted=True, status='WORKLOAD_VERIFIED_CLEANUP_PENDING',
+        run.update(full_p3_accepted=True,
+                   status='PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED' if fixture.paper_p5b_control_regression
+                   else 'WORKLOAD_VERIFIED_CLEANUP_PENDING',
                    command_count=6, metrics_disabled_command_count=1,
                    db_counts=smoke.paper_p1_count_db(registry, pg))
         return run

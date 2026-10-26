@@ -31,6 +31,10 @@ const (
 	maxMicrobatchBytes        = 256 << 20
 	defaultMicrobatchWait     = time.Second
 	maxMicrobatchWait         = 5 * time.Second
+	defaultRAMDedupEntries    = 100_000
+	maxRAMDedupEntries        = 1_000_000
+	defaultRAMDedupBytes      = 64 << 20
+	maxRAMDedupBytes          = 256 << 20
 	// Conservative accounting bounds for decoded rows and per-delivery metadata.
 	// These are sizing guards, not estimates of Go RSS.
 	microbatchDecodedRowBudgetBytes int64 = 256
@@ -98,6 +102,10 @@ type IngressConfig struct {
 	MicrobatchMaxRows         int
 	MicrobatchMaxPayloadBytes int64
 	MicrobatchMaxWait         time.Duration
+
+	RAMDedupEnabled    bool
+	RAMDedupMaxEntries int
+	RAMDedupMaxBytes   int64
 }
 
 // String redacts every value so diagnostics never reveal credentials or paths.
@@ -188,6 +196,15 @@ func loadIngress(lookup LookupFunc, databaseMaxConns int32, credentialEnabled bo
 		return c, err
 	}
 	if c.MicrobatchMaxWait, err = boundedDuration(lookup, "MQTT_MICROBATCH_MAX_WAIT", defaultMicrobatchWait, time.Millisecond, maxMicrobatchWait); err != nil {
+		return c, err
+	}
+	if c.RAMDedupEnabled, err = boolValue(lookup, "MQTT_RAM_DEDUP_ENABLED", false); err != nil {
+		return c, err
+	}
+	if c.RAMDedupMaxEntries, err = integer(lookup, "MQTT_RAM_DEDUP_MAX_ENTRIES", defaultRAMDedupEntries, 1, maxRAMDedupEntries); err != nil {
+		return c, err
+	}
+	if c.RAMDedupMaxBytes, err = boundedInt64(lookup, "MQTT_RAM_DEDUP_MAX_BYTES", defaultRAMDedupBytes, 1, maxRAMDedupBytes); err != nil {
 		return c, err
 	}
 	if c.MicrobatchEnabled {

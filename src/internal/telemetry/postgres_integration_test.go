@@ -101,7 +101,7 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 		}
 		return count
 	}
-	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond).Add(123 * time.Microsecond)
 	makePayload := func(id, gw, sensor string, seq int64, boot string, values []float64) []byte {
 		b, _ := json.Marshal(BatchDTO{ProtocolVersion: 1, MessageID: mustUUID(id), MessageType: "telemetry_batch", GatewayID: gw, SensorID: sensor, BootID: mustUUID(boot), FirstSequence: seq, SampleCount: int32(len(values)), MeasuredAt: base.Format(time.RFC3339Nano), SampleIntervalUS: 10000, Samples: values})
 		return b
@@ -133,7 +133,7 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 		t.Fatalf("raw count=%d err=%v", rows, err)
 	}
 	var ledger int
-	if err := setup.QueryRow(ctx, `SELECT count(*) FROM processed_messages WHERE gateway_id='fixture_gw' AND message_id=$1 AND payload_hash=$2 AND source_topic=$3 AND first_sequence=12501 AND last_sequence=12600 AND sample_count=100`, mustUUID(id), msg.PayloadHash(), msg.Topic().SourceTopic).Scan(&ledger); err != nil || ledger != 1 {
+	if err := setup.QueryRow(ctx, `SELECT count(*) FROM processed_messages WHERE gateway_id='fixture_gw' AND message_id=$1 AND payload_hash=$2 AND source_topic=$3 AND first_sequence=12501 AND last_sequence=12600 AND sample_count=100 AND timestamp=$4`, mustUUID(id), msg.PayloadHash(), msg.Topic().SourceTopic, base).Scan(&ledger); err != nil || ledger != 1 {
 		t.Fatalf("ledger rows=%d err=%v", ledger, err)
 	}
 	var firstSeq, lastSeq int64
@@ -244,7 +244,7 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 	if totalTemporal != twinTemporalBefore+1 {
 		t.Fatalf("total temporal rows after first batch = %d; want %d", totalTemporal, twinTemporalBefore+1)
 	}
-	ledgerSnapshot := snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count)::text FROM processed_messages ORDER BY gateway_id,message_id`)
+	ledgerSnapshot := snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count,timestamp)::text FROM processed_messages ORDER BY gateway_id,message_id`)
 	rawSnapshot := snapshotRows(ctx, t, setup, `SELECT row(measured_at,gateway_id,sensor_id,sequence_num,value,boot_id,message_id,sample_index)::text FROM telemetry ORDER BY measured_at,gateway_id,message_id,sample_index`)
 	expectedLedger, expectedRaw := 1, 100
 	assertUnchanged := func(t *testing.T) {
@@ -259,7 +259,7 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 		if l != expectedLedger || r != expectedRaw {
 			t.Fatalf("unexpected ledger/raw totals %d/%d", l, r)
 		}
-		if got := snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count)::text FROM processed_messages ORDER BY gateway_id,message_id`); got != ledgerSnapshot {
+		if got := snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count,timestamp)::text FROM processed_messages ORDER BY gateway_id,message_id`); got != ledgerSnapshot {
 			t.Fatal("ledger contents changed after retry/rejection")
 		}
 		if got := snapshotRows(ctx, t, setup, `SELECT row(measured_at,gateway_id,sensor_id,sequence_num,value,boot_id,message_id,sample_index)::text FROM telemetry ORDER BY measured_at,gateway_id,message_id,sample_index`); got != rawSnapshot {
@@ -391,7 +391,7 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 		t.Fatalf("nonoverlap totals ledger/raw=%d/%d", finalLedger, finalRaw)
 	}
 	expectedLedger, expectedRaw = finalLedger, finalRaw
-	ledgerSnapshot = snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count)::text FROM processed_messages ORDER BY gateway_id,message_id`)
+	ledgerSnapshot = snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count,timestamp)::text FROM processed_messages ORDER BY gateway_id,message_id`)
 	rawSnapshot = snapshotRows(ctx, t, setup, `SELECT row(measured_at,gateway_id,sensor_id,sequence_num,value,boot_id,message_id,sample_index)::text FROM telemetry ORDER BY measured_at,gateway_id,message_id,sample_index`)
 	// Incomplete graph edges and Gateway/Sensor states fail closed without writes.
 	incomplete := func(topic, gateway, sensor, mid string) {
@@ -604,7 +604,7 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 		t.Fatalf("range race Sensor temporal rows = %d; want 6", got)
 	}
 	expectedLedger, expectedRaw = raceLedger, raceRaw
-	ledgerSnapshot = snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count)::text FROM processed_messages ORDER BY gateway_id,message_id`)
+	ledgerSnapshot = snapshotRows(ctx, t, setup, `SELECT row(gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count,timestamp)::text FROM processed_messages ORDER BY gateway_id,message_id`)
 	rawSnapshot = snapshotRows(ctx, t, setup, `SELECT row(measured_at,gateway_id,sensor_id,sequence_num,value,boot_id,message_id,sample_index)::text FROM telemetry ORDER BY measured_at,gateway_id,message_id,sample_index`)
 	// Task 3.3 boundary: persistence advances only the resolved Sensor Twin and
 	// appends one temporal observation per new batch. No new Twin state rows are
@@ -1114,7 +1114,7 @@ func runPostgresGroupAcceptance(ctx context.Context, t *testing.T, setup, app *p
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Millisecond)
+	base := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Microsecond).Add(123 * time.Microsecond)
 	const boot = "70000000-0000-4000-8000-000000000001"
 	makeMessage := func(id, gw, sensor string, first int64, at time.Time, values ...float64) *Message {
 		t.Helper()
@@ -1184,6 +1184,17 @@ func runPostgresGroupAcceptance(ctx context.Context, t *testing.T, setup, app *p
 	if got := count("SELECT count(*) FROM twin_temporal_values"); got != 3 {
 		t.Fatalf("group temporal count=%d want 3", got)
 	}
+	for i, message := range messages {
+		var stored time.Time
+		first, ok := message.FirstSample()
+		if !ok {
+			t.Fatalf("group message[%d] has no first sample", i)
+		}
+		identity := message.Identity()
+		if err := setup.QueryRow(ctx, "SELECT timestamp FROM processed_messages WHERE gateway_id=$1 AND message_id=$2", identity.GatewayID, identity.MessageID).Scan(&stored); err != nil || !stored.Equal(first.MeasuredAt.UTC()) {
+			t.Fatalf("group ledger timestamp[%d]=%s want %s err=%v", i, stored, first.MeasuredAt.UTC(), err)
+		}
+	}
 	var seqs string
 	if err := setup.QueryRow(ctx, `SELECT string_agg(sequence_num::text, ',' ORDER BY sample_id) FROM telemetry WHERE message_id IN ($1,$2,$3)`, mustUUID("71000000-0000-4000-8000-000000000001"), mustUUID("71000000-0000-4000-8000-000000000002"), mustUUID("71000000-0000-4000-8000-000000000003")).Scan(&seqs); err != nil || seqs != "80001,80002,80003,1,2,3" {
 		t.Fatalf("group raw ordering=%q err=%v", seqs, err)
@@ -1224,6 +1235,11 @@ func runPostgresGroupAcceptance(ctx context.Context, t *testing.T, setup, app *p
 	}
 	if got := count("SELECT count(*) FROM telemetry"); got != 7 {
 		t.Fatalf("mixed raw count=%d want 7", got)
+	}
+	var fallbackTimestamp time.Time
+	fallbackFirst, fallbackHasFirst := valid.FirstSample()
+	if err := setup.QueryRow(ctx, "SELECT timestamp FROM processed_messages WHERE gateway_id='fixture_gw' AND message_id=$1", mustUUID("71000000-0000-4000-8000-000000000004")).Scan(&fallbackTimestamp); err != nil || !fallbackHasFirst || !fallbackTimestamp.Equal(fallbackFirst.MeasuredAt.UTC()) {
+		t.Fatalf("fallback ledger timestamp=%s want %s err=%v", fallbackTimestamp, fallbackFirst.MeasuredAt.UTC(), err)
 	}
 	if got := count("SELECT count(*) FROM twin_temporal_values"); got != 4 {
 		t.Fatalf("mixed temporal count=%d want 4", got)

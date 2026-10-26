@@ -42,7 +42,7 @@ SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
 # of accepting any suffix keeps a missing, extra, renamed, or wrong-version
 # history failing closed; a newly supported migration must update this pin
 # explicitly rather than being silently accepted.
-EXPECTED_SCHEMA_TERMINAL = "23:sensor_control_intent"
+EXPECTED_SCHEMA_TERMINAL = "24:telemetry_ledger_timestamp"
 
 
 def expected_schema_history(directory=None):
@@ -107,6 +107,9 @@ DEFAULTS = dict(
     MQTT_MICROBATCH_ENABLED="false", MQTT_MICROBATCH_MAX_MESSAGES="32",
     MQTT_MICROBATCH_MAX_ROWS="500", MQTT_MICROBATCH_MAX_PAYLOAD_BYTES="4194304",
     MQTT_MICROBATCH_MAX_WAIT="1s",
+    # P5b RAM metadata cache is independently opt-in with explicit local caps.
+    MQTT_RAM_DEDUP_ENABLED="false", MQTT_RAM_DEDUP_MAX_ENTRIES="100000",
+    MQTT_RAM_DEDUP_MAX_BYTES="67108864",
     MQTT_DYNSEC_MANAGER_USERNAME="credential_manager",
     MQTT_DYNSEC_JSON_PATH="/mosquitto/dynsec/dynamic-security.json",
     MQTT_DYNSEC_WRITER_UID="1883",
@@ -165,6 +168,10 @@ class Fixture:
     paper_p5a_dataset: str | None = None
     paper_p3_microbatch: bool = False
     paper_p5a_shutdown: bool = False
+    paper_p5b_cache_smoke: bool = False
+    paper_p5b_control_regression: bool = False
+    paper_p5b: bool = False
+    paper_p5b_cache_mode: str | None = None
 
 
 def fixture_services(fixture):
@@ -559,7 +566,8 @@ def paper_p5a_support():
 
 def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False,
             paper_p2=False, paper_p3=False, paper_p4=None, paper_p5a=None,
-            paper_p3_microbatch=False, paper_p5a_shutdown=False):
+            paper_p3_microbatch=False, paper_p5a_shutdown=False, paper_p5b_cache_smoke=False,
+            paper_p5b_control_regression=False, paper_p5b=None):
     if paper_p3_microbatch and (not paper_p3 or not metrics_enabled or paper_p4 or paper_p5a):
         raise ValueError('paper_p3_microbatch_mode_rejected')
     if paper_p5a is not None:
@@ -568,8 +576,19 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             raise ValueError('paper_p5a_mode_rejected')
         mode, dataset = paper_p5a
         # Validate the complete selector before allocating any fixture paths.
-        paper_p5a_support().profile(mode, dataset, shutdown_smoke=paper_p5a_shutdown)
+        paper_p5a_support().profile(mode, dataset, shutdown_smoke=paper_p5a_shutdown,
+                                    cache_smoke=paper_p5b_cache_smoke)
         paper_p2 = True  # Reuse P2's HTTPS/Unix and TLS/DynSec topology.
+    if paper_p5b is not None:
+        if (not isinstance(paper_p5b, tuple) or len(paper_p5b) != 2 or not metrics_enabled
+                or paper_p0 or paper_p1 or paper_p2_spike or paper_p2 or paper_p3 or paper_p4
+                or paper_p5a is not None or paper_p5a_shutdown or paper_p5b_cache_smoke):
+            raise ValueError('paper_p5b_mode_rejected')
+        cache_mode, dataset = paper_p5b
+        paper_p5a_support().p5b_profile(cache_mode, dataset)
+        mode = 'on'  # P5b compares cache only; microbatch remains enabled in both arms.
+        paper_p5a = (mode, dataset)
+        paper_p2 = True
     if paper_p4 is not None:
         if (paper_p4 not in ('baseline', 'optimized') or not metrics_enabled or paper_p0 or paper_p1
                 or paper_p2_spike or paper_p2 or paper_p3):
@@ -609,12 +628,19 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
         if paper_p3_microbatch:
             values['MQTT_MICROBATCH_ENABLED'] = 'true'
+        if paper_p5b_control_regression:
+            if not paper_p3_microbatch:
+                raise ValueError('paper_p5b_control_requires_p5a_control')
+            values.update(MQTT_RAM_DEDUP_ENABLED='true', MQTT_RAM_DEDUP_MAX_ENTRIES='100000',
+                          MQTT_RAM_DEDUP_MAX_BYTES='67108864')
     if paper_p4:
         values.update(paper_p4_support().profile(paper_p4))
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10', MQTT_MAX_PAYLOAD_BYTES='65536',
                        MQTT_QUEUE_CAPACITY='256', MQTT_WORKER_COUNT='4', STAGE5_ENABLED='false')
     if paper_p5a:
-        values.update(paper_p5a_support().profile(mode, dataset, shutdown_smoke=paper_p5a_shutdown))
+        values.update(paper_p5a_support().p5b_profile(paper_p5b[0], dataset) if paper_p5b else
+                      paper_p5a_support().profile(mode, dataset, shutdown_smoke=paper_p5a_shutdown,
+                                                  cache_smoke=paper_p5b_cache_smoke))
     for key in ("POSTGRES_PASSWORD", "AUTH_DB_PASSWORD", "STORAGE_DB_PASSWORD",
                 "BACKEND_DB_PASSWORD", "JWT_SECRET", "MQTT_PASSWORD",
                 "MQTT_DYNSEC_MANAGER_PASSWORD", "DASHBOARD_PASSWORD"):
@@ -661,14 +687,24 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       art_stat.st_dev, art_stat.st_ino, paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p3,
                       paper_p4 is not None, paper_p4, paper_p5a is not None,
                       mode if paper_p5a else None, dataset if paper_p5a else None,
-                      paper_p3_microbatch, paper_p5a_shutdown)
+                       paper_p3_microbatch, paper_p5a_shutdown, paper_p5b_cache_smoke,
+                       paper_p5b_control_regression)
+    if paper_p5b is not None:
+        object.__setattr__(fixture, 'paper_p5b', True)
+        object.__setattr__(fixture, 'paper_p5b_cache_mode', paper_p5b[0])
     if paper_p2_spike or paper_p2:
         paper_p2_support().prepare_spike(sys.modules[__name__], fixture)
     if paper_p2:
         paper_p2_support().prepare_perimeter(sys.modules[__name__], fixture)
     if paper_p5a:
-        metadata = paper_p5a_support().run_metadata(mode, dataset, shutdown_smoke=paper_p5a_shutdown,
-                                                    effective_environment=fixture.values)
+        metadata = (paper_p5a_support().p5b_run_metadata(paper_p5b[0], dataset,
+                                                         effective_environment=fixture.values,
+                                                         source_revision=paper_p0_git(fixture, 'rev-parse', 'HEAD'),
+                                                         dirty_worktree=bool(paper_p0_git(fixture, 'status', '--porcelain')))
+                    if paper_p5b else
+                    paper_p5a_support().run_metadata(mode, dataset, shutdown_smoke=paper_p5a_shutdown,
+                                                     cache_smoke=paper_p5b_cache_smoke,
+                                                     effective_environment=fixture.values))
         metadata.update(schema_version=1, run_id=fixture.project, status='PREPARED_NOT_EXECUTED',
                         native_executed=False)
         durable_json(fixture.artifacts / 'run.json', metadata)
@@ -712,20 +748,23 @@ def verify_bootstrap_result(fixture, result):
 
 
 def paper_p3_acceptance_report(project, evidence, cleanup_verified, microbatch_enabled=False,
-                               cleanup_counts=None):
+                               cleanup_counts=None, p5b_cache_enabled=False):
     p3_ok = cleanup_verified is True and evidence.get('full_p3_accepted') is True
     regression_ok = (not microbatch_enabled or
                      evidence.get('microbatch_control_regression_accepted') is True)
     accepted = p3_ok and regression_ok
     return {'schema_version': 1,
-            'status': ('PAPER_P5A_CONTROL_REGRESSION_ACCEPTED' if microbatch_enabled else 'PAPER_P3_ACCEPTED')
+            'status': ('PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED' if p5b_cache_enabled else
+                       'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED' if microbatch_enabled else 'PAPER_P3_ACCEPTED')
                       if accepted else 'FAIL',
             'project': project, 'native_executed': True,
             'full_p3_accepted': evidence.get('full_p3_accepted') is True,
             'microbatch_enabled': microbatch_enabled,
+            'ram_dedup_enabled': p5b_cache_enabled,
             'microbatch_control_regression_accepted': (evidence.get('microbatch_control_regression_accepted')
                                                         if microbatch_enabled else None),
-            'effective_optimizations': ['mqtt_microbatch'] if microbatch_enabled else [],
+            'effective_optimizations': (['mqtt_microbatch', 'mqtt_ram_dedup'] if p5b_cache_enabled else
+                                        ['mqtt_microbatch'] if microbatch_enabled else []),
             'exact_cleanup_verified': cleanup_verified is True,
             'cleanup_counts': cleanup_counts or {}}
 
@@ -758,6 +797,7 @@ def validate_effective_model(fixture, model):
             str(ROOT / "migrations/000021_admin_user_management.up.sql"): "/migrations/000021_admin_user_management.up.sql",
             str(ROOT / "migrations/000022_gateway_membership_revocation.up.sql"): "/migrations/000022_gateway_membership_revocation.up.sql",
             str(ROOT / "migrations/000023_sensor_control_intent.up.sql"): "/migrations/000023_sensor_control_intent.up.sql",
+            str(ROOT / "migrations/000024_telemetry_ledger_timestamp.up.sql"): "/migrations/000024_telemetry_ledger_timestamp.up.sql",
         },
         "supabase-envoy": {str(ROOT / "config/envoy" / name): target for name, target in (
             ("envoy.yaml", "/etc/envoy/envoy.yaml"), ("cds.yaml", "/etc/envoy/cds.yaml"),
@@ -835,15 +875,23 @@ def validate_effective_model(fixture, model):
             raise ValueError('paper_p0_profile_rejected')
         if fixture.paper_p3_microbatch and str(env.get('MQTT_MICROBATCH_ENABLED')).lower() != 'true':
             raise ValueError('paper_p3_microbatch_profile_rejected')
+        if fixture.paper_p5b_control_regression and any(
+                str(env.get(key)).lower() != fixture.values[key].lower()
+                for key in ('MQTT_RAM_DEDUP_ENABLED', 'MQTT_RAM_DEDUP_MAX_ENTRIES', 'MQTT_RAM_DEDUP_MAX_BYTES')):
+            raise ValueError('paper_p5b_control_profile_rejected')
         if (fixture.paper_p1 or fixture.paper_p4 or fixture.paper_p5a) and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
             raise ValueError('paper_p1_profile_rejected')
         if fixture.paper_p2:
             paper_p2_support().validate_perimeter(fixture, services)
         if fixture.paper_p4:
             paper_p4_support().validate_effective_environment(fixture, env)
-        if fixture.paper_p5a:
+        if fixture.paper_p5b:
+            paper_p5a_support().p5b_run_metadata(fixture.paper_p5b_cache_mode,
+                fixture.paper_p5a_dataset, effective_environment=env)
+        elif fixture.paper_p5a:
             paper_p5a_support().validate_effective_profile(env, fixture.paper_p5a_mode,
-                fixture.paper_p5a_dataset, shutdown_smoke=fixture.paper_p5a_shutdown)
+                fixture.paper_p5a_dataset, shutdown_smoke=fixture.paper_p5a_shutdown,
+                cache_smoke=fixture.paper_p5b_cache_smoke)
     if backend.get("build", {}).get("context") != str(ROOT / "src") or backend["build"].get("dockerfile") != "Dockerfile" or backend["build"].get("target") != "backend":
         raise ValueError("effective_build_rejected")
     for name in ("backend", "mosquitto"):
@@ -854,7 +902,7 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_rootfs_rejected")
     commands = {"application-migrations": ["/bin/sh", "/run-migrations.sh"],
                 "supabase-role-provisioner": ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"],
-                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql']}
+                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000024_telemetry_ledger_timestamp.up.sql']}
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})
@@ -1236,21 +1284,38 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         if fixture.paper_p5a:
             accepted = (not failure and cleanup_verified and
                         evidence.get('paper_p5a', {}).get('full_p5a_workload_accepted') is True and
+                        (not fixture.paper_p5b or
+                         evidence.get('paper_p5a', {}).get('duplicate_replay', {}).get('status') == 'PASS') and
                         paper_p5a_cleanup_acceptance(fixture, evidence['paper_p5a'],
                                                      cleanup_counts, cleanup_verified, registry))
-            run.update(status='PAPER_P5A_WORKLOAD_ACCEPTED' if accepted else 'FAIL',
+            if fixture.paper_p5b:
+                run.update(status='PAPER_P5B_PROFILE_WORKLOAD_ACCEPTED' if accepted else 'FAIL',
+                           p5b_profile_workload_accepted=accepted,
+                           p5b_comparison_accepted=False,
+                           p5b_pending_phases=['four_profile_reconciliation'])
+            else:
+                run.update(status='PAPER_P5A_WORKLOAD_ACCEPTED' if accepted else 'FAIL')
+            run.update(
                        native_executed=True, cleanup_verified=cleanup_verified,
                         exact_cleanup_verified=accepted, cleanup_counts=cleanup_counts,
                         error=sanitize_failure_code(failure) if failure else None)
+            if fixture.paper_p5b_cache_smoke:
+                run['p5b_cache_functional_accepted'] = accepted
         if fixture.paper_p3:
             accepted = (not failure and cleanup_verified and
                         run.get('full_p3_accepted') is True and
                         (not fixture.paper_p3_microbatch or
                          run.get('microbatch_control_regression_accepted') is True))
-            run.update(status=('PAPER_P5A_CONTROL_REGRESSION_ACCEPTED' if fixture.paper_p3_microbatch
+            run.update(status=(('PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED'
+                                if fixture.paper_p5b_control_regression else
+                                'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED') if fixture.paper_p3_microbatch
                                and accepted else 'PAPER_P3_ACCEPTED' if accepted else 'FAIL'),
                        native_executed=True, full_p3_accepted=run.get('full_p3_accepted') is True,
                        microbatch_enabled=fixture.values['MQTT_MICROBATCH_ENABLED'] == 'true',
+                       ram_dedup_enabled=fixture.values['MQTT_RAM_DEDUP_ENABLED'] == 'true',
+                       p5b_control_configuration_preservation_accepted=(
+                           run.get('microbatch_control_regression_accepted') is True
+                           if fixture.paper_p5b_control_regression else None),
                        microbatch_control_regression_accepted=(run.get('microbatch_control_regression_accepted')
                                                                if fixture.paper_p3_microbatch else None),
                        exact_cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
@@ -1292,7 +1357,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                       'exact_cleanup_verified': True, 'cleanup_counts': cleanup_counts}
         elif fixture.paper_p3:
             report = paper_p3_acceptance_report(fixture.project, evidence['paper_p3'], cleanup_verified,
-                fixture.paper_p3_microbatch, cleanup_counts)
+                fixture.paper_p3_microbatch, cleanup_counts, fixture.paper_p5b_control_regression)
             if report['status'] == 'FAIL':
                 raise ValueError('cleanup_acceptance_incomplete')
         elif fixture.paper_p2:
@@ -1644,6 +1709,8 @@ ALLOWED_FAILURE_ERROR_CODES = {
     "envoy_probe_ownership_refused", "envoy_probe_exit_unresolved",
     "envoy_probe_replacement_refused", "envoy_probe_cleanup_failed",
     "envoy_probe_cleanup_unresolved", "native_execution_deferred",
+    "paper_p5b_conflict_sensor_provision_failed",
+    "paper_p5b_cold_replay_reconciliation_failed", "paper_p5b_functional_smoke_failed",
     "http_body_too_large", "unsafe_summary", "unsafe_failure_report", "unclassified"
 }
 
@@ -2343,6 +2410,25 @@ P5A_MICROBATCH_FIELDS = {
 }
 P5A_MICROBATCH_CONFIG_FIELDS = frozenset((
     'enabled', 'max_messages', 'max_rows', 'max_payload_bytes', 'max_wait_ns'))
+RAM_DEDUP_COUNTER_FIELDS = (
+    'lookup_hit_total', 'lookup_miss_total', 'lookup_expired_total',
+    'lookup_metadata_mismatch_total', 'lookup_disabled_bypass_total',
+    'publication_stored_total', 'publication_existing_total',
+    'publication_metadata_mismatch_total', 'publication_full_total',
+    'publication_invalid_skip_total', 'publication_disabled_bypass_total',
+    'capacity_bypass_total', 'rotations_total', 'database_calls_avoided_total',
+)
+RAM_DEDUP_GAUGE_FIELDS = ('entries', 'logical_bytes', 'current_generation_entries',
+                          'previous_generation_entries')
+RAM_DEDUP_CONFIG_FIELDS = ('enabled', 'ttl_seconds', 'max_entries', 'max_bytes')
+RAM_DEDUP_FIELD_UNITS = {
+    **{name: ('counter', 'operations') for name in RAM_DEDUP_COUNTER_FIELDS},
+    'entries': ('gauge', 'entries'), 'logical_bytes': ('gauge', 'bytes'),
+    'current_generation_entries': ('gauge', 'entries'),
+    'previous_generation_entries': ('gauge', 'entries'),
+    'enabled': ('gauge', 'boolean'), 'ttl_seconds': ('gauge', 'seconds'),
+    'max_entries': ('gauge', 'entries'), 'max_bytes': ('gauge', 'bytes'),
+}
 P1_RATES = {'received_delivery_msg_per_s': 'Received', 'new_committed_msg_per_s': 'Committed',
             'new_committed_samples_per_s': 'SamplesNew'}
 
@@ -2459,6 +2545,32 @@ def paper_p1_metrics_csv(path, samples):
                     if type(old) in (int, float) and value >= old:
                         delta = value - old
                 row('ingress_microbatch', name, kind, unit, value, delta=delta)
+            cache = snap.get('ram_dedup')
+            cache_availability = snap.get('availability', {}).get('ram_dedup')
+            if cache_availability not in ('available', 'disabled', 'unavailable'):
+                cache_availability = 'available' if isinstance(cache, dict) else 'unavailable'
+            previous_cache = previous.get('ram_dedup') if previous else None
+            cache_delta_valid = (persistence_delta_valid and previous is not None
+                                 and snap.get('process_instance') == previous.get('process_instance'))
+            for name, (kind, unit) in RAM_DEDUP_FIELD_UNITS.items():
+                value = cache.get(name) if isinstance(cache, dict) else None
+                valid_type = type(value) is bool if name == 'enabled' else type(value) is int
+                config_available = (cache_availability == 'disabled'
+                                    and name in RAM_DEDUP_CONFIG_FIELDS
+                                    and valid_type)
+                if ((cache_availability != 'available' and not config_available)
+                        or not valid_type):
+                    availability = ('disabled' if cache_availability == 'disabled'
+                                    and name not in RAM_DEDUP_CONFIG_FIELDS else 'unavailable')
+                    writer.writerow(dict(base, group='ram_dedup', metric=name, kind=kind, unit=unit,
+                                         availability=availability))
+                    continue
+                delta = None
+                if kind == 'counter' and cache_delta_valid and isinstance(previous_cache, dict):
+                    old = previous_cache.get(name)
+                    if type(old) is int and value >= old:
+                        delta = value - old
+                row('ram_dedup', name, kind, unit, value, delta=delta)
             for name, value in rates.items():
                 row('ingress', name, 'rate', 'samples/s' if 'samples' in name else 'messages/s', value)
             histograms = [('ingress', key, value) for key, value in ing.get('Durations', {}).items()
@@ -2714,6 +2826,16 @@ def prepare_paper_workload(fixture, registry, endpoint, containers, images, stat
                 or not body.get('password')):
             raise ValueError('paper_p0_seed_failed')
         passwords.append(body['password'])
+    if fixture.paper_p5b_cache_smoke:
+        # The moved-ID case must remain a valid same-Gateway telemetry target;
+        # provision a second Sensor through the ordinary owner API path.
+        for role, spec in zip(('a', 'b'), specs):
+            conflict_sensor_id = spec.sensor_id + '-conflict'
+            status, _, body = http_request(endpoint, 'PUT',
+                f'/v1/gateways/{spec.gateway_id}/sensors/{urllib.parse.quote(conflict_sensor_id, safe="")}',
+                token=tokens[role], body={'name': 'Cache conflict sensor', 'unit': spec.sensor_unit})
+            if status != 201 or body.get('entity_id') != f'urn:ngsi-ld:Sensor:{spec.gateway_id}:{conflict_sensor_id}':
+                raise ValueError('paper_p5b_conflict_sensor_seed_failed')
     sensor_path = '/v1/digital-twins/' + urllib.parse.quote(specs[0].sensor_urn, safe=':')
     status, _, body = http_request(endpoint, 'GET', sensor_path, token=tokens['a'])
     durable_json(fixture.private / 'paper-p0-read-progress.json',
@@ -2822,8 +2944,8 @@ FROM telemetry WHERE gateway_id=:'gw';
 
 def cli_arguments():
     return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http",
-            "--paper-p0", "--paper-p1", "--paper-p3", "--p5a-control-regression",
-            "--paper-p4", "--paper-p5a", "--mode", "--dataset")
+            "--paper-p0", "--paper-p1", "--paper-p3", "--p5a-control-regression", "--p5b-control-regression",
+            "--paper-p4", "--paper-p5a", "--paper-p5b", "--cache-mode", "--mode", "--dataset")
 
 
 def paper_p4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
@@ -2858,9 +2980,19 @@ def paper_p4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verif
 
 def paper_p5a_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
     """The workload marker is intentionally narrower than full P5a acceptance."""
-    return (evidence.get('full_p5a_workload_accepted') is True and cleanup_verified is True
+    accepted = (evidence.get('full_p5a_workload_accepted') is True and cleanup_verified is True
             and paper_p4_cleanup_acceptance(
                 fixture, {'full_p4_accepted': True}, cleanup_counts, cleanup_verified, registry))
+    if fixture.paper_p5b_cache_smoke:
+        from paper_p5a_support import cache_smoke_acceptance_ready
+        accepted = accepted and cache_smoke_acceptance_ready({
+            'warm_replay': evidence.get('warm_replay'),
+            'conflicts': evidence.get('conflict_assertions'),
+            'cold_replay': evidence.get('cold_replay'),
+            'exact_cleanup_verified': cleanup_verified is True})
+        evidence['p5b_cache_functional_accepted'] = accepted
+        evidence['exact_cleanup_verified'] = cleanup_verified is True
+    return accepted
 
 
 def paper_p1_resources_csv(path, snapshots, limits):
@@ -3014,15 +3146,23 @@ def paper_p1_subscription_messages(data):
     return messages
 
 
-def paper_p1_capture_subscription(subscription, expected_topic, *, timeout=5, max_bytes=131072):
+def paper_p1_capture_subscription(subscription, expected_topic, *, timeout=5, max_bytes=131072,
+                                  after_count=0):
+    if type(after_count) is not int or after_count < 0:
+        raise ValueError('paper_p1_subscription_failed')
     proc, _, path = subscription[:3]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.stat().st_size > max_bytes:
             raise ValueError('paper_p1_subscription_failed')
         messages = paper_p1_subscription_messages(path.read_bytes())
+        matching_ordinal = 0
         for topic, payload in messages:
             if topic == expected_topic:
+                ordinal = matching_ordinal
+                matching_ordinal += 1
+                if ordinal < after_count:
+                    continue
                 if not payload or len(payload) > 65536:
                     raise ValueError('paper_p1_subscription_failed')
                 return payload
@@ -3030,6 +3170,12 @@ def paper_p1_capture_subscription(subscription, expected_topic, *, timeout=5, ma
             return None
         time.sleep(0.05)
     return None
+
+
+def paper_p1_subscription_match_count(subscription, expected_topic, *, max_bytes=131072):
+    """Return the current matching-PUBLISH ordinal boundary for one subscription."""
+    return sum(topic == expected_topic for topic, _ in
+               paper_p1_subscription_log_messages(subscription, max_bytes=max_bytes))
 
 
 def paper_p1_subscription_log_messages(subscription, *, max_bytes=131072):
@@ -3426,10 +3572,18 @@ def main():
     parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
     parser.add_argument('--p5a-control-regression', action='store_true',
                         help='With --paper-p3, opt in to microbatch and run the focused command/result preservation regression')
+    parser.add_argument('--p5b-control-regression', action='store_true',
+                        help='With --paper-p3 --p5a-control-regression, enable schema-24 RAM dedup during the P3 regression')
     parser.add_argument('--paper-p4', action='store_true', help='P4 isolated finite two-Gateway ingress workload')
     parser.add_argument('--paper-p5a', action='store_true', help='Run the finite isolated P5a MQTT/Gateway workload')
     parser.add_argument('--paper-p5a-shutdown-smoke', action='store_true',
                         help='Add one isolated on/1 partial-group SIGTERM drain smoke')
+    parser.add_argument('--paper-p5b-cache-smoke', action='store_true',
+                        help='Opt in to schema-24 P5b cache profile on the existing P5a fixture (on/1 only)')
+    parser.add_argument('--paper-p5b', action='store_true',
+                        help='Select the comparable schema-24 P5b RAM-cache workload profile')
+    parser.add_argument('--cache-mode', choices=('off', 'on'),
+                        help='P5b RAM-cache mode; independent of the fixed microbatch-on setting')
     parser.add_argument('--mode', choices=('baseline', 'optimized', 'off', 'on'))
     parser.add_argument('--dataset', choices=('100', '1'))
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
@@ -3440,6 +3594,8 @@ def main():
         parser.error('P3 cannot be combined with other execution modes')
     if args.p5a_control_regression and not args.paper_p3:
         parser.error('--p5a-control-regression requires --paper-p3')
+    if args.p5b_control_regression and not (args.paper_p3 and args.p5a_control_regression):
+        parser.error('--p5b-control-regression requires --paper-p3 --p5a-control-regression')
     if args.paper_p2 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.startup_only,
                              args.positive_http_only, args.role_http_only, args.full_http, args.mode, args.metrics_off)):
         parser.error('P2 cannot be combined with other execution modes')
@@ -3457,18 +3613,31 @@ def main():
                                args.paper_p3, args.paper_p4, args.startup_only, args.positive_http_only,
                                args.role_http_only, args.full_http, args.metrics_off)):
         parser.error('P5a cannot be combined with other execution modes or metrics-off')
+    if args.paper_p5b and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
+                               args.paper_p3, args.paper_p4, args.paper_p5a, args.startup_only,
+                               args.positive_http_only, args.role_http_only, args.full_http,
+                               args.paper_p5a_shutdown_smoke, args.paper_p5b_cache_smoke, args.metrics_off)):
+        parser.error('P5b cannot be combined with other execution modes')
     if args.paper_p1 and args.mode is None:
         parser.error('--paper-p1 requires --mode')
     if args.paper_p4 and args.mode is None:
         parser.error('--paper-p4 requires --mode')
     if args.paper_p5a and (args.mode not in ('off', 'on') or args.dataset is None):
         parser.error('--paper-p5a requires --mode off|on and --dataset 100|1')
+    if args.paper_p5b and (args.cache_mode not in ('off', 'on') or args.dataset is None):
+        parser.error('--paper-p5b requires --cache-mode off|on and --dataset 100|1')
     if args.paper_p5a_shutdown_smoke and not (args.paper_p5a and args.mode == 'on' and args.dataset == '1'):
         parser.error('--paper-p5a-shutdown-smoke requires --paper-p5a --mode on --dataset 1')
+    if args.paper_p5b_cache_smoke and not (args.paper_p5a and args.mode == 'on' and args.dataset == '1'
+                                           and not args.paper_p5a_shutdown_smoke):
+        parser.error('--paper-p5b-cache-smoke requires --paper-p5a --mode on --dataset 1 without shutdown smoke')
     if args.dataset is not None and not args.paper_p5a:
-        parser.error('--dataset requires --paper-p5a')
+        if not args.paper_p5b:
+            parser.error('--dataset requires --paper-p5a or --paper-p5b')
     if args.mode is not None and not args.paper_p1 and not args.paper_p4 and not args.paper_p5a:
         parser.error('--mode requires --paper-p1, --paper-p4 or --paper-p5a')
+    if args.cache_mode is not None and not args.paper_p5b:
+        parser.error('--cache-mode requires --paper-p5b')
     if args.metrics_off and not args.paper_p1:
         parser.error('--metrics-off requires --paper-p1')
     fixture = None
@@ -3478,9 +3647,12 @@ def main():
                           metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike,
                            paper_p2=args.paper_p2, paper_p3=args.paper_p3,
                            paper_p3_microbatch=args.p5a_control_regression,
+                           paper_p5b_control_regression=args.p5b_control_regression,
                            paper_p4=args.mode if args.paper_p4 else None,
                             paper_p5a=(args.mode, args.dataset) if args.paper_p5a else None,
-                            paper_p5a_shutdown=args.paper_p5a_shutdown_smoke)
+                            paper_p5b=(args.cache_mode, args.dataset) if args.paper_p5b else None,
+                             paper_p5a_shutdown=args.paper_p5a_shutdown_smoke,
+                             paper_p5b_cache_smoke=args.paper_p5b_cache_smoke)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -3505,7 +3677,8 @@ def main():
         return 1
 
     try:
-        if args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3 or args.paper_p4 or args.paper_p5a:
+        if (args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3
+                or args.paper_p4 or args.paper_p5a or args.paper_p5b):
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.

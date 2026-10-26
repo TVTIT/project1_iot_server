@@ -4,7 +4,7 @@
 Disposable fixture stack, all owned resources created and removed by exact ID
 under /tmp/opencode:
 
-  * pinned TimescaleDB container (reused DatabaseFixture), migrations 1..20,
+  * pinned TimescaleDB container (reused DatabaseFixture), migrations 1..24,
     seeded Gateway/Sensor graph with sentinel desired/Gateway state;
   * pinned Mosquitto 2.0.18 broker using the production config file (with the
     new max_packet_size/message_size_limit limits), TLS and a fresh DynSec store
@@ -56,7 +56,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/tests'))
 from task28_simplified_schema_runner import DatabaseFixture, ENV, sanitize_output  # noqa: E402
-from stage3_persistence_runner import bootstrap_to_9, run_existing_migration_runner  # noqa: E402
+from stage3_persistence_runner import (  # noqa: E402
+    apply_post_auth_compatibility, bootstrap_to_9, run_existing_migration_runner,
+)
 from task26_harness_helpers import MQTT, RESPONSE  # noqa: E402
 
 MOSQUITTO_IMAGE = 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
@@ -796,6 +798,9 @@ def main(argv=None) -> int:
         else:
             bootstrap_to_9(fixture)
             run_existing_migration_runner(fixture, 20)
+            # This fixture runs the current telemetry writer, which requires the
+            # timestamp ledger column introduced by schema 24.
+            apply_post_auth_compatibility(fixture)
             seed_graph(fixture)
 
         print('stage=bootstrap-dynsec', flush=True)

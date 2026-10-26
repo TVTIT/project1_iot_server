@@ -133,6 +133,108 @@ func TestMQTTIngressOptionsWireEveryMicrobatchLimit(t *testing.T) {
 	}
 }
 
+func TestMQTTIngressOptionsWireRAMDedupIndependently(t *testing.T) {
+	cfg := ingressTestConfig("unused")
+	cfg.Ingress.RAMDedupEnabled = true
+	cfg.Ingress.RAMDedupMaxEntries = 321
+	cfg.Ingress.RAMDedupMaxBytes = 987654
+	got := mqttIngressOptions(cfg)
+	if got.RAMDedup != (mqttingress.DedupCacheOptions{Enabled: true, MaxEntries: 321, MaxBytes: 987654}) {
+		t.Fatalf("RAM dedup options = %+v", got.RAMDedup)
+	}
+	if got.Microbatch.Enabled || got.MetricsEnabled {
+		t.Fatalf("cache options unexpectedly changed independent flags: %+v", got)
+	}
+}
+
+func TestComposeIngressRAMDedupMetricsOffStillEnforcesAndExportsFixedSnapshot(t *testing.T) {
+	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.RAMDedupEnabled = true
+	cfg.Ingress.RAMDedupMaxEntries = 321
+	cfg.Ingress.RAMDedupMaxBytes = 987654
+	cfg.MetricsEnabled = false
+	runtime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := runtime.ingress.Snapshot()
+	if !snapshot.RAMDedup.Enabled || snapshot.RAMDedup.MaxEntries != 321 || snapshot.RAMDedup.MaxBytes != 987654 || snapshot.RAMDedup.TTLSeconds != 600 {
+		t.Fatalf("effective cache config missing with metrics off: %+v", snapshot.RAMDedup)
+	}
+	if runtime.metrics != nil {
+		t.Fatal("persistence instrumentation should remain off")
+	}
+
+	// Metrics are an optional observer; cache enforcement and its accounting live
+	// in the ingress/cache and remain available even if that observer is absent.
+	cache := runtime.ingress.DedupCacheSnapshot()
+	if !cache.Enabled || cache.MaxEntries != 321 || cache.MaxBytes != 987654 {
+		t.Fatalf("cache enforcement snapshot = %+v", cache)
+	}
+
+	cfg.MetricsEnabled = true
+	metricsRuntime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := &httpserver.RouterDependencies{}
+	populateMetricsDependencies(deps, cfg, testPool(t), metricsRuntime, stage5Runtime{})
+	process := deps.MetricsSnapshot().(processMetrics)
+	if process.RAMDedup == nil || process.Availability["ram_dedup"] != "available" {
+		t.Fatalf("metrics snapshot missing cache state: %+v", process)
+	}
+	if process.RAMDedup.Enabled != true || process.RAMDedup.TTLSeconds != 600 || process.RAMDedup.MaxEntries != 321 || process.RAMDedup.MaxBytes != 987654 {
+		t.Fatalf("wrong fixed cache metrics: %+v", process.RAMDedup)
+	}
+}
+
+func TestProcessMetricsDistinguishesDisabledAndUnavailableRAMDedup(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		cfg        config.Config
+	}{
+		{name: "disabled", want: "disabled", cfg: config.Config{MetricsEnabled: true}},
+		{name: "cache disabled without ingress source", want: "disabled", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{Enabled: true}}},
+		{name: "ingress disabled with cache flag", want: "disabled", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{RAMDedupEnabled: true}}},
+		{name: "enabled without ingress source", want: "unavailable", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{Enabled: true, RAMDedupEnabled: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := &httpserver.RouterDependencies{}
+			populateMetricsDependencies(deps, tc.cfg, testPool(t), ingressRuntime{}, stage5Runtime{})
+			got := deps.MetricsSnapshot().(processMetrics)
+			if got.Availability["ram_dedup"] != tc.want {
+				t.Fatalf("ram_dedup availability = %q, want %q", got.Availability["ram_dedup"], tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessMetricsRAMDedupAvailabilityUsesRuntimeSnapshot(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "available"}[enabled], func(t *testing.T) {
+			cfg := ingressTestConfig(writeIngressTestCA(t))
+			cfg.MetricsEnabled = true
+			cfg.Ingress.RAMDedupEnabled = enabled
+			cfg.Ingress.RAMDedupMaxEntries = 10
+			cfg.Ingress.RAMDedupMaxBytes = 65536
+			runtime, err := composeIngress(cfg, testPool(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			deps := &httpserver.RouterDependencies{}
+			populateMetricsDependencies(deps, cfg, testPool(t), runtime, stage5Runtime{})
+			got := deps.MetricsSnapshot().(processMetrics)
+			want := "disabled"
+			if enabled {
+				want = "available"
+			}
+			if got.RAMDedup == nil || got.RAMDedup.Enabled != enabled || got.Availability["ram_dedup"] != want {
+				t.Fatalf("RAM dedup snapshot = %+v, availability = %q, want %q", got.RAMDedup, got.Availability["ram_dedup"], want)
+			}
+		})
+	}
+}
+
 func TestComposeIngressUsesConfiguredRepositoryModeAndSharedMetrics(t *testing.T) {
 	t.Run("default off keeps baseline path and no collector", func(t *testing.T) {
 		cfg := ingressTestConfig(writeIngressTestCA(t))

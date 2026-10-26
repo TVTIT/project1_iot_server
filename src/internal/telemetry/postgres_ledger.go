@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -25,6 +26,7 @@ type ledgerMessage struct {
 	firstSample SampleCandidate
 	lastSample  SampleCandidate
 	sampleCount int32
+	timestamp   time.Time
 }
 
 // insertTelemetryLedger inserts a message provenance row or classifies an
@@ -39,13 +41,13 @@ func insertTelemetryLedger(ctx context.Context, tx pgx.Tx, message *Message) (le
 	var insertedGatewayID string
 	err = tx.QueryRow(ctx, `INSERT INTO public.processed_messages (
 		gateway_id, message_id, payload_hash, source_topic, sensor_id, boot_id,
-		first_sequence, last_sequence, sample_count
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		first_sequence, last_sequence, sample_count, timestamp
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	ON CONFLICT (gateway_id, message_id) DO NOTHING
 	RETURNING gateway_id`,
 		entry.topic.GatewayID, entry.messageID, entry.payloadHash,
 		entry.topic.SourceTopic, entry.sensorID, entry.bootID,
-		entry.firstSample.SequenceNum, entry.lastSample.SequenceNum, entry.sampleCount,
+		entry.firstSample.SequenceNum, entry.lastSample.SequenceNum, entry.sampleCount, entry.timestamp,
 	).Scan(&insertedGatewayID)
 	if err == nil {
 		var overlap bool
@@ -78,12 +80,13 @@ func insertTelemetryLedger(ctx context.Context, tx pgx.Tx, message *Message) (le
 	var firstSequence pgtype.Int8
 	var lastSequence pgtype.Int8
 	var sampleCount pgtype.Int4
+	var timestamp pgtype.Timestamptz
 	err = tx.QueryRow(ctx, `SELECT payload_hash, source_topic, sensor_id, boot_id,
-		first_sequence, last_sequence, sample_count
+		first_sequence, last_sequence, sample_count, timestamp
 		FROM public.processed_messages
 		WHERE gateway_id = $1 AND message_id = $2`,
 		entry.topic.GatewayID, entry.messageID,
-	).Scan(&payloadHash, &sourceTopic, &sensorID, &bootID, &firstSequence, &lastSequence, &sampleCount)
+	).Scan(&payloadHash, &sourceTopic, &sensorID, &bootID, &firstSequence, &lastSequence, &sampleCount, &timestamp)
 	if err != nil {
 		return ledgerDispositionUnconfirmed, dependencyError("read conflicting telemetry message ledger", err)
 	}
@@ -94,13 +97,17 @@ func insertTelemetryLedger(ctx context.Context, tx pgx.Tx, message *Message) (le
 		lastSequence.Int64-firstSequence.Int64 != int64(sampleCount.Int32)-1 {
 		return ledgerDispositionUnconfirmed, &ReasonError{Code: ReasonLegacyProvenanceUnknown, Field: "ledger_provenance"}
 	}
+	if !timestamp.Valid {
+		return ledgerDispositionUnconfirmed, &ReasonError{Code: ReasonLegacyProvenanceUnknown, Field: "ledger_timestamp_unknown"}
+	}
 	if payloadHash.String != entry.payloadHash || sourceTopic.String != entry.topic.SourceTopic {
 		return ledgerDispositionUnconfirmed, &ReasonError{Code: ReasonMessageConflict, Field: "message_id"}
 	}
 	if sensorID.String != entry.sensorID || bootID.Bytes != entry.bootID.Bytes ||
 		firstSequence.Int64 != entry.firstSample.SequenceNum ||
 		lastSequence.Int64 != entry.lastSample.SequenceNum ||
-		sampleCount.Int32 != entry.sampleCount {
+		sampleCount.Int32 != entry.sampleCount ||
+		!timestamp.Time.UTC().Equal(entry.timestamp) {
 		return ledgerDispositionUnconfirmed, &ReasonError{Code: ReasonMessageConflict, Field: "message_provenance"}
 	}
 	return ledgerDispositionDuplicate, nil
@@ -136,5 +143,6 @@ func ledgerMetadata(message *Message) (ledgerMessage, error) {
 		firstSample: first,
 		lastSample:  last,
 		sampleCount: int32(count),
+		timestamp:   first.MeasuredAt.UTC(),
 	}, nil
 }

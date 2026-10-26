@@ -28,11 +28,11 @@ class MetricsOffReplacementTests(unittest.TestCase):
         self.smoke.startup_state.return_value = True
         self.state = mock.Mock()
 
-    def invoke(self, returncode=0):
+    def invoke(self, returncode=0, preserve_ram_dedup=False):
         with mock.patch.object(runner.subprocess, 'run', return_value=SimpleNamespace(
                 returncode=returncode, stdout=b'', stderr=b'')) as command:
             runner.replace_backend_without_metrics(self.smoke, self.fixture, self.registry,
-                                                   self.containers, self.state)
+                                                   self.containers, self.state, preserve_ram_dedup)
             return command
 
     def test_removes_exact_old_backend_before_allocating_replacement(self):
@@ -82,6 +82,21 @@ class MetricsOffReplacementTests(unittest.TestCase):
             self.invoke()
         self.registry.remove.assert_not_called()
         self.registry.allocating.assert_not_called()
+
+    def test_metrics_off_replacement_keeps_cache_effective_flags_when_requested(self):
+        self.obj['Config']['Env'] += ['MQTT_RAM_DEDUP_ENABLED=true',
+                                      'MQTT_RAM_DEDUP_MAX_ENTRIES=100000',
+                                      'MQTT_RAM_DEDUP_MAX_BYTES=67108864']
+        self.invoke(preserve_ram_dedup=True)
+        fragment = self.smoke.private_write.call_args_list[0].args[1]
+        self.assertIn('METRICS_ENABLED: "false"', fragment)
+        self.assertIn('MQTT_RAM_DEDUP_ENABLED: "true"', fragment)
+        self.assertIn('MQTT_RAM_DEDUP_MAX_ENTRIES: "100000"', fragment)
+        self.assertIn('MQTT_RAM_DEDUP_MAX_BYTES: "67108864"', fragment)
+
+    def test_metrics_off_cache_readback_fails_closed_if_flag_was_lost(self):
+        with self.assertRaisesRegex(ValueError, 'paper_p3_acceptance_failed'):
+            self.invoke(preserve_ram_dedup=True)
 
 
 class MicrobatchRegressionContractTests(unittest.TestCase):

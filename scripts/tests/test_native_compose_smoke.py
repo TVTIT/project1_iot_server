@@ -176,6 +176,22 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn(f"{key}={value}\n", env_text)
             self.assertNotIn("deployment-value-must-not-leak", env_text)
 
+    def test_p5b_ram_dedup_defaults_are_explicit_and_default_off(self):
+        expected = {
+            "MQTT_RAM_DEDUP_ENABLED": "false",
+            "MQTT_RAM_DEDUP_MAX_ENTRIES": "100000",
+            "MQTT_RAM_DEDUP_MAX_BYTES": "67108864",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
     def test_p4_broker_configs_keep_packet_overhead_and_control_bounds(self):
         root_config = smoke.ROOT / "config/mosquitto/mosquitto.conf"
         text = root_config.read_text()
@@ -671,6 +687,84 @@ class PaperP1Tests(unittest.TestCase):
                     ('ingress_microbatch', 'enabled'), ('ingress_durations', 'batch_wait.count')):
             self.assertEqual(missing_fields[key]['value'], '')
 
+    def test_p1_metrics_csv_exports_fixed_ram_dedup_fields_with_truthful_availability(self):
+        import csv
+        snapshot = {'process_instance': 'cache-instance', 'elapsed_seconds': 12,
+                    'observed_at': '2026-10-26T10:00:00Z',
+                    'availability': {'ram_dedup': 'available'},
+                    'ram_dedup': {
+                        'lookup_hit_total': 4, 'lookup_miss_total': 8,
+                        'lookup_expired_total': 1, 'lookup_metadata_mismatch_total': 2,
+                        'lookup_disabled_bypass_total': 0, 'publication_stored_total': 7,
+                        'publication_existing_total': 2, 'publication_metadata_mismatch_total': 1,
+                        'publication_full_total': 3, 'publication_invalid_skip_total': 4,
+                        'publication_disabled_bypass_total': 5, 'capacity_bypass_total': 6,
+                        'rotations_total': 2, 'database_calls_avoided_total': 4,
+                        'entries': 7, 'logical_bytes': 896, 'current_generation_entries': 5,
+                        'previous_generation_entries': 2, 'enabled': True, 'ttl_seconds': 600,
+                        'max_entries': 1000, 'max_bytes': 65536,
+                        'unexpected_private_label': 'must_not_export'},
+                    'ingress': {}}
+        disabled = {'process_instance': 'cache-instance', 'elapsed_seconds': 13,
+                    'observed_at': '2026-10-26T10:00:01Z',
+                    'availability': {'ram_dedup': 'disabled'},
+                    'ram_dedup': {'enabled': False}, 'ingress': {}}
+        unavailable = {'process_instance': 'cache-instance', 'elapsed_seconds': 14,
+                      'observed_at': '2026-10-26T10:00:02Z',
+                      'availability': {'ram_dedup': 'unavailable'}, 'ingress': {}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [
+                {'phase': 'warm', 'snapshot': snapshot},
+                {'phase': 'disabled', 'snapshot': disabled},
+                {'phase': 'missing', 'snapshot': unavailable}])
+            with target.open() as stream:
+                reader = csv.DictReader(stream)
+                header = reader.fieldnames
+                rows = list(reader)
+        values = {(r['phase'], r['metric']): r for r in rows if r['group'] == 'ram_dedup'}
+        self.assertEqual(values[('warm', 'lookup_hit_total')]['value'], '4')
+        self.assertEqual(values[('warm', 'lookup_hit_total')]['unit'], 'operations')
+        self.assertEqual(values[('warm', 'logical_bytes')]['unit'], 'bytes')
+        self.assertEqual(values[('warm', 'ttl_seconds')]['unit'], 'seconds')
+        self.assertEqual(values[('warm', 'database_calls_avoided_total')]['value'], '4')
+        self.assertEqual(values[('warm', 'database_calls_avoided_total')]['delta'], '')
+        self.assertEqual(values[('disabled', 'lookup_hit_total')]['availability'], 'disabled')
+        self.assertEqual(values[('disabled', 'max_bytes')]['availability'], 'unavailable')
+        self.assertEqual(values[('missing', 'lookup_hit_total')]['availability'], 'unavailable')
+        self.assertEqual(values[('missing', 'lookup_hit_total')]['value'], '')
+        self.assertNotIn('unexpected_private_label', {r['metric'] for r in rows})
+        self.assertEqual(header, ['schema_version', 'timestamp_utc', 'elapsed_seconds', 'process_instance',
+                                  'phase', 'group', 'metric', 'kind', 'unit', 'value', 'delta',
+                                  'rate_per_s', 'availability', 'error'])
+
+    def test_p1_cache_export_preserves_explicit_unavailable_with_present_snapshot(self):
+        import csv
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                snapshot = {
+                    'process_instance': 'same', 'elapsed_seconds': 1,
+                    'observed_at': '2026-10-26T10:00:00Z',
+                    'availability': {'ram_dedup': 'unavailable'},
+                    'ram_dedup': {'enabled': enabled, 'lookup_hit_total': 0},
+                    'ingress': {},
+                }
+                target = Path(directory) / 'metrics.csv'
+                smoke.paper_p1_metrics_csv(target, [{'phase': 'unavailable', 'snapshot': snapshot}])
+                with target.open() as stream:
+                    rows = [row for row in csv.DictReader(stream) if row['group'] == 'ram_dedup']
+                hit = next(row for row in rows if row['metric'] == 'lookup_hit_total')
+                self.assertEqual(hit['availability'], 'unavailable')
+                self.assertEqual(hit['value'], '')
+
+    def test_p5a_metadata_has_explicit_cache_off_and_schema24_defaults(self):
+        support = smoke.paper_p5a_support()
+        metadata = support.run_metadata('off', '100')
+        self.assertEqual(metadata['database_schema_version'], 24)
+        self.assertEqual(metadata['ram_cache'], {
+            'enabled': False, 'ttl_seconds': 600, 'max_entries': 100000,
+            'max_bytes': 67108864, 'status': 'configured_not_run'})
+
     def test_p5a_profiles_only_change_microbatch_and_keep_cache_disabled(self):
         support = smoke.paper_p5a_support()
         for dataset, samples in (('100', 100), ('1', 1)):
@@ -690,7 +784,9 @@ class PaperP1Tests(unittest.TestCase):
                 self.assertEqual(meta['offered_pattern']['status'], 'configured_not_run')
                 self.assertEqual(meta['auth_tls_acl'], {
                     'auth_mode': 'rs256', 'https': True, 'mqtt_tls': True, 'acl_enforced': True})
-                self.assertEqual(meta['ram_cache'], {'enabled': False, 'status': 'not_implemented'})
+                self.assertEqual(meta['ram_cache'], {
+                    'enabled': False, 'ttl_seconds': 600, 'max_entries': 100000,
+                    'max_bytes': 67108864, 'status': 'configured_not_run'})
                 self.assertEqual(meta['mode'], mode)
                 self.assertEqual(meta['effective_profile_source'], 'validated_compose_environment')
                 self.assertEqual(meta['effective_profile']['MQTT_MICROBATCH_ENABLED'],
@@ -788,6 +884,37 @@ class PaperP1Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '^paper_p3_microbatch_mode_rejected$'):
                 smoke.prepare(Path(directory) / 'bad', paper_p3_microbatch=True)
 
+    def test_p5b_control_variant_requires_p5a_control_and_keeps_schema24_cache_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, '^paper_p5b_control_requires_p5a_control$'):
+                smoke.prepare(Path(directory) / 'bad', paper_p3=True, paper_p5b_control_regression=True)
+            fixture = smoke.prepare(Path(directory) / 'good', paper_p3=True, paper_p3_microbatch=True,
+                                    paper_p5b_control_regression=True)
+            self.assertTrue(fixture.paper_p5b_control_regression)
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            model = smoke.dry_effective_config(fixture)
+            env = model['services']['backend']['environment']
+            self.assertEqual(env['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(env['MQTT_RAM_DEDUP_MAX_ENTRIES'], '100000')
+            self.assertEqual(env['MQTT_RAM_DEDUP_MAX_BYTES'], '67108864')
+            self.assertIn('000024_telemetry_ledger_timestamp.up.sql',
+                          model['services']['supabase-compat-migration']['command'][-1])
+
+    def test_p5b_control_cli_requires_both_explicit_regression_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P3_FIXTURE_ONLY'}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'cli'),
+                    '--paper-p3', '--p5a-control-regression', '--p5b-control-regression']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            self.assertTrue(captured['fixture'].paper_p5b_control_regression)
+            self.assertIn('--p5b-control-regression', smoke.cli_arguments())
+
     def test_p3_microbatch_cli_routes_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as directory:
             captured = {}
@@ -817,6 +944,14 @@ class PaperP1Tests(unittest.TestCase):
             self.assertEqual(report['status'], 'FAIL')
             if not cleanup:
                 self.assertFalse(report['exact_cleanup_verified'])
+
+    def test_p5b_control_report_is_narrow_and_requires_exact_cleanup(self):
+        evidence = {'full_p3_accepted': True, 'microbatch_control_regression_accepted': True}
+        report = smoke.paper_p3_acceptance_report('fixture', evidence, True, True, {}, True)
+        self.assertEqual(report['status'], 'PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED')
+        self.assertTrue(report['ram_dedup_enabled'])
+        self.assertFalse(report.get('full_p5b_accepted', False))
+        self.assertEqual(smoke.paper_p3_acceptance_report('fixture', evidence, False, True, {}, True)['status'], 'FAIL')
 
     def test_p4_profiles_are_comparable_and_use_real_shaper_switch(self):
         expected = {
@@ -1006,6 +1141,89 @@ class PaperP1Tests(unittest.TestCase):
             wrapper = (smoke.ROOT / 'scripts/test-paper-p5a.sh').read_text()
             self.assertIn('--paper-p5a', wrapper)
 
+    def test_p5b_cli_selects_cache_mode_without_running_native_workload(self):
+        support = smoke.paper_p5a_support()
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P5B_PROFILE_FIXTURE_ONLY', 'native_executed': False}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'p5b'),
+                    '--paper-p5b', '--cache-mode', 'off', '--dataset', '100']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            fixture = captured['fixture']
+            self.assertTrue(fixture.paper_p5b)
+            self.assertEqual((fixture.paper_p5b_cache_mode, fixture.paper_p5a_dataset), ('off', '100'))
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'false')
+            artifact = json.loads((fixture.artifacts / 'run.json').read_text())
+            self.assertEqual(artifact['comparison']['cache_mode'], 'off')
+            self.assertEqual(artifact['phases']['duplicate_replay']['status'], 'configured_not_run')
+            self.assertFalse(artifact['native_executed'])
+            self.assertIn('--paper-p5b', smoke.cli_arguments())
+
+    def test_p5b_prepared_arms_use_same_schema24_profile_except_ram_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for dataset in ('100', '1'):
+                prepared = {}
+                for mode in ('off', 'on'):
+                    fixture = smoke.prepare(Path(directory) / f'{mode}-{dataset}',
+                                            paper_p5b=(mode, dataset))
+                    prepared[mode] = fixture
+                    artifact = json.loads((fixture.artifacts / 'run.json').read_text())
+                    self.assertEqual(artifact['database_schema_version'], 24)
+                    self.assertEqual(artifact['comparison']['microbatch_mode'], 'on')
+                    self.assertEqual(artifact['effective_profile']['MQTT_MICROBATCH_ENABLED'], 'true')
+                    self.assertEqual(artifact['effective_profile']['MQTT_RAM_DEDUP_ENABLED'],
+                                     'true' if mode == 'on' else 'false')
+                    self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'false')
+                    self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '10')
+                    self.assertEqual(fixture.values['MQTT_WORKER_COUNT'], '4')
+                    self.assertEqual(artifact['phases']['new_messages']['status'], 'configured_not_run')
+                    self.assertEqual(artifact['phases']['duplicate_replay']['offered_attempts'], 24)
+                    self.assertIsInstance(artifact['source']['source_revision'], str)
+                    self.assertIsInstance(artifact['source']['dirty_worktree'], bool)
+                    self.assertEqual(artifact['source']['image_manifest']['status'], 'captured_after_image_build')
+                off_profile = smoke.paper_p5a_support().p5b_profile('off', dataset)
+                on_profile = smoke.paper_p5a_support().p5b_profile('on', dataset)
+                self.assertEqual({k: v for k, v in off_profile.items() if k != 'MQTT_RAM_DEDUP_ENABLED'},
+                                 {k: v for k, v in on_profile.items() if k != 'MQTT_RAM_DEDUP_ENABLED'})
+
+    def test_p5b_cli_rejects_missing_or_conflicting_cache_selector(self):
+        cases = (
+            ['--paper-p5b', '--dataset', '1'],
+            ['--cache-mode', 'on', '--dataset', '1'],
+            ['--paper-p5b', '--cache-mode', 'on', '--dataset', '1', '--paper-p5a', '--mode', 'on'],
+        )
+        for extra in cases:
+            with self.subTest(extra=extra), patch.object(sys, 'argv', ['native_compose_smoke.py',
+                    '--prepare', '/tmp/unused-p5b', *extra]), \
+                    self.assertRaises(SystemExit):
+                smoke.main()
+
+    def test_p5b_cache_flag_selects_only_the_schema24_p5a_on_one_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p5b', paper_p5a=('on', '1'),
+                                    paper_p5b_cache_smoke=True)
+            self.assertTrue(fixture.paper_p5b_cache_smoke)
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_MAX_ENTRIES'], '100000')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_MAX_BYTES'], '67108864')
+            metadata = smoke.paper_p5a_support().run_metadata('on', '1', cache_smoke=True,
+                                                               effective_environment=fixture.values)
+            self.assertEqual(metadata['database_schema_version'], 24)
+            self.assertEqual(metadata['cache_smoke_contract']['status'],
+                             'configured_not_run')
+            self.assertEqual(metadata['cache_smoke_contract']['phases'],
+                             ['warm_from_new_commit', 'exact_replay', 'representative_conflicts',
+                              'cold_exact_replay_after_controlled_backend_restart'])
+            for profile in (('off', '1'), ('on', '100')):
+                with self.assertRaisesRegex(ValueError, '^paper_p5b_cache_profile_rejected$'):
+                    smoke.prepare(Path(directory) / ('bad' + profile[0] + profile[1]),
+                                  paper_p5a=profile, paper_p5b_cache_smoke=True)
+
     def test_p1_profile_reuses_p0_resources_but_keeps_its_own_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             for mode in ('baseline', 'optimized'):
@@ -1157,34 +1375,34 @@ class PaperP0Tests(unittest.TestCase):
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 23);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 24);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("23:sensor_control_intent", expected)
+        self.assertIn("24:telemetry_ledger_timestamp", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",23:sensor_control_intent")
+        stale = expected.removesuffix(",24:telemetry_ledger_timestamp")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "23:sensor_control_intent")
+        missing = ",".join(p for p in expected.split(",") if p != "24:telemetry_ledger_timestamp")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("23:sensor_control_intent", "23:unexpected_name")
+        wrong = expected.replace("24:telemetry_ledger_timestamp", "24:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
         expected = smoke.expected_schema_history()
-        self.assertFalse(smoke.schema_history_verified(0, expected + ",23:future_migration", expected))
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",24:future_migration", expected))
 
     def test_failed_migration_returncode_rejected(self):
         expected = smoke.expected_schema_history()
@@ -1195,7 +1413,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("23:sensor_control_intent", "24:future_migration")
+        future = expected.replace("24:telemetry_ledger_timestamp", "25:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 
@@ -2304,6 +2522,13 @@ class AllocationTests(unittest.TestCase):
     def test_safe_failure_report_schema_and_allowlists(self):
         with tempfile.TemporaryDirectory() as directory:
             f = smoke.prepare(Path(directory) / "fixture")
+            for code in ("paper_p5b_cold_replay_reconciliation_failed",
+                         "paper_p5b_functional_smoke_failed"):
+                self.assertIn(code, smoke.ALLOWED_FAILURE_ERROR_CODES)
+                self.assertEqual(smoke.sanitize_failure_code(ValueError(code)), code)
+                report = smoke.record_failure_report(f, phase="paper_p5a",
+                    exc=ValueError(code), cleanup_verified=True)
+                self.assertEqual(report["error_code"], code)
             valid_report = {
                 "schema_version": 1,
                 "status": "STARTUP_FAILED",

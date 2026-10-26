@@ -1,6 +1,10 @@
 package telemetry
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
 
 func TestLedgerMetadataRequiresValidatedSampleRange(t *testing.T) {
 	if _, err := ledgerMetadata(nil); reasonCode(err) != ReasonInvalidPayload {
@@ -34,4 +38,84 @@ func TestLedgerMetadataRequiresValidatedSampleRange(t *testing.T) {
 	if _, err := ledgerMetadata(&malformed); reasonCode(err) != ReasonInvalidPayload {
 		t.Fatalf("inconsistent sample range error = %v, want %s", err, ReasonInvalidPayload)
 	}
+}
+
+func TestLedgerMetadataPreservesOriginalSampleZeroTimestamp(t *testing.T) {
+	validator, err := NewValidator(messageTestLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sourceTimestamp = "2026-08-21T10:15:00.123456+02:00"
+	message, err := validator.Validate("gateways/gateway_001/telemetry/sensor_001",
+		messageTestBatchPayload(t, sourceTimestamp, 12501, []float64{1, 2}), messageTestReceivedAt())
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := ledgerMetadata(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 21, 8, 15, 0, 123456000, time.UTC)
+	if !metadata.timestamp.Equal(want) || metadata.timestamp.Location() != time.UTC {
+		t.Fatalf("ledger timestamp = %s (%s), want %s UTC", metadata.timestamp, metadata.timestamp.Location(), want)
+	}
+}
+
+func TestInsertTelemetryLedgerPersistsAndComparesTimestamp(t *testing.T) {
+	validator, err := NewValidator(messageTestLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := validator.Validate("gateways/gateway_001/telemetry/sensor_001",
+		messageTestBatchPayload(t, "2026-08-21T10:15:00.123456Z", 12501, []float64{1, 2}), messageTestReceivedAt())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 21, 10, 15, 0, 123456000, time.UTC)
+	t.Run("new ledger persists sample-zero timestamp", func(t *testing.T) {
+		tx := &telemetryFakeTx{message: message}
+		got, err := insertTelemetryLedger(context.Background(), tx, message)
+		if err != nil || got != ledgerDispositionNew {
+			t.Fatalf("insert disposition = %v, error = %v", got, err)
+		}
+		if len(tx.ledgerInsertArgs) != 10 {
+			t.Fatalf("insert args count = %d, want timestamp as tenth argument", len(tx.ledgerInsertArgs))
+		}
+		stored, ok := tx.ledgerInsertArgs[9].(time.Time)
+		if !ok || !stored.Equal(want) || stored.Location() != time.UTC {
+			t.Fatalf("insert timestamp = %#v, want %s UTC", tx.ledgerInsertArgs[9], want)
+		}
+	})
+
+	t.Run("exact replay is duplicate", func(t *testing.T) {
+		tx := &telemetryFakeTx{message: message, duplicate: true}
+		got, err := insertTelemetryLedger(context.Background(), tx, message)
+		if err != nil || got != ledgerDispositionDuplicate {
+			t.Fatalf("replay disposition = %v, error = %v", got, err)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		edit func(*telemetryFakeTx)
+	}{
+		{"timestamp", func(tx *telemetryFakeTx) { other := want.Add(time.Microsecond); tx.duplicateTimestamp = &other }},
+		{"sensor", func(tx *telemetryFakeTx) { tx.duplicateSensor = "sensor_other" }},
+		{"payload", func(tx *telemetryFakeTx) { tx.duplicateHash = "different-hash" }},
+	} {
+		t.Run("same ID different "+tc.name+" conflicts", func(t *testing.T) {
+			tx := &telemetryFakeTx{message: message, duplicate: true}
+			tc.edit(tx)
+			got, err := insertTelemetryLedger(context.Background(), tx, message)
+			if got != ledgerDispositionUnconfirmed || reasonCode(err) != ReasonMessageConflict {
+				t.Fatalf("conflicting replay = %v, %v; want unconfirmed message conflict", got, err)
+			}
+		})
+	}
+	t.Run("legacy NULL timestamp remains unconfirmed", func(t *testing.T) {
+		tx := &telemetryFakeTx{message: message, duplicate: true, duplicateNullTimestamp: true}
+		got, err := insertTelemetryLedger(context.Background(), tx, message)
+		if got != ledgerDispositionUnconfirmed || reasonCode(err) != ReasonLegacyProvenanceUnknown {
+			t.Fatalf("NULL timestamp replay = %v, %v; want conservative legacy unknown", got, err)
+		}
+	})
 }

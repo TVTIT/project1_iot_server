@@ -52,6 +52,7 @@ type Snapshot struct {
 	Received, ReceivedBytes, AcceptedBytes, InFlight int64
 	Durations                                        DurationSnapshot
 	Microbatch                                       MicrobatchSnapshot `json:"microbatch"`
+	RAMDedup                                         DedupCacheSnapshot `json:"ram_dedup"`
 	// Admission.
 	Accepted                      int64
 	RejectedNotRunning            int64
@@ -116,6 +117,7 @@ func (i *Ingress) Snapshot() Snapshot {
 	return Snapshot{
 		Received: i.counters.received.Load(), ReceivedBytes: i.counters.receivedBytes.Load(),
 		AcceptedBytes: i.counters.acceptedBytes.Load(), InFlight: i.counters.inFlight.Load(),
+		RAMDedup:                      i.dedupCache.Snapshot(),
 		Durations:                     DurationSnapshot{QueueWait: i.queueWait.Snapshot(), Validation: i.validation.Snapshot(), Persistence: i.persistence.Snapshot(), ACKPublish: i.ackPublish.Snapshot(), BatchWait: i.batchWait.Snapshot(), GroupPersistence: i.groupPersistence.Snapshot()},
 		Microbatch:                    MicrobatchSnapshot{Enabled: i.microbatch.Enabled, MaxMessages: i.microbatch.MaxMessages, MaxRows: i.microbatch.MaxRows, MaxPayloadBytes: i.microbatch.MaxPayloadBytes, MaxWait: i.microbatch.MaxWait, Groups: i.counters.groupCount.Load(), Members: i.counters.groupMembers.Load(), Rows: i.counters.groupRows.Load(), PayloadBytes: i.counters.groupPayloadBytes.Load(), MaxMembers: i.counters.groupMaxMembers.Load(), FlushMessages: i.counters.flushMessages.Load(), FlushRows: i.counters.flushRows.Load(), FlushBytes: i.counters.flushBytes.Load(), FlushTimer: i.counters.flushTimer.Load(), FlushStop: i.counters.flushStop.Load(), StandaloneOversized: i.counters.standaloneOversized.Load()},
 		Accepted:                      i.counters.accepted.Load(),

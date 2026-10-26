@@ -222,10 +222,11 @@ services:
       - ./migrations/000021_admin_user_management.up.sql:/migrations/000021_admin_user_management.up.sql:ro
       - ./migrations/000022_gateway_membership_revocation.up.sql:/migrations/000022_gateway_membership_revocation.up.sql:ro
       - ./migrations/000023_sensor_control_intent.up.sql:/migrations/000023_sensor_control_intent.up.sql:ro
+      - ./migrations/000024_telemetry_ledger_timestamp.up.sql:/migrations/000024_telemetry_ledger_timestamp.up.sql:ro
     command:
       - /bin/sh
       - -ec
-      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000023_sensor_control_intent.up.sql
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000024_telemetry_ledger_timestamp.up.sql
     networks:
       - iot_net
 
@@ -317,6 +318,10 @@ services:
       MQTT_MICROBATCH_MAX_ROWS: ${MQTT_MICROBATCH_MAX_ROWS:-500}
       MQTT_MICROBATCH_MAX_PAYLOAD_BYTES: ${MQTT_MICROBATCH_MAX_PAYLOAD_BYTES:-4194304}
       MQTT_MICROBATCH_MAX_WAIT: ${MQTT_MICROBATCH_MAX_WAIT:-1s}
+      # RAM cache cap includes logical metadata estimates, not measured RSS.
+      MQTT_RAM_DEDUP_ENABLED: ${MQTT_RAM_DEDUP_ENABLED:-false}
+      MQTT_RAM_DEDUP_MAX_ENTRIES: ${MQTT_RAM_DEDUP_MAX_ENTRIES:-100000}
+      MQTT_RAM_DEDUP_MAX_BYTES: ${MQTT_RAM_DEDUP_MAX_BYTES:-67108864}
       # Shaper rate/burst are per-Gateway delivery attempts; byte budget covers raw payload copies in queue and workers, not RSS.
       MQTT_SHAPER_ENABLED: ${MQTT_SHAPER_ENABLED:-false}
       MQTT_SHAPER_RATE_PER_SECOND: ${MQTT_SHAPER_RATE_PER_SECOND:-2}

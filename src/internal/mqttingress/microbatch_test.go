@@ -78,7 +78,7 @@ func TestMicrobatchProcessingLifecycle(t *testing.T) {
 			opts := microOptions()
 			opts.MetricsEnabled = enabled
 			ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
-			ing.clock = clock
+			ing.setClock(clock)
 			mustStart(t, ing)
 			t.Cleanup(func() { ing.cancelRun(); _ = ing.Drain(context.Background()) })
 			wait := func(ch <-chan struct{}) {
@@ -137,7 +137,7 @@ func TestMicrobatchReleaseLifecycleExactlyOnce(t *testing.T) {
 	opts := microOptions()
 	opts.MetricsEnabled = true
 	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, &fakeBatchRepo{}, &fakePublisher{})
-	ing.clock = clock
+	ing.setClock(clock)
 	// A delivery discarded before processing starts owns no timing sample.
 	unstarted := &validatedDelivery{}
 	ing.releaseDelivery(unstarted)
@@ -290,7 +290,7 @@ func TestMicrobatchReorderedResultsAndErrorOverride(t *testing.T) {
 	clock := &controlledClock{timers: make(chan *controlledTimer, 1)}
 	opts.Microbatch.MaxMessages = 2
 	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
-	ing.clock = clock
+	ing.setClock(clock)
 	mustStart(t, ing)
 	admitMicro(t, ing, 1, 1)
 	<-clock.timers // first member is now in the collection group
@@ -337,7 +337,7 @@ func TestMicrobatchACKFailureDoesNotBlockRemainingACKs(t *testing.T) {
 	opts.Microbatch.MaxMessages = 2
 	clock := &controlledClock{timers: make(chan *controlledTimer, 1)}
 	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
-	ing.clock = clock
+	ing.setClock(clock)
 	mustStart(t, ing)
 	admitMicro(t, ing, 1, 1)
 	<-clock.timers
@@ -408,7 +408,7 @@ func TestMicrobatchConfirmedResultsAreCountedAfterDrainCancellation(t *testing.T
 	pub := &fakePublisher{}
 	clock := &controlledClock{timers: make(chan *controlledTimer, 1)}
 	ing := newIngressWithBatch(t, microOptions(), newValidator(t), &fakeRepo{}, batch, pub)
-	ing.clock = clock
+	ing.setClock(clock)
 	mustStart(t, ing)
 	admitMicro(t, ing, 1, 2)
 	select {
@@ -516,6 +516,209 @@ func TestMicrobatchMessageCapFlushAndPreservesReceivedAt(t *testing.T) {
 	}
 }
 
+func TestMicrobatchCacheHitBypassesGroupAndFreshMemberWarmsCache(t *testing.T) {
+	batch := &fakeBatchRepo{}
+	opts := microOptions()
+	opts.MetricsEnabled = true
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 8, MaxBytes: 4096}
+	pub := &fakePublisher{}
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	// Seed one confirmed proof, modeling an earlier successfully committed delivery.
+	seedID := uuid.New()
+	topic, payload, at := testPayloadFor(t, "gateway_001", "sensor_001", seedID, testBootID, 1)
+	seed, err := newValidator(t).Validate(topic, payload, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, proof, ok := buildDedupMetadata(seed, time.Now().UTC())
+	if !ok || ing.dedupCache.Publish(key, proof) != dedupPublishStored {
+		t.Fatal("failed to seed proof")
+	}
+	mustStart(t, ing)
+	if got := ing.Admit(topic, payload, at, false); got != AdmissionAccepted {
+		t.Fatal(got)
+	}
+	freshID := uuid.New()
+	topic2, payload2, at2 := testPayloadFor(t, "gateway_001", "sensor_002", freshID, testBootID, 2)
+	if got := ing.Admit(topic2, payload2, at2, false); got != AdmissionAccepted {
+		t.Fatal(got)
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ing.rotationDone:
+	default:
+		t.Fatal("Drain returned before cache rotation goroutine stopped")
+	}
+	batch.mu.Lock()
+	defer batch.mu.Unlock()
+	if len(batch.groups) != 1 || len(batch.groups[0]) != 1 || batch.groups[0][0].Identity().MessageID != freshID {
+		t.Fatalf("batch groups did not retain only fresh input: %#v", batch.groups)
+	}
+	snap := ing.Snapshot()
+	if snap.DuplicateCommitted != 1 || snap.Committed != 1 || snap.SamplesNew != 2 || snap.ACKPublished != 2 || snap.BufferedPayloadBytes != 0 {
+		t.Fatalf("snapshot=%+v", snap)
+	}
+	if ing.dedupCache.Snapshot().Entries != 2 {
+		t.Fatalf("cache=%+v", ing.dedupCache.Snapshot())
+	}
+}
+
+func TestMicrobatchConfirmedProofSurvivesCanceledACKAndMetricsOff(t *testing.T) {
+	var ing *Ingress
+	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		ing.cancelRun() // persistence has committed; suppress the subsequent ACK only.
+		return []telemetry.BatchPersistResult{{InputIndex: 0, Identity: identityOf(messages[0]), Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[0].SampleCount()}}
+	})
+	opts := microOptions()
+	opts.MetricsEnabled = false
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	pub := &fakePublisher{}
+	ing = newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	mustStart(t, ing)
+	admitMicro(t, ing, 1, 1)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ing.dedupCache.Snapshot().Entries != 1 {
+		t.Fatalf("proof was not published before canceled ACK: %+v", ing.dedupCache.Snapshot())
+	}
+	snap := ing.Snapshot()
+	if snap.Committed != 1 || snap.SamplesNew != 1 || snap.ACKPublished != 0 || snap.BufferedPayloadBytes != 0 || snap.ProcessingCount != 1 {
+		t.Fatalf("metrics-off lifecycle/counters=%+v", snap)
+	}
+}
+
+func TestMicrobatchStandaloneFallbackWarmsProof(t *testing.T) {
+	opts := microOptions()
+	opts.Microbatch.MaxRows = 1 // A valid two-row message takes the existing standalone fallback.
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	repo := &fakeRepo{}
+	batch := &fakeBatchRepo{}
+	ing := newIngressWithBatch(t, opts, newValidator(t), repo, batch, &fakePublisher{})
+	mustStart(t, ing)
+	topic, payload, at := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 2)
+	for n := 0; n < 2; n++ {
+		if got := ing.Admit(topic, payload, at, false); got != AdmissionAccepted {
+			t.Fatal(got)
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repo.count() != 1 || len(batch.groups) != 0 || ing.dedupCache.Snapshot().Entries != 1 {
+		t.Fatalf("fallback repo=%d groups=%d cache=%+v", repo.count(), len(batch.groups), ing.dedupCache.Snapshot())
+	}
+}
+
+func TestMicrobatchMismatchedIdentityDoesNotWarmOrACK(t *testing.T) {
+	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		identity := identityOf(messages[0])
+		identity.SensorID = "other_sensor"
+		return []telemetry.BatchPersistResult{{InputIndex: 0, Identity: identity, Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[0].SampleCount()}}
+	})
+	opts := microOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	pub := &fakePublisher{}
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	mustStart(t, ing)
+	admitMicro(t, ing, 1, 1)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ing.dedupCache.Snapshot().Entries != 0 || len(pub.deliveries()) != 0 {
+		t.Fatalf("mismatch published proof/ACK: cache=%+v ACKs=%d", ing.dedupCache.Snapshot(), len(pub.deliveries()))
+	}
+}
+
+func TestMicrobatchGroupErrorDoesNotTrustProvisionalResultButKeepsConfirmedPartialMember(t *testing.T) {
+	var groupIDs []telemetry.MessageIdentity
+	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		groupIDs = []telemetry.MessageIdentity{identityOf(messages[0]), identityOf(messages[1])}
+		return []telemetry.BatchPersistResult{
+			{InputIndex: 0, Identity: groupIDs[0], Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[0].SampleCount(), Err: errors.New("group member failed")},
+			{InputIndex: 1, Identity: groupIDs[1], Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[1].SampleCount()},
+		}
+	})
+	opts := microOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	pub := &fakePublisher{}
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	clock := &controlledClock{timers: make(chan *controlledTimer, 1)}
+	ing.setClock(clock)
+	mustStart(t, ing)
+	topic0, payload0, at0 := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 1)
+	topic1, payload1, at1 := testPayloadFor(t, "gateway_001", "sensor_002", uuid.New(), testBootID, 1)
+	if ing.Admit(topic0, payload0, at0, false) != AdmissionAccepted {
+		t.Fatal("first admission failed")
+	}
+	select {
+	case <-clock.timers:
+	case <-time.After(time.Second):
+		t.Fatal("first member did not enter collection")
+	}
+	if ing.Admit(topic1, payload1, at1, false) != AdmissionAccepted {
+		t.Fatal("second admission failed")
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(pub.deliveries()) != 1 || ing.dedupCache.Snapshot().Entries != 1 {
+		t.Fatalf("ACKs=%d cache=%+v; only confirmed partial-success member may publish", len(pub.deliveries()), ing.dedupCache.Snapshot())
+	}
+	// Exactly one ACK and one proof demonstrate that the errored provisional
+	// result was ignored while the successful partial member was retained.
+	_ = groupIDs
+}
+
+func TestMicrobatchInvalidIndexSuppressesAllProvisionalSuccesses(t *testing.T) {
+	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		return []telemetry.BatchPersistResult{
+			{InputIndex: 0, Identity: identityOf(messages[0]), Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[0].SampleCount()},
+			{InputIndex: len(messages), Identity: identityOf(messages[1]), Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[1].SampleCount()},
+		}
+	})
+	opts := microOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	pub := &fakePublisher{}
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	clock := &controlledClock{timers: make(chan *controlledTimer, 1)}
+	ing.setClock(clock)
+	mustStart(t, ing)
+	admitMicro(t, ing, 0, 1)
+	select {
+	case <-clock.timers:
+	case <-time.After(time.Second):
+		t.Fatal("first member did not enter collection")
+	}
+	admitMicro(t, ing, 1, 1)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pub.count() != 0 || ing.dedupCache.Snapshot().Entries != 0 {
+		t.Fatalf("invalid result trusted: ACKs=%d cache=%+v", pub.count(), ing.dedupCache.Snapshot())
+	}
+}
+
+func TestMicrobatchCommitUnconfirmedDoesNotPublishProofOrACK(t *testing.T) {
+	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		return []telemetry.BatchPersistResult{{InputIndex: 0, Identity: identityOf(messages[0]), Outcome: telemetry.CommitOutcomeUnconfirmed}}
+	})
+	opts := microOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	pub := &fakePublisher{}
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	mustStart(t, ing)
+	admitMicro(t, ing, 0, 1)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pub.count() != 0 || ing.dedupCache.Snapshot().Entries != 0 {
+		t.Fatalf("unconfirmed group result trusted: ACKs=%d cache=%+v", pub.count(), ing.dedupCache.Snapshot())
+	}
+}
+
 func TestEnabledMicrobatchRequiresBatchRepository(t *testing.T) {
 	var typedNil *fakeBatchRepo
 	for _, batch := range []telemetry.BatchRepository{nil, typedNil} {
@@ -572,7 +775,7 @@ func TestMicrobatchRowByteAndDeadlineFlushes(t *testing.T) {
 			opts.Microbatch.MaxMessages = 10
 			clock := &controlledClock{timers: make(chan *controlledTimer, 4)}
 			ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, &fakePublisher{})
-			ing.clock = clock
+			ing.setClock(clock)
 			mustStart(t, ing)
 			admitMicro(t, ing, 1, 1)
 			if tc.timed {
@@ -598,7 +801,7 @@ func TestMicrobatchDeadlineDoesNotResetAndCarriesCapExceedingItem(t *testing.T) 
 	opts.Microbatch.MaxMessages = 8
 	opts.Microbatch.MaxRows = 3
 	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, &fakePublisher{})
-	ing.clock = clock
+	ing.setClock(clock)
 	mustStart(t, ing)
 	admitMicro(t, ing, 1, 2)
 	timer := <-clock.timers
@@ -638,7 +841,7 @@ func TestMicrobatchDeadlineIsNotResetByIncomingItemsAndMalformedExcluded(t *test
 	captured := make(chan time.Time, 4)
 	validator := captureValidator{Validator: newValidator(t), got: captured}
 	ing := newIngressWithBatch(t, opts, validator, &fakeRepo{}, batch, &fakePublisher{})
-	ing.clock = clock
+	ing.setClock(clock)
 	mustStart(t, ing)
 	r1 := admitMicro(t, ing, 1, 1)
 	timer := <-clock.timers
@@ -707,7 +910,7 @@ func TestMicrobatchGroupMetricsCaptureFlushesAndEffectiveBounds(t *testing.T) {
 	opts.Microbatch.MaxRows = 3
 	opts.Microbatch.MaxPayloadBytes = 1 << 20
 	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, &fakePublisher{})
-	ing.clock = clock
+	ing.setClock(clock)
 	mustStart(t, ing)
 	admitMicro(t, ing, 1, 2)
 	<-clock.timers
@@ -767,7 +970,7 @@ func TestMicrobatchMetricFlushReasonsAndStandalone(t *testing.T) {
 			}
 			clock := &controlledClock{timers: make(chan *controlledTimer, 4)}
 			ing := newIngressWithBatch(t, opts, newValidator(t), repo, batch, &fakePublisher{})
-			ing.clock = clock
+			ing.setClock(clock)
 			mustStart(t, ing)
 			rows := 1
 			if tc.trigger == "standalone" {

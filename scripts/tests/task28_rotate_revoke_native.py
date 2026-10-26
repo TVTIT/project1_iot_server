@@ -374,8 +374,9 @@ def run_native_rotate_revoke_suite(dry_run: bool = False) -> dict[str, Any]:
         }
         return res
 
-    # Host root directory under /tmp/opencode
-    tmp_base = Path('/tmp/opencode')
+    # Physical base: the approved /tmp/opencode alias may itself be a symlink.
+    # Keep the ancestor guard strict; never resolve an untrusted fixture path.
+    tmp_base = Path('/var/tmp/opencode')
     tmp_base.mkdir(parents=True, exist_ok=True)
 
     fixture_dir, host_receipt = create_verified_host_fixture_dir(tmp_base)

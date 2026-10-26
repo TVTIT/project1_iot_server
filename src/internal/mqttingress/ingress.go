@@ -58,6 +58,8 @@ type Options struct {
 	// Microbatch enables bounded per-worker grouping. Disabled mode exclusively
 	// uses Repository.Persist.
 	Microbatch MicrobatchOptions
+	// RAMDedup enables the bounded process-local confirmed-commit cache.
+	RAMDedup DedupCacheOptions
 	// PersistTimeout bounds connection acquisition, locks, SQL and commit of
 	// one Repository.Persist call.
 	PersistTimeout time.Duration
@@ -66,6 +68,13 @@ type Options struct {
 	// Logger receives reason-coded, payload-free structured events. Nil uses
 	// slog.Default().
 	Logger *slog.Logger
+}
+
+// DedupCacheOptions enables the bounded process-local confirmed-commit cache.
+type DedupCacheOptions struct {
+	Enabled    bool
+	MaxEntries int64
+	MaxBytes   int64
 }
 
 // MicrobatchOptions contains finite per-worker collection caps.
@@ -111,6 +120,7 @@ type Ingress struct {
 	workerCount                  int
 	microbatch                   MicrobatchOptions
 	batchRepository              telemetry.BatchRepository
+	dedupCache                   *dedupCache
 	clock                        ingressClock
 	maxPayloadBytes              int
 	bufferedPayloadCapacityBytes int64
@@ -142,7 +152,8 @@ type Ingress struct {
 	runCtx    context.Context
 	cancelRun context.CancelFunc
 
-	workers sync.WaitGroup
+	workers      sync.WaitGroup
+	rotationDone chan struct{}
 
 	counters                                                                    counters
 	shaper                                                                      *Shaper
@@ -201,6 +212,9 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 		}
 		batchRepository = batchRepositories[0]
 	}
+	if opts.RAMDedup.Enabled && (opts.RAMDedup.MaxEntries < 1 || opts.RAMDedup.MaxBytes < 1) {
+		return nil, errors.New("mqttingress: enabled RAM dedup requires positive entry and byte bounds")
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -225,6 +239,7 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 		shaper:                       shaper,
 		microbatch:                   opts.Microbatch,
 		batchRepository:              batchRepository,
+		dedupCache:                   newDedupCache(opts.RAMDedup.Enabled, opts.RAMDedup.MaxEntries, opts.RAMDedup.MaxBytes, realIngressClock{}),
 		clock:                        realIngressClock{},
 	}, nil
 }
@@ -243,6 +258,13 @@ func (i *Ingress) Start() error {
 	}
 	i.workers.Add(i.workerCount)
 	i.started.Store(true)
+	if i.dedupCache.Enabled() {
+		i.rotationDone = make(chan struct{})
+		go func(ctx context.Context, done chan struct{}) {
+			defer close(done)
+			_ = i.dedupCache.RunRotation(ctx)
+		}(i.runCtx, i.rotationDone)
+	}
 	for w := 0; w < i.workerCount; w++ {
 		go i.worker()
 	}
@@ -439,10 +461,16 @@ func (i *Ingress) Drain(ctx context.Context) error {
 	select {
 	case <-done:
 		i.cancelRun()
+		if i.rotationDone != nil {
+			<-i.rotationDone
+		}
 		return nil
 	case <-ctx.Done():
 		i.cancelRun()
 		<-done
+		if i.rotationDone != nil {
+			<-i.rotationDone
+		}
 		return ctx.Err()
 	}
 }
@@ -475,6 +503,15 @@ type ingressClock interface {
 }
 type realIngressClock struct{}
 type realIngressTimer struct{ t *time.Timer }
+
+// setClock keeps ingress lifecycle timestamps and cache proof expiry on the
+// same clock. It is primarily useful to deterministic package tests.
+func (i *Ingress) setClock(clock ingressClock) {
+	i.clock = clock
+	if i.dedupCache != nil {
+		i.dedupCache.clock = clock
+	}
+}
 
 func (realIngressClock) NewTimer(d time.Duration) ingressTimer {
 	return realIngressTimer{time.NewTimer(d)}
@@ -563,6 +600,11 @@ func (i *Ingress) microbatchWorker() {
 			return
 		}
 		d.validatedAt = i.clock.Now()
+		if cached, ok := i.confirmedCacheHit(d); ok {
+			i.publishACK(d, cached)
+			i.releaseDelivery(d)
+			return
+		}
 		memberRows := d.message.SampleCount()
 		if memberRows > i.microbatch.MaxRows || int64(len(it.payload)) > i.microbatch.MaxPayloadBytes {
 			// Attribute a preceding group's flush to the standalone member's
@@ -646,6 +688,9 @@ func (i *Ingress) persistStandaloneBatch(ctx context.Context, d *validatedDelive
 	// single-message persistence contract without revalidation or reshaping.
 	confirmed, ok := i.persistDeliveryContext(ctx, d)
 	if ok {
+		if confirmed.result.Outcome == telemetry.CommitOutcomeCommitted {
+			i.publishConfirmedProof(d, confirmed)
+		}
 		i.publishACK(d, confirmed)
 	}
 }
@@ -674,6 +719,7 @@ func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validate
 		}
 	}
 	results := i.batchRepository.PersistBatch(pctx, msgs)
+	commitObservedAt := i.clock.Now().UTC()
 	if i.metricsEnabled {
 		elapsed := time.Since(groupStart)
 		i.groupPersistence.Observe(elapsed)
@@ -726,7 +772,7 @@ func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validate
 			i.logReject("persist", r.Err)
 			continue
 		}
-		confirmed[r.InputIndex] = confirmedDelivery{result: telemetry.PersistResult{Identity: r.Identity, Outcome: r.Outcome, SamplesSaved: r.SamplesSaved}, confirmedAt: i.clock.Now().UTC()}
+		confirmed[r.InputIndex] = confirmedDelivery{result: telemetry.PersistResult{Identity: r.Identity, Outcome: r.Outcome, SamplesSaved: r.SamplesSaved}, confirmedAt: commitObservedAt}
 		valid[r.InputIndex] = true
 	}
 	for n, ok := range valid {
@@ -735,6 +781,7 @@ func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validate
 			if r.Outcome == telemetry.CommitOutcomeCommitted {
 				i.counters.committed.Add(1)
 				i.counters.samplesNew.Add(int64(r.SamplesSaved))
+				i.publishConfirmedProof(members[n], confirmed[n])
 			} else {
 				i.counters.duplicateCommitted.Add(1)
 			}
@@ -774,10 +821,16 @@ func (i *Ingress) process(it item) {
 	if !i.validateDelivery(delivery) {
 		return
 	}
-
+	if cached, ok := i.confirmedCacheHit(delivery); ok {
+		i.publishACK(delivery, cached)
+		return
+	}
 	confirmed, ok := i.persistDelivery(delivery)
 	if !ok {
 		return
+	}
+	if confirmed.result.Outcome == telemetry.CommitOutcomeCommitted {
+		i.publishConfirmedProof(delivery, confirmed)
 	}
 	i.publishACK(delivery, confirmed)
 }
@@ -865,7 +918,7 @@ func (i *Ingress) persistDeliveryContext(parent context.Context, delivery *valid
 	// after Persist returned. It is not the measurement time and not an exact
 	// PostgreSQL commit timestamp; a retry may report a different value for the
 	// same message_id/status.
-	delivery.confirmedAt = time.Now().UTC()
+	delivery.confirmedAt = i.clock.Now().UTC()
 
 	// The database result is final: record the confirmed commit regardless of
 	// whether the ACK publish below succeeds.
@@ -877,6 +930,41 @@ func (i *Ingress) persistDeliveryContext(parent context.Context, delivery *valid
 	}
 
 	return confirmedDelivery{result: result, confirmedAt: delivery.confirmedAt}, true
+}
+
+func (i *Ingress) confirmedCacheHit(delivery *validatedDelivery) (confirmedDelivery, bool) {
+	if !i.dedupCache.Enabled() {
+		return confirmedDelivery{}, false
+	}
+	key, metadata, ok := buildDedupMetadata(delivery.message, i.clock.Now())
+	if !ok || i.dedupCache.Lookup(key, metadata) != dedupLookupHit {
+		return confirmedDelivery{}, false
+	}
+	identity := delivery.message.Identity()
+	result := telemetry.PersistResult{Identity: identity, Outcome: telemetry.CommitOutcomeDuplicateCommitted}
+	i.counters.duplicateCommitted.Add(1)
+	return confirmedDelivery{result: result, confirmedAt: metadata.confirmedCommitAt}, true
+}
+
+// DedupCacheSnapshot returns fixed cache counters and O(1) generation accounting.
+func (i *Ingress) DedupCacheSnapshot() DedupCacheSnapshot {
+	if i == nil || i.dedupCache == nil {
+		return DedupCacheSnapshot{}
+	}
+	return i.dedupCache.Snapshot()
+}
+
+func (i *Ingress) publishConfirmedProof(delivery *validatedDelivery, confirmed confirmedDelivery) {
+	if i.dedupCache == nil || confirmed.result.Outcome != telemetry.CommitOutcomeCommitted || !identityMatches(delivery.message, confirmed.result.Identity) || confirmed.result.SamplesSaved != delivery.message.SampleCount() {
+		return
+	}
+	key, metadata, ok := buildDedupMetadata(delivery.message, confirmed.confirmedAt)
+	if !ok {
+		// Record the confirmed outcome's ineligible cache proof as an invalid
+		// publication skip; this never changes the already-committed result.
+		key, metadata = dedupKey{}, dedupMetadata{}
+	}
+	i.dedupCache.Publish(key, metadata)
 }
 
 // publishACK constructs and publishes one application ACK. It deliberately

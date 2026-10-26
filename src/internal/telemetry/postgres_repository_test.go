@@ -45,18 +45,23 @@ func (database *telemetryFakeDatabase) BeginTx(ctx context.Context, options pgx.
 
 type telemetryFakeTx struct {
 	pgx.Tx
-	message       *Message
-	duplicate     bool
-	commitErr     error
-	rollbackErr   error
-	copyErr       error
-	copyCount     int64
-	copyRows      int
-	commitCalls   int
-	rollbackCalls int
-	rollbackValid bool
-	queryCalls    int
-	cancelQuery   context.CancelFunc
+	message                *Message
+	duplicate              bool
+	duplicateTimestamp     *time.Time
+	duplicateNullTimestamp bool
+	duplicateSensor        string
+	duplicateHash          string
+	ledgerInsertArgs       []any
+	commitErr              error
+	rollbackErr            error
+	copyErr                error
+	copyCount              int64
+	copyRows               int
+	commitCalls            int
+	rollbackCalls          int
+	rollbackValid          bool
+	queryCalls             int
+	cancelQuery            context.CancelFunc
 
 	sensorState        []byte
 	sensorVersion      int64
@@ -122,6 +127,7 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, args ...a
 		}
 		return telemetryFakeRow{values: []any{tx.sensorState, tx.sensorVersion, tx.sensorLastReported}}
 	case strings.Contains(query, "INSERT INTO public.processed_messages"):
+		tx.ledgerInsertArgs = append([]any(nil), args...)
 		if tx.batchLedger != nil {
 			key := fmt.Sprintf("%v/%v", args[0], args[1])
 			if _, exists := tx.batchLedger[key]; exists {
@@ -150,11 +156,21 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, args ...a
 				pgtype.Text{String: metadata.sensorID, Valid: true}, metadata.bootID,
 				pgtype.Int8{Int64: metadata.firstSample.SequenceNum, Valid: true}, pgtype.Int8{Int64: metadata.lastSample.SequenceNum, Valid: true},
 				pgtype.Int4{Int32: metadata.sampleCount, Valid: true},
+				pgtype.Timestamptz{Time: metadata.timestamp, Valid: true},
 			}}
 		}
 		metadata, err := ledgerMetadata(message)
 		if err != nil {
 			return telemetryFakeRow{err: err}
+		}
+		if tx.duplicateTimestamp != nil {
+			metadata.timestamp = *tx.duplicateTimestamp
+		}
+		if tx.duplicateSensor != "" {
+			metadata.sensorID = tx.duplicateSensor
+		}
+		if tx.duplicateHash != "" {
+			metadata.payloadHash = tx.duplicateHash
 		}
 		return telemetryFakeRow{values: []any{
 			pgtype.Text{String: metadata.payloadHash, Valid: true},
@@ -164,6 +180,7 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, args ...a
 			pgtype.Int8{Int64: metadata.firstSample.SequenceNum, Valid: true},
 			pgtype.Int8{Int64: metadata.lastSample.SequenceNum, Valid: true},
 			pgtype.Int4{Int32: metadata.sampleCount, Valid: true},
+			pgtype.Timestamptz{Time: metadata.timestamp, Valid: !tx.duplicateNullTimestamp},
 		}}
 	default:
 		return telemetryFakeRow{err: errors.New("unexpected query")}

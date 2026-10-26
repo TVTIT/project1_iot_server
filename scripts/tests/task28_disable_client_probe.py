@@ -677,6 +677,8 @@ class DynSecProbeFixture:
                '--security-opt', 'no-new-privileges:true', '--cap-drop', 'ALL']
         for cap in ('CHOWN', 'DAC_OVERRIDE', 'FOWNER'):
             cmd += ['--cap-add', cap]
+        for tmpfs in ('/tmp', '/mosquitto/data', '/mosquitto/log'):
+            cmd += ['--tmpfs', tmpfs]
         for mount in (f'{self.project}_security:/security',
                       f'{self.project}_native_store:/native-store',
                       f'{self.project}_public_ca:/public-ca', f'{self.d}/broker:/fixture'):
