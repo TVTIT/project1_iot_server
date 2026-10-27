@@ -237,6 +237,64 @@ func TestMicrobatchNeverACKsBeforeBatchRepositoryReturns(t *testing.T) {
 	}
 }
 
+func TestMicrobatchSubmitsAllCommittedInputIndexesBeforeACKLoop(t *testing.T) {
+	sink := &recordingBatchSink{}
+	batch := batchRepoFunc(func(_ context.Context, ms []*telemetry.Message) []telemetry.BatchPersistResult {
+		out := make([]telemetry.BatchPersistResult, len(ms))
+		for n := range ms {
+			idx := len(ms) - n - 1 // deliberately return associations out of order
+			m := ms[idx]
+			out[n] = telemetry.BatchPersistResult{InputIndex: idx, Identity: identityOf(m), Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: m.SampleCount()}
+		}
+		return out
+	})
+	pub := &fakePublisher{onPublish: func(context.Context, Delivery) error { return errors.New("ack unavailable") }}
+	opts := microOptions()
+	opts.PostCommitSink = sink
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, batch, pub)
+	mustStart(t, ing)
+	firstID, secondID := uuid.New(), uuid.New()
+	for _, item := range []struct {
+		id   uuid.UUID
+		rows int
+	}{{firstID, 2}, {secondID, 3}} {
+		topic, payload, received := testPayloadFor(t, "gateway_001", "sensor_001", item.id, testBootID, item.rows)
+		if got := ing.Admit(topic, payload, received, false); got != AdmissionAccepted {
+			t.Fatalf("Admit = %v", got)
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	batches := sink.snapshot()
+	if len(batches) != 2 {
+		t.Fatalf("submitted %d batches, want both committed members", len(batches))
+	}
+	if batches[0].MessageID != firstID || batches[1].MessageID != secondID {
+		t.Fatalf("InputIndex association lost: ids=%v,%v", batches[0].MessageID, batches[1].MessageID)
+	}
+	if got := pub.count(); got != 2 {
+		t.Fatalf("ACK attempts=%d, want 2", got)
+	}
+}
+
+func TestOversizedStandalonePostCommitSink(t *testing.T) {
+	sink := &recordingBatchSink{}
+	opts := microOptions()
+	opts.Microbatch.MaxRows = 1
+	opts.PostCommitSink = sink
+	ing := newIngressWithBatch(t, opts, newValidator(t), &fakeRepo{}, &fakeBatchRepo{}, &fakePublisher{})
+	mustStart(t, ing)
+	admitMicro(t, ing, 1, 2)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	batches := sink.snapshot()
+	if len(batches) != 1 || batches[0].SampleCount != 2 || len(batches[0].Samples) != 2 {
+		t.Fatalf("standalone post-commit batches = %+v", batches)
+	}
+}
+
 func TestMicrobatchRejectsMalformedResultSetsWithoutACK(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -634,7 +692,12 @@ func TestMicrobatchMismatchedIdentityDoesNotWarmOrACK(t *testing.T) {
 
 func TestMicrobatchGroupErrorDoesNotTrustProvisionalResultButKeepsConfirmedPartialMember(t *testing.T) {
 	var groupIDs []telemetry.MessageIdentity
+	groupEntered := make(chan int, 1)
 	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		groupEntered <- len(messages)
+		if len(messages) != 2 {
+			return nil
+		}
 		groupIDs = []telemetry.MessageIdentity{identityOf(messages[0]), identityOf(messages[1])}
 		return []telemetry.BatchPersistResult{
 			{InputIndex: 0, Identity: groupIDs[0], Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[0].SampleCount(), Err: errors.New("group member failed")},
@@ -661,6 +724,14 @@ func TestMicrobatchGroupErrorDoesNotTrustProvisionalResultButKeepsConfirmedParti
 	if ing.Admit(topic1, payload1, at1, false) != AdmissionAccepted {
 		t.Fatal("second admission failed")
 	}
+	select {
+	case n := <-groupEntered:
+		if n != 2 {
+			t.Fatalf("persistence group has %d members, want 2", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("two-member persistence group did not enter before Drain")
+	}
 	if err := ing.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +744,12 @@ func TestMicrobatchGroupErrorDoesNotTrustProvisionalResultButKeepsConfirmedParti
 }
 
 func TestMicrobatchInvalidIndexSuppressesAllProvisionalSuccesses(t *testing.T) {
+	groupEntered := make(chan int, 1)
 	batch := batchRepoFunc(func(_ context.Context, messages []*telemetry.Message) []telemetry.BatchPersistResult {
+		groupEntered <- len(messages)
+		if len(messages) != 2 {
+			return nil
+		}
 		return []telemetry.BatchPersistResult{
 			{InputIndex: 0, Identity: identityOf(messages[0]), Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[0].SampleCount()},
 			{InputIndex: len(messages), Identity: identityOf(messages[1]), Outcome: telemetry.CommitOutcomeCommitted, SamplesSaved: messages[1].SampleCount()},
@@ -693,6 +769,14 @@ func TestMicrobatchInvalidIndexSuppressesAllProvisionalSuccesses(t *testing.T) {
 		t.Fatal("first member did not enter collection")
 	}
 	admitMicro(t, ing, 1, 1)
+	select {
+	case n := <-groupEntered:
+		if n != 2 {
+			t.Fatalf("persistence group has %d members, want 2", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("two-member persistence group did not enter before Drain")
+	}
 	if err := ing.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}

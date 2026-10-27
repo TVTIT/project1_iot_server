@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -313,3 +314,145 @@ func (r *fakeGatewayRows) Scan(dest ...any) error {
 
 func (r *fakeGatewayRows) Err() error { return nil }
 func (r *fakeGatewayRows) Close()     { r.closed = true }
+
+type fakeRoleDatabase struct {
+	query string
+	args  []any
+	role  Role
+	err   error
+}
+
+func (d *fakeRoleDatabase) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
+	d.query = query
+	d.args = args
+	return fakeRoleRow{role: d.role, err: d.err}
+}
+
+func (d *fakeRoleDatabase) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query call")
+}
+
+type fakeRoleRow struct {
+	role Role
+	err  error
+}
+
+func (r fakeRoleRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) > 0 {
+		if ptr, ok := dest[0].(*Role); ok {
+			*ptr = r.role
+		}
+	}
+	return nil
+}
+
+func TestAuthorizeSubscriptionTarget(t *testing.T) {
+	ctx := context.Background()
+	user := uuid.New()
+
+	t.Run("input validation", func(t *testing.T) {
+		db := &fakeRoleDatabase{}
+		repo, _ := NewPostgresRepository(db)
+
+		// nil user
+		if _, err := repo.AuthorizeSubscriptionTarget(ctx, uuid.Nil, "gw-1", ""); !errors.Is(err, ErrInvalidUser) {
+			t.Fatalf("nil user: err = %v, want ErrInvalidUser", err)
+		}
+
+		// invalid gateway ID
+		if _, err := repo.AuthorizeSubscriptionTarget(ctx, user, "bad gw ID!", ""); !errors.Is(err, ErrInvalidGatewayID) {
+			t.Fatalf("bad gateway ID: err = %v, want ErrInvalidGatewayID", err)
+		}
+		if _, err := repo.AuthorizeSubscriptionTarget(ctx, user, "backend_service", ""); !errors.Is(err, ErrInvalidGatewayID) {
+			t.Fatalf("reserved gateway ID: err = %v, want ErrInvalidGatewayID", err)
+		}
+
+		// invalid sensor ID
+		if _, err := repo.AuthorizeSubscriptionTarget(ctx, user, "gw-1", "bad sensor ID!"); !errors.Is(err, ErrInvalidSensorID) {
+			t.Fatalf("bad sensor ID: err = %v, want ErrInvalidSensorID", err)
+		}
+	})
+
+	t.Run("gateway target queries and argument correctness", func(t *testing.T) {
+		roles := []Role{RoleOwner, RoleOperator, RoleViewer}
+		for _, wantRole := range roles {
+			db := &fakeRoleDatabase{role: wantRole}
+			repo, _ := NewPostgresRepository(db)
+
+			role, err := repo.AuthorizeSubscriptionTarget(ctx, user, "gw-valid-01", "")
+			if err != nil {
+				t.Fatalf("unexpected error for %s: %v", wantRole, err)
+			}
+			if role != wantRole {
+				t.Fatalf("role = %v, want %v", role, wantRole)
+			}
+			if !reflect.DeepEqual(db.args, []any{user, "gw-valid-01"}) {
+				t.Fatalf("args = %v, want [%v, gw-valid-01]", db.args, user)
+			}
+			if !strings.Contains(db.query, "FROM public.user_gateways") ||
+				!strings.Contains(db.query, "JOIN public.gateways") ||
+				strings.Contains(db.query, "sensors") {
+				t.Fatalf("query for gateway target must join user_gateways and gateways, but not sensors: %s", db.query)
+			}
+		}
+	})
+
+	t.Run("sensor target queries and argument correctness", func(t *testing.T) {
+		roles := []Role{RoleOwner, RoleOperator, RoleViewer}
+		for _, wantRole := range roles {
+			db := &fakeRoleDatabase{role: wantRole}
+			repo, _ := NewPostgresRepository(db)
+
+			role, err := repo.AuthorizeSubscriptionTarget(ctx, user, "gw-valid-01", "sensor-01")
+			if err != nil {
+				t.Fatalf("unexpected error for %s: %v", wantRole, err)
+			}
+			if role != wantRole {
+				t.Fatalf("role = %v, want %v", role, wantRole)
+			}
+			if !reflect.DeepEqual(db.args, []any{user, "gw-valid-01", "sensor-01"}) {
+				t.Fatalf("args = %v, want [%v, gw-valid-01, sensor-01]", db.args, user)
+			}
+			if !strings.Contains(db.query, "FROM public.user_gateways") ||
+				!strings.Contains(db.query, "JOIN public.gateways") ||
+				!strings.Contains(db.query, "JOIN public.sensors") {
+				t.Fatalf("query for sensor target must join user_gateways, gateways, and sensors: %s", db.query)
+			}
+		}
+	})
+
+	t.Run("not found (no rows) conflation for nonmember or absent entity", func(t *testing.T) {
+		db := &fakeRoleDatabase{err: pgx.ErrNoRows}
+		repo, _ := NewPostgresRepository(db)
+
+		// Gateway target
+		if _, err := repo.AuthorizeSubscriptionTarget(ctx, user, "gw-missing", ""); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("gateway not found: err = %v, want ErrNotFound", err)
+		}
+
+		// Sensor target
+		if _, err := repo.AuthorizeSubscriptionTarget(ctx, user, "gw-mine", "sen-missing"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("sensor not found: err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("database failure returns wrapped internal error", func(t *testing.T) {
+		dbFailure := errors.New("pgx: connection reset by peer")
+		db := &fakeRoleDatabase{err: dbFailure}
+		repo, _ := NewPostgresRepository(db)
+
+		_, err := repo.AuthorizeSubscriptionTarget(ctx, user, "gw-valid", "")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if errors.Is(err, ErrNotFound) {
+			t.Fatal("DB failure must not be conflated with ErrNotFound")
+		}
+		if !errors.Is(err, dbFailure) {
+			t.Fatalf("err = %v, want to unwrap dbFailure", err)
+		}
+	})
+}

@@ -63,8 +63,17 @@ func (m *HTTPMetrics) Snapshot() []HTTPMetricSnapshot {
 	return out
 }
 
+// ObserveWebSocketHandshake records only the HTTP upgrade phase.
+func (m *HTTPMetrics) ObserveWebSocketHandshake(duration time.Duration) {
+	m.durations[23].Observe(duration)
+}
+
 func (m *HTTPMetrics) middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.Request.Method == "GET" && c.Request.URL.Path == "/v1/ws" && strings.EqualFold(c.Request.Header.Get("Upgrade"), "websocket") {
+			c.Next()
+			return
+		}
 		start := time.Now()
 		c.Next()
 		key, index := c.Request.Method+" "+c.FullPath(), 0

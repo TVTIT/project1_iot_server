@@ -17,10 +17,21 @@ import (
 
 // NewInternalAuthHandler exposes identity verification only on its own router.
 // Resource authorization remains on the independent business router.
-func NewInternalAuthHandler(verifier Verifier, observer *Metrics, duration *metrics.Histogram) http.Handler {
+// When wsEnabled is false, the internal WS verification route falls back to
+// standard REST Bearer authentication so perimeter requests to the /v1/ws
+// disabled stub reach the business 501 handler. When true, strict WebSocket
+// credentials (app subprotocol + Bearer or browser subprotocol) are enforced.
+func NewInternalAuthHandler(verifier Verifier, observer *Metrics, duration *metrics.Histogram, wsEnabled bool) http.Handler {
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
 	router.GET("/internal/auth/verify", AuthenticationMiddleware(verifier, observer), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	wsMiddleware := AuthenticationMiddleware(verifier, observer)
+	if wsEnabled {
+		wsMiddleware = WSAuthenticationMiddleware(verifier, observer)
+	}
+	router.GET("/internal/auth/verify/ws", wsMiddleware, func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

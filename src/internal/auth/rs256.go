@@ -227,7 +227,7 @@ func (v *RS256Verifier) Verify(ctx context.Context, raw string) (Principal, erro
 	if err != nil || id == uuid.Nil {
 		return Principal{}, ErrInvalidToken
 	}
-	return Principal{UserID: id, Role: claims.Role}, nil
+	return Principal{UserID: id, Role: claims.Role, ExpiresAt: claims.ExpiresAt.UTC()}, nil
 }
 
 // Close stops SDK refresh and pending HTTP work, then releases idle connections.

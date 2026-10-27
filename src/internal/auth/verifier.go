@@ -111,5 +111,5 @@ func (v *hs256Verifier) Verify(ctx context.Context, rawToken string) (Principal,
 		return Principal{}, ErrInvalidToken
 	}
 
-	return Principal{UserID: userID, Role: claims.Role}, nil
+	return Principal{UserID: userID, Role: claims.Role, ExpiresAt: claims.ExpiresAt.UTC()}, nil
 }

@@ -51,6 +51,21 @@ server {
         proxy_read_timeout 3s;
     }
 
+    # WS verification shares the Go WS credential parser; keep this internal-only.
+    location = /_p2_ws_auth {
+        internal;
+        proxy_pass http://auth_verifier/internal/auth/verify/ws;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_pass_request_headers off;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;
+        proxy_set_header Content-Length "";
+        proxy_connect_timeout 1s;
+        proxy_send_timeout 3s;
+        proxy_read_timeout 3s;
+    }
+
     # Auth and Storage retain their own API-key/JWT/policy verification.
     # Public JWKS must be reachable without a JWT; login/refresh are not looped.
     location /auth/v1/ {
@@ -80,7 +95,7 @@ server {
     location = /v1/ws {
         error_page 418 = @business_preflight;
         if ($request_method = OPTIONS) { return 418; }
-        auth_request /_p2_auth;
+        auth_request /_p2_ws_auth;
         proxy_pass http://backend_api;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;

@@ -15,6 +15,7 @@ import (
 	"iot-platform/internal/config"
 	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpapi"
+	"iot-platform/internal/telemetryws"
 )
 
 type readinessCheckerFunc func(context.Context) error
@@ -160,6 +161,38 @@ func TestPlannedBusinessRoutesRequireAuthenticationBeforeStub(t *testing.T) {
 		if authRec.Code == http.StatusNotImplemented {
 			t.Errorf("GET %s with token unexpectedly returned 501", path)
 		}
+	}
+}
+
+func TestWebSocketEnabledRoutesRequireStrictWSAuth(t *testing.T) {
+	deps := testRouterDependencies(readinessCheckerFunc(func(context.Context) error { return nil }))
+	deps.WebSocketEnabled = true
+	wsHandler, err := telemetryws.NewHandler(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wsHandler.Shutdown(context.Background()) }()
+	deps.WebSocketHandler = wsHandler
+
+	router, err := NewRouter(deps)
+	if err != nil {
+		t.Fatalf("NewRouter failed: %v", err)
+	}
+
+	// Without token -> 401
+	unauth := httptest.NewRecorder()
+	router.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/v1/ws", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Errorf("GET /v1/ws without token status = %d, want %d", unauth.Code, http.StatusUnauthorized)
+	}
+
+	// Bearer-only without Sec-WebSocket-Protocol app subprotocol -> 401 (rejected by WSAuthenticationMiddleware)
+	reqBearerOnly := httptest.NewRequest(http.MethodGet, "/v1/ws", nil)
+	reqBearerOnly.Header.Set("Authorization", "Bearer valid-token")
+	recBearerOnly := httptest.NewRecorder()
+	router.ServeHTTP(recBearerOnly, reqBearerOnly)
+	if recBearerOnly.Code != http.StatusUnauthorized {
+		t.Errorf("GET /v1/ws with Bearer-only in enabled mode status = %d, want %d", recBearerOnly.Code, http.StatusUnauthorized)
 	}
 }
 

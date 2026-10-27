@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -36,6 +37,21 @@ func TestHTTPMetricsBoundedTemplatesAndScopes(t *testing.T) {
 	if count != 4 {
 		t.Fatal(count)
 	}
+}
+
+func TestWebSocketMetricsRecordOnlyHandshakeDurationSeries(t *testing.T) {
+	m := NewHTTPMetrics()
+	m.ObserveWebSocketHandshake(time.Millisecond)
+	snapshot := m.Snapshot()
+	for _, series := range snapshot {
+		if series.Route == "GET /v1/ws" {
+			if series.Duration.Count != 1 {
+				t.Fatalf("WS handshake metric count=%d", series.Duration.Count)
+			}
+			return
+		}
+	}
+	t.Fatal("WS route metric missing")
 }
 
 func TestMetricsRouteUsesExistingAdminGuardsAndFlag(t *testing.T) {

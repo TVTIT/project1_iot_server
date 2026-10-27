@@ -111,6 +111,28 @@ type fakePublisher struct {
 	onPublish func(context.Context, Delivery) error
 }
 
+type recordingBatchSink struct {
+	mu      sync.Mutex
+	batches []telemetry.BatchDTO
+	times   []time.Time
+	reject  bool
+}
+
+func (s *recordingBatchSink) TrySubmitBatch(batch telemetry.BatchDTO, observedAt time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batch.Samples = append([]float64(nil), batch.Samples...)
+	s.batches = append(s.batches, batch)
+	s.times = append(s.times, observedAt)
+	return !s.reject
+}
+
+func (s *recordingBatchSink) snapshot() []telemetry.BatchDTO {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]telemetry.BatchDTO(nil), s.batches...)
+}
+
 func (p *fakePublisher) Publish(ctx context.Context, d Delivery) error {
 	p.mu.Lock()
 	p.calls++
@@ -345,6 +367,59 @@ func TestACKOnlyAfterConfirmedCommit(t *testing.T) {
 	}
 	if pub.count() != 1 {
 		t.Fatalf("ack published %d times, want exactly 1", pub.count())
+	}
+}
+
+func TestPostCommitSinkOnlyForConfirmedNewCommitIndependentOfACK(t *testing.T) {
+	sink := &recordingBatchSink{}
+	repo := &fakeRepo{enter: make(chan *telemetry.Message, 2), release: make(chan struct{})}
+	pub := &fakePublisher{onPublish: func(context.Context, Delivery) error { return errors.New("ack unavailable") }}
+	opts := defaultOptions()
+	opts.PostCommitSink = sink
+	ing := newIngress(t, opts, newValidator(t), repo, pub)
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 2)
+	if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+		t.Fatalf("Admit = %v", got)
+	}
+	waitMessage(t, repo.enter)
+	if got := len(sink.snapshot()); got != 0 {
+		t.Fatalf("sink called before Persist returned: %d", got)
+	}
+	close(repo.release)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	batches := sink.snapshot()
+	if len(batches) != 1 || batches[0].MessageID != testMessageID || batches[0].SampleCount != 2 || len(batches[0].Samples) != 2 {
+		t.Fatalf("post-commit batches = %+v, want one persisted batch", batches)
+	}
+	if got := ing.Snapshot(); got.Committed != 1 || got.ACKPublishFailures != 1 {
+		t.Fatalf("sink changed commit/ACK outcome: %+v", got)
+	}
+}
+
+func TestPostCommitSinkRejectAndDuplicateAreIndependent(t *testing.T) {
+	sink := &recordingBatchSink{reject: true}
+	repo := &fakeRepo{onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
+		return duplicateResult(m), nil
+	}}
+	opts := defaultOptions()
+	opts.PostCommitSink = sink
+	ing := newIngress(t, opts, newValidator(t), repo, &fakePublisher{})
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 1)
+	if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+		t.Fatalf("Admit = %v", got)
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sink.snapshot()); got != 0 {
+		t.Fatalf("duplicate submitted %d events", got)
+	}
+	if got := ing.Snapshot(); got.DuplicateCommitted != 1 || got.ACKPublished != 1 {
+		t.Fatalf("sink changed duplicate ACK outcome: %+v", got)
 	}
 }
 

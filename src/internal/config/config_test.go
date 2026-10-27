@@ -25,6 +25,48 @@ func TestMetricsFlagDefaultAndValidation(t *testing.T) {
 	}
 }
 
+func TestWebSocketFlagOptIn(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.WebSocketEnabled {
+		t.Fatalf("default websocket flag=%v err=%v", cfg.WebSocketEnabled, err)
+	}
+	values["WEBSOCKET_ENABLED"] = "true"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.WebSocketEnabled {
+		t.Fatalf("enabled websocket flag=%v err=%v", cfg.WebSocketEnabled, err)
+	}
+	values["WEBSOCKET_ENABLED"] = "invalid"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("invalid websocket flag accepted")
+	}
+}
+
+func TestWebSocketLimitsDefaultsAndValidation(t *testing.T) {
+	cfg, err := Load(mapLookup(validConfigValues()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cfg.WebSocket
+	if cfg.WebSocketEnabled || w.MaxSessions != 32 || w.MaxSubscriptionsPerSession != 16 || w.GlobalEventSlots != 64 || w.GlobalEventBytes != 8<<20 || w.SessionEventSlots != 64 || w.SessionEventBytes != 256<<10 || w.MaxFrameBytes != 66560 || w.ReadFrameBytes != 4096 || w.RequestRatePerSecond != 10 || w.RecheckInterval != 5*time.Second || w.RecheckSweepBudget != 2*time.Second || w.RecheckConcurrency != 2 || w.HeartbeatInterval != 20*time.Second || w.PongTimeout != 45*time.Second || w.WriteTimeout != 5*time.Second {
+		t.Fatalf("unexpected websocket defaults: enabled=%v config=%+v", cfg.WebSocketEnabled, w)
+	}
+	for key, value := range map[string]string{"WS_MAX_SESSIONS": "33", "WS_MAX_SUBSCRIPTIONS_PER_SESSION": "17", "WS_MAX_FRAME_BYTES": "66561", "WS_PONG_TIMEOUT": "19s", "WS_RECHECK_CONCURRENCY": "3"} {
+		values := validConfigValues()
+		values[key] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("accepted %s=%s", key, value)
+		}
+	}
+	values := validConfigValues()
+	values["WS_MAX_SESSIONS"] = "4"
+	values["WS_MAX_SUBSCRIPTIONS_PER_SESSION"] = "3"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || cfg.WebSocket.MaxSessions != 4 || cfg.WebSocket.MaxSubscriptionsPerSession != 3 {
+		t.Fatalf("lower test limits not accepted: %+v err=%v", cfg.WebSocket, err)
+	}
+}
+
 func TestMQTTRuntimeOptIn(t *testing.T) {
 	values := validConfigValues()
 	cfg, err := Load(mapLookup(values))

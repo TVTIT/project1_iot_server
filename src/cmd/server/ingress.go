@@ -53,7 +53,11 @@ type ingressRuntime struct {
 	metrics    *telemetry.PersistenceMetrics
 }
 
-func mqttIngressOptions(cfg config.Config) mqttingress.Options {
+func mqttIngressOptions(cfg config.Config, sinks ...mqttingress.PostCommitSink) mqttingress.Options {
+	var sink mqttingress.PostCommitSink
+	if len(sinks) != 0 {
+		sink = sinks[0]
+	}
 	return mqttingress.Options{
 		MetricsEnabled:       cfg.MetricsEnabled,
 		QueueCapacity:        cfg.Ingress.QueueCapacity,
@@ -77,15 +81,20 @@ func mqttIngressOptions(cfg config.Config) mqttingress.Options {
 		RAMDedup: mqttingress.DedupCacheOptions{
 			Enabled: cfg.Ingress.RAMDedupEnabled, MaxEntries: int64(cfg.Ingress.RAMDedupMaxEntries), MaxBytes: cfg.Ingress.RAMDedupMaxBytes,
 		},
+		PostCommitSink: sink,
 	}
 }
 
 // composeIngress builds the telemetry validator, repository, ingress core and
 // data transport only when MQTT_INGRESS_ENABLED is true. An invalid CA or
 // broker configuration fails here, at startup, before any worker runs.
-func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, error) {
+func composeIngress(cfg config.Config, pool *pgxpool.Pool, sinks ...mqttingress.PostCommitSink) (ingressRuntime, error) {
 	if !cfg.Ingress.Enabled {
 		return ingressRuntime{}, nil
+	}
+	var sink mqttingress.PostCommitSink
+	if len(sinks) != 0 {
+		sink = sinks[0]
 	}
 
 	validator, err := telemetry.NewValidator(telemetry.Limits{
@@ -142,9 +151,9 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 
 	var core *mqttingress.Ingress
 	if cfg.Ingress.MicrobatchEnabled {
-		core, err = mqttingress.New(mqttIngressOptions(cfg), validator, repository, transport, batchRepository)
+		core, err = mqttingress.New(mqttIngressOptions(cfg, sink), validator, repository, transport, batchRepository)
 	} else {
-		core, err = mqttingress.New(mqttIngressOptions(cfg), validator, repository, transport)
+		core, err = mqttingress.New(mqttIngressOptions(cfg, sink), validator, repository, transport)
 	}
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry ingress: %w", err)

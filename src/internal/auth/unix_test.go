@@ -16,7 +16,7 @@ import (
 
 func TestInternalAuthHandlerUsesStrictBearer(t *testing.T) {
 	v := newTestVerifier(t, 0)
-	h := NewInternalAuthHandler(v, &Metrics{}, nil)
+	h := NewInternalAuthHandler(v, &Metrics{}, nil, false)
 	valid := signToken(t, jwt.SigningMethodHS256, []byte(testSecret), validClaims(uuid.New()))
 	for _, tc := range []struct {
 		path, header string
@@ -44,7 +44,7 @@ func TestUnixAuthSocketPermissionsAndLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "auth.sock")
-	s, err := ListenUnixAuth(path, NewInternalAuthHandler(newTestVerifier(t, 0), nil, nil))
+	s, err := ListenUnixAuth(path, NewInternalAuthHandler(newTestVerifier(t, 0), nil, nil, false))
 	if err != nil {
 		t.Fatal(err)
 	}

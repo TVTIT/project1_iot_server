@@ -60,6 +60,9 @@ type Options struct {
 	Microbatch MicrobatchOptions
 	// RAMDedup enables the bounded process-local confirmed-commit cache.
 	RAMDedup DedupCacheOptions
+	// PostCommitSink optionally receives validated batch snapshots after a new
+	// persistence commit is confirmed. Implementations must admit without waiting.
+	PostCommitSink PostCommitSink
 	// PersistTimeout bounds connection acquisition, locks, SQL and commit of
 	// one Repository.Persist call.
 	PersistTimeout time.Duration
@@ -68,6 +71,12 @@ type Options struct {
 	// Logger receives reason-coded, payload-free structured events. Nil uses
 	// slog.Default().
 	Logger *slog.Logger
+}
+
+// PostCommitSink is the optional, ingress-owned seam for bounded committed
+// telemetry admission. It is independent of repository and ACK outcomes.
+type PostCommitSink interface {
+	TrySubmitBatch(batch telemetry.BatchDTO, confirmedObservedAt time.Time) bool
 }
 
 // DedupCacheOptions enables the bounded process-local confirmed-commit cache.
@@ -113,9 +122,10 @@ type validatedDelivery struct {
 // item traverses Validator.Validate -> Repository.Persist -> post-commit ACK
 // exactly once.
 type Ingress struct {
-	validator  Validator
-	repository Repository
-	publisher  Publisher
+	validator      Validator
+	repository     Repository
+	publisher      Publisher
+	postCommitSink PostCommitSink
 
 	workerCount                  int
 	microbatch                   MicrobatchOptions
@@ -226,6 +236,7 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 		validator:                    validator,
 		repository:                   repository,
 		publisher:                    publisher,
+		postCommitSink:               opts.PostCommitSink,
 		workerCount:                  opts.WorkerCount,
 		maxPayloadBytes:              opts.MaxPayloadBytes,
 		bufferedPayloadCapacityBytes: bufferedPayloadBytes,
@@ -690,6 +701,7 @@ func (i *Ingress) persistStandaloneBatch(ctx context.Context, d *validatedDelive
 	if ok {
 		if confirmed.result.Outcome == telemetry.CommitOutcomeCommitted {
 			i.publishConfirmedProof(d, confirmed)
+			i.submitCommittedBatch(d, confirmed)
 		}
 		i.publishACK(d, confirmed)
 	}
@@ -719,7 +731,8 @@ func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validate
 		}
 	}
 	results := i.batchRepository.PersistBatch(pctx, msgs)
-	commitObservedAt := i.clock.Now().UTC()
+	commitObserved := i.clock.Now()
+	commitObservedAt := commitObserved.UTC()
 	if i.metricsEnabled {
 		elapsed := time.Since(groupStart)
 		i.groupPersistence.Observe(elapsed)
@@ -772,7 +785,7 @@ func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validate
 			i.logReject("persist", r.Err)
 			continue
 		}
-		confirmed[r.InputIndex] = confirmedDelivery{result: telemetry.PersistResult{Identity: r.Identity, Outcome: r.Outcome, SamplesSaved: r.SamplesSaved}, confirmedAt: commitObservedAt}
+		confirmed[r.InputIndex] = confirmedDelivery{result: telemetry.PersistResult{Identity: r.Identity, Outcome: r.Outcome, SamplesSaved: r.SamplesSaved}, confirmedAt: commitObservedAt, observedAt: commitObserved}
 		valid[r.InputIndex] = true
 	}
 	for n, ok := range valid {
@@ -785,6 +798,13 @@ func (i *Ingress) persistValidatedGroup(ctx context.Context, members []*validate
 			} else {
 				i.counters.duplicateCommitted.Add(1)
 			}
+		}
+	}
+	// Submit every confirmed-new member before entering the ACK loop: cancellation
+	// or a publish failure for one member cannot erase another committed event.
+	for n, ok := range valid {
+		if ok && confirmed[n].result.Outcome == telemetry.CommitOutcomeCommitted {
+			i.submitCommittedBatch(members[n], confirmed[n])
 		}
 	}
 	for n, ok := range valid {
@@ -831,6 +851,7 @@ func (i *Ingress) process(it item) {
 	}
 	if confirmed.result.Outcome == telemetry.CommitOutcomeCommitted {
 		i.publishConfirmedProof(delivery, confirmed)
+		i.submitCommittedBatch(delivery, confirmed)
 	}
 	i.publishACK(delivery, confirmed)
 }
@@ -884,6 +905,7 @@ func (i *Ingress) validateDelivery(delivery *validatedDelivery) bool {
 type confirmedDelivery struct {
 	result      telemetry.PersistResult
 	confirmedAt time.Time
+	observedAt  time.Time
 }
 
 // persistDelivery validates the persistence result and records confirmed
@@ -918,7 +940,8 @@ func (i *Ingress) persistDeliveryContext(parent context.Context, delivery *valid
 	// after Persist returned. It is not the measurement time and not an exact
 	// PostgreSQL commit timestamp; a retry may report a different value for the
 	// same message_id/status.
-	delivery.confirmedAt = i.clock.Now().UTC()
+	observedAt := i.clock.Now()
+	delivery.confirmedAt = observedAt.UTC()
 
 	// The database result is final: record the confirmed commit regardless of
 	// whether the ACK publish below succeeds.
@@ -929,7 +952,18 @@ func (i *Ingress) persistDeliveryContext(parent context.Context, delivery *valid
 		i.counters.duplicateCommitted.Add(1)
 	}
 
-	return confirmedDelivery{result: result, confirmedAt: delivery.confirmedAt}, true
+	return confirmedDelivery{result: result, confirmedAt: delivery.confirmedAt, observedAt: observedAt}, true
+}
+
+func (i *Ingress) submitCommittedBatch(delivery *validatedDelivery, confirmed confirmedDelivery) {
+	if i.postCommitSink == nil || delivery == nil || delivery.message == nil ||
+		confirmed.result.Outcome != telemetry.CommitOutcomeCommitted ||
+		!identityMatches(delivery.message, confirmed.result.Identity) {
+		return
+	}
+	// Message.Batch returns an independent sample slice, so the sink sees the
+	// exact validated batch that was passed to persistence, not later state.
+	i.postCommitSink.TrySubmitBatch(delivery.message.Batch(), confirmed.observedAt)
 }
 
 func (i *Ingress) confirmedCacheHit(delivery *validatedDelivery) (confirmedDelivery, bool) {

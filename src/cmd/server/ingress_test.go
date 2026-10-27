@@ -118,6 +118,57 @@ func TestMQTTIngressOptionsWireConfiguredByteBudgetAndShaper(t *testing.T) {
 	}
 }
 
+func TestMQTTIngressOptionsPreservePostCommitSinkIndependentOfMetrics(t *testing.T) {
+	ws, err := composeWebSocket(config.Config{WebSocketEnabled: true, WebSocket: config.WebSocketConfig{MaxSessions: 2, MaxSubscriptionsPerSession: 2, GlobalEventSlots: 2, GlobalEventBytes: 1 << 20, SessionEventSlots: 2, SessionEventBytes: 1 << 16, MaxFrameBytes: 66560}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ws.close(context.Background()); err != nil {
+			t.Errorf("close websocket runtime: %v", err)
+		}
+	}()
+	cfg := config.Config{}
+	got := mqttIngressOptions(cfg, ws.events)
+	if got.PostCommitSink != ws.events {
+		t.Fatal("ingress sink does not use the composed EventRuntime")
+	}
+	if got.MetricsEnabled {
+		t.Fatal("metrics unexpectedly enabled")
+	}
+}
+
+func TestComposeWebSocketDisabledHasNoRuntimeAndCloseIsIdempotent(t *testing.T) {
+	w, err := composeWebSocket(config.Config{})
+	if err != nil || w.hub != nil || w.events != nil {
+		t.Fatalf("disabled runtime=%+v err=%v", w, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestComposeWebSocketEnabledClosesOwnedWorkerWithinSharedBudget(t *testing.T) {
+	cfg := config.Config{WebSocketEnabled: true, WebSocket: config.WebSocketConfig{MaxSessions: 2, GlobalEventSlots: 2, GlobalEventBytes: 4096, SessionEventSlots: 2, SessionEventBytes: 4096, MaxFrameBytes: 66560}}
+	w, err := composeWebSocket(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.hub == nil || w.events == nil {
+		t.Fatal("enabled composition omitted hub/runtime")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := w.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMQTTIngressOptionsWireEveryMicrobatchLimit(t *testing.T) {
 	cfg := ingressTestConfig("unused")
 	cfg.Ingress.MicrobatchEnabled = true

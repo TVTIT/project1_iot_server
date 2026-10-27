@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/MicahParks/jwkset v0.11.3
 	github.com/MicahParks/keyfunc/v3 v3.8.2
+	github.com/coder/websocket v1.8.15
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/gin-gonic/gin v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.3.1

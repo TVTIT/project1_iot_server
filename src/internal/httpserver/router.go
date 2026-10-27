@@ -15,6 +15,7 @@ import (
 	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/httpapi"
 	"iot-platform/internal/metrics"
+	"iot-platform/internal/telemetryws"
 	"iot-platform/internal/usermanagement"
 )
 
@@ -51,6 +52,8 @@ type RouterDependencies struct {
 	AdminInventoryMaxLimit     int
 	AdminMaxBodyBytes          int64
 	CredentialAPIEnabled       bool
+	WebSocketEnabled           bool
+	WebSocketHandler           *telemetryws.Handler
 	CredentialRequestTimeout   time.Duration
 	CredentialManager          CredentialManager
 	CredentialStartupReadiness CredentialStartupReadiness
@@ -91,6 +94,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	if auth.IsNilDependency(deps.TokenVerifier) {
 		return nil, fmt.Errorf("token verifier is required")
+	}
+	if deps.WebSocketEnabled && deps.WebSocketHandler == nil {
+		return nil, fmt.Errorf("enabled websocket requires owned handler")
 	}
 	if auth.IsNilDependency(deps.PlatformAdminChecker) {
 		return nil, fmt.Errorf("platform admin checker is required")
@@ -276,7 +282,11 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
 	authenticated.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensorForOwner(deps.OwnerSensorProvisioner, deps.AdminMaxBodyBytes))
-	authenticated.GET("/ws", notImplemented)
+	if deps.WebSocketEnabled {
+		router.GET("/v1/ws", auth.WSAuthenticationMiddleware(deps.TokenVerifier, deps.AuthMetrics), deps.WebSocketHandler.ServeHTTP)
+	} else {
+		authenticated.GET("/ws", notImplemented)
+	}
 	authenticated.GET("/digital-twins", listDigitalTwins(deps.TwinListReader, deps.TwinQueryParser))
 	authenticated.POST("/digital-twins", postDigitalTwin(deps.EntityCreator, deps.TwinMaxBodyBytes))
 	authenticated.GET("/digital-twins/:entity_id", getDigitalTwinDetail(deps.TwinDetailReader, deps.TwinStateReader, deps.TwinQueryParser))

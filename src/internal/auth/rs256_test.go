@@ -66,7 +66,7 @@ func TestRS256ContractAndBoundedRefresh(t *testing.T) {
 	defer v.Close()
 	good := validClaims(uuid.New())
 	for range 3 {
-		if p, err := v.Verify(context.Background(), rsaToken(t, k1, "k1", good)); err != nil || p.UserID.String() != good.Subject {
+		if p, err := v.Verify(context.Background(), rsaToken(t, k1, "k1", good)); err != nil || p.UserID.String() != good.Subject || !p.ExpiresAt.Equal(good.ExpiresAt.Time) {
 			t.Fatal(p, err)
 		}
 	}

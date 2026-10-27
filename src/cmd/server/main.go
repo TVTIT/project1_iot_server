@@ -19,6 +19,7 @@ import (
 	"iot-platform/internal/database"
 	"iot-platform/internal/gateway"
 	"iot-platform/internal/httpserver"
+	"iot-platform/internal/telemetryws"
 )
 
 func main() {
@@ -50,14 +51,22 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer pool.Close()
+	// A pool may only be closed after shutdown has joined every DB-using worker.
+	// If a bounded join is unconfirmed, process exit reclaims the pool instead of
+	// racing an outstanding cancellation-aware query with Pool.Close.
+	closePool := true
+	defer func() {
+		if closePool {
+			pool.Close()
+		}
+	}()
 	credentials, err := composeCredentials(rootCtx, pool, cfg.Credential)
 	if err != nil {
 		return err
 	}
 
-	// One shutdown path, one SHUTDOWN_TIMEOUT budget, shared by HTTP, the
-	// telemetry ingress drain and the credential close. It is registered before
+	// One shutdown path, one SHUTDOWN_TIMEOUT budget, shared by HTTP, upgraded
+	// sockets/recheck, telemetry ingress drain and credential close. It is registered before
 	// any component below starts so a startup failure after the ingress starts
 	// still tears it down. A sync.Once keeps it idempotent, and components that
 	// never came online stay inert.
@@ -70,6 +79,8 @@ func run() error {
 		control      stage5Runtime
 		authSocket   *auth.UnixAuthServer
 		closeAuth    = func() {}
+		wsHandler    *telemetryws.Handler
+		wsRuntime    websocketRuntime
 	)
 	shutdown := func() error {
 		shutdownOnce.Do(func() {
@@ -86,14 +97,21 @@ func run() error {
 			if serverReady {
 				go func() { httpErrors <- server.Shutdown(ctx) }()
 			}
+			if wsHandler != nil {
+				if err := wsHandler.Shutdown(ctx); err != nil {
+					shutdownErr = errors.Join(shutdownErr, fmt.Errorf("websocket shutdown: %w", err))
+				}
+			}
 
-			// Drain admitted work within the same budget, then close MQTT. The
-			// shared pool is closed by the deferred pool.Close after this returns,
-			// so it is never closed while workers are still running.
+			// Drain admitted work (including application ACKs) before stopping the
+			// WS event/recheck workers. Auth dependencies and the pool close later.
 			if err := ingress.drainAndClose(ctx); err != nil {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("telemetry ingress shutdown: %w", err))
 			}
 			ingress.logSummary()
+			if err := wsRuntime.close(ctx); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("websocket runtime shutdown: %w", err))
+			}
 			if err := control.close(ctx); err != nil {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("stage 5 shutdown: %w", err))
 			}
@@ -110,6 +128,9 @@ func run() error {
 			if err := credentials.closeContext(ctx); err != nil {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("credential shutdown close unconfirmed: %w", err))
 			}
+			if shutdownErr != nil {
+				closePool = false
+			}
 		})
 		return shutdownErr
 	}
@@ -123,7 +144,11 @@ func run() error {
 		}
 	}()
 
-	if ingress, err = composeIngress(cfg, pool); err != nil {
+	wsRuntime, err = composeWebSocket(cfg)
+	if err != nil {
+		return fmt.Errorf("compose websocket runtime: %w", err)
+	}
+	if ingress, err = composeIngress(cfg, pool, wsRuntime.events); err != nil {
 		return err
 	}
 	if control, err = composeStage5Transport(cfg, pool); err != nil {
@@ -147,6 +172,9 @@ func run() error {
 	gatewayRepository, err := gateway.NewPostgresRepository(pool)
 	if err != nil {
 		return fmt.Errorf("create gateway repository: %w", err)
+	}
+	if err := wsRuntime.configure(cfg, gatewayRepository); err != nil {
+		return fmt.Errorf("compose websocket application: %w", err)
 	}
 	gatewayService, err := gateway.NewService(gatewayRepository, cfg.AuthorizationTimeout)
 	if err != nil {
@@ -218,7 +246,18 @@ func run() error {
 	if err := populateUserManagementDependencies(&routerDeps, cfg, pool); err != nil {
 		return fmt.Errorf("compose user management dependencies: %w", err)
 	}
-	populateMetricsDependencies(&routerDeps, cfg, pool, ingress, control)
+	populateMetricsDependencies(&routerDeps, cfg, pool, ingress, control, wsRuntime)
+	routerDeps.WebSocketEnabled = cfg.WebSocketEnabled
+	if cfg.WebSocketEnabled {
+		wsHandler = wsRuntime.handler
+		if wsHandler == nil {
+			return errors.New("websocket application handler unavailable")
+		}
+		if routerDeps.HTTPMetrics != nil {
+			wsHandler.SetHandshakeObserver(routerDeps.HTTPMetrics.ObserveWebSocketHandshake)
+		}
+		routerDeps.WebSocketHandler = wsHandler
+	}
 	router, err := httpserver.NewRouter(routerDeps)
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)
@@ -235,7 +274,7 @@ func run() error {
 	var authSocketErrors <-chan error
 	if cfg.AuthUnixSocketPath != "" {
 		authSocket, err = auth.ListenUnixAuth(cfg.AuthUnixSocketPath,
-			auth.NewInternalAuthHandler(tokenVerifier, routerDeps.UnixAuthMetrics, routerDeps.UnixAuthDuration))
+			auth.NewInternalAuthHandler(tokenVerifier, routerDeps.UnixAuthMetrics, routerDeps.UnixAuthDuration, cfg.WebSocketEnabled))
 		if err != nil {
 			return fmt.Errorf("start auth socket: %w", err)
 		}
@@ -247,6 +286,9 @@ func run() error {
 	}
 	if err := control.start(); err != nil {
 		return fmt.Errorf("start stage 5 transport: %w", err)
+	}
+	if err := wsRuntime.start(rootCtx); err != nil {
+		return fmt.Errorf("start websocket membership rechecker: %w", err)
 	}
 
 	serverErrors := make(chan error, 1)

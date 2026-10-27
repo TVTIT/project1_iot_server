@@ -18,6 +18,8 @@ type LookupFunc func(string) (string, bool)
 // Config contains process-level settings required by the backend.
 type Config struct {
 	MetricsEnabled             bool
+	WebSocketEnabled           bool
+	WebSocket                  WebSocketConfig
 	Stage5                     Stage5Config
 	Credential                 CredentialConfig
 	Ingress                    IngressConfig
@@ -54,6 +56,18 @@ type Config struct {
 	AuthUnixSocketPath         string
 }
 
+// WebSocketConfig contains policy bounds. Limits are clamped to the hard caps
+// enforced by telemetryws access state and recheck worker.
+type WebSocketConfig struct {
+	MaxSessions, MaxSubscriptionsPerSession             int
+	GlobalEventSlots, GlobalEventBytes                  int
+	SessionEventSlots, SessionEventBytes                int
+	MaxFrameBytes, ReadFrameBytes, RequestRatePerSecond int
+	RecheckInterval, RecheckSweepBudget                 time.Duration
+	RecheckConcurrency                                  int
+	HeartbeatInterval, PongTimeout, WriteTimeout        time.Duration
+}
+
 // LoadFromEnvironment loads configuration from the process environment.
 func LoadFromEnvironment() (Config, error) {
 	return Load(os.LookupEnv)
@@ -75,6 +89,12 @@ func Load(lookup LookupFunc) (Config, error) {
 		ServerEnv:   valueOrDefault(lookup, "SERVER_ENV", "development"),
 	}
 	if cfg.MetricsEnabled, err = boolValue(lookup, "METRICS_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.WebSocketEnabled, err = boolValue(lookup, "WEBSOCKET_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.WebSocket, err = loadWebSocket(lookup); err != nil {
 		return Config{}, err
 	}
 

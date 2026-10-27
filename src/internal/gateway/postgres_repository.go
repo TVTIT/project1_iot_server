@@ -51,6 +51,12 @@ FROM public.user_gateways AS ug
 JOIN public.gateways AS g ON g.gateway_id = ug.gateway_id
 WHERE ug.user_id = $1 AND g.gateway_id = $2`
 
+const checkSensorSubscriptionTargetQuery = `SELECT ug.role
+FROM public.user_gateways AS ug
+JOIN public.gateways AS g ON g.gateway_id = ug.gateway_id
+JOIN public.sensors AS s ON s.gateway_id = g.gateway_id AND s.sensor_id = $3
+WHERE ug.user_id = $1 AND g.gateway_id = $2`
+
 const checkPlatformAdminQuery = `SELECT EXISTS (
     SELECT 1
     FROM public.platform_admins
@@ -131,6 +137,47 @@ func (r *postgresRepository) GetGatewayRole(ctx context.Context, userID uuid.UUI
 		return "", fmt.Errorf("query gateway role: %w", err)
 	}
 	return role, nil
+}
+
+func (r *postgresRepository) AuthorizeSubscriptionTarget(ctx context.Context, userID uuid.UUID, gatewayID string, sensorID string) (Role, error) {
+	if userID == uuid.Nil {
+		return "", ErrInvalidUser
+	}
+	if err := ValidateGatewayID(gatewayID); err != nil {
+		return "", err
+	}
+	if sensorID != "" {
+		if err := ValidateSensorID(sensorID); err != nil {
+			return "", err
+		}
+		var role Role
+		if err := r.database.QueryRow(ctx, checkSensorSubscriptionTargetQuery, userID, gatewayID, sensorID).Scan(&role); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", ErrNotFound
+			}
+			return "", fmt.Errorf("authorize sensor subscription: %w", err)
+		}
+		switch role {
+		case RoleOwner, RoleOperator, RoleViewer:
+			return role, nil
+		default:
+			return "", ErrNotFound
+		}
+	}
+
+	var role Role
+	if err := r.database.QueryRow(ctx, gatewayRoleQuery, userID, gatewayID).Scan(&role); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("authorize gateway subscription: %w", err)
+	}
+	switch role {
+	case RoleOwner, RoleOperator, RoleViewer:
+		return role, nil
+	default:
+		return "", ErrNotFound
+	}
 }
 
 func (r *postgresRepository) ListAdminGateways(ctx context.Context, actor uuid.UUID, query AdminGatewayInventoryQuery) (AdminGatewayInventoryPage, error) {
