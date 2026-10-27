@@ -75,8 +75,9 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
     test ! -e "$run_dir" && sh scripts/test-paper-p5a.sh on 1 "$run_dir" --shutdown-smoke >"$log" 2>&1
     ```
    - `off` là rollback/ablation sang persistence từng message; protocol telemetry và ACK từng message không đổi. Xem báo cáo P5b để biết runner bốn profile, cache-off DB fallback và cache functional/P3 control smokes. `STAGE5_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false` là deployment defaults độc lập. **Ghi chú lịch sử tại checkpoint P5 (26/10/2026):** lúc đó P6 chưa chạy và công việc dừng ở P5; trạng thái hiện tại được cập nhật riêng ngay bên dưới, không sửa evidence/checkpoint P5.
-- **P6 — Dispatch và tải hỗn hợp (26/10/2026): PASS trong phạm vi Local MVP trên simulator.** Bốn arm polling/wake-up theo source-qualified report (dataset 100 và 1 sample/message) có 6/6 commands accepted+succeeded, telemetry/database accounting và exact fixture cleanup; recovery `ncs_ce2eb3785586` được chấp nhận với broker giữ ổn định, chỉ restart backend. Xem [báo cáo P6](docs/backend/paper-p6-dispatch-and-mixed-load.md), [summary JSON](docs/backend/results/p6/summary.json), [summary CSV](docs/backend/results/p6/summary.csv) và [backlog/giới hạn chung](docs/dynsec/limitations-and-backlog.md). Runner native là [`scripts/tests/native_compose_smoke.py`](scripts/tests/native_compose_smoke.py); chế độ, run-directory mới và log riêng được mô tả trong report. Không chạy lại trên deployment.
-   - Wake-up chỉ là hint sau confirmed commit; periodic/startup scan vẫn là fallback. Deployment giữ `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false`. Stage 5 gốc vẫn **chưa hoàn tất**: full/remote CI requirement lane, AM5728/HIL, cảm biến vật lý và live rollout NOT RUN; P6 Local MVP không phải xác nhận production.
+   - **P6 — Dispatch và tải hỗn hợp (26/10/2026): PASS trong phạm vi Local MVP trên simulator.** Bốn arm polling/wake-up theo source-qualified report (dataset 100 và 1 sample/message) có 6/6 commands accepted+succeeded, telemetry/database accounting và exact fixture cleanup; recovery `ncs_ce2eb3785586` được chấp nhận với broker giữ ổn định, chỉ restart backend. Xem [báo cáo P6](docs/backend/paper-p6-dispatch-and-mixed-load.md), [summary JSON](docs/backend/results/p6/summary.json), [summary CSV](docs/backend/results/p6/summary.csv) và [backlog/giới hạn chung](docs/dynsec/limitations-and-backlog.md). Runner native là [`scripts/tests/native_compose_smoke.py`](scripts/tests/native_compose_smoke.py); chế độ, run-directory mới và log riêng được mô tả trong report. Không chạy lại trên deployment.
+    - Wake-up chỉ là hint sau confirmed commit; periodic/startup scan vẫn là fallback. Deployment giữ `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false`. Stage 5 gốc vẫn **chưa hoàn tất**: full/remote CI requirement lane, AM5728/HIL, cảm biến vật lý và live rollout NOT RUN; P6 Local MVP không phải xác nhận production.
+   - **P7 — WebSocket telemetry (27/10/2026): LOCAL MVP COMPLETE, SOURCE-QUALIFIED.** Có native sublane PASS cho perimeter, lifecycle, grouped/single commit fan-out, slow viewer, reconnect, cặp 0/2 viewer mô tả và P6+WS regression. Mỗi run giữ nguyên `full_p7_accepted=false`; aggregate không đổi cờ raw nào và không phải production acceptance. Xem [báo cáo P7](docs/backend/paper-p7-websocket-telemetry.md), [protocol v1](docs/protocols/websocket-v1.md), [opt-in runbook](config/nginx/P7-WS-OPT-IN.md), [summary JSON](docs/backend/results/p7/summary.json), [summary CSV](docs/backend/results/p7/summary.csv) và [backlog chung](docs/dynsec/limitations-and-backlog.md). Deployment giữ `WEBSOCKET_ENABLED=false` cùng Stage 5 flags false. Full/remote CI, HIL/AM5728, P8 capacity/soak và live rollout NOT RUN; dừng tại P7.
 
 ---
 
@@ -111,8 +112,8 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 
 ### Các thành phần chính trong hệ thống:
 1. **Nginx (`config/nginx/nginx.conf.template`)**: HTTP reverse proxy duy nhất nhận traffic từ Cloudflare Tunnel / mạng ngoài, điều hướng các prefix:
-   - `/v1/*`: Định tuyến vào Go Backend (REST API).
-   - `/v1/ws`, `/v1/telemetry/ws`: Reverse proxy WebSocket cho Go Backend.
+    - `/v1/*`: Định tuyến vào Go Backend (REST API) theo template/profile được chọn.
+    - Exact `/v1/ws`: default template trả 404; P2 TLS template và opt-in P7 profile có route WebSocket qua perimeter auth. Xem [P7 opt-in runbook](config/nginx/P7-WS-OPT-IN.md). `/v1/telemetry/ws` không phải alias hiện hành.
    - `/auth/v1/*`: Định tuyến tới Supabase Auth (GoTrue qua Envoy gateway).
    - `/storage/v1/*`: Định tuyến tới Supabase Storage API (qua Envoy gateway).
 2. **Mosquitto MQTT Broker (`config/mosquitto/`)**:
@@ -124,7 +125,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 3. **Go Backend Modular Monolith (`src/cmd/server`)**:
    - Xử lý xác thực JWT Supabase, phân quyền quan hệ User–Gateway (`user_gateways`).
    - Thu thập telemetry từ Mosquitto, deduplication bằng `processed_messages`, lưu trữ TimescaleDB.
-   - API truy vấn lịch sử (`time_bucket`), WebSocket streaming realtime cho client được cấp quyền.
+    - API truy vấn lịch sử (`time_bucket`); WebSocket telemetry streaming tại `/v1/ws` là opt-in Local MVP (`WEBSOCKET_ENABLED=false` mặc định), không phải durable replay hoặc production rollout.
    - Cấp Signed Upload/Read URL cho media (ảnh chụp từ Gateway), xác thực metadata và lưu trạng thái vào `media_objects`.
    - **Digital Twin Subsystem**: Quản lý thực thể Gateway/Sensor/Device chuẩn NGSI-LD, đồng bộ `reported_state` từ uplink, tiếp nhận `desired_state` từ người dùng, quản lý lệnh điều khiển qua Transactional Outbox và đối soát trạng thái (reconciliation).
 4. **PostgreSQL 16 + TimescaleDB**:
@@ -511,11 +512,11 @@ Các route này đã được triển khai hoàn chỉnh theo Kế hoạch chi t
 | `DELETE` | `/v1/admin/gateways/{gateway_id}/users/{user_id}` | Bearer JWT + `platform_admins` | Thu hồi quyền thành viên (`operator`/`viewer`) trên Gateway; không có body/query. Thao tác có tính lũy đẳng (idempotent), không xóa tài khoản/profile/global role và không ảnh hưởng Gateway khác | Đã triển khai: HTTP 204 No Content (body rỗng) khi xóa thành công hoặc khi membership không tồn tại; HTTP 409 Conflict (`owner_transfer_required`) nếu target là owner (yêu cầu chuyển owner trước); HTTP 404 Not Found nếu Gateway không tồn tại; HTTP 400 nếu có body/query hoặc ID sai |
 
 #### 4. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
-Hiện tại chỉ còn duy nhất 1 route stub cho WebSocket truyền dữ liệu thời gian thực (thuộc Giai đoạn 7):
+Không còn route WebSocket business stub mặc định: exact `/v1/ws` trả 404 ở default Nginx; khi route tới Go authenticated compatibility handler và `WEBSOCKET_ENABLED=false`, handler trả 501. P7 có implementation opt-in Local MVP; xem protocol/runbook phía trên. Bảng này chỉ liệt kê disabled-handler compatibility response:
 
 | Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
 |---|---|---|---|---|
-| `GET` | `/v1/ws` | Bearer JWT `authenticated` (header) | Nâng cấp kết nối WebSocket để streaming dữ liệu cảm biến thời gian thực | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
+| `GET` | `/v1/ws` | Bearer JWT or browser credential subprotocol | WebSocket telemetry; disabled authenticated Go handler returns 501; default Nginx exact route returns 404; opt-in profile behavior per protocol | HTTP 401 invalid/missing auth; 501 only if disabled Go handler is reached |
 
 #### 5. Endpoint điều khiển Sensor — đã hoàn thành P3 trên simulator, mặc định tắt trên deployment:
 
