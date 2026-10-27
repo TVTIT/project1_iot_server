@@ -691,6 +691,43 @@ class PaperP1Tests(unittest.TestCase):
             self.assertEqual(fields['ShaperPassed']['availability'], 'available')
             self.assertEqual(fields['ShaperPassed']['value'], '0')
 
+    def test_p7_websocket_metrics_csv_uses_fixed_rows_and_units(self):
+        import csv
+        histogram = {'count': 1, 'sum_seconds': 0.25, 'overflow': 0,
+                     'upper_seconds': [0.1], 'buckets': [0]}
+        ws = {'availability': 'available', 'sessions': 2, 'subscriptions': 3,
+              'global_queued_work': 1, 'global_queued_bytes': 2048,
+              'session_queued_in_flight_bytes': 512, 'submissions': 1,
+              'new_events': 1, 'build_failures': 0, 'deliveries_enqueued': 2,
+              'telemetry_writes_completed': 2, 'control_writes_completed': 1,
+              'drops': 0, 'slow_closes': 0, 'auth_denials': 0, 'origin_denials': 0,
+              'expiries': 0, 'revocations': 0, 'origin_missing': 0,
+              'confirmed_to_write_seconds': histogram, 'identity': 'PRIVATE_SENTINEL'}
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'availability': {'websocket': 'available'}, 'websocket_metrics': ws}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'ws', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        fields = {(r['metric'], r['unit']): r for r in rows if r['group'] == 'websocket'}
+        self.assertEqual(fields[('global_queued_bytes', 'bytes')]['value'], '2048')
+        self.assertEqual(fields[('telemetry_writes_completed', 'count')]['value'], '2')
+        self.assertEqual(fields[('confirmed_to_write_seconds.sum', 'seconds')]['value'], '0.25')
+        self.assertNotIn('PRIVATE_SENTINEL', str(rows))
+
+    def test_p7_websocket_metrics_csv_preserves_disabled_availability(self):
+        import csv
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'availability': {'websocket': 'disabled'}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'disabled', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        self.assertTrue(all(r['availability'] == 'disabled' and r['value'] == ''
+                            for r in rows if r['group'] == 'websocket'))
+
     def test_p5a_metrics_csv_exports_actual_persistence_and_microbatch_operations(self):
         import csv
         h = {'count': 2, 'sum_seconds': 0.03, 'overflow': 0,
@@ -1191,6 +1228,56 @@ class PaperP1Tests(unittest.TestCase):
             self.assertTrue(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
             registry.items[-1]['removed'] = False
             self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
+
+    def test_p7_slow_viewer_mode_is_profiled_dispatched_and_proof_gated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'slow', paper_p7=True, paper_p7_mode='slow_viewer')
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(smoke.paper_p7_support().pilot_mode(fixture), 'slow_viewer')
+            labels = {'io.iot.native-smoke.run': fixture.project}
+            item = {'kind': 'volume', 'name': fixture.project + '_store', 'run': fixture.project,
+                    'task': 'native-compose-allocation', 'allocation_attempted': True, 'removed': True,
+                    'labels': labels, 'receipt': {'id': fixture.project + '_store',
+                    'created': '2026-10-27T08:00:00Z', 'labels': dict(labels)}}
+            registry = Mock(items=[item])
+            proof_path = fixture.artifacts / 'p7-slow-viewer-proof.json'
+            ids = [f'id-{i}' for i in range(1000)]
+            proof_path.write_text(json.dumps({'functional_status': 'PASS',
+                'capture_finalization_status': 'finished', 'resource_cleanup_status': 'pending',
+                'workload': {'messages_offered': 1000, 'application_acks_expected': 1000,
+                    'application_acks_actual': 1000, 'unique_application_acks': 1000, 'message_ids': ids},
+                'database': {'actual_counts': {'ledger': 1000, 'raw': 1000000, 'temporal': 1000},
+                    'expected_counts': {'ledger': 1000, 'raw': 1000000, 'temporal': 1000},
+                    'ledger_ids': ids, 'temporal_ids': ids, 'ledger_provenance_match': True,
+                    'ledger_ids_match': True, 'ledger_time_provenance_match': True,
+                    'raw_content_match': True, 'raw_value_sequence_time_match': True,
+                    'temporal_ids_match': True, 'temporal_value_time_match': True,
+                    'temporal_provenance_match': True, 'temporal_values': [
+                        {'message_id': item, 'observed_at': '2026-10-27T00:00:00Z', 'value_number': 10000}
+                        for item in ids], 'ledger_time_values': [
+                        {'message_id': item, 'measured_at': '2026-10-27T00:00:00Z'} for item in ids],
+                    'raw_chunk_statistics': {'total_rows_expected': 1000000, 'rows_checked': 1000000,
+                        'chunks_checked': 10, 'failing_chunk': None}},
+                'policy': {'close_causes': ['queue_overflow'], 'close_cause_observed': True,
+                    'slow_close_delta_verified': True, 'queue_drained': True},
+                'capture_finalization': {'expected_a_count': 1000,
+                    'a': {'status': 'PASS', 'count': 1000, 'event_header_count': 1000,
+                        'headers_match_count': True, 'namespace_match': True},
+                    'b': {'status': 'ready', 'count': 0, 'event_header_count': 0,
+                        'headers_match_count': True, 'namespace_match': True}}}))
+            good = {'status': 'PASS', 'mode': 'paper_p7_slow_viewer', 'full_p7_accepted': False,
+                    'exact_cleanup_verified': False, 'evidence': {key: True for key in
+                    smoke.paper_p7_support().SLOW_VIEWER_REQUIRED_PROOFS},
+                    'capture_finalization_status': 'finished',
+                    'precleanup_proof_artifact': 'p7-slow-viewer-proof.json',
+                    'precleanup_proof_path': str(proof_path)}
+            self.assertTrue(smoke.paper_p7_cleanup_acceptance(fixture, {'paper_p7': good},
+                {'container': 0, 'network': 0, 'volume': 1}, True, registry))
+            bad = dict(good, evidence=dict(good['evidence'], database_counts=False))
+            self.assertFalse(smoke.paper_p7_cleanup_acceptance(fixture, {'paper_p7': bad},
+                {'container': 0, 'network': 0, 'volume': 1}, True, registry))
 
     def test_p5a_workload_acceptance_is_separate_and_exact_cleanup_gated(self):
         with tempfile.TemporaryDirectory() as directory:

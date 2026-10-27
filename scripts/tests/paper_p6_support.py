@@ -1234,7 +1234,7 @@ def sensor_count_delta(spec, current, baseline):
             for key in ('ledger', 'raw', 'raw_samples', 'temporal')}
 
 
-def run(smoke, fixture, endpoint, registry, containers, images, state):
+def run(smoke, fixture, endpoint, registry, containers, images, state, fixture_callback=None):
     """Execute a finite P6 workload on the exact-owned native fixture."""
     if any(v is None for v in (endpoint, registry, containers, images, state)):
         raise ValueError('paper_p6_fixture_required')
@@ -1367,6 +1367,12 @@ def run(smoke, fixture, endpoint, registry, containers, images, state):
         'gateway_id': item['gateway_id'], 'sensor_id': item['sensor_id'],
         'sensor_urn': item['sensor_urn']}) for item in command_sims]
     db_before = {(spec.gateway_id, spec.sensor_id): sensor_db_counts(spec) for spec in db_specs}
+
+    # Test-only synchronization point for an affected P7 regression. Existing P6
+    # callers pass no callback and retain the original execution path unchanged.
+    if fixture_callback is not None:
+        fixture_callback.start(pg=pg, tokens=tokens, specs=specs, baseline=db_before,
+                              sensor_db_counts=sensor_db_counts)
 
     command_windows = []
     def issue_commands(sim, frequencies, phase):
@@ -1614,4 +1620,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state):
     smoke.durable_json(fixture.artifacts / 'run.json', safe_artifact(run_data))
     if not overlap_verified or not summaries_valid:
         raise ValueError('paper_p6_workload_evidence_failed')
+    if fixture_callback is not None:
+        fixture_callback.finish(run_data=run_data, db_specs=specs, pg=pg,
+                                sensor_db_counts=sensor_db_counts)
     return run_data

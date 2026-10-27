@@ -18,6 +18,67 @@ spec.loader.exec_module(smoke)
 
 
 class PaperP2Tests(unittest.TestCase):
+    def test_fixture_dispatch_routes_p7_only_to_handshake_helper(self):
+        p7 = Mock(paper_p7=True, paper_p2=True)
+        p2 = Mock(paper_p7=False, paper_p2=True)
+        helper = Mock()
+        helper.run.return_value = {'status': 'PASS'}
+        helper.run_full.return_value = {'status': 'P2'}
+        self.assertEqual(smoke.dispatch_paper_fixture(p7, helper, 'args'), {'status': 'PASS'})
+        helper.run.assert_called_once_with('args')
+        helper.run_full.assert_not_called()
+        helper.reset_mock()
+        self.assertEqual(smoke.dispatch_paper_fixture(p2, helper, 'args'), {'status': 'P2'})
+        helper.run_full.assert_called_once_with('args')
+        helper.run.assert_not_called()
+
+    def test_upgrade_probe_uses_one_buffered_reader_and_closes_all_statuses(self):
+        helper = smoke.paper_p7_support()
+        for status in (101, 401, 403):
+            client, peer = socket.socketpair()
+            peer.sendall(f'HTTP/1.1 {status} Result\r\nX-Test: yes\r\n\r\n'.encode())
+            context = Mock()
+            context.wrap_socket.return_value = client
+            with patch.object(helper.ssl, 'create_default_context', return_value=context), \
+                    patch.object(helper.socket, 'create_connection', return_value=client):
+                code, fields = helper.native_probe('https://localhost:443', 'fixture-ca', 'token')
+            self.assertEqual(code, status)
+            self.assertEqual(fields['x-test'], 'yes')
+            self.assertEqual(client.fileno(), -1)
+            peer.close()
+
+    def test_upgrade_probe_bounds_headers_and_closes_on_eof_or_timeout(self):
+        helper = smoke.paper_p7_support()
+        for payload in (b'HTTP/1.1 101 OK\r\nX: ' + b'a' * 200 + b'\r\n',
+                        b'HTTP/1.1 101 OK\r\nX: y\r\n'):
+            client, peer = socket.socketpair()
+            peer.sendall(payload)
+            context = Mock()
+            context.wrap_socket.return_value = client
+            with patch.object(helper.ssl, 'create_default_context', return_value=context), \
+                    patch.object(helper.socket, 'create_connection', return_value=client):
+                with self.assertRaises((ValueError, OSError)):
+                    helper.native_probe('https://localhost:443', 'fixture-ca', 'token')
+            self.assertEqual(client.fileno(), -1)
+            peer.close()
+
+    def test_upgrade_probe_parse_exception_releases_reader_and_socket(self):
+        helper = smoke.paper_p7_support()
+        client, peer = socket.socketpair()
+        peer.sendall(b'not-http\r\n\r\n')
+        reader = Mock()
+        reader.readline.side_effect = [b'not-http\r\n']
+        context = Mock()
+        context.wrap_socket.return_value = client
+        with patch.object(helper.ssl, 'create_default_context', return_value=context), \
+                patch.object(helper.socket, 'create_connection', return_value=client), \
+                patch.object(helper.socket.socket, 'makefile', return_value=reader):
+            with self.assertRaises(ValueError):
+                helper.native_probe('https://localhost:443', 'fixture-ca', 'token')
+        reader.close.assert_called_once()
+        self.assertEqual(client.fileno(), -1)
+        peer.close()
+
     def test_storage_probe_retries_only_transient_status_and_keeps_safe_diagnostics(self):
         helper = smoke.paper_p2_support()
         record = {}
@@ -159,16 +220,60 @@ class PaperP2Tests(unittest.TestCase):
             self.assertNotIn('SUPABASE_JWT_SECRET', m['services']['backend']['environment'])
             self.assertEqual(m['services']['nginx']['ports'][0]['target'], 443)
             self.assertEqual(m['services']['backend']['environment']['AUTH_UNIX_SOCKET_PATH'], '/run/iot-auth/auth.sock')
+            self.assertEqual(m['services']['backend']['environment']['WEBSOCKET_ENABLED'], 'false')
+
+    def test_p7_mode_alone_enables_ws_and_rejects_p2_mode_mix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p2 = smoke.prepare(Path(directory) / 'p2', paper_p2=True)
+            p7 = smoke.prepare(Path(directory) / 'p7', paper_p7=True)
+            self.assertFalse(p2.paper_p7)
+            self.assertEqual(p2.values['WEBSOCKET_ENABLED'], 'false')
+            self.assertTrue(p7.paper_p7)
+            self.assertEqual(p7.values['WEBSOCKET_ENABLED'], 'true')
+            self.assertEqual(smoke.fixture_services(p7), smoke.fixture_services(p2))
+            with self.assertRaisesRegex(ValueError, 'paper_p7_mode_rejected'):
+                smoke.prepare(Path(directory) / 'mixed', paper_p7=True, paper_p2=True)
 
     def test_nginx_perimeter_template_is_separate_and_fail_closed(self):
         text = (smoke.ROOT / 'config/nginx/paper-p2.conf.template').read_text()
-        for required in ('listen 443 ssl', 'auth_request /_p2_auth;', 'internal;',
+        for required in ('listen 443 ssl', 'auth_request /_p2_auth;', 'auth_request /_p2_ws_auth;',
+                         'proxy_pass http://auth_verifier/internal/auth/verify/ws;',
+                         'proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;', 'internal;',
                          'unix:/run/iot-auth/auth.sock', 'proxy_pass_request_body off;',
                          'client_max_body_size 16k;', 'client_max_body_size 50m;',
                          'proxy_set_header X-Forwarded-For $remote_addr;'):
             self.assertIn(required, text)
         self.assertNotIn('satisfy any', text)
         self.assertNotIn('auth_request', (smoke.ROOT / 'config/nginx/nginx.conf.template').read_text())
+
+    def test_p7_ws_overlay_is_opt_in_and_uses_private_unix_verifier(self):
+        base = (smoke.ROOT / 'docker-compose.yml').read_text()
+        overlay = (smoke.ROOT / 'docker-compose.p7-ws.yml').read_text()
+        template = (smoke.ROOT / 'config/nginx/paper-p7-ws.conf.template').read_text()
+        default_nginx = (smoke.ROOT / 'config/nginx/nginx.conf.template').read_text()
+        self.assertIn('WEBSOCKET_ENABLED: ${WEBSOCKET_ENABLED:-false}', base)
+        self.assertIn('AUTH_UNIX_SOCKET_PATH: ${AUTH_UNIX_SOCKET_PATH:-}', base)
+        self.assertNotIn('auth_socket', base)
+        self.assertIn('auth_socket_p7:/run/iot-auth', overlay)
+        self.assertIn('auth_socket_p7:/run/iot-auth:ro', overlay)
+        self.assertIn('group_add:', overlay)
+        self.assertIn('chmod 2710 /run/iot-auth', overlay)
+        self.assertIn('cap_add: [ CHOWN, FOWNER, FSETID ]', overlay)
+        self.assertIn("WEBSOCKET_ENABLED: 'true'", overlay)
+        self.assertIn("AUTH_UNIX_SOCKET_PATH: /run/iot-auth/auth.sock", overlay)
+        self.assertIn('location = /v1/ws', template)
+        self.assertIn('auth_request /_p7_ws_auth;', template)
+        self.assertIn('proxy_pass http://auth_verifier/internal/auth/verify/ws;', template)
+        self.assertIn('proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;', template)
+        self.assertIn('unix:/run/iot-auth/auth.sock', template)
+        self.assertIn('internal;', template)
+        self.assertNotIn('/v1/telemetry/ws', template)
+        self.assertNotIn('/v1/telemetry/ws', default_nginx)
+        self.assertIn('location = /v1/ws {\n        return 404;', default_nginx)
+        self.assertNotIn('auth_request', default_nginx)
+        self.assertNotIn('proxy_pass http://backend_api;', template.split('location = /v1/ws', 1)[1].split('location /v1/', 1)[0].split('auth_request', 1)[0])
+        for identity_header in ('X-User-ID', 'X-Authenticated-User', 'X-Role', 'X-Forwarded-User', 'X-Forwarded-Roles', 'Forwarded'):
+            self.assertIn(f'proxy_set_header {identity_header} "";', template)
 
     def test_spike_is_opt_in_with_storage_and_private_auth_keys_only(self):
         with tempfile.TemporaryDirectory() as directory:

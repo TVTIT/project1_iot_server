@@ -80,7 +80,14 @@ DEFAULTS = dict(
     GOTRUE_SITE_URL="http://localhost", GOTRUE_DISABLE_SIGNUP="true",
     SUPABASE_JWT_AUDIENCE="authenticated", GOTRUE_JWT_ISSUER="http://localhost/auth/v1",
     JWT_EXPIRY="3600", GLOBAL_S3_BUCKET="fixture-unused", SERVER_ENV="production",
-    CORS_ALLOWED_ORIGINS="", DATABASE_MAX_CONNS="5", DATABASE_MIN_CONNS="1",
+    CORS_ALLOWED_ORIGINS="", WEBSOCKET_ENABLED="false", WS_MAX_SESSIONS="32",
+    WS_MAX_SUBSCRIPTIONS_PER_SESSION="16", WS_GLOBAL_EVENT_SLOTS="64",
+    WS_GLOBAL_EVENT_BYTES="8388608", WS_SESSION_EVENT_SLOTS="64",
+    WS_SESSION_EVENT_BYTES="262144", WS_MAX_FRAME_BYTES="66560",
+    WS_READ_FRAME_BYTES="4096", WS_REQUEST_RATE_PER_SECOND="10",
+    WS_RECHECK_INTERVAL="5s", WS_RECHECK_SWEEP_BUDGET="2s",
+    WS_RECHECK_CONCURRENCY="2", WS_HEARTBEAT_INTERVAL="20s",
+    WS_PONG_TIMEOUT="45s", WS_WRITE_TIMEOUT="5s", DATABASE_MAX_CONNS="5", DATABASE_MIN_CONNS="1",
     DATABASE_CONNECT_TIMEOUT="10s", READINESS_TIMEOUT="2s", AUTHORIZATION_TIMEOUT="2s",
     ADMIN_MAX_BODY_BYTES="16384", HTTP_READ_HEADER_TIMEOUT="5s", HTTP_READ_TIMEOUT="15s",
     HTTP_WRITE_TIMEOUT="55s", HTTP_IDLE_TIMEOUT="60s", SHUTDOWN_TIMEOUT="55s",
@@ -177,6 +184,8 @@ class Fixture:
     paper_p6_mode: str | None = None
     paper_p6_dataset: str | None = None
     paper_p6_recovery_smoke: bool = False
+    paper_p7: bool = False
+    paper_p7_mode: str | None = None
 
 
 def fixture_services(fixture):
@@ -555,6 +564,33 @@ def paper_p2_support():
     return module
 
 
+def paper_p7_support():
+    spec = importlib.util.spec_from_file_location('paper_p7_support', Path(__file__).with_name('paper_p7_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def dispatch_paper_fixture(fixture, helper, *args):
+    """Keep P7 handshake, reconnect, and finite telemetry lanes separate from P2 behavior."""
+    if fixture.paper_p7:
+        mode = helper.pilot_mode(fixture)
+        if mode in ('overhead_zero', 'overhead_two'):
+            return helper.run_overhead(*args)
+        if mode == 'lifecycle':
+            return helper.run_lifecycle(*args)
+        if mode == 'slow_viewer':
+            return helper.run_slow_viewer(*args)
+        if mode == 'reconnect':
+            return helper.run_reconnect(*args)
+        if mode in ('telemetry_pilot', 'single_path'):
+            return helper.run_telemetry_pilot(*args)
+        return helper.run(*args)
+    if fixture.paper_p2:
+        return helper.run_full(*args)
+    raise ValueError('paper_fixture_mode_missing')
+
+
 def paper_p4_support():
     spec = importlib.util.spec_from_file_location('paper_p4_support', Path(__file__).with_name('paper_p4_support.py'))
     module = importlib.util.module_from_spec(spec)
@@ -577,11 +613,23 @@ def paper_p6_support():
 
 
 def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False,
-            paper_p2=False, paper_p3=False, paper_p4=None, paper_p5a=None,
+            paper_p2=False, paper_p7=False, paper_p7_mode=None, paper_p3=False, paper_p4=None, paper_p5a=None,
             paper_p3_microbatch=False, paper_p5a_shutdown=False, paper_p5b_cache_smoke=False,
             paper_p5b_control_regression=False, paper_p5b=None, paper_p6=None):
     if paper_p3_microbatch and (not paper_p3 or not metrics_enabled or paper_p4 or paper_p5a):
         raise ValueError('paper_p3_microbatch_mode_rejected')
+    if paper_p7:
+        if (paper_p2 or paper_p0 or paper_p1 or paper_p2_spike or paper_p3 or paper_p4
+                or paper_p5a is not None or paper_p5b is not None or
+                (paper_p6 is not None and paper_p7_mode != 'p6_ws')):
+            raise ValueError('paper_p7_mode_rejected')
+        if paper_p7_mode not in (None, 'handshake_only', 'telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two', 'p6_ws'):
+            raise ValueError('paper_p7_mode_rejected')
+        if paper_p7_mode == 'p6_ws' and paper_p6 is None:
+            paper_p6 = ('wake-up', '100')
+        paper_p2 = True  # Reuse P2 HTTPS/Auth topology, not P2 assertions or probes.
+    elif paper_p7_mode is not None:
+        raise ValueError('paper_p7_mode_rejected')
     if paper_p5a is not None:
         if (not isinstance(paper_p5a, tuple) or len(paper_p5a) != 2 or not metrics_enabled
                 or paper_p0 or paper_p1 or paper_p2_spike or paper_p2 or paper_p3 or paper_p4):
@@ -603,8 +651,10 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         paper_p2 = True
     if paper_p6 is not None:
         if (not isinstance(paper_p6, tuple) or len(paper_p6) != 2 or not metrics_enabled
-                or paper_p0 or paper_p1 or paper_p2_spike or paper_p2 or paper_p3 or paper_p4
-                or paper_p5a is not None or paper_p5b is not None):
+                or paper_p0 or paper_p1 or paper_p2_spike
+                or (paper_p2 and not (paper_p7 and paper_p7_mode == 'p6_ws')) or paper_p3 or paper_p4
+                or paper_p5a is not None or paper_p5b is not None
+                or (paper_p2 and paper_p7_mode != 'p6_ws')):
             raise ValueError('paper_p6_mode_rejected')
         mode, dataset = paper_p6
         paper_p6_support().profile(mode, dataset)
@@ -638,12 +688,19 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     if paper_profile:
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
                       MQTT_MAX_PAYLOAD_BYTES='65536')
-    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4 or paper_p5a or paper_p6) and metrics_enabled else 'false'
+    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4 or paper_p5a or paper_p6 or
+        paper_p7 and paper_p7_mode in ('overhead_zero', 'overhead_two', 'p6_ws')) and metrics_enabled else 'false'
+    if paper_p7 and paper_p7_mode == 'single_path':
+        values.update(paper_p7_support().single_path_profile())
+    elif paper_p7 and paper_p7_mode in ('telemetry_pilot', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two'):
+        # Isolated P7 telemetry pilot or reconnect: explicit bounded ingress/microbatch/dedup profile.
+        values.update(paper_p7_support().telemetry_pilot_profile())
     if paper_p2:
         values.update(SUPABASE_JWT_MODE='rs256', SUPABASE_JWKS_URL='http://supabase-envoy:8000/auth/v1/.well-known/jwks.json',
                       AUTH_UNIX_SOCKET_PATH='/run/iot-auth/auth.sock', GOTRUE_JWT_ISSUER='https://localhost/auth/v1',
                       SUPABASE_PUBLIC_URL='https://localhost', GOTRUE_SITE_URL='https://localhost',
                       CORS_ALLOWED_ORIGINS='https://client.example.test')
+    values['WEBSOCKET_ENABLED'] = 'true' if paper_p7 else 'false'
     if paper_p3:
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
         if paper_p3_microbatch:
@@ -710,7 +767,9 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       paper_p4 is not None, paper_p4, paper_p5a is not None,
                       mode if paper_p5a else None, dataset if paper_p5a else None,
                        paper_p3_microbatch, paper_p5a_shutdown, paper_p5b_cache_smoke,
-                       paper_p5b_control_regression)
+                        paper_p5b_control_regression)
+    object.__setattr__(fixture, 'paper_p7', paper_p7)
+    object.__setattr__(fixture, 'paper_p7_mode', paper_p7_mode or 'handshake_only')
     if paper_p5b is not None:
         object.__setattr__(fixture, 'paper_p5b', True)
         object.__setattr__(fixture, 'paper_p5b_cache_mode', paper_p5b[0])
@@ -897,22 +956,32 @@ def validate_effective_model(fixture, model):
                 or len(service.get("volumes", [])) != len(actual_binds) + len(actual_volumes)):
             raise ValueError("effective_mounts_rejected")
     backend = services["backend"]
-    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2 or fixture.paper_p6:
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2 or fixture.paper_p6 or fixture.paper_p7:
         env = backend.get('environment', {})
         expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'true' if fixture.paper_p3 or fixture.paper_p6 else 'false',
                     'MQTT_CREDENTIAL_RUNTIME_ENABLED': 'false', 'MQTT_CREDENTIAL_API_ENABLED': 'true',
                     'DATABASE_MAX_CONNS': '12' if fixture.paper_p3 or fixture.paper_p6 else '10', 'MQTT_QUEUE_CAPACITY': '256',
-                    'MQTT_WORKER_COUNT': '4', 'MQTT_MAX_PAYLOAD_BYTES': '65536'}
+                'MQTT_WORKER_COUNT': '1' if (fixture.paper_p7 and fixture.paper_p7_mode in ('telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two')) else '4',
+                    'MQTT_MAX_PAYLOAD_BYTES': '65536'}
         if (any(str(env.get(k)).lower() != v for k, v in expected.items())
                 or backend.get('cpus') != 2 or str(backend.get('mem_limit')) != '4294967296'):
             raise ValueError('paper_p0_profile_rejected')
         if fixture.paper_p3_microbatch and str(env.get('MQTT_MICROBATCH_ENABLED')).lower() != 'true':
             raise ValueError('paper_p3_microbatch_profile_rejected')
+        if fixture.paper_p7 and fixture.paper_p7_mode in ('telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two'):
+            microbatch_expected = 'false' if fixture.paper_p7_mode == 'single_path' else 'true'
+            if any(str(env.get(key)).lower() != value for key, value in {
+                    'MQTT_MICROBATCH_ENABLED': microbatch_expected, 'MQTT_RAM_DEDUP_ENABLED': 'true',
+                    'MQTT_RAM_DEDUP_MAX_ENTRIES': '100000',
+                    'MQTT_RAM_DEDUP_MAX_BYTES': '67108864',
+                    'MQTT_WORKER_COUNT': '1'}.items()):
+                raise ValueError('paper_p7_telemetry_profile_rejected')
         if fixture.paper_p5b_control_regression and any(
                 str(env.get(key)).lower() != fixture.values[key].lower()
                 for key in ('MQTT_RAM_DEDUP_ENABLED', 'MQTT_RAM_DEDUP_MAX_ENTRIES', 'MQTT_RAM_DEDUP_MAX_BYTES')):
             raise ValueError('paper_p5b_control_profile_rejected')
-        if (fixture.paper_p1 or fixture.paper_p4 or fixture.paper_p5a or fixture.paper_p6) and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
+        if (fixture.paper_p1 or fixture.paper_p4 or fixture.paper_p5a or fixture.paper_p6 or
+                fixture.paper_p7 and fixture.paper_p7_mode in ('overhead_zero', 'overhead_two', 'p6_ws')) and str(env.get('METRICS_ENABLED')).lower() != fixture.values['METRICS_ENABLED']:
             raise ValueError('paper_p1_profile_rejected')
         if fixture.paper_p2:
             paper_p2_support().validate_perimeter(fixture, services)
@@ -1026,6 +1095,11 @@ def verify_runtime_receipt(obj, expectation):
         raise ValueError('runtime_receipt_rejected')
 
 
+def requires_gateway_image(fixture):
+    return bool(fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2 or
+                (fixture.paper_p7 and fixture.paper_p7_mode in ('telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two')))
+
+
 def startup_only(fixture, registry=None, positive_http=False, role_http=False, full_http=False):
     """Phased real startup. Optionally runs positive HTTP smoke slice."""
     lifecycle = bootstrap_lifecycle()
@@ -1052,7 +1126,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         if result.returncode:
             raise ValueError('backend_build_image_unresolved')
         images['backend'] = json.loads(result.stdout)[0]['Id']
-        if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2:
+        if requires_gateway_image(fixture):
             # Same Dockerfile builder, but the real Gateway target, not a host binary.
             fd = os.open(fixture.private / 'gateway-build-output.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'wb') as stream:
@@ -1182,6 +1256,10 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     phase = 'paper_p5a'
                     evidence['paper_p5a'] = paper_p5a_support().run(
                         sys.modules[__name__], fixture, endpoint, registry, containers, images, state)
+                elif fixture.paper_p6 and fixture.paper_p7_mode == 'p6_ws':
+                    phase = 'paper_p6_ws'
+                    evidence['paper_p6_ws'] = paper_p7_support().run_p6_ws(
+                        sys.modules[__name__], fixture, endpoint, registry, containers, images, state)
                 elif fixture.paper_p6:
                     phase = 'paper_p6'
                     if fixture.paper_p6_recovery_smoke:
@@ -1199,9 +1277,14 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     import paper_p3_support
                     evidence['paper_p3'] = paper_p3_support.run(sys.modules[__name__], fixture,
                         registry, endpoint, containers, images, state)
+                elif fixture.paper_p7:
+                    phase = 'paper_p7'
+                    evidence['paper_p7'] = dispatch_paper_fixture(fixture, paper_p7_support(),
+                        sys.modules[__name__], fixture, registry, endpoint, containers, images, state)
                 elif fixture.paper_p2:
                     phase = 'paper_p2'
-                    evidence['paper_p2'] = paper_p2_support().run_full(sys.modules[__name__], fixture,
+                    evidence['paper_p2'] = dispatch_paper_fixture(fixture, paper_p2_support(),
+                        sys.modules[__name__], fixture,
                         registry, endpoint, containers, images, state)
                 elif fixture.paper_p2_spike:
                     phase = 'paper_p2_spike'
@@ -1239,10 +1322,19 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     durable_json(fixture.private / 'startup-failure.json', {
                         'phase': phase, 'error_type': sanitize_failure_type(exc),
                         'error_code': code})
+                    durable_json(fixture.private / 'startup-exception-private.json', {
+                        'type': type(exc).__name__, 'message': str(exc)[:2048],
+                        'traceback': traceback.format_exc()[-12000:]})
                     if phase in containers and containers[phase]['allocation_attempted']:
                         obj = registry.resolve(containers[phase])
                         if obj:
                             durable_json(fixture.private / 'failed-phase-state.json', obj['State'])
+                            health = obj['State'].get('Health', {})
+                            durable_json(fixture.private / 'failed-phase-health-private.json', {
+                                'status': str(health.get('Status', ''))[:64],
+                                'log': [{key: str(entry.get(key, ''))[:2048] for key in
+                                         ('Start', 'End', 'ExitCode', 'Output')}
+                                        for entry in health.get('Log', [])[-8:] if isinstance(entry, dict)]})
                             log = registry.command(['logs', '--tail', '30', obj['Id']])
                             durable_json(fixture.private / 'failed-phase-private-log.json', {
                                 'stdout': log.stdout.decode(errors='replace'), 'stderr': log.stderr.decode(errors='replace')})
@@ -1263,6 +1355,13 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         raise ValueError('child_cleanup_unresolved')
                     if registry.items:
                         lifecycle.reconcile_child_receipts(fixture.private, registry.items[0]['name'], registry.items[0]['labels'])
+                        try:
+                            durable_json(fixture.private / 'resource-receipts.json', [
+                                {k: (str(v) if isinstance(v, Path) else v) for k, v in item.items()}
+                                for item in registry.items
+                            ])
+                        except Exception:
+                            pass
                     # Consumers first, then infrastructure, then inputs. No down/prune.
                     ordered = sorted(reversed(registry.items), key=lambda i: {'container': 0, 'network': 1, 'volume': 2}[i['kind']])
                     cleanup_deadline = time.monotonic() + BUDGETS['cleanup'] * 2
@@ -1319,7 +1418,9 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             'schema_version': 1, 'run_id': fixture.project,
             'mode': (fixture.paper_p5a_mode if fixture.paper_p5a else
                      fixture.paper_p4_mode if fixture.paper_p4 else fixture.paper_p1)}
-        run.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
+        run.update(status=('WORKLOAD_COMPLETE_PENDING_CLEANUP' if fixture.paper_p7_mode == 'p6_ws'
+                           and not failure and cleanup_verified else
+                           'FAIL' if failure or not cleanup_verified else 'PASS'),
                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                    error=sanitize_failure_code(failure) if failure else None)
         if fixture.paper_p4:
@@ -1345,7 +1446,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         error=sanitize_failure_code(failure) if failure else None)
             if fixture.paper_p5b_cache_smoke:
                 run['p5b_cache_functional_accepted'] = accepted
-        if fixture.paper_p6:
+        if fixture.paper_p6 and fixture.paper_p7_mode != 'p6_ws':
             if fixture.paper_p6_recovery_smoke:
                 path = fixture.artifacts / 'p6-recovery.json'
                 run = json.loads(path.read_text()) if path.exists() else {'native_executed': True}
@@ -1429,7 +1530,20 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                       ['mqtt_shaper'] if fixture.values['MQTT_SHAPER_ENABLED'] == 'true' else [],
                       'exact_cleanup_verified': True, 'cleanup_counts': cleanup_counts}
         elif fixture.paper_p6:
-            if fixture.paper_p6_recovery_smoke:
+            if fixture.paper_p7_mode == 'p6_ws':
+                p6ws = evidence.get('paper_p6_ws', {})
+                run = json.loads((fixture.artifacts / 'run.json').read_text())
+                if (not paper_p7_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry)
+                        or p6ws.get('mode') != 'paper_p7_p6_ws' or p6ws.get('full_p7_accepted') is not False
+                        or run.get('status') != 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+                        or run.get('acceptance', {}).get('exact_cleanup_verified') is not False):
+                    raise ValueError('paper_p7_p6_ws_acceptance_incomplete')
+                report = {'schema_version': 1, 'status': 'PAPER_P7_P6_WS_REGRESSION_ACCEPTED',
+                    'project': fixture.project, 'mode': 'p6_ws', 'native_executed': True,
+                    'full_p7_accepted': False, 'exact_cleanup_verified': cleanup_verified,
+                    'cleanup_counts': cleanup_counts, 'p6_reference': 'p6-reference.json',
+                    'evidence': p6ws}
+            elif fixture.paper_p6_recovery_smoke:
                 run = json.loads((fixture.artifacts / 'p6-recovery.json').read_text())
                 if run.get('status') != 'PAPER_P6_RECOVERY_ACCEPTED':
                     raise ValueError('paper_p6_recovery_acceptance_incomplete')
@@ -1450,6 +1564,83 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 fixture.paper_p3_microbatch, cleanup_counts, fixture.paper_p5b_control_regression)
             if report['status'] == 'FAIL':
                 raise ValueError('cleanup_acceptance_incomplete')
+        elif fixture.paper_p7:
+            if not paper_p7_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+                raise ValueError('cleanup_acceptance_incomplete')
+            if fixture.paper_p7_mode == 'single_path':
+                p7_pilot = evidence['paper_p7']
+                report = {'schema_version': 1, 'status': 'PAPER_P7_SINGLE_PATH_ACCEPTED',
+                          'project': fixture.project, 'native_executed': True,
+                          'full_p7_accepted': False, 'single_path_accepted': True,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'evidence': p7_pilot.get('evidence', {})}
+            elif fixture.paper_p7_mode == 'telemetry_pilot':
+                p7_pilot = evidence['paper_p7']
+                report = {'schema_version': 1, 'status': 'PAPER_P7_TELEMETRY_PILOT_ACCEPTED',
+                          'project': fixture.project, 'native_executed': True,
+                          'full_p7_accepted': False, 'telemetry_pilot_accepted': True,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'evidence': p7_pilot.get('evidence', {})}
+            elif fixture.paper_p7_mode == 'reconnect':
+                p7_rec = evidence['paper_p7']
+                report = {'schema_version': 1, 'status': 'PAPER_P7_RECONNECT_ACCEPTED',
+                          'project': fixture.project, 'native_executed': True,
+                          'full_p7_accepted': False, 'reconnect_accepted': True,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'evidence': p7_rec.get('evidence', {})}
+            elif fixture.paper_p7_mode == 'lifecycle':
+                p7_lifecycle = evidence['paper_p7']
+                from paper_p7_support import finalize_lifecycle_cleanup
+                lifecycle_accepted = finalize_lifecycle_cleanup(p7_lifecycle, cleanup_verified)
+                report = {'schema_version': 1,
+                          'status': 'PAPER_P7_LIFECYCLE_ACCEPTED' if lifecycle_accepted else 'PAPER_P7_LIFECYCLE_PARTIAL',
+                          'project': fixture.project, 'native_executed': True,
+                          'full_p7_accepted': False, 'lifecycle_accepted': lifecycle_accepted,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'evidence': p7_lifecycle.get('evidence', {})}
+            elif fixture.paper_p7_mode == 'slow_viewer':
+                slow = evidence['paper_p7']
+                report = {'schema_version': 1, 'status': 'PAPER_P7_SLOW_VIEWER_ACCEPTED',
+                          'project': fixture.project, 'native_executed': True,
+                          'full_p7_accepted': False, 'slow_viewer_accepted': True,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'evidence': slow.get('evidence', {}), 'counts': slow.get('counts', {}),
+                          'application_ack_count': slow.get('application_ack_count'),
+                          'healthy_peer_events': slow.get('healthy_peer_events'),
+                           'capture_proof': slow.get('capture_proof'),
+                           'close_evidence': slow.get('close_evidence'),
+                           'precleanup_proof_artifact': slow.get('precleanup_proof_artifact'),
+                           'capture_finalization_status': slow.get('capture_finalization_status'),
+                           'probe_close_corroboration': slow.get('probe_close_corroboration'),
+                           'manual_publisher_outbox': 'N/A'}
+            elif fixture.paper_p7_mode in ('overhead_zero', 'overhead_two'):
+                overhead = evidence['paper_p7']
+                report = {'schema_version': 1,
+                    'status': 'PAPER_P7_OVERHEAD_ACCEPTED', 'project': fixture.project,
+                    'native_executed': True, 'full_p7_accepted': False,
+                    'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                    'mode': overhead['mode'], 'run_json': 'run.json',
+                    'metrics_csv': 'metrics.csv', 'resources_csv': 'resources.csv',
+                    'evidence': overhead.get('evidence', {})}
+            else:
+                p7_handshake = evidence['paper_p7']['handshake']
+                report = {'schema_version': 1, 'status': 'PAPER_P7_HANDSHAKE_ACCEPTED',
+                      'project': fixture.project, 'native_executed': True,
+                      'handshake_accepted': True, 'full_p7_accepted': False,
+                      'exact_cleanup_verified': True, 'cleanup_counts': cleanup_counts,
+                      'backend_image_id': images['backend'],
+                      'tool_image_id': p7_handshake.get('tool_qualification', {}).get('tool_image_id', ''),
+                      'revision': p7_handshake.get('source_qualification', {}).get('revision', ''),
+                      'dirty_source_build_hash': p7_handshake.get('source_qualification', {}).get('dirty_source_build_hash', ''),
+                      'effective_ws_flag': True,
+                      'session_cap': 32,
+                      'checks': {
+                          'native': p7_handshake['native'],
+                          'browser': p7_handshake['browser'],
+                          'negative_count': len(p7_handshake['negative']),
+                          'leak_check': p7_handshake['leak_check'],
+                          'perimeter_isolation': p7_handshake.get('perimeter_isolation', {}),
+                      }}
         elif fixture.paper_p2:
             if cleanup_counts != {'container': 19, 'network': 1, 'volume': 7} or not evidence['paper_p2'].get('full_p2_accepted'):
                 raise ValueError('cleanup_acceptance_incomplete')
@@ -2857,11 +3048,41 @@ def paper_p1_metrics_csv(path, samples):
                 row(group, name + '.overflow', 'histogram', 'count', h['overflow'])
                 for upper, count in zip(h['upper_seconds'], h['buckets']):
                     row(group, name + '.bucket_upper_ms_' + str(upper * 1000), 'histogram_bucket', 'count', count)
+            # P7 WebSocket fields are a fixed allowlist; never recurse through arbitrary payloads.
+            ws = snap.get('websocket_metrics') or {}
+            ws_status = (snap.get('availability') or {}).get('websocket', 'unavailable')
+            ws_fields = {'sessions': ('gauge','count'), 'subscriptions': ('gauge','count'),
+                         'global_queued_work': ('gauge','count'), 'global_queued_bytes': ('gauge','bytes'),
+                         'session_queued_in_flight_bytes': ('gauge','bytes'), 'submissions': ('counter','count'),
+                         'new_events': ('counter','count'), 'build_failures': ('counter','count'),
+                         'deliveries_enqueued': ('counter','count'), 'telemetry_writes_completed': ('counter','count'),
+                         'control_writes_completed': ('counter','count'), 'drops': ('counter','count'),
+                         'slow_closes': ('counter','count'), 'auth_denials': ('counter','count'),
+                         'origin_denials': ('counter','count'), 'expiries': ('counter','count'),
+                         'revocations': ('counter','count'), 'origin_missing': ('counter','count')}
+            for key, (kind, unit) in ws_fields.items():
+                value = ws.get(key)
+                if ws_status == 'available' and type(value) in (int, float):
+                    row('websocket', key, kind, unit, value)
+                else:
+                    writer.writerow(dict(base, group='websocket', metric=key, kind=kind, unit=unit,
+                                         availability=ws_status if ws_status in ('disabled','unavailable') else 'unavailable'))
+            for key in ('confirmed_to_submit_seconds','confirmed_to_dispatch_seconds','confirmed_to_write_seconds'):
+                h = ws.get(key)
+                if ws_status == 'available' and isinstance(h, dict):
+                    row('websocket', key + '.count', 'histogram', 'count', h['count'])
+                    row('websocket', key + '.sum', 'histogram', 'seconds', h['sum_seconds'])
+                    row('websocket', key + '.overflow', 'histogram', 'count', h['overflow'])
+                    for upper, count in zip(h['upper_seconds'], h['buckets']):
+                        row('websocket', key + '.bucket_upper_ms_' + str(upper * 1000), 'histogram_bucket', 'count', count)
+                else:
+                    for suffix, unit in (('count','count'),('sum','seconds'),('overflow','count')):
+                        writer.writerow(dict(base,group='websocket',metric=key+'.'+suffix,kind='histogram',unit=unit,availability=ws_status))
             for key in ('acquired', 'idle', 'total', 'max', 'acquire_count', 'empty_acquire_count', 'canceled_acquire_count', 'acquire_seconds'):
                 if key in snap.get('db', {}):
                     row('db', key, 'pool_stat', 'seconds' if key.endswith('seconds') else 'count', snap['db'][key])
             for key in ('ingress', 'http', 'auth', 'db', 'command', 'dispatch_e2e', 'result',
-                        'persistence', 'group_persistence', 'batch_wait', 'websocket'):
+                         'persistence', 'group_persistence', 'batch_wait', 'websocket'):
                 status = snap.get('availability', {}).get(key)
                 if status in ('available', 'disabled', 'not_implemented'):
                     writer.writerow(dict(base, group=key, metric='availability', availability=status))
@@ -3278,6 +3499,91 @@ def paper_p5a_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_veri
         evidence['p5b_cache_functional_accepted'] = accepted
         evidence['exact_cleanup_verified'] = cleanup_verified is True
     return accepted
+
+
+def paper_p7_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    """P7 handshake acceptance requires verified exact cleanup and complete handshake evidence."""
+    if not cleanup_verified:
+        return False
+    items = list(registry.items)
+    kinds = ('container', 'network', 'volume')
+    if not items:
+        return False
+    for item in items:
+        receipt = item.get('receipt')
+        if (item.get('kind') not in kinds or item.get('run') != fixture.project
+                or item.get('task') != 'native-compose-allocation'
+                or item.get('allocation_attempted') is not True or item.get('removed') is not True
+                or not isinstance(receipt, dict) or set(receipt) != {'id', 'created', 'labels'}
+                or not isinstance(receipt.get('created'), str) or not receipt['created']
+                or not isinstance(receipt.get('labels'), dict)
+                or any(receipt['labels'].get(key) != value for key, value in item.get('labels', {}).items())):
+            return False
+        identity = receipt.get('id')
+        if item['kind'] == 'volume':
+            if identity != item.get('name'):
+                return False
+        elif not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9]{64}', identity):
+            return False
+    registered = {kind: sum(item.get('kind') == kind for item in items) for kind in kinds}
+    removed = {kind: sum(item.get('kind') == kind and item.get('removed') is True for item in items) for kind in kinds}
+    if cleanup_counts != removed or removed != registered:
+        return False
+
+    if fixture.paper_p7_mode == 'p6_ws':
+        p6ws = evidence.get('paper_p6_ws', {}) if isinstance(evidence, dict) else {}
+        return (p6ws.get('status') == 'PASS' and p6ws.get('mode') == 'paper_p7_p6_ws'
+                and p6ws.get('full_p7_accepted') is False
+                and p6ws.get('exact_cleanup_verified') is False)
+    p7 = evidence.get('paper_p7', {}) if isinstance(evidence, dict) else {}
+    if p7.get('status') != 'PASS':
+        return False
+    if fixture.paper_p7_mode == 'single_path':
+        p7['exact_cleanup_verified'] = cleanup_verified is True
+        return paper_p7_support().single_path_result_ok(p7)
+    if fixture.paper_p7_mode == 'telemetry_pilot':
+        p7['exact_cleanup_verified'] = cleanup_verified is True
+        return paper_p7_support().telemetry_pilot_result_ok(p7)
+    if fixture.paper_p7_mode == 'reconnect':
+        p7['exact_cleanup_verified'] = cleanup_verified is True
+        return paper_p7_support().reconnect_result_ok(p7)
+    if fixture.paper_p7_mode == 'lifecycle':
+        return paper_p7_support().finalize_lifecycle_cleanup(p7, cleanup_verified)
+    if fixture.paper_p7_mode == 'slow_viewer':
+        p7['precleanup_proof_path'] = str(fixture.artifacts / 'p7-slow-viewer-proof.json')
+        return paper_p7_support().finalize_slow_viewer_cleanup(p7, cleanup_verified)
+    if fixture.paper_p7_mode in ('overhead_zero', 'overhead_two'):
+        p7['exact_cleanup_verified'] = cleanup_verified is True
+        return paper_p7_support().overhead_result_ok(p7)
+    if p7.get('mode') != 'paper_p7_handshake_only':
+        return False
+    perimeter = p7.get('perimeter', {})
+    if perimeter.get('status') != 'PASS' or not perimeter.get('https_configured') or not perimeter.get('auth_request_enabled'):
+        return False
+    handshake = p7.get('handshake', {})
+    if handshake.get('status') != 'PASS':
+        return False
+    native = handshake.get('native', {})
+    if native.get('http_status') != 101 or native.get('subprotocol') != 'iot.telemetry.v1':
+        return False
+    browser = handshake.get('browser', {})
+    if browser.get('status') != 'PASS' or browser.get('event') != 'open' or browser.get('selected_protocol') != 'iot.telemetry.v1':
+        return False
+    negatives = handshake.get('negative', {})
+    required_negatives = {'missing_credentials', 'bad_token', 'conflicting_credentials',
+                          'denied_origin', 'missing_app_protocol', 'expired_jwt',
+                          'rest_subprotocol_only', 'browser_denied_origin'}
+    if not required_negatives.issubset(set(negatives.keys())):
+        return False
+    if any(neg.get('status') != 'PASS' for neg in negatives.values()):
+        return False
+    leak_check = handshake.get('leak_check', {})
+    if leak_check.get('status') != 'PASS' or leak_check.get('leaks_found_count') != 0:
+        return False
+    perimeter = handshake.get('perimeter_isolation', {})
+    if perimeter.get('status') != 'PASS':
+        return False
+    return True
 
 
 def paper_p1_resources_csv(path, snapshots, limits):
@@ -3854,6 +4160,9 @@ def main():
     parser.add_argument('--paper-p1', action='store_true', help='Bounded metrics and artifact workload, same isolated lifecycle as P0')
     parser.add_argument('--paper-p2-spike', action='store_true', help='P2.1 compatibility only; not P2 acceptance')
     parser.add_argument('--paper-p2', action='store_true', help='P2 isolated HTTPS/Unix perimeter checks')
+    parser.add_argument('--paper-p7', action='store_true', help='P7 isolated HTTPS/Auth topology; P7 probes only')
+    parser.add_argument('--paper-p7-mode', choices=('handshake_only', 'telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two', 'p6_ws'),
+                        help='P7 lane; default handshake_only preserves historical behavior; single_path runs microbatch OFF; reconnect runs ReconnectCatchupClient')
     parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
     parser.add_argument('--p5a-control-regression', action='store_true',
                         help='With --paper-p3, opt in to microbatch and run the focused command/result preservation regression')
@@ -3890,6 +4199,13 @@ def main():
     if args.paper_p2 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.startup_only,
                              args.positive_http_only, args.role_http_only, args.full_http, args.mode, args.metrics_off)):
         parser.error('P2 cannot be combined with other execution modes')
+    if args.paper_p7_mode is not None and not args.paper_p7:
+        parser.error('--paper-p7-mode requires --paper-p7')
+    if args.paper_p7 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
+                              args.paper_p3, args.paper_p4, args.paper_p5a, args.paper_p5b,
+                              args.paper_p6 and args.paper_p7_mode != 'p6_ws',
+                              args.positive_http_only, args.role_http_only, args.full_http, args.metrics_off)):
+        parser.error('P7 cannot be combined with other execution modes')
     if args.paper_p2_spike and any((args.paper_p0, args.paper_p1, args.startup_only,
                                   args.positive_http_only, args.role_http_only, args.full_http,
                                   args.mode, args.metrics_off)):
@@ -3914,7 +4230,7 @@ def main():
                               args.startup_only, args.positive_http_only, args.role_http_only,
                               args.full_http, args.metrics_off, args.mode, args.cache_mode)):
         parser.error('P6 cannot be combined with other execution modes')
-    if args.paper_p6 and (args.dispatch_mode not in ('polling', 'wake-up') or args.dataset is None):
+    if args.paper_p6 and args.paper_p7_mode != 'p6_ws' and (args.dispatch_mode not in ('polling', 'wake-up') or args.dataset is None):
         parser.error('--paper-p6 requires --dispatch-mode polling|wake-up and --dataset 100|1')
     if args.p6_recovery_smoke and not args.paper_p6:
         parser.error('--p6-recovery-smoke requires --paper-p6')
@@ -3949,7 +4265,8 @@ def main():
         fixture = prepare(args.prepare, paper_p0=args.paper_p0,
                           paper_p1=args.mode if args.paper_p1 else None,
                           metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike,
-                           paper_p2=args.paper_p2, paper_p3=args.paper_p3,
+                          paper_p2=args.paper_p2, paper_p7=args.paper_p7,
+                          paper_p7_mode=args.paper_p7_mode, paper_p3=args.paper_p3,
                            paper_p3_microbatch=args.p5a_control_regression,
                            paper_p5b_control_regression=args.p5b_control_regression,
                            paper_p4=args.mode if args.paper_p4 else None,
@@ -3957,7 +4274,8 @@ def main():
                             paper_p5b=(args.cache_mode, args.dataset) if args.paper_p5b else None,
                               paper_p5a_shutdown=args.paper_p5a_shutdown_smoke,
                               paper_p5b_cache_smoke=args.paper_p5b_cache_smoke,
-                               paper_p6=(args.dispatch_mode, args.dataset) if args.paper_p6 else None)
+                                paper_p6=(('wake-up', '100') if args.paper_p7 and args.paper_p7_mode == 'p6_ws' else
+                                          (args.dispatch_mode, args.dataset) if args.paper_p6 else None))
         if fixture.paper_p6:
             object.__setattr__(fixture, 'paper_p6_recovery_smoke', args.p6_recovery_smoke)
     except BaseException as exc:
@@ -3984,14 +4302,20 @@ def main():
         return 1
 
     try:
-        if (args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p3
+        if (args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p7 or args.paper_p3
                  or args.paper_p4 or args.paper_p5a or args.paper_p5b or args.paper_p6):
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.
             if not is_fixture_verified(fixture):
                 raise ValueError('unsafe_fixture_path')
-            shutil.rmtree(fixture.private)
+            if not args.paper_p7:
+                shutil.rmtree(fixture.private)
+            else:
+                try:
+                    fixture.private.chmod(0o700)
+                except OSError:
+                    pass
             print(json.dumps(report))
             return 0
         if args.startup_only:

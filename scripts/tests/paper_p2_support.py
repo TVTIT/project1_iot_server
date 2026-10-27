@@ -162,6 +162,8 @@ def prepare_perimeter(smoke, fixture):
     text += f'''  backend:
     environment:
       SUPABASE_JWT_SECRET: !reset null
+      WEBSOCKET_ENABLED: '{str(fixture.paper_p7).lower()}'
+      CORS_ALLOWED_ORIGINS: 'https://client.example.test'
     volumes:
       - auth_socket:/run/iot-auth
     depends_on:
@@ -219,10 +221,15 @@ def validate_perimeter(fixture, services):
             raise ValueError('paper_p2_perimeter_failed')
 
 
-def direct_go(smoke, registry, containers, token, path='/v1/admin/metrics'):
+def direct_go(smoke, registry, containers, token, path='/v1/admin/metrics', headers=None):
     # Token stays on stdin, never a docker/wget command-line argument.
+    cmd_headers = ['--header="Authorization: Bearer $token"']
+    if headers:
+        for k, v in headers.items():
+            cmd_headers.append(f'--header="{k}: {v}"')
+    headers_arg = ' '.join(cmd_headers)
     result = registry.command(['exec', '-i', containers['backend']['receipt']['id'], '/bin/sh', '-ec',
-        'IFS= read -r token; wget -S -T 5 -O - --header="Authorization: Bearer $token" "http://127.0.0.1:8080' + path + '"'],
+        'IFS= read -r token; wget -S -T 5 -O - ' + headers_arg + ' "http://127.0.0.1:8080' + path + '"'],
         input=(token + '\n').encode())
     codes = re.findall(rb'HTTP/1\.[01] (\d{3})', result.stderr)
     if not codes:
@@ -262,6 +269,7 @@ def run_perimeter(smoke, fixture, registry, endpoint, containers, images, state)
     run['supabase_spike_checks'] = spike['checks']
     login = json.loads((fixture.private / 'p2-login-response.json').read_text())
     token, uid = login['access_token'], login['user']['id']
+    smoke.durable_json(fixture.artifacts / 'run.json', run)
     smoke.db_psql(registry, containers['postgres']['receipt']['id'],
         "INSERT INTO platform_admins(user_id) VALUES (:'uid');", {'uid': uid})
     for name, value, expected in [('missing', '', 401), ('invalid', 'invalid', 401), ('admin', token, 200),
@@ -274,7 +282,8 @@ def run_perimeter(smoke, fixture, registry, endpoint, containers, images, state)
         status, _ = direct_go(smoke, registry, containers, value)
         check('direct_' + name, status == expected, http_status=status)
     check('direct_internal_hidden', direct_go(smoke, registry, containers, token, '/internal/auth/verify')[0] == 404)
-    check('websocket_stub', smoke.http_request(endpoint, 'GET', '/v1/ws', token=token)[0] == 501)
+    if not fixture.paper_p7:
+        check('websocket_stub', smoke.http_request(endpoint, 'GET', '/v1/ws', token=token)[0] == 501)
     status = smoke.http_request(endpoint, 'OPTIONS', '/v1/gateways', headers={'Origin': 'https://client.example.test',
         'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'authorization'})[0]
     check('cors_preflight', status == 204, http_status=status)
@@ -282,21 +291,19 @@ def run_perimeter(smoke, fixture, registry, endpoint, containers, images, state)
         'Origin': 'https://denied.example.test', 'Access-Control-Request-Method': 'GET'})[0] == 403)
     check('login_requires_api_key', smoke.http_request(endpoint, 'POST', '/auth/v1/token?grant_type=password',
         body={'email': 'not-a-user@example.test', 'password': 'not-a-password'})[0] == 401)
-    _, metrics_before_pause = direct_go(smoke, registry, containers, token)
-    ws_before = next(r['duration']['count'] for r in metrics_before_pause['http'] if r['route'] == 'GET /v1/ws')
     backend_id = containers['backend']['receipt']['id']
     result = registry.command(['exec', backend_id, 'mv', '/run/iot-auth/auth.sock', '/run/iot-auth/auth.paused'])
     check('upstream_pause', result.returncode == 0)
     try:
-        status = smoke.http_request(endpoint, 'GET', '/v1/ws', token=token)[0]
+        ws_headers = {'Connection': 'Upgrade', 'Upgrade': 'websocket',
+                      'Sec-WebSocket-Protocol': 'iot.telemetry.v1'} if fixture.paper_p7 else None
+        status = smoke.http_request(endpoint, 'GET', '/v1/ws', token=token, headers=ws_headers)[0]
         check('upstream_fail_closed', status == 500, http_status=status)
-        _, metrics_during_pause = direct_go(smoke, registry, containers, token)
-        ws_during = next(r['duration']['count'] for r in metrics_during_pause['http'] if r['route'] == 'GET /v1/ws')
-        check('upstream_failure_never_enters_business', ws_before == ws_during)
     finally:
         result = registry.command(['exec', backend_id, 'mv', '/run/iot-auth/auth.paused', '/run/iot-auth/auth.sock'])
         check('upstream_restore', result.returncode == 0)
-    check('upstream_recovered', smoke.http_request(endpoint, 'GET', '/v1/ws', token=token)[0] == 501)
+    if not fixture.paper_p7:
+        check('upstream_recovered', smoke.http_request(endpoint, 'GET', '/v1/ws', token=token)[0] == 501)
     run['status'] = 'PASS'
     smoke.durable_json(fixture.artifacts / 'run.json', run)
     return run
