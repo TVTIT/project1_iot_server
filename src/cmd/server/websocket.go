@@ -24,7 +24,14 @@ func composeWebSocket(cfg config.Config) (websocketRuntime, error) {
 		return websocketRuntime{}, nil
 	}
 	w := cfg.WebSocket
-	hub := telemetryws.NewHub(telemetryws.HubConfig{MaxSessions: w.MaxSessions, MaxQueueSlots: w.SessionEventSlots, MaxQueueBytes: w.SessionEventBytes, MaxFrameBytes: w.MaxFrameBytes})
+	hub := telemetryws.NewHub(telemetryws.HubConfig{
+		MaxSessions:              w.MaxSessions,
+		MaxQueueSlots:            w.SessionEventSlots,
+		MaxQueueBytes:            w.SessionEventBytes,
+		MaxFrameBytes:            w.MaxFrameBytes,
+		MaxSessionReferenceBytes: w.SessionReferenceBytes,
+		FanoutMode:               telemetryws.FanoutMode(w.FanoutMode),
+	})
 	var observer *telemetryws.Metrics
 	if cfg.MetricsEnabled {
 		observer = &telemetryws.Metrics{}
@@ -65,7 +72,7 @@ func (w *websocketRuntime) configure(cfg config.Config, repo telemetryws.TargetA
 	w.handler = app
 	w.worker = telemetryws.NewRecheckWorker(authorizer, w.hub, telemetryws.RecheckWorkerConfig{
 		Interval: c.RecheckInterval, SweepBudget: c.RecheckSweepBudget,
-		Concurrency: c.RecheckConcurrency, MaxSessions: c.MaxSessions,
+		Concurrency: c.RecheckConcurrency, MaxSessions: c.MaxSessions, Metrics: w.metrics,
 	})
 	return nil
 }

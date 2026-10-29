@@ -219,6 +219,97 @@ func TestTargetAuthorizer_CrossGatewaySameSensorID(t *testing.T) {
 	}
 }
 
+func TestTargetAuthorizer_BatchCompositeKeysAndFailClosed(t *testing.T) {
+	userA, userB := uuid.New(), uuid.New()
+	keys := []gateway.SubscriptionTargetKey{
+		{UserID: userA, GatewayID: "gateway_A", SensorID: "shared_sensor"},
+		{UserID: userB, GatewayID: "gateway_B", SensorID: "shared_sensor"},
+		{UserID: userA, GatewayID: "gateway_A", SensorID: "missing_sensor"},
+	}
+	repo := &fakeBatchTargetRepo{results: []gateway.SubscriptionTargetAuthorization{
+		{Key: keys[0], Role: gateway.RoleViewer, Authorized: true},
+		{Key: keys[1], Role: gateway.RoleOwner, Authorized: true},
+		{Key: keys[2]},
+	}}
+	authorizer, _ := NewTargetAuthorizer(repo, time.Second)
+	invalid := append([]gateway.SubscriptionTargetKey(nil), keys...)
+	invalid[0].SensorID = "invalid sensor id"
+	if _, err := authorizer.AuthorizeTargetsBatch(context.Background(), invalid); err == nil || repo.calls != 0 {
+		t.Fatal("invalid batch key must be rejected before repository call")
+	}
+	overbound := make([]gateway.SubscriptionTargetKey, gateway.MaxSubscriptionTargetBatchSize+1)
+	for i := range overbound {
+		overbound[i] = keys[0]
+	}
+	if _, err := authorizer.AuthorizeTargetsBatch(context.Background(), overbound); err == nil || repo.calls != 0 {
+		t.Fatal("overbound batch must be rejected rather than truncated")
+	}
+	got, err := authorizer.AuthorizeTargetsBatch(context.Background(), keys)
+	if err != nil || len(got) != len(keys) || !got[0].Authorized || !got[1].Authorized || got[0].Key != keys[0] || got[1].Key != keys[1] || got[2].Authorized {
+		t.Fatalf("batch results = %#v, err=%v", got, err)
+	}
+
+	repo.results = repo.results[:2]
+	got, err = authorizer.AuthorizeTargetsBatch(context.Background(), keys)
+	if err == nil || len(got) != len(keys) {
+		t.Fatalf("incomplete repository result must fail closed for all keys, got %#v, err=%v", got, err)
+	}
+	for _, outcome := range got {
+		if outcome.Authorized {
+			t.Fatal("malformed result partially granted authorization")
+		}
+	}
+
+	repo.err = errors.New("database unavailable")
+	got, err = authorizer.AuthorizeTargetsBatch(context.Background(), keys)
+	if err == nil || len(got) != len(keys) {
+		t.Fatalf("DB failure must return per-key failure, got %#v, err=%v", got, err)
+	}
+	for _, outcome := range got {
+		if outcome.Authorized || outcome.Err == nil {
+			t.Fatalf("DB failure granted or omitted outcome: %#v", outcome)
+		}
+	}
+}
+
+type fakeBatchTargetRepo struct {
+	results []gateway.SubscriptionTargetAuthorization
+	err     error
+	calls   int
+}
+
+func (f *fakeBatchTargetRepo) AuthorizeSubscriptionTarget(context.Context, uuid.UUID, string, string) (gateway.Role, error) {
+	return "", errors.New("single-target path must not be used")
+}
+
+func (f *fakeBatchTargetRepo) AuthorizeSubscriptionTargets(context.Context, []gateway.SubscriptionTargetKey) ([]gateway.SubscriptionTargetAuthorization, error) {
+	f.calls++
+	return f.results, f.err
+}
+
+func TestTargetAuthorizer_BatchFallbackKeepsDenialKeyScopedAndContextErrorTyped(t *testing.T) {
+	repo := newFakeTargetRepo()
+	user := uuid.New()
+	a, err := NewTargetAuthorizer(repo, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := gateway.SubscriptionTargetKey{UserID: user, GatewayID: "gw_denied"}
+	allowed := gateway.SubscriptionTargetKey{UserID: user, GatewayID: "gw_allowed"}
+	repo.setTarget("gw_denied", "", "", gateway.ErrNotFound)
+	repo.setTarget("gw_allowed", "", gateway.RoleViewer, nil)
+	queryStarts := 0
+	out, err := a.AuthorizeTargetsBatchObserved(context.Background(), []gateway.SubscriptionTargetKey{denied, allowed}, func() { queryStarts++ })
+	if err != nil || len(out) != 2 || out[0].Authorized || !errors.Is(out[0].Err, ErrTargetUnauthorized) || !out[1].Authorized || queryStarts != 2 {
+		t.Fatalf("key-specific fallback denial damaged unrelated authorization: outcomes=%+v err=%v", out, err)
+	}
+	repo.setTarget("gw_allowed", "", "", context.DeadlineExceeded)
+	_, err = a.AuthorizeTargetsBatchObserved(context.Background(), []gateway.SubscriptionTargetKey{allowed}, func() { queryStarts++ })
+	if !errors.Is(err, context.DeadlineExceeded) || queryStarts != 3 {
+		t.Fatalf("batch wrapper flattened context deadline or omitted started fallback query: err=%v starts=%d", err, queryStarts)
+	}
+}
+
 func TestTargetAuthorizer_AbsentSensorAndWrongParent(t *testing.T) {
 	repo := newFakeTargetRepo()
 	authorizer, _ := NewTargetAuthorizer(repo, 2*time.Second)

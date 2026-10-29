@@ -23,10 +23,27 @@ var ErrTargetUnauthorized = errors.New("subscription target unauthorized")
 // ErrInvalidUserID indicates an unauthenticated or nil user UUID.
 var ErrInvalidUserID = errors.New("invalid user identity")
 
+// ErrBatchAuthorizationFailed is deliberately identity-free for failed batch lookups.
+var ErrBatchAuthorizationFailed = errors.New("batch target authorization failed")
+
 // TargetAuthorizerRepository checks membership access and entity existence for subscription targets.
 // It accepts primitive types to avoid import cycles between gateway and telemetryws.
 type TargetAuthorizerRepository interface {
 	AuthorizeSubscriptionTarget(ctx context.Context, userID uuid.UUID, gatewayID string, sensorID string) (gateway.Role, error)
+}
+
+// TargetBatchAuthorizerRepository is an optional bounded batch extension to the existing interface.
+type TargetBatchAuthorizerRepository interface {
+	AuthorizeSubscriptionTargets(context.Context, []gateway.SubscriptionTargetKey) ([]gateway.SubscriptionTargetAuthorization, error)
+}
+
+// TargetAuthorizationOutcome records a key-specific sweep outcome without exposing identities in
+// metric labels. Failures are generic and fail closed.
+type TargetAuthorizationOutcome struct {
+	Key        gateway.SubscriptionTargetKey
+	Role       gateway.Role
+	Authorized bool
+	Err        error
 }
 
 // AuthorizedTarget represents a successfully authorized subscription target with its membership role.
@@ -176,4 +193,103 @@ func (a *TargetAuthorizer) AuthorizeTargets(ctx context.Context, userID uuid.UUI
 	}
 
 	return authorized, nil
+}
+
+// AuthorizeTargetsBatch maps one optional repository batch to outcomes for its full composite keys.
+// Malformed repository output and any query failure revoke every outcome in the batch.
+func (a *TargetAuthorizer) AuthorizeTargetsBatch(ctx context.Context, keys []gateway.SubscriptionTargetKey) ([]TargetAuthorizationOutcome, error) {
+	return a.AuthorizeTargetsBatchObserved(ctx, keys, nil)
+}
+
+// AuthorizeTargetsBatchObserved reports each actual repository authorization query as it starts.
+// It allows sweep metrics to count timeout-started work and legacy per-key fallback truthfully.
+func (a *TargetAuthorizer) AuthorizeTargetsBatchObserved(ctx context.Context, keys []gateway.SubscriptionTargetKey, onQueryStart func()) ([]TargetAuthorizationOutcome, error) {
+	if len(keys) == 0 || len(keys) > gateway.MaxSubscriptionTargetBatchSize {
+		return nil, ErrBatchAuthorizationFailed
+	}
+	unique := make([]gateway.SubscriptionTargetKey, 0, len(keys))
+	seen := make(map[gateway.SubscriptionTargetKey]struct{}, len(keys))
+	for _, key := range keys {
+		if key.UserID == uuid.Nil || gateway.ValidateGatewayID(key.GatewayID) != nil || (key.SensorID != "" && gateway.ValidateSensorID(key.SensorID) != nil) {
+			return nil, ErrBatchAuthorizationFailed
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+
+	authCtx, cancel := context.WithTimeout(ctx, a.budget)
+	defer cancel()
+	outcomes := make([]TargetAuthorizationOutcome, len(unique))
+	for i, key := range unique {
+		outcomes[i] = TargetAuthorizationOutcome{Key: key, Err: ErrTargetUnauthorized}
+	}
+	batchRepo, supportsBatch := a.repo.(TargetBatchAuthorizerRepository)
+	if !supportsBatch {
+		for i, key := range unique {
+			if onQueryStart != nil {
+				onQueryStart()
+			}
+			role, err := a.repo.AuthorizeSubscriptionTarget(authCtx, key.UserID, key.GatewayID, key.SensorID)
+			if err != nil {
+				if errors.Is(err, gateway.ErrNotFound) || errors.Is(err, gateway.ErrInvalidGatewayID) || errors.Is(err, gateway.ErrInvalidSensorID) || errors.Is(err, gateway.ErrInvalidUser) {
+					outcomes[i].Err = ErrTargetUnauthorized
+					continue
+				}
+				return failBatchOutcomes(outcomes), errors.Join(ErrBatchAuthorizationFailed, err)
+			}
+			if !isAllowedSubscriptionRole(role) {
+				outcomes[i].Err = ErrTargetUnauthorized
+				continue
+			}
+			outcomes[i] = TargetAuthorizationOutcome{Key: key, Role: role, Authorized: true}
+		}
+		return outcomes, nil
+	}
+
+	if onQueryStart != nil {
+		onQueryStart()
+	}
+	repositoryResults, err := batchRepo.AuthorizeSubscriptionTargets(authCtx, unique)
+	if err != nil {
+		return failBatchOutcomes(outcomes), errors.Join(ErrBatchAuthorizationFailed, err)
+	}
+	if len(repositoryResults) != len(unique) {
+		return failBatchOutcomes(outcomes), ErrBatchAuthorizationFailed
+	}
+	byKey := make(map[gateway.SubscriptionTargetKey]gateway.SubscriptionTargetAuthorization, len(repositoryResults))
+	for _, result := range repositoryResults {
+		if _, requested := seen[result.Key]; !requested {
+			return failBatchOutcomes(outcomes), ErrBatchAuthorizationFailed
+		}
+		if _, duplicate := byKey[result.Key]; duplicate || (result.Authorized && !isAllowedSubscriptionRole(result.Role)) || (!result.Authorized && result.Role != "") {
+			return failBatchOutcomes(outcomes), ErrBatchAuthorizationFailed
+		}
+		byKey[result.Key] = result
+	}
+	if len(byKey) != len(unique) {
+		return failBatchOutcomes(outcomes), ErrBatchAuthorizationFailed
+	}
+	for i, key := range unique {
+		result := byKey[key]
+		if result.Authorized {
+			outcomes[i] = TargetAuthorizationOutcome{Key: key, Role: result.Role, Authorized: true}
+		}
+	}
+	return outcomes, nil
+}
+
+func failBatchOutcomes(outcomes []TargetAuthorizationOutcome) []TargetAuthorizationOutcome {
+	for i := range outcomes {
+		outcomes[i].Role = ""
+		outcomes[i].Authorized = false
+		outcomes[i].Err = ErrBatchAuthorizationFailed
+	}
+	return outcomes
+}
+
+func isAllowedSubscriptionRole(role gateway.Role) bool {
+	return role == gateway.RoleOwner || role == gateway.RoleOperator || role == gateway.RoleViewer
 }

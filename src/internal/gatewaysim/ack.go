@@ -40,6 +40,7 @@ const maxACKBytes = 1024
 const (
 	minACKAdmissionCapacity = 1
 	maxACKAdmissionCapacity = 4096
+	MaxIgnoredValidACKs     = 10
 )
 
 // ACK rejection reasons. They are stable sentinels so callers never inspect
@@ -229,8 +230,8 @@ type ackAdmission struct {
 
 // ACKStats is a point-in-time snapshot of the ACK processor counters. The
 // admission counters describe what the callback dropped; Acknowledged counts
-// only deletes that committed. A malformed, foreign or duplicate ACK changes no
-// row and no counter, so there is deliberately no "invalid" or "no-op" count.
+// only deletes that committed. IgnoredValidACKs separately counts the opt-in
+// fault seam; malformed, foreign and unmatched ACKs do not change row counters.
 type ACKStats struct {
 	// Admitted counts admissions accepted into the bounded queue.
 	Admitted int64
@@ -244,7 +245,8 @@ type ACKStats struct {
 	DroppedFull int64
 	// DeleteFailed counts deletes whose outcome was unknown; each is fatal and
 	// never counts as an acknowledged success.
-	DeleteFailed int64
+	DeleteFailed     int64
+	IgnoredValidACKs int64
 }
 
 // ACKProcessor is the bounded single-worker ACK path. Admit is the only method
@@ -269,12 +271,16 @@ type ACKProcessor struct {
 	fatalMu  sync.Mutex
 	fatalErr error
 
-	admitted        atomic.Int64
-	acknowledged    atomic.Int64
-	droppedRetained atomic.Int64
-	droppedOversize atomic.Int64
-	droppedFull     atomic.Int64
-	deleteFailed    atomic.Int64
+	admitted         atomic.Int64
+	acknowledged     atomic.Int64
+	droppedRetained  atomic.Int64
+	droppedOversize  atomic.Int64
+	droppedFull      atomic.Int64
+	deleteFailed     atomic.Int64
+	ignoredValidACKs atomic.Int64
+	ignoreBudget     int
+	ignoreRemaining  int
+	ignoredNotify    chan struct{}
 
 	latency LatencyRecorder
 }
@@ -289,6 +295,11 @@ func WithACKLatencyRecorder(rec LatencyRecorder) ACKProcessorOption {
 	}
 }
 
+// WithACKIgnoreValidBudget enables bounded, explicit ACK-ignore fault injection.
+func WithACKIgnoreValidBudget(n int) ACKProcessorOption {
+	return func(p *ACKProcessor) { p.ignoreBudget = n }
+}
+
 // NewACKProcessor builds the ACK processor for the gateway bound by outbox. The
 // configured gateway identity is taken from the outbox so a topic check can
 // never be satisfied with a different gateway. admissionCapacity sets the fixed
@@ -301,17 +312,22 @@ func NewACKProcessor(outbox *Outbox, admissionCapacity int, opts ...ACKProcessor
 		return nil, fmt.Errorf("gatewaysim: ACK admission capacity must be between %d and %d", minACKAdmissionCapacity, maxACKAdmissionCapacity)
 	}
 	p := &ACKProcessor{
-		gatewayID:  outbox.gatewayID,
-		outbox:     outbox,
-		admissions: make(chan ackAdmission, admissionCapacity),
-		notify:     make(chan struct{}, 1),
-		done:       make(chan struct{}),
-		finished:   make(chan struct{}),
-		fatalCh:    make(chan struct{}),
+		gatewayID:     outbox.gatewayID,
+		outbox:        outbox,
+		admissions:    make(chan ackAdmission, admissionCapacity),
+		notify:        make(chan struct{}, 1),
+		done:          make(chan struct{}),
+		finished:      make(chan struct{}),
+		fatalCh:       make(chan struct{}),
+		ignoredNotify: make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(p)
 	}
+	if p.ignoreBudget < 0 || p.ignoreBudget > MaxIgnoredValidACKs {
+		return nil, fmt.Errorf("gatewaysim: ignored valid ACK budget must be between 0 and %d", MaxIgnoredValidACKs)
+	}
+	p.ignoreRemaining = p.ignoreBudget
 	return p, nil
 }
 
@@ -358,6 +374,9 @@ func (p *ACKProcessor) Admit(topic string, payload []byte, retained bool) {
 // value until drained and is signalled only after a delete commit.
 func (p *ACKProcessor) Notify() <-chan struct{} { return p.notify }
 
+// IgnoredValidACKNotify receives a nonblocking signal for an ignored valid ACK.
+func (p *ACKProcessor) IgnoredValidACKNotify() <-chan struct{} { return p.ignoredNotify }
+
 // FatalSignal is closed once when the worker stops on an operational failure.
 func (p *ACKProcessor) FatalSignal() <-chan struct{} { return p.fatalCh }
 
@@ -371,12 +390,13 @@ func (p *ACKProcessor) Fatal() error {
 // Stats returns a snapshot of the ACK counters.
 func (p *ACKProcessor) Stats() ACKStats {
 	return ACKStats{
-		Admitted:        p.admitted.Load(),
-		Acknowledged:    p.acknowledged.Load(),
-		DroppedRetained: p.droppedRetained.Load(),
-		DroppedOversize: p.droppedOversize.Load(),
-		DroppedFull:     p.droppedFull.Load(),
-		DeleteFailed:    p.deleteFailed.Load(),
+		Admitted:         p.admitted.Load(),
+		Acknowledged:     p.acknowledged.Load(),
+		DroppedRetained:  p.droppedRetained.Load(),
+		DroppedOversize:  p.droppedOversize.Load(),
+		DroppedFull:      p.droppedFull.Load(),
+		DeleteFailed:     p.deleteFailed.Load(),
+		IgnoredValidACKs: p.ignoredValidACKs.Load(),
 	}
 }
 
@@ -427,6 +447,21 @@ func (p *ACKProcessor) handleAdmission(ctx context.Context, admission ackAdmissi
 		// A malformed, foreign or mismatched ACK is a normal negative case that
 		// changes no row and no counter; the item stays pending for resend.
 		return nil
+	}
+	if p.ignoreRemaining > 0 {
+		item, found, lookupErr := p.outbox.Lookup(ctx, ack.MessageID)
+		if lookupErr != nil {
+			return fmt.Errorf("gatewaysim: ACK pending lookup failed: %w", lookupErr)
+		}
+		if found && item.Status == outboxStatusPending {
+			p.ignoreRemaining--
+			p.ignoredValidACKs.Add(1)
+			select {
+			case p.ignoredNotify <- struct{}{}:
+			default:
+			}
+			return nil
+		}
 	}
 
 	deleted, err := p.outbox.DeletePending(ctx, p.gatewayID, ack.MessageID)

@@ -456,3 +456,94 @@ func TestAuthorizeSubscriptionTarget(t *testing.T) {
 		}
 	})
 }
+
+type batchAuthRow struct {
+	user   uuid.UUID
+	gw     string
+	sensor string
+	role   Role
+}
+
+type batchAuthRows struct {
+	pgx.Rows
+	items   []batchAuthRow
+	index   int
+	scanErr error
+	endErr  error
+}
+
+func (r *batchAuthRows) Next() bool { return r.index < len(r.items) }
+func (r *batchAuthRows) Scan(dest ...any) error {
+	if r.scanErr != nil {
+		return r.scanErr
+	}
+	item := r.items[r.index]
+	r.index++
+	*dest[0].(*uuid.UUID) = item.user
+	*dest[1].(*string) = item.gw
+	*dest[2].(*string) = item.sensor
+	*dest[3].(*Role) = item.role
+	return nil
+}
+func (r *batchAuthRows) Err() error { return r.endErr }
+func (r *batchAuthRows) Close()     {}
+
+type batchAuthDB struct {
+	rows  pgx.Rows
+	err   error
+	query string
+	args  []any
+	calls int
+}
+
+func (d *batchAuthDB) Query(_ context.Context, query string, args ...any) (pgx.Rows, error) {
+	d.calls++
+	d.query, d.args = query, args
+	return d.rows, d.err
+}
+func (d *batchAuthDB) QueryRow(context.Context, string, ...any) pgx.Row { return fakeRow{} }
+
+func TestAuthorizeSubscriptionTargetsBatch(t *testing.T) {
+	userA, userB := uuid.New(), uuid.New()
+	keys := []SubscriptionTargetKey{
+		{UserID: userA, GatewayID: "gateway_A", SensorID: "shared_sensor"},
+		{UserID: userB, GatewayID: "gateway_B", SensorID: "shared_sensor"},
+		{UserID: userA, GatewayID: "gateway_A", SensorID: "missing_sensor"},
+	}
+	db := &batchAuthDB{rows: &batchAuthRows{items: []batchAuthRow{
+		{user: userA, gw: "gateway_A", sensor: "shared_sensor", role: RoleViewer},
+		{user: userB, gw: "gateway_B", sensor: "shared_sensor", role: RoleOwner},
+	}}}
+	repo, _ := NewPostgresRepository(db)
+	got, err := repo.(BatchSubscriptionTargetRepository).AuthorizeSubscriptionTargets(context.Background(), keys)
+	if err != nil || len(got) != 3 || !got[0].Authorized || !got[1].Authorized || got[0].Key != keys[0] || got[1].Key != keys[1] || got[2].Authorized {
+		t.Fatalf("results=%#v err=%v", got, err)
+	}
+	if !strings.Contains(db.query, "requested.user_id") || !strings.Contains(db.query, "requested.gateway_id") || !strings.Contains(db.query, "requested.sensor_id") || !strings.Contains(db.query, "public.user_gateways") || !strings.Contains(db.query, "public.sensors") {
+		t.Fatalf("batch query does not preserve full composite identity/membership/existence: %s", db.query)
+	}
+
+	beforeCalls := db.calls
+	overbound := make([]SubscriptionTargetKey, MaxSubscriptionTargetBatchSize+1)
+	for i := range overbound {
+		overbound[i] = keys[0]
+	}
+	if _, err := repo.(BatchSubscriptionTargetRepository).AuthorizeSubscriptionTargets(context.Background(), overbound); err == nil || db.calls != beforeCalls {
+		t.Fatal("overbound batch must be rejected before querying")
+	}
+	invalid := append([]SubscriptionTargetKey(nil), keys[:1]...)
+	invalid[0].GatewayID = "bad gateway"
+	if _, err := repo.(BatchSubscriptionTargetRepository).AuthorizeSubscriptionTargets(context.Background(), invalid); !errors.Is(err, ErrInvalidGatewayID) || db.calls != beforeCalls {
+		t.Fatal("invalid key must be rejected before querying")
+	}
+
+	db.err = errors.New("db unavailable")
+	if got, err := repo.(BatchSubscriptionTargetRepository).AuthorizeSubscriptionTargets(context.Background(), keys); err == nil || got != nil {
+		t.Fatal("query error must return no partial results")
+	}
+	db.err = nil
+	db.rows = &batchAuthRows{items: []batchAuthRow{{user: userA, gw: "gateway_A", sensor: "shared_sensor", role: RoleViewer}}, scanErr: errors.New("scan failure")}
+	if got, err := repo.(BatchSubscriptionTargetRepository).AuthorizeSubscriptionTargets(context.Background(), keys); err == nil || got != nil {
+		t.Fatal("row scan error must return no partial results")
+	}
+}

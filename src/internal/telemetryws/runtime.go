@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"iot-platform/internal/gateway"
 	"iot-platform/internal/telemetry"
 )
 
@@ -225,8 +226,21 @@ func (r *EventRuntime) process(job eventJob) {
 		if r.metrics != nil {
 			r.metrics.BuildFailure()
 		}
-		r.hub.CloseAllSessions(RevocationReasonGap)
+		if target, ok := trustedBatchTarget(job.batch); ok {
+			r.hub.CloseTargetSessions(target, RevocationReasonGap)
+		} else {
+			// Without a valid composite identity the lost event cannot be scoped;
+			// preserve the conservative global-gap policy rather than lose it silently.
+			r.hub.CloseAllSessions(RevocationReasonGap)
+		}
 	}
+}
+
+func trustedBatchTarget(batch telemetry.BatchDTO) (TargetKey, bool) {
+	if gateway.ValidateGatewayID(batch.GatewayID) != nil || gateway.ValidateSensorID(batch.SensorID) != nil {
+		return TargetKey{}, false
+	}
+	return TargetKey{GatewayID: batch.GatewayID, SensorID: batch.SensorID}, true
 }
 
 // PendingSlots reports queued plus worker-held reservations.

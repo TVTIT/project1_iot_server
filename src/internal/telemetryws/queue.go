@@ -13,6 +13,10 @@ const (
 
 	// DefaultSessionQueueBytes is the default logical byte cap for pending and in-flight frames (256 KiB).
 	DefaultSessionQueueBytes = 256 * 1024
+
+	// DefaultSessionReferenceBytes bounds logical bytes referenced by all session queues.
+	DefaultSessionReferenceBytes = 8 * 1024 * 1024
+	MaxSessionReferenceBytes     = 256 * 1024 * 1024
 )
 
 // Common queue errors.
@@ -22,7 +26,75 @@ var (
 
 	// ErrQueueClosed indicates operations on a closed session queue.
 	ErrQueueClosed = errors.New("telemetryws: session queue closed")
+
+	// ErrAggregateBudget indicates the shared session-reference budget is exhausted.
+	ErrAggregateBudget = errors.New("telemetryws: aggregate session-reference budget exhausted")
 )
+
+// SessionReferenceBudget accounts one logical payload reference per session,
+// including telemetry/control owned by writers after dequeue.
+type SessionReferenceBudget struct {
+	mu    sync.Mutex
+	used  int
+	limit int
+}
+
+func newSessionReferenceBudget(limit int) *SessionReferenceBudget {
+	if limit <= 0 {
+		limit = DefaultSessionReferenceBytes
+	}
+	return &SessionReferenceBudget{limit: limit}
+}
+
+func (b *SessionReferenceBudget) reserve(size int) bool {
+	if b == nil || size < 0 {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used > b.limit || size > b.limit-b.used {
+		return false
+	}
+	b.used += size
+	return true
+}
+
+func (b *SessionReferenceBudget) release(size int) {
+	if b == nil || size <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used -= size
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.mu.Unlock()
+}
+
+func (b *SessionReferenceBudget) snapshot() (used, limit int) {
+	if b == nil {
+		return 0, 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.used, b.limit
+}
+
+// fitsQueueBudget avoids adding potentially large counters before checking the
+// remaining capacity. Queue-owned counters are expected to stay within max.
+func fitsQueueBudget(max, queued, inFlight, controls, size int) bool {
+	if size < 0 || queued < 0 || inFlight < 0 || controls < 0 {
+		return false
+	}
+	remaining := max
+	for _, used := range [...]int{queued, inFlight, controls} {
+		if used > remaining {
+			return false
+		}
+		remaining -= used
+	}
+	return size <= remaining
+}
 
 // QueuedFrame pairs an immutable SharedEvent with explicit byte ownership accounting.
 //
@@ -80,24 +152,25 @@ func (f *QueuedFrame) Release() {
 //   - All state transitions are protected by an internal mutex.
 //   - Signal notifications use a dedicated non-blocking channel separate from ownership buffers.
 //   - Enqueue never sends on a closed channel and never performs network I/O.
-//   - When queue bounds are exceeded, Enqueue returns ErrQueueFull; the hub isolates the slow session
-//     by closing it and requesting REST catch-up, never blocking the publisher or other viewers.
+//   - Per-session bounds return ErrQueueFull; the shared Hub budget returns ErrAggregateBudget.
+//     The Hub closes the affected session for either condition without blocking publishers.
 type SessionQueue struct {
-	sessionID     string
-	mu            sync.Mutex
-	items         []*SharedEvent
-	queuedBytes   int
-	inFlightBytes int
-	inFlightCount int
-	controlBytes  int
-	controlCount  int
-	maxSlots      int
-	maxBytes      int
-	maxFrameBytes int
-	closed        bool
-	notifyCh      chan struct{}
-	closeCh       chan struct{}
-	closeOnce     sync.Once
+	sessionID       string
+	mu              sync.Mutex
+	items           []*SharedEvent
+	queuedBytes     int
+	inFlightBytes   int
+	inFlightCount   int
+	controlBytes    int
+	controlCount    int
+	maxSlots        int
+	maxBytes        int
+	maxFrameBytes   int
+	referenceBudget *SessionReferenceBudget
+	closed          bool
+	notifyCh        chan struct{}
+	closeCh         chan struct{}
+	closeOnce       sync.Once
 }
 
 // QueueReservation accounts a control frame against the same per-session byte cap.
@@ -116,19 +189,26 @@ func (r *QueueReservation) Release() {
 		r.queue.mu.Lock()
 		r.queue.controlBytes -= r.size
 		r.queue.controlCount--
+		if r.queue.referenceBudget != nil {
+			r.queue.referenceBudget.release(r.size)
+		}
 		r.queue.mu.Unlock()
 	})
 }
 
 // ReserveControl accounts one queued or in-flight application control frame.
+// A per-session limit returns ErrQueueFull; shared-budget exhaustion returns ErrAggregateBudget.
 func (q *SessionQueue) ReserveControl(size, maxControls int) (*QueueReservation, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
 		return nil, ErrQueueClosed
 	}
-	if size < 0 || len(q.items)+q.inFlightCount+q.controlCount >= q.maxSlots || q.controlCount >= maxControls || q.queuedBytes+q.inFlightBytes+q.controlBytes+size > q.maxBytes {
+	if size < 0 || len(q.items)+q.inFlightCount+q.controlCount >= q.maxSlots || q.controlCount >= maxControls || !fitsQueueBudget(q.maxBytes, q.queuedBytes, q.inFlightBytes, q.controlBytes, size) {
 		return nil, ErrQueueFull
+	}
+	if q.referenceBudget != nil && !q.referenceBudget.reserve(size) {
+		return nil, ErrAggregateBudget
 	}
 	q.controlCount++
 	q.controlBytes += size
@@ -137,6 +217,10 @@ func (q *SessionQueue) ReserveControl(size, maxControls int) (*QueueReservation,
 
 // NewSessionQueue initializes a new SessionQueue for sessionID with bounded limits.
 func NewSessionQueue(sessionID string, maxSlots, maxBytes, maxFrameBytes int) *SessionQueue {
+	return newSessionQueue(sessionID, maxSlots, maxBytes, maxFrameBytes, nil)
+}
+
+func newSessionQueue(sessionID string, maxSlots, maxBytes, maxFrameBytes int, referenceBudget *SessionReferenceBudget) *SessionQueue {
 	if maxSlots <= 0 {
 		maxSlots = DefaultSessionQueueSlots
 	}
@@ -148,13 +232,14 @@ func NewSessionQueue(sessionID string, maxSlots, maxBytes, maxFrameBytes int) *S
 	}
 
 	return &SessionQueue{
-		sessionID:     sessionID,
-		items:         make([]*SharedEvent, 0, min(maxSlots, 16)),
-		maxSlots:      maxSlots,
-		maxBytes:      maxBytes,
-		maxFrameBytes: maxFrameBytes,
-		notifyCh:      make(chan struct{}, 1),
-		closeCh:       make(chan struct{}),
+		sessionID:       sessionID,
+		items:           make([]*SharedEvent, 0, min(maxSlots, 16)),
+		maxSlots:        maxSlots,
+		maxBytes:        maxBytes,
+		maxFrameBytes:   maxFrameBytes,
+		referenceBudget: referenceBudget,
+		notifyCh:        make(chan struct{}, 1),
+		closeCh:         make(chan struct{}),
 	}
 }
 
@@ -165,7 +250,8 @@ func (q *SessionQueue) SessionID() string {
 
 // Enqueue adds an immutable SharedEvent to the queue.
 // Returns ErrQueueClosed if the queue is closed.
-// Returns ErrQueueFull if slot capacity or byte capacity would be exceeded.
+// Returns ErrQueueFull if per-session slot/byte capacity would be exceeded, or
+// ErrAggregateBudget if the shared Hub session-reference budget is exhausted.
 // Returns EventTooLargeError if the event exceeds maxFrameBytes.
 // Enqueue NEVER blocks and NEVER performs network I/O.
 func (q *SessionQueue) Enqueue(evt *SharedEvent) error {
@@ -191,9 +277,13 @@ func (q *SessionQueue) Enqueue(evt *SharedEvent) error {
 	}
 
 	// Byte cap check (includes both queued and in-flight bytes)
-	if q.queuedBytes+q.inFlightBytes+q.controlBytes+byteSize > q.maxBytes {
+	if !fitsQueueBudget(q.maxBytes, q.queuedBytes, q.inFlightBytes, q.controlBytes, byteSize) {
 		q.mu.Unlock()
 		return ErrQueueFull
+	}
+	if q.referenceBudget != nil && !q.referenceBudget.reserve(byteSize) {
+		q.mu.Unlock()
+		return ErrAggregateBudget
 	}
 
 	q.items = append(q.items, evt)
@@ -274,6 +364,9 @@ func (q *SessionQueue) releaseInFlight(byteSize int) {
 	if q.inFlightCount < 0 {
 		q.inFlightCount = 0
 	}
+	if q.referenceBudget != nil {
+		q.referenceBudget.release(byteSize)
+	}
 }
 
 // PurgeMatching removes unsent events from the queue matching the given predicate,
@@ -296,6 +389,9 @@ func (q *SessionQueue) PurgeMatching(predicate func(evt *SharedEvent) bool) int 
 	for _, item := range q.items {
 		if predicate(item) {
 			q.queuedBytes -= item.ByteSize()
+			if q.referenceBudget != nil {
+				q.referenceBudget.release(item.ByteSize())
+			}
 			purgedCount++
 		} else {
 			retained = append(retained, item)
@@ -321,6 +417,9 @@ func (q *SessionQueue) Close() error {
 	}
 
 	q.closed = true
+	if q.referenceBudget != nil {
+		q.referenceBudget.release(q.queuedBytes)
+	}
 	for i := range q.items {
 		q.items[i] = nil
 	}

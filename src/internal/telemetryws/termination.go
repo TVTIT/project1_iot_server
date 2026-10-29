@@ -27,12 +27,14 @@ const (
 	RevocationReasonUnknown      RevocationReason = "unknown"
 )
 
-var closeReasonKeys = [...]string{"ping_timeout", "write_timeout", "transport_error", "read_eof", "remote_close", "shutdown", "context_canceled", "rate_limit", "stream_gap", "unknown", "queue_overflow", "jwt_expired", "membership_revoked", "authorization_error", "client_close"}
+var closeReasonKeys = [...]string{"ping_timeout", "write_timeout", "transport_error", "read_eof", "remote_close", "shutdown", "context_canceled", "rate_limit", "stream_gap", "unknown", "queue_overflow", "aggregate_capacity", "jwt_expired", "membership_revoked", "authorization_error", "client_close"}
 
 func closeReasonKey(r RevocationReason) string {
 	switch r {
 	case RevocationReasonSlowConsumer:
 		return "queue_overflow"
+	case RevocationReasonAggregateCapacity:
+		return "aggregate_capacity"
 	case RevocationReasonExpired:
 		return "jwt_expired"
 	case RevocationReasonDenied:

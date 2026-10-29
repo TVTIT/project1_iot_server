@@ -13,10 +13,11 @@ func loadWebSocket(lookup LookupFunc) (WebSocketConfig, error) {
 		dst      *int
 		def, max int
 	}{
-		{"WS_MAX_SESSIONS", &c.MaxSessions, 32, 32},
+		{"WS_MAX_SESSIONS", &c.MaxSessions, 32, 10000},
 		{"WS_MAX_SUBSCRIPTIONS_PER_SESSION", &c.MaxSubscriptionsPerSession, 16, 16},
 		{"WS_GLOBAL_EVENT_SLOTS", &c.GlobalEventSlots, 64, 64},
 		{"WS_GLOBAL_EVENT_BYTES", &c.GlobalEventBytes, 8 << 20, 8 << 20},
+		{"WS_SESSION_REFERENCE_BYTES", &c.SessionReferenceBytes, 8 << 20, 256 << 20},
 		{"WS_SESSION_EVENT_SLOTS", &c.SessionEventSlots, 64, 64},
 		{"WS_SESSION_EVENT_BYTES", &c.SessionEventBytes, 256 << 10, 256 << 10},
 		{"WS_MAX_FRAME_BYTES", &c.MaxFrameBytes, 66560, 66560},
@@ -53,6 +54,16 @@ func loadWebSocket(lookup LookupFunc) (WebSocketConfig, error) {
 	}
 	if c.WriteTimeout >= c.HeartbeatInterval {
 		return WebSocketConfig{}, fmt.Errorf("WS_WRITE_TIMEOUT must be less than WS_HEARTBEAT_INTERVAL")
+	}
+	fanoutMode := valueOrDefault(lookup, "WS_FANOUT_MODE", "indexed")
+	if fanoutMode == "" {
+		fanoutMode = "indexed"
+	}
+	switch fanoutMode {
+	case "indexed", "scan":
+		c.FanoutMode = fanoutMode
+	default:
+		return WebSocketConfig{}, fmt.Errorf("WS_FANOUT_MODE must be either %q or %q", "indexed", "scan")
 	}
 	return c, nil
 }

@@ -61,11 +61,13 @@ type Config struct {
 type WebSocketConfig struct {
 	MaxSessions, MaxSubscriptionsPerSession             int
 	GlobalEventSlots, GlobalEventBytes                  int
+	SessionReferenceBytes                               int
 	SessionEventSlots, SessionEventBytes                int
 	MaxFrameBytes, ReadFrameBytes, RequestRatePerSecond int
 	RecheckInterval, RecheckSweepBudget                 time.Duration
 	RecheckConcurrency                                  int
 	HeartbeatInterval, PongTimeout, WriteTimeout        time.Duration
+	FanoutMode                                          string
 }
 
 // LoadFromEnvironment loads configuration from the process environment.

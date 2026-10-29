@@ -30,3 +30,14 @@ func TestMetricsNilSafe(t *testing.T) {
 		t.Fatalf("availability=%q", got.Availability)
 	}
 }
+
+func TestRecheckMetricsAreFixedCardinalityAndIdentityFree(t *testing.T) {
+	m := &Metrics{}
+	m.RecheckSweep(SweepReport{SessionsChecked: 64, DistinctKeys: 3, Chunks: 1, Queries: 1, Timeouts: 1, Duration: 20 * time.Millisecond})
+	s := m.Snapshot(NewHub(HubConfig{}))
+	if s.RecheckSessionsExamined != 64 || s.RecheckDistinctKeys != 3 || s.RecheckChunks != 1 || s.RecheckQueries != 1 || s.RecheckTimeouts != 1 || s.RecheckDuration.Count != 1 {
+		t.Fatalf("recheck observation missing: %+v", s)
+	}
+	var disabled *Metrics
+	disabled.RecheckSweep(SweepReport{SessionsChecked: 1})
+}

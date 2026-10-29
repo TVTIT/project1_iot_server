@@ -75,6 +75,9 @@ type Config struct {
 	Username  string
 	Password  string
 	CAFile    string
+	// MQTTServerName optionally overrides the TLS verification name for a
+	// trusted local tunnel. Certificate verification remains enabled.
+	MQTTServerName string
 
 	OutboxPath string
 
@@ -178,6 +181,11 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if err = validateCleanAbsolutePath("GATEWAY_MQTT_CA_FILE", c.CAFile); err != nil {
 		return c, err
+	}
+	if c.MQTTServerName, ok = nonEmpty(lookup, "GATEWAY_MQTT_SERVER_NAME"); ok {
+		if len(c.MQTTServerName) > 253 || strings.ContainsAny(c.MQTTServerName, "/:@ \t\r\n") {
+			return c, fmt.Errorf("GATEWAY_MQTT_SERVER_NAME is invalid")
+		}
 	}
 
 	if c.OutboxPath, ok = nonEmpty(lookup, "GATEWAY_OUTBOX_PATH"); !ok {

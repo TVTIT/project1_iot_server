@@ -23,7 +23,7 @@ var (
 	// ErrTargetLimitExceeded indicates an attempt to exceed the per-session subscription limit (max 16).
 	ErrTargetLimitExceeded = errors.New("telemetryws: target limit per session exceeded")
 
-	// ErrSessionLimitExceeded indicates the registry has reached the maximum allowed concurrent sessions (max 32).
+	// ErrSessionLimitExceeded indicates the registry has reached its configured concurrent session limit.
 	ErrSessionLimitExceeded = errors.New("telemetryws: maximum session limit exceeded")
 )
 
@@ -51,6 +51,9 @@ const (
 
 	// RevocationReasonSlowConsumer indicates the session's queue overflowed slot or byte bounds.
 	RevocationReasonSlowConsumer RevocationReason = "SLOW_CONSUMER"
+
+	// RevocationReasonAggregateCapacity indicates shared session-reference capacity was exhausted.
+	RevocationReasonAggregateCapacity RevocationReason = "AGGREGATE_CAPACITY"
 )
 
 // SessionRevocationHandler is the minimal typed contract requested by the access lifecycle.
@@ -364,12 +367,33 @@ func (s *SessionAccessState) Close(reason RevocationReason) {
 	}
 }
 
+// closeIfGeneration closes only the snapshot generation authorized by a recheck.
+// The generation comparison and state transition are atomic; a concurrent unsubscribe
+// or replacement subscription cannot be revoked by an older sweep result.
+func (s *SessionAccessState) closeIfGeneration(generation uint64, reason RevocationReason) bool {
+	s.mu.Lock()
+	if s.closed || s.generation != generation {
+		s.mu.Unlock()
+		return false
+	}
+	s.closed = true
+	s.generation++
+	s.targets = make(map[TargetKey]struct{})
+	notify, handler, sid := !s.revoked, s.handler, s.sessionID
+	s.revoked = true
+	s.mu.Unlock()
+	if notify && handler != nil {
+		handler.OnRevocation(sid, reason)
+	}
+	return true
+}
+
 // SessionProvider supplies active session access states for periodic recheck sweeps.
 type SessionProvider interface {
 	GetActiveSessions(limit int) []*SessionAccessState
 }
 
-// SessionRegistry provides a bounded container of active SessionAccessState instances (capped at MaxSessions = 32).
+// SessionRegistry provides a bounded container of active SessionAccessState instances (default cap MaxSessions = 32).
 // It implements SessionProvider and is intended for use or embedding by the P7.4 hub.
 type SessionRegistry struct {
 	mu       sync.RWMutex

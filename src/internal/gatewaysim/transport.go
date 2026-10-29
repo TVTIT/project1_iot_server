@@ -105,6 +105,12 @@ type TransportOptions struct {
 	Username  string
 	Password  string
 	CAFile    string
+	// ServerName optionally overrides the endpoint hostname for an explicitly
+	// configured TLS tunnel. Certificate verification remains enabled.
+	ServerName string
+	// FailFastConnect disables reconnect attempts after the first failed
+	// connection/subscription, for bounded external load clients.
+	FailFastConnect bool
 
 	ConnectTimeout       time.Duration
 	SubscribeTimeout     time.Duration
@@ -143,6 +149,7 @@ func TransportOptionsFromConfig(cfg Config) TransportOptions {
 		Username:             cfg.Username,
 		Password:             cfg.Password,
 		CAFile:               cfg.CAFile,
+		ServerName:           cfg.MQTTServerName,
 		ConnectTimeout:       cfg.ConnectTimeout,
 		SubscribeTimeout:     cfg.SubscribeTimeout,
 		PublishTimeout:       cfg.PublishTimeout,
@@ -382,9 +389,13 @@ func NewTransport(opts TransportOptions, admit ACKAdmitter) (*Transport, error) 
 		stopReconnect: make(chan struct{}),
 		fatalCh:       make(chan struct{}),
 	}
+	serverName := opts.ServerName
+	if serverName == "" {
+		serverName = u.Hostname()
+	}
 	t.tls = &tls.Config{
 		RootCAs:    roots,
-		ServerName: u.Hostname(),
+		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
 	}
 	if opts.newClient == nil {
@@ -689,6 +700,10 @@ func (t *Transport) supervise(ctx context.Context) {
 		if err != nil {
 			t.counters.connectFailures.Add(1)
 			t.log.Warn("gatewaysim transport connect failed", "event", "connect_failed", "reason", classifyConnectError(err))
+			if t.opts.FailFastConnect {
+				t.setFatal(errors.New("gatewaysim: startup connection or subscription failed"))
+				return
+			}
 			if !t.waitBackoff(ctx, attempt) {
 				return
 			}

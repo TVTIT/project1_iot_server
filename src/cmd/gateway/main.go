@@ -63,6 +63,8 @@ run flags:
   --completion-timeout D  time to wait for application ACKs after the target
   --measure               enable bounded ACK latency measurement (requires --batches > 0)
   --measure-capacity N    explicit measurement capacity (defaults to --batches)
+  --ignore-first-valid-acks N  test fault: ignore up to 10 valid pending-row ACKs
+  --stop-after-ignored-ack     cooperatively stop after the first ignored ACK (requires finite --batches and N > 0)
 `
 
 // simTransport is the transport surface the run lifecycle composes. It is the
@@ -96,7 +98,7 @@ func run(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, stdou
 		ctx = context.Background()
 	}
 	if len(args) == 0 {
-		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0)
+		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0, 0, false)
 	}
 	switch args[0] {
 	case "run":
@@ -124,6 +126,8 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 	measure := fs.Bool("measure", false, "record ACK latency and emit measurement summary for finite run (requires --batches > 0)")
 	measureLatency := fs.Bool("measure-latency", false, "alias for --measure")
 	measureCap := fs.Int("measure-capacity", 0, "explicit measurement capacity (defaults to --batches)")
+	ignoreACKs := fs.Int("ignore-first-valid-acks", 0, "test-only: ignore at most 10 valid ACKs for pending rows")
+	stopAfterIgnore := fs.Bool("stop-after-ignored-ack", false, "test-only: stop after the first ignored valid ACK")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -136,6 +140,18 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 	}
 	if *batches < 0 || *batches > maxFiniteBatches {
 		writef(stderr, "--batches must be between 0 and %d\n", maxFiniteBatches)
+		return 2
+	}
+	if *ignoreACKs < 0 || *ignoreACKs > gatewaysim.MaxIgnoredValidACKs {
+		writef(stderr, "--ignore-first-valid-acks must be between 0 and %d\n", gatewaysim.MaxIgnoredValidACKs)
+		return 2
+	}
+	if *ignoreACKs > 0 && *batches == 0 {
+		writeln(stderr, "--ignore-first-valid-acks requires a finite run (--batches > 0)")
+		return 2
+	}
+	if *stopAfterIgnore && (*ignoreACKs == 0 || *batches == 0) {
+		writeln(stderr, "--stop-after-ignored-ack requires --batches > 0 and --ignore-first-valid-acks > 0")
 		return 2
 	}
 	if *completion < minCompletionTimeout || *completion > maxCompletionTimeout {
@@ -167,14 +183,14 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 		return 2
 	}
 
-	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity)
+	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity, *ignoreACKs, *stopAfterIgnore)
 }
 
 // runSimulator composes the outbox, ACK processor, transport and scheduler and
 // runs until the context ends, a finite target completes, or a classified fatal
 // stop occurs. Every resource opened here is closed on every exit path, and
 // SQLite is closed only after the scheduler and ACK worker have stopped.
-func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity int) int {
+func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity, ignoreACKBudget int, stopAfterIgnore bool) int {
 	cfg, err := gatewaysim.Load(lookup)
 	if err != nil {
 		writef(stderr, "configuration error: %s\n", err)
@@ -226,7 +242,7 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		_ = outbox.Close()
 	}
 
-	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight), gatewaysim.WithACKLatencyRecorder(tracker))
+	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight), gatewaysim.WithACKLatencyRecorder(tracker), gatewaysim.WithACKIgnoreValidBudget(ignoreACKBudget))
 	if err != nil {
 		writeln(stderr, "error: could not create the ACK processor")
 		closeAll()
@@ -311,11 +327,18 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	if control != nil {
 		controlFatal = control.FatalSignal()
 	}
+	intentionalFaultStop := false
+	var ignoredACKStop <-chan struct{}
+	if stopAfterIgnore {
+		ignoredACKStop = processor.IgnoredValidACKNotify()
+	}
 
 	select {
 	case <-ctx.Done():
 	case <-scheduler.Done():
 	case <-controlFatal:
+	case <-ignoredACKStop:
+		intentionalFaultStop = true
 	}
 
 	// One shutdown budget for every teardown step. The scheduler's own publish
@@ -363,8 +386,9 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		counts = gatewaysim.OutboxCounts{}
 	}
 
-	writef(stdout, "run summary: enqueued=%d publish_attempts=%d app_acknowledged=%d pending_rows=%d pending_bytes=%d quarantined_rows=%d quarantined_bytes=%d completed=%t\n",
+	writef(stdout, "run summary: enqueued=%d publish_attempts=%d app_acknowledged=%d ignored_valid_acks=%d intentional_fault_stop=%t pending_rows=%d pending_bytes=%d quarantined_rows=%d quarantined_bytes=%d completed=%t\n",
 		stats.UniqueEnqueued, stats.PublishAttempts, ackStats.Acknowledged,
+		ackStats.IgnoredValidACKs, intentionalFaultStop,
 		counts.PendingRows, counts.PendingBytes, counts.QuarantinedRows, counts.QuarantinedBytes, stats.Completed)
 
 	if tracker != nil {
@@ -383,6 +407,9 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		return 0
 	case errors.Is(schedErr, gatewaysim.ErrSchedulerCompletion):
 		writeln(stderr, "error: the finite run did not complete within the completion budget; unacknowledged items are preserved for the next run")
+		return 1
+	case intentionalFaultStop:
+		writeln(stdout, "stopped intentionally after ignored valid ACK; pending outbox rows are preserved for reopen/replay")
 		return 1
 	case schedErr != nil && errors.Is(schedErr, context.DeadlineExceeded):
 		writeln(stderr, "error: the scheduler did not stop within the shutdown budget; recovery is supervised")

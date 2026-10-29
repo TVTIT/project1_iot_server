@@ -108,6 +108,96 @@ func TestEventRuntime_OversizeAndNoopNil(t *testing.T) {
 	}
 }
 
+func TestEventRuntime_TargetBuildFailureDoesNotCloseIndependentNamespace(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		maxFrame int
+		encoder  EventEncoder
+	}{
+		{name: "encoder error", encoder: func(TelemetryEventDTO, int) (*CommittedBatchEvent, error) { return nil, errors.New("encode") }},
+		{name: "encoder nil", encoder: func(TelemetryEventDTO, int) (*CommittedBatchEvent, error) { return nil, nil }},
+		{name: "oversize", maxFrame: 512, encoder: func(dto TelemetryEventDTO, max int) (*CommittedBatchEvent, error) {
+			return &CommittedBatchEvent{DTO: dto, Raw: make([]byte, max+1)}, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHub(HubConfig{})
+			defer func() { _ = h.Close() }()
+			queues := make(map[string]*SessionQueue)
+			for _, item := range []struct {
+				id      string
+				targets []TargetKey
+			}{
+				{id: "A-gateway", targets: []TargetKey{{GatewayID: "gwA"}}},
+				{id: "A-sensor", targets: []TargetKey{{GatewayID: "gwA", SensorID: "sensorA"}}},
+				{id: "A-overlap", targets: []TargetKey{{GatewayID: "gwA"}, {GatewayID: "gwA", SensorID: "sensorA"}}},
+				{id: "B", targets: []TargetKey{{GatewayID: "gwB"}}},
+			} {
+				state, q := createTestSession(t, h, item.id)
+				queues[item.id] = q
+				gen, err := state.PrepareSubscribe(item.targets, time.Now())
+				if err != nil {
+					t.Fatal(err)
+				}
+				authorized := make([]AuthorizedTarget, 0, len(item.targets))
+				for _, target := range item.targets {
+					authorized = append(authorized, AuthorizedTarget{Target: target})
+				}
+				if _, err := h.CommitSubscribe(state.SessionID(), gen, authorized, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			encoder := tc.encoder
+			if encoder == nil {
+				encoder = EncodeTelemetryEvent
+			}
+			maxFrame := tc.maxFrame
+			rt := NewEventRuntime(h, EventRuntimeConfig{QueueSlots: 2, MaxPendingBytes: 1 << 20, MaxFrameBytes: maxFrame}, func(dto TelemetryEventDTO, max int) (*CommittedBatchEvent, error) {
+				if dto.GatewayID == "gwA" {
+					return encoder(dto, max)
+				}
+				return EncodeTelemetryEvent(dto, max)
+			})
+
+			bad := eventBatch(1)
+			bad.GatewayID = "gwA"
+			bad.SensorID = "sensorA"
+			if !rt.TrySubmitBatch(bad, time.Now()) {
+				t.Fatal("admitted committed batch rejected")
+			}
+			waitFor(t, func() bool { return rt.PendingSlots() == 0 })
+			if got := rt.PendingBytes(); got != 0 {
+				t.Fatalf("failed event reservation leaked %d bytes", got)
+			}
+			if h.SessionCount() != 1 || queues["B"].IsClosed() {
+				t.Fatalf("target failure closed unrelated namespace: sessions=%d B_closed=%v", h.SessionCount(), queues["B"].IsClosed())
+			}
+			for _, id := range []string{"A-gateway", "A-sensor", "A-overlap"} {
+				if !queues[id].IsClosed() {
+					t.Errorf("target session %s remained open", id)
+				}
+			}
+
+			good := eventBatch(1)
+			good.GatewayID = "gwB"
+			good.SensorID = "sensorB"
+			if !rt.TrySubmitBatch(good, time.Now()) {
+				t.Fatal("healthy namespace batch rejected")
+			}
+			waitFor(t, func() bool { return queues["B"].QueuedSlots() == 1 })
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := rt.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if slots, bytes := rt.PendingSlots(), rt.PendingBytes(); slots != 0 || bytes != 0 {
+				t.Fatalf("shutdown leaked reservations: slots=%d bytes=%d", slots, bytes)
+			}
+		})
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

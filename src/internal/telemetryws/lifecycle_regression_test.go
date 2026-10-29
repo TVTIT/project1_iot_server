@@ -269,7 +269,7 @@ func TestReviewShellBoundsAndActiveExpiry(t *testing.T) {
 						_ = c.CloseNow()
 					}
 				}()
-				for i := 0; i < maxSessions; i++ {
+				for i := 0; i < MaxSessions; i++ {
 					c, _, e := websocket.Dial(ctx, "ws"+srv.URL[4:]+"/v1/ws", opts)
 					if e != nil {
 						t.Fatal(e)

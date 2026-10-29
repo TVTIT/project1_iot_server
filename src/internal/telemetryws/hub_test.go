@@ -85,6 +85,42 @@ func TestHub_AdmissionCapMax32(t *testing.T) {
 	}
 }
 
+func TestHub_ConfiguredAdmissionCapAndRelease(t *testing.T) {
+	const cap = 64
+	hub := NewHub(HubConfig{MaxSessions: cap})
+	defer func() { _ = hub.Close() }()
+	for i := 0; i < cap; i++ {
+		_, _ = createTestSession(t, hub, fmt.Sprintf("configured-%02d", i))
+	}
+	extra, err := NewSessionAccessState("configured-overflow", uuid.New(), time.Now().Add(time.Hour), hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hub.RegisterSession(extra); !errors.Is(err, ErrSessionLimitExceeded) {
+		t.Fatalf("cap+1 registration err=%v, want ErrSessionLimitExceeded", err)
+	}
+	hub.CloseSession("configured-00", RevocationReasonClientClose)
+	if _, err := hub.RegisterSession(extra); err != nil {
+		t.Fatalf("registration after releasing a slot: %v", err)
+	}
+}
+
+func TestApplicationHandlerConfiguredSessionLimit(t *testing.T) {
+	hub := NewHub(HubConfig{MaxSessions: 64})
+	defer func() { _ = hub.Close() }()
+	authz := &socketPolicyAuthorizer{}
+	h, err := NewApplicationHandlerWithOptions(nil, ApplicationHandlerDeps{Hub: hub, Authorizer: authz, Options: HandlerOptions{MaxSessions: 64}})
+	if err != nil {
+		t.Fatalf("configured 64 sessions rejected: %v", err)
+	}
+	if got := cap(h.slots); got != 64 {
+		t.Fatalf("handler admission slots=%d, want configured cap 64", got)
+	}
+	if _, err := NewApplicationHandlerWithOptions(nil, ApplicationHandlerDeps{Hub: hub, Authorizer: authz, Options: HandlerOptions{MaxSessions: 10001}}); err == nil {
+		t.Fatal("session limit above finite ceiling accepted")
+	}
+}
+
 // 2. Index Target Selection: gateway-wide vs specific sensor filter.
 func TestHub_IndexTargetSelection(t *testing.T) {
 	hub := NewHub(DefaultHubConfig())

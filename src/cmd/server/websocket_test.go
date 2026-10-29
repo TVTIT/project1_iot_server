@@ -41,7 +41,7 @@ func (v wsTestVerifier) Verify(context.Context, string) (auth.Principal, error) 
 func TestWebSocketCompositionWiresOneSharedApplicationAndRechecker(t *testing.T) {
 	cfg := config.Config{WebSocketEnabled: true, AuthorizationTimeout: time.Second, WebSocket: config.WebSocketConfig{
 		MaxSessions: 3, MaxSubscriptionsPerSession: 4, ReadFrameBytes: 2048, RequestRatePerSecond: 7,
-		GlobalEventSlots: 4, GlobalEventBytes: 4096, SessionEventSlots: 3, SessionEventBytes: 2048,
+		GlobalEventSlots: 4, GlobalEventBytes: 4096, SessionEventSlots: 3, SessionEventBytes: 2048, SessionReferenceBytes: 8192,
 		MaxFrameBytes: 1024, RecheckInterval: 5 * time.Second, RecheckSweepBudget: 2 * time.Second, RecheckConcurrency: 2,
 		HeartbeatInterval: 20 * time.Second, PongTimeout: 45 * time.Second, WriteTimeout: 5 * time.Second,
 	}}
@@ -56,6 +56,9 @@ func TestWebSocketCompositionWiresOneSharedApplicationAndRechecker(t *testing.T)
 	}
 	if w.hub == nil || w.events == nil || w.handler == nil || w.worker == nil {
 		t.Fatalf("incomplete enabled composition: %+v", w)
+	}
+	if used, limit := w.hub.SessionReferenceBudget(); used != 0 || limit != 8192 {
+		t.Fatalf("session-reference budget composition used/limit=%d/%d, want 0/8192", used, limit)
 	}
 	if err := w.start(context.Background()); err != nil {
 		t.Fatal(err)

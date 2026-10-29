@@ -16,9 +16,20 @@ var (
 	ErrSessionNotFound = errors.New("telemetryws: session not found in hub")
 )
 
+// FanoutMode specifies how interested sessions are selected during FanOut.
+type FanoutMode string
+
+const (
+	// FanoutModeIndexed selects sessions via two-key lookup in targetIndex (default).
+	FanoutModeIndexed FanoutMode = "indexed"
+
+	// FanoutModeScan selects sessions by scanning active registered sessions and their filters (opt-in baseline).
+	FanoutModeScan FanoutMode = "scan"
+)
+
 // HubConfig configures the limits and bounds for Hub fan-out and session management.
 type HubConfig struct {
-	// MaxSessions is the upper bound on concurrent sessions registered with the hub (default 32).
+	// MaxSessions is the finite upper bound on sessions registered with the hub (default 32).
 	MaxSessions int
 
 	// MaxQueueSlots is the per-session maximum pending event slot capacity (default 64).
@@ -29,15 +40,23 @@ type HubConfig struct {
 
 	// MaxFrameBytes is the upper bound on a single telemetry frame (default DefaultMaxEventBytes = 66,560).
 	MaxFrameBytes int
+
+	// MaxSessionReferenceBytes bounds logical references across all queues, including in-flight work.
+	MaxSessionReferenceBytes int
+
+	// FanoutMode specifies candidate selection: FanoutModeIndexed (default) or FanoutModeScan.
+	FanoutMode FanoutMode
 }
 
 // DefaultHubConfig returns the standard production limits for the P7.4 WebSocket Hub.
 func DefaultHubConfig() HubConfig {
 	return HubConfig{
-		MaxSessions:   MaxSessions,
-		MaxQueueSlots: DefaultSessionQueueSlots,
-		MaxQueueBytes: DefaultSessionQueueBytes,
-		MaxFrameBytes: DefaultMaxEventBytes,
+		MaxSessions:              MaxSessions,
+		MaxQueueSlots:            DefaultSessionQueueSlots,
+		MaxQueueBytes:            DefaultSessionQueueBytes,
+		MaxFrameBytes:            DefaultMaxEventBytes,
+		MaxSessionReferenceBytes: DefaultSessionReferenceBytes,
+		FanoutMode:               FanoutModeIndexed,
 	}
 }
 
@@ -71,6 +90,7 @@ type Hub struct {
 	closed              bool
 	afterFanOutSnapshot func() // test synchronization seam; nil in production
 	metrics             *Metrics
+	referenceBudget     *SessionReferenceBudget
 }
 
 // SetMetrics attaches the process-owned, optional observer once during composition.
@@ -111,13 +131,23 @@ func NewHub(cfg HubConfig) *Hub {
 	if cfg.MaxFrameBytes <= 0 {
 		cfg.MaxFrameBytes = DefaultMaxEventBytes
 	}
+	if cfg.MaxSessionReferenceBytes <= 0 {
+		cfg.MaxSessionReferenceBytes = DefaultSessionReferenceBytes
+	}
+	if cfg.MaxSessionReferenceBytes > MaxSessionReferenceBytes {
+		cfg.MaxSessionReferenceBytes = MaxSessionReferenceBytes
+	}
+	if cfg.FanoutMode != FanoutModeScan {
+		cfg.FanoutMode = FanoutModeIndexed
+	}
 
 	return &Hub{
-		cfg:            cfg,
-		registry:       NewSessionRegistry(cfg.MaxSessions),
-		queues:         make(map[string]*SessionQueue),
-		targetIndex:    make(map[TargetKey]map[string]struct{}),
-		sessionTargets: make(map[string]map[TargetKey]struct{}),
+		cfg:             cfg,
+		registry:        NewSessionRegistry(cfg.MaxSessions),
+		queues:          make(map[string]*SessionQueue),
+		targetIndex:     make(map[TargetKey]map[string]struct{}),
+		sessionTargets:  make(map[string]map[TargetKey]struct{}),
+		referenceBudget: newSessionReferenceBudget(cfg.MaxSessionReferenceBytes),
 	}
 }
 
@@ -126,13 +156,21 @@ func (h *Hub) Registry() *SessionRegistry {
 	return h.registry
 }
 
+// FanoutMode returns the effective candidate selection strategy for the hub.
+func (h *Hub) FanoutMode() FanoutMode {
+	if h == nil {
+		return FanoutModeIndexed
+	}
+	return h.cfg.FanoutMode
+}
+
 // GetActiveSessions implements SessionProvider for PeriodicRecheckWorker.
 func (h *Hub) GetActiveSessions(limit int) []*SessionAccessState {
 	return h.registry.GetActiveSessions(limit)
 }
 
 // RegisterSession registers a newly authenticated session with the hub, allocating its bounded queue.
-// Returns ErrSessionLimitExceeded if the hub has reached its maximum session capacity (default 32).
+// Returns ErrSessionLimitExceeded if the hub has reached its configured session cap (default 32).
 func (h *Hub) RegisterSession(state *SessionAccessState) (*SessionQueue, error) {
 	if state == nil {
 		return nil, errors.New("telemetryws: nil session state")
@@ -162,7 +200,7 @@ func (h *Hub) RegisterSession(state *SessionAccessState) (*SessionQueue, error) 
 		return nil, err
 	}
 
-	q := NewSessionQueue(sid, h.cfg.MaxQueueSlots, h.cfg.MaxQueueBytes, h.cfg.MaxFrameBytes)
+	q := newSessionQueue(sid, h.cfg.MaxQueueSlots, h.cfg.MaxQueueBytes, h.cfg.MaxFrameBytes, h.referenceBudget)
 	h.queues[sid] = q
 	h.sessionTargets[sid] = make(map[TargetKey]struct{})
 
@@ -318,6 +356,33 @@ func (h *Hub) CloseAllSessions(reason RevocationReason) {
 	}
 }
 
+// CloseTargetSessions closes only sessions whose currently installed Gateway
+// or Sensor subscription matches the failed event target. The index union is
+// deduplicated while h.mu is held, and state callbacks run after releasing it.
+func (h *Hub) CloseTargetSessions(target TargetKey, reason RevocationReason) {
+	if h == nil || target.GatewayID == "" || target.SensorID == "" {
+		return
+	}
+	h.mu.Lock()
+	ids := make(map[string]struct{})
+	for _, key := range [...]TargetKey{target, {GatewayID: target.GatewayID}} {
+		for id := range h.targetIndex[key] {
+			ids[id] = struct{}{}
+		}
+	}
+	states := make([]*SessionAccessState, 0, len(ids))
+	for id := range ids {
+		if state := h.registry.Get(id); state != nil {
+			states = append(states, state)
+		}
+		h.cleanupSessionInternal(id)
+	}
+	h.mu.Unlock()
+	for _, state := range states {
+		state.Close(reason)
+	}
+}
+
 // OnRevocation implements SessionRevocationHandler.
 // It is invoked by SessionAccessState or PeriodicRecheckWorker outside state locks
 // when a session's token expires, membership is revoked, or sweep times out.
@@ -325,6 +390,8 @@ func (h *Hub) CloseAllSessions(reason RevocationReason) {
 func (h *Hub) OnRevocation(sessionID string, reason RevocationReason) {
 	if h.metrics != nil {
 		switch reason {
+		case RevocationReasonAggregateCapacity:
+			h.metrics.AggregateCapacityClose()
 		case RevocationReasonExpired:
 			h.metrics.Expired()
 		case RevocationReasonDenied, RevocationReasonDBError, RevocationReasonSweepTimeout:
@@ -365,8 +432,9 @@ func (h *Hub) cleanupSessionInternal(sessionID string) {
 // FanOut routes one immutable SharedEvent to all interested sessions via index.
 // It does NOT scan all registered viewers.
 // Overlapping Gateway and Sensor filters select each session AT MOST ONCE.
-// If a viewer's queue is full or oversize, that slow session is closed with
-// RevocationReasonSlowConsumer and isolated; the publisher and other viewers never block.
+// Per-session queue overflow closes that viewer with RevocationReasonSlowConsumer;
+// aggregate reference-budget exhaustion closes affected viewers with its distinct reason.
+// The publisher and other viewers never block.
 // Returns the number of sessions to which the event was successfully queued.
 func (h *Hub) FanOut(evt *SharedEvent) (int, error) {
 	if evt == nil {
@@ -387,16 +455,45 @@ func (h *Hub) FanOut(evt *SharedEvent) (int, error) {
 	var interestedQueues []*SessionQueue
 	seen := make(map[string]struct{})
 
-	for _, key := range [...]TargetKey{sensorKey, gatewayKey} {
-		if sessions, exists := h.targetIndex[key]; exists {
-			for sid := range sessions {
-				if _, alreadySeen := seen[sid]; !alreadySeen {
-					seen[sid] = struct{}{}
-					if q, ok := h.queues[sid]; ok && !q.IsClosed() {
+	if h.cfg.FanoutMode == FanoutModeScan {
+		// Scan mode: bounded scan across registered active sessions (bounded by effective cap <= 10000,
+		// filters <= 16 per session). Overlapping filters select each session AT MOST ONCE.
+		sessionsExamined := 0
+		for sid, q := range h.queues {
+			if q.IsClosed() {
+				continue
+			}
+			sessionsExamined++
+			targets := h.sessionTargets[sid]
+			for target := range targets {
+				if target.Matches(evt.GatewayID(), evt.SensorID()) {
+					if _, alreadySeen := seen[sid]; !alreadySeen {
+						seen[sid] = struct{}{}
 						interestedQueues = append(interestedQueues, q)
+					}
+					break
+				}
+			}
+		}
+		if h.metrics != nil {
+			h.metrics.FanoutScanEvaluation(sessionsExamined)
+		}
+	} else {
+		// Indexed mode: existing two-key lookup unchanged.
+		for _, key := range [...]TargetKey{sensorKey, gatewayKey} {
+			if sessions, exists := h.targetIndex[key]; exists {
+				for sid := range sessions {
+					if _, alreadySeen := seen[sid]; !alreadySeen {
+						seen[sid] = struct{}{}
+						if q, ok := h.queues[sid]; ok && !q.IsClosed() {
+							interestedQueues = append(interestedQueues, q)
+						}
 					}
 				}
 			}
+		}
+		if h.metrics != nil {
+			h.metrics.FanoutIndexedSelection()
 		}
 	}
 	h.mu.RUnlock()
@@ -412,7 +509,10 @@ func (h *Hub) FanOut(evt *SharedEvent) (int, error) {
 	// enqueue while holding the hub lock. This makes unsubscribe/purge and enqueue
 	// linearizable; Enqueue is bounded and never performs network I/O.
 	deliveredCount := 0
-	var slowSessions []string
+	var closeSessions []struct {
+		sessionID string
+		reason    RevocationReason
+	}
 
 	for _, q := range interestedQueues {
 		h.mu.Lock()
@@ -430,22 +530,28 @@ func (h *Hub) FanOut(evt *SharedEvent) (int, error) {
 			continue
 		}
 
-		if errors.Is(err, ErrQueueFull) || errors.Is(err, ErrQueueClosed) {
+		if errors.Is(err, ErrQueueFull) || errors.Is(err, ErrQueueClosed) || errors.Is(err, ErrAggregateBudget) {
 			if h.metrics != nil {
 				h.metrics.Drop()
 			}
-			if errors.Is(err, ErrQueueFull) && h.metrics != nil {
+			reason := RevocationReasonSlowConsumer
+			if errors.Is(err, ErrAggregateBudget) {
+				reason = RevocationReasonAggregateCapacity
+			} else if errors.Is(err, ErrQueueFull) && h.metrics != nil {
 				h.metrics.SlowClose()
 			}
-			slowSessions = append(slowSessions, q.SessionID())
+			closeSessions = append(closeSessions, struct {
+				sessionID string
+				reason    RevocationReason
+			}{q.SessionID(), reason})
 		} else if h.metrics != nil {
 			h.metrics.Drop()
 		}
 	}
 
-	// Step 3: Isolate and close slow sessions outside publisher critical path.
-	for _, sid := range slowSessions {
-		h.CloseSession(sid, RevocationReasonSlowConsumer)
+	// Step 3: Isolate and close affected sessions outside publisher critical path.
+	for _, item := range closeSessions {
+		h.CloseSession(item.sessionID, item.reason)
 	}
 
 	return deliveredCount, nil
@@ -545,4 +651,12 @@ func (h *Hub) TotalControlBytes() int {
 		total += q.ControlBytes()
 	}
 	return total
+}
+
+// SessionReferenceBudget returns aggregate logical bytes currently owned and the configured cap.
+func (h *Hub) SessionReferenceBudget() (used, limit int) {
+	if h == nil {
+		return 0, 0
+	}
+	return h.referenceBudget.snapshot()
 }

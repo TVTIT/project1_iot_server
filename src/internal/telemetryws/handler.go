@@ -20,8 +20,6 @@ import (
 	"iot-platform/internal/auth"
 )
 
-const maxSessions = 32
-
 // HandlerOptions are per-socket bounds. Non-positive values select documented defaults.
 type HandlerOptions struct {
 	MaxSessions                             int
@@ -73,7 +71,7 @@ func (h *Handler) SetHandshakeObserver(observer func(time.Duration)) { h.observe
 
 // NewHandler validates the exact browser Origin allowlist.
 func NewHandler(origins []string) (*Handler, error) {
-	h := &Handler{origins: make(map[string]struct{}), slots: make(chan struct{}, maxSessions), connections: make(map[*websocket.Conn]struct{}), sessionClose: make(map[string]func())}
+	h := &Handler{origins: make(map[string]struct{}), slots: make(chan struct{}, MaxSessions), connections: make(map[*websocket.Conn]struct{}), sessionClose: make(map[string]func())}
 	for _, origin := range origins {
 		parsed, err := url.Parse(origin)
 		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || origin == "*" {
@@ -106,10 +104,10 @@ func NewApplicationHandlerWithOptions(origins []string, deps ApplicationHandlerD
 		return nil, fmt.Errorf("websocket subscription limit exceeds protocol maximum")
 	}
 	if deps.Options.MaxSessions <= 0 {
-		deps.Options.MaxSessions = maxSessions
+		deps.Options.MaxSessions = MaxSessions
 	}
-	if deps.Options.MaxSessions > maxSessions {
-		return nil, fmt.Errorf("websocket session limit exceeds protocol maximum")
+	if deps.Options.MaxSessions > MaxSupportedSessions {
+		return nil, fmt.Errorf("websocket session limit exceeds configured maximum")
 	}
 	if deps.Options.MaxReadBytes <= 0 {
 		deps.Options.MaxReadBytes = MaxClientMessageBytes
@@ -437,10 +435,17 @@ func (h *Handler) enqueueControl(s *appSession, msg any) {
 	reservation, reserveErr := s.queue.ReserveControl(len(b), 16)
 	if reserveErr != nil {
 		reason := RevocationReasonUnknown
-		if errors.Is(reserveErr, ErrQueueFull) {
+		if errors.Is(reserveErr, ErrAggregateBudget) {
+			reason = RevocationReasonAggregateCapacity
+		} else if errors.Is(reserveErr, ErrQueueFull) {
 			reason = RevocationReasonSlowConsumer
 		}
 		s.recordTermination(context.Background(), nil, reason, "control_reserve", reserveErr)
+		if reason == RevocationReasonAggregateCapacity {
+			if m := h.observer(); m != nil {
+				m.AggregateCapacityClose()
+			}
+		}
 		s.stop()
 		return
 	}
