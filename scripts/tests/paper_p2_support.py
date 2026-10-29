@@ -159,11 +159,14 @@ def prepare_perimeter(smoke, fixture):
     smoke.private_write(fixture.private / 'p2-ca.crt', ca.public_bytes(serialization.Encoding.PEM).decode())
     path = fixture.private / 'compose.p2.yml'
     text = path.read_text()
+    p8_slow_timers = ("      WS_HEARTBEAT_INTERVAL: '2s'\n      WS_PONG_TIMEOUT: '4s'\n"
+                      "      WS_WRITE_TIMEOUT: '1s'\n") if (getattr(fixture, 'paper_p8_slow', False)
+                                                            or getattr(fixture, 'paper_p8_e1', False)) else ''
     text += f'''  backend:
     environment:
       SUPABASE_JWT_SECRET: !reset null
-      WEBSOCKET_ENABLED: '{str(fixture.paper_p7).lower()}'
-      CORS_ALLOWED_ORIGINS: 'https://client.example.test'
+      WEBSOCKET_ENABLED: '{str(bool(fixture.paper_p7 or getattr(fixture, "paper_p8_sessions", False) or getattr(fixture, "paper_p8_slow", False) or getattr(fixture, "paper_p8_e1", False) or getattr(fixture, "paper_p8_e4", False) or getattr(fixture, "paper_p8_e5", False))).lower()}'
+{p8_slow_timers}      CORS_ALLOWED_ORIGINS: 'https://client.example.test'
     volumes:
       - auth_socket:/run/iot-auth
     depends_on:

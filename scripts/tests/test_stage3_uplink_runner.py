@@ -538,6 +538,13 @@ class ProbeBatchTests(unittest.TestCase):
         self.assertTrue(R.probe_batch_is_valid(payload, a))
         # The same payload is not valid for another Gateway.
         self.assertFalse(R.probe_batch_is_valid(payload, b))
+        v7 = R.build_probe_batch(a, '00000000-0000-7000-8000-000000000010',
+                                 '00000000-0000-4000-8000-000000000020', R.FIRST_SEQUENCE)
+        self.assertTrue(R.probe_batch_is_valid(v7, a))
+        for unsupported in ('00000000-0000-1000-8000-000000000010',
+                            '00000000-0000-5000-8000-000000000010'):
+            self.assertFalse(R.probe_batch_is_valid(R.build_probe_batch(a, unsupported,
+                '00000000-0000-4000-8000-000000000020', R.FIRST_SEQUENCE), a))
 
     def test_probe_batch_rejects_malformed_payloads(self):
         a, _ = R.default_specs()

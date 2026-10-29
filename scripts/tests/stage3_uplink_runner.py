@@ -536,8 +536,8 @@ def probe_batch_is_valid(payload: bytes, spec: GatewaySpec, *, expected_samples:
         return False
     if obj['gateway_id'] != spec.gateway_id or obj['sensor_id'] != spec.sensor_id:
         return False
-    if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',
-                        obj['message_id']):
+    if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',
+                        obj['message_id'], re.IGNORECASE):
         return False
     if not isinstance(obj['samples'], list) or len(obj['samples']) != obj['sample_count']:
         return False

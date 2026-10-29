@@ -21,6 +21,138 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_p8_e1_selector_builds_opt_in_websocket_profile_and_reuses_load_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True)
+            self.assertTrue(fixture.paper_p8_load)
+            self.assertTrue(fixture.paper_p8_e1)
+            self.assertEqual(fixture.values['WEBSOCKET_ENABLED'], 'true')
+            self.assertEqual(fixture.values['WS_MAX_SESSIONS'], '64')
+            for key, expected in {'WS_HEARTBEAT_INTERVAL': '2s', 'WS_PONG_TIMEOUT': '4s',
+                                  'WS_WRITE_TIMEOUT': '1s', 'WS_RECHECK_INTERVAL': '5s',
+                                  'WS_RECHECK_SWEEP_BUDGET': '2s', 'WS_RECHECK_CONCURRENCY': '2',
+                                  'WS_FANOUT_MODE': 'indexed'}.items():
+                self.assertEqual(fixture.values[key], expected)
+            self.assertIn('target: 8883', fixture.override.read_text())
+            self.assertEqual(fixture.private.joinpath('bin').exists(), False)
+            self.assertTrue(fixture.paper_p2)
+            self.assertFalse(any(fixture.values[k] == 'true' for k in
+                ('STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED', 'MQTT_SHAPER_ENABLED',
+                 'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED')))
+
+    def test_p8_e1_rejects_mixed_probe_and_e2_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'mixed', paper_p8_e1=True, paper_p8_sessions=True)
+
+    def test_p8_e2_selector_uses_isolated_shaper_microbatch_profile_with_ws_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'e2', paper_p8_e2=True)
+            self.assertTrue(fixture.paper_p8_load)
+            self.assertTrue(fixture.paper_p8_e2)
+            self.assertFalse(fixture.paper_p8_e1)
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['WEBSOCKET_ENABLED'], 'false')
+            for key, value in {'MQTT_SHAPER_ENABLED': 'true', 'MQTT_SHAPER_RATE_PER_SECOND': '2',
+                               'MQTT_SHAPER_BURST': '4', 'MQTT_MICROBATCH_ENABLED': 'true',
+                               'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+                               'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
+                               'MQTT_MICROBATCH_MAX_WAIT': '50ms', 'MQTT_RAM_DEDUP_ENABLED': 'false',
+                               'STAGE5_ENABLED': 'false', 'STAGE5_WAKEUP_ENABLED': 'false'}.items():
+                self.assertEqual(fixture.values[key], value)
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'mixed', paper_p8_e2=True, paper_p8_load=True)
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'sessions', paper_p8_e2=True, paper_p8_sessions=True)
+
+    def test_p8_e2_cli_rejects_other_p8_lanes(self):
+        for extra in ('--paper-p8-e1', '--paper-p8-sessions', '--paper-p8-slow-viewer', '--paper-p8-load'):
+            with self.subTest(extra=extra), patch.object(sys, 'argv',
+                    ['native_compose_smoke.py', '--prepare', '/tmp/not-created', '--paper-p8-e2', extra]):
+                with self.assertRaises(SystemExit) as raised:
+                    smoke.main()
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_p8_e1_acceptance_requires_complete_workload_and_exact_owned_cleanup(self):
+        fixture = type('Fixture', (), {'project': 'run'})()
+        item = {'kind': 'container', 'run': 'run', 'task': 'native-compose-allocation',
+                'allocation_attempted': True, 'removed': True,
+                'receipt': {'id': 'a' * 64, 'created': 'created', 'labels': {}}}
+        registry = type('Registry', (), {'items': [item]})()
+        counts = {'container': 1, 'network': 0, 'volume': 0}
+        complete = {'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP', 'sockets': 64,
+                    'workload': {'telemetry': {'generated_unique': 20}},
+                    'validation': {'valid': True, 'failures': []}, 'full_p8_accepted': False}
+        self.assertTrue(smoke.paper_p8_e1_cleanup_acceptance(fixture, complete, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e1_cleanup_acceptance(fixture, {}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e1_cleanup_acceptance(fixture,
+            {**complete, 'validation': {'valid': False}}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e1_cleanup_acceptance(fixture, complete, counts, False, registry))
+
+    def test_p8_load_dispatch_selects_e1_helper_without_changing_e2_route(self):
+        sentinel = object()
+        helper = Mock(run=Mock(return_value=sentinel))
+        e2 = Mock(run_e2_telemetry100=Mock(return_value=sentinel))
+        with patch.object(smoke, 'paper_p8_e1_support', return_value=helper), \
+             patch.object(smoke, 'paper_p8_support', return_value=e2):
+            e1_fixture = type('Fixture', (), {'paper_p8_e1': True})()
+            e2_fixture = type('Fixture', (), {'paper_p8_e1': False})()
+            args = (smoke, e1_fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            result = smoke.dispatch_paper_p8_load(e1_fixture, smoke, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            self.assertIs(result, sentinel)
+            helper.run.assert_called_once_with(*args)
+            e2.run_e2_telemetry100.assert_not_called()
+            smoke.dispatch_paper_p8_load(e2_fixture, smoke, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            e2.run_e2_telemetry100.assert_called_once_with(smoke, e2_fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+
+    def test_p8_e2_dispatch_uses_e2_helper(self):
+        sentinel = object()
+        helper = Mock(run=Mock(return_value=sentinel))
+        with patch.object(smoke, 'paper_p8_e2_support', return_value=helper):
+            fixture = type('Fixture', (), {'paper_p8_e2': True, 'paper_p8_e1': False})()
+            args = (smoke, fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            self.assertIs(smoke.dispatch_paper_p8_load(fixture, args[0], *args[2:]), sentinel)
+            helper.run.assert_called_once_with(*args)
+
+    def test_p8_e2_acceptance_requires_both_valid_profiles_and_exact_cleanup(self):
+        fixture = type('Fixture', (), {'project': 'run'})()
+        item = {'kind': 'container', 'run': 'run', 'task': 'native-compose-allocation',
+                'allocation_attempted': True, 'removed': True,
+                'receipt': {'id': 'a' * 64, 'created': 'created', 'labels': {}}}
+        registry = type('Registry', (), {'items': [item]})()
+        counts = {'container': 1, 'network': 0, 'volume': 0}
+        def profile(samples):
+            return {'samples_per_message': samples, 'status': 'PASS',
+                    'validation': {'valid': True, 'failures': []},
+                    'workloads': {arm: {'telemetry': {'generated_unique': n,
+                        'application_acks': n, 'pending_messages': 0}} for arm, n in (('A', 8), ('B', 16))}}
+        evidence = {'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP', 'full_p8_accepted': False,
+                    'profiles': [profile(100), profile(1)]}
+        self.assertTrue(smoke.paper_p8_e2_cleanup_acceptance(fixture, evidence, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, {**evidence, 'profiles': [profile(100)]}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, {**evidence, 'profiles': [profile(100), {**profile(1), 'status': 'FAIL'}]}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, {**evidence, 'profiles': [profile(100), {**profile(1), 'validation': {}}]}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, evidence, counts, False, registry))
+        self.assertTrue(smoke.paper_p8_e2_report_acceptance({**evidence, 'status': 'PASS',
+            'workload_status': evidence['status'], 'cleanup_verified': True}, True))
+        self.assertFalse(smoke.paper_p8_e2_report_acceptance({**evidence, 'status': 'PASS',
+            'workload_status': evidence['status'], 'cleanup_verified': False}, True))
+
+    def test_p8_load_selector_isolated_and_adds_only_loopback_mqtt_tls_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_load=True)
+            self.assertTrue(fixture.paper_p2)
+            self.assertTrue(fixture.paper_p8_load)
+            for key in ('STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED', 'MQTT_SHAPER_ENABLED',
+                        'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED'):
+                self.assertEqual(fixture.values[key], 'false')
+            override = fixture.override.read_text()
+            self.assertIn('published: "0"', override)
+            self.assertIn('host_ip: "127.0.0.1"', override)
+            self.assertIn('target: 8883', override)
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'second', paper_p8_load=True, paper_p8_sessions=True)
+
     def test_gateway_cli_captures_owned_diagnostics_before_callback_error(self):
         writes = []
         class Registry:
@@ -173,6 +305,35 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(set(env), {"PATH", "HOME", "DOCKER_CONFIG", "COMPOSE_DISABLE_ENV_FILE"})
             self.assertEqual(env["COMPOSE_DISABLE_ENV_FILE"], "1")
             self.assertNotEqual(env["HOME"], "/deployment")
+
+    def test_e5_go_builds_use_trimpath_only_for_e5_and_keep_owned_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for is_e5 in (False, True):
+                private = Path(directory) / ('e5' if is_e5 else 'default')
+                private.mkdir()
+                (private / 'bin').mkdir()
+                fixture = type('Fixture', (), {'private': private, 'paper_p8_e5': is_e5})()
+                calls = []
+
+                def build(command, **kwargs):
+                    calls.append((command, kwargs))
+                    Path(command[command.index('-o') + 1]).write_bytes(b'binary')
+                    return type('Result', (), {'returncode': 0})()
+
+                with patch.object(smoke.subprocess, 'run', side_effect=build):
+                    paperload = smoke.build_paperload(fixture, '/tool/go')
+                    gateway = smoke.build_paper_p8_e3_gateway(fixture, '/tool/go')
+
+                expected_flags = ['-trimpath'] if is_e5 else []
+                self.assertEqual([('-trimpath' in call[0]) for call in calls], [is_e5, is_e5])
+                self.assertEqual(calls[0][0], ['/tool/go', 'build', *expected_flags, '-o', str(paperload), './cmd/paperload'])
+                self.assertEqual(calls[1][0], ['/tool/go', 'build', *expected_flags, '-o', str(gateway), './cmd/gateway'])
+                for _, kwargs in calls:
+                    self.assertEqual(kwargs['cwd'], smoke.ROOT / 'src')
+                    self.assertEqual(kwargs['env'], smoke.process_env(fixture))
+                    self.assertEqual(kwargs['check'], False)
+                self.assertTrue((private / 'paperload-build.log').is_file())
+                self.assertTrue((private / 'gateway-build.log').is_file())
 
     def test_all_root_interpolation_inputs_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1568,6 +1729,14 @@ class PaperP0Tests(unittest.TestCase):
             bad['volumes']['storage_data']['name'] = 'deployment_storage_data'
             with self.assertRaisesRegex(ValueError, 'effective_names_rejected'):
                 smoke.validate_effective_model(fixture, bad)
+
+    def test_effective_e3_polling_profile_accepts_required_stage5_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p8_e3='polling')
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_ENABLED'], 'true')
+            self.assertEqual(model['services']['backend']['environment']['DATABASE_MAX_CONNS'], '12')
+            smoke.validate_effective_model(fixture, model)
 
     def test_effective_p6_profile_accepts_stage5_pool_and_metrics_configuration(self):
         with tempfile.TemporaryDirectory() as directory:

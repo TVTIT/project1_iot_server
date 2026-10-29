@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +134,97 @@ esac
 
 
 class AuthHarnessTests(unittest.TestCase):
+    def test_direct_go_and_proxy_routes_have_distinct_default_off_websocket_contracts(self):
+        stack = stage2_auth.Stack()
+        token = "valid-test-token"
+        unauthorized = (
+            401,
+            {"error": {"code": "unauthorized", "request_id": "request-1"}},
+            {"X-Request-ID": "request-1", "WWW-Authenticate": "Bearer"},
+        )
+        not_implemented = (
+            501,
+            {"error": {"code": "not_implemented", "request_id": "request-3"}},
+            {"X-Request-ID": "request-3"},
+        )
+        responses = {
+            ("http://backend", "/healthz", None, False): (200, {}, {}),
+            ("http://backend", "/v1/health", None, False): (200, {}, {}),
+            ("http://backend", "/v1/digital-twins", None, False): unauthorized,
+            ("http://backend", "/v1/digital-twins", token, False): (200, {"items": []}, {}),
+            ("http://backend", "/v1/ws", None, False): unauthorized,
+            ("http://backend", "/v1/ws", token, False): not_implemented,
+            ("http://backend", "/v1/ws", None, True): unauthorized,
+            ("http://backend", "/v1/ws", token, True): not_implemented,
+            ("http://proxy", "/healthz", None, False): (200, {}, {}),
+            ("http://proxy", "/v1/health", None, False): (200, {}, {}),
+            ("http://proxy", "/v1/digital-twins", None, False): unauthorized,
+            ("http://proxy", "/v1/digital-twins", token, False): (200, {"items": []}, {}),
+            ("http://proxy", "/v1/ws", None, False): (404, None, {}),
+            ("http://proxy", "/v1/ws", token, False): (404, None, {}),
+            ("http://proxy", "/v1/ws", None, True): (404, None, {}),
+            ("http://proxy", "/v1/ws", token, True): (404, None, {}),
+        }
+
+        def request(base, path, request_token=None, **kwargs):
+            return responses[(base, path, request_token, kwargs.get("upgrade", False))]
+
+        with mock.patch.object(stage2_auth, "http_request", side_effect=request) as http:
+            stack.check_routes("http://backend", token, via_proxy=False)
+            stack.check_routes("http://proxy", token, via_proxy=True)
+
+        ws_calls = [call.args[1:] for call in http.call_args_list if call.args[1] == "/v1/ws"]
+        self.assertEqual(
+            ws_calls,
+            [
+                ("/v1/ws", None), ("/v1/ws", token), ("/v1/ws", None), ("/v1/ws", token),
+                ("/v1/ws", None), ("/v1/ws", token), ("/v1/ws", None), ("/v1/ws", token),
+            ],
+        )
+
+    def test_smoke_caller_explicitly_checks_direct_go_boundary(self):
+        fake_stack = mock.Mock()
+        fake_stack.prepare.return_value = {}
+        fake_stack.start_backend.return_value = "http://backend"
+        fake_stack.secret = "unit-test-secret"
+        fake_stack.sensitive = []
+        with (
+            mock.patch.object(stage2_auth, "Stack", return_value=fake_stack),
+            mock.patch.object(stage2_auth, "http_request", return_value=(200, {}, {})),
+            mock.patch.object(stage2_auth, "assert_route_response"),
+            mock.patch.object(sys, "argv", ["stage2_auth.py", "smoke"]),
+        ):
+            stage2_auth.main()
+        fake_stack.check_routes.assert_called_once()
+        self.assertIs(fake_stack.check_routes.call_args.kwargs["via_proxy"], False)
+
+    def test_bad_jwts_are_checked_on_live_protected_route(self):
+        stack = stage2_auth.Stack()
+        stack.secret = "test-only-secret"
+        claims = {
+            "iss": stage2_auth.ISSUER,
+            "aud": "authenticated",
+            "role": "authenticated",
+            "sub": "11111111-1111-4111-8111-111111111111",
+            "iat": 1,
+            "exp": 2,
+        }
+        unauthorized = (
+            401,
+            {"error": {"code": "unauthorized", "request_id": "request-1"}},
+            {"X-Request-ID": "request-1", "WWW-Authenticate": "Bearer"},
+        )
+
+        def request(_base, path, token=None, **_kwargs):
+            self.assertEqual(path, "/v1/digital-twins")
+            self.assertTrue(token)
+            return unauthorized
+
+        with mock.patch.object(stage2_auth, "http_request", side_effect=request) as http:
+            stack.check_bad_tokens("http://backend", claims)
+
+        self.assertEqual(http.call_count, 10)
+
     def test_provision_response_strict_schema_metadata_and_utc(self):
         expected = {"gateway_id": "fixture", "name": " Name ", "description": None,
                     "owner_user_id": "11111111-1111-4111-8111-111111111111",

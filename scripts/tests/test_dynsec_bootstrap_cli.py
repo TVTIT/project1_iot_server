@@ -1568,6 +1568,98 @@ class TestDynsecBootstrapCliCancellation(unittest.TestCase):
             self.assertIn("RunnerError: execution interrupted (SIGTERM)", err_output)
             self.assertNotIn("Traceback", err_output)
 
+    def test_safe_diagnostic_redacts_secrets_and_protects_fields(self):
+        """Structured diagnostic in mqtt-bootstrap must never leak secrets from args or command."""
+        spec = importlib.util.spec_from_file_location('mqtt_bootstrap', cli.BOOTSTRAP_SCRIPT)
+        boot = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(boot)
+
+        secret = "SECRET_PASSWORD_99887766"
+        # 1. OSError with secret in message
+        try:
+            raise FileNotFoundError(f"Missing file containing {secret}")
+        except OSError as exc:
+            diag = boot.format_safe_diagnostic(exc)
+            dumped = json.dumps(diag)
+            self.assertNotIn(secret, dumped)
+            self.assertEqual(diag['exception_class'], 'FileNotFoundError')
+            self.assertIn('frames', diag)
+            self.assertTrue(len(diag['frames']) > 0)
+            self.assertIn('function', diag['frames'][0])
+            self.assertIn('line', diag['frames'][0])
+            self.assertNotIn('file', diag['frames'][0])
+            self.assertNotIn('args', diag['frames'][0])
+
+        # 2. CalledProcessError with secret in argv, stdout, stderr
+        try:
+            raise subprocess.CalledProcessError(
+                returncode=42,
+                cmd=['docker', 'run', '--secret', secret],
+                output=f"stdout with {secret}".encode(),
+                stderr=f"stderr with {secret}".encode()
+            )
+        except subprocess.SubprocessError as exc:
+            diag = boot.format_safe_diagnostic(exc)
+            dumped = json.dumps(diag)
+            self.assertNotIn(secret, dumped)
+            self.assertEqual(diag['exception_class'], 'CalledProcessError')
+            self.assertEqual(diag['returncode'], 42)
+
+        # 3. TimeoutExpired with secret in cmd
+        try:
+            raise subprocess.TimeoutExpired(cmd=['sh', '-c', secret], timeout=12.5)
+        except subprocess.SubprocessError as exc:
+            diag = boot.format_safe_diagnostic(exc)
+            dumped = json.dumps(diag)
+            self.assertNotIn(secret, dumped)
+            self.assertEqual(diag['exception_class'], 'TimeoutExpired')
+            self.assertEqual(diag['timeout'], 12.5)
+
+    def test_run_bootstrap_command_retains_diagnostic_and_redacts_secrets(self):
+        """run_bootstrap_command writes safe diagnostic to target if available and never leaks raw stderr/secrets."""
+        secret = "SUPER_SECRET_LEAK_TOKEN"
+        diag_payload = {
+            'exception_class': 'CalledProcessError',
+            'returncode': 1,
+            'errno': None,
+            'timeout': None,
+            'frames': [{'function': 'bootstrap_container', 'line': 819}]
+        }
+        child_stderr = (
+            b"bootstrap refused/failed; store and ownership require offline verification\n"
+            b"bootstrap_diagnostic: " + json.dumps(diag_payload).encode() + b"\n"
+            b"raw internal stderr containing " + secret.encode() + b"\n"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            private_dir = Path(td) / "private"
+            private_dir.mkdir(mode=0o700)
+            cmd = ['python3', 'bootstrap.py', '--recovery-dir', str(private_dir)]
+
+            process = mock.Mock(pid=12345, returncode=1)
+            def spawn(cmd, **kwargs):
+                kwargs['stderr'].write(child_stderr)
+                return process
+
+            with mock.patch.object(cli.subprocess, 'Popen', side_effect=spawn), \
+                    mock.patch.object(cli.os, 'killpg', side_effect=ProcessLookupError):
+                with self.assertRaises(cli.IncompleteCleanup) as ctx:
+                    cli.run_bootstrap_command(cmd)
+
+                # Secret must NOT be in the exception message
+                self.assertNotIn(secret, str(ctx.exception))
+                self.assertIn("CalledProcessError:1", str(ctx.exception))
+
+            # Diagnostic file must exist in private_dir and must NOT contain secret
+            diag_file = private_dir / 'bootstrap-diagnostic.json'
+            self.assertTrue(diag_file.exists())
+            diag_content = diag_file.read_text()
+            self.assertNotIn(secret, diag_content)
+            saved = json.loads(diag_content)
+            self.assertEqual(saved['exception_class'], 'CalledProcessError')
+            self.assertEqual(saved['returncode'], 1)
+            self.assertEqual(diag_file.stat().st_mode & 0o777, 0o600)
+
 
 if __name__ == '__main__':
     unittest.main()

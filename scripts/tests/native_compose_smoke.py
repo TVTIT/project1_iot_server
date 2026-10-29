@@ -81,12 +81,13 @@ DEFAULTS = dict(
     SUPABASE_JWT_AUDIENCE="authenticated", GOTRUE_JWT_ISSUER="http://localhost/auth/v1",
     JWT_EXPIRY="3600", GLOBAL_S3_BUCKET="fixture-unused", SERVER_ENV="production",
     CORS_ALLOWED_ORIGINS="", WEBSOCKET_ENABLED="false", WS_MAX_SESSIONS="32",
+    WS_SESSION_REFERENCE_BYTES="8388608",
     WS_MAX_SUBSCRIPTIONS_PER_SESSION="16", WS_GLOBAL_EVENT_SLOTS="64",
     WS_GLOBAL_EVENT_BYTES="8388608", WS_SESSION_EVENT_SLOTS="64",
     WS_SESSION_EVENT_BYTES="262144", WS_MAX_FRAME_BYTES="66560",
     WS_READ_FRAME_BYTES="4096", WS_REQUEST_RATE_PER_SECOND="10",
     WS_RECHECK_INTERVAL="5s", WS_RECHECK_SWEEP_BUDGET="2s",
-    WS_RECHECK_CONCURRENCY="2", WS_HEARTBEAT_INTERVAL="20s",
+    WS_RECHECK_CONCURRENCY="2", WS_FANOUT_MODE="indexed", WS_HEARTBEAT_INTERVAL="20s",
     WS_PONG_TIMEOUT="45s", WS_WRITE_TIMEOUT="5s", DATABASE_MAX_CONNS="5", DATABASE_MIN_CONNS="1",
     DATABASE_CONNECT_TIMEOUT="10s", READINESS_TIMEOUT="2s", AUTHORIZATION_TIMEOUT="2s",
     ADMIN_MAX_BODY_BYTES="16384", HTTP_READ_HEADER_TIMEOUT="5s", HTTP_READ_TIMEOUT="15s",
@@ -186,6 +187,18 @@ class Fixture:
     paper_p6_recovery_smoke: bool = False
     paper_p7: bool = False
     paper_p7_mode: str | None = None
+    paper_p8_sessions: bool = False
+    paper_p8_slow: bool = False
+    paper_p8_load: bool = False
+    paper_p8_e1: bool = False
+    paper_p8_e2: bool = False
+    paper_p8_e3: str | None = None
+    paper_p8_e3_workload: str = 'mixed'
+    paper_p8_e4: str | None = None
+    paper_p8_e5: str | None = None
+    paper_p8_e5_context: str | None = None
+    paper_p8_e5_reference: str | None = None
+    paper_p8_recovery: bool = False
 
 
 def fixture_services(fixture):
@@ -571,6 +584,122 @@ def paper_p7_support():
     return module
 
 
+def paper_p8_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_support', Path(__file__).with_name('paper_p8_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_slow_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_slow_support', Path(__file__).with_name('paper_p8_slow_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_e1_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_e1_support', Path(__file__).with_name('paper_p8_e1_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_e2_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_e2_support', Path(__file__).with_name('paper_p8_e2_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_e3_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_e3_fixture', Path(__file__).with_name('paper_p8_e3_fixture.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_e4_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_e4_support', Path(__file__).with_name('paper_p8_e4_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_e5_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_e5_fixture', Path(__file__).with_name('paper_p8_e5_fixture.py'))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_recovery_support():
+    test_dir = str(Path(__file__).resolve().parent)
+    if test_dir not in sys.path:
+        sys.path.insert(0, test_dir)
+    spec = importlib.util.spec_from_file_location('paper_p8_recovery_fixture', Path(__file__).with_name('paper_p8_recovery_fixture.py'))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_paper_p8_e3_gateway(fixture, go_binary):
+    binary = fixture.private / 'bin' / 'gateway'
+    log = fixture.private / 'gateway-build.log'
+    reproducible_flags = ['-trimpath'] if getattr(fixture, 'paper_p8_e5', None) else []
+    with log.open('xb') as stream:
+        result = subprocess.run([go_binary, 'build', *reproducible_flags, '-o', str(binary), './cmd/gateway'],
+            cwd=ROOT / 'src', stdout=stream, stderr=subprocess.STDOUT,
+            timeout=BUDGETS['build'], env=process_env(fixture), check=False)
+    if result.returncode or not binary.is_file():
+        raise ValueError('gateway_build_failed')
+    return binary
+
+
+def build_paperload(fixture, go_binary):
+    binary = fixture.private / 'bin' / 'paperload'
+    log = fixture.private / 'paperload-build.log'
+    reproducible_flags = ['-trimpath'] if getattr(fixture, 'paper_p8_e5', None) else []
+    with log.open('xb') as stream:
+        result = subprocess.run([go_binary, 'build', *reproducible_flags, '-o', str(binary), './cmd/paperload'],
+            cwd=ROOT / 'src', stdout=stream, stderr=subprocess.STDOUT,
+            timeout=BUDGETS['build'], env=process_env(fixture), check=False)
+    if result.returncode or not binary.is_file():
+        raise ValueError('paperload_build_failed')
+    return binary
+
+
+def dispatch_paper_p8_load(fixture, smoke, endpoint, registry, containers, images, state,
+                           paperload_binary, gateway_binary=None):
+    if getattr(fixture, 'paper_p8_recovery', False):
+        return paper_p8_recovery_support().run(smoke, fixture, endpoint, registry, containers,
+            images, state, paperload_binary, gateway_binary or fixture.private / 'bin' / 'gateway')
+    if getattr(fixture, 'paper_p8_e5', None):
+        return paper_p8_e5_support().run(smoke, fixture, endpoint, registry, containers,
+            images, state, paperload_binary, gateway_binary or fixture.private / 'bin' / 'gateway',
+            fixture.paper_p8_e5, fixture.paper_p8_e5_context, getattr(fixture, 'paper_p8_e5_reference', None))
+    if getattr(fixture, 'paper_p8_e4', None):
+        return paper_p8_e4_support().run(smoke, fixture, endpoint, registry, containers,
+                                         images, state, paperload_binary,
+                                         gateway_binary or fixture.private / 'bin' / 'gateway',
+                                         fixture.paper_p8_e4)
+    if getattr(fixture, 'paper_p8_e3', None):
+        return paper_p8_e3_support().run(smoke, fixture, endpoint, registry, containers,
+                                         images, state, paperload_binary,
+                                          gateway_binary or fixture.private / 'bin' / 'gateway', fixture.paper_p8_e3,
+                                          getattr(fixture, 'paper_p8_e3_workload', 'mixed'))
+    if getattr(fixture, 'paper_p8_e2', False):
+        return paper_p8_e2_support().run(smoke, fixture, endpoint, registry, containers, images,
+                                         state, paperload_binary)
+    if getattr(fixture, 'paper_p8_e1', False):
+        return paper_p8_e1_support().run(smoke, fixture, endpoint, registry, containers, images,
+                                         state, paperload_binary)
+    return paper_p8_support().run_e2_telemetry100(smoke, fixture, endpoint, registry, containers,
+                                                   images, state, paperload_binary)
+
+
 def dispatch_paper_fixture(fixture, helper, *args):
     """Keep P7 handshake, reconnect, and finite telemetry lanes separate from P2 behavior."""
     if fixture.paper_p7:
@@ -615,7 +744,49 @@ def paper_p6_support():
 def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_spike=False,
             paper_p2=False, paper_p7=False, paper_p7_mode=None, paper_p3=False, paper_p4=None, paper_p5a=None,
             paper_p3_microbatch=False, paper_p5a_shutdown=False, paper_p5b_cache_smoke=False,
-            paper_p5b_control_regression=False, paper_p5b=None, paper_p6=None):
+            paper_p5b_control_regression=False, paper_p5b=None, paper_p6=None,
+             paper_p8_sessions=False, paper_p8_slow=False, paper_p8_load=False, paper_p8_e1=False,
+             paper_p8_e2=False, paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e4=None,
+              paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
+              paper_p8_recovery=False):
+    if paper_p8_recovery:
+        if any((paper_p8_e5, paper_p8_e5_context, paper_p8_e5_reference,
+                paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p7, paper_p3,
+                paper_p4, paper_p5a, paper_p5b, paper_p6)):
+            raise ValueError('paper_p8_recovery_selector_conflict')
+        if paper_p8_load or any((paper_p8_sessions, paper_p8_slow, paper_p8_e1, paper_p8_e2,
+                                 paper_p8_e3, paper_p8_e4)):
+            raise ValueError('paper_p8_recovery_selector_conflict')
+        paper_p8_e5 = 'optimized'
+    if paper_p8_load and (paper_p8_e1 or paper_p8_e2 or paper_p8_e3 or paper_p8_e4 or paper_p8_e5):
+        raise ValueError('paper_p8_mode_rejected')
+    if paper_p8_e1 or paper_p8_e2 or paper_p8_e3 or paper_p8_e4 or paper_p8_e5:
+        paper_p8_load = True
+    if (paper_p8_e5 not in (None, 'optimized', 'shaper_off', 'microbatch_off', 'ram_dedup_off', 'polling', 'fanout_scan')
+            or bool(paper_p8_e5) != bool(paper_p8_e5_context) and not paper_p8_recovery):
+        raise ValueError('paper_p8_e5_context_required')
+    if paper_p8_e5_reference and (not paper_p8_e5 or paper_p8_e5 == 'optimized'):
+        raise ValueError('paper_p8_e5_reference_rejected')
+    if paper_p8_e3 not in (None, 'polling', 'wakeup'):
+        raise ValueError('paper_p8_mode_rejected')
+    if paper_p8_e3_workload not in ('mixed', 'low_load') or (paper_p8_e3_workload != 'mixed' and not paper_p8_e3):
+        raise ValueError('paper_p8_mode_rejected')
+    if paper_p8_e4 not in (None, 'on', 'off'):
+        raise ValueError('paper_p8_mode_rejected')
+    if sum((bool(paper_p8_sessions), bool(paper_p8_slow), bool(paper_p8_load and not (paper_p8_e1 or paper_p8_e2 or paper_p8_e3 or paper_p8_e4 or paper_p8_e5)),
+             bool(paper_p8_e1), bool(paper_p8_e2), bool(paper_p8_e3), bool(paper_p8_e4), bool(paper_p8_e5))) > 1:
+        raise ValueError('paper_p8_mode_rejected')
+    if paper_p8_sessions or paper_p8_slow or paper_p8_load:
+        if any((paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p7, paper_p3, paper_p4,
+                paper_p5a is not None, paper_p5b is not None, paper_p6 is not None, not metrics_enabled)):
+            raise ValueError('paper_p8_mode_rejected')
+        paper_p2 = True
+    if paper_p8_recovery:
+        if any((paper_p0, paper_p1, paper_p2_spike, paper_p7, paper_p3, paper_p4,
+                paper_p5a is not None, paper_p5b is not None, paper_p6 is not None, not metrics_enabled)):
+            raise ValueError('paper_p8_recovery_selector_conflict')
+        paper_p8_load = True
+        paper_p2 = True
     if paper_p3_microbatch and (not paper_p3 or not metrics_enabled or paper_p4 or paper_p5a):
         raise ValueError('paper_p3_microbatch_mode_rejected')
     if paper_p7:
@@ -683,12 +854,22 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     private, artifacts = base / "private", base / "artifacts"
     for path in (private, artifacts, private / "certs", private / "home", private / "docker"):
         path.mkdir(mode=0o700)
+    if paper_p8_recovery:
+        for source_dir in (ROOT / 'scripts', ROOT / 'scripts/tests'):
+            if str(source_dir) not in sys.path:
+                sys.path.insert(0, str(source_dir))
+        driver_spec = importlib.util.spec_from_file_location('paper_p8_e5_driver_recovery', ROOT / 'scripts/paper_p8_e5.py')
+        driver = importlib.util.module_from_spec(driver_spec)
+        driver_spec.loader.exec_module(driver)
+        context_root = private / 'p8-recovery-context'
+        context_root.mkdir(mode=0o700)
+        _, paper_p8_e5_context = driver.prepare_repeat(context_root, 1, 813)
     project = "ncs_" + secrets.token_hex(6)
     values = dict(DEFAULTS)
     if paper_profile:
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
                       MQTT_MAX_PAYLOAD_BYTES='65536')
-    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4 or paper_p5a or paper_p6 or
+    values['METRICS_ENABLED'] = 'true' if (paper_p1 or paper_p2 or paper_p4 or paper_p5a or paper_p6 or paper_p8_e4 or
         paper_p7 and paper_p7_mode in ('overhead_zero', 'overhead_two', 'p6_ws')) and metrics_enabled else 'false'
     if paper_p7 and paper_p7_mode == 'single_path':
         values.update(paper_p7_support().single_path_profile())
@@ -700,7 +881,42 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       AUTH_UNIX_SOCKET_PATH='/run/iot-auth/auth.sock', GOTRUE_JWT_ISSUER='https://localhost/auth/v1',
                       SUPABASE_PUBLIC_URL='https://localhost', GOTRUE_SITE_URL='https://localhost',
                       CORS_ALLOWED_ORIGINS='https://client.example.test')
-    values['WEBSOCKET_ENABLED'] = 'true' if paper_p7 else 'false'
+    values['WEBSOCKET_ENABLED'] = 'true' if (paper_p7 or paper_p8_sessions or paper_p8_slow or paper_p8_e1 or paper_p8_e5) else 'false'
+    if paper_p8_sessions:
+        values.update(paper_p8_support().profile())
+    if paper_p8_slow:
+        values.update(paper_p8_support().profile())
+    if paper_p8_e1:
+        values.update(paper_p8_support().profile())
+        values.update(WS_HEARTBEAT_INTERVAL='2s', WS_PONG_TIMEOUT='4s', WS_WRITE_TIMEOUT='1s',
+                      WS_RECHECK_INTERVAL='5s', WS_RECHECK_SWEEP_BUDGET='2s', WS_RECHECK_CONCURRENCY='2',
+                      WS_FANOUT_MODE='indexed')
+    if paper_p8_e2:
+        values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND='2', MQTT_SHAPER_BURST='4',
+                      MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
+                      MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
+                      MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
+                       STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
+    if paper_p8_e3:
+        values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12',
+                      STAGE5_WAKEUP_ENABLED='true' if paper_p8_e3 == 'wakeup' else 'false',
+                      MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND='2', MQTT_SHAPER_BURST='4',
+                      MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
+                      MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
+                       MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false', WEBSOCKET_ENABLED='false')
+    if paper_p8_e4:
+        values.update(STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', MQTT_SHAPER_ENABLED='false',
+                      MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
+                      MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
+                      MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='true' if paper_p8_e4 == 'on' else 'false',
+                       WEBSOCKET_ENABLED='true')
+    if paper_p8_e5:
+        scripts_dir = str(ROOT / 'scripts')
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import paper_p8_e5_support as e5
+        values.update(e5.e5_arm_profile(paper_p8_e5))
+        values['METRICS_ENABLED'] = 'true'
     if paper_p3:
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
         if paper_p3_microbatch:
@@ -747,7 +963,9 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     services = SERVICES[:-2] + ('supabase-storage',) + SERVICES[-2:] if paper_profile else SERVICES
     for service in services:
         stanzas.append(f"  {service}:\n    container_name: !reset null\n    restart: 'no'\n")
-        if service != "nginx":
+        if service == 'mosquitto' and paper_p8_load:
+            stanzas.append('    ports: !override\n      - target: 8883\n        published: "0"\n        host_ip: "127.0.0.1"\n        protocol: tcp\n')
+        elif service != "nginx":
             stanzas.append("    ports: !override []\n")
         stanzas.append(f"    labels:\n      io.iot.native-smoke.run: ${{NCS_RUN:?required}}\n      io.iot.native-smoke.role: {service}\n      test.task: native-compose-startup\n      test.run: ${{NCS_RUN:?required}}\n")
         stanzas.append(extra_by_service.get(service, ""))
@@ -770,6 +988,19 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                         paper_p5b_control_regression)
     object.__setattr__(fixture, 'paper_p7', paper_p7)
     object.__setattr__(fixture, 'paper_p7_mode', paper_p7_mode or 'handshake_only')
+    object.__setattr__(fixture, 'paper_p8_sessions', paper_p8_sessions)
+    object.__setattr__(fixture, 'paper_p8_slow', paper_p8_slow)
+    object.__setattr__(fixture, 'paper_p8_load', paper_p8_load)
+    object.__setattr__(fixture, 'paper_p8_e2', paper_p8_e2)
+    object.__setattr__(fixture, 'paper_p8_e3', paper_p8_e3)
+    object.__setattr__(fixture, 'paper_p8_e3_workload', paper_p8_e3_workload)
+    object.__setattr__(fixture, 'paper_p8_e4', paper_p8_e4)
+    object.__setattr__(fixture, 'paper_p8_e4_cache_mode', paper_p8_e4)
+    object.__setattr__(fixture, 'paper_p8_e5', paper_p8_e5)
+    object.__setattr__(fixture, 'paper_p8_e5_context', str(paper_p8_e5_context) if paper_p8_e5_context else None)
+    object.__setattr__(fixture, 'paper_p8_e5_reference', str(paper_p8_e5_reference) if paper_p8_e5_reference else None)
+    object.__setattr__(fixture, 'paper_p8_recovery', paper_p8_recovery)
+    object.__setattr__(fixture, 'paper_p8_e1', paper_p8_e1)
     if paper_p5b is not None:
         object.__setattr__(fixture, 'paper_p5b', True)
         object.__setattr__(fixture, 'paper_p5b_cache_mode', paper_p5b[0])
@@ -942,6 +1173,11 @@ def validate_effective_model(fixture, model):
                     or str(ports[0].get("published")) != "0" or ports[0].get("target") != (443 if fixture.paper_p2 else 80)
                     or ports[0].get("protocol") != "tcp"):
                 raise ValueError("effective_ports_rejected")
+        elif name == 'mosquitto' and getattr(fixture, 'paper_p8_load', False):
+            if (len(ports) != 1 or ports[0].get('host_ip') != '127.0.0.1'
+                    or str(ports[0].get('published')) != '0' or ports[0].get('target') != 8883
+                    or ports[0].get('protocol') != 'tcp'):
+                raise ValueError('effective_ports_rejected')
         elif ports:
             raise ValueError("effective_ports_rejected")
         actual_binds, actual_volumes = {}, set()
@@ -956,11 +1192,11 @@ def validate_effective_model(fixture, model):
                 or len(service.get("volumes", [])) != len(actual_binds) + len(actual_volumes)):
             raise ValueError("effective_mounts_rejected")
     backend = services["backend"]
-    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2 or fixture.paper_p6 or fixture.paper_p7:
+    if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2 or fixture.paper_p6 or fixture.paper_p7 or getattr(fixture, 'paper_p8_e5', None):
         env = backend.get('environment', {})
-        expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'true' if fixture.paper_p3 or fixture.paper_p6 else 'false',
+        expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'true' if fixture.paper_p3 or fixture.paper_p6 or getattr(fixture, 'paper_p8_e3', None) or getattr(fixture, 'paper_p8_e5', None) else 'false',
                     'MQTT_CREDENTIAL_RUNTIME_ENABLED': 'false', 'MQTT_CREDENTIAL_API_ENABLED': 'true',
-                    'DATABASE_MAX_CONNS': '12' if fixture.paper_p3 or fixture.paper_p6 else '10', 'MQTT_QUEUE_CAPACITY': '256',
+                     'DATABASE_MAX_CONNS': '12' if fixture.paper_p3 or fixture.paper_p6 or getattr(fixture, 'paper_p8_e3', None) else '11' if getattr(fixture, 'paper_p8_e5', None) else '10', 'MQTT_QUEUE_CAPACITY': '256',
                 'MQTT_WORKER_COUNT': '1' if (fixture.paper_p7 and fixture.paper_p7_mode in ('telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two')) else '4',
                     'MQTT_MAX_PAYLOAD_BYTES': '65536'}
         if (any(str(env.get(k)).lower() != v for k, v in expected.items())
@@ -968,6 +1204,21 @@ def validate_effective_model(fixture, model):
             raise ValueError('paper_p0_profile_rejected')
         if fixture.paper_p3_microbatch and str(env.get('MQTT_MICROBATCH_ENABLED')).lower() != 'true':
             raise ValueError('paper_p3_microbatch_profile_rejected')
+        if getattr(fixture, 'paper_p8_e4', None):
+            expected_e4 = {'STAGE5_ENABLED': 'false', 'STAGE5_WAKEUP_ENABLED': 'false',
+                'WEBSOCKET_ENABLED': 'true', 'MQTT_SHAPER_ENABLED': 'false',
+                'MQTT_MICROBATCH_ENABLED': 'true',
+                'MQTT_RAM_DEDUP_ENABLED': 'true' if fixture.paper_p8_e4 == 'on' else 'false',
+                'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+                'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304', 'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
+            if any(str(env.get(k)).lower() != v for k, v in expected_e4.items()):
+                raise ValueError('paper_p8_e4_profile_rejected')
+        if getattr(fixture, 'paper_p8_e5', None):
+            import paper_p8_e5_support as e5
+            expected_e5 = e5.e5_arm_profile(fixture.paper_p8_e5)
+            expected_e5['METRICS_ENABLED'] = 'true'
+            if any(str(env.get(k, '')).lower() != str(v).lower() for k, v in expected_e5.items()):
+                raise ValueError('paper_p8_e5_profile_rejected')
         if fixture.paper_p7 and fixture.paper_p7_mode in ('telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two'):
             microbatch_expected = 'false' if fixture.paper_p7_mode == 'single_path' else 'true'
             if any(str(env.get(key)).lower() != value for key, value in {
@@ -1097,7 +1348,89 @@ def verify_runtime_receipt(obj, expectation):
 
 def requires_gateway_image(fixture):
     return bool(fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2 or
+                getattr(fixture, 'paper_p8_load', False) or
                 (fixture.paper_p7 and fixture.paper_p7_mode in ('telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two')))
+
+
+def _load_e5_reference(path, fixture):
+    path = Path(path)
+    try:
+        st = path.lstat()
+        if path.is_symlink() or not path.is_file() or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_size > 2_000_000:
+            raise ValueError('e5_reference_file_rejected')
+        report = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError('e5_reference_artifact_invalid') from None
+    if (not isinstance(report, dict) or report.get('status') != 'PASS' or report.get('arm') != 'optimized'
+            or report.get('cleanup_verified') is not True or report.get('full_p8_accepted') is not False
+            or not paper_p8_e5_acceptance(report, {'arm': 'optimized'}, True)):
+        raise ValueError('e5_reference_artifact_rejected')
+    current = paper_p8_support()._source_fingerprint(ROOT)
+    old = report.get('source_fingerprint')
+    if (not isinstance(old, dict) or not old.get('revision') or not old.get('dirty_source_sha256')
+            or old.get('revision') != current.get('revision')
+            or old.get('dirty_source_sha256') != current.get('dirty_source_sha256')):
+        raise ValueError('e5_reference_source_mismatch')
+    context_path = Path(fixture.paper_p8_e5_context)
+    context_stat = context_path.lstat()
+    if context_path.is_symlink() or not context_path.is_file() or context_stat.st_uid != os.getuid() or context_stat.st_mode & 0o077 or context_stat.st_size > 16384:
+        raise ValueError('e5_dataset_context_not_private')
+    reference_context = report.get('context') or report.get('dataset_context')
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    dataset_path = Path(context.get('dataset_path', ''))
+    dataset_stat = dataset_path.lstat()
+    dataset_raw = dataset_path.read_bytes()
+    if dataset_path.is_symlink() or dataset_stat.st_uid != os.getuid() or dataset_stat.st_mode & 0o077 or len(dataset_raw) > 2_000_000 or hashlib.sha256(dataset_raw).hexdigest() != context.get('sha256'):
+        raise ValueError('e5_reference_context_mismatch')
+    metadata = report.get('metadata') if isinstance(report.get('metadata'), dict) else {}
+    workload = metadata.get('workload') if isinstance(metadata.get('workload'), dict) else {}
+    if reference_context:
+        matches = all(reference_context.get(k) == context.get(k) for k in ('sha256', 'seed', 'anchor'))
+    else:
+        matches = (workload.get('journal_sha256') == context.get('sha256')
+            and metadata.get('seed') == context.get('seed')
+            and (workload.get('telemetry') or {}).get('dataset_anchor') == context.get('anchor'))
+    if not matches:
+        raise ValueError('e5_reference_context_mismatch')
+    ids = report.get('image_ids') or (report.get('metadata') or {}).get('image_ids')
+    if not isinstance(ids, dict) or any(not isinstance(ids.get(k), str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', ids[k]) for k in ('backend', 'gateway')):
+        raise ValueError('e5_reference_images_invalid')
+    return {'image_ids': ids, 'report': report}
+
+
+def _reuse_e5_image(registry, image_ids, role, tag, create_tag=True):
+    expected = image_ids.get(role)
+    if not isinstance(expected, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', expected):
+        raise ValueError('e5_reference_images_invalid')
+    inspected = registry.command(['image', 'inspect', expected])
+    if inspected.returncode:
+        raise ValueError('e5_reference_image_unavailable')
+    try:
+        actual = json.loads(inspected.stdout)[0].get('Id')
+    except (ValueError, IndexError, TypeError, AttributeError):
+        raise ValueError('e5_reference_image_unavailable') from None
+    if actual != expected:
+        raise ValueError('e5_reference_image_mismatch')
+    if create_tag:
+        existing = registry.command(['image', 'inspect', tag])
+        if existing.returncode == 0:
+            try:
+                existing_id = json.loads(existing.stdout)[0].get('Id')
+            except (ValueError, IndexError, TypeError, AttributeError):
+                raise ValueError('e5_reference_target_tag_collision') from None
+            if existing_id != expected:
+                raise ValueError('e5_reference_target_tag_collision')
+        else:
+            tagged = registry.command(['image', 'tag', expected, tag])
+            if tagged.returncode:
+                raise ValueError('e5_reference_tag_failed')
+            verify = registry.command(['image', 'inspect', tag])
+            try:
+                if verify.returncode or json.loads(verify.stdout)[0].get('Id') != expected:
+                    raise ValueError('e5_reference_tag_failed')
+            except (ValueError, IndexError, TypeError, AttributeError):
+                raise ValueError('e5_reference_tag_failed') from None
+    return expected
 
 
 def startup_only(fixture, registry=None, positive_http=False, role_http=False, full_http=False):
@@ -1120,26 +1453,51 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             if result.returncode:
                 raise ValueError('local_image_unavailable')
             images[name] = json.loads(result.stdout)[0]['Id']
-        phase = 'build'
-        build_native_image(fixture, prevalidated=True)
-        result = registry.command(['image', 'inspect', fixture.project + '-backend'])
-        if result.returncode:
-            raise ValueError('backend_build_image_unresolved')
-        images['backend'] = json.loads(result.stdout)[0]['Id']
-        if requires_gateway_image(fixture):
-            # Same Dockerfile builder, but the real Gateway target, not a host binary.
-            fd = os.open(fixture.private / 'gateway-build-output.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'wb') as stream:
-                result = subprocess.run(['docker', 'build', '--target', 'gateway', '-t',
-                    fixture.project + '-gateway', '-f', str(ROOT / 'src/Dockerfile'), str(ROOT / 'src')],
-                    stdout=stream, stderr=subprocess.STDOUT, timeout=BUDGETS['build'],
-                    env=process_env(fixture), check=False)
-            if result.returncode:
-                raise ValueError('native_dockerfile_build_blocked')
-            result = registry.command(['image', 'inspect', fixture.project + '-gateway'])
+        reuse = bool(getattr(fixture, 'paper_p8_e5_reference', None))
+        if getattr(fixture, 'paper_p8_e5', None) not in (None, 'optimized') and not reuse:
+            raise ValueError('e5_reference_required')
+        if reuse:
+            reference = _load_e5_reference(fixture.paper_p8_e5_reference, fixture)
+            for name, image_id in images.items():
+                if reference['image_ids'].get(name) != image_id:
+                    raise ValueError('e5_reference_image_mismatch')
+            phase = 'build'
+            _reuse_e5_image(registry, reference['image_ids'], 'backend', fixture.project + '-backend')
+            images['backend'] = reference['image_ids']['backend']
+        else:
+            phase = 'build'
+            build_native_image(fixture, prevalidated=True)
+            result = registry.command(['image', 'inspect', fixture.project + '-backend'])
             if result.returncode:
                 raise ValueError('backend_build_image_unresolved')
-            images['gateway'] = json.loads(result.stdout)[0]['Id']
+            images['backend'] = json.loads(result.stdout)[0]['Id']
+        if requires_gateway_image(fixture):
+            # Same Dockerfile builder, but the real Gateway target, not a host binary.
+            if reuse:
+                _reuse_e5_image(registry, reference['image_ids'], 'gateway', fixture.project + '-gateway', create_tag=False)
+                images['gateway'] = reference['image_ids']['gateway']
+            else:
+                fd = os.open(fixture.private / 'gateway-build-output.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'wb') as stream:
+                    result = subprocess.run(['docker', 'build', '--target', 'gateway', '-t',
+                        fixture.project + '-gateway', '-f', str(ROOT / 'src/Dockerfile'), str(ROOT / 'src')],
+                        stdout=stream, stderr=subprocess.STDOUT, timeout=BUDGETS['build'],
+                        env=process_env(fixture), check=False)
+                if result.returncode:
+                    raise ValueError('native_dockerfile_build_blocked')
+                result = registry.command(['image', 'inspect', fixture.project + '-gateway'])
+                if result.returncode:
+                    raise ValueError('backend_build_image_unresolved')
+                images['gateway'] = json.loads(result.stdout)[0]['Id']
+        paperload_binary = None
+        if getattr(fixture, 'paper_p8_load', False):
+            go_binary = shutil.which('go')
+            if not go_binary:
+                raise ValueError('paperload_build_failed')
+            (fixture.private / 'bin').mkdir(mode=0o700)
+            paperload_binary = build_paperload(fixture, go_binary)
+            if getattr(fixture, 'paper_p8_e3', None) or getattr(fixture, 'paper_p8_e4', None) or getattr(fixture, 'paper_p8_e5', None):
+                gateway_binary = build_paper_p8_e3_gateway(fixture, go_binary)
 
         with lifecycle.cancellation_scope() as state:
             try:
@@ -1281,6 +1639,45 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     phase = 'paper_p7'
                     evidence['paper_p7'] = dispatch_paper_fixture(fixture, paper_p7_support(),
                         sys.modules[__name__], fixture, registry, endpoint, containers, images, state)
+                elif fixture.paper_p8_sessions:
+                    phase = 'paper_p8_sessions'
+                    evidence['paper_p8_sessions'] = paper_p8_support().run(
+                        sys.modules[__name__], fixture, endpoint, registry, containers, images, state)
+                elif fixture.paper_p8_slow:
+                    phase = 'paper_p8_slow_viewer'
+                    evidence['paper_p8_slow'] = paper_p8_slow_support().run(
+                        sys.modules[__name__], fixture, endpoint, registry, containers, images, state)
+                elif getattr(fixture, 'paper_p8_load', False):
+                    if getattr(fixture, 'paper_p8_e5', None):
+                        phase = 'paper_p8_e5_' + fixture.paper_p8_e5
+                        evidence['paper_p8_e5'] = dispatch_paper_p8_load(
+                            fixture, sys.modules[__name__], endpoint, registry, containers, images, state,
+                            paperload_binary, gateway_binary)
+                    elif getattr(fixture, 'paper_p8_e4', None):
+                        phase = 'paper_p8_e4_' + fixture.paper_p8_e4
+                        evidence['paper_p8_e4'] = dispatch_paper_p8_load(
+                            fixture, sys.modules[__name__], endpoint, registry, containers, images,
+                            state, paperload_binary, gateway_binary)
+                    elif getattr(fixture, 'paper_p8_e3', None):
+                        phase = 'paper_p8_e3_' + fixture.paper_p8_e3
+                        evidence['paper_p8_e3'] = dispatch_paper_p8_load(
+                            fixture, sys.modules[__name__], endpoint, registry, containers, images,
+                            state, paperload_binary, gateway_binary)
+                    elif getattr(fixture, 'paper_p8_e1', False):
+                        phase = 'paper_p8_e1'
+                        evidence['paper_p8_e1'] = dispatch_paper_p8_load(
+                            fixture, sys.modules[__name__], endpoint, registry, containers, images,
+                            state, paperload_binary)
+                    elif getattr(fixture, 'paper_p8_e2', False):
+                        phase = 'paper_p8_e2_pilot'
+                        evidence['paper_p8_e2'] = dispatch_paper_p8_load(
+                            fixture, sys.modules[__name__], endpoint, registry, containers, images,
+                            state, paperload_binary)
+                    else:
+                        phase = 'paper_p8_e2_telemetry100'
+                        evidence['paper_p8_load'] = dispatch_paper_p8_load(
+                            fixture, sys.modules[__name__], endpoint, registry, containers, images,
+                            state, paperload_binary)
                 elif fixture.paper_p2:
                     phase = 'paper_p2'
                     evidence['paper_p2'] = dispatch_paper_fixture(fixture, paper_p2_support(),
@@ -1412,17 +1809,118 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
         result.update(status='FAIL' if failure or not cleanup_verified else 'PASS',
                       cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts)
         durable_json(path, result)
-    if fixture.paper_p1 or fixture.paper_p2 or fixture.paper_p3 or fixture.paper_p4 or fixture.paper_p5a or fixture.paper_p6:
+    if fixture.paper_p1 or fixture.paper_p2 or fixture.paper_p3 or fixture.paper_p4 or fixture.paper_p5a or fixture.paper_p6 or fixture.paper_p8_sessions or fixture.paper_p8_slow or getattr(fixture, 'paper_p8_load', False):
         path = fixture.artifacts / 'run.json'
         run = json.loads(path.read_text()) if path.exists() else {
             'schema_version': 1, 'run_id': fixture.project,
             'mode': (fixture.paper_p5a_mode if fixture.paper_p5a else
                      fixture.paper_p4_mode if fixture.paper_p4 else fixture.paper_p1)}
+        e1_cleanup_accepted = (paper_p8_e1_cleanup_acceptance(
+            fixture, evidence.get('paper_p8_e1', {}), cleanup_counts, cleanup_verified, registry)
+            if getattr(fixture, 'paper_p8_e1', False) else None)
+        e2_cleanup_accepted = (paper_p8_e2_cleanup_acceptance(
+            fixture, evidence.get('paper_p8_e2', {}), cleanup_counts, cleanup_verified, registry)
+            if getattr(fixture, 'paper_p8_e2', False) else None)
+        e3_cleanup_accepted = (paper_p8_e3_cleanup_acceptance(
+            fixture, evidence.get('paper_p8_e3', {}), cleanup_counts, cleanup_verified, registry)
+            if getattr(fixture, 'paper_p8_e3', None) else None)
+        e4_cleanup_accepted = (paper_p8_e4_cleanup_acceptance(
+            fixture, evidence.get('paper_p8_e4', {}), cleanup_counts, cleanup_verified, registry)
+            if getattr(fixture, 'paper_p8_e4', None) else None)
         run.update(status=('WORKLOAD_COMPLETE_PENDING_CLEANUP' if fixture.paper_p7_mode == 'p6_ws'
                            and not failure and cleanup_verified else
-                           'FAIL' if failure or not cleanup_verified else 'PASS'),
+                           'FAIL' if failure or not cleanup_verified or e1_cleanup_accepted is False
+                             or e2_cleanup_accepted is False or e3_cleanup_accepted is False
+                             or e4_cleanup_accepted is False else 'PASS'),
                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                    error=sanitize_failure_code(failure) if failure else None)
+        if fixture.paper_p8_sessions:
+            p8_path = fixture.artifacts / 'p8-sessions.json'
+            p8 = json.loads(p8_path.read_text()) if p8_path.exists() else {}
+            p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                      status='PASS' if not failure and cleanup_verified and p8.get('status') == 'PASS' else 'FAIL')
+            run['p8_sessions'] = p8
+            durable_json(fixture.artifacts / 'p8-sessions.json', p8)
+        if fixture.paper_p8_slow:
+            p8_path = fixture.artifacts / 'p8-slow-viewer.json'
+            p8 = json.loads(p8_path.read_text()) if p8_path.exists() else {}
+            p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                      status='PASS' if not failure and cleanup_verified and p8.get('status') == 'PASS' else 'FAIL')
+            run['p8_slow_viewer'] = p8
+            durable_json(p8_path, p8)
+        if getattr(fixture, 'paper_p8_load', False):
+            p8_path = fixture.artifacts / ('p8-recovery.json' if getattr(fixture, 'paper_p8_recovery', False) else
+                                            f'p8-e5-{fixture.paper_p8_e5}.json' if getattr(fixture, 'paper_p8_e5', None)
+                                            else paper_p8_e4_artifact_name(fixture) if getattr(fixture, 'paper_p8_e4', None)
+                                            else paper_p8_e3_artifact_name(fixture) if getattr(fixture, 'paper_p8_e3', None)
+                                           else 'p8-e1-pilot.json' if getattr(fixture, 'paper_p8_e1', False)
+                                           else 'p8-e2-pilot.json' if getattr(fixture, 'paper_p8_e2', False)
+                                           else 'p8-e2-smoke.json')
+            staged_recovery = fixture.private / 'p8-recovery-result.json'
+            staged_e5 = fixture.private / 'p8-e5-result.json'
+            p8 = (json.loads(staged_recovery.read_text()) if getattr(fixture, 'paper_p8_recovery', False) and staged_recovery.exists()
+                  else json.loads(staged_e5.read_text()) if getattr(fixture, 'paper_p8_e5', None) and staged_e5.exists()
+                  else json.loads(p8_path.read_text()) if p8_path.exists() else {})
+            if getattr(fixture, 'paper_p8_recovery', False):
+                p8['workload_status'] = p8.get('status')
+                p8['full_p8_accepted'] = False
+                p8['exact_cleanup_verified'] = cleanup_verified
+                p8['cleanup_counts'] = cleanup_counts
+                phase_pass = bool(p8.get('phases')) and all(
+                    isinstance(row, dict) and row.get('status') == 'PASS'
+                    for row in p8['phases'].values()) and p8.get('all_children_stopped') is True
+                p8.update(cleanup_verified=cleanup_verified,
+                    status='PASS' if not failure and cleanup_verified and phase_pass and
+                    p8.get('workload_status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP' else 'FAIL')
+                durable_json(p8_path, p8)
+                run['p8_recovery'] = p8
+            elif getattr(fixture, 'paper_p8_e5', None):
+                p8['workload_status'] = p8.get('status')
+                p8['lane_marker'] = 'PAPER_P8_E5_ARM_PILOT'
+                p8['full_p8_accepted'] = False
+                p8['exact_cleanup_verified'] = cleanup_verified
+                p8['cleanup_counts'] = cleanup_counts
+            elif getattr(fixture, 'paper_p8_e4', None):
+                p8['workload_status'] = p8.get('status')
+                p8['full_p8_accepted'] = False
+                p8['exact_cleanup_verified'] = cleanup_verified
+                p8['cleanup_counts'] = cleanup_counts
+            elif getattr(fixture, 'paper_p8_e3', None):
+                p8['workload_status'] = p8.get('status')
+                p8['full_p8_accepted'] = False
+                p8['lane_marker'] = 'PAPER_P8_E3_PILOT'
+            elif fixture.paper_p8_e1:
+                p8['workload_status'] = p8.get('status')
+                p8['full_p8_accepted'] = False
+            elif getattr(fixture, 'paper_p8_e2', False):
+                p8['workload_status'] = p8.get('status')
+                p8['full_p8_accepted'] = False
+            if not getattr(fixture, 'paper_p8_recovery', False):
+                p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                      status='PASS' if (not failure and cleanup_verified and
+                            (paper_p8_e5_acceptance(p8, evidence.get('paper_p8_e5', {}), cleanup_verified) if getattr(fixture, 'paper_p8_e5', None) else
+                            paper_p8_e4_cleanup_acceptance(fixture, evidence.get('paper_p8_e4', {}),
+                               cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e4', None) else
+                            paper_p8_e3_cleanup_acceptance(fixture, evidence.get('paper_p8_e3', {}),
+                              cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e3', None) else
+                            paper_p8_e1_cleanup_acceptance(fixture, evidence.get('paper_p8_e1', {}),
+                             cleanup_counts, cleanup_verified, registry) if fixture.paper_p8_e1 else
+                           paper_p8_e2_cleanup_acceptance(fixture, evidence.get('paper_p8_e2', {}),
+                             cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e2', False)
+                             else p8.get('status') == 'PASS')) else 'FAIL')
+                durable_json(p8_path, p8)
+            if getattr(fixture, 'paper_p8_recovery', False):
+                run['p8_recovery'] = p8
+            elif getattr(fixture, 'paper_p8_e5', None):
+                run['p8_e5'] = p8
+            elif getattr(fixture, 'paper_p8_e4', None):
+                run['p8_e4'] = p8
+            elif getattr(fixture, 'paper_p8_e3', None):
+                run['p8_e3'] = p8
+            elif fixture.paper_p8_e1:
+                run['p8_e1'] = p8
+            elif getattr(fixture, 'paper_p8_e2', False):
+                run['p8_e2'] = p8
         if fixture.paper_p4:
             run.update(effective_optimizations=(['mqtt_shaper']
                        if fixture.values['MQTT_SHAPER_ENABLED'] == 'true' else []))
@@ -1641,6 +2139,139 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                           'leak_check': p7_handshake['leak_check'],
                           'perimeter_isolation': p7_handshake.get('perimeter_isolation', {}),
                       }}
+        elif fixture.paper_p8_sessions:
+            p8 = json.loads((fixture.artifacts / 'p8-sessions.json').read_text())
+            report = {'schema_version': 1,
+                      'status': 'PAPER_P8_3A2_SESSION_LANE_PASS'
+                      if p8.get('status') == 'PASS' and p8.get('cleanup_verified') is True else 'FAIL',
+                      'project': fixture.project, 'native_executed': True,
+                      'p8_3a2_lane_pass': p8.get('status') == 'PASS',
+                      'exact_cleanup_verified': cleanup_verified,
+                      'cleanup_counts': cleanup_counts, 'artifact': 'p8-sessions.json'}
+            if report['status'] == 'FAIL':
+                raise ValueError('paper_p8_lane_acceptance_incomplete')
+        elif fixture.paper_p8_slow:
+            p8 = json.loads((fixture.artifacts / 'p8-slow-viewer.json').read_text())
+            report = {'schema_version': 1,
+                      'status': 'PAPER_P8_3A3_SLOW_VIEWER_PROBE' if p8.get('status') == 'PASS' else 'FAIL',
+                      'project': fixture.project, 'native_executed': True,
+                      'p8_3a3_probe_pass': p8.get('status') == 'PASS',
+                      'full_p8_accepted': False, 'exact_cleanup_verified': cleanup_verified,
+                      'cleanup_counts': cleanup_counts, 'artifact': 'p8-slow-viewer.json'}
+            if report['status'] == 'FAIL':
+                raise ValueError('paper_p8_slow_viewer_probe_incomplete')
+        elif getattr(fixture, 'paper_p8_load', False):
+            if getattr(fixture, 'paper_p8_recovery', False):
+                name = 'p8-recovery.json'
+                p8 = json.loads((fixture.artifacts / name).read_text())
+                accepted = (p8.get('status') == 'PASS' and p8.get('lane_marker') == 'PAPER_P8_RECOVERY_PILOT'
+                    and p8.get('full_p8_accepted') is False and p8.get('cleanup_verified') is True
+                    and cleanup_verified is True)
+                report = {'schema_version': 1,
+                    'status': 'PAPER_P8_RECOVERY_PILOT' if accepted else 'FAIL',
+                    'lane': 'PAPER_P8_RECOVERY_PILOT', 'project': fixture.project,
+                    'native_executed': True, 'recovery_pilot_pass': accepted,
+                    'full_p8_accepted': False, 'exact_cleanup_verified': cleanup_verified,
+                    'cleanup_counts': cleanup_counts, 'artifact': name}
+                if not accepted:
+                    raise ValueError('paper_p8_recovery_incomplete')
+            elif getattr(fixture, 'paper_p8_e5', None):
+                name = f'p8-e5-{fixture.paper_p8_e5}.json'
+                p8 = json.loads((fixture.artifacts / name).read_text())
+                accepted = (p8.get('status') == 'PASS' and p8.get('lane_marker') == 'PAPER_P8_E5_ARM_PILOT'
+                            and p8.get('full_p8_accepted') is False and p8.get('cleanup_verified') is True
+                            and cleanup_verified is True and paper_p8_e5_acceptance(p8, evidence.get('paper_p8_e5', {}), cleanup_verified))
+                report = {'schema_version': 1, 'status': 'PAPER_P8_E5_ARM_PILOT' if accepted else 'FAIL',
+                          'lane': 'PAPER_P8_E5_ARM_PILOT', 'arm': fixture.paper_p8_e5,
+                          'project': fixture.project, 'native_executed': True, 'p8_e5_arm_pilot_pass': accepted,
+                          'full_p8_accepted': False, 'exact_cleanup_verified': cleanup_verified,
+                          'cleanup_counts': cleanup_counts, 'artifact': name}
+                if not accepted:
+                    raise ValueError('paper_p8_e5_arm_pilot_incomplete')
+            elif getattr(fixture, 'paper_p8_e4', None):
+                name = paper_p8_e4_artifact_name(fixture)
+                p8 = json.loads((fixture.artifacts / name).read_text())
+                cold_status = p8.get('coldrestart')
+                cold_ok = cold_status == ('PASS' if fixture.paper_p8_e4_cache_mode == 'on' else 'NOT APPLICABLE')
+                accepted = (p8.get('status') == 'PASS'
+                            and p8.get('workload_status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+                            and p8.get('lane_marker') == 'PAPER_P8_E4_PILOT_COMPLETE'
+                            and p8.get('full_p8_accepted') is False and cold_ok
+                            and isinstance(p8.get('new_ws_event_proof'), dict)
+                            and p8['new_ws_event_proof'].get('status') == 'PASS'
+                            and isinstance(p8.get('conflicts'), dict) and p8['conflicts'].get('status') == 'PASS'
+                            and isinstance(p8.get('durable_gateway_reopen'), dict)
+                            and p8['durable_gateway_reopen'].get('status') == 'PASS'
+                            and p8.get('cleanup_verified') is True and cleanup_verified is True
+                            and paper_p8_e4_cleanup_acceptance(fixture, evidence.get('paper_p8_e4', {}),
+                                                               cleanup_counts, cleanup_verified, registry))
+                report = {'schema_version': 1,
+                          'status': 'PAPER_P8_E4_PILOT' if accepted else 'FAIL',
+                          'lane': 'PAPER_P8_E4_PILOT', 'cache_mode': fixture.paper_p8_e4,
+                          'project': fixture.project, 'native_executed': True,
+                          'p8_e4_pilot_pass': accepted, 'full_p8_accepted': False,
+                          'coldrestart': p8.get('coldrestart'),
+                          'conflicts': (p8['conflicts'].get('status') if isinstance(p8.get('conflicts'), dict)
+                                        else p8.get('conflicts')),
+                          'durable_gateway_reopen': (p8['durable_gateway_reopen'].get('status')
+                              if isinstance(p8.get('durable_gateway_reopen'), dict)
+                              else p8.get('durable_gateway_reopen')),
+                          'new_ws_event_proof': (p8['new_ws_event_proof'].get('status')
+                              if isinstance(p8.get('new_ws_event_proof'), dict)
+                              else p8.get('new_ws_event_proof')),
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'artifact': name}
+                if not accepted:
+                    raise ValueError('paper_p8_e4_warm_pilot_incomplete')
+            elif getattr(fixture, 'paper_p8_e3', None):
+                low_load = getattr(fixture, 'paper_p8_e3_workload', 'mixed') == 'low_load'
+                name = paper_p8_e3_artifact_name(fixture)
+                p8 = json.loads((fixture.artifacts / name).read_text())
+                accepted = (p8.get('status') == 'PASS' and p8.get('full_p8_accepted') is False
+                            and p8.get('cleanup_verified') is True and cleanup_verified is True
+                            and paper_p8_e3_cleanup_acceptance(fixture, evidence.get('paper_p8_e3', {}),
+                                                               cleanup_counts, cleanup_verified, registry))
+                report = {'schema_version': 1,
+                          'status': 'PAPER_P8_E3_PILOT' if accepted else 'FAIL',
+                          'lane': 'PAPER_P8_E3_PILOT', 'arm': fixture.paper_p8_e3,
+                          'workload': getattr(fixture, 'paper_p8_e3_workload', 'mixed'),
+                          'project': fixture.project, 'native_executed': True,
+                          'p8_e3_pilot_pass': accepted, 'full_p8_accepted': False,
+                          'representative_probes_pending': p8.get('representative_probes_pending'),
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'artifact': name}
+                if not accepted:
+                    raise ValueError('paper_p8_e3_pilot_incomplete')
+            elif getattr(fixture, 'paper_p8_e1', False):
+                p8 = json.loads((fixture.artifacts / 'p8-e1-pilot.json').read_text())
+                accepted = paper_p8_e1_report_acceptance(p8, cleanup_verified, e1_cleanup_accepted)
+                report = {'schema_version': 1, 'status': 'PAPER_P8_E1_PILOT' if accepted else 'FAIL',
+                          'project': fixture.project, 'native_executed': True,
+                          'p8_e1_pilot_pass': accepted, 'full_p8_accepted': False,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'artifact': 'p8-e1-pilot.json'}
+                if not accepted:
+                    raise ValueError('paper_p8_e1_pilot_incomplete')
+            elif getattr(fixture, 'paper_p8_e2', False):
+                p8 = json.loads((fixture.artifacts / 'p8-e2-pilot.json').read_text())
+                accepted = paper_p8_e2_report_acceptance(p8, cleanup_verified)
+                report = {'schema_version': 1, 'status': 'PAPER_P8_E2_PILOT' if accepted else 'FAIL',
+                          'project': fixture.project, 'native_executed': True,
+                          'p8_e2_pilot_pass': accepted, 'full_p8_accepted': False,
+                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                          'artifact': 'p8-e2-pilot.json'}
+                if not accepted:
+                    raise ValueError('paper_p8_e2_pilot_incomplete')
+            else:
+                p8 = json.loads((fixture.artifacts / 'p8-e2-smoke.json').read_text())
+                report = {'schema_version': 1,
+                          'status': 'PAPER_P8_4F_E2_TELEMETRY100_SMOKE' if p8.get('status') == 'PASS' else 'FAIL',
+                          'project': fixture.project, 'native_executed': True,
+                          'p8_4f_e2_telemetry100_smoke_pass': p8.get('status') == 'PASS',
+                          'full_p8_accepted': False, 'exact_cleanup_verified': cleanup_verified,
+                          'cleanup_counts': cleanup_counts, 'artifact': 'p8-e2-smoke.json'}
+                if report['status'] == 'FAIL':
+                    raise ValueError('paper_p8_e2_smoke_incomplete')
         elif fixture.paper_p2:
             if cleanup_counts != {'container': 19, 'network': 1, 'volume': 7} or not evidence['paper_p2'].get('full_p2_accepted'):
                 raise ValueError('cleanup_acceptance_incomplete')
@@ -3275,7 +3906,7 @@ def paper_p0_temporal_query(first, last):
                                   'timeAt': utc_z(start), 'endTimeAt': utc_z(end)})
 
 
-def prepare_paper_workload(fixture, registry, endpoint, containers, images, state):
+def prepare_paper_workload(fixture, registry, endpoint, containers, images, state, gateway_ids=None):
     # Reuse the Stage 3 synthetic profile and independent SQL oracle on THIS DB.
     # No other runner/main is invoked and no sentinel desired/config is seeded.
     from stage3_uplink_runner import default_specs
@@ -3307,10 +3938,18 @@ def prepare_paper_workload(fixture, registry, endpoint, containers, images, stat
         users[role] = create_user_via_admin_api(endpoint, fixture.values['SERVICE_ROLE_KEY'], email, password)
         tokens[role] = login_user_for_token(endpoint, fixture.values['ANON_KEY'], email, password)
     db_psql(registry, pg, "INSERT INTO platform_admins(user_id) VALUES (:'uid');", {'uid': users['admin']})
-    specs = [replace(s, gateway_id='gw_p0_' + role + '_' + secrets.token_hex(4),
+    if gateway_ids is not None:
+        if (not isinstance(gateway_ids, (list, tuple)) or len(gateway_ids) != 2 or
+                any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', value)
+                    for value in gateway_ids) or len(set(gateway_ids)) != 2):
+            raise ValueError('paper_workload_gateway_ids_invalid')
+        selected_gateway_ids = tuple(gateway_ids)
+    else:
+        selected_gateway_ids = tuple('gw_p0_' + role + '_' + secrets.token_hex(4) for role in ('a', 'b'))
+    specs = [replace(s, gateway_id=gateway_id,
                      gateway_reported={}, gateway_desired={}, gateway_reported_version=0,
                      gateway_desired_version=0, sensor_desired={}, sensor_desired_version=0)
-             for role, s in zip(('a', 'b'), default_specs())]
+             for gateway_id, s in zip(selected_gateway_ids, default_specs())]
     passwords = []
     for role, spec in zip(('a', 'b'), specs):
         state.checkpoint()
@@ -3499,6 +4138,207 @@ def paper_p5a_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_veri
         evidence['p5b_cache_functional_accepted'] = accepted
         evidence['exact_cleanup_verified'] = cleanup_verified is True
     return accepted
+
+
+def paper_p8_e1_validation_valid(evidence):
+    result = evidence.get('validation')
+    return (isinstance(result, dict) and result.get('valid') is True
+            and isinstance(result.get('failures'), list) and not result['failures'])
+
+
+def paper_p8_e1_report_acceptance(evidence, cleanup_verified, owned_cleanup_accepted):
+    return (evidence.get('status') == 'PASS' and paper_p8_e1_validation_valid(evidence)
+            and evidence.get('full_p8_accepted') is False and cleanup_verified is True
+            and owned_cleanup_accepted is True)
+
+
+def paper_p8_e1_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    """E1 is a workload pilot only; require helper validation and exact owned cleanup."""
+    workload = evidence.get('workload')
+    return (evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+            and paper_p8_e1_validation_valid(evidence)
+            and evidence.get('sockets') == 64 and isinstance(workload, dict)
+            and isinstance(workload.get('telemetry'), dict)
+            and workload['telemetry'].get('generated_unique') == 20
+            and evidence.get('full_p8_accepted') is not True and cleanup_verified is True
+            and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                            cleanup_counts, cleanup_verified, registry))
+
+
+def paper_p8_e2_profiles_valid(evidence):
+    profiles = evidence.get('profiles') if isinstance(evidence, dict) else None
+    if not isinstance(profiles, list) or len(profiles) != 2:
+        return False
+    found = set()
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            return False
+        samples = profile.get('samples_per_message')
+        validation = profile.get('validation')
+        workloads = profile.get('workloads')
+        if (samples not in (100, 1) or samples in found or profile.get('status') != 'PASS'
+                or not isinstance(validation, dict) or validation.get('valid') is not True
+                or validation.get('failures') != [] or not isinstance(workloads, dict)):
+            return False
+        found.add(samples)
+        for arm, expected in (('A', 8), ('B', 16)):
+            workload = workloads.get(arm)
+            telemetry = workload.get('telemetry') if isinstance(workload, dict) else None
+            if (not isinstance(telemetry, dict) or telemetry.get('generated_unique') != expected
+                    or telemetry.get('application_acks') != expected or telemetry.get('pending_messages') != 0):
+                return False
+    return found == {100, 1}
+
+
+def paper_p8_e2_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    return (isinstance(evidence, dict) and evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+            and evidence.get('full_p8_accepted') is False and paper_p8_e2_profiles_valid(evidence)
+            and cleanup_verified is True
+            and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                            cleanup_counts, cleanup_verified, registry))
+
+
+def paper_p8_e2_report_acceptance(evidence, cleanup_verified):
+    return (isinstance(evidence, dict) and evidence.get('status') == 'PASS'
+            and evidence.get('workload_status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+            and evidence.get('full_p8_accepted') is False
+            and paper_p8_e2_profiles_valid(evidence) and evidence.get('cleanup_verified') is True
+            and cleanup_verified is True)
+
+
+def paper_p8_e4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    validation = evidence.get('validation') if isinstance(evidence, dict) else None
+    delta = evidence.get('database_delta') if isinstance(evidence, dict) else None
+    raw = evidence.get('raw_verification') if isinstance(evidence, dict) else None
+    unique = (evidence.get('workloads') or {}).get('unique', {}) if isinstance(evidence, dict) else {}
+    replay = (evidence.get('workloads') or {}).get('replay', {}) if isinstance(evidence, dict) else {}
+    ut, rt = unique.get('telemetry', {}), replay.get('telemetry', {})
+    cold_status = evidence.get('coldrestart') if isinstance(evidence, dict) else None
+    expected_cold = 'PASS' if getattr(fixture, 'paper_p8_e4_cache_mode', None) == 'on' else 'NOT APPLICABLE'
+    return (isinstance(evidence, dict) and evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+            and evidence.get('lane_marker') == 'PAPER_P8_E4_PILOT_COMPLETE'
+            and cold_status == expected_cold
+            and evidence.get('full_p8_accepted') is False
+            and isinstance(evidence.get('new_ws_event_proof'), dict)
+            and evidence['new_ws_event_proof'].get('status') == 'PASS'
+            and isinstance(validation, dict) and validation.get('valid') is True and validation.get('failures') == []
+            and evidence.get('runner_stopped') is True
+            and isinstance(evidence.get('conflicts'), dict) and evidence['conflicts'].get('status') == 'PASS'
+            and isinstance(evidence.get('durable_gateway_reopen'), dict)
+            and evidence['durable_gateway_reopen'].get('status') == 'PASS'
+            and isinstance(delta, dict) and delta.get('ledger') == 20 and delta.get('raw') == 2000
+            and delta.get('temporal') == 20
+            and isinstance(raw, list) and len(raw) == 2
+            and all(isinstance(row, dict) and row.get('verified_exact') is True for row in raw)
+            and ut.get('generated_unique') == 20 and ut.get('application_acks') == 20
+            and ut.get('ignored_valid_acks') == 1 and ut.get('pending_messages') == 0
+            and rt.get('replay_offered') == 10 and rt.get('replay_application_acks') == 10
+            and cleanup_verified is True
+            and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                            cleanup_counts, cleanup_verified, registry))
+
+
+def paper_p8_e4_artifact_name(fixture):
+    return f"p8-e4-{fixture.paper_p8_e4}.json"
+
+
+def paper_p8_e5_acceptance(report, evidence, cleanup_verified):
+    """Require complete E5 workload proof and registry-owned cleanup; never P8 acceptance."""
+    phases = report.get('phases') if isinstance(report, dict) else None
+    initial = phases.get('initial', {}) if isinstance(phases, dict) else {}
+    warm = phases.get('warm_replay', {}) if isinstance(phases, dict) else {}
+    delta = initial.get('database_delta', {})
+    commands = report.get('control_reconciliation', {}) if isinstance(report, dict) else {}
+    accounting = report.get('accounting', {}) if isinstance(report, dict) else {}
+    validation = report.get('validation', {}) if isinstance(report, dict) else {}
+    raw = report.get('raw_verification', []) if isinstance(report, dict) else []
+    viewer = report.get('viewer', {}) if isinstance(report, dict) else {}
+    metadata = report.get('metadata', {}) if isinstance(report, dict) else {}
+    return (isinstance(report, dict) and isinstance(evidence, dict)
+        and report.get('status') in ('WORKLOAD_COMPLETE_PENDING_CLEANUP', 'PASS')
+        and report.get('workload_status', report.get('status')) == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+        and report.get('arm') == evidence.get('arm')
+        and validation.get('valid') is True and validation.get('failures') == []
+        and report.get('full_p8_accepted') is False and cleanup_verified is True
+        and report.get('processes_stopped') is True and report.get('runner_stopped') is True
+        and not report.get('cleanup_errors')
+        and (initial.get('e4') or {}).get('journal_entry_count') == 20
+        and (warm.get('e4') or {}).get('journal_entry_count') == 10
+        and all(delta.get(k) == v for k, v in {'ledger': 20, 'raw': 2000, 'temporal': 20}.items())
+        and accounting.get('imported_input') == 20 and accounting.get('warm_replay') == 10
+        and len(raw) == 2 and all(row.get('verified_exact') is True for row in raw)
+        and viewer.get('ready_servers') == 2 and viewer.get('subscriptions') == 3
+        and isinstance(commands, dict) and commands.get('status') == 'PASS'
+        and commands.get('verified_receipts') == 4 and commands.get('verified_configurations') == 2
+        and accounting.get('command_receipts_verified') == 4
+        and accounting.get('command_configurations_verified') == 2
+        and isinstance(accounting.get('ingress_delta'), dict)
+        and isinstance(report.get('mechanism_metrics'), dict)
+        and metadata.get('workload') and metadata.get('effective_flags')
+        and report.get('lane_marker') == 'PAPER_P8_E5_ARM_PILOT')
+
+
+def paper_p8_e5_artifact_name(fixture):
+    return f'p8-e5-{fixture.paper_p8_e5}.json'
+
+
+def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    validation = evidence.get('validation') if isinstance(evidence, dict) else None
+    accounting = evidence.get('accounting') if isinstance(evidence, dict) else None
+    control = accounting.get('control') if isinstance(accounting, dict) else None
+    reconciliation = evidence.get('control_reconciliation') if isinstance(evidence, dict) else None
+    receipts = reconciliation.get('receipt_verification') if isinstance(reconciliation, dict) else None
+    configurations = reconciliation.get('rest_configuration') if isinstance(reconciliation, dict) else None
+    executors = reconciliation.get('sqlite_executors') if isinstance(reconciliation, dict) else None
+    raw = evidence.get('raw_verification') if isinstance(evidence, dict) else None
+    probes = evidence.get('representative_probes') if isinstance(evidence, dict) else None
+    probe_operations = probes.get('operations') if isinstance(probes, dict) else None
+    expected_probes = {
+        'offline_admission': 202,
+        'same_key_replay': 202,
+        'busy': 409,
+        'stale': 409,
+        'noop': 200,
+        'noop_replay': 200,
+    }
+    probes_valid = (
+        isinstance(probes, dict) and probes.get('valid') is True and probes.get('failures') == []
+        and isinstance(probe_operations, list) and len(probe_operations) == len(expected_probes)
+        and {row.get('kind') for row in probe_operations if isinstance(row, dict)} == set(expected_probes)
+        and all(isinstance(row, dict) and row.get('expected') == expected_probes.get(row.get('kind'))
+                and row.get('actual') == expected_probes.get(row.get('kind'))
+                and row.get('match') is True for row in probe_operations)
+        and probes.get('auxiliary_command_count') == 1
+        and probes.get('receipt_count') == 2
+        and probes.get('outside_fresh_command_measurement') is True
+    )
+    return (isinstance(evidence, dict)
+            and evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
+            and evidence.get('arm') == getattr(fixture, 'paper_p8_e3', None)
+            and evidence.get('workload', 'mixed') == getattr(fixture, 'paper_p8_e3_workload', 'mixed')
+            and evidence.get('full_p8_accepted') is False
+            and isinstance(validation, dict) and validation.get('valid') is True
+            and validation.get('failures') == []
+            and evidence.get('runner_stopped') is True
+            and isinstance(control, dict) and control.get('planned') == 4
+            and control.get('sent') == 4 and control.get('pending') == 0
+            and isinstance(receipts, dict) and receipts.get('verified') is True
+            and isinstance(receipts.get('verified_idempotency_keys'), list)
+            and len(receipts['verified_idempotency_keys']) == 4
+            and isinstance(configurations, dict) and len(configurations) == 2
+            and all(isinstance(value, dict) for value in configurations.values())
+            and isinstance(executors, list) and len(executors) == 2
+            and isinstance(raw, list) and len(raw) == 2
+            and all(isinstance(row, dict) and row.get('verified_exact') is True for row in raw)
+            and probes_valid
+            and cleanup_verified is True
+            and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                            cleanup_counts, cleanup_verified, registry))
+
+
+def paper_p8_e3_artifact_name(fixture):
+    low_load = getattr(fixture, 'paper_p8_e3_workload', 'mixed') == 'low_load'
+    return f"p8-e3-{fixture.paper_p8_e3}{'-low-load' if low_load else ''}.json"
 
 
 def paper_p7_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
@@ -4162,7 +5002,19 @@ def main():
     parser.add_argument('--paper-p2', action='store_true', help='P2 isolated HTTPS/Unix perimeter checks')
     parser.add_argument('--paper-p7', action='store_true', help='P7 isolated HTTPS/Auth topology; P7 probes only')
     parser.add_argument('--paper-p7-mode', choices=('handshake_only', 'telemetry_pilot', 'single_path', 'reconnect', 'lifecycle', 'slow_viewer', 'overhead_zero', 'overhead_two', 'p6_ws'),
-                        help='P7 lane; default handshake_only preserves historical behavior; single_path runs microbatch OFF; reconnect runs ReconnectCatchupClient')
+                         help='P7 lane; default handshake_only preserves historical behavior; single_path runs microbatch OFF; reconnect runs ReconnectCatchupClient')
+    parser.add_argument('--paper-p8-sessions', action='store_true', help='Run the bounded native 64-session WSS prerequisite lane')
+    parser.add_argument('--paper-p8-slow-viewer', action='store_true', help='Run the finite three-peer P8 slow-viewer lane')
+    parser.add_argument('--paper-p8-load', action='store_true', help='Run only the local E2 telemetry100 20-batch paperload smoke')
+    parser.add_argument('--paper-p8-e1', action='store_true', help='Run the bounded P8 E1 WebSocket + MQTT pilot workload')
+    parser.add_argument('--paper-p8-e2', action='store_true', help='Run the bounded P8 E2 shaper + microbatch telemetry pilot')
+    parser.add_argument('--paper-p8-e3', choices=('polling', 'wakeup'), help='Run the bounded P8 E3 fresh-command pilot arm')
+    parser.add_argument('--paper-p8-e3-low-load', action='store_true', help='Use the bounded low-load E3 profile; requires --paper-p8-e3')
+    parser.add_argument('--paper-p8-e4', choices=('on', 'off'), help='Run the bounded P8 E4 warm RAM-dedup pilot arm')
+    parser.add_argument('--paper-p8-e5', choices=('optimized', 'shaper_off', 'microbatch_off', 'ram_dedup_off', 'polling', 'fanout_scan'), help='Run one bounded E5 native mechanism arm')
+    parser.add_argument('--paper-p8-e5-context', type=Path, help='Private repeat context JSON required by E5')
+    parser.add_argument('--paper-p8-e5-reference', type=Path, help='Successful optimized E5 artifact required for immutable ablation image reuse')
+    parser.add_argument('--paper-p8-recovery', action='store_true', help='Run the bounded native P8.13 recovery fixture using a fresh E5 optimized input context')
     parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
     parser.add_argument('--p5a-control-regression', action='store_true',
                         help='With --paper-p3, opt in to microbatch and run the focused command/result preservation regression')
@@ -4188,6 +5040,25 @@ def main():
                         help='P6 dispatch arm; only valid with --paper-p6')
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
     args = parser.parse_args()
+    if args.paper_p8_e3_low_load and args.paper_p8_e3 is None:
+        parser.error('--paper-p8-e3-low-load requires --paper-p8-e3 polling|wakeup')
+    if (args.paper_p8_sessions or args.paper_p8_slow_viewer or args.paper_p8_load or args.paper_p8_e1 or args.paper_p8_e2 or args.paper_p8_e3 or args.paper_p8_e4 or args.paper_p8_e5 or args.paper_p8_recovery) and any((args.paper_p8_e3 is not None and args.paper_p8_e1, args.paper_p0, args.paper_p1, args.paper_p2_spike,
+            args.paper_p2, args.paper_p7, args.paper_p3, args.paper_p4, args.paper_p5a,
+            args.paper_p5b, args.paper_p6, args.startup_only, args.positive_http_only,
+            args.role_http_only, args.full_http, args.metrics_off)):
+        parser.error('P8 probe selectors are isolated opt-in fixture lanes')
+    if bool(args.paper_p8_e5) != bool(args.paper_p8_e5_context):
+        parser.error('--paper-p8-e5 requires --paper-p8-e5-context, and context requires E5')
+    if args.paper_p8_e5_reference and (not args.paper_p8_e5 or args.paper_p8_e5 == 'optimized'):
+        parser.error('--paper-p8-e5-reference is only valid for E5 ablation arms')
+    if args.paper_p8_e5 and args.paper_p8_e5 != 'optimized' and not args.paper_p8_e5_reference:
+        parser.error('E5 ablation requires --paper-p8-e5-reference')
+    if args.paper_p8_recovery and any((args.paper_p8_sessions, args.paper_p8_slow_viewer, args.paper_p8_load,
+            args.paper_p8_e1, args.paper_p8_e2, args.paper_p8_e3, args.paper_p8_e4, args.paper_p8_e5,
+            args.paper_p8_e5_context, args.paper_p8_e5_reference)):
+        parser.error('--paper-p8-recovery conflicts with other P8 experiment selectors')
+    if sum((args.paper_p8_sessions, args.paper_p8_slow_viewer, args.paper_p8_load, args.paper_p8_e1, args.paper_p8_e2, args.paper_p8_e3 is not None, args.paper_p8_e4 is not None, args.paper_p8_e5 is not None, args.paper_p8_recovery)) > 1:
+        parser.error('select only one P8 probe lane')
     if args.paper_p3 and any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2,
                               args.startup_only, args.positive_http_only, args.role_http_only,
                               args.full_http, args.paper_p4, args.paper_p5a, args.mode, args.dataset, args.metrics_off)):
@@ -4275,7 +5146,18 @@ def main():
                               paper_p5a_shutdown=args.paper_p5a_shutdown_smoke,
                               paper_p5b_cache_smoke=args.paper_p5b_cache_smoke,
                                 paper_p6=(('wake-up', '100') if args.paper_p7 and args.paper_p7_mode == 'p6_ws' else
-                                          (args.dispatch_mode, args.dataset) if args.paper_p6 else None))
+                                  (args.dispatch_mode, args.dataset) if args.paper_p6 else None),
+                             paper_p8_sessions=args.paper_p8_sessions,
+                             paper_p8_slow=args.paper_p8_slow_viewer,
+                             paper_p8_load=args.paper_p8_load,
+                               paper_p8_e1=args.paper_p8_e1,
+                               paper_p8_e2=args.paper_p8_e2,
+                                 paper_p8_e3=args.paper_p8_e3,
+                                 paper_p8_e3_workload='low_load' if args.paper_p8_e3_low_load else 'mixed',
+                                 paper_p8_e4=args.paper_p8_e4,
+                                  paper_p8_e5=args.paper_p8_e5, paper_p8_e5_context=args.paper_p8_e5_context,
+                             paper_p8_e5_reference=args.paper_p8_e5_reference,
+                                  paper_p8_recovery=args.paper_p8_recovery)
         if fixture.paper_p6:
             object.__setattr__(fixture, 'paper_p6_recovery_smoke', args.p6_recovery_smoke)
     except BaseException as exc:
@@ -4303,13 +5185,13 @@ def main():
 
     try:
         if (args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p7 or args.paper_p3
-                 or args.paper_p4 or args.paper_p5a or args.paper_p5b or args.paper_p6):
+                   or args.paper_p4 or args.paper_p5a or args.paper_p5b or args.paper_p6 or args.paper_p8_sessions or args.paper_p8_slow_viewer or args.paper_p8_load or args.paper_p8_e1 or args.paper_p8_e2 or args.paper_p8_e3 or args.paper_p8_e4 or args.paper_p8_e5 or args.paper_p8_recovery):
             report = startup_only(fixture)
             # Only this new mode removes its own generated secret inputs after
             # successful owned-resource cleanup; failure inputs remain private.
             if not is_fixture_verified(fixture):
                 raise ValueError('unsafe_fixture_path')
-            if not args.paper_p7:
+            if not args.paper_p7 and not args.paper_p8_sessions and not args.paper_p8_slow_viewer and not args.paper_p8_load and not args.paper_p8_e1 and not args.paper_p8_e2 and not args.paper_p8_e3 and not args.paper_p8_e4 and not args.paper_p8_e5 and not args.paper_p8_recovery:
                 shutil.rmtree(fixture.private)
             else:
                 try:

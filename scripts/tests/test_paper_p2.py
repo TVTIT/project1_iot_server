@@ -234,6 +234,37 @@ class PaperP2Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'paper_p7_mode_rejected'):
                 smoke.prepare(Path(directory) / 'mixed', paper_p7=True, paper_p2=True)
 
+    def test_p8_slow_selector_reuses_p2_overlay_with_websocket_only_in_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p8-slow', paper_p8_slow=True)
+            self.assertTrue(fixture.paper_p8_slow)
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['WEBSOCKET_ENABLED'], 'true')
+            overlay = (fixture.private / 'compose.p2.yml').read_text()
+            self.assertIn("WEBSOCKET_ENABLED: 'true'", overlay)
+            self.assertNotIn("\n        WEBSOCKET_ENABLED:", overlay)
+            self.assertIn("WS_HEARTBEAT_INTERVAL: '2s'", overlay)
+            self.assertIn("WS_PONG_TIMEOUT: '4s'", overlay)
+            self.assertIn("WS_WRITE_TIMEOUT: '1s'", overlay)
+            self.assertEqual(fixture.values['WS_MAX_SESSIONS'], '64')
+            for key in ('STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED', 'MQTT_SHAPER_ENABLED',
+                        'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED'):
+                self.assertEqual(fixture.values[key], 'false')
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'mixed-p8', paper_p8_sessions=True, paper_p8_slow=True)
+
+    def test_p8_e4_enables_websocket_only_in_its_private_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p8-e4', paper_p8_e4='on')
+            self.assertTrue(fixture.paper_p2)
+            self.assertTrue(fixture.paper_p8_e4)
+            self.assertEqual(fixture.values['WEBSOCKET_ENABLED'], 'true')
+            self.assertEqual(fixture.values['METRICS_ENABLED'], 'true')
+            overlay = (fixture.private / 'compose.p2.yml').read_text()
+            self.assertIn("WEBSOCKET_ENABLED: 'true'", overlay)
+            default = (smoke.ROOT / 'docker-compose.yml').read_text()
+            self.assertIn('WEBSOCKET_ENABLED: ${WEBSOCKET_ENABLED:-false}', default)
+
     def test_nginx_perimeter_template_is_separate_and_fail_closed(self):
         text = (smoke.ROOT / 'config/nginx/paper-p2.conf.template').read_text()
         for required in ('listen 443 ssl', 'auth_request /_p2_auth;', 'auth_request /_p2_ws_auth;',

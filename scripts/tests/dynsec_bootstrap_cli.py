@@ -203,12 +203,102 @@ def run_bootstrap_command(cmd, timeout=45, runner=subprocess.run, grace=120, sec
                 raise IncompleteCleanup('INCOMPLETE_CLEANUP: child descendants still alive; inputs retained')
             scan_output_for_secrets(res.stdout, res.stderr, secrets_to_scan)
             if b'incomplete' in res.stderr.lower() or b'offline verification' in res.stderr.lower():
-                raise IncompleteCleanup('INCOMPLETE_CLEANUP: child reported unresolved ownership; receipts retained')
+                diag = parse_safe_diagnostic_from_stderr(res.stderr)
+                exc_cls = diag['exception_class'] if diag else 'unclassified'
+                code = (diag.get('returncode') if diag.get('returncode') is not None else diag.get('errno')) if diag else None
+                detail = f"{exc_cls}:{code}" if code is not None else exc_cls
+                target_dir = find_target_dir_from_cmd(cmd)
+                target_written = False
+                if target_dir is not None and diag is not None:
+                    diagnostic_path = target_dir / 'bootstrap-diagnostic.json'
+                    temp_path = target_dir / f'.diagnostic_{secrets.token_hex(6)}.tmp'
+                    try:
+                        fd = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                            json.dump(diag, f, indent=2, sort_keys=True)
+                            f.write('\n')
+                        temp_path.replace(diagnostic_path)
+                        target_written = True
+                    except Exception:
+                        target_written = False
+                    finally:
+                        if temp_path.exists():
+                            try:
+                                temp_path.unlink()
+                            except OSError:
+                                pass
+                raise IncompleteCleanup(f'INCOMPLETE_CLEANUP: child reported unresolved ownership ({detail}); receipts retained')
     if _cancellation is not None:
         _cancellation.checkpoint()
     if timed_out:
         raise RunnerError('bootstrap child deadline exceeded')
     return res
+
+
+def parse_safe_diagnostic_from_stderr(stderr_bytes):
+    prefix = b'bootstrap_diagnostic: '
+    diag = None
+    if stderr_bytes:
+        for line in stderr_bytes.splitlines():
+            line = line.strip()
+            if line.startswith(prefix):
+                try:
+                    payload = json.loads(line[len(prefix):].decode('utf-8'))
+                    if isinstance(payload, dict):
+                        raw_cls = payload.get('exception_class')
+                        safe_cls = str(raw_cls) if isinstance(raw_cls, str) and re.fullmatch(r'[A-Za-z0-9_]+', raw_cls) else 'unclassified'
+                        err_no = payload.get('errno') if isinstance(payload.get('errno'), int) else None
+                        ret_code = payload.get('returncode') if isinstance(payload.get('returncode'), int) else None
+                        t_out = payload.get('timeout') if isinstance(payload.get('timeout'), (int, float)) else None
+                        raw_frames = payload.get('frames')
+                        safe_frames = []
+                        if isinstance(raw_frames, list):
+                            for f in raw_frames:
+                                if isinstance(f, dict):
+                                    fn_name = str(f.get('function', ''))
+                                    ln_no = f.get('line')
+                                    if isinstance(ln_no, int) and re.fullmatch(r'[A-Za-z0-9_<>]+', fn_name):
+                                        safe_frames.append({'function': fn_name, 'line': ln_no})
+                        diag = {
+                            'exception_class': safe_cls,
+                            'errno': err_no,
+                            'returncode': ret_code,
+                            'timeout': t_out,
+                            'frames': safe_frames,
+                        }
+                except Exception:
+                    pass
+                break
+    return diag
+
+
+def find_target_dir_from_cmd(cmd):
+    if not isinstance(cmd, (list, tuple)):
+        return None
+    for opt in ('--recovery-dir', '-r'):
+        if opt in cmd:
+            try:
+                idx = cmd.index(opt)
+                if idx + 1 < len(cmd):
+                    p = Path(cmd[idx + 1]).resolve()
+                    if p.is_dir() and not p.is_symlink():
+                        st = p.stat()
+                        if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700:
+                            return p
+            except Exception:
+                pass
+    if '--config' in cmd:
+        try:
+            idx = cmd.index('--config')
+            if idx + 1 < len(cmd):
+                p = Path(cmd[idx + 1]).resolve().parent
+                if p.is_dir() and not p.is_symlink():
+                    st = p.stat()
+                    if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700:
+                        return p
+        except Exception:
+            pass
+    return None
 
 
 def run_cmd(cmd, input_data=None, timeout=30, runner=subprocess.run):
