@@ -1,0 +1,15 @@
+field,value,qualification
+logical_artifact_id,p8-recovery,final P8.13 recovery run
+status,PASS_SOURCE_QUALIFIED,8 of 8 phases
+source_revision,52fd9456a9dbaa3316196eb92de40d14ba4ef32e,Git HEAD at source checkpoint; dirty SHA is separate
+source_dirty_sha256,b73d86246e44e5d0c4afa6c46fc4c74459170b769cbe1e0bdbc95318aa168800,dirty-tree fingerprint; source revision 52fd9456a9dbaa3316196eb92de40d14ba4ef32e
+raw_report_sha256,a6f6dc9926519096fa6e6447352aec83566960be8ecc581d360bf6d653d4a364,raw p8-recovery.json report digest
+backup_archive_sha256,9567e934ee96649c1f9c275d3bfaf65de3dc36064ec1e6ad33caeec5d1ff9f68,distinct private dump digest; 430003 bytes; mode 0600
+cleanup,14 containers / 1 network / 5 volumes,exact owned cleanup verified
+tracked children,4 joined / 4 tracked,all joined
+database restore,2035 raw rows; schema 24,source/restore counts and content hashes equal
+SQLite reopen,341 bytes preserved; enqueue 1; ACK 2; pending 0,one committed unacknowledged payload survived
+authorization,owner 200; temporal 200; nonmember 404; no JWT 401,100 temporal values
+restore scope,database only,same fixture-owned Postgres cluster; not whole-platform/HA
+original control runner,PARTIAL_RETAINED,historical status unchanged
+full_p8_accepted,false,not official paper acceptance

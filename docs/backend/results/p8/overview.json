@@ -1,0 +1,61 @@
+{
+  "schema": "p8-safe-overview-v1",
+  "status": "LOCAL_TOOLING_COMPLETE_SOURCE_QUALIFIED",
+  "full_p8_accepted": false,
+  "official_paper_accepted": false,
+  "deployment_rollout": false,
+  "local_pilots": {
+    "E1": {"status": "PASS", "logical_artifact_id": "P8.6-E1-final-pilot", "raw_report_sha256": "d3c19bf2b3e2af898a169532ce9f6bd029b64f09f25d360ac1e6aba4614b8b0f", "unique_messages": 20, "raw_samples": 2000, "websocket_writes": 530, "cleanup": "12/1/5", "capacity_claim": false},
+    "E2": {"status": "PASS", "logical_artifact_id": "P8.7-E2-final-pilot", "raw_report_sha256": "8f7a1515655b0641395d9c3a46f9f0825c1d1e224cdb3e49476d20ad80e1769f", "qualification": "two earlier native FAILs retained; bounded paired pilot only"},
+    "E3": {"status": "PASS", "logical_artifact_id": "P8.8-E3-low-load-polling", "raw_report_sha256": "a8c56ae6c2a6018ddf9dd383a89692bf20078112292d90516890511415c943ff", "terminal_commands": 4, "background_db_delta": "12 ledger / 1200 raw / 12 temporal", "pending": 0, "burst_overlap": "NOT_APPLICABLE_LOW_LOAD", "mixed_load_source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e", "mixed_load_source_dirty_sha256": "02b4122157a62bed89de17d8e6dfe5d81b948ba4be8f33f2a4b04292f57721f4", "mixed_load_polling": {"status": "PASS", "raw_report_sha256": "1d506a35323afcbea72358312fba2ed61988756cd93c1fb2ffc2317547a2ce92", "cleanup": "12/1/5", "background_db_delta": "24 ledger / 2400 raw / 24 temporal", "command_raw_samples_actual": 33, "command_temporal_observations": 21, "runner_observed_overlap": true, "receipts_verified": 4, "configurations_verified": 2, "pending_after_drain": 0}, "mixed_load_wakeup": {"status": "PASS", "raw_report_sha256": "6dba74512d342fc7df45ba123a7373b54967fa62213d9e944653128479599bd9", "cleanup": "12/1/5", "background_db_delta": "24 ledger / 2400 raw / 24 temporal", "command_raw_samples_actual": 32, "command_temporal_observations": 21, "runner_observed_overlap": true, "receipts_verified": 4, "configurations_verified": 2, "pending_after_drain": 0}, "server_origin_d_dispatch_e2e": "null_unavailable"},
+    "E4": {"status": "PASS", "logical_artifact_id": "P8.9-E4-extended-on", "raw_report_sha256": "eb9e8b6da9659a85195924d439a1f9e8453b46d552d1c95a0c987132ba30b9d3", "cleanup": "13/1/5", "official_ttl_600s": "NOT_RUN"}
+  },
+  "e5": {
+    "frozen_runs": 6,
+    "driver_native_pass": 6,
+    "strict_comparable_pairs": 5,
+    "official_repeats_gte_3": false,
+    "per_run_full_p8_accepted": false,
+    "dataset_unique_messages": 20,
+    "raw_samples": 2000,
+    "warm_replays": 10,
+    "websocket_events_total": 20,
+    "websocket_viewers": 2,
+    "websocket_events_each_viewer": 10,
+    "receipts_verified": 4,
+    "configurations_verified": 2,
+    "exact_cleanup_each": {"containers": 12, "networks": 1, "volumes": 5},
+    "fanout_scan": {"indexed_selections": 20, "scan_evaluations": 40, "activation": "INCONCLUSIVE", "reason": "fanout_viewer_readiness_unverified"},
+    "command_window": {"status": "INCONCLUSIVE", "reason": "counter_field_missing_events", "count": null},
+    "logical_artifact_ids": [
+      "p8-e5-optimized-7039c0a9eb731fa0",
+      "p8-e5-shaper_off-090fc844cf1bbd68",
+      "p8-e5-microbatch_off-3aafb955dd42a600",
+      "p8-e5-ram_dedup_off-9252b4ecd604539a",
+      "p8-e5-polling-0c6d6097e17acd84",
+      "p8-e5-fanout_scan-0cadf405faabd3c8"
+    ]
+  },
+  "final_local_source_gate": {
+    "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+    "source_dirty_sha256": "b73d86246e44e5d0c4afa6c46fc4c74459170b769cbe1e0bdbc95318aa168800",
+    "go_format_vet_lint_build_full_race_required_guards": "PASS",
+    "required_test_guards": 35,
+    "coverage_percent": 77.7,
+    "coverage_is_gate": false,
+    "native_optin_skip_events": 106,
+    "remote_github_ci": "NOT_RUN",
+    "full_python_discovery": "NOT_RUN"
+  },
+  "recovery": {
+    "logical_artifact_id": "p8-recovery",
+    "phases_passed": 8,
+    "phases_total": 8,
+    "exact_cleanup": {"containers": 14, "networks": 1, "volumes": 5},
+    "tracked_children_joined": 4,
+    "scope": "database_restore_same_fixture_owned_postgres_cluster",
+    "full_platform_or_ha_backup": false
+  },
+  "not_run": ["remote_a_b", "official_repeats_gte_3", "high_load_capacity_soak", "real_ttl_600s", "am5728_hil", "physical_sensors", "live_rollout", "remote_github_ci"],
+  "limitations": ["single_colocated_e5_pilot_not_capacity", "sparse_resources_not_capacity", "stage5_not_blanket_complete", "deferred_legacy_supervisor_reloader_jobs_not_pass"]
+}

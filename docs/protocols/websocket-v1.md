@@ -1,6 +1,6 @@
 # Giao thức WebSocket v1 (WebSocket Telemetry Protocol v1)
 
-**Trạng thái:** Đã triển khai, Local MVP dạng tùy chọn kích hoạt (opt-in); `/v1/ws` bị tắt theo mặc định. Tài liệu này mô tả hành vi hiện hành của Go / bộ phân tích cú pháp (parser) / môi trường thực thi (runtime), không phải toàn bộ các cam kết nghiệm thu đề xuất cho P7. Đường dẫn là `GET /v1/ws`; giao thức con ứng dụng (application subprotocol) được thương lượng là `iot.telemetry.v1`.
+**Trạng thái:** Đã triển khai, Local MVP dạng tùy chọn kích hoạt (opt-in); `/v1/ws` bị tắt theo mặc định. P8 có cap hữu hạn cấu hình được `WS_MAX_SESSIONS` 1–10.000 (mặc định 32), logical budget tổng cho session-reference `WS_SESSION_REFERENCE_BYTES` 1–256 MiB (mặc định 8 MiB). Các giới hạn cấu hình không phải nghiệm thu tải/RSS; mặc định recheck interval 5s, sweep budget 2s, concurrency 2. Ring tối đa 32 close observations không đổi. Xem [báo cáo P8](../backend/paper-p8-experiments-and-acceptance.md) về source qualification, pilot và phần còn thiếu. Tài liệu này mô tả hành vi hiện tại của Go/parser/runtime, không phải toàn bộ cam kết nghiệm thu đề xuất cho P7. Đường dẫn là `GET /v1/ws`; giao thức con ứng dụng được thương lượng là `iot.telemetry.v1`.
 
 ## Bắt tay, thông tin xác thực và ranh giới ngoại vi (Handshake, credentials and perimeter)
 

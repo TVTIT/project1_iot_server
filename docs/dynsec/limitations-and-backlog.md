@@ -476,6 +476,15 @@ Bảng dưới đây ghi nhận trạng thái giải quyết và danh mục các
 
 ## 3. Danh Mục Tồn Đọng Theo Thứ Tự Ưu Tiên (Prioritized Backlog)
 
+### Giới hạn bàn giao P8 (29/10/2026)
+
+- **E5 fanout readiness (ảnh hưởng: chưa kết luận được điều kiện kích hoạt scan-vs-index).** Raw counters ghi indexed 20 so với scan 40 evaluation và event viewer đúng, nhưng adapter thận trọng không ghi `readiness_verified`; arm activation là `INCONCLUSIVE: fanout_viewer_readiness_unverified`. Cách xử lý: chỉ báo raw counters đã quan sát, không công nhận scan eligible/có lợi. Chỉ xem lại khi adapter chứng minh readiness và có lượt repeat so sánh được, được cho phép riêng.
+- **E5 command measurement window (ảnh hưởng: không thể tuyên bố latency command-phase hoặc zero-sample).** Command-window timeline được giữ ở trạng thái `INCONCLUSIVE: counter_field_missing_events`; snapshot đầu được lấy trước khi gửi command. Cách xử lý: null/unavailable, không phải zero và không thay bằng RTT. Xem lại trong task instrumentation/evidence được giao rõ ràng, không đổi nhãn pilot cũ.
+- **Nghiệm thu remote/official/physical (ảnh hưởng: mục tiêu paper/capacity và tuyên bố deployment chưa được chứng minh).** Remote A/B, remote CI, ≥3 official repeats độc lập, các rung high-load/capacity/soak đã chọn, TTL thực 600s, AM5728/HIL, cảm biến vật lý và live rollout còn NOT RUN; legacy supervisor/reloader CI jobs còn DEFERRED. Cách xử lý: giữ các tuyên bố pending và deployment flags false. Chỉ xem lại khi có cửa sổ máy/board/CI được cho phép và kế hoạch chạy có giới hạn.
+- **Phạm vi recovery (ảnh hưởng: DB restore không bảo đảm disaster-recovery hoặc HA toàn hệ thống).** P8.13 restore database trong cùng PostgreSQL cluster thuộc fixture; Auth/roles/broker/keys/socket được giữ riêng. Cách xử lý: chỉ gọi là database restore. Backup toàn platform, restore cluster độc lập, broker state và HA/failover không thuộc bằng chứng này. Xem lại theo yêu cầu recovery có phạm vi riêng.
+
+Liên kết bằng chứng: [báo cáo nghiệm thu P8](../backend/paper-p8-experiments-and-acceptance.md), [overview an toàn](../backend/results/p8/overview.json), [summary recovery](../backend/results/p8/recovery-summary.json), [handbook công cụ tải](../backend/paper-p8-load-tools.md). Các mục này nêu qualification cho bằng chứng hiện tại theo source; không thay thế lịch sử FAIL/PARTIAL/NOT RUN.
+
 | Thứ Tự | Hạng Mục Công Việc | Mức Độ Rủi Ro / Ảnh Hưởng | Hướng Hiện Thực Đề Xuất |
 |:---:|---|---|---|
 | **P1** | **Xác thực lưu trữ mật khẩu sau Rotate (ROT2 Verifier) & Nghiệm thu Khởi động lại (T10)** | Rủi ro nạp lại mật khẩu cũ nếu broker crash sau khi rotate; thiếu bằng chứng E2E cho T10. | Hiện thực bộ đọc phân tích hash mật khẩu mới trên snapshot `dynamic-security.json` trước khi finalize DB; bổ sung test case native khởi động lại Mosquitto container và xác minh kết nối. |

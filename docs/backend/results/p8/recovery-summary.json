@@ -1,0 +1,20 @@
+{
+  "schema": "p8-recovery-safe-summary-v1",
+  "logical_artifact_id": "p8-recovery",
+  "status": "PASS_SOURCE_QUALIFIED",
+  "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+  "source_dirty_sha256": "b73d86246e44e5d0c4afa6c46fc4c74459170b769cbe1e0bdbc95318aa168800",
+  "raw_report_sha256": "a6f6dc9926519096fa6e6447352aec83566960be8ecc581d360bf6d653d4a364",
+  "backup_archive": {"path_scope": "private_fixture_artifact", "filename": "p8-recovery-smoke.dump", "sha256": "9567e934ee96649c1f9c275d3bfaf65de3dc36064ec1e6ad33caeec5d1ff9f68", "size_bytes": 430003, "mode_octal": "0600"},
+  "phases": {"passed": 8, "total": 8},
+  "cleanup": {"verified": true, "containers": 14, "networks": 1, "volumes": 5},
+  "tracked_children": {"joined": 4, "total": 4},
+  "database": {"schema_version": 24, "raw_rows": 2035, "source_restore_counts_equal": true, "source_restore_content_hash_equal": true, "restore_cluster_scope": "same fixture-owned PostgreSQL cluster"},
+  "sqlite_delivery": {"committed_unacknowledged_payload_survived_restart_restore": true, "payload_bytes": 341, "reopened_actual_enqueue": 1, "application_acknowledgements": 2, "pending_after_ack": 0},
+  "authorization": {"restored_owner_http": 200, "temporal_http": 200, "temporal_values": 100, "nonmember_http": 404, "missing_jwt_http": 401},
+  "verified_command_details": 4,
+  "verified_configurations": 2,
+  "scope_limit": "database restore only; Auth, roles, broker, keys and socket retained separately; not whole-platform/HA backup",
+  "original_control_runner": "PARTIAL_RETAINED",
+  "full_p8_accepted": false
+}
