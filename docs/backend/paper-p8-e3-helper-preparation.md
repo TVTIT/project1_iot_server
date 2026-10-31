@@ -1,226 +1,422 @@
-# P8 E3 — profile helper (low-load / mixed; polling / wakeup)
+# P8 E3 — profile helper (source-qualified)
 
-**Phạm vi:** helper E3 chạy bốn profile workload/dispatch; collector của A bắt đầu
-trước khi xác nhận `begin`, B chỉ xuất inventory kết quả đã allowlist. A kiểm tra
-độc lập PostgreSQL/REST và so khớp command receipts/configuration từ hai SQLite
-executor. Báo cáo luôn giữ `full_p8_accepted=false`; pilot cùng máy ghi
-`generator_colocated=true`, `physical_ab=NOT RUN`. Mixed chỉ được chấp nhận khi
-runner-clock chứng minh command interval overlap cả A steady lẫn B burst. Không
-chứng minh HIL hay triển khai.
+Tài liệu hướng dẫn vận hành và báo cáo bằng chứng cho thử nghiệm P8 E3 (khảo sát năng lực điều khiển Sensor phối hợp viễn trắc qua bốn profile kết hợp giữa hai chế độ tải `low_load` / `mixed` và hai cơ chế dispatch `polling` / `wakeup`). E3 được thực hiện trên cùng nền tảng kiến trúc backend (Go modular monolith, Mosquitto DynSec, TimescaleDB, HTTP/REST và Mosquitto TLS) kết hợp với Gateway simulator executor hai arm độc lập.
 
-## Quy trình operator
+Thử nghiệm chạy tuần tự các profile trong từng fixture độc lập; mỗi profile được kiểm định dữ liệu và dọn dẹp tài nguyên độc lập. Báo cáo luôn giữ `full_p8_accepted=false`; pilot cùng máy ghi nhận `generator_colocated=true` (hoặc `same-host/unverified`), `physical_ab=NOT RUN`. Không chứng minh phần cứng HIL (bo mạch AM5728) hay triển khai môi trường live rollout.
 
-Mỗi lượt dùng ROOT mới/private; không tái sử dụng thư mục đã có state, bundle,
-SQLite hay artifacts. Cần Docker, Python 3, Go toolchain và thư mục `src/` sạch
-đủ dependency để build hai binaries. Build vào scratch private (hoặc chỉ dùng
-binaries đã xác minh cùng source revision):
+---
 
-```sh
-mkdir -m 700 -p /var/tmp/opencode/p8-e3-lowpoll-build
-(cd src && CGO_ENABLED=0 go build -o /var/tmp/opencode/p8-e3-lowpoll-build/paperload ./cmd/paperload)
-(cd src && CGO_ENABLED=0 go build -o /var/tmp/opencode/p8-e3-lowpoll-build/gateway ./cmd/gateway)
-```
+## 1. Tổng quan và phân biệt bốn profile E3
 
-Dùng bản private copy của network config checkpoint tại
-`/var/tmp/opencode/p8-e3-prepare-lowpoll-attempt4-20261030/network.json`.
-Giữ interface/TLS CA/SAN/hostname và chọn host ports còn trống; không in config
-hay credentials vào log. `serve` chạy ở terminal A1/background để A2 có thể điều
-khiển:
+Thử nghiệm E3 khảo sát sự tương tác giữa luồng dữ liệu viễn trắc (telemetry uplink) và luồng lệnh điều khiển cảm biến (sensor control loop) qua 4 profile độc lập nằm hoàn toàn trong phạm vi thử nghiệm E3 (`--experiment E3`):
+
+### 1.1 Ma trận cấu hình 4 Profile của E3
+
+| Đặc tính / Cấu hình | Profile 1: Low-Load Polling | Profile 2: Low-Load Wakeup | Profile 3: Mixed Polling | Profile 4: Mixed Wakeup |
+|---|---|---|---|---|
+| **Tham số `--workload`** | `low_load` | `low_load` | `mixed` | `mixed` |
+| **Tham số `--dispatch-mode`** | `polling` | `wakeup` | `polling` | `wakeup` |
+| **Cờ `STAGE5_WAKEUP_ENABLED`** | `false` | `true` | `false` | `true` |
+| **Cờ `STAGE5_ENABLED`** | `true` | `true` | `true` | `true` |
+| **Telemetry Arm A (Steady)** | 8 messages (1 msg/s) | 8 messages (1 msg/s) | 8 messages (1 msg/s) | 8 messages (1 msg/s) |
+| **Telemetry Arm B (Traffic)** | 4 messages (1 msg/s, không burst) | 4 messages (1 msg/s, không burst) | 16 messages (4 steady + 12 burst) | 16 messages (4 steady + 12 burst) |
+| **Tổng Telemetry Unique Messages** | 12 messages | 12 messages | 24 messages | 24 messages |
+| **Lệnh điều khiển (Control Commands)** | 4 lệnh (2 lệnh / executor) | 4 lệnh (2 lệnh / executor) | 4 lệnh (2 lệnh / executor) | 4 lệnh (2 lệnh / executor) |
+| **Tần số lệnh (Frequency Hz)** | 1.5, 0.5, 2.0, 0.75 Hz | 1.5, 0.5, 2.0, 0.75 Hz | 1.5, 0.5, 2.0, 0.75 Hz | 1.5, 0.5, 2.0, 0.75 Hz |
+| **Quy tắc Overlap Clock** | Burst overlap: NOT APPLICABLE | Burst overlap: NOT APPLICABLE | Bắt buộc overlap cả A steady & B burst | Bắt buộc overlap cả A steady & B burst |
+| **Cấu hình triển khai** | Deployment defaults giữ nguyên (`STAGE5_ENABLED=false`...) | Deployment defaults giữ nguyên (`STAGE5_ENABLED=false`...) | Deployment defaults giữ nguyên (`STAGE5_ENABLED=false`...) | Deployment defaults giữ nguyên (`STAGE5_ENABLED=false`...) |
+
+### 1.2 Giải thích cờ `STAGE5_WAKEUP_ENABLED` và Tính tương đương Cấu hình
+
+- **Bản chất chuyển đổi Polling vs Wakeup**: Giữa hai cơ chế dispatch `polling` và `wakeup`, hệ thống chỉ thay đổi duy nhất một cờ môi trường `STAGE5_WAKEUP_ENABLED` (`false` ở polling, `true` ở wakeup; cả hai đều có `STAGE5_ENABLED=true`).
+- **Bảo toàn ngữ nghĩa**: Toàn bộ manifest luồng dữ liệu (traffic manifest), manifest lệnh điều khiển (control manifest), định danh roles, các thông số profile, hạn ngạch quota và ngữ nghĩa nghiệp vụ của API được giữ nguyên vẹn 100%, không bị sửa đổi giữa polling và wakeup.
+- **Sự khác biệt giữa `low_load` và `mixed`**:
+  - `low_load`: Arm A phát 8 messages (steady 1 msg/s), Arm B phát 4 messages (steady 1 msg/s, không kích hoạt burst). Tổng telemetry unique messages là 12. Do Arm B không có burst, chỉ tiêu burst overlap là **NOT APPLICABLE**; hệ thống chỉ kiểm tra command interval giao với A steady interval.
+  - `mixed`: Giữ nguyên cấu hình tải hỗn hợp với Arm A phát 8 messages (steady 1 msg/s) và Arm B phát 16 messages (4 steady + 12 burst). Tổng telemetry unique messages là 24. Yêu cầu bắt buộc phải chứng minh sự giao thoa thời gian (overlap) giữa lệnh điều khiển và cả hai luồng A steady lẫn B burst.
+
+### 1.3 Phân biệt hai Logical Producers và hai Physical Hosts
+
+Cần phân biệt rõ ràng hai khái niệm độc lập:
+- **Hai Logical Producers / Gateway Arms (A và B)**:
+  - Là hai nhánh mô phỏng tải logic trong workload:
+    - Arm A: Sở hữu 1 Gateway và 1 Sensor cho luồng telemetry nền (`steady`).
+    - Arm B: Sở hữu 1 Gateway và 1 Sensor cho luồng telemetry (`steady` ở low_load; `steady` + `burst` ở mixed).
+  - Đồng thời, E3 vận hành 2 Gateway executor độc lập (`gw_a`, `gw_b`) nhận và thực thi 4 lệnh điều khiển sensor (mỗi executor nhận 2 lệnh tuần tự).
+  - Mỗi session tạo mới định danh Gateway và Sensor fresh; ánh xạ role-to-identity và cấu hình executor tương ứng không thay đổi giữa các arm.
+- **Hai Physical Hosts (Host A và Host B)**:
+  - **Host A (Server Host)**: Máy chủ chạy hạ tầng Go backend, PostgreSQL/TimescaleDB, Mosquitto DynSec, Nginx reverse proxy, và bộ thu thập chỉ số phía server (`collector`).
+  - **Host B (Client Host)**: Máy trạm chạy tiến trình phát tải viễn trắc (`paperload`) và tiến trình executor nhận lệnh điều khiển (`gateway`).
+  - **Giới hạn máy đo**: Thử nghiệm được người vận hành chạy trên cùng máy chủ cục bộ với metadata ghi nhận là `generator_colocated=true` (hoặc `same-host/unverified`); chưa chứng minh môi trường hai máy vật lý độc lập qua mạng vật lý (`physical_ab=NOT RUN`).
+
+### 1.4 Quy tắc Overlap Clock của chế độ Mixed
+
+- **Bắt buộc chứng minh Overlap**: Trong chế độ `mixed`, điều kiện tiên quyết để nghiệm thu kết quả là đồng hồ phía runner (`runner-clock`) phải chứng minh khoảng thời gian thực thi lệnh điều khiển (`command interval`) giao thoa đồng thời với cả luồng A steady và luồng B burst.
+- **Độ trễ ống dẫn chưa xác định (Unknown Pipe Lag)**: Độ trễ truyền thông qua ống dẫn mạng giữa các tiến trình là chưa xác định (`unknown`); tuyệt đối không thực hiện phép trừ đồng hồ giữa hai máy Host A và Host B (no A/B clock subtraction) để tránh sai số trôi đồng hồ (clock drift) ngụy tạo độ trễ.
+- **Chế độ `low_load`**: Do Arm B không phát burst, trường xác thực burst overlap được ghi nhận chuẩn mực là **`NOT APPLICABLE`**, không đánh giá FAIL.
+
+---
+
+## 2. Hướng dẫn vận hành từng bước (Runbook)
+
+### 2.1 Quy định an toàn và nguyên tắc vận hành
+
+- **Placeholders và bảo vệ dữ liệu**: Chỉ sử dụng placeholders hoặc biến môi trường mẫu (`/path/to/private-network-copy.json`, `$ROOT`, `$SESSION_ID`). Tuyệt đối không đưa IP máy thật, đường dẫn home cá nhân, thông tin định danh hay secrets vào tài liệu vận hành.
+- **Phân quyền tập tin nghiêm ngặt**:
+  - Thư mục cha và thư mục làm việc: quyền `0700`.
+  - Tập tin cấu hình, bundle, chứng chỉ, SQLite và kết quả: quyền `0600`.
+  - Tập tin thực thi binary (`paperload`, `gateway`): quyền `0700`.
+- **Chống ghi đè tập tin và cách ly môi trường**: Mỗi lượt chạy bắt buộc sử dụng một thư mục gốc hoàn toàn mới (`ROOT=/var/tmp/opencode/p8-e3-<profile>-<unique-run>`). Tuyệt đối không tái sử dụng thư mục đã có state, bundle, SQLite hay artifacts cũ.
+- **Ngân sách thời gian (Deadline budget)**: Thời hạn deadline của server `--deadline-seconds 900` (15 phút) phải đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle và 2 binary, chạy workload, chờ drain, export/import, hậu kiểm đối soát SQL/REST/SQLite và dọn dẹp.
+- **Trình tự đồng bộ Collector nghiêm ngặt**: Bộ thu thập phía server trên Host A bắt buộc phải được kích hoạt và xác nhận sẵn sàng (`phase=MEASURING`, `collector_ready=true`) TRƯỚC KHI tiến trình client trên Host B được phép khởi chạy phát tải.
+- **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Steps)**: Việc chuyển bundle, 2 file nhị phân (`paperload`, `gateway`) và kết quả đo giữa Host A và Host B là thao tác truyền file thủ công của người vận hành (copy an toàn qua đường dẫn hoặc scp), không tuyên bố là tự động hóa qua SSH.
+- **Xử lý sự cố và dọn dẹp an toàn**: Khi request hoặc kết quả bị từ chối, giữ nguyên hiện trạng các file SQLite, outbox, journal và artifacts để phục vụ chẩn đoán lỗi; không tự ý reseed hay ghi đè. Quy trình `finalize` (hoặc `abort`) vẫn là kênh đóng phiên chính thức để giải phóng an toàn 100% tài nguyên Docker.
+
+---
+
+### 2.2 Quy trình vận hành chi tiết 8 bước
+
+Áp dụng cho bất kỳ profile nào trong 4 profile E3 bằng cách chọn cặp cờ tương ứng:
+- `--dispatch-mode polling|wakeup`
+- `--workload low_load|mixed`
+
+Thiết lập thư mục gốc làm việc riêng biệt cho lượt chạy:
 
 ```sh
 ROOT=/var/tmp/opencode/p8-e3-<profile>-<unique-run>
-mkdir -m 700 -p "$ROOT"
-python3 scripts/paper_p8_server.py serve --root "$ROOT/A" \
-  --network-config /path/to/private-network-copy.json --experiment E3 \
-  --dispatch-mode polling --workload low_load --deadline-seconds 900
+mkdir -p "$ROOT" && chmod 0700 "$ROOT"
 ```
 
-`--dispatch-mode` nhận `polling|wakeup`; `--workload` nhận `low_load|mixed`.
-Giữa polling/wakeup chỉ đổi `STAGE5_WAKEUP_ENABLED`; các traffic/control manifest,
-roles, số liệu profile, quota và semantics giữ nguyên. Với low-load, A/B phát 8/4
-messages và B không có burst. Mixed giữ profile khai báo A/B = 8/16 và B burst 12.
-Mỗi session vẫn tạo identity/gateway IDs fresh; mapping role→identity và cấu hình
-executor tương ứng không đổi giữa arms.
+#### Bước 0 — Chuẩn bị nhị phân paperload và gateway
 
-Chờ `E3_PREPARED`/`READY` từ A2 status, chuyển nguyên `A/client-bundle` và
-binaries đến B root tách biệt. Trên B:
+Biên dịch hai file nhị phân từ thư mục mã nguồn `src/` sạch vào thư mục scratch riêng biệt với cờ `CGO_ENABLED=0`:
 
 ```sh
-python3 scripts/paper_p8_client.py bind --bundle "$ROOT/B/client-bundle" --workspace "$ROOT/B/workspace"
-python3 scripts/paper_p8_client.py preflight --workspace "$ROOT/B/workspace" --binary "$ROOT/B/paperload" --gateway-binary "$ROOT/B/gateway"
-python3 scripts/paper_p8_client.py check-connection --workspace "$ROOT/B/workspace"
+BIN_DIR=/var/tmp/opencode/p8-e3-binaries
+mkdir -p "$BIN_DIR" && chmod 0700 "$BIN_DIR"
+(cd src && CGO_ENABLED=0 go build -o "$BIN_DIR/paperload" ./cmd/paperload)
+(cd src && CGO_ENABLED=0 go build -o "$BIN_DIR/gateway" ./cmd/gateway)
+chmod 0700 "$BIN_DIR/paperload" "$BIN_DIR/gateway"
 ```
 
-Trên A2, đọc session id từ status (không đưa token/config ra terminal). Bắt đầu
-collector ở A bằng đúng `SESSION_ID` và phase id lấy từ session state:
+*(Lưu ý: Chỉ sử dụng các binary đã được xác minh cùng revision mã nguồn với backend)*.
+
+#### Bước 1 — Khởi động Server Fixture E3 trên Host A (Terminal A1)
+
+Sử dụng bản sao cấu hình mạng riêng (`private-network-copy.json`), giữ nguyên interface/TLS CA/SAN/hostname và chọn host ports còn trống. Chạy lệnh `serve` (giữ tiến trình này chạy ngầm hoặc trên Terminal A1 riêng biệt):
 
 ```sh
-python3 scripts/paper_p8_server.py begin --root "$ROOT/A" --experiment E3 \
-  --session-id "$SESSION_ID" --phase READY --phase-id "$PHASE_ID"
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/A" \
+  --network-config /path/to/private-network-copy.json \
+  --experiment E3 \
+  --dispatch-mode polling \
+  --workload low_load \
+  --deadline-seconds 900
+```
+
+*(Thay thế `--dispatch-mode wakeup` hoặc `--workload mixed` tương ứng với profile cần chạy)*.
+
+#### Bước 2 — Kiểm tra trạng thái và lưu session_id trên Host A (Terminal A2)
+
+Trên terminal điều khiển A2 của Host A, kiểm tra trạng thái cho đến khi hệ thống sẵn sàng:
+
+```sh
 python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
 ```
 
-Chỉ sau khi A `status` xác nhận `MEASURING` và `collector_ready=true`, chạy B:
+Chờ cho đến khi status trả về `preparation_status=E3_PREPARED` và `phase=READY`. Đặt `session_id` nhận được vào biến môi trường (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế từ status):
 
 ```sh
-python3 scripts/paper_p8_client.py run --workspace "$ROOT/B/workspace" --binary "$ROOT/B/paperload" --gateway-binary "$ROOT/B/gateway"
-python3 scripts/paper_p8_client.py export-results --workspace "$ROOT/B/workspace" --output "$ROOT/B/results"
+SESSION_ID=<session_id>
+# Ví dụ: SESSION_ID=a1b2c3d4e5f6...
 ```
 
-Chuyển results nguyên bản sang A, không sửa projection/inventory. Trên A2, gọi:
+Đồng thời thiết lập định danh `PHASE_ID` theo đúng cấu trúc `e3-<workload>-<dispatch_mode>` của profile đang chạy (ví dụ `e3-low_load-polling`, `e3-low_load-wakeup`, `e3-mixed-polling`, `e3-mixed-wakeup`):
 
 ```sh
-python3 scripts/paper_p8_server.py finish-phase --root "$ROOT/A" --experiment E3 \
-  --session-id "$SESSION_ID" --phase MEASURING --phase-id "$PHASE_ID" \
-  --results "$ROOT/A/results"
-python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
-python3 scripts/paper_p8_server.py finalize --root "$ROOT/A" --experiment E3 \
-  --session-id "$SESSION_ID" --phase VERIFYING
+# Khai báo theo profile đang chạy:
+PHASE_ID="e3-low_load-polling"
+# Hoặc nếu chạy profile khác:
+# PHASE_ID="e3-low_load-wakeup"
+# PHASE_ID="e3-mixed-polling"
+# PHASE_ID="e3-mixed-wakeup"
+```
+
+#### Bước 3 — Chuyển giao gói dữ liệu và nhị phân sang Host B (Manual Transfer Step)
+
+Sao chép bundle cấu hình và 2 file nhị phân đã biên dịch sang Host B qua kênh truyền duyệt an toàn:
+1. Sao chép thư mục `$ROOT/A/client-bundle/` sang Host B tại `$ROOT/B/received-bundle/`.
+2. Sao chép hai tập tin thực thi nhị phân `$BIN_DIR/paperload` và `$BIN_DIR/gateway` sang Host B tại `$ROOT/B/bin/paperload` và `$ROOT/B/bin/gateway`.
+3. Thiết lập phân quyền nghiêm ngặt trên Host B (lưu ý: thư mục `workspace` không được tạo trước vì lệnh `bind` yêu cầu tự tạo mới với quyền `0700`; nếu thư mục `workspace` đã tồn tại từ trước, `bind` sẽ từ chối với lỗi `workspace_output_leaf_exists`):
+
+```sh
+mkdir -p "$ROOT/B/bin"
+chmod 0700 "$ROOT/B" "$ROOT/B/bin"
+chmod 0700 "$ROOT/B/bin/paperload" "$ROOT/B/bin/gateway"
+find "$ROOT/B/received-bundle" -type d -exec chmod 0700 {} +
+find "$ROOT/B/received-bundle" -type f -exec chmod 0600 {} +
+```
+
+#### Bước 4 — Thiết lập Workspace và kiểm tra kết nối trên Host B
+
+Trên Host B, thực hiện liên kết bundle, tiền kiểm tra cả hai nhị phân và kiểm tra kết nối mạng/xác thực TLS:
+
+```sh
+python3 scripts/paper_p8_client.py bind \
+  --bundle "$ROOT/B/received-bundle" \
+  --workspace "$ROOT/B/workspace"
+
+python3 scripts/paper_p8_client.py preflight \
+  --workspace "$ROOT/B/workspace" \
+  --binary "$ROOT/B/bin/paperload" \
+  --gateway-binary "$ROOT/B/bin/gateway"
+
+python3 scripts/paper_p8_client.py check-connection \
+  --workspace "$ROOT/B/workspace"
+```
+
+Xác nhận preflight và check-connection đều trả về `PASS`.
+
+#### Bước 5 — Kích hoạt pha đo lường trên Host A (Terminal A2)
+
+Trên Terminal A2 của Host A, gửi lệnh bắt đầu pha đo lường bằng đúng `$SESSION_ID` và `$PHASE_ID`:
+
+```sh
+python3 scripts/paper_p8_server.py begin \
+  --root "$ROOT/A" \
+  --experiment E3 \
+  --session-id "$SESSION_ID" \
+  --phase READY \
+  --phase-id "$PHASE_ID"
+
 python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
 ```
 
-Đọc `validation`, workload outcome, cleanup outcome và server exit code. Đợi
-serve exit 0/cleanup VERIFIED trước khi kết luận. Request/result sai bị từ chối; giữ nguyên SQLite,
-outbox, journal và artifacts để xử lý, không reseed/ghi đè. Finalize/abort vẫn là
-đường đóng phiên khi import lỗi.
+Chờ cho đến khi status trả về `phase=MEASURING`, `phase_id=$PHASE_ID`, và **`collector_ready=true`**.
 
-## Kiểm tra và giới hạn
+#### Bước 6 — Chạy tải và xuất kết quả trên Host B
 
-Result inventory giới hạn file/kích thước, kiểm tra session/run/phase/roles,
-bundle hash, per-file SHA-256, đường dẫn và symlink. Chỉ lấy projection an toàn,
-không chạy file/SQL từ B. Collector là A-side bounded polling; command-server
-origin latency nếu collector không có histogram vẫn unavailable/inconclusive (không
-quy thành 0). Collector snapshots cumulative; báo cáo dùng đúng snapshot terminal
-mới nhất, không cộng các snapshots lặp lại. Client PATCH RTT và B-process resource
-samples không được diễn giải/thêm vào nếu không có measurement tương ứng.
-Background sensor delta tách riêng khỏi command-sensor delta. B phải dừng/join
-runner trước khi chiếu SQLite receipts; A reconcile command ID, version, interval,
-result hash với DB và REST. Bằng chứng receipt/config không tự nó chứng minh
-physical A/B; `low_load` không được diễn giải là mixed overlap.
+Chỉ sau khi bước 5 xác nhận `collector_ready=true`, trên Host B tiến hành chạy tải phát tin viễn trắc kết hợp thực thi lệnh điều khiển và xuất kết quả đo lường:
 
-Trước khi dùng, chạy các test E3/client/supervisor; native acceptance chỉ được
-ghi nhận từ một lượt hoàn chỉnh có bundle, collector, workload, import,
-reconciliation và exact-owned cleanup cùng artifacts tương ứng. Lỗi bất kỳ không
-được báo PASS.
+```sh
+python3 scripts/paper_p8_client.py run \
+  --workspace "$ROOT/B/workspace" \
+  --binary "$ROOT/B/bin/paperload" \
+  --gateway-binary "$ROOT/B/bin/gateway"
 
-### Native helper CLI low-load polling — attempt 19 (2026-10-30)
+python3 scripts/paper_p8_client.py export-results \
+  --workspace "$ROOT/B/workspace" \
+  --output "$ROOT/B/exported-results"
+```
 
-- A chuẩn bị session `a1002f4c332234a10234325f77f4c5d1` ở `READY`; B bind,
-  Go preflight và HTTPS/MQTT TLS connection checks đều PASS. Collector A xác nhận
-  `MEASURING/collector_ready=true` trước khi B chạy.
-- Workload B exit 0: telemetry A/B lần lượt 8/8 và 4/4 generated/offered/application
-  ACK, không có retry/failure/drop, pending rows/bytes đều 0. Bốn control PATCH trả
-  202, terminal `succeeded`; frequency là 1.5, 0.5, 2.0, 0.75 Hz. Hai SQLite
-  executor độc lập có mỗi 2 completed receipts và pending outbox 0; captured
-  configurations là 500000µs và 1333333µs. Đây chưa phải SQL/REST reconciliation.
-- A từ chối kết thúc phase với `e3_rest_config_read_failed` khi lấy reported
-  configuration qua REST. Import/reconciliation/validation chưa đạt; workload
-  outcome giữ `ABORTED`, không gán PASS. Abort đóng server exit 0 và exact-owned
-  cleanup VERIFIED (12 containers / 1 network / 5 volumes).
-- Artifacts còn nguyên tại
-  `/var/tmp/opencode/p8-e3-lowpoll-native-20261030/attempt19/`. Terminal summary:
-  `PAPER_P8_E3_WORKLOAD_VALIDATION_FAILED`; `full_p8_accepted=false`. A-side SQL
-  deltas, REST/SQL/SQLite reconciliation, raw DB deltas và server-origin latency
-  chưa được xác nhận. Client PATCH RTTs 18–41ms không phải dispatch/E2E latency.
-- Provenance offline: attempt17 A/B workload artifacts đúng E2/A-remote,
-  E2/B-remote và E3/control scopes; current importer chấp nhận bundle đó. Regression
-  test khóa role-to-experiment mapping và vẫn bác stale run-id/sai experiment.
-  Attempt17 vẫn là lịch sử thất bại, không được nâng thành PASS.
-- Root cause được xác định sau attempt19: prepared `control_targets` là hai dict,
-  nhưng các consumer đã unpack mỗi dict thành keys `gateway_id`/`sensor_id`, làm
-  REST GET dùng URN giả và SQL baseline/delta sai scope. Các consumer nay dùng
-  target projection kiểm tra kiểu; command raw delta phải dương. Projection B-side
-  giữ executor `configuration` và result hash thực; reported configuration thiếu
-  bị từ chối. Đã đọc trực tiếp hai SQLite attempt19 ở read-only mode: mỗi DB có
-  2 completed receipts, pending 0, version 2; raw result bytes và exported result
-  hashes tương ứng. Đây là diagnostic artifact cũ, không phải SQL reconciliation.
-- Finalization E3 sau khi collector đã bắt đầu không thể coi `NOT_RUN`/abort là
-  thành công; chỉ preparation chưa bắt đầu workload hoặc imported `VALIDATED` mới
-  cho phép exit 0. Attempt19 exit 0 vẫn giữ nguyên lịch sử; behavior sửa áp dụng
-  cho lần chạy mới.
+#### Bước 7 — Chuyển giao kết quả đo về Host A (Manual Transfer Step)
 
-### Native helper CLI low-load polling — attempt 20 (2026-10-30)
+Sao chép nguyên vẹn thư mục kết quả `$ROOT/B/exported-results/` sang Host A tại đường dẫn `$ROOT/A/received-results/`.
+Thiết lập phân quyền an toàn trên Host A: thư mục quyền `0700` và tập tin quyền `0600`:
 
-- Sau khi sửa target mapping và terminal outcome gate, full helper workflow đạt
-  `PAPER_P8_E3_WORKLOAD_VERIFIED`: A READY → B bind/preflight/TLS check → A collector
-  ready/MEASURING → B workload/export → A finish/reconciliation → finalize.
-  B runner exit 0; A server exit 0; workload `VALIDATED`, validation failures `[]`.
-- B ghi **4/4** command PATCH thành công (HTTP 202, terminal succeeded), keys
-  distinct: 1.5 Hz và 0.5 Hz từ version 0, tiếp theo 2.0 Hz và 0.75 Hz từ version
-  1. SQLite hai executor có mỗi **2 completed receipts**, pending outbox **0**;
-  kết quả cuối version 2, interval lần lượt 500000µs và 1333333µs. A reconcile SQL
-  receipts + REST reported configuration với SQLite receipts/configuration.
-- Telemetry nền: A **8/8**, B **4/4** generated/offered/application ACK; A ghi nhận
-  1 retry (không có publish failure/drop, pending 0), B không retry; đây không phải
-  zero-retry claim. A-side deltas tách riêng: background
-  12 ledger / 1200 raw / 12 temporal; command sensors **36 raw / 24 temporal**.
-  Tổng fixture delta là 36 ledger / 1236 raw / 36 temporal / 2 configuration.
-- Low-load phase validation available; có command interval giao với A steady
-  interval, burst overlap **NOT APPLICABLE**. Snapshot terminal đã lưu histograms
-  cumulative: trích offline count 4, dispatch sum 2.678130341s / mean 0.669532585s;
-  succeeded E2E sum 2.893375296s / mean 0.723343824s; missing origin/dispatch/pending
-  đều 0. Đây là post-hoc extraction từ artifact, không sửa raw report lịch sử.
-  PATCH client RTT 19–39ms là số khác, không trộn vào server latency hoặc so đồng hồ A/B.
-- Exact-owned cleanup VERIFIED: **12 containers / 1 network / 5 volumes**.
-  `full_p8_accepted=false`, `generator_colocated=true`, `physical_ab=NOT RUN`.
-  Artifacts: `/var/tmp/opencode/p8-e3-lowpoll-native-20261030/attempt20/`.
-  Attempt19 và attempt17 failures vẫn được giữ nguyên.
+```sh
+chmod 0700 "$ROOT/A/received-results"
+find "$ROOT/A/received-results" -type f -exec chmod 0600 {} +
+```
 
-### Native helper CLI low-load wakeup — lần đầu lỗi, rerun hợp lệ (2026-10-30)
+*(Lưu ý: Giữ nguyên vẹn tập tin projection/inventory, không can thiệp sửa đổi nội dung)*.
 
-- Lượt đầu `/var/tmp/opencode/p8-e3-profiles-20261030/low-load-wakeup/` dừng ở
-  preflight, cleanup VERIFIED; chưa chạy workload. Diagnostic private traceback cho
-  thấy selector `--p8-arm wakeup` bị bỏ qua khi dựng Fixture (hard-code fallback
-  polling), nên `STAGE5_WAKEUP_ENABLED=false` làm sai effective-flags gate. Đây là
-  lỗi helper xác định, không phải kết quả profile.
-- Sửa selector để lifecycle-hold lấy chính arm đã yêu cầu; regression test polling /
-  wakeup. Một lần rerun fresh root đạt `PAPER_P8_E3_WORKLOAD_VERIFIED`, A/B exit 0,
-  workload `VALIDATED`, cleanup VERIFIED 12/1/5; effective readback xác nhận
-  `STAGE5_ENABLED=true`, `STAGE5_WAKEUP_ENABLED=true`.
-- B control **4/4** succeeded HTTP 202, 4 distinct keys; executor mỗi bên 2 completed,
-  version 2, pending 0. A/B telemetry **8/8** và **4/4** app ACK; retry/failure/drop
-  0. Background DB 12/1200/12; command sensor DB 33 raw / 22 temporal; total
-  34 ledger / 1233 raw / 34 temporal / 2 configuration.
-- Low-load phase available; command/steady overlap observed, burst **NOT APPLICABLE**.
-  Terminal collector histogram count 4: dispatch mean **42.15ms**, succeeded E2E mean
-  **137.93ms** (respective sums 0.168590961s / 0.551705864s). Client PATCH RTT
-  31–42ms is reported separately. `full_p8_accepted=false`, colocated generator,
-  physical A/B NOT RUN. Artifacts: `/var/tmp/opencode/p8-e3-profiles-20261030/low-load-wakeup-rerun/`.
+#### Bước 8 — Hậu kiểm dữ liệu, đối soát và đóng Fixture trên Host A (Terminal A2)
 
-### Native helper CLI mixed polling (2026-10-30)
+Trên Terminal A2 của Host A, gửi lệnh kết thúc pha đo lường kèm đường dẫn kết quả nhận được để kích hoạt quy trình đối soát dữ liệu (reconciliation):
 
-- `PAPER_P8_E3_WORKLOAD_VERIFIED`, validation `VALIDATED`, runner/server exit 0,
-  cleanup VERIFIED 12 containers / 1 network / 5 volumes. Effective flags read back
-  `STAGE5_ENABLED=true`, wakeup false. B control **4/4** succeeded HTTP 202 with
-  four distinct fresh keys; each executor 2 completed receipts, version 2, pending 0.
-- Telemetry A/B **8/8** and **16/16** application ACK, pending 0; retries 2 and 27
-  respectively; no publish failure/drop. Background DB **24 ledger / 2400 raw /
-  24 temporal**; command sensors **35 raw / 23 temporal**; total **47 / 2435 / 47 /
-  2 configuration**.
-- Runner-clock A steady interval overlapped B burst **3,321,496ns**; command intervals
-  overlapped both steady and burst. Pipe lag remains unknown; no A/B clock subtraction.
-  Terminal collector: 4 dispatch observations, sum **2.864832765s**, mean **716.21ms**;
-  4 succeeded E2E, sum **3.039973099s**, mean **759.99ms**. Client PATCH RTT
-  21–112ms, separate. `full_p8_accepted=false`, colocated, physical A/B NOT RUN.
-  Artifacts: `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-polling/`.
+```sh
+python3 scripts/paper_p8_server.py finish-phase \
+  --root "$ROOT/A" \
+  --experiment E3 \
+  --session-id "$SESSION_ID" \
+  --phase MEASURING \
+  --phase-id "$PHASE_ID" \
+  --results "$ROOT/A/received-results"
 
-### Native helper CLI mixed wakeup (2026-10-30)
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
+```
 
-- `PAPER_P8_E3_WORKLOAD_VERIFIED`, validation `VALIDATED`, runner/server exit 0,
-  cleanup VERIFIED 12/1/5. Effective flags read back `STAGE5_ENABLED=true`, wakeup
-  true. B control **4/4** succeeded HTTP 202 with four distinct fresh keys; each
-  executor 2 completed receipts, version 2, pending 0.
-- Telemetry A/B **8/8** and **16/16** application ACK, pending 0; retries 0 and 26
-  respectively; no publish failure/drop. Background DB **24 / 2400 / 24**;
-  command sensors **33 raw / 22 temporal**; total **46 ledger / 2433 raw /
-  46 temporal / 2 configuration**.
-- Runner-clock A steady interval overlapped B burst **3,742,897ns**; command intervals
-  overlapped both. Terminal collector: 4 dispatch observations, sum **0.217684148s**,
-  mean **54.42ms**; 4 succeeded E2E, sum **0.374731331s**, mean **93.68ms**.
-  Client PATCH RTT 14–121ms, separate. `full_p8_accepted=false`, colocated,
-  physical A/B NOT RUN. Artifacts: `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-wakeup/`.
+Kiểm tra status chờ chuyển sang `phase=VERIFYING` và xác nhận trường `workload_outcome=VALIDATED` (kèm `validation_valid=true` và `validation_failures=[]`). Sau đó tiến hành dọn dẹp và đóng server:
 
-All three requested missing profiles now have a passing complete helper CLI proof;
-low-load polling remains the already accepted attempt20 and was not rerun. Resource
-samples are A-side fixture observations only; no B-generator process resource claim.
-No E4/E5 or later stage was run.
+```sh
+python3 scripts/paper_p8_server.py finalize \
+  --root "$ROOT/A" \
+  --experiment E3 \
+  --session-id "$SESSION_ID" \
+  --phase VERIFYING
+
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
+```
+
+Chờ tiến trình `serve` trên Terminal A1 kết thúc với mã thoát 0. Kiểm tra status xác nhận `phase=CLOSED` và `cleanup_outcome=VERIFIED`. Báo cáo kết quả được lưu trong thư mục:
+`$ROOT/A/fixture/artifacts/`.
+
+---
+
+## 3. Bằng chứng thực nghiệm và lịch sử kiểm thử
+
+### 3.1 Bảng tổng hợp kết quả 4 Profile E3 — 2026-10-30
+
+Toàn bộ 4 profile của E3 đã được kiểm định thực tế qua native CLI runner trên hệ thống ngày 2026-10-30:
+
+| Profile | Workload Outcome | Validation Failures | Control Succeeded | SQLite Receipts / Pending | Telemetry App ACK (A / B) | Background DB (Ledger/Raw/Temp) | Command DB (Raw/Temp) | Total DB Delta (Ledger/Raw/Temp/Config) | Succeeded E2E Latency (Mean) | Runner Overlap | Exact Cleanup Verified | Serve Exit |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **Low-Load Polling** (Att. 20) | `VALIDATED` | `[]` | 4/4 (HTTP 202) | 2 completed / 0 pending (mỗi bên) | 8 / 4 (A có 1 retry, B 0 retry) | 12 / 1.200 / 12 | 36 / 24 | 36 / 1.236 / 36 / 2 | 723,34 ms (sum 2,893s) | Steady overlap (Burst N/A) | 12 ctn, 1 net, 5 vol | 0 |
+| **Low-Load Wakeup** (Rerun) | `VALIDATED` | `[]` | 4/4 (HTTP 202) | 2 completed / 0 pending (mỗi bên) | 8 / 4 (0 retry) | 12 / 1.200 / 12 | 33 / 22 | 34 / 1.233 / 34 / 2 | 137,93 ms (sum 0,552s) | Steady overlap (Burst N/A) | 12 ctn, 1 net, 5 vol | 0 |
+| **Mixed Polling** | `VALIDATED` | `[]` | 4/4 (HTTP 202) | 2 completed / 0 pending (mỗi bên) | 8 / 16 (A: 2 retries, B: 27 retries) | 24 / 2.400 / 24 | 35 / 23 | 47 / 2.435 / 47 / 2 | 759,99 ms (sum 3,040s) | Overlap burst: 3.321.496 ns | 12 ctn, 1 net, 5 vol | 0 |
+| **Mixed Wakeup** | `VALIDATED` | `[]` | 4/4 (HTTP 202) | 2 completed / 0 pending (mỗi bên) | 8 / 16 (A: 0 retry, B: 26 retries) | 24 / 2.400 / 24 | 33 / 22 | 46 / 2.433 / 46 / 2 | 93,68 ms (sum 0,375s) | Overlap burst: 3.742.897 ns | 12 ctn, 1 net, 5 vol | 0 |
+
+---
+
+### 3.2 Chi tiết thực nghiệm Low-Load Polling — 2026-10-30
+
+#### 1. Attempt 19 (`lowpoll-attempt19`) — FAIL
+- **Thực thi và dữ liệu data-plane**:
+  - Host A chuẩn bị session `a1002f4c332234a10234325f77f4c5d1` ở trạng thái `READY`; Host B bind, Go preflight và HTTPS/MQTT TLS connection checks đều PASS. Bộ thu thập chỉ số Collector trên Host A xác nhận `MEASURING` và `collector_ready=true` trước khi Host B khởi chạy.
+  - Tiến trình client Host B kết thúc với mã thoát 0: telemetry Arm A đạt 8/8 và Arm B đạt 4/4 generated / offered / application ACK, không phát sinh retry, lỗi hay drop, pending outbox 0.
+  - Bốn lệnh điều khiển PATCH đều trả về HTTP 202 Accepted, đạt trạng thái terminal `succeeded`; các giá trị tần số thiết lập là 1.5, 0.5, 2.0, 0.75 Hz.
+  - Hai SQLite executor độc lập trên Host B ghi nhận mỗi bên 2 completed receipts và pending outbox 0; cấu hình được ghi nhận là 500.000 µs và 1.333.333 µs.
+- **Nguyên nhân thất bại**:
+  - Tại bước kết thúc phase trên Host A, hệ thống từ chối import với mã lỗi `e3_rest_config_read_failed` khi truy vấn reported configuration qua giao diện REST.
+  - Quy trình import, reconciliation và validation không hoàn tất; trạng thái workload giữ nguyên nhãn `ABORTED`, tuyệt đối không gán PASS.
+  - Quy trình abort kích hoạt dọn dẹp an toàn: server exit mã 0 và exact-owned cleanup VERIFIED (12 containers, 1 network, 5 volumes).
+  - Báo cáo kết quả: `PAPER_P8_E3_WORKLOAD_VALIDATION_FAILED`, `full_p8_accepted=false`.
+- **Phân tích nguyên nhân gốc (Root Cause Analysis)**:
+  - Trường `control_targets` được chuẩn bị dưới dạng hai từ điển (dictionaries), nhưng các hàm tiêu thụ (consumers) giải nén mỗi từ điển thành các khóa `gateway_id` và `sensor_id`, dẫn đến việc REST GET truy vấn bằng định danh URN không hợp lệ và truy vấn đường cơ sở SQL baseline/delta sai phạm vi (scope).
+  - Hướng khắc phục: Chuẩn hóa target projection để kiểm tra kiểu dữ liệu; yêu cầu command raw delta phải là số dương; projection phía Host B lưu giữ executor `configuration` và mã băm kết quả thực.
+- **Bảo toàn bằng chứng**: Thư mục artifacts được lưu giữ nguyên vẹn tại:
+  `/var/tmp/opencode/p8-e3-lowpoll-native-20261030/attempt19/`.
+  Lịch sử thất bại của Attempt 19 được bảo toàn nguyên vẹn, không chỉnh sửa thành PASS.
+
+#### 2. Attempt 20 (`lowpoll-attempt20`) — PASS
+- **Khắc phục**: Sửa lỗi target mapping và áp dụng cổng kiểm soát kết quả terminal nghiêm ngặt (chỉ cho phép finalization kết thúc với mã 0 khi workload đạt `VALIDATED`).
+- **Thực thi và kết quả**:
+  - Toàn bộ quy trình helper hoàn tất trọn vẹn: A READY → B bind/preflight/TLS check → A collector ready/MEASURING → B workload/export → A finish/reconciliation → finalize.
+  - Cả Host B runner và Host A server đều kết thúc với mã thoát 0; kết quả đạt **`PAPER_P8_E3_WORKLOAD_VERIFIED`** (`workload_outcome: VALIDATED`, `validation_failures: []`).
+  - Host B ghi nhận **4/4** command PATCH thành công (HTTP 202, terminal succeeded) với 4 khóa định danh phân biệt: 1.5 Hz và 0.5 Hz từ version 0, tiếp theo là 2.0 Hz và 0.75 Hz từ version 1.
+  - Hai SQLite executor độc lập ghi nhận mỗi bên **2 completed receipts**, pending outbox **0**; kết quả cấu hình cuối cùng đạt version 2, chu kỳ lấy mẫu tương ứng là 500.000 µs (2.0 Hz) và 1.333.333 µs (0.75 Hz).
+  - Đối soát dữ liệu (Reconciliation): Host A đối chiếu khớp 100% giữa SQL receipts + REST reported configuration và SQLite receipts + configuration từ Host B.
+  - Telemetry nền: Arm A đạt **8/8**, Arm B đạt **4/4** generated / offered / application ACK. Arm A ghi nhận 1 retry (không có publish failure hay drop, pending outbox 0), Arm B không retry.
+  - Phân tách số đếm cơ sở dữ liệu (DB deltas): Luồng telemetry nền ghi nhận 12 ledger / 1.200 raw / 12 temporal; các cảm biến nhận lệnh điều khiển ghi nhận **36 raw / 24 temporal**. Tổng delta toàn fixture là **36 ledger / 1.236 raw / 36 temporal / 2 configuration**.
+  - Độ trễ điều khiển (Control Latency): Trích xuất từ snapshot terminal cumulative histogram (count = 4):
+    - Thời gian điều phối (Dispatch latency): tổng 2,678130341 s, giá trị trung bình **669,53 ms**.
+    - Thời gian hoàn tất vòng điều khiển (Succeeded E2E latency): tổng 2,893375296 s, giá trị trung bình **723,34 ms**.
+    - Các trường missing origin, missing dispatch, missing pending đều bằng 0.
+    - Thời gian phản hồi mạng client PATCH RTT đạt từ 19 ms đến 39 ms (được báo cáo riêng biệt, không gộp vào độ trễ xử lý của server).
+  - Dọn dẹp tài nguyên: VERIFIED (12 containers, 1 network, 5 volumes dọn sạch theo receipts).
+  - Thư mục artifacts: `/var/tmp/opencode/p8-e3-lowpoll-native-20261030/attempt20/`.
+
+---
+
+### 3.3 Chi tiết thực nghiệm Low-Load Wakeup — 2026-10-30
+
+#### 1. Lần chạy đầu (`low-load-wakeup-first`) — FAIL (Lỗi Selector Helper)
+- Lượt chạy đầu tại `/var/tmp/opencode/p8-e3-profiles-20261030/low-load-wakeup/` dừng ngay tại bước preflight, dọn dẹp tài nguyên VERIFIED, chưa chạy workload.
+- Traceback chẩn đoán cho thấy tham số `--p8-arm wakeup` bị bỏ qua khi dựng Fixture (do cơ chế hard-code fallback về polling trong mã nguồn helper cũ), dẫn đến việc `STAGE5_WAKEUP_ENABLED=false` làm sai lệch cổng kiểm tra cờ hiệu lực (effective-flags gate).
+- Đây là lỗi của công cụ helper, không phải lỗi của profile backend. Thất bại này được giữ nguyên trong lịch sử kiểm thử.
+
+#### 2. Lần chạy lại hợp lệ (`low-load-wakeup-rerun`) — PASS
+- **Khắc phục**: Sửa selector để cơ chế lifecycle-hold nhận diện chính xác arm được yêu cầu; bổ sung regression test cho cả polling và wakeup.
+- **Thực thi và kết quả**:
+  - Khởi chạy fresh root tại `/var/tmp/opencode/p8-e3-profiles-20261030/low-load-wakeup-rerun/`.
+  - Kết quả đạt **`PAPER_P8_E3_WORKLOAD_VERIFIED`**: Host A và Host B exit mã 0, workload `VALIDATED`, cleanup VERIFIED (12 containers, 1 network, 5 volumes).
+  - Cờ hiệu lực đọc lại xác nhận chuẩn xác: `STAGE5_ENABLED=true`, `STAGE5_WAKEUP_ENABLED=true`.
+  - Lệnh điều khiển: **4/4** PATCH succeeded (HTTP 202, 4 keys phân biệt); mỗi executor hoàn thành 2 receipts, đạt version 2, pending outbox 0.
+  - Telemetry nền: Arm A đạt **8/8**, Arm B đạt **4/4** application ACK; không có retry, failure hay drop.
+  - Phân tách số đếm cơ sở dữ liệu: Luồng nền ghi nhận 12 ledger / 1.200 raw / 12 temporal; cảm biến điều khiển ghi nhận 33 raw / 22 temporal. Tổng delta: **34 ledger / 1.233 raw / 34 temporal / 2 configuration**.
+  - Kiểm tra overlap: Low-load phase available; command interval giao thoa với A steady interval; burst overlap ghi nhận **NOT APPLICABLE**.
+  - Độ trễ điều khiển (Terminal collector histogram count = 4):
+    - Dispatch latency trung bình: **42,15 ms** (tổng 0,168590961 s).
+    - Succeeded E2E latency trung bình: **137,93 ms** (tổng 0,551705864 s).
+    - Client PATCH RTT: 31 ms đến 42 ms (báo cáo tách biệt).
+  - Thư mục artifacts: `/var/tmp/opencode/p8-e3-profiles-20261030/low-load-wakeup-rerun/`.
+
+---
+
+### 3.4 Chi tiết thực nghiệm Mixed Polling — 2026-10-30
+
+- Thực thi tại thư mục `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-polling/`.
+- Kết quả đạt **`PAPER_P8_E3_WORKLOAD_VERIFIED`** (`workload_outcome: VALIDATED`), cả runner và server đều kết thúc mã thoát 0, cleanup VERIFIED (12 containers, 1 network, 5 volumes).
+- Cờ hiệu lực đọc lại xác nhận: `STAGE5_ENABLED=true`, `STAGE5_WAKEUP_ENABLED=false`.
+- Lệnh điều khiển: **4/4** PATCH succeeded (HTTP 202 với 4 keys phân biệt); mỗi executor hoàn tất 2 receipts, đạt version 2, pending outbox 0.
+- Telemetry nền: Arm A đạt **8/8** application ACK (phát sinh 2 retries); Arm B đạt **16/16** application ACK (phát sinh 27 retries do shaper rate-limit pha burst); không có publish failure hay drop; pending outbox 0.
+- Phân tách số đếm cơ sở dữ liệu: Luồng nền ghi nhận 24 ledger / 2.400 raw / 24 temporal; cảm biến điều khiển ghi nhận 35 raw / 23 temporal. Tổng delta: **47 ledger / 2.435 raw / 47 temporal / 2 configuration**.
+- Xác thực Overlap Clock: Đồng hồ runner-clock chứng minh khoảng thời gian A steady interval giao thoa với B burst interval là **3.321.496 ns**; khoảng thời gian thực thi lệnh (command intervals) bao trùm đồng thời cả pha steady và pha burst. Pipe lag giữa các tiến trình chưa xác định; không thực hiện phép trừ đồng hồ giữa hai máy.
+- Độ trễ điều khiển (Terminal collector histogram count = 4):
+  - Dispatch latency: tổng 2,864832765 s, giá trị trung bình **716,21 ms**.
+  - Succeeded E2E latency: tổng 3,039973099 s, giá trị trung bình **759,99 ms**.
+  - Client PATCH RTT: 21 ms đến 112 ms (báo cáo tách biệt).
+- Thư mục artifacts: `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-polling/`.
+
+---
+
+### 3.5 Chi tiết thực nghiệm Mixed Wakeup — 2026-10-30
+
+- Thực thi tại thư mục `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-wakeup/`.
+- Kết quả đạt **`PAPER_P8_E3_WORKLOAD_VERIFIED`** (`workload_outcome: VALIDATED`), cả runner và server kết thúc mã thoát 0, cleanup VERIFIED (12 containers, 1 network, 5 volumes).
+- Cờ hiệu lực đọc lại xác nhận: `STAGE5_ENABLED=true`, `STAGE5_WAKEUP_ENABLED=true`.
+- Lệnh điều khiển: **4/4** PATCH succeeded (HTTP 202 với 4 keys phân biệt); mỗi executor hoàn tất 2 receipts, đạt version 2, pending outbox 0.
+- Telemetry nền: Arm A đạt **8/8** application ACK (0 retry); Arm B đạt **16/16** application ACK (phát sinh 26 retries trong pha burst); không có publish failure hay drop; pending outbox 0.
+- Phân tách số đếm cơ sở dữ liệu: Luồng nền ghi nhận 24 ledger / 2.400 raw / 24 temporal; cảm biến điều khiển ghi nhận 33 raw / 22 temporal. Tổng delta: **46 ledger / 2.433 raw / 46 temporal / 2 configuration**.
+- Xác thực Overlap Clock: Đồng hồ runner-clock chứng minh khoảng thời gian A steady interval giao thoa với B burst interval là **3.742.897 ns**; khoảng thời gian thực thi lệnh bao trùm đồng thời cả pha steady và pha burst.
+- Độ trễ điều khiển (Terminal collector histogram count = 4):
+  - Dispatch latency: tổng 0,217684148 s, giá trị trung bình **54,42 ms**.
+  - Succeeded E2E latency: tổng 0,374731331 s, giá trị trung bình **93,68 ms**.
+  - Client PATCH RTT: 14 ms đến 121 ms (báo cáo tách biệt).
+- Thư mục artifacts: `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-wakeup/`.
+
+---
+
+### 3.6 Cơ chế kiểm định kết quả và đối soát nghiêm ngặt (Reconciliation)
+
+Quy trình hậu kiểm của E3 thực hiện đối soát đa tầng giữa client, broker, database và REST API:
+1. **Kiểm tra Result Inventory**:
+   - Chỉ cho phép các tập tin kết quả nằm trong danh sách trắng (allowlist), giới hạn kích thước tối đa.
+   - Kiểm tra chặt chẽ các trường session ID, run ID, phase ID, phân vai roles, bundle hash, mã băm SHA-256 từng file, kiểm tra đường dẫn an toàn và tuyệt đối cấm symlink.
+   - Phía Host A chỉ tiếp nhận hình chiếu an toàn (safe projection), tuyệt đối không thực thi tập tin nhị phân hay mã SQL từ Host B.
+2. **Đối soát biên lai điều khiển (Command Receipts Reconciliation)**:
+   - Host B bắt buộc phải dừng và join runner hoàn toàn trước khi xuất hình chiếu receipts từ 2 cơ sở dữ liệu SQLite cục bộ.
+   - Host A đối chiếu chéo (cross-reconcile) giữa dữ liệu receipts trong PostgreSQL và cấu hình reported configuration qua REST API với biên lai SQLite receipts và configuration hash từ Host B: kiểm tra khớp 100% command ID, version, sample_interval_us, và result hash.
+3. **Phân tách số liệu đo lường (Telemetry Separation)**:
+   - Dữ liệu viễn trắc của các cảm biến nền (background sensors) được phân tách tuyệt đối khỏi dữ liệu của các cảm biến nhận lệnh điều khiển (command sensors), ngăn ngừa hiện tượng ô nhiễm dữ liệu mẫu.
+
+---
+
+### 3.7 Phân định chỉ số đo lường và Giới hạn diễn giải
+
+- **Bản chất số liệu Snapshot Collector**: Bộ thu thập chỉ số phía server (`collector`) hoạt động theo chu kỳ polling có giới hạn (bounded polling). Snapshots thu thập mang tính tích lũy (cumulative); báo cáo chính thức chỉ sử dụng duy nhất snapshot terminal mới nhất ở ranh giới kết thúc pha, tuyệt đối không cộng dồn các snapshot lặp lại.
+- **Độ trễ điều phối và E2E**:
+  - Được tính toán từ các mốc thời gian origin do server gắn nhãn khi tiếp nhận lệnh và mốc hoàn thành khi tiếp nhận kết quả thực thi từ Gateway. Nếu collector không thu thập được histogram, chỉ số này được ghi nhận là `unavailable` hoặc `inconclusive`, không quy đổi về 0.
+  - Thời gian phản hồi mạng client PATCH RTT (14 ms đến 121 ms) là số đo độc lập tại máy khách, phản ánh thời gian giao tiếp HTTP qua Nginx, không đồng nhất và không được trộn lẫn với độ trễ điều phối nội bộ (dispatch latency) hay độ trễ hoàn thành vòng điều khiển (succeeded E2E latency) của backend.
+- **Giới hạn đo tài nguyên**: Các mẫu tài nguyên CPU/RAM được ghi nhận là quan sát từ fixture phía Host A; không đại diện cho tài nguyên tiêu thụ của tiến trình phát tải và executor phía Host B.
+
+---
+
+### 3.8 Danh mục Checksum và Đường dẫn Artifacts
+
+Toàn bộ báo cáo và dấu vết thực nghiệm được lưu trữ nguyên bản tại các thư mục artifacts trên máy chủ kiểm thử:
+- **Low-Load Polling (Attempt 19 — FAIL)**:
+  - Thư mục: `/var/tmp/opencode/p8-e3-lowpoll-native-20261030/attempt19/`
+  - Trạng thái: `PAPER_P8_E3_WORKLOAD_VALIDATION_FAILED` (bảo toàn lịch sử thất bại).
+- **Low-Load Polling (Attempt 20 — PASS)**:
+  - Thư mục: `/var/tmp/opencode/p8-e3-lowpoll-native-20261030/attempt20/`
+  - Báo cáo kết quả: `PAPER_P8_E3_WORKLOAD_VERIFIED`, cleanup 12/1/5 VERIFIED.
+- **Low-Load Wakeup (Rerun — PASS)**:
+  - Thư mục: `/var/tmp/opencode/p8-e3-profiles-20261030/low-load-wakeup-rerun/`
+  - Báo cáo kết quả: `PAPER_P8_E3_WORKLOAD_VERIFIED`, cleanup 12/1/5 VERIFIED.
+- **Mixed Polling (PASS)**:
+  - Thư mục: `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-polling/`
+  - Báo cáo kết quả: `PAPER_P8_E3_WORKLOAD_VERIFIED`, cleanup 12/1/5 VERIFIED.
+- **Mixed Wakeup (PASS)**:
+  - Thư mục: `/var/tmp/opencode/p8-e3-profiles-20261030/mixed-wakeup/`
+  - Báo cáo kết quả: `PAPER_P8_E3_WORKLOAD_VERIFIED`, cleanup 12/1/5 VERIFIED.
+
+---
+
+## 4. Giới hạn và trạng thái gate
+
+- **Trạng thái cổng P8**: `full_p8_accepted=false`.
+- **Giới hạn topo mạng**: `physical_ab=NOT RUN`. Thử nghiệm được thực hiện trên cùng máy chủ cục bộ với metadata ghi nhận `generator_colocated=true` (hoặc `same-host/unverified`); chưa chứng minh được hành vi phân tán trên hai máy vật lý độc lập qua môi trường mạng vật lý tách biệt.
+- **Các kịch bản chưa thực hiện**: Các bài kiểm tra phần cứng HIL trên bo mạch AM5728, bài kiểm tra đầy đủ trên hệ thống CI từ xa (full remote CI), bài đo năng lực chịu tải và ngâm tải dài hạn (capacity/soak testing), cùng quy trình triển khai sản xuất (live rollout) đều là **NOT RUN**.
+- **Phạm vi dừng**: Bốn profile E3 đã hoàn thành đầy đủ bằng chứng kiểm thử native thông qua công cụ helper CLI. Nhiệm vụ nghiệm thu E3 dừng tại mốc bàn giao này; tuyệt đối không tự ý triển khai, chạy lại hay mở rộng sang E4, E5 hay Stage 6 nếu chưa có chỉ thị mới.

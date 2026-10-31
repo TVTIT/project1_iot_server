@@ -124,8 +124,12 @@ Trên terminal điều khiển khác của Host A, kiểm tra trạng thái cho 
 python3 scripts/paper_p8_server.py status --root "$ROOT/s100/A"
 ```
 
-Ghi nhận `session_id` từ kết quả status (gọi là `SESSION_ID_100`). Xác nhận tập tin thực thi lưu trữ đã sẵn sàng tại:
-`$ROOT/s100/A/fixture/artifacts/bin/paperload`.
+Đặt `session_id` nhận được vào biến `SESSION_ID_100` để dùng cho các lệnh sau (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế nhận được từ status):
+
+```sh
+SESSION_ID_100=<session_id>
+# Ví dụ: SESSION_ID_100=e817d576fffef0wB...
+```
 
 #### Bước 2 — Chuyển giao gói dữ liệu sang Host B (Manual Transfer Step)
 
@@ -241,7 +245,12 @@ python3 scripts/paper_p8_server.py serve \
   --reference "$ROOT/s100/A/fixture/artifacts/p8-e2-equal-samples-100-remote-result.json"
 ```
 
-Kiểm tra status chờ đạt `preparation_status=E2_PREPARED` và `phase=READY`, lấy `SESSION_ID_1`.
+Kiểm tra status chờ đạt `preparation_status=E2_PREPARED` và `phase=READY`. Đặt `session_id` nhận được vào biến `SESSION_ID_1` để dùng cho các lệnh sau (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế từ status):
+
+```sh
+SESSION_ID_1=<session_id>
+# Ví dụ: SESSION_ID_1=f928e461b2a3...
+```
 
 #### Bước 9 — Thực hiện chu kỳ đo lường cho Profile S=1
 
