@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -441,6 +442,64 @@ def _verify_control_receipts(sqlite_summaries, commands, postgres_receipts, rest
     return verified
 
 
+def _e3_control_targets(prepared):
+    """Return target objects from the canonical dict-shaped manifest targets."""
+    targets = prepared.get('control_targets')
+    if (not isinstance(targets, list) or len(targets) != 2
+            or any(not isinstance(row, dict) or not row.get('gateway_id') or not row.get('sensor_id')
+                   for row in targets)):
+        raise ValueError('e3_control_targets_invalid')
+    return [SimpleNamespace(gateway_id=row['gateway_id'], sensor_id=row['sensor_id'],
+        sensor_urn=f"urn:ngsi-ld:Sensor:{row['gateway_id']}:{row['sensor_id']}",
+        rest_path=f"/v1/digital-twins/urn:ngsi-ld:Sensor:{row['gateway_id']}:{row['sensor_id']}?format=simplified")
+        for row in targets]
+
+
+def _e3_command_database_delta(before, after):
+    if len(before) != 2 or len(after) != 2:
+        raise ValueError('e3_command_counts_invalid')
+    return {
+        'raw_samples': sum(after[i]['raw'] - before[i]['raw'] for i in range(2)),
+        'temporal_observations': sum(after[i]['temporal'] - before[i]['temporal'] for i in range(2)),
+    }
+
+
+def _e3_executor_receipt_projection(executor_data):
+    """Project the exported Go supervisor's SQLite evidence without fabricating fields."""
+    if not isinstance(executor_data, list) or len(executor_data) != 2:
+        raise ValueError('e3_executor_receipts_invalid')
+    projected = []
+    for executor in executor_data:
+        receipts = executor.get('receipts') if isinstance(executor, dict) else None
+        if (not isinstance(receipts, list) or not isinstance(executor.get('pending_outbox'), int)
+                or type(executor.get('pending_outbox')) is bool):
+            raise ValueError('e3_executor_receipts_invalid')
+        projected.append({
+            'receipts': [{'command_id': row.get('command_id'),
+                          'result_hash': (row.get('result') or {}).get('result_sha256'),
+                          'desired_version': row.get('desired_version'),
+                          'sample_interval_us': row.get('sample_interval_us'),
+                          'status': row.get('status'),
+                          'result_summary': row.get('result') or {}}
+                         for row in receipts if isinstance(row, dict)],
+            'completed_receipts_count': sum(row.get('status') == 'completed' for row in receipts
+                                            if isinstance(row, dict)),
+            'pending_outbox': executor['pending_outbox'],
+            'configuration': executor.get('configuration'),
+        })
+    return projected
+
+
+def _e3_reported_configuration(body):
+    if not isinstance(body, dict):
+        raise ValueError('e3_rest_reported_configuration_missing')
+    reported = body.get('reported_state')
+    configuration = reported.get('configuration') if isinstance(reported, dict) else None
+    if not isinstance(configuration, dict) or not configuration:
+        raise ValueError('e3_rest_reported_configuration_missing')
+    return configuration
+
+
 def _pending_outbox_identities(db_path, max_rows=500, max_bytes=4 << 20):
     """Read, but never mutate, a bounded snapshot of pending payload identities."""
     p = Path(db_path).resolve()
@@ -560,8 +619,238 @@ def _drain_executor_outboxes(smoke, fixture, registry, pg, gateway_binary, env_f
     return results
 
 
+def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
+            arm, workload='mixed', remote_profile=None, session_id=None):
+    """Provision E3 inputs only; no producer, executor, or command is started."""
+    return run(smoke, fixture, endpoint, registry, containers, images, state,
+               None, None, arm, workload, prepare_only=True,
+               remote_profile=remote_profile, session_id=session_id)
+
+
+def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_seconds=60):
+    """Export the prepared E3 inputs through the existing bounded P8 bundle format."""
+    try:
+        from scripts import paper_p8_bundle
+    except ModuleNotFoundError:
+        spec = importlib.util.spec_from_file_location(
+            'paper_p8_bundle_runtime', _SCRIPTS / 'paper_p8_bundle.py')
+        paper_p8_bundle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(paper_p8_bundle)
+    root = Path(prepared['root'])
+    ca_root = root / 'portable-ca-inputs'
+    ca_root.mkdir(mode=0o700, exist_ok=False)
+    ca_files = {}
+    for name, source in (('https', prepared['https_ca_file']), ('mqtt', prepared['mqtt_ca_file'])):
+        target = ca_root / f'{name}-ca.pem'
+        target.write_bytes(Path(source).read_bytes())
+        target.chmod(0o600)
+        ca_files[name] = target
+    identities = {'A:telemetry': prepared['telemetry_files']['A'],
+                  'B:telemetry': prepared['telemetry_files']['B'],
+                  'control:control': prepared['control_token_file']}
+    manifests = {name: str(Path(path).resolve()) for name, path in
+                 zip(('A', 'B', 'control'), [str(root / 'plan' / f'{name}.manifest.json')
+                                              for name in ('A', 'B', 'control')])}
+    role_metadata = {'roles': {
+        'A:telemetry': {'role': 'telemetry', 'principals': []},
+        'B:telemetry': {'role': 'telemetry', 'principals': []},
+        'control:control': {'role': 'control', 'principals': ['e3-operator']}},
+        'gateways': {gateway_id: {'role': 'gateway', 'gateway_id': gateway_id,
+            'username': json.loads(Path(path).read_text())['username']}
+            for gateway_id, path in prepared['gateway_files'].items()}}
+    spec = json.loads(Path(prepared['plan']['run_spec']).read_text(encoding='utf-8'))
+    workload = {'experiment': 'E3', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
+        'profile': 'pilot', 'workload': prepared['workload'], 'seed': 89,
+        'generator_colocated': 'unverified', 'dispatch_mode': prepared['arm']}
+    return paper_p8_bundle.export_bundle(output_leaf=output_leaf,
+        session_id=prepared['session_id'], experiment='E3', arm=prepared['arm'],
+        phase=prepared['phase_id'], manifests=manifests, identity_files=identities,
+        gateway_identity_files=prepared['gateway_files'],
+        gateway_env_files={f'executor-{i+1}': path for i, path in enumerate(prepared['gateway_env_files'])},
+        ca_files=ca_files, role_metadata=role_metadata, wait_seconds=wait_seconds,
+        workload_seconds=workload_seconds, topology={'gateways': 2, 'sensors': 4,
+            'sensors_per_gateway': 2, 'users': 0, 'viewers': 0}, workload=workload,
+        run_spec=prepared['plan']['run_spec'])
+
+
+def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prepared, *, phase_id):
+    """Capture scoped baseline and start bounded A-side polling before B is ACKed."""
+    if phase_id != prepared['phase_id']:
+        raise ValueError('e3_phase_id_mismatch')
+    from paper_p8_e2_support import _support
+    before_global = smoke.paper_p1_count_db(registry, prepared['pg'])
+    before_background = [_target_counts(smoke, registry, prepared['pg'], spec)
+                         for spec in prepared['specs']]
+    before_commands = [_target_counts(smoke, registry, prepared['pg'], target)
+                       for target in _e3_control_targets(prepared)]
+    baseline = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+    collector = BoundedCollector(scrape=lambda: _support._admin_metrics(
+        smoke, endpoint, prepared['tokens']['admin']), interval=0.5, max_snapshots=64,
+        deadline_seconds=120, baseline_metrics=baseline,
+        baseline_server=smoke.paper_p0_stats(registry, containers, 'e3_workload_start'))
+    prepared.update(before_global=before_global, before_background=before_background,
+                    before_commands=before_commands, baseline=baseline, collector=collector)
+    collector.start(None)
+    return {'collector_ready': True, 'phase_id': phase_id, 'dispatch_mode': prepared['arm'],
+            'workload': prepared['workload']}
+
+
+def _load_e3_result_bundle(results_root, prepared, paperload_binary):
+    """Load only the exact bounded result inventory exported by the bound B workspace."""
+    root = Path(results_root).absolute()
+    if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
+        raise ValueError('e3_result_root_rejected')
+    summary_path = root / 'results.json'
+    if summary_path.is_symlink() or not summary_path.is_file() or summary_path.stat().st_mode & 0o077:
+        raise ValueError('e3_result_summary_rejected')
+    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    roles = ['A', 'B', 'control']
+    expected_session = {'session_id': prepared['session_id'], 'run_ids': [prepared['run_id']],
+                        'experiment': 'E3', 'arm': prepared['arm'], 'phase': prepared['phase_id']}
+    if (summary.get('session') != expected_session or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
+            or summary.get('expected_workload_roles') != roles or summary.get('present_workload_roles') != roles
+            or summary.get('missing_workload_roles') != [] or summary.get('full_p8_accepted') is not False
+            or summary.get('physical_ab') != 'NOT RUN'):
+        raise ValueError('e3_result_correlation_rejected')
+    expected = {f'results/workloads/{r}/workload.json': r for r in roles}
+    expected.update({'results/runner/run.json': 'runner', 'results/runner/provenance.json': 'provenance',
+                     'results/runner/executor-receipts.json': 'executors'})
+    inventory = summary.get('files')
+    if not isinstance(inventory, list) or len(inventory) != len(expected):
+        raise ValueError('e3_result_inventory_rejected')
+    values, seen, total = {}, set(), 0
+    for row in inventory:
+        rel = row.get('path') if isinstance(row, dict) else None
+        if rel not in expected or rel in seen or type(row.get('size_bytes')) is not int or row['size_bytes'] > 8 << 20:
+            raise ValueError('e3_result_inventory_rejected')
+        seen.add(rel)
+        path = root / rel
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError('e3_result_file_rejected')
+        data = path.read_bytes()
+        total += len(data)
+        if total > 32 << 20:
+            raise ValueError('e3_result_total_size_rejected')
+        if len(data) != row['size_bytes'] or hashlib.sha256(data).hexdigest() != row.get('sha256'):
+            raise ValueError('e3_result_digest_mismatch')
+        value = json.loads(data)
+        kind = expected[rel]
+        if kind in ('A', 'B', 'control') and not _e3_workload_provenance_valid(
+                value, kind, prepared['run_id']):
+            raise ValueError('e3_workload_provenance_mismatch')
+        if kind == 'provenance':
+            if (not isinstance(value, dict) or set(value) != {'binary_sha256', 'binary_os', 'binary_arch'}
+                    or not re.fullmatch(r'[0-9a-f]{64}', value.get('binary_sha256', ''))
+                    or value.get('binary_os') != sys.platform
+                    or value.get('binary_arch') != __import__('platform').machine()):
+                raise ValueError('e3_binary_provenance_mismatch')
+        values[kind] = value
+    if seen != set(expected):
+        raise ValueError('e3_result_roles_missing')
+    if (summary.get('binary') != values.get('provenance')
+            or summary.get('source_inventory') != prepared.get('bundle_inventory')
+            or not isinstance(summary.get('bound_manifest_sha256'), dict)
+            or set(summary['bound_manifest_sha256']) != {'A', 'B', 'control'}
+            or any(not isinstance(x, str) or not re.fullmatch(r'[0-9a-f]{64}', x)
+                   for x in summary['bound_manifest_sha256'].values())
+            or not isinstance(summary.get('bound_gateway_environment_sha256'), dict)
+            or len(summary['bound_gateway_environment_sha256']) != 2
+            or any(not isinstance(x, str) or not re.fullmatch(r'[0-9a-f]{64}', x)
+                   for x in summary['bound_gateway_environment_sha256'].values())
+            or not isinstance(summary.get('bound_run_spec_sha256'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', summary['bound_run_spec_sha256'])):
+        raise ValueError('e3_result_provenance_rejected')
+    return values
+
+
+def _e3_workload_provenance_valid(value, role, run_id):
+    """E3 carries E2 A/B telemetry children alongside its E3 control child."""
+    if not isinstance(value, dict) or role not in ('A', 'B', 'control'):
+        return False
+    expected_experiment = 'E3' if role == 'control' else 'E2'
+    return (value.get('experiment') == expected_experiment
+            and value.get('arm') == role
+            and value.get('run_id') == run_id
+            and (role == 'control' or value.get('mode') == 'remote'))
+
+
+def finish_remote_collection(smoke, fixture, endpoint, registry, containers, prepared,
+                             results_root, *, phase_id, paperload_binary):
+    """Stop collector and reconcile imported evidence against independent A-side reads."""
+    if phase_id != prepared['phase_id'] or not prepared.get('collector'):
+        raise ValueError('e3_phase_collection_mismatch')
+    imported = _load_e3_result_bundle(results_root, prepared, paperload_binary)
+    collector = prepared['collector']
+    collector.stop(None)
+    from paper_p8_e2_support import _support
+    terminal_admin = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+    collector.metrics.append({'phase': 'workload_terminal', 'snapshot': terminal_admin})
+    collector.resources.append(smoke.paper_p0_stats(registry, containers, 'e3_workload_terminal'))
+    after_global = smoke.paper_p1_count_db(registry, prepared['pg'])
+    after_background = [_target_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
+    after_commands = [_target_counts(smoke, registry, prepared['pg'], target)
+                      for target in _e3_control_targets(prepared)]
+    delta = {k: after_global[k] - prepared['before_global'][k] for k in prepared['before_global']}
+    bg_delta = {k: sum(after_background[i][k] - prepared['before_background'][i][k] for i in range(2))
+                for k in ('ledger', 'raw', 'temporal')}
+    command_delta = _e3_command_database_delta(prepared['before_commands'], after_commands)
+    control = imported['control']
+    keys = [row.get('idempotency_key') for row in control.get('commands', [])]
+    pg_receipts = {}
+    for key in keys:
+        text = smoke.db_psql(registry, prepared['pg'], """SELECT json_build_object(
+          'idempotency_key',r.idempotency_key,'command_id',r.command_id::text,'status',c.status,
+          'result_hash',c.result_hash,'desired_version',c.desired_version::text,
+          'sample_interval_us',(c.parameters->>'sample_interval_us')::bigint)::text
+          FROM twin_command_requests r JOIN twin_commands c ON c.command_id=r.command_id
+          WHERE r.idempotency_key=:'key' AND r.status_code=202;""", {'key': key}).strip()
+        if text:
+            pg_receipts[key] = json.loads(text)
+    sqlite = _e3_executor_receipt_projection(imported['executors'])
+    rest = {}
+    control_targets = _e3_control_targets(prepared)
+    for target in control_targets:
+        sid = target.sensor_id
+        status, _, body = smoke.http_request(endpoint, 'GET',
+            target.rest_path, token=prepared['tokens']['a'])
+        if status != 200 or not isinstance(body, dict):
+            raise ValueError('e3_rest_config_read_failed')
+        rest[sid] = _e3_reported_configuration(body)
+    receipts_ok = _verify_control_receipts(sqlite, prepared['manifests']['control']['commands'],
+        pg_receipts, rest, [target.sensor_id for target in control_targets])
+    receipt_verification = {'verified': receipts_ok and len(pg_receipts) == 4,
+                            'verified_idempotency_keys': list(pg_receipts)}
+    workload = prepared['workload']
+    raw_checks = []
+    for role, index in (('A', 0), ('B', 1)):
+        producer_ids = [row.get('message_id') for row in imported[role].get('identity_samples', [])
+                        if isinstance(row, dict) and isinstance(row.get('message_id'), str)]
+        raw_checks.append(verify_pilot_raw(smoke, registry, prepared['pg'],
+            prepared['specs'][index], message_ids=producer_ids))
+    validation = validate_e3_result(control_workload=control, telemetry_a=imported['A'], telemetry_b=imported['B'],
+        phase_events=imported['runner'].get('phase_observations', {}).get('events', []),
+        background_database_delta=bg_delta, command_database_delta=command_delta,
+        control_receipt_verification=receipt_verification,
+        runner_stopped=imported['runner'].get('actual_stop_confirmed') is True,
+        declared_idempotency_keys=prepared['manifests']['idempotency_keys'], raw_checks=raw_checks,
+        workload=workload, collector_metrics=collector.metrics)
+    if collector.errors:
+        validation['valid'] = False
+        validation.setdefault('failures', []).append('collector_incomplete')
+    return {'status': 'PASS' if validation['valid'] else 'FAIL',
+        'workload_outcome': 'VALIDATED' if validation['valid'] else 'VALIDATION_FAILED',
+        'experiment': 'E3', 'arm': prepared['arm'], 'workload': workload, 'dispatch_mode': prepared['arm'],
+        'session_id': prepared['session_id'], 'run_id': prepared['run_id'], 'phase_id': phase_id,
+        'database_delta': delta, 'background_database_delta': bg_delta,
+        'command_database_delta': command_delta, 'collector_metrics': collector.metrics,
+        'collector_resources': collector.resources, 'collector_errors': collector.errors,
+        'validation': validation, 'full_p8_accepted': False, 'generator_colocated': True,
+        'physical_ab': 'NOT RUN'}
+
+
 def run(smoke, fixture, endpoint, registry, containers, images, state,
-        paperload_binary, gateway_binary, arm, workload='mixed'):
+        paperload_binary, gateway_binary, arm, workload='mixed', *,
+        prepare_only=False, remote_profile=None, session_id=None):
     """Execute E3 pilot workload for given arm (polling or wakeup) in disposable fixture."""
     pilot_arms = e3_pilot_arms()
     if arm not in pilot_arms:
@@ -585,10 +874,32 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         raise ValueError('p8_mqtt_mapping_readback_rejected')
     published = int(ports[0].get('HostPort', '0'))
     host_ip = ports[0].get('HostIp')
-    _support.validate_mqtt_readback({'service': 'mosquitto', 'host_ip': host_ip,
-        'target': 8883, 'published': published}, owned_service='mosquitto')
-    mqtt_broker_url = f'ssl://127.0.0.1:{published}'
-    manifest_mqtt_endpoint = f'mqtts://127.0.0.1:{published}'
+    if remote_profile is None:
+        _support.validate_mqtt_readback({'service': 'mosquitto', 'host_ip': host_ip,
+            'target': 8883, 'published': published}, owned_service='mosquitto')
+    else:
+        smoke.paper_p8_remote_support().validate_runtime_mapping(
+            'mosquitto', broker.get('NetworkSettings', {}).get('Ports') or {}, remote_profile)
+    if remote_profile is not None:
+        remote_support = smoke.paper_p8_remote_support()
+        remote_support.validate_runtime_mapping(
+            'mosquitto', broker.get('NetworkSettings', {}).get('Ports') or {}, remote_profile)
+        nginx = registry.resolve(containers['nginx'])
+        remote_support.validate_runtime_mapping(
+            'nginx', nginx.get('NetworkSettings', {}).get('Ports') or {}, remote_profile)
+        advertised_host = remote_profile['advertised_host']
+        advertised_mqtt = remote_profile['advertised_mqtt_tls']
+        from urllib.parse import urlsplit
+        mqtt_url = urlsplit(advertised_mqtt)
+        mqtt_broker_url = f'ssl://{mqtt_url.hostname}:{mqtt_url.port}'
+        manifest_mqtt_endpoint = advertised_mqtt
+        https_endpoint = remote_profile['advertised_https']
+        execution_mode = 'remote'
+    else:
+        mqtt_broker_url = f'ssl://127.0.0.1:{published}'
+        manifest_mqtt_endpoint = f'mqtts://127.0.0.1:{published}'
+        https_endpoint = endpoint.url
+        execution_mode = 'local'
 
     root = fixture.private / 'p8-e3' / arm
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -641,14 +952,14 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
     smoke.private_write(control_token_file, json.dumps({'e3-operator': tokens['a']}, sort_keys=True))
 
     common = {
-        'mode': 'local',
-        'run_id': f'{fixture.project}-e3-{arm}',
+        'mode': execution_mode,
+        'run_id': (f'p8e3-{session_id}-{arm}' if session_id else f'{fixture.project}-e3-{arm}'),
         'seed': 89,
         'bundle_path': str(root),
         'publish_timeout_ms': 3000,
     }
     tls_config = {
-        'https_endpoint': endpoint.url,
+        'https_endpoint': https_endpoint,
         'https_ca_file': str(endpoint.ca_file),
         'mqtt_tls_endpoint': manifest_mqtt_endpoint,
         'mqtt_tls_ca_file': str(ca_path),
@@ -665,6 +976,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         tls=tls_config,
         workload=workload,
     )
+    manifest_bundle['control']['mode'] = execution_mode
 
     gateway_env_files = []
     executor_outbox_paths = []
@@ -708,6 +1020,24 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         gateway_env_files=gateway_env_files,
         shutdown_timeouts_seconds=[10, 10],
     )
+
+    prepared = {
+        'experiment': 'E3', 'session_id': session_id, 'run_id': common['run_id'],
+        'phase_id': f'e3-{workload}-{arm}', 'arm': arm, 'workload': workload,
+        'mode': execution_mode, 'profile': arm_profile, 'schema': schema,
+        'quota': quota, 'effective': effective, 'resources': resources,
+        'storage_status': storage_status, 'tokens': tokens, 'specs': specs,
+        'passwords': passwords, 'pg': pg, 'root': root, 'control_targets': control_targets,
+        'command_sensor_ids': cmd_sensor_ids, 'initial_versions': initial_versions,
+        'background_targets': background_targets, 'gateway_files': gateway_files,
+        'telemetry_files': telemetry_files, 'control_token_file': control_token_file,
+        'gateway_env_files': gateway_env_files, 'executor_outbox_paths': executor_outbox_paths,
+        'manifests': manifest_bundle, 'plan': plan, 'https_endpoint': https_endpoint,
+        'mqtt_endpoint': manifest_mqtt_endpoint, 'https_ca_file': str(endpoint.ca_file),
+        'mqtt_ca_file': str(ca_path), 'advertised_host': (advertised_host if remote_profile else '127.0.0.1'),
+    }
+    if prepare_only:
+        return prepared
 
     before_global = smoke.paper_p1_count_db(registry, pg)
     before_bg_targets = [_target_counts(smoke, registry, pg, spec) for spec in specs]

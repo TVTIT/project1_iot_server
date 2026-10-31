@@ -1,4 +1,7 @@
 import json
+import hashlib
+import platform
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +9,8 @@ from pathlib import Path
 from scripts.tests.paper_p8_e1_support import (
     mixed_e1_mapping, role_artifacts, safe_effective_flags, validate_e1_result,
     _drain_websocket_metrics, websocket_metrics_window, e1_role_manifests,
+    export_prepared_bundle,
+    _load_result_bundle,
 )
 
 
@@ -33,6 +38,105 @@ class E1PilotSupportTests(unittest.TestCase):
         self.assertNotIn('durability_mode', viewer)
         self.assertEqual(viewer['viewer'], {'mode': 'healthy'})
         self.assertEqual(telemetry['durability_mode'], 'synthetic-load')
+
+    def test_remote_export_passes_exact_prepared_roles_and_session_correlation(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); root.chmod(0o700)
+            viewer = root / 'viewer.json'; viewer.write_text('{"user-000":"jwt","user-001":"jwt"}')
+            telemetry = root / 'telemetry.json'; telemetry.write_text('{}')
+            gateway = root / 'gw.json'; gateway.write_text('{"username":"gw-a","password":"private"}')
+            run_spec = root / 'run-spec.json'
+            run_spec.write_text(json.dumps({'paperload': [
+                {'manifest': str(root/'viewer.manifest.json')},
+                {'manifest': str(root/'telemetry.manifest.json')}]}))
+            ca_https = root / 'https-ca.pem'; ca_https.write_text('https-ca')
+            ca_mqtt = root / 'mqtt-ca.pem'; ca_mqtt.write_text('mqtt-ca')
+            prepared = {'viewer_identity': viewer, 'telemetry_identity': telemetry,
+                'gateway_refs': {'gw-a': gateway}, 'plan': {'run_spec': str(run_spec)},
+                'common': {'arm': 'e1-pilot', 'topology': {'gateways': 2,
+                    'sensors_per_gateway': 2, 'users': 2, 'viewers': 64}},
+                'targets': self.targets, 'root': root, 'session_id': 'a' * 32, 'phase': 'pilot',
+                'https_ca_file': ca_https, 'mqtt_ca_file': ca_mqtt}
+            with mock.patch('scripts.paper_p8_bundle.export_bundle', return_value={'bundle_root':'fresh'}) as export:
+                result = export_prepared_bundle(prepared, output_leaf=root/'bundle')
+            kwargs = export.call_args.kwargs
+            self.assertEqual(result, {'bundle_root':'fresh'})
+            self.assertEqual(kwargs['session_id'], 'a' * 32)
+            self.assertEqual(kwargs['arm'], 'e1-pilot')
+            self.assertEqual(kwargs['phase'], 'pilot')
+            self.assertEqual(kwargs['role_metadata']['roles']['viewer']['principals'], ['user-000','user-001'])
+            self.assertEqual(kwargs['role_metadata']['roles']['telemetry']['principals'], [])
+            self.assertNotIn('admin', json.dumps(kwargs['role_metadata']))
+
+    def _result_bundle(self, root, *, session_id='a'*32, role='telemetry', unsafe_path=None,
+                       bound_gateway_environment=None):
+        root.mkdir(mode=0o700)
+        binary = b'paperload-binary'
+        digest = hashlib.sha256(binary).hexdigest()
+        payloads = {
+            'results/runner/run.json': {'status':'COMPLETE'},
+            'results/runner/provenance.json': {'binary_sha256':digest,
+                'binary_os':sys.platform,'binary_arch':platform.machine()},
+            'results/workloads/viewer/workload.json': {'status':'COMPLETE','experiment':'E1',
+                'arm':'e1-pilot','run_id':'p8e1-'+('a'*32),'mode':'remote','profile':'pilot'},
+            'results/workloads/telemetry/workload.json': {'status':'COMPLETE','experiment':'E2',
+                'arm':'e1-pilot','run_id':'p8e1-'+('a'*32),'mode':'remote','profile':'pilot'},
+        }
+        rows=[]
+        for rel, value in payloads.items():
+            data=json.dumps(value,separators=(',',':')).encode()
+            path=root/rel; path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            path.write_bytes(data); path.chmod(0o600)
+            rows.append({'path':rel,'size_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+        summary={'schema_version':1,'full_p8_accepted':False,'physical_ab':'NOT RUN',
+            'session':{'session_id':session_id,'run_ids':['p8e1-'+'a'*32],
+                'experiment':'E1','arm':'e1-pilot','phase':'pilot'},
+            'source_bundle_sha256':'b'*64,'runner_status':'COMPLETE',
+            'expected_workload_roles':['telemetry','viewer'],
+            'present_workload_roles':['telemetry','viewer'],'missing_workload_roles':[],
+            'source_inventory':[], 'bound_manifest_sha256':{'viewer':'1'*64,'telemetry':'2'*64},
+            'bound_gateway_environment_sha256':bound_gateway_environment or {}, 'bound_run_spec_sha256':'3'*64,
+            'binary':payloads['results/runner/provenance.json'],
+            'files':rows}
+        if unsafe_path:
+            summary['files'][0]['path']=unsafe_path
+        data=json.dumps(summary).encode()
+        (root/'results.json').write_bytes(data); (root/'results.json').chmod(0o600)
+        prepared={'session_id':'a'*32,'run_id':'p8e1-'+'a'*32,
+            'common':{'arm':'e1-pilot'},'bundle_sha256':'b'*64,'bundle_inventory':[],
+            'gateway_refs':{'gw-a':'/unused/a','gw-b':'/unused/b'}}
+        return prepared,digest
+
+    def test_imported_result_requires_correlation_all_roles_and_digest_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)/'results'; prepared,binary=self._result_bundle(root)
+            loaded=_load_result_bundle(root,prepared,phase_id='pilot',binary_sha256=binary)
+            self.assertEqual(set(loaded),{'viewer','telemetry','_result_status','runner','binary_provenance'})
+        for kwargs, code in (({'session_id':'c'*32},'result_bundle_correlation_rejected'),
+                             ({'unsafe_path':'../outside'},'result_inventory_rejected'),
+                             ({'bound_gateway_environment':{'unexpected':'4'*64}},
+                              'result_manifest_provenance_rejected')):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)/'results'; prepared,binary=self._result_bundle(root,**kwargs)
+                with self.assertRaisesRegex(ValueError,code):
+                    _load_result_bundle(root,prepared,phase_id='pilot',binary_sha256=binary)
+
+    def test_imported_result_rejects_symlink_and_oversized_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)/'results'; prepared,binary=self._result_bundle(root)
+            target=root/'results/runner/run.json'
+            data=target.read_bytes(); target.unlink(); outside=Path(directory)/'outside.json'
+            outside.write_bytes(data); outside.chmod(0o600); target.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError,'result_path_symlink_rejected'):
+                _load_result_bundle(root,prepared,phase_id='pilot',binary_sha256=binary)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)/'results'; prepared,binary=self._result_bundle(root)
+            summary=json.loads((root/'results.json').read_text())
+            summary['files'][0]['size_bytes']=9<<20
+            (root/'results.json').write_text(json.dumps(summary)); (root/'results.json').chmod(0o600)
+            with self.assertRaisesRegex(ValueError,'result_inventory_rejected'):
+                _load_result_bundle(root,prepared,phase_id='pilot',binary_sha256=binary)
 
     def valid_inputs(self):
         mapping = mixed_e1_mapping(self.targets)

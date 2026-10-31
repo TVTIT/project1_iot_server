@@ -15,6 +15,77 @@ from scripts.paper_p8 import GATEWAY_ENV_KEYS, _gateway_environment
 
 
 class E3FixtureTests(unittest.TestCase):
+    def test_control_target_dicts_map_to_real_sensor_scopes_and_positive_raw_delta(self):
+        prepared = {'control_targets': [
+            {'gateway_id': 'gw-real', 'sensor_id': 'sensor-alpha'},
+            {'gateway_id': 'gw-real', 'sensor_id': 'sensor-beta'},
+        ]}
+        targets = e3_fixture._e3_control_targets(prepared)
+        self.assertEqual([target.sensor_id for target in targets], ['sensor-alpha', 'sensor-beta'])
+        self.assertEqual([target.sensor_urn for target in targets], [
+            'urn:ngsi-ld:Sensor:gw-real:sensor-alpha',
+            'urn:ngsi-ld:Sensor:gw-real:sensor-beta'])
+        self.assertEqual([target.rest_path for target in targets], [
+            '/v1/digital-twins/urn:ngsi-ld:Sensor:gw-real:sensor-alpha?format=simplified',
+            '/v1/digital-twins/urn:ngsi-ld:Sensor:gw-real:sensor-beta?format=simplified'])
+        delta = e3_fixture._e3_command_database_delta(
+            [{'raw': 10, 'temporal': 10}, {'raw': 20, 'temporal': 20}],
+            [{'raw': 13, 'temporal': 13}, {'raw': 22, 'temporal': 22}])
+        self.assertEqual(delta, {'raw_samples': 5, 'temporal_observations': 5})
+
+    def test_e3_workload_provenance_qualifies_e2_telemetry_children_and_e3_control(self):
+        run_id = 'p8e3-session-polling'
+        for role in ('A', 'B'):
+            self.assertTrue(e3_fixture._e3_workload_provenance_valid(
+                {'experiment': 'E2', 'arm': role, 'run_id': run_id, 'mode': 'remote'},
+                role, run_id))
+        self.assertTrue(e3_fixture._e3_workload_provenance_valid(
+            {'experiment': 'E3', 'arm': 'control', 'run_id': run_id}, 'control', run_id))
+        self.assertFalse(e3_fixture._e3_workload_provenance_valid(
+            {'experiment': 'E3', 'arm': 'A', 'run_id': run_id, 'mode': 'remote'}, 'A', run_id))
+        self.assertFalse(e3_fixture._e3_workload_provenance_valid(
+            {'experiment': 'E2', 'arm': 'B', 'run_id': 'stale', 'mode': 'remote'}, 'B', run_id))
+
+    def test_prepare_seam_is_explicitly_preparation_only_and_accepts_profile_arguments(self):
+        with patch.object(e3_fixture, 'run', return_value={'experiment': 'E3'}) as runner:
+            result = e3_fixture.prepare('smoke', 'fixture', 'endpoint', 'registry',
+                'containers', 'images', 'state', arm='polling', workload='low_load',
+                remote_profile={'advertised_https': 'https://example.invalid',
+                                'advertised_mqtt_tls': 'mqtts://example.invalid:8883'},
+                session_id='0123456789abcdef0123456789abcdef')
+        self.assertEqual(result, {'experiment': 'E3'})
+        args, kwargs = runner.call_args
+        self.assertEqual(args[7:9], (None, None))
+        self.assertEqual(kwargs, {'prepare_only': True, 'remote_profile': {
+            'advertised_https': 'https://example.invalid',
+            'advertised_mqtt_tls': 'mqtts://example.invalid:8883'},
+            'session_id': '0123456789abcdef0123456789abcdef'})
+
+    def test_e3_bundle_export_keeps_three_roles_and_two_executor_envs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for rel in ('https-ca.pem','mqtt-ca.pem','telemetry-a.json','telemetry-b.json',
+                        'control.json','gw-a.json','env-a.json','env-b.json','run-spec.json',
+                        'plan/A.manifest.json','plan/B.manifest.json','plan/control.manifest.json'):
+                path=root/rel; path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                path.write_text('{}'); path.chmod(0o600)
+            (root/'gw-a.json').write_text(json.dumps({'username':'gw-a','password':'pw'}))
+            prepared={'root':root,'https_ca_file':root/'https-ca.pem','mqtt_ca_file':root/'mqtt-ca.pem',
+                'telemetry_files':{'A':root/'telemetry-a.json','B':root/'telemetry-b.json'},
+                'control_token_file':root/'control.json','gateway_files':{'gw-a':root/'gw-a.json'},
+                'gateway_env_files':[root/'env-a.json',root/'env-b.json'],
+                'plan':{'run_spec':str(root/'run-spec.json')},'session_id':'s'*32,
+                'arm':'polling','phase_id':'e3-low_load-polling','workload':'low_load'}
+            with patch('scripts.paper_p8_bundle.export_bundle', return_value={'file_count':12}) as export:
+                result=e3_fixture.export_prepared_bundle(prepared,output_leaf=root/'bundle')
+            self.assertEqual(result['file_count'],12)
+            kwargs=export.call_args.kwargs
+            self.assertEqual(kwargs['experiment'],'E3')
+            self.assertEqual(set(kwargs['manifests']),{'A','B','control'})
+            self.assertEqual(len(kwargs['gateway_env_files']),2)
+            self.assertEqual(set(kwargs['identity_files']),{'A:telemetry','B:telemetry','control:control'})
+            self.assertEqual(kwargs['workload']['workload'],'low_load')
+
     def test_representative_probe_status_classification_is_literal_and_distinguishes_conflicts(self):
         self.assertTrue(e3_fixture._probe_status_classification('busy', 409)['match'])
         self.assertTrue(e3_fixture._probe_status_classification('stale', 409)['match'])
@@ -161,6 +232,48 @@ class E3FixtureTests(unittest.TestCase):
     def test_reconciliation_rejects_mismatched_final_configuration(self):
         data, commands, pg, rest = self._receipt_fixture()
         data[1]['configuration']['sample_interval_us'] = 500000
+        self.assertFalse(e3_fixture._verify_control_receipts(
+            data, commands, pg, rest, ['p8-e3-command-a', 'p8-e3-command-b']))
+
+    def test_reconciliation_rejects_missing_reported_or_executor_configuration(self):
+        data, commands, pg, rest = self._receipt_fixture()
+        data[0]['configuration'] = None
+        self.assertFalse(e3_fixture._verify_control_receipts(
+            data, commands, pg, rest, ['p8-e3-command-a', 'p8-e3-command-b']))
+
+    def test_real_exported_executor_receipt_shape_projects_and_reconciles(self):
+        commands = []
+        postgres = {}
+        exported = []
+        rest = {}
+        for sid, interval, frequency in (('sensor-alpha', 666667, '1.5'),
+                                         ('sensor-beta', 1333333, '0.75')):
+            executor = {'configuration': {'desired_version': '2',
+                        'sample_interval_us': interval, 'applied_at': 'captured'},
+                        'pending_outbox': 0, 'receipts': []}
+            rest[sid] = dict(executor['configuration'])
+            for version in (1, 2):
+                key, command_id = f'{sid}-{version}', f'cmd-{sid}-{version}'
+                commands.append({'sensor_id': sid, 'idempotency_key': key,
+                    'expected_desired_version': version - 1, 'frequency_hz': frequency})
+                digest = f'hash-{command_id}'
+                result = {'command_id': command_id, 'desired_version': str(version),
+                    'sample_interval_us': interval, 'status': 'succeeded', 'result_sha256': digest}
+                executor['receipts'].append({'command_id': command_id, 'desired_version': str(version),
+                    'sample_interval_us': interval, 'status': 'completed', 'result': result})
+                postgres[key] = {'idempotency_key': key, 'command_id': command_id,
+                    'status': 'succeeded', 'result_hash': digest, 'desired_version': str(version),
+                    'sample_interval_us': interval}
+            exported.append(executor)
+        projected = e3_fixture._e3_executor_receipt_projection(exported)
+        self.assertEqual([row['configuration']['sample_interval_us'] for row in projected],
+                         [666667, 1333333])
+        self.assertTrue(e3_fixture._verify_control_receipts(
+            projected, commands, postgres, rest, ['sensor-alpha', 'sensor-beta']))
+        with self.assertRaisesRegex(ValueError, 'e3_rest_reported_configuration_missing'):
+            e3_fixture._e3_reported_configuration({'reported_state': {}})
+        data, commands, pg, rest = self._receipt_fixture()
+        del rest['p8-e3-command-b']
         self.assertFalse(e3_fixture._verify_control_receipts(
             data, commands, pg, rest, ['p8-e3-command-a', 'p8-e3-command-b']))
 

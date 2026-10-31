@@ -2,6 +2,8 @@
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +69,266 @@ def e2_fixture_profile(*, microbatch_wait_ms):
             'microbatch': {'max_messages': 32, 'max_rows': 500,
                            'max_bytes': 4 << 20, 'wait_ms': microbatch_wait_ms},
             'scope': 'proposed disposable E2 fixture only; deployment defaults unchanged'}
+
+
+def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state, *,
+                   session_id, samples_per_message, output_root, bundle_root,
+                   arm='E2-pilot'):
+    """Prepare one bounded E2 profile for the existing A/B helper lifecycle."""
+    if samples_per_message not in PILOT_SAMPLES:
+        raise ValueError('e2_samples_profile_rejected')
+    pg, quota, effective, resources, storage_status, tokens, specs, passwords, _ = (
+        smoke.prepare_paper_workload(fixture, registry, endpoint, containers, images, state))
+    schema = smoke.db_psql(registry, pg,
+        "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
+    if schema != '24:telemetry_ledger_timestamp':
+        raise ValueError('p8_schema_terminal_rejected')
+    broker = registry.resolve(containers['mosquitto'])
+    ports = broker.get('NetworkSettings', {}).get('Ports', {}).get('8883/tcp') or []
+    if len(ports) != 1:
+        raise ValueError('p8_mqtt_mapping_readback_rejected')
+    published = int(ports[0].get('HostPort', '0'))
+    remote_config = getattr(fixture, 'remote_network_config', None)
+    mqtt_host = remote_config['advertised_host'] if remote_config else '127.0.0.1'
+    if remote_config:
+        smoke.paper_p8_remote_support().validate_runtime_mapping(
+            'mosquitto', broker.get('NetworkSettings', {}).get('Ports') or {}, remote_config)
+    else:
+        _support.validate_mqtt_readback({'service': 'mosquitto', 'host_ip': '127.0.0.1',
+            'target': 8883, 'published': published}, owned_service='mosquitto')
+    root = Path(output_root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    ca_path = fixture.private / 'certs/ca.crt'
+    targets = [{'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id} for spec in specs]
+    gateway_files, telemetry_files = {}, {}
+    for spec, password, role_arm in zip(specs, passwords, ('A', 'B')):
+        credential = root / f'gateway-{spec.gateway_id}.json'
+        smoke.private_write(credential, json.dumps({'username': spec.gateway_id, 'password': password}, sort_keys=True))
+        gateway_files[spec.gateway_id] = str(credential)
+        identity = root / f'telemetry-{role_arm}-identities.json'
+        smoke.private_write(identity, '{}')
+        telemetry_files[role_arm] = str(identity)
+    run_id = f'p8e2-{session_id}-{samples_per_message}'
+    common = {'mode': 'remote', 'run_id': f'p8e2-{session_id}', 'seed': PILOT_SEED,
+        'bundle_path': str(root), 'publish_timeout_ms': 3000,
+        'tls': {'https_endpoint': endpoint.url, 'https_ca_file': str(endpoint.ca_file),
+            'mqtt_tls_endpoint': f'mqtts://{mqtt_host}:{published}',
+            'mqtt_tls_ca_file': str(ca_path), 'mqtt_tls_server_name': 'localhost'}}
+    manifests = e2_pilot_manifests(common=common, targets=targets,
+        gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files)
+    pair = manifests['profiles'][str(samples_per_message)]
+    manifest_paths = {}
+    for role_arm in ('A', 'B'):
+        path = root / f'{role_arm}.manifest.json'
+        smoke.private_write(path, json.dumps(pair[role_arm], sort_keys=True, separators=(',', ':')))
+        manifest_paths[role_arm] = path
+    plan_root = root / 'plan'
+    plan = build_e2_execution_plan(output_dir=plan_root, manifest_a=manifest_paths['A'],
+                                   manifest_b=manifest_paths['B'])
+    prepared = {'session_id': session_id, 'run_id': run_id, 'arm': arm,
+        'samples_per_message': samples_per_message, 'profile': 'pilot', 'root': root,
+        'bundle_root': Path(bundle_root), 'plan': plan, 'manifest_paths': manifest_paths,
+        'manifests': pair, 'pg': pg, 'quota': quota, 'effective': effective,
+        'resources': resources, 'storage_status': storage_status, 'tokens': tokens,
+        'specs': specs, 'schema': schema, 'gateway_files': gateway_files,
+        'telemetry_files': telemetry_files, 'https_ca_file': endpoint.ca_file,
+        'mqtt_ca_file': ca_path, 'endpoint': endpoint, 'phase_id': f'samples-{samples_per_message}'}
+    prepared['bundle'] = export_prepared_bundle(prepared)
+    return prepared
+
+
+def export_prepared_bundle(prepared, *, wait_seconds=90, workload_seconds=30):
+    try:
+        from scripts import paper_p8_bundle
+    except ModuleNotFoundError:
+        spec = importlib.util.spec_from_file_location(
+            'paper_p8_bundle_runtime', Path(__file__).parents[1] / 'paper_p8_bundle.py')
+        paper_p8_bundle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(paper_p8_bundle)
+    ca_root = prepared['root'] / 'bundle-ca-inputs'
+    ca_root.mkdir(mode=0o700)
+    ca_files = {}
+    for name, source in (('https', prepared['https_ca_file']), ('mqtt', prepared['mqtt_ca_file'])):
+        target = ca_root / f'{name}-ca.pem'
+        target.write_bytes(Path(source).read_bytes()); target.chmod(0o600); ca_files[name] = target
+    identities = {f'{arm}:telemetry': prepared['telemetry_files'][arm] for arm in ('A', 'B')}
+    principals = {key: [] for key in identities}
+    role_metadata = {'roles': {key: {'role': 'telemetry', 'principals': value}
+                               for key, value in principals.items()},
+        'gateways': {gateway_id: {'role': 'gateway', 'gateway_id': gateway_id,
+            'username': json.loads(Path(path).read_text())['username']}
+            for gateway_id, path in prepared['gateway_files'].items()}}
+    spec = json.loads(Path(prepared['plan']['run_spec']).read_text())
+    manifests = {arm: spec['paperload'][index]['manifest'] for index, arm in enumerate(('A', 'B'))}
+    for arm, path in manifests.items():
+        manifests[arm] = str(Path(path).resolve())
+    workload = {'experiment': 'E2', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
+        'profile': 'pilot', 'workload': 'e2-telemetry-ab-pilot', 'seed': PILOT_SEED,
+        'samples_per_message': prepared['samples_per_message'], 'unique_batches': 24,
+        'rate_per_second': 1, 'measure_seconds': 8, 'offered_messages': 24,
+        'generator_colocated': 'unverified'}
+    return paper_p8_bundle.export_bundle(output_leaf=prepared['bundle_root'],
+        session_id=prepared['session_id'], experiment='E2', arm=prepared['arm'],
+        phase=prepared['phase_id'], manifests=manifests, identity_files=identities,
+        gateway_identity_files=prepared['gateway_files'], gateway_env_files={}, ca_files=ca_files,
+        role_metadata=role_metadata, wait_seconds=wait_seconds,
+        workload_seconds=workload_seconds, topology={'gateways': 2, 'sensors': 2,
+            'sensors_per_gateway': 1, 'users': 0, 'viewers': 0}, workload=workload,
+        run_spec=prepared['plan']['run_spec'])
+
+
+def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prepared, *, phase_id):
+    if phase_id != prepared['phase_id']:
+        raise ValueError('e2_phase_id_mismatch')
+    before_global = smoke.paper_p1_count_db(registry, prepared['pg'])
+    before_targets = [_target_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
+    baseline = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+    collector = BoundedCollector(scrape=lambda: _support._admin_metrics(
+        smoke, endpoint, prepared['tokens']['admin']), interval=0.5, max_snapshots=64,
+        deadline_seconds=60, baseline_metrics=baseline,
+        baseline_server=smoke.paper_p0_stats(registry, containers, 'workload_start'))
+    prepared.update({'before_global': before_global, 'before_targets': before_targets,
+                     'baseline': baseline, 'collector': collector})
+    collector.start(None)
+    return {'collector_ready': True, 'phase_id': phase_id}
+
+
+def _target_counts(smoke, registry, pg, spec):
+    sql = """SELECT json_build_object(
+ 'ledger',(SELECT count(*) FROM processed_messages WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
+ 'raw',(SELECT count(*) FROM telemetry WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
+ 'temporal',(SELECT count(*) FROM twin_temporal_values v JOIN twin_entities e ON e.id=v.entity_id WHERE e.entity_id=:'urn'),
+ 'configuration',(SELECT count(*) FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn' AND s.reported_state ? 'configuration'));"""
+    return json.loads(smoke.db_psql(registry, pg, sql, {'gw': spec.gateway_id,
+        'sensor': spec.sensor_id, 'urn': spec.sensor_urn}).strip())
+
+
+def finish_remote_collection(smoke, fixture, endpoint, registry, containers, prepared,
+                             results_root, *, phase_id, paperload_binary):
+    if phase_id != prepared['phase_id'] or not prepared.get('collector'):
+        raise ValueError('e2_phase_collection_mismatch')
+    collector = prepared['collector']
+    collector.stop(None)
+    imported = _load_e2_result_bundle(results_root, prepared, paperload_binary)
+    after_admin = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+    collector.metrics.append({'phase': 'workload_terminal', 'snapshot': after_admin})
+    terminal_server = smoke.paper_p0_stats(registry, containers, 'workload_terminal')
+    collector.resources.append(terminal_server)
+    after_global = smoke.paper_p1_count_db(registry, prepared['pg'])
+    delta = {key: after_global[key] - prepared['before_global'][key]
+             for key in prepared['before_global']}
+    after_targets = [_target_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
+    scoped = sensor_scoped_delta(
+        [{'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id, 'counts': count}
+         for spec, count in zip(prepared['specs'], prepared['before_targets'])],
+        [{'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id, 'counts': count}
+         for spec, count in zip(prepared['specs'], after_targets)])
+    mapping = {'A': {'gateway_id': prepared['specs'][0].gateway_id,
+                     'sensor_id': prepared['specs'][0].sensor_id},
+               'B': {'gateway_id': prepared['specs'][1].gateway_id,
+                     'sensor_id': prepared['specs'][1].sensor_id}}
+    by_gateway, raw = {}, []
+    for role, index in (('A', 0), ('B', 1)):
+        spec = prepared['specs'][index]
+        counts = dict((scoped.get('available') or {}).get(
+            f'{spec.gateway_id}/{spec.sensor_id}', {}))
+        counts['configuration'] = (after_targets[index]['configuration']
+                                   - prepared['before_targets'][index]['configuration'])
+        by_gateway[spec.gateway_id] = counts
+        producer_ids = [sample['message_id'] for sample in imported[role].get('identity_samples', [])
+                        if isinstance(sample, dict) and isinstance(sample.get('message_id'), str)]
+        raw.append(verify_pilot_raw(smoke, registry, prepared['pg'], spec, message_ids=producer_ids))
+    ingress = _support.calculate_ingress_delta(prepared['baseline'], after_admin)
+    run_path = Path(results_root) / 'results/runner/run.json'
+    runner = imported['runner']
+    events = runner.get('phase_observations', {}).get('events', [])
+    validation = validate_e2_result(workload_a=imported['A'], workload_b=imported['B'],
+        ingress_delta=ingress, database_delta=delta, database_by_gateway=by_gateway,
+        phase_events=events, raw_verification=raw,
+        execution_context={'samples_per_message': prepared['samples_per_message'],
+                           'role_to_target': mapping},
+        resources={'server': collector.resources, 'generator_samples': []})
+    if collector.errors:
+        validation['valid'] = False
+        validation['failures'].append('collector_incomplete:' + ','.join(collector.errors))
+    result = {'status': 'PASS' if validation['valid'] else 'FAIL',
+        'workload_outcome': 'VALIDATED' if validation['valid'] else 'VALIDATION_FAILED',
+        'experiment': 'E2', 'phase_id': phase_id,
+        'samples_per_message': prepared['samples_per_message'], 'workloads': {
+            'A': imported['A'], 'B': imported['B']}, 'runner': runner,
+        'database_delta': delta, 'database_by_gateway': by_gateway,
+        'raw_verification': raw, 'ingress_delta': ingress, 'validation': validation,
+        'collector_errors': collector.errors, 'collector_metrics': collector.metrics,
+        'collector_resources': collector.resources, 'full_p8_accepted': False,
+        'generator_colocated': True, 'physical_ab': 'NOT RUN'}
+    smoke.durable_json(fixture.artifacts / f'p8-e2-samples-{prepared["samples_per_message"]}-remote-result.json', result)
+    return result
+
+
+def _load_e2_result_bundle(results_root, prepared, paperload_binary):
+    root = Path(results_root).absolute()
+    if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
+        raise ValueError('e2_result_root_rejected')
+    summary_path = root / 'results.json'
+    if summary_path.is_symlink() or not summary_path.is_file() or summary_path.stat().st_mode & 0o077:
+        raise ValueError('e2_result_summary_rejected')
+    summary = json.loads(summary_path.read_text())
+    expected_roles = ['A', 'B']
+    if (summary.get('session') != {'session_id': prepared['session_id'],
+            'run_ids': [prepared['run_id']], 'experiment': 'E2', 'arm': prepared['arm'],
+            'phase': prepared['phase_id']} or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
+            or summary.get('expected_workload_roles') != expected_roles
+            or summary.get('present_workload_roles') != expected_roles
+            or summary.get('missing_workload_roles') != [] or summary.get('physical_ab') != 'NOT RUN'
+            or summary.get('full_p8_accepted') is not False
+            or summary.get('runner_status') not in ('COMPLETE', 'PARTIAL', 'FAILED')):
+        raise ValueError('e2_result_correlation_rejected')
+    bound_manifests = summary.get('bound_manifest_sha256')
+    source_inventory = summary.get('source_inventory')
+    if (not isinstance(bound_manifests, dict) or set(bound_manifests) != {'A', 'B'}
+            or any(not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value)
+                   for value in bound_manifests.values())
+            or summary.get('bound_gateway_environment_sha256') != {}
+            or not isinstance(summary.get('bound_run_spec_sha256'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', summary['bound_run_spec_sha256'])
+            or source_inventory != prepared['bundle_inventory']):
+        raise ValueError('e2_result_manifest_provenance_rejected')
+    files = {f'results/workloads/{arm}/workload.json': arm for arm in expected_roles}
+    files.update({'results/runner/run.json': 'runner', 'results/runner/provenance.json': 'provenance'})
+    inventory = summary.get('files')
+    if not isinstance(inventory, list) or len(inventory) != len(files):
+        raise ValueError('e2_result_inventory_rejected')
+    values, seen = {}, set()
+    for row in inventory:
+        rel = row.get('path') if isinstance(row, dict) else None
+        if rel not in files or rel in seen or row.get('size_bytes', 1 << 30) > 8 << 20:
+            raise ValueError('e2_result_inventory_rejected')
+        seen.add(rel)
+        path = root / rel
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+            raise ValueError('e2_result_file_rejected')
+        data = path.read_bytes()
+        if len(data) != row['size_bytes'] or hashlib.sha256(data).hexdigest() != row.get('sha256'):
+            raise ValueError('e2_result_digest_mismatch')
+        value = json.loads(data)
+        role = files[rel]
+        if role == 'provenance':
+            if (value.get('binary_sha256') != hashlib.sha256(Path(paperload_binary).read_bytes()).hexdigest()
+                    or value.get('binary_os') != __import__('sys').platform
+                    or value.get('binary_arch') != __import__('platform').machine()):
+                raise ValueError('e2_binary_provenance_mismatch')
+        elif role in ('A', 'B'):
+            if (value.get('experiment') != 'E2' or value.get('arm') != role
+                    or value.get('run_id') != prepared['run_id'] or value.get('mode') != 'remote'
+                    or value.get('profile') != 'pilot'):
+                raise ValueError('e2_workload_provenance_mismatch')
+            values[role] = value
+        else:
+            values[role] = value
+    if seen != set(files) or summary.get('binary') != json.loads((root / 'results/runner/provenance.json').read_text()):
+        raise ValueError('e2_result_roles_missing')
+    values['binary_provenance'] = json.loads((root / 'results/runner/provenance.json').read_text())
+    return values
 
 
 def build_e2_execution_plan(*, output_dir, manifest_a, manifest_b, seed=PILOT_SEED,
@@ -184,7 +446,8 @@ def e2_official_estimate(*, rate_per_second, duration_seconds, samples_per_messa
 def _phase_intervals(events, arm):
     def belongs(row):
         # Go-local phase events use a different clock and cannot compare children.
-        return row.get('child') == f'paperload-telemetry:{arm}.manifest.json'
+        return row.get('child') in (f'paperload-telemetry:{arm}.manifest.json',
+                                    f'paperload-telemetry:{arm}.json')
     rows = [e for e in events if isinstance(e, dict) and belongs(e)]
     times = {}
     for row in rows:
@@ -367,7 +630,9 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
     published = int(ports[0].get('HostPort', '0'))
     _support.validate_mqtt_readback({'service': 'mosquitto', 'host_ip': '127.0.0.1',
         'target': 8883, 'published': published}, owned_service='mosquitto')
-    mqtt_endpoint = f'mqtts://127.0.0.1:{published}'
+    remote_config = getattr(fixture, 'remote_network_config', None)
+    mqtt_host = remote_config['advertised_host'] if remote_config else '127.0.0.1'
+    mqtt_endpoint = f'mqtts://{mqtt_host}:{published}'
     root = fixture.private / 'p8-e2'
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     ca_path = fixture.private / 'certs/ca.crt'

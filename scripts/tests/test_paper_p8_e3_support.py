@@ -23,6 +23,28 @@ def fixture():
 
 
 class E3SupportTests(unittest.TestCase):
+    def test_collector_latency_uses_latest_cumulative_snapshot_once(self):
+        metrics = [
+            {'phase': 'sample-1', 'snapshot': {'command_timeline': {
+                'd_dispatch': {'upper_seconds':[1], 'buckets':[1], 'count':1,
+                    'overflow':0, 'sum_seconds':0.2},
+                'd_e2e_succeeded': {'upper_seconds':[1], 'buckets':[1], 'count':1,
+                    'overflow':0, 'sum_seconds':0.3}, 'missing_origin':0,
+                'missing_dispatch':0, 'pending_origins':0}}},
+            {'phase': 'terminal', 'snapshot': {'command_timeline': {
+                'd_dispatch': {'upper_seconds':[1], 'buckets':[2], 'count':2,
+                    'overflow':0, 'sum_seconds':0.7},
+                'd_e2e_succeeded': {'upper_seconds':[1], 'buckets':[2], 'count':2,
+                    'overflow':0, 'sum_seconds':0.9}, 'missing_origin':0,
+                'missing_dispatch':0, 'pending_origins':0}}},
+        ]
+        evidence = e3.server_origin_latency_from_collector(metrics)
+        self.assertEqual(evidence['histograms']['snapshot_phase'], 'terminal')
+        self.assertEqual(evidence['latency']['dispatch']['count'], 2)
+        self.assertEqual(evidence['latency']['dispatch']['sum_seconds'], 0.7)
+        self.assertEqual(evidence['latency']['dispatch']['mean_seconds'], 0.35)
+        self.assertEqual(e3.server_origin_latency_from_collector([])['availability'], 'unavailable')
+
     def test_separate_targets_and_control_manifest_contract(self):
         manifests = fixture()
         self.assertNotIn(('gw1','ctl1'), {(m['targets'][0]['gateway_id'],m['targets'][0]['sensor_id']) for m in manifests['background'].values()})
@@ -104,7 +126,7 @@ class E3SupportTests(unittest.TestCase):
         events.extend({'child':'paperload-control:control.manifest.json','event':ev,'command_ordinal':0,'observed_at_runner_monotonic_ns':stamp}
                       for ev,stamp in [('generation_stopped',900),('producers_stopped',910),('workers_joined',920)])
         kwargs = dict(control_workload=control, telemetry_a=ta, telemetry_b=tb_low, phase_events=events,
-            background_database_delta={'ledger':12,'raw':1200,'temporal':12}, command_database_delta={'raw_samples':0},
+            background_database_delta={'ledger':12,'raw':1200,'temporal':12}, command_database_delta={'raw_samples':4},
             control_receipt_verification={'verified':True,'verified_idempotency_keys':[f'k{i}' for i in range(4)]},
             runner_stopped=True, declared_idempotency_keys=[f'k{i}' for i in range(4)],
             raw_checks=[{'verified_exact':True,'raw_identity_value_mismatches':0,'ledger_count':8,'identity_ranges':[{'sample_count':100} for _ in range(8)]},
@@ -112,6 +134,14 @@ class E3SupportTests(unittest.TestCase):
         result = e3.validate_e3_result(**kwargs, workload='low_load')
         self.assertTrue(result['valid'], result['failures'])
         self.assertEqual(result['phase_overlap']['burst_overlap'], 'NOT APPLICABLE')
+        portable_events = [{**row, 'child': row['child'].replace('.manifest.json', '.json')}
+                           for row in events]
+        portable = e3.validate_e3_result(**{**kwargs, 'phase_events': portable_events}, workload='low_load')
+        self.assertTrue(portable['valid'], portable['failures'])
+        zero_command_raw = e3.validate_e3_result(**{**kwargs, 'command_database_delta': {'raw_samples': 0}},
+                                                 workload='low_load')
+        self.assertFalse(zero_command_raw['valid'])
+        self.assertIn('command_raw_counts_invalid', zero_command_raw['failures'])
         kwargs['background_database_delta'] = {'ledger':11,'raw':1100,'temporal':11}
         bad = e3.validate_e3_result(**kwargs, workload='low_load')
         self.assertIn('background_database_delta_mismatch', bad['failures'])
@@ -174,7 +204,7 @@ class E3SupportTests(unittest.TestCase):
         rcpt = {'verified':True,'verified_idempotency_keys':[f'key{i}' for i in range(4)]}
         keys = [f'key{i}' for i in range(4)]
         bg = {'ledger':24,'raw':2400,'temporal':24}
-        cmd_db = {'raw_samples':0}
+        cmd_db = {'raw_samples':4}
 
         # 1. Telemetry old field (acknowledged instead of application_acks or missing generated_unique)
         bad_ta = {'status':'COMPLETE','telemetry':{'acknowledged':8,'pending':0}}

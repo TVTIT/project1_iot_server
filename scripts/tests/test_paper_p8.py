@@ -104,6 +104,21 @@ class PaperP8EntrypointTests(unittest.TestCase):
         with self.assertRaises(paper_p8.PaperloadInputError):
             paper_p8.invoke_paperload('/does-not-exist', '', 'out')
 
+    def test_gateway_password_file_is_loaded_only_into_runtime_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); root.chmod(0o700)
+            password = root / 'password'; password.write_text('tls-secret-value'); password.chmod(0o600)
+            env_path = root / 'gateway.json'
+            config = {'GATEWAY_CONTROL_ENABLED':'true', 'GATEWAY_ID':'gw', 'SENSOR_ID':'sensor',
+                'GATEWAY_MQTT_BROKER_URL':'ssl://broker.example.test:8883',
+                'GATEWAY_MQTT_CLIENT_ID':'client', 'GATEWAY_MQTT_USERNAME':'gw',
+                'GATEWAY_MQTT_PASSWORD_FILE':str(password), 'GATEWAY_MQTT_CA_FILE':str(root/'ca.pem'),
+                'GATEWAY_OUTBOX_PATH':str(root/'outbox.sqlite')}
+            env_path.write_text(json.dumps(config)); env_path.chmod(0o600)
+            loaded = paper_p8._gateway_environment(str(env_path))
+            self.assertEqual(loaded['GATEWAY_MQTT_PASSWORD'], 'tls-secret-value')
+            self.assertNotIn('GATEWAY_MQTT_PASSWORD', json.loads(env_path.read_text()))
+
 
 class FakeChild:
     next_pid = 100

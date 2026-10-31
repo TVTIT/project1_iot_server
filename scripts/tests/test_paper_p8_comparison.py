@@ -726,6 +726,64 @@ def sample_e5_report(
     return rep
 
 
+def sample_remote_e5_report(
+    arm: str,
+    *,
+    seed: int = 805,
+    paperload_binary_sha256: str = '8' * 64,
+    gateway_binary_sha256: str = '9' * 64,
+    combined_binary_sha256: str = '7' * 64,
+    declared_windows: Optional[Dict[str, float]] = None,
+    observed_windows: Optional[Dict[str, float]] = None,
+    contradictory_canonical_binary: Optional[str] = None,
+    fanout_readiness_verified: bool = True,
+) -> Dict[str, Any]:
+    rep = sample_e5_report(
+        arm,
+        seed=seed,
+        gateway_binary_sha256=gateway_binary_sha256,
+        paperload_binary_sha256=paperload_binary_sha256,
+        combined_binary_sha256=combined_binary_sha256,
+    )
+    rep.pop('paperload_binary_sha256', None)
+    rep.pop('gateway_binary_sha256', None)
+    rep['metadata'].pop('binary_sha256', None)
+    if contradictory_canonical_binary:
+        rep['metadata']['binary_sha256'] = contradictory_canonical_binary
+
+    rep['metadata']['paperload_binary_sha256'] = paperload_binary_sha256
+    rep['metadata']['gateway_binary_sha256'] = gateway_binary_sha256
+    rep['metadata']['combined_binary_sha256'] = combined_binary_sha256
+
+    if declared_windows is None:
+        declared_windows = {'initial': 1.0, 'warm_replay': 2.0, 'control': 8.0}
+    if observed_windows is None:
+        variance = 0.0 if arm == 'optimized' else 0.05
+        observed_windows = {
+            'initial': 4.137 + variance,
+            'warm_replay': 2.083 + variance,
+            'control': 12.72 + variance,
+        }
+
+    rep['metadata']['b_declared'] = {
+        'declared_measurement_windows': declared_windows,
+        'observed_measurement_windows': observed_windows,
+        'paperload_binary_sha256': paperload_binary_sha256,
+        'gateway_binary_sha256': gateway_binary_sha256,
+        'combined_binary_sha256': combined_binary_sha256,
+    }
+    rep['metadata']['phase_seconds'] = observed_windows
+    if fanout_readiness_verified:
+        rep['mechanisms']['fanout']['readiness_verified'] = True
+        rep['mechanism_metrics']['fanout']['readiness_verified'] = True
+    rep['accounting']['ingress_delta']['delta']['ShaperRateLimited'] = 24 if arm == 'optimized' else 0
+    rep['accounting']['ingress_delta']['delta']['ShaperPassed'] = 20
+    rep['mechanisms']['microbatch']['max_members'] = 2 if arm == 'optimized' else 0
+    rep['mechanism_metrics']['microbatch']['max_members'] = 2 if arm == 'optimized' else 0
+
+    return rep
+
+
 class CliInterfaceTests(unittest.TestCase):
     def test_cli_preflight_arm(self):
         import io
@@ -984,6 +1042,169 @@ class CliInterfaceTests(unittest.TestCase):
     def test_e5_summary_fails_closed_on_missing_arm(self):
         with self.assertRaises(ValueError):
             p8c.build_e5_summary({'optimized':'missing.json'})
+
+    def test_remote_e5_summary_and_cli_lifecycle(self):
+        import tempfile
+        import io
+        import contextlib
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        td_path = Path(td.name)
+        paths = {}
+        for arm in p8c.ARM_NAMES:
+            r = sample_remote_e5_report(arm, seed=805)
+            p = td_path / f'p8-e5-{arm}.json'
+            p.write_text(json.dumps(r))
+            paths[arm] = p
+
+        # 1. Verify validate_run_comparability on all 5 pairs
+        opt_report = json.loads(paths['optimized'].read_text())
+        for arm in p8c.ARM_NAMES[1:]:
+            arm_report = json.loads(paths[arm].read_text())
+            comp = p8c.validate_run_comparability(opt_report, arm_report, arm)
+            self.assertTrue(comp['comparable'], f'{arm} comparability failed: {comp.get("reason")}')
+            self.assertIsNone(comp['reason'])
+            act = p8c.check_mechanism_activation(arm, opt_report, arm_report)
+            self.assertEqual(act['status'], 'ELIGIBLE', f'{arm} activation failed: {act}')
+
+        # 2. Test CLI compare
+        f_cmp = io.StringIO()
+        with contextlib.redirect_stdout(f_cmp):
+            rc = p8c.main([
+                'compare',
+                '--ref', str(paths['optimized']),
+                '--arm-file', str(paths['shaper_off']),
+                '--expected-arm', 'shaper_off',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertIn('"status": "COMPARABLE"', f_cmp.getvalue())
+
+        # 3. Test build_e5_summary
+        summary = p8c.build_e5_summary(paths, private_context='2411c01b9ea1be35ddb44ee449b311e8460f99cbdfe01fa2d41a335bd1500175')
+        self.assertEqual(summary['status'], 'PILOT_RUNS_COMPLETE_QUALIFIED')
+        self.assertEqual(summary['run_count'], 6)
+        self.assertEqual(len(summary['pairs']), 5)
+        for pair in summary['pairs']:
+            self.assertEqual(pair['comparability'], 'COMPARABLE')
+            self.assertEqual(pair['activation_status'], 'ELIGIBLE')
+
+        # 4. Test CLI e5-summary export
+        out_dir = td_path / 'summary_export'
+        f_sum = io.StringIO()
+        with contextlib.redirect_stdout(f_sum):
+            rc = p8c.main([
+                'e5-summary',
+                '--optimized', str(paths['optimized']),
+                '--shaper-off', str(paths['shaper_off']),
+                '--microbatch-off', str(paths['microbatch_off']),
+                '--ram-dedup-off', str(paths['ram_dedup_off']),
+                '--polling', str(paths['polling']),
+                '--fanout-scan', str(paths['fanout_scan']),
+                '--output-dir', str(out_dir),
+                '--private-context', '2411c01b9ea1be35ddb44ee449b311e8460f99cbdfe01fa2d41a335bd1500175',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertTrue((out_dir / 'e5-summary.json').is_file())
+        self.assertTrue((out_dir / 'e5-runs.csv').is_file())
+        self.assertTrue((out_dir / 'e5-pairs.csv').is_file())
+
+    def test_remote_e5_negative_cases(self):
+        # 1. Missing constituent binary fails (one-sided or both missing)
+        ref = sample_remote_e5_report('optimized')
+        arm = sample_remote_e5_report('shaper_off')
+        arm_no_pl = copy.deepcopy(arm)
+        arm_no_pl['metadata'].pop('paperload_binary_sha256')
+        res = p8c.validate_run_comparability(ref, arm_no_pl, 'shaper_off')
+        self.assertFalse(res['comparable'])
+        self.assertEqual(res['reason'], 'missing_fingerprint_paperload_binary_sha256')
+
+        ref_no_both = copy.deepcopy(ref)
+        arm_no_both = copy.deepcopy(arm)
+        ref_no_both['metadata'].pop('paperload_binary_sha256', None)
+        ref_no_both['metadata'].pop('gateway_binary_sha256', None)
+        arm_no_both['metadata'].pop('paperload_binary_sha256', None)
+        arm_no_both['metadata'].pop('gateway_binary_sha256', None)
+        res_both_missing = p8c.validate_run_comparability(ref_no_both, arm_no_both, 'shaper_off')
+        self.assertFalse(res_both_missing['comparable'])
+        self.assertEqual(res_both_missing['reason'], 'missing_fingerprint_paperload_binary_sha256')
+
+        ref_no_gw = copy.deepcopy(ref)
+        arm_no_gw = copy.deepcopy(arm)
+        ref_no_gw['metadata'].pop('gateway_binary_sha256', None)
+        arm_no_gw['metadata'].pop('gateway_binary_sha256', None)
+        res_gw_missing = p8c.validate_run_comparability(ref_no_gw, arm_no_gw, 'shaper_off')
+        self.assertFalse(res_gw_missing['comparable'])
+        self.assertEqual(res_gw_missing['reason'], 'missing_fingerprint_gateway_binary_sha256')
+
+        # 2. Mismatched constituent binary fails
+        arm_bad_gw = copy.deepcopy(arm)
+        arm_bad_gw['metadata']['gateway_binary_sha256'] = '0' * 64
+        res = p8c.validate_run_comparability(ref, arm_bad_gw, 'shaper_off')
+        self.assertFalse(res['comparable'])
+        self.assertEqual(res['reason'], 'gateway_binary_sha256_mismatch')
+
+        # 3. Contradictory combined alias fails
+        arm_contra = sample_remote_e5_report('shaper_off', contradictory_canonical_binary='1' * 64)
+        res = p8c.validate_run_comparability(ref, arm_contra, 'shaper_off')
+        self.assertFalse(res['comparable'])
+        self.assertEqual(res['reason'], 'contradictory_binary_fingerprint')
+
+        # 4. Changed declared measurement window fails
+        arm_diff_decl = sample_remote_e5_report('shaper_off', declared_windows={'initial': 2.0, 'warm_replay': 2.0, 'control': 8.0})
+        res = p8c.validate_run_comparability(ref, arm_diff_decl, 'shaper_off')
+        self.assertFalse(res['comparable'])
+        self.assertEqual(res['reason'], 'window_duration_mismatch')
+
+        # 5. Invalid declared measurement window formats fail (non-finite, bool, partial, extra keys, negative)
+        arm_nan = sample_remote_e5_report('shaper_off', declared_windows={'initial': float('nan'), 'warm_replay': 2.0, 'control': 8.0})
+        res = p8c.validate_run_comparability(ref, arm_nan, 'shaper_off')
+        self.assertFalse(res['comparable'])
+        self.assertEqual(res['reason'], 'invalid_fingerprint_phase_seconds')
+
+        ref_bool = copy.deepcopy(ref)
+        arm_bool = copy.deepcopy(arm)
+        ref_bool['metadata']['b_declared']['declared_measurement_windows'] = {'initial': True, 'warm_replay': 2.0, 'control': 8.0}
+        arm_bool['metadata']['b_declared']['declared_measurement_windows'] = {'initial': 1.0, 'warm_replay': 2.0, 'control': 8.0}
+        res_bool = p8c.validate_run_comparability(ref_bool, arm_bool, 'shaper_off')
+        self.assertFalse(res_bool['comparable'])
+        self.assertEqual(res_bool['reason'], 'invalid_fingerprint_phase_seconds')
+
+        ref_part = copy.deepcopy(ref)
+        arm_part = copy.deepcopy(arm)
+        ref_part['metadata']['b_declared']['declared_measurement_windows'] = {'initial': 1.0, 'control': 8.0}
+        arm_part['metadata']['b_declared']['declared_measurement_windows'] = {'initial': 1.0, 'control': 8.0}
+        res_part = p8c.validate_run_comparability(ref_part, arm_part, 'shaper_off')
+        self.assertFalse(res_part['comparable'])
+        self.assertEqual(res_part['reason'], 'invalid_fingerprint_phase_seconds')
+
+        ref_extra = copy.deepcopy(ref)
+        arm_extra = copy.deepcopy(arm)
+        ref_extra['metadata']['b_declared']['declared_measurement_windows'] = {'initial': 1.0, 'warm_replay': 2.0, 'control': 8.0, 'extra': 1.0}
+        arm_extra['metadata']['b_declared']['declared_measurement_windows'] = {'initial': 1.0, 'warm_replay': 2.0, 'control': 8.0, 'extra': 1.0}
+        res_extra = p8c.validate_run_comparability(ref_extra, arm_extra, 'shaper_off')
+        self.assertFalse(res_extra['comparable'])
+        self.assertEqual(res_extra['reason'], 'invalid_fingerprint_phase_seconds')
+
+        ref_neg = copy.deepcopy(ref)
+        arm_neg = copy.deepcopy(arm)
+        ref_neg['metadata']['b_declared']['declared_measurement_windows'] = {'initial': -1.0, 'warm_replay': 2.0, 'control': 8.0}
+        arm_neg['metadata']['b_declared']['declared_measurement_windows'] = {'initial': -1.0, 'warm_replay': 2.0, 'control': 8.0}
+        res_neg = p8c.validate_run_comparability(ref_neg, arm_neg, 'shaper_off')
+        self.assertFalse(res_neg['comparable'])
+        self.assertEqual(res_neg['reason'], 'invalid_fingerprint_phase_seconds')
+
+        # 6. Differing observed durations are accepted while declared windows match
+        arm_varied_obs = sample_remote_e5_report('shaper_off', observed_windows={'initial': 4.999, 'warm_replay': 3.123, 'control': 15.001})
+        res = p8c.validate_run_comparability(ref, arm_varied_obs, 'shaper_off')
+        self.assertTrue(res['comparable'])
+        self.assertIsNone(res['reason'])
+
+        # 7. Wrong one-factor delta fails
+        arm_wrong_flag = copy.deepcopy(arm)
+        arm_wrong_flag['metadata']['effective_flags']['MQTT_SHAPER_ENABLED'] = 'true'
+        res = p8c.validate_run_comparability(ref, arm_wrong_flag, 'shaper_off')
+        self.assertFalse(res['comparable'])
+        self.assertIn(res['reason'], ('ablation_flags_invalid', 'ablation_diff_mismatch'))
 
 
 if __name__ == '__main__':

@@ -96,6 +96,26 @@ def _gateway_environment(path):
                 'GATEWAY_OUTBOX_PATH')
     if any(not env.get(key) for key in required):
         raise PaperloadInputError('Gateway environment is missing required configuration')
+    password_file = env.get('GATEWAY_MQTT_PASSWORD_FILE')
+    if password_file:
+        if env.get('GATEWAY_MQTT_PASSWORD'):
+            raise PaperloadInputError('Gateway environment has conflicting password sources')
+        source = Path(password_file).absolute()
+        try:
+            for parent in (source, *source.parents):
+                if parent.is_symlink():
+                    raise PaperloadInputError('Gateway password file must be private regular file')
+            st = source.lstat()
+            if (not source.is_file() or st.st_uid != os.getuid() or st.st_mode & 0o077
+                    or st.st_size <= 0 or st.st_size > 4096):
+                raise PaperloadInputError('Gateway password file must be private regular file')
+            password = source.read_text(encoding='utf-8')
+        except (OSError, UnicodeError):
+            raise PaperloadInputError('Gateway password file must be private regular file') from None
+        if not password or '\x00' in password:
+            raise PaperloadInputError('Gateway password file content is invalid')
+        # Keep the value in memory for the child only; never serialize it.
+        env['GATEWAY_MQTT_PASSWORD'] = password
     if env['GATEWAY_MQTT_CLIENT_ID'] == env['GATEWAY_ID']:
         raise PaperloadInputError('Gateway MQTT client ID must be distinct from Gateway identity')
     return env

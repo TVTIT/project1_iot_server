@@ -6,7 +6,10 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location('e4', Path(__file__).with_name('paper_p8_e4_support.py'))
@@ -46,6 +49,377 @@ def sample(mode='on'):
 
 
 class E4SupportTests(unittest.TestCase):
+    def test_durable_a_side_sql_validators_require_committed_and_exact_raw_evidence(self):
+        pending={'gateway_id':'gw1','sensor_id':'p8-e4-durable','message_id':'m1',
+            'sample_count':100,'payload_sha256':'a'*64}
+        committed={'gateway_id':'gw1','sensor_id':'p8-e4-durable','hash':'a'*64,
+            'raw':100,'ledger_fingerprint':'b'*32}
+        self.assertEqual(e4.validate_durable_fault_sql(pending=pending,committed=committed)['status'],'PASS')
+        with self.assertRaisesRegex(ValueError,'p8_e4_durable_backend_commit_mismatch'):
+            e4.validate_durable_fault_sql(pending=pending,committed={**committed,'raw':99})
+        first=datetime(2026,1,1,tzinfo=timezone.utc)
+        rows=[{'sequence':i,'measured_at':(first+timedelta(microseconds=10000*(i-7))).isoformat()}
+              for i in range(7,107)]
+        identity={'message_id':'m1','boot_id':'boot1','sequence':7,'interval_us':10000,
+            'payload_sha256':'a'*64,'ledger_fingerprint':'b'*32,'measured_at':first.isoformat()}
+        answer=e4.validate_durable_reopen_sql(before=identity,reopened={**identity,'generated':1},
+            raw_rows=rows,aux_delta={'ledger':2,'raw':200,'temporal':2},
+            main_before={'fingerprint':'main'},main_after={'fingerprint':'main'})
+        self.assertEqual(answer['status'],'PASS')
+        rows[0]['sequence']=8
+        with self.assertRaisesRegex(ValueError,'p8_e4_durable_reopen_raw_rows_mismatch'):
+            e4.validate_durable_reopen_sql(before=identity,reopened={**identity,'generated':1},
+                raw_rows=rows,aux_delta={'ledger':2,'raw':200,'temporal':2},
+                main_before={'fingerprint':'main'},main_after={'fingerprint':'changed'})
+
+    def test_cold_manifest_is_distinct_but_reuses_replay_workload_and_journal(self):
+        common = {'run_id': 'e4-run', 'phases': {'measure_seconds': 4},
+                  'topology': {'gateways': 2}}
+        manifest = e4.e4_phase_manifest(common, 'outputs/e4-journal.sqlite', 'cold-replay')
+        self.assertEqual(manifest['run_id'], 'e4-run-cold-replay')
+        self.assertEqual(manifest['e4']['mode'], 'replay')
+        self.assertEqual(manifest['e4']['replay_count'], 10)
+        self.assertEqual(manifest['e4']['journal_path'], 'outputs/e4-journal.sqlite')
+        self.assertEqual(manifest['phases']['measure_seconds'], 2)
+        with self.assertRaisesRegex(ValueError, 'manifest_phase_rejected'):
+            e4.e4_phase_manifest(common, 'journal', 'warm')
+
+    def test_cold_window_requires_new_process_empty_cache_and_duplicate_commits(self):
+        before = {'process_instance': 'new', 'ram_dedup': {'entries': 0,
+            'lookup_miss_total': 0, 'lookup_hit_total': 0},
+            'persistence': {'begin_attempts': 0, 'confirmed_commits': 0,
+                'confirmed_new_rows': 0, 'copy_calls': 0},
+            'ingress': {'Committed': 0, 'SamplesNew': 0}}
+        after = {'process_instance': 'new', 'ram_dedup': {'entries': 10,
+            'lookup_miss_total': 10, 'lookup_hit_total': 0},
+            'persistence': {'begin_attempts': 10, 'confirmed_commits': 10,
+                'confirmed_new_rows': 0, 'copy_calls': 0},
+            'ingress': {'Committed': 0, 'SamplesNew': 0}}
+        result = e4._cold.cold_window_evidence({'process_instance': 'old'}, before, after,
+            before_db=[{'fingerprint': 'a'}], after_db=[{'fingerprint': 'a'}],
+            application_ack_count=10)
+        self.assertEqual(result['status'], 'PASS')
+        wrong = {**before, 'ram_dedup': {'entries': 2, 'lookup_miss_total': 0,
+            'lookup_hit_total': 1}}
+        rejected = e4._cold.cold_window_evidence({'process_instance': 'old'}, wrong, after,
+            before_db=[{'fingerprint': 'a'}], after_db=[{'fingerprint': 'b'}],
+            application_ack_count=9)
+        self.assertEqual(rejected['status'], 'FAIL')
+        self.assertIn('replacement_cache_not_empty', rejected['reasons'])
+        self.assertIn('cold_lookup_hit_observed', rejected['reasons'])
+
+    def test_cold_report_is_distinct_and_requires_all_phase_evidence(self):
+        zero_ws = {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+                   'telemetry_writes_completed': 0, 'drops': 0}
+        cold = {'status': 'PASS', 'old_process_instance': 'old', 'process_instance': 'new',
+            'cache_entries_before': 0, 'cache_miss_delta': 10, 'cache_hit_delta': 0,
+            'persistence_delta': {'begin_attempts': 10, 'confirmed_commits': 10,
+                'confirmed_new_rows': 0, 'copy_calls': 0}, 'application_ack_count': 10,
+            'database_unchanged': True}
+        phases = ['unique', 'replay', 'cold-replay']
+        digest = 'a' * 64
+        results = {phase: {'validation_valid': True} for phase in phases}
+        windows = {'unique': {'database_delta': {'ledger': 20, 'raw': 2000,
+                'temporal': 20, 'configuration': 0}, 'ws_delta': {
+                'submissions': 20, 'new_events': 20, 'deliveries_enqueued': 20,
+                'telemetry_writes_completed': 20, 'drops': 0}, 'journal_sha256': digest},
+            'replay': {'database_delta': {'ledger': 0, 'raw': 0, 'temporal': 0,
+                'configuration': 0}, 'ws_delta': zero_ws, 'journal_sha256': digest,
+                'cache': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+                'database_proof': {'exact_equal': True}},
+            'cold-replay': {'database_delta': {'ledger': 0, 'raw': 0, 'temporal': 0,
+                'configuration': 0}, 'ws_delta': zero_ws, 'journal_sha256': digest,
+                'cold_evidence': cold}}
+        prepared = {'include_cold_replay': True, 'cache_mode': 'on', 'phase_results': results,
+            'phase_windows': windows, 'overall_validation': {'valid': True},
+            'cold_replacement_proof': {'metrics_readback': True}, 'phase_run_ids': {},
+            'arm': 'warm', 'session_id': 's', 'run_id': 'r', 'schema': '24:x',
+            'quota': {}, 'effective_flags': {}, 'image_ids': {}, 'unique_database_snapshot': []}
+        report = e4.finalize_remote_report(prepared,
+            {'phase_history': phases, 'workload_outcome': 'VALIDATED'},
+            cleanup_verified=True, cleanup_counts={})
+        self.assertEqual(report['lane_marker'], 'PAPER_P8_E4_COLD_REPLAY_SUBSET')
+        self.assertEqual(report['coldrestart'], 'PASS')
+        self.assertEqual(report['status'], 'PASS')
+        self.assertFalse(report['full_p8_accepted'])
+        cold['application_ack_count'] = 9
+        cold['status'] = 'FAIL'
+        failed = e4.finalize_remote_report(prepared,
+            {'phase_history': phases, 'workload_outcome': 'VALIDATED'},
+            cleanup_verified=True, cleanup_counts={})
+        self.assertNotEqual(failed['status'], 'PASS')
+
+    def test_remote_report_source_uses_prepared_image_metadata(self):
+        images = {'backend': 'sha256:backend', 'mosquitto': 'sha256:broker',
+                  'gateway': 'sha256:gateway', 'unrelated': 'unused'}
+        smoke = SimpleNamespace(ROOT=Path('/source'), paper_p0_git=Mock(return_value='revision'))
+        fixture = object()
+        with patch.object(e4._support, '_source_fingerprint', return_value='fingerprint'):
+            metadata = e4.remote_report_source(smoke, fixture, {'image_ids': images})
+        self.assertEqual(metadata['image_ids'], {
+            key: images[key] for key in ('backend', 'mosquitto', 'gateway')})
+        self.assertEqual(metadata['source_revision'], 'revision')
+        self.assertEqual(metadata['source_fingerprint'], 'fingerprint')
+        smoke.paper_p0_git.assert_called_once_with(fixture, 'rev-parse', 'HEAD')
+
+    def test_captured_unique_result_shape_passes_current_phase_validator(self):
+        captured = Path('/var/tmp/opencode/e4-warm-slice-20261030/attempt-02/fixture/private/incoming/unique/results/phases/unique/workloads')
+        if not captured.is_dir():
+            self.skipTest('captured native UNIQUE result is not present on this host')
+        telemetry = json.loads((captured / 'unique/workload.json').read_text())
+        viewer = json.loads((captured / 'viewer/workload.json').read_text())
+        result = e4._validate_e4_phase_samples('unique', telemetry, viewer)
+        self.assertTrue(result['valid'], result['failures'])
+        self.assertEqual(viewer['unique_events'], 20)
+
+    def test_phase_counters_are_required_integer_values_not_bool_or_missing(self):
+        telemetry = {'experiment': 'E4', 'e4': {'mode': 'replay'}, 'telemetry': {
+            'replay_offered': 10, 'replay_application_acks': 10, 'generated_unique': 0,
+            'offered_unique': 0, 'application_acks': 0, 'pending_messages': 0, 'pending_bytes': 0}}
+        viewer = {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+            'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 0,
+            'unique_events': 0, 'identity_samples': []}
+        self.assertTrue(e4._validate_e4_phase_samples('replay', telemetry, viewer)['valid'])
+        del viewer['unique_events']
+        self.assertIn('replay_viewer_no_new_events',
+            e4._validate_e4_phase_samples('replay', telemetry, viewer)['failures'])
+        viewer['unique_events'] = False
+        self.assertIn('replay_viewer_no_new_events',
+            e4._validate_e4_phase_samples('replay', telemetry, viewer)['failures'])
+        del telemetry['telemetry']['replay_offered']
+        self.assertIn('replay_telemetry_result',
+            e4._validate_e4_phase_samples('replay', telemetry, viewer)['failures'])
+
+    def test_viewer_verification_uses_real_event_totals_and_two_header_hashes(self):
+        telemetry_samples = []
+        headers = []
+        viewer_samples = []
+        for index in range(10):
+            viewer_id = 'e4-viewer-a' if index % 2 == 0 else 'e4-viewer-b'
+            row = {'viewer_id': '', 'gateway_id': f'gw-{index}', 'sensor_id': f'sensor-{index}',
+                'message_id': f'00000000-0000-0000-0000-{index + 1:012d}', 'boot_id': f'boot-{index}',
+                'first_sequence': '0', 'sample_count': 100}
+            canonical = json.dumps({key: row[key] for key in
+                ('gateway_id', 'sensor_id', 'message_id', 'boot_id', 'first_sequence', 'sample_count')},
+                separators=(',', ':'), ensure_ascii=False).encode()
+            row['header_sha256'] = hashlib.sha256(canonical).hexdigest()
+            telemetry_samples.append(row)
+            headers.append({'topic': f"gateways/{row['gateway_id']}/telemetry/{row['sensor_id']}",
+                'gateway_id': row['gateway_id'], 'sensor_id': row['sensor_id'],
+                'message_id': row['message_id'], 'boot_id': row['boot_id'],
+                'first_sequence': '0', 'sample_count': 100, 'payload_sha256': 'a' * 64})
+            if index < 2:
+                viewer_samples.append({**row, 'viewer_id': viewer_id})
+        telemetry = {'status': 'COMPLETE', 'experiment': 'E4', 'identity_samples': telemetry_samples,
+            'e4': {'mode': 'unique', 'safe_header_samples': headers},
+            'telemetry': {'generated_unique': 20, 'offered_unique': 20,
+                'application_acks': 20, 'ignored_valid_acks': 1, 'retries': 1,
+                'pending_messages': 0, 'pending_bytes': 0}}
+        viewer = {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+            'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2,
+            'unique_events': 20, 'identity_samples': viewer_samples}
+        self.assertTrue(e4._validate_e4_phase_samples('unique', telemetry, viewer)['valid'])
+        viewer['unique_events'] = 0
+        self.assertIn('unique_viewer_subscribed_and_received',
+            e4._validate_e4_phase_samples('unique', telemetry, viewer)['failures'])
+
+    def test_remote_result_import_checks_run_identity_inventory_and_digest(self):
+        with tempfile.TemporaryDirectory(prefix='p8-e4-import-', dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); root.chmod(0o700)
+            phase = 'unique'
+            rels = {
+                f'results/phases/{phase}/runner/run.json': {'status': 'COMPLETE'},
+                f'results/phases/{phase}/runner/provenance.json': {
+                    'binary_sha256': 'a' * 64, 'binary_os': 'linux', 'binary_arch': 'amd64'},
+                f'results/phases/{phase}/workloads/{phase}/workload.json': {
+                    'status': 'COMPLETE', 'experiment': 'E4', 'e4': {'mode': 'unique'}},
+                f'results/phases/{phase}/workloads/viewer/workload.json': {
+                    'status': 'COMPLETE', 'experiment': 'E1'},
+            }
+            inventory = []
+            for rel, payload in rels.items():
+                path = root / rel; path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                data = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+                path.write_bytes(data); path.chmod(0o600)
+                inventory.append({'path': rel, 'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+            summary = {'schema_version': 1, 'phase': phase, 'phase_run_id': 'e4-run-unique',
+                'source_bundle_sha256': 'b' * 64, 'session': {'experiment': 'E4', 'session_id': 'session-1'},
+                'runner_status': 'COMPLETE', 'full_p8_accepted': False, 'physical_ab': 'NOT RUN',
+                'expected_workload_roles': ['unique', 'viewer'], 'present_workload_roles': ['unique', 'viewer'],
+                'missing_workload_roles': [], 'files': inventory}
+            summary_path = root / 'results.json'; summary_path.write_text(json.dumps(summary)); summary_path.chmod(0o600)
+            got, files = e4._read_e4_result_bundle(root, phase=phase, session_id='session-1',
+                run_id='e4-run-unique', bundle_sha256='b' * 64)
+            self.assertEqual(got['phase'], 'unique')
+            self.assertEqual(files[f'results/phases/{phase}/workloads/{phase}/workload.json']['e4']['mode'], 'unique')
+            summary['session']['session_id'] = 'other-session'
+            summary_path.write_text(json.dumps(summary)); summary_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'identity_rejected'):
+                e4._read_e4_result_bundle(root, phase=phase, session_id='session-1',
+                    run_id='e4-run-unique', bundle_sha256='b' * 64)
+
+    def test_prepare_extracts_bounded_manifests_without_starting_processes(self):
+        scratch = Path('/var/tmp/opencode')
+        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='p8-e4-prepare-', dir=scratch) as tmp:
+            private = Path(tmp) / 'private'
+            private.mkdir(mode=0o700)
+            certs = private / 'certs'; certs.mkdir(mode=0o700)
+            specs = [SimpleNamespace(gateway_id='gw-a', sensor_id='sensor-a',
+                         sensor_urn='urn:ngsi-ld:Sensor:gw-a:sensor-a'),
+                     SimpleNamespace(gateway_id='gw-b', sensor_id='sensor-b',
+                         sensor_urn='urn:ngsi-ld:Sensor:gw-b:sensor-b')]
+            endpoint = SimpleNamespace(url='https://127.0.0.1:9443', ca_file=certs / 'https-ca.pem')
+            fixture = SimpleNamespace(private=private, project='ncs_0123456789ab')
+            registry = Mock()
+            registry.resolve.return_value = {'NetworkSettings': {'Ports': {
+                '8883/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '18883'}]}}}
+
+            class Smoke:
+                def prepare_paper_workload(self, *args):
+                    def jwt(sub):
+                        enc = lambda value: base64.urlsafe_b64encode(value).decode().rstrip('=')
+                        return enc(b'{"alg":"none"}') + '.' + enc(json.dumps(
+                            {'sub': sub, 'exp': time.time() + 3600}).encode()) + '.sig'
+                    env = {'WEBSOCKET_ENABLED': 'true', 'STAGE5_ENABLED': 'false',
+                        'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'false',
+                        'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'true',
+                        'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+                        'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20),
+                        'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
+                    return ('pg', {'cpus': 2}, {'services': {'backend': {'environment': env}}},
+                        {'fixture': 1}, 'storage-ready', {'a': jwt('a'), 'b': jwt('b'), 'admin': 'admin'},
+                        specs, ['pass-a', 'pass-b'], 'sensor')
+
+                def db_psql(self, _registry, _pg, sql, _params=None):
+                    if 'schema_migrations' in sql:
+                        return '24:telemetry_ledger_timestamp'
+                    if 'SELECT json_build_object' in sql:
+                        return json.dumps({'ledger': 0, 'raw': 0, 'temporal': 0,
+                                           'configuration': 0})
+                    return 'a' * 32
+
+                @staticmethod
+                def http_request(_endpoint, method, path, *, token, body):
+                    gateway, sensor = path.split('/')[3], path.split('/')[-1]
+                    return 201, {}, {'entity_id': f'urn:ngsi-ld:Sensor:{gateway}:{sensor}'}
+
+                @staticmethod
+                def private_write(path, text):
+                    Path(path).write_text(text, encoding='utf-8')
+                    Path(path).chmod(0o600)
+
+            containers = {'mosquitto': {'receipt': {'id': 'owned-broker'}}}
+            with patch.object(e4.subprocess, 'Popen', side_effect=AssertionError('prepare launched process')):
+                context = e4.prepare(Smoke(), fixture, endpoint, registry, containers,
+                                     {'backend': 'image'}, object(), 'on', session_id='b' * 32)
+
+            unique = json.loads(context['manifests'][0].read_text())
+            replay = json.loads(context['manifests'][1].read_text())
+            viewer = json.loads(context['viewer_manifest_path'].read_text())
+            self.assertEqual(unique['e4']['mode'], 'unique')
+            self.assertEqual(replay['e4']['mode'], 'replay')
+            self.assertEqual(unique['e4']['journal_path'], replay['e4']['journal_path'])
+            self.assertEqual(unique['e4']['max_messages'], 20)
+            self.assertEqual(unique['e4']['max_bytes'], 1 << 20)
+            self.assertEqual(replay['e4']['replay_count'], 10)
+            self.assertEqual(unique['roles'], ['telemetry'])
+            self.assertEqual(unique['targets'], [
+                {'gateway_id': 'gw-a', 'sensor_id': 'sensor-a'},
+                {'gateway_id': 'gw-b', 'sensor_id': 'sensor-b'}])
+            self.assertEqual(unique['samples_per_message'], 100)
+            self.assertEqual(unique['limits'], {'retries': 4, 'workers': 2, 'connections': 2,
+                'pending_messages': 64, 'pending_bytes': 1 << 20,
+                'disk_growth_bytes': 1 << 20, 'wall_seconds': 30})
+            self.assertEqual(viewer['experiment'], 'E1')
+            self.assertEqual(viewer['roles'], ['viewer'])
+            self.assertEqual(viewer['topology']['viewers'], 2)
+            self.assertNotIn('gateway_identity_files', viewer)
+            self.assertEqual(context['effective_flags']['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(context['image_ids'], {'backend': 'image'})
+            self.assertEqual(len(context['before']), 2)
+            self.assertEqual(context['subscriptions'][0]['sensor_id'], 'sensor-a')
+
+    def test_e4_remote_preparation_uses_advertised_tls_endpoints_and_exact_mappings(self):
+        scratch = Path('/var/tmp/opencode')
+        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='p8-e4-remote-prepare-', dir=scratch) as tmp:
+            root = Path(tmp); private = root / 'private'; private.mkdir(mode=0o700)
+            (private / 'certs').mkdir(mode=0o700)
+            specs = [SimpleNamespace(gateway_id='gw-a', sensor_id='sensor-a', sensor_urn='urn:ngsi-ld:Sensor:gw-a:sensor-a'),
+                     SimpleNamespace(gateway_id='gw-b', sensor_id='sensor-b', sensor_urn='urn:ngsi-ld:Sensor:gw-b:sensor-b')]
+            env = {'WEBSOCKET_ENABLED': 'true', 'STAGE5_ENABLED': 'false', 'STAGE5_WAKEUP_ENABLED': 'false',
+                'MQTT_SHAPER_ENABLED': 'false', 'MQTT_MICROBATCH_ENABLED': 'true',
+                'MQTT_RAM_DEDUP_ENABLED': 'true', 'MQTT_MICROBATCH_MAX_MESSAGES': '32',
+                'MQTT_MICROBATCH_MAX_ROWS': '500', 'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20),
+                'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
+            class Smoke:
+                def __init__(self, remote_support): self.remote_support = remote_support
+                def prepare_paper_workload(self, *args):
+                    def jwt(sub):
+                        enc = lambda value: base64.urlsafe_b64encode(value).decode().rstrip('=')
+                        return enc(b'{"alg":"none"}') + '.' + enc(json.dumps(
+                            {'sub': sub, 'exp': time.time() + 3600}).encode()) + '.sig'
+                    return ('pg', {'quota': 1}, {'services': {'backend': {'environment': env}}}, {},
+                        'ready', {'a': jwt('a'), 'b': jwt('b'), 'admin': 'admin'}, specs, ['pa', 'pb'], None)
+                def db_psql(self, _r, _p, sql, _v=None):
+                    return '24:telemetry_ledger_timestamp' if 'schema_migrations' in sql else json.dumps(
+                        {'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}) if 'SELECT json_build_object' in sql else 'a' * 32
+                @staticmethod
+                def http_request(_endpoint, method, path, *, token, body):
+                    gateway, sensor = path.split('/')[3], path.split('/')[-1]
+                    return 201, {}, {'entity_id': f'urn:ngsi-ld:Sensor:{gateway}:{sensor}'}
+                def private_write(self, path, text):
+                    Path(path).write_text(text, encoding='utf-8'); Path(path).chmod(0o600)
+                def paper_p8_remote_support(self): return self.remote_support
+            remote = Mock()
+            profile = {'advertised_https': 'https://192.168.50.10:9443',
+                       'advertised_mqtt_tls': 'mqtts://192.168.50.10:9883',
+                       'advertised_host': '192.168.50.10', 'bind_ip': '192.168.50.10',
+                       'https_port': 9443, 'mqtt_tls_port': 9883}
+            broker = {'NetworkSettings': {'Ports': {'8883/tcp': [
+                {'HostIp': '192.168.50.10', 'HostPort': '9883'}]}}}
+            nginx = {'NetworkSettings': {'Ports': {'443/tcp': [
+                {'HostIp': '192.168.50.10', 'HostPort': '9443'}]}}}
+            registry = Mock()
+            registry.resolve.side_effect = [broker, nginx]
+            fixture = SimpleNamespace(private=private, project='ncs_0123456789ab')
+            endpoint = SimpleNamespace(url='https://127.0.0.1:80', ca_file=private / 'certs/https-ca.pem')
+            context = e4.prepare(Smoke(remote), fixture, endpoint, registry, {'mosquitto': 'broker', 'nginx': 'nginx'},
+                {}, object(), 'on', remote_profile=profile, session_id='a' * 32)
+            unique = json.loads(context['manifests'][0].read_text())
+            self.assertEqual(context['mode'], 'remote')
+            self.assertEqual(unique['tls']['https_endpoint'], profile['advertised_https'])
+            self.assertEqual(unique['tls']['mqtt_tls_endpoint'], profile['advertised_mqtt_tls'])
+            self.assertEqual(unique['tls']['mqtt_tls_server_name'], profile['advertised_host'])
+            self.assertEqual(unique['run_id'], 'p8e4-' + 'a' * 32 + '-warm-unique')
+            remote.validate_runtime_mapping.assert_any_call('mosquitto', broker['NetworkSettings']['Ports'], profile)
+            remote.validate_runtime_mapping.assert_any_call('nginx', nginx['NetworkSettings']['Ports'], profile)
+            for path in (endpoint.ca_file, private / 'certs/ca.crt'):
+                path.write_text('test-ca', encoding='utf-8'); path.chmod(0o600)
+            bundle = e4.export_prepared_bundle(context, output_leaf=private / 'portable-bundle')
+            from scripts import paper_p8_bundle
+            workspace = private / 'bound-workspace'
+            paper_p8_bundle.bind_bundle(bundle_root=bundle['bundle_root'], workspace_leaf=workspace)
+            bound_manifests = [json.loads(path.read_text()) for path in
+                sorted((workspace / 'runtime/manifests').glob('*.json'))]
+            journal_paths = {manifest['e4']['journal_path'] for manifest in bound_manifests
+                             if isinstance(manifest.get('e4'), dict)}
+            self.assertEqual(journal_paths, {str((workspace / 'outputs/e4-journal.sqlite').resolve())})
+            self.assertNotIn(str(context['journal']), journal_paths)
+            viewer = next(manifest for manifest in bound_manifests if manifest['roles'] == ['viewer'])
+            self.assertEqual(viewer['experiment'], 'E1')
+            from scripts import paper_p8_client
+            self.assertEqual(paper_p8_client.main(['run', '--workspace', str(workspace),
+                '--binary', '/bin/true']), 1)
+
+    def test_local_runner_consumes_prepared_context_once(self):
+        import inspect
+        source = inspect.getsource(e4.run)
+        self.assertIn('prepared = prepare(', source)
+        self.assertNotIn('smoke.prepare_paper_workload(', source)
+        self.assertNotIn("'unique', 'unique', 4", source)
+
     def test_two_viewer_manifest_is_e1_viewer_only_and_bounded(self):
         common = {'topology': {'gateways': 2}, 'durability_mode': 'synthetic-load',
                   'gateway_identity_files': {'gw': 'secret'}}
@@ -142,6 +516,109 @@ class E4SupportTests(unittest.TestCase):
             unique_window=uw, replay_window=rw, cache_mode='off')
         self.assertIn('cache_off_database_path_unproven', result['failures'])
 
+    def test_remote_cache_off_finish_persists_snapshot_proof_through_final_acceptance(self):
+        from scripts.tests import native_compose_smoke as smoke
+        unique, replay, unique_window, replay_window = sample('off')
+        initial = [{'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0,
+                    'fingerprint': '0' * 32} for _ in range(2)]
+        unique_ack = replay_window['database_proof']['unique_ack']
+        after = json.loads(json.dumps(unique_ack))
+        unique_hash = 'a' * 64
+        metrics_before = {'process_instance': 'proc', 'ingress': unique_window['before'],
+                          'websocket_metrics': {'deliveries_enqueued': 20}}
+        metrics_after = {'process_instance': 'proc', 'ingress': replay_window['after'],
+                         'websocket_metrics': {'deliveries_enqueued': 20}}
+        phase_result = {'results': {'replay': {'telemetry': replay, 'viewer': {},
+                                               'validation_valid': True}}}
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp)
+            incoming = root / 'incoming'; result_dir = incoming / 'replay'
+            result_dir.mkdir(parents=True)
+            (result_dir / 'results.json').write_text('{}')
+            prepared = {
+                'phase_results': {'unique': {'telemetry': unique, 'viewer': {},
+                                              'validation_valid': True}},
+                'phase_windows': {'unique': {'journal_sha256': unique_hash,
+                    'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+                    'database_before': initial, 'database_after': unique_ack,
+                    'ingress_delta': unique_window['delta'],
+                    'admin_before': {'ingress': unique_window['before']},
+                    'admin_after': {'ingress': unique_window['after']},
+                    'ws_delta': {'submissions': 20, 'new_events': 20,
+                        'deliveries_enqueued': 20, 'telemetry_writes_completed': 20, 'drops': 0},
+                    'raw': [{'verified_exact': True, 'ledger_count': 10}] * 2}},
+                'unique_database_snapshot': unique_ack,
+                'phase_baselines': {'replay': {'database': unique_ack,
+                    'admin_metrics': metrics_before}},
+                'remote_collectors': {'replay': Mock()}, 'tokens': {'admin': 'token'},
+                'pg': 'pg', 'specs': [SimpleNamespace(gateway_id='g1', sensor_id='s1'),
+                    SimpleNamespace(gateway_id='g2', sensor_id='s2')],
+                'session_id': 'session', 'phase_run_ids': {'replay': 'run'},
+                'bundle_sha256': 'b' * 64, 'cache_mode': 'off',
+                'arm': 'warm', 'run_id': 'run', 'schema': 'schema', 'quota': {},
+                'effective_flags': {}, 'image_ids': {'backend': 'b', 'mosquitto': 'm', 'gateway': 'g'},
+                'overall_validation': None}
+            fixture = SimpleNamespace(private=root)
+            smoke_runtime = Mock(); smoke_runtime.paper_p0_stats.return_value = {}
+            telemetry_path = 'results/phases/replay/workloads/replay/workload.json'
+            viewer_path = 'results/phases/replay/workloads/viewer/workload.json'
+            with patch.object(e4, '_read_e4_result_bundle', return_value=(
+                    {'journal_sha256': unique_hash, 'source_bundle_sha256': 'b' * 64},
+                    {telemetry_path: replay, viewer_path: {}})), \
+                 patch.object(e4, '_validate_e4_phase_samples', return_value={'valid': True, 'failures': []}), \
+                 patch.object(e4._support, '_admin_metrics', return_value=metrics_after), \
+                 patch.object(e4, '_wait_e4_ws_drain', return_value=metrics_after), \
+                 patch.object(e4, '_counts', side_effect=after), \
+                 patch.object(e4, '_database_delta', return_value={'ledger': 0, 'raw': 0,
+                     'temporal': 0, 'configuration': 0}), \
+                 patch.object(e4._support, 'calculate_ingress_delta', return_value={
+                     'available': True, 'delta': replay_window['delta']}), \
+                 patch.object(e4, '_e4_ws_window', return_value={'submissions': 0, 'new_events': 0,
+                     'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0}), \
+                 patch.object(e4, '_cache_counter_window', return_value=dict(replay_window['cache'])), \
+                 patch.object(e4, '_replay_headers_match_manifest_prefix', return_value=True), \
+                 patch.object(e4, 'validate_e4_results', return_value={
+                     'valid': True, 'failures': [], 'status': 'PASS', 'cache_mode': 'off'}):
+                result = e4.finish_remote_phase(smoke_runtime, fixture, 'endpoint', 'registry',
+                    'containers', prepared, result_dir, phase='replay')
+            saved = prepared['phase_windows']['replay']['database_proof']
+            self.assertEqual(saved, {'unique_ack': unique_ack, 'replay_end': after,
+                                     'exact_equal': True})
+            self.assertTrue(result['validation_valid'])
+            prepared['phase_windows']['replay']['ws_delta'] = {'submissions': 0, 'new_events': 0,
+                'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0}
+            session = {'phase_history': ['unique', 'replay'], 'workload_outcome': 'VALIDATED'}
+            report = e4.finalize_remote_report(prepared, session,
+                cleanup_verified=True, cleanup_counts={'container': 12, 'network': 1, 'volume': 5})
+            self.assertEqual(report['counter_windows']['replay']['database_proof'], saved)
+            self.assertEqual(report['status'], 'PASS')
+            report['cleanup_verified'] = True
+            self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+            prepared['unique_database_snapshot'] = None
+            prepared['phase_results']['unique']['validation_valid'] = True
+            with patch.object(e4, '_counts', side_effect=after), \
+                 patch.object(e4, '_read_e4_result_bundle', return_value=(
+                     {'journal_sha256': unique_hash, 'source_bundle_sha256': 'b' * 64},
+                     {telemetry_path: replay, viewer_path: {}})), \
+                 patch.object(e4, '_validate_e4_phase_samples', return_value={'valid': True, 'failures': []}), \
+                 patch.object(e4._support, '_admin_metrics', return_value=metrics_after), \
+                 patch.object(e4, '_wait_e4_ws_drain', return_value=metrics_after), \
+                 patch.object(e4, '_database_delta', return_value={'ledger': 0, 'raw': 0,
+                     'temporal': 0, 'configuration': 0}), \
+                 patch.object(e4._support, 'calculate_ingress_delta', return_value={
+                     'available': True, 'delta': replay_window['delta']}), \
+                 patch.object(e4, '_e4_ws_window', return_value={'submissions': 0, 'new_events': 0,
+                     'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0}), \
+                 patch.object(e4, '_cache_counter_window', return_value=dict(replay_window['cache'])), \
+                 patch.object(e4, '_replay_headers_match_manifest_prefix', return_value=True):
+                e4.finish_remote_phase(smoke_runtime, fixture, 'endpoint', 'registry',
+                    'containers', prepared, result_dir, phase='replay')
+            self.assertFalse(prepared['phase_windows']['replay']['database_proof']['exact_equal'])
+            prepared['phase_windows']['replay'].pop('database_proof')
+            failed = e4.finalize_remote_report(prepared, session,
+                cleanup_verified=True, cleanup_counts={'container': 12, 'network': 1, 'volume': 5})
+            self.assertNotEqual(failed['status'], 'PASS')
+
     def test_wrong_cache_evidence_is_rejected(self):
         unique, replay, uw, rw = sample('off')
         result = e4.validate_e4_results(unique, replay,
@@ -196,6 +673,78 @@ class E4SupportTests(unittest.TestCase):
             raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('replay_journal_content_mismatch', result['failures'])
+
+    def test_finish_remote_replay_checks_declared_manifest_prefix_and_keeps_proofs_strict(self):
+        with tempfile.TemporaryDirectory(prefix='p8-e4-finish-', dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); incoming = root / 'incoming'; result_root = incoming / 'replay'
+            result_root.mkdir(parents=True); (result_root / 'results.json').write_text('{}')
+            manifest = root / 'replay.json'
+            manifest.write_text(json.dumps({'e4': {'replay_count': 10}}))
+            unique, replay, _, _ = sample()
+            unique['e4']['safe_header_samples'] = [{'id': i} for i in range(20)]
+            replay['e4']['safe_header_samples'] = [{'id': i} for i in range(10)]
+            telemetry = {'e4': replay['e4']}
+            viewer = {}
+            snapshot = [{'ledger': 20, 'raw': 2000, 'temporal': 20,
+                         'configuration': 0, 'fingerprint': 'a' * 32}]
+            metrics = {'websocket_metrics': {}, 'process_instance': 'same'}
+            prepared = {'phase_baselines': {'replay': {'admin_metrics': metrics,
+                'database': snapshot, 'server': {}, 'ws_process_instance': 'same'}},
+                'remote_collectors': {'replay': Mock()}, 'manifests': [manifest, manifest],
+                'session_id': 's', 'phase_run_ids': {'replay': 'r'}, 'bundle_sha256': 'b' * 64,
+                'cache_mode': 'on', 'tokens': {'admin': 'admin'},
+                'specs': [SimpleNamespace(gateway_id='gw', sensor_id='sensor')], 'pg': 'pg',
+                'phase_results': {'unique': {'telemetry': unique, 'validation_valid': True}},
+                'phase_windows': {'unique': {'journal_sha256': 'c' * 64}},
+                'unique_database_snapshot': snapshot}
+            fixture = SimpleNamespace(private=root)
+            smoke = Mock()
+            smoke._unused = None
+            with patch.object(e4, '_read_e4_result_bundle', return_value=(
+                    {'journal_sha256': 'c' * 64, 'source_bundle_sha256': 'b' * 64},
+                    {'results/phases/replay/workloads/replay/workload.json': telemetry,
+                     'results/phases/replay/workloads/viewer/workload.json': viewer})), \
+                 patch.object(e4, '_validate_e4_phase_samples', return_value={'valid': True, 'failures': []}), \
+                 patch.object(e4._support, '_admin_metrics', return_value=metrics), \
+                 patch.object(e4, '_wait_e4_ws_drain', return_value=metrics), \
+                 patch.object(e4, '_counts', return_value=snapshot[0]), \
+                 patch.object(e4, '_database_delta', return_value={'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}), \
+                 patch.object(e4._support, 'calculate_ingress_delta', return_value={'available': True,
+                     'delta': {'Committed': 0, 'SamplesNew': 0, 'DuplicateCommitted': 10, 'ACKPublished': 10}}), \
+                 patch.object(e4, '_cache_counter_window', return_value={'warm_lookup_hits': 10,
+                     'repository_calls_avoided': 10}), \
+                 patch.object(e4, '_e4_ws_window', return_value={'submissions': 0, 'new_events': 0,
+                     'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0}), \
+                 patch.object(e4, 'sensor_scoped_delta', return_value={}), \
+                 patch.object(e4, 'validate_e4_results', return_value={'valid': True, 'failures': []}):
+                answer = e4.finish_remote_phase(smoke, fixture, 'endpoint', 'registry', {}, prepared,
+                                                result_root, phase='replay')
+                self.assertTrue(answer['validation_valid'], answer['validation_failures'])
+                # Changed journal proof still fails, despite matching prefix and unchanged DB.
+                prepared['phase_windows']['unique']['journal_sha256'] = 'd' * 64
+                answer = e4.finish_remote_phase(smoke, fixture, 'endpoint', 'registry', {}, prepared,
+                                                result_root, phase='replay')
+                self.assertIn('replay_journal_continuity_mismatch', answer['validation_failures'])
+                prepared['phase_windows']['unique']['journal_sha256'] = 'c' * 64
+                prepared['unique_database_snapshot'] = [{**snapshot[0], 'fingerprint': 'd' * 32}]
+                answer = e4.finish_remote_phase(smoke, fixture, 'endpoint', 'registry', {}, prepared,
+                                                result_root, phase='replay')
+                self.assertIn('replay_unique_snapshot_mismatch', answer['validation_failures'])
+
+    def test_declared_replay_prefix_rejects_count_order_and_foreign_headers(self):
+        with tempfile.TemporaryDirectory(prefix='p8-e4-prefix-', dir='/var/tmp/opencode') as tmp:
+            manifest = Path(tmp) / 'replay.json'
+            manifest.write_text(json.dumps({'e4': {'replay_count': 10}}))
+            prepared = {'manifests': [manifest, manifest]}
+            full = {'e4': {'safe_header_samples': [{'id': i} for i in range(20)]}}
+            prefix = {'e4': {'safe_header_samples': [{'id': i} for i in range(10)]}}
+            self.assertTrue(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
+            prefix['e4']['safe_header_samples'][0] = {'id': 'foreign'}
+            self.assertFalse(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
+            prefix['e4']['safe_header_samples'] = [{'id': i} for i in range(9)]
+            self.assertFalse(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
+            manifest.write_text(json.dumps({'e4': {'replay_count': True}}))
+            self.assertFalse(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
 
     def test_cache_on_accepts_zero_unique_db_duplicates_but_requires_replay_no_db_work(self):
         unique, replay, uw, rw = sample()
@@ -397,9 +946,10 @@ class E4SupportTests(unittest.TestCase):
             'first_sequence': 11, 'sample_count': 100, 'measured_at': '2026-10-28T00:00:00+00:00',
             'sample_interval_us': 10000, 'samples': list(range(100))}, separators=(',', ':')).encode()
         digest = hashlib.sha256(payload).hexdigest()
-        identity = {'hash': digest, 'ledger_fingerprint': 'ledger-fp', 'raw': 100,
+        identity = {'message_id':message_id,'hash': digest, 'ledger_fingerprint': 'ledger-fp', 'raw': 100,
                     'boot': 'boot-a', 'first_sequence': 11, 'interval_us': 10000,
-                    'sample_count': 100}
+                    'sample_count': 100, 'gateway_id':'gw','sensor_id':'p8-e4-durable',
+                    'first_timestamp':'2026-10-28T00:00:00+00:00'}
         if mismatch:
             identity[mismatch] = 99 if isinstance(identity[mismatch], int) else 'wrong'
         aux_reads = iter(({'ledger': 0, 'raw': 0, 'temporal': 0},
@@ -415,9 +965,10 @@ class E4SupportTests(unittest.TestCase):
                 if "'ledger',(SELECT count(*)" in sql:
                     return json.dumps(next(aux_reads))
                 if "'last_sequence'" in sql:
-                    return json.dumps({'hash': digest, 'ledger_fingerprint': 'ledger-fp',
+                    return json.dumps({'message_id':message_id,'hash': digest, 'ledger_fingerprint': 'ledger-fp',
                         'raw': identity.get('raw'), 'boot': 'boot-a', 'first_sequence': 11,
-                        'last_sequence': 110, 'sample_count': 100})
+                        'last_sequence': 110, 'sample_count': 100,
+                        'first_timestamp':'2026-10-28T00:00:00+00:00'})
                 if "'ledger_fingerprint'" in sql and 'p.payload_hash' in sql:
                     return json.dumps(identity)
                 if 'json_agg(json_build_object' in sql:
@@ -427,6 +978,7 @@ class E4SupportTests(unittest.TestCase):
                         'measured_at': (start + timedelta(microseconds=10000 * i)).isoformat()}
                         for i in range(100)])
                 return json.dumps({'hash': digest, 'ledger_fingerprint': 'ledger-fp', 'raw': 100,
+                    'gateway_id': 'gw', 'sensor_id': 'p8-e4-durable',
                     'boot': 'boot-a', 'first_sequence': 11, 'last_sequence': 110, 'sample_count': 100})
 
         class Proc:
@@ -507,6 +1059,213 @@ class E4SupportTests(unittest.TestCase):
 
     def test_durable_runtime_probe_timeout_joins_child(self):
         self.run_probe(timeout=True)
+
+    def test_extract_e4_journal_first_record_and_generate_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_path = Path(tmp) / 'journal.jsonl'
+            mid = '550e8400-e29b-41d4-a716-446655440000'
+            payload_dict = {
+                'protocol_version': 1, 'message_id': mid, 'message_type': 'telemetry_batch',
+                'gateway_id': 'gw-1', 'sensor_id': 'sensor-1', 'boot_id': 'boot-1',
+                'first_sequence': 10, 'sample_count': 100, 'measured_at': '2026-10-28T00:00:00Z',
+                'sample_interval_us': 10000, 'samples': [float(i) for i in range(100)]
+            }
+            raw_payload = json.dumps(payload_dict, separators=(',', ':')).encode()
+            digest = hashlib.sha256(raw_payload).hexdigest()
+            record = {
+                'topic': 'gateways/gw-1/telemetry/sensor-1',
+                'gateway_id': 'gw-1',
+                'sensor_id': 'sensor-1',
+                'message_id': mid,
+                'boot_id': 'boot-1',
+                'first_sequence': '10',
+                'sample_count': 100,
+                'payload_sha256': digest,
+                'payload': base64.b64encode(raw_payload).decode('ascii')
+            }
+            journal_path.write_text(json.dumps(record) + '\n', encoding='utf-8')
+            header, extracted_payload = e4.extract_e4_journal_first_record(journal_path)
+            self.assertEqual(header['message_id'], mid)
+            self.assertEqual(extracted_payload, raw_payload)
+
+            cases = e4.generate_e4_conflict_payloads(extracted_payload, gateway_id='gw-1', sensor_id='sensor-1')
+            self.assertEqual(set(cases), {'same_id_changed_payload', 'different_first_sequence_overlap'})
+
+    def test_begin_and_finish_remote_conflicts_phase_lifecycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = SimpleNamespace(private=root / 'private')
+            fixture.private.mkdir(mode=0o700, parents=True)
+            incoming = fixture.private / 'incoming'
+            incoming.mkdir(mode=0o700, parents=True)
+            probe_dir = incoming / 'conflict-probe'
+            probe_dir.mkdir(mode=0o700, parents=True)
+
+            mid = '550e8400-e29b-41d4-a716-446655440000'
+            payload_dict = {
+                'protocol_version': 1, 'message_id': mid, 'message_type': 'telemetry_batch',
+                'gateway_id': 'gw-1', 'sensor_id': 'sensor-1', 'boot_id': 'boot-1',
+                'first_sequence': 10, 'sample_count': 100, 'measured_at': '2026-10-28T00:00:00Z',
+                'sample_interval_us': 10000, 'samples': [float(i) for i in range(100)]
+            }
+            raw_payload = json.dumps(payload_dict, separators=(',', ':')).encode()
+            cases = e4.generate_e4_conflict_payloads(raw_payload, gateway_id='gw-1', sensor_id='sensor-1')
+
+            probe_data = {
+                'schema_version': 1, 'experiment': 'E4', 'phase': 'conflicts',
+                'session_id': 'a' * 32, 'run_id': 'run-1',
+                'original_header': {'gateway_id': 'gw-1', 'sensor_id': 'sensor-1', 'message_id': mid,
+                                    'boot_id': 'boot-1', 'first_sequence': '10', 'sample_count': 100,
+                                    'payload_sha256': hashlib.sha256(raw_payload).hexdigest()},
+                'original_payload_sha256': hashlib.sha256(raw_payload).hexdigest(),
+                'original_payload_b64': base64.b64encode(raw_payload).decode(),
+                'cases': {
+                    name: {
+                        'message_id': json.loads(case_bytes)['message_id'],
+                        'payload_sha256': hashlib.sha256(case_bytes).hexdigest(),
+                        'raw_payload_b64': base64.b64encode(case_bytes).decode()
+                    }
+                    for name, case_bytes in cases.items()
+                }
+            }
+            probe_bytes = json.dumps(probe_data, sort_keys=True, separators=(',', ':')).encode()
+            (probe_dir / 'conflict-probe.json').write_bytes(probe_bytes)
+            bundle_binding = {'source_bundle_sha256': 'bundle-hash', 'source_inventory': [],
+                              'session': {'session_id': 'a' * 32, 'run_id': 'run-1'}}
+            probe_summary = {'schema_version': 1, 'experiment': 'E4', 'phase': 'conflicts',
+                'session_id': 'a' * 32, 'run_id': 'run-1', 'source_bundle_sha256': 'bundle-hash',
+                'source_inventory': [], 'binding': bundle_binding,
+                'binding_sha256': hashlib.sha256(json.dumps(bundle_binding, sort_keys=True,
+                    separators=(',', ':')).encode()).hexdigest(),
+                'proof': {'path': 'conflict-probe.json', 'size_bytes': len(probe_bytes),
+                    'sha256': hashlib.sha256(probe_bytes).hexdigest()},
+                'full_p8_accepted': False, 'physical_ab': 'NOT RUN'}
+            (probe_dir / 'results.json').write_text(json.dumps(probe_summary))
+            for path in probe_dir.iterdir(): path.chmod(0o600)
+
+            spec = SimpleNamespace(gateway_id='gw-1', sensor_id='sensor-1', sensor_urn='urn:s1')
+            prepared = {
+                'specs': [spec],
+                'pg': 'pg-info',
+                'bundle_sha256': 'bundle-hash',
+                'bundle_inventory': [],
+                'bundle_session': {'session_id': 'a' * 32},
+                'session_id': 'a' * 32,
+                'bundle_session': bundle_binding['session'],
+                'phase_results': {'unique': {'telemetry': {'e4': {'safe_header_samples':
+                    [probe_data['original_header']]}}}},
+                'run_id': 'run-1',
+                'containers': {'backend': {'receipt': {'id': 'backend-id'}}}
+            }
+
+            class MockSmoke:
+                def db_psql(self, registry, pg, query, params=None):
+                    if 'SELECT EXISTS' in query:
+                        return 't'
+                    if 'json_build_object' in query:
+                        return json.dumps({'ledger': 10, 'raw': 1000, 'temporal': 10, 'configuration': 0})
+                    if 'SELECT md5' in query:
+                        return 'd' * 32
+                    return 't'
+
+            class MockRegistry:
+                def command(self, args):
+                    return SimpleNamespace(returncode=0, stdout=b'reason_code=message_conflict\nreason_code=sequence_overlap\n', stderr=b'')
+
+            smoke = MockSmoke()
+            registry = MockRegistry()
+
+            (probe_dir / 'results.json').write_text(json.dumps(dict(probe_summary, session_id='wrong-session')))
+            with self.assertRaisesRegex(ValueError, 'probe_provenance_rejected'):
+                e4.read_conflict_probe_bundle(probe_dir, prepared=prepared)
+            (probe_dir / 'results.json').write_text(json.dumps(probe_summary))
+            (probe_dir / 'results.json').chmod(0o600)
+
+            # Begin
+            baseline = e4.begin_remote_conflicts_phase(smoke, fixture, registry, prepared)
+            self.assertIn('main', baseline)
+            self.assertEqual(prepared['conflict_baseline'], baseline)
+
+            # Finish setup
+            results_dir = incoming / 'conflicts'
+            results_dir.mkdir(mode=0o700, parents=True)
+            proof = {
+                'status': 'PASS',
+                'joined': True,
+                'phase': 'conflicts',
+                'cases': {
+                    name: {
+                        'message_id': probe_data['cases'][name]['message_id'],
+                        'payload_sha256': probe_data['cases'][name]['payload_sha256'],
+                        'schema_valid': True,
+                        'positive_control_ack_count': 1,
+                        'conflict_ack_count': 0,
+                        'raw_payload_b64': probe_data['cases'][name]['raw_payload_b64'],
+                        'status': 'EXPECTED_REJECTED_NO_ACK',
+                        'positive_control': {'status': 'COMPLETE', 'replay_offered': 1,
+                            'replay_application_acks': 1, 'pending_messages': 0, 'joined': True,
+                            'publish_attempts': 1, 'broker_pubacks': 1,
+                            'binary_sha256': 'b' * 64, 'binary_os': 'linux', 'binary_arch': 'x86_64',
+                            'returncode': 0, 'workload_sha256': 'a' * 64},
+                        'transport': {'status': 'PARTIAL', 'returncode': 4, 'replay_offered': 1,
+                            'replay_application_acks': 0, 'pending_messages': 1, 'joined': True,
+                            'publish_attempts': 1, 'broker_pubacks': 1, 'retries': 1,
+                            'observation_seconds': 4, 'binary_sha256': 'b' * 64,
+                            'binary_os': 'linux', 'binary_arch': 'x86_64', 'workload_sha256': 'c' * 64}
+                    }
+                    for name in ('same_id_changed_payload', 'different_first_sequence_overlap')
+                }
+            }
+            proof_bytes = json.dumps(proof).encode()
+            (results_dir / 'conflicts-proof.json').write_bytes(proof_bytes)
+            (results_dir / 'conflicts-proof.json').chmod(0o600)
+
+            binding = bundle_binding
+            binding_sha256 = hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            summary = {
+                'schema_version': 1, 'experiment': 'E4', 'phase': 'conflicts',
+                'session_id': 'a' * 32, 'run_id': 'run-1',
+                'source_bundle_sha256': 'bundle-hash',
+                'source_inventory': [],
+                'binding': binding,
+                'binding_sha256': binding_sha256,
+                'proof': {'path': 'conflicts-proof.json', 'size_bytes': len(proof_bytes), 'sha256': hashlib.sha256(proof_bytes).hexdigest()},
+                'full_p8_accepted': False, 'physical_ab': 'NOT RUN'
+            }
+            (results_dir / 'results.json').write_text(json.dumps(summary))
+            (results_dir / 'results.json').chmod(0o600)
+
+            # Recomputed transport/result digests cannot replace the exact A-guarded case bytes.
+            forged_dir = incoming / 'forged-results'; forged_dir.mkdir(mode=0o700)
+            forged = json.loads(json.dumps(proof))
+            forged['cases']['same_id_changed_payload']['raw_payload_b64'] = base64.b64encode(raw_payload).decode()
+            forged_bytes = json.dumps(forged).encode()
+            (forged_dir / 'conflicts-proof.json').write_bytes(forged_bytes)
+            (forged_dir / 'conflicts-proof.json').chmod(0o600)
+            forged_summary = dict(summary, proof={'path': 'conflicts-proof.json',
+                'size_bytes': len(forged_bytes), 'sha256': hashlib.sha256(forged_bytes).hexdigest()})
+            (forged_dir / 'results.json').write_text(json.dumps(forged_summary))
+            (forged_dir / 'results.json').chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'payload_changed_after_guard'):
+                e4.finish_remote_conflicts_phase(smoke, fixture, registry, prepared, forged_dir)
+
+            class EmptyLogs:
+                def command(self, args):
+                    return SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+            with self.assertRaisesRegex(ValueError, 'backend_logs_unavailable'):
+                e4.finish_remote_conflicts_phase(smoke, fixture, EmptyLogs(), prepared, results_dir)
+
+            class MockRegistryFinish:
+                def command(self, args):
+                    # Extra rejection log entries
+                    return SimpleNamespace(returncode=0, stdout=b'reason_code=message_conflict\nreason_code=message_conflict\nreason_code=sequence_overlap\nreason_code=sequence_overlap\n', stderr=b'')
+
+            finish_result = e4.finish_remote_conflicts_phase(smoke, fixture, MockRegistryFinish(), prepared, results_dir)
+            self.assertEqual(finish_result['workload_outcome'], 'VALIDATED')
+            self.assertEqual(prepared['conflict_verified']['status'], 'PASS')
+            self.assertEqual(prepared['conflict_verified']['database_before'],
+                             prepared['conflict_verified']['database_after'])
+            self.assertIn('transport_proof', prepared['conflict_verified']['cases']['same_id_changed_payload'])
 
 
 if __name__ == '__main__':

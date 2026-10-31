@@ -11,6 +11,7 @@ from scripts.tests.paper_p8_e2_support import (
 from scripts.tests import paper_p8_e2_support as e2
 from scripts.tests import paper_p8_support as p8
 from scripts.tests import native_compose_smoke as smoke_runtime
+from scripts import paper_p8_client
 
 
 class E2SupportTests(unittest.TestCase):
@@ -28,6 +29,7 @@ class E2SupportTests(unittest.TestCase):
                             self.profiles['profiles']['1']['A']['run_id'])
         for samples, pair in self.profiles['profiles'].items():
             self.assertEqual(int(samples), pair['A']['samples_per_message'])
+            self.assertEqual(pair['A']['run_id'], f'e2-{samples}')
             self.assertEqual(pair['A']['samples_per_message'], pair['B']['samples_per_message'])
             self.assertEqual(pair['A']['seed'], pair['B']['seed'])
             self.assertEqual(pair['A']['targets'], [self.targets[0]])
@@ -220,6 +222,45 @@ class E2SupportTests(unittest.TestCase):
             {'status':'PASS'}, {'status':'FAIL', 'validation':{'valid':False}}], 'full_p8_accepted':False}
         self.assertFalse(completed['full_p8_accepted'])
         self.assertNotEqual([p['status'] for p in completed['profiles']], ['PASS', 'PASS'])
+
+    def test_remote_phase_event_projection_preserves_only_bounded_arm_source(self):
+        events = [{'child':'paperload-telemetry:A.manifest.json','event':'measure_begin',
+                   'observed_at_runner_monotonic_ns':10},
+                  {'child':'paperload-telemetry:B.manifest.json','event':'burst_begin',
+                   'observed_at_runner_monotonic_ns':20}]
+        projected = paper_p8_client._safe_phase_events(events)
+        self.assertEqual([row['child'] for row in projected], [row['child'] for row in events])
+        with self.assertRaisesRegex(ValueError, 'phase event schema rejected'):
+            paper_p8_client._safe_phase_events([{'child':'/private/path', 'event':'measure_begin'}])
+
+    def test_e2_runner_phase_events_use_runtime_child_names_and_elapsed_field(self):
+        events = [{'child':'paperload-telemetry:A.json','event':'measure_begin',
+                   'child_elapsed_ns':123,'observed_at_runner_monotonic_ns':456,
+                   'clock_qualification':'runner observed pipe receipt; observation lag unknown; child elapsed is process-local',
+                   'configured_phases':{'measure_seconds':8},
+                   'counters':{'generated_unique':4}}]
+        projected = paper_p8_client._safe_phase_events(events)
+        self.assertEqual(projected[0]['child'], 'paperload-telemetry:A.json')
+        self.assertEqual(projected[0]['elapsed_ns'], 123)
+        self.assertNotIn('child_elapsed_ns', projected[0])
+
+    def test_e2_phase_overlap_accepts_actual_runner_child_names(self):
+        events = []
+        for arm, names, start in (
+                ('A', ('measure_begin', 'measure_end'), 100),
+                ('B', ('burst_begin', 'burst_end'), 150)):
+            for offset, name in enumerate(names):
+                events.append({'child':f'paperload-telemetry:{arm}.json', 'event':name,
+                               'observed_at_runner_monotonic_ns':start + offset * 100})
+        a = e2._phase_intervals(events, 'A')
+        b = e2._phase_intervals(events, 'B')
+        self.assertGreater(min(a['measure_end'], b['burst_end']) -
+                           max(a['measure_begin'], b['burst_begin']), 0)
+
+    def test_e2_remote_prepare_rejects_unselected_sample_profile(self):
+        with self.assertRaisesRegex(ValueError, 'samples_profile_rejected'):
+            e2.prepare_remote(None, None, None, None, None, None, None,
+                session_id='a'*32, samples_per_message=10, output_root='unused', bundle_root='unused')
 
 
 if __name__ == '__main__':

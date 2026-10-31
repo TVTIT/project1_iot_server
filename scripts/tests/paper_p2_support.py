@@ -141,6 +141,12 @@ def prepare_perimeter(smoke, fixture):
           .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False)
           .sign(ca_key, hashes.SHA256()))
     server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    remote_profile = getattr(fixture, 'remote_network_config', None)
+    dns_sans = (remote_profile['required_san_dns'] if remote_profile else
+                ['localhost', 'nginx', 'mosquitto'])
+    ip_sans = (remote_profile['required_san_ips'] if remote_profile else ['127.0.0.1'])
+    san_names = [x509.DNSName(value) for value in dns_sans]
+    san_names.extend(x509.IPAddress(ipaddress.ip_address(value)) for value in ip_sans)
     cert = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'localhost')]))
             .issuer_name(name).public_key(server_key.public_key()).serial_number(x509.random_serial_number())
             .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=2))
@@ -151,8 +157,7 @@ def prepare_perimeter(smoke, fixture):
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()), False)
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName('localhost'), x509.DNSName('nginx'),
-                x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), False).sign(ca_key, hashes.SHA256()))
+            .add_extension(x509.SubjectAlternativeName(san_names), False).sign(ca_key, hashes.SHA256()))
     smoke.private_write(tls / 'server.key', server_key.private_bytes(serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
     smoke.private_write(tls / 'server.crt', cert.public_bytes(serialization.Encoding.PEM).decode())
@@ -162,6 +167,8 @@ def prepare_perimeter(smoke, fixture):
     p8_slow_timers = ("      WS_HEARTBEAT_INTERVAL: '2s'\n      WS_PONG_TIMEOUT: '4s'\n"
                       "      WS_WRITE_TIMEOUT: '1s'\n") if (getattr(fixture, 'paper_p8_slow', False)
                                                             or getattr(fixture, 'paper_p8_e1', False)) else ''
+    remote_nginx_port = (remote_profile['https_port'] if remote_profile else '0')
+    remote_bind = (remote_profile['bind_ip'] if remote_profile else '127.0.0.1')
     text += f'''  backend:
     environment:
       SUPABASE_JWT_SECRET: !reset null
@@ -177,8 +184,8 @@ def prepare_perimeter(smoke, fixture):
   nginx:
     ports: !override
       - target: 443
-        published: "0"
-        host_ip: "127.0.0.1"
+        published: "{remote_nginx_port}"
+        host_ip: "{remote_bind}"
         protocol: tcp
     volumes: !override
       - {smoke.ROOT / 'config/nginx/paper-p2.conf.template'}:/etc/nginx/templates/default.conf.template:ro
@@ -206,8 +213,20 @@ volumes:
       io.iot.native-smoke.run: {fixture.project}
       io.iot.native-smoke.role: auth_socket
 '''
+    if remote_profile:
+        mosquitto_ports = f'''  mosquitto:
+    ports: !override
+      - target: 8883
+        published: "{remote_profile['mqtt_tls_port']}"
+        host_ip: "{remote_profile['bind_ip']}"
+        protocol: tcp
+'''
+        text = text.replace('volumes:\n  auth_socket:', mosquitto_ports + 'volumes:\n  auth_socket:', 1)
     # This is an existing protected, fixture-owned input, not a source template.
-    smoke.durable_json(fixture.private / 'p2-profile.json', {'https': True, 'socket_gid': 101})
+    smoke.durable_json(fixture.private / 'p2-profile.json', {'https': True, 'socket_gid': 101,
+        'remote_network': bool(remote_profile), 'remote_endpoints': ({
+            'https': remote_profile['advertised_https'], 'mqtt_tls': remote_profile['advertised_mqtt_tls']}
+            if remote_profile else None)})
     with path.open('w') as stream:
         stream.write(text)
 

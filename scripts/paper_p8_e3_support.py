@@ -37,6 +37,42 @@ def e3_pilot_arms():
     return arms
 
 
+def server_origin_latency_from_collector(metrics):
+    """Use the latest cumulative A-side command timeline; never sum snapshots."""
+    for sample in reversed(metrics if isinstance(metrics, list) else []):
+        snapshot = sample.get('snapshot') if isinstance(sample, dict) else None
+        timeline = snapshot.get('command_timeline') if isinstance(snapshot, dict) else None
+        if not isinstance(timeline, dict):
+            continue
+        dispatch = timeline.get('d_dispatch')
+        succeeded = timeline.get('d_e2e_succeeded')
+        def valid_histogram(value):
+            return (isinstance(value, dict) and type(value.get('count')) is int
+                    and value['count'] >= 0 and type(value.get('overflow')) is int
+                    and value['overflow'] >= 0 and isinstance(value.get('buckets'), list)
+                    and isinstance(value.get('upper_seconds'), list)
+                    and len(value['buckets']) == len(value['upper_seconds'])
+                    and all(type(n) is int and n >= 0 for n in value['buckets'])
+                    and isinstance(value.get('sum_seconds'), (int, float))
+                    and value['sum_seconds'] >= 0)
+        if not valid_histogram(dispatch) or not valid_histogram(succeeded):
+            return {'histograms': None, 'latency': None, 'availability': 'unavailable'}
+        histograms = {'d_dispatch': dispatch, 'd_e2e_succeeded': succeeded,
+                      'missing_origin': timeline.get('missing_origin'),
+                      'missing_dispatch': timeline.get('missing_dispatch'),
+                      'pending_origins': timeline.get('pending_origins'),
+                      'snapshot_phase': sample.get('phase')}
+        def summary(histogram):
+            count = histogram['count']
+            return {'count': count, 'sum_seconds': histogram['sum_seconds'],
+                    'mean_seconds': histogram['sum_seconds'] / count if count else None,
+                    'overflow': histogram['overflow']}
+        return {'histograms': histograms,
+                'latency': {'dispatch': summary(dispatch), 'e2e_succeeded': summary(succeeded)},
+                'availability': 'available' if dispatch['count'] or succeeded['count'] else 'no_observations'}
+    return {'histograms': None, 'latency': None, 'availability': 'unavailable'}
+
+
 def e3_pilot_manifests(*, common, background_targets, background_gateway_identity_files,
                        telemetry_identity_files, control_targets, initial_versions,
                        control_identity_file, tls, idempotency_keys=None, workload='mixed'):
@@ -169,7 +205,7 @@ def build_e3_execution_plan(*, output_dir, manifests, gateway_env_files,
 def validate_e3_result(*, control_workload, telemetry_a, telemetry_b, phase_events,
                        background_database_delta, command_database_delta,
                        control_receipt_verification, runner_stopped, declared_idempotency_keys,
-                        raw_checks=None, workload='mixed'):
+                        raw_checks=None, workload='mixed', collector_metrics=None):
     """Adapt actual artifacts; freshness/DB evidence is supplied by native fixture."""
     failures = []
     commands = control_workload.get('commands') if isinstance(control_workload, dict) else None
@@ -195,9 +231,9 @@ def validate_e3_result(*, control_workload, telemetry_a, telemetry_b, phase_even
     total_messages = sum(expected_messages.values())
     bg_expected = {'ledger': total_messages, 'raw': total_messages * 100, 'temporal': total_messages}
     if background_database_delta != bg_expected: failures.append('background_database_delta_mismatch')
-    if not isinstance(command_database_delta, dict) or not isinstance(command_database_delta.get('raw_samples'), int):
+    if not isinstance(command_database_delta, dict) or type(command_database_delta.get('raw_samples')) is not int:
         failures.append('command_raw_counts_unavailable')
-    elif command_database_delta['raw_samples'] < 0:
+    elif command_database_delta['raw_samples'] <= 0:
         failures.append('command_raw_counts_invalid')
     if not all(isinstance(w, dict) and w.get('status') == 'COMPLETE' and isinstance(w.get('telemetry'), dict)
                for w in (telemetry_a, telemetry_b)):
@@ -231,7 +267,14 @@ def validate_e3_result(*, control_workload, telemetry_a, telemetry_b, phase_even
     try:
         if not isinstance(phase_events, list): raise ValueError('phase_events_missing')
         def interval(child, begin, end):
-            rows = [e for e in phase_events if isinstance(e, dict) and e.get('child') == child]
+            # The local fixture uses *.manifest.json; the portable bundle binds
+            # those same roles as A.json/B.json/control.json.
+            aliases = {child}
+            if child.startswith('paperload-telemetry:'):
+                aliases.add(child.replace('.manifest.json', '.json'))
+            elif child == 'paperload-control:control.manifest.json':
+                aliases.add('paperload-control:control.json')
+            rows = [e for e in phase_events if isinstance(e, dict) and e.get('child') in aliases]
             found = {}
             for e in rows:
                 ev, stamp = e.get('event'), e.get('observed_at_runner_monotonic_ns')
@@ -248,7 +291,8 @@ def validate_e3_result(*, control_workload, telemetry_a, telemetry_b, phase_even
             overlap = max(0, min(a1, b1) - max(a0, b0))
         else:
             overlap = None
-        ctrl = [e for e in phase_events if isinstance(e, dict) and e.get('child') == 'paperload-control:control.manifest.json']
+        ctrl = [e for e in phase_events if isinstance(e, dict) and e.get('child') in
+                ('paperload-control:control.manifest.json', 'paperload-control:control.json')]
         by_ordinal = {}
         lifecycle = {'request_begin', 'admission_observed', 'terminal_observed'}
         for e in ctrl:
@@ -294,8 +338,10 @@ def validate_e3_result(*, control_workload, telemetry_a, telemetry_b, phase_even
                   'command_active_intervals': active}
     except (ValueError, TypeError) as exc:
         failures.append('phase_overlap_inconclusive'); phases = {'availability': 'inconclusive', 'reason': str(exc)}
+    latency = server_origin_latency_from_collector(collector_metrics)
     return {'valid': not failures, 'availability': 'available' if phases['availability'] == 'available' else 'inconclusive',
             'failures': failures, 'phase_overlap': phases,
             'command_raw_samples_actual': command_database_delta.get('raw_samples') if isinstance(command_database_delta, dict) else None,
-            'server_dispatch_e2e_histograms': 'collector-only; unavailable unless supplied by collector',
-            'server_origin_latency': None}
+            'server_dispatch_e2e_histograms': latency['histograms'],
+            'server_origin_latency': latency['latency'],
+            'server_origin_latency_availability': latency['availability']}
