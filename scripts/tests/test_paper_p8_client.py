@@ -221,6 +221,17 @@ class IdentityAndProbeTests(unittest.TestCase):
             'command_ordinal': 1}])
         self.assertEqual(events[0]['child'], 'paperload-control:control.manifest.json')
 
+    def test_e1_safe_phase_events_accepts_telemetry_child_labels(self):
+        for child in ('paperload-telemetry:telemetry.json',
+                      'paperload-telemetry:telemetry.manifest.json'):
+            with self.subTest(child=child):
+                event = {'child': child, 'event': 'measure_begin',
+                         'child_elapsed_ns': 10, 'observed_at_runner_monotonic_ns': 20,
+                         'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}
+                expected = {key: value for key, value in event.items() if key != 'child_elapsed_ns'}
+                expected['elapsed_ns'] = 10
+                self.assertEqual(client._safe_phase_events([event]), [expected])
+
     def test_e5_safe_phase_events_accepts_initial_and_warm_replay_child_labels(self):
         accepted_children = [
             'paperload-telemetry:initial.json',
@@ -255,6 +266,10 @@ class IdentityAndProbeTests(unittest.TestCase):
             'paperload-viewer:control.json',
             'paperload-control:initial.json',
             'paperload-control:viewer.json',
+            'paperload-viewer:telemetry.json',
+            'paperload-control:telemetry.json',
+            'paperload-telemetry:../telemetry.json',
+            'paperload-telemetry:telemetry.json.extra',
             'paperload-telemetry:../initial.json',
             'paperload-telemetry:/etc/passwd',
             'paperload-telemetry:initial',
@@ -497,7 +512,12 @@ class ResultProjectionTests(unittest.TestCase):
             path.write_text(json.dumps(value))
             path.chmod(0o600)
         runner = workspace / 'outputs/run.json'
+        phase_event = {'child': 'paperload-telemetry:telemetry.json',
+                       'event': 'measure_end', 'child_elapsed_ns': 10,
+                       'observed_at_runner_monotonic_ns': 20,
+                       'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}
         runner.write_text(json.dumps({'status': 'COMPLETE', 'children': [{'name': '/private/path'}],
+                                      'phase_observations': {'status': 'observed', 'events': [phase_event]},
                                       'resource_sampling': {'status': 'not_collected_in_P8.4'}}))
         runner.chmod(0o600)
         provenance = workspace / 'runtime/runner-provenance.json'
@@ -507,6 +527,11 @@ class ResultProjectionTests(unittest.TestCase):
         out = fixture.root / 'safe-results'
         client._export_results(workspace, out)
         summary = json.loads((out / 'results.json').read_text())
+        exported_runner = json.loads((out / 'results/runner/run.json').read_text())
+        expected_event = {key: value for key, value in phase_event.items() if key != 'child_elapsed_ns'}
+        expected_event['elapsed_ns'] = 10
+        self.assertEqual(exported_runner['phase_observations'],
+                         {'status': 'observed', 'events': [expected_event]})
         self.assertEqual(len({row['path'] for row in summary['files']}), len(summary['files']))
         self.assertEqual(set(summary['bound_manifest_sha256']), {'viewer','telemetry'})
         self.assertTrue(all(re.fullmatch(r'[0-9a-f]{64}', digest) for digest in
