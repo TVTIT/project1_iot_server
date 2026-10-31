@@ -193,6 +193,9 @@ class Fixture:
     paper_p8_load: bool = False
     paper_p8_e1: bool = False
     paper_p8_e2: bool = False
+    paper_p8_e2_workload: str = 'steady_burst'
+    paper_p8_e2_context: str | None = None
+    paper_p8_e2_reference: str | None = None
     paper_p8_e3: str | None = None
     paper_p8_e3_workload: str = 'mixed'
     paper_p8_e4: str | None = None
@@ -760,7 +763,9 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             paper_p3_microbatch=False, paper_p5a_shutdown=False, paper_p5b_cache_smoke=False,
             paper_p5b_control_regression=False, paper_p5b=None, paper_p6=None,
              paper_p8_sessions=False, paper_p8_slow=False, paper_p8_load=False, paper_p8_e1=False,
-             paper_p8_e2=False, paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e4=None,
+             paper_p8_e2=False, paper_p8_e2_workload='steady_burst',
+             paper_p8_e2_context=None, paper_p8_e2_reference=None,
+             paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e4=None,
                paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
                paper_p8_recovery=False, remote_network_config=None):
     if remote_network_config is not None:
@@ -781,6 +786,52 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         raise ValueError('paper_p8_mode_rejected')
     if paper_p8_e1 or paper_p8_e2 or paper_p8_e3 or paper_p8_e4 or paper_p8_e5:
         paper_p8_load = True
+    if paper_p8_e2:
+        if paper_p8_e2_workload not in ('steady_burst', 'equal_samples'):
+            raise ValueError('paper_p8_e2_workload_rejected')
+        if paper_p8_e2_workload == 'steady_burst':
+            if paper_p8_e2_context is not None or paper_p8_e2_reference is not None:
+                raise ValueError('paper_p8_e2_context_rejected')
+        elif paper_p8_e2_workload == 'equal_samples':
+            if paper_p8_e2_context is None:
+                raise ValueError('paper_p8_e2_context_required')
+            ctx_path = Path(paper_p8_e2_context).absolute()
+            if ctx_path.is_symlink() or any(p.is_symlink() for p in ctx_path.parents):
+                raise ValueError('paper_p8_e2_context_symlink_rejected')
+            if not ctx_path.is_file():
+                raise ValueError('paper_p8_e2_context_missing')
+            st = ctx_path.lstat()
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                raise ValueError('paper_p8_e2_context_permissions_rejected')
+            if st.st_size > 65536:
+                raise ValueError('paper_p8_e2_context_size_rejected')
+            try:
+                ctx_data = json.loads(ctx_path.read_text(encoding='utf-8'))
+            except Exception as exc:
+                raise ValueError('paper_p8_e2_context_invalid') from exc
+            paper_p8_e2_support().validate_e2_equal_samples_context(ctx_data, check_freshness=True)
+            if paper_p8_e2_reference is not None:
+                ref_path = Path(paper_p8_e2_reference).absolute()
+                if ref_path.is_symlink() or any(p.is_symlink() for p in ref_path.parents):
+                    raise ValueError('paper_p8_e2_reference_symlink_rejected')
+                if not ref_path.is_file():
+                    raise ValueError('paper_p8_e2_reference_missing')
+                rst = ref_path.lstat()
+                if rst.st_uid != os.getuid() or rst.st_mode & 0o077:
+                    raise ValueError('paper_p8_e2_reference_permissions_rejected')
+                if rst.st_size > 8 << 20:
+                    raise ValueError('paper_p8_e2_reference_size_rejected')
+                try:
+                    ref_data = json.loads(ref_path.read_text(encoding='utf-8'))
+                except Exception as exc:
+                    raise ValueError('paper_p8_e2_reference_invalid') from exc
+                if not isinstance(ref_data, dict) or ref_data.get('experiment') != 'E2':
+                    raise ValueError('paper_p8_e2_reference_invalid')
+                if ref_data.get('workload') != 'equal_samples' and ref_data.get('workload_type') != 'equal_samples':
+                    raise ValueError('paper_p8_e2_reference_invalid')
+    else:
+        if paper_p8_e2_workload != 'steady_burst' or paper_p8_e2_context is not None or paper_p8_e2_reference is not None:
+            raise ValueError('paper_p8_mode_rejected')
     if (paper_p8_e5 not in (None, 'optimized', 'shaper_off', 'microbatch_off', 'ram_dedup_off', 'polling', 'fanout_scan')
             or bool(paper_p8_e5) != bool(paper_p8_e5_context) and not paper_p8_recovery):
         raise ValueError('paper_p8_e5_context_required')
@@ -914,11 +965,18 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                       WS_RECHECK_INTERVAL='5s', WS_RECHECK_SWEEP_BUDGET='2s', WS_RECHECK_CONCURRENCY='2',
                       WS_FANOUT_MODE='indexed')
     if paper_p8_e2:
-        values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND='2', MQTT_SHAPER_BURST='4',
-                      MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
-                      MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
-                      MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
-                       STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
+        if paper_p8_e2_workload == 'equal_samples':
+            values.update(MQTT_SHAPER_ENABLED='false',
+                          MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
+                          MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
+                          MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
+                          STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
+        else:
+            values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND='2', MQTT_SHAPER_BURST='4',
+                          MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
+                          MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
+                          MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
+                          STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
     if paper_p8_e3:
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12',
                       STAGE5_WAKEUP_ENABLED='true' if paper_p8_e3 == 'wakeup' else 'false',
@@ -1014,6 +1072,9 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     object.__setattr__(fixture, 'paper_p8_slow', paper_p8_slow)
     object.__setattr__(fixture, 'paper_p8_load', paper_p8_load)
     object.__setattr__(fixture, 'paper_p8_e2', paper_p8_e2)
+    object.__setattr__(fixture, 'paper_p8_e2_workload', paper_p8_e2_workload)
+    object.__setattr__(fixture, 'paper_p8_e2_context', str(paper_p8_e2_context) if paper_p8_e2_context else None)
+    object.__setattr__(fixture, 'paper_p8_e2_reference', str(paper_p8_e2_reference) if paper_p8_e2_reference else None)
     object.__setattr__(fixture, 'paper_p8_e3', paper_p8_e3)
     object.__setattr__(fixture, 'paper_p8_e3_workload', paper_p8_e3_workload)
     object.__setattr__(fixture, 'paper_p8_e4', paper_p8_e4)
@@ -1446,6 +1507,52 @@ def _reuse_e5_image(registry, image_ids, role, tag, create_tag=True):
     return expected
 
 
+def _load_e2_reference(path, fixture):
+    context_path = Path(fixture.paper_p8_e2_context)
+    st = context_path.lstat()
+    if context_path.is_symlink() or not context_path.is_file() or st.st_uid != os.getuid() or (st.st_mode & 0o077) or st.st_size > 65536:
+        raise ValueError('paper_p8_e2_context_invalid')
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    validated_ctx = paper_p8_e2_support().validate_e2_equal_samples_context(context, check_freshness=False)
+    current_fp = paper_p8_support()._source_fingerprint(ROOT)
+    return paper_p8_e2_support().validate_e2_reference(path, validated_ctx, current_source_fp=current_fp)
+
+
+def _reuse_e2_binary(fixture, e2_reference):
+    bin_path = e2_reference.get('binary_path')
+    expected_sha256 = e2_reference.get('binary_sha256')
+    if not bin_path or not expected_sha256:
+        raise ValueError('e2_reference_binary_missing')
+    bin_file = Path(bin_path)
+    if bin_file.is_symlink() or not bin_file.is_file() or bin_file.stat().st_uid != os.getuid() or (bin_file.stat().st_mode & 0o077):
+        raise ValueError('e2_reference_binary_missing')
+    raw = bin_file.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError('e2_reference_binary_mismatch')
+    (fixture.private / 'bin').mkdir(mode=0o700, exist_ok=True)
+    dest = fixture.private / 'bin' / 'paperload'
+    dest.write_bytes(raw)
+    dest.chmod(0o700)
+    (fixture.artifacts / 'bin').mkdir(mode=0o700, exist_ok=True)
+    retained = fixture.artifacts / 'bin' / 'paperload'
+    retained.write_bytes(raw)
+    retained.chmod(0o700)
+    if hashlib.sha256(dest.read_bytes()).hexdigest() != expected_sha256:
+        raise ValueError('e2_reference_binary_mismatch')
+    return dest
+
+
+def _retain_e2_binary(fixture, paperload_binary):
+    if not paperload_binary or not Path(paperload_binary).is_file():
+        return
+    (fixture.artifacts / 'bin').mkdir(mode=0o700, exist_ok=True)
+    retained = fixture.artifacts / 'bin' / 'paperload'
+    raw = Path(paperload_binary).read_bytes()
+    retained.write_bytes(raw)
+    retained.chmod(0o700)
+
+
+
 def startup_only(fixture, registry=None, positive_http=False, role_http=False, full_http=False,
                  hold_callback=None, finalization_callback=None):
     """Phased real startup; optional hold returns through the same cleanup finally."""
@@ -1455,6 +1562,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
     phase, failure, evidence = 'preflight', None, {}
     containers = {}
     images = {}
+    paperload_binary = None
     cleanup_verified = False
 
     try:
@@ -1467,10 +1575,13 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             if result.returncode:
                 raise ValueError('local_image_unavailable')
             images[name] = json.loads(result.stdout)[0]['Id']
-        reuse = bool(getattr(fixture, 'paper_p8_e5_reference', None))
-        if getattr(fixture, 'paper_p8_e5', None) not in (None, 'optimized') and not reuse:
+        reuse_e5 = bool(getattr(fixture, 'paper_p8_e5_reference', None))
+        reuse_e2 = bool(getattr(fixture, 'paper_p8_e2', False) and
+                        getattr(fixture, 'paper_p8_e2_workload', '') == 'equal_samples' and
+                        getattr(fixture, 'paper_p8_e2_reference', None))
+        if getattr(fixture, 'paper_p8_e5', None) not in (None, 'optimized') and not reuse_e5:
             raise ValueError('e5_reference_required')
-        if reuse:
+        if reuse_e5:
             reference = _load_e5_reference(fixture.paper_p8_e5_reference, fixture)
             for name, image_id in images.items():
                 if reference['image_ids'].get(name) != image_id:
@@ -1478,6 +1589,21 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             phase = 'build'
             _reuse_e5_image(registry, reference['image_ids'], 'backend', fixture.project + '-backend')
             images['backend'] = reference['image_ids']['backend']
+        elif reuse_e2:
+            e2_ref = _load_e2_reference(fixture.paper_p8_e2_reference, fixture)
+            for name, image_id in images.items():
+                ref_img = e2_ref['image_ids'].get(name)
+                if ref_img is not None and ref_img != image_id:
+                    raise ValueError('e2_reference_image_mismatch')
+            phase = 'build'
+            _reuse_e5_image(registry, e2_ref['image_ids'], 'backend', fixture.project + '-backend')
+            inspect_res = registry.command(['image', 'inspect', fixture.project + '-backend'])
+            if inspect_res.returncode:
+                raise ValueError('e2_reference_image_unavailable')
+            actual_backend_id = json.loads(inspect_res.stdout)[0].get('Id')
+            if actual_backend_id != e2_ref['image_ids']['backend']:
+                raise ValueError('e2_reference_image_mismatch')
+            images['backend'] = actual_backend_id
         else:
             phase = 'build'
             build_native_image(fixture, prevalidated=True)
@@ -1487,9 +1613,18 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             images['backend'] = json.loads(result.stdout)[0]['Id']
         if requires_gateway_image(fixture):
             # Same Dockerfile builder, but the real Gateway target, not a host binary.
-            if reuse:
+            if reuse_e5:
                 _reuse_e5_image(registry, reference['image_ids'], 'gateway', fixture.project + '-gateway', create_tag=False)
                 images['gateway'] = reference['image_ids']['gateway']
+            elif reuse_e2:
+                _reuse_e5_image(registry, e2_ref['image_ids'], 'gateway', fixture.project + '-gateway', create_tag=False)
+                inspect_res = registry.command(['image', 'inspect', e2_ref['image_ids']['gateway']])
+                if inspect_res.returncode:
+                    raise ValueError('e2_reference_image_unavailable')
+                actual_gateway_id = json.loads(inspect_res.stdout)[0].get('Id')
+                if actual_gateway_id != e2_ref['image_ids']['gateway']:
+                    raise ValueError('e2_reference_image_mismatch')
+                images['gateway'] = actual_gateway_id
             else:
                 fd = os.open(fixture.private / 'gateway-build-output.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, 'wb') as stream:
@@ -1505,13 +1640,18 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 images['gateway'] = json.loads(result.stdout)[0]['Id']
         paperload_binary = None
         if getattr(fixture, 'paper_p8_load', False):
-            go_binary = shutil.which('go')
-            if not go_binary:
-                raise ValueError('paperload_build_failed')
-            (fixture.private / 'bin').mkdir(mode=0o700)
-            paperload_binary = build_paperload(fixture, go_binary)
-            if getattr(fixture, 'paper_p8_e3', None) or getattr(fixture, 'paper_p8_e4', None) or getattr(fixture, 'paper_p8_e5', None):
-                gateway_binary = build_paper_p8_e3_gateway(fixture, go_binary)
+            if reuse_e2:
+                paperload_binary = _reuse_e2_binary(fixture, e2_ref)
+            else:
+                go_binary = shutil.which('go')
+                if not go_binary:
+                    raise ValueError('paperload_build_failed')
+                (fixture.private / 'bin').mkdir(mode=0o700, exist_ok=True)
+                paperload_binary = build_paperload(fixture, go_binary)
+                if getattr(fixture, 'paper_p8_e3', None) or getattr(fixture, 'paper_p8_e4', None) or getattr(fixture, 'paper_p8_e5', None):
+                    gateway_binary = build_paper_p8_e3_gateway(fixture, go_binary)
+                if getattr(fixture, 'paper_p8_e2', False) and getattr(fixture, 'paper_p8_e2_workload', '') == 'equal_samples':
+                    _retain_e2_binary(fixture, paperload_binary)
 
         with lifecycle.cancellation_scope() as state:
             try:
@@ -1916,12 +2056,20 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             run['p8_slow_viewer'] = p8
             durable_json(p8_path, p8)
         if getattr(fixture, 'paper_p8_load', False):
+            phase_id = remote_session.get('phase_id') if prepare_only else None
+            is_e2_equal = bool(getattr(fixture, 'paper_p8_e2', False) and
+                               getattr(fixture, 'paper_p8_e2_workload', 'steady_burst') == 'equal_samples')
+            e2_target_name = (
+                f'p8-e2-{phase_id}-remote-result.json' if is_e2_equal and prepare_only and remote_outcome == 'VALIDATED' and phase_id
+                else 'p8-e2-equal-samples-pilot.json' if is_e2_equal and prepare_only
+                else 'p8-e2-pilot.json'
+            )
             p8_path = fixture.artifacts / ('p8-recovery.json' if getattr(fixture, 'paper_p8_recovery', False) else
                                             f'p8-e5-{fixture.paper_p8_e5}.json' if getattr(fixture, 'paper_p8_e5', None)
                                             else paper_p8_e4_artifact_name(fixture) if getattr(fixture, 'paper_p8_e4', None)
                                             else paper_p8_e3_artifact_name(fixture) if getattr(fixture, 'paper_p8_e3', None)
                                            else 'p8-e1-pilot.json' if getattr(fixture, 'paper_p8_e1', False)
-                                           else 'p8-e2-pilot.json' if getattr(fixture, 'paper_p8_e2', False)
+                                           else e2_target_name if getattr(fixture, 'paper_p8_e2', False)
                                            else 'p8-e2-smoke.json')
             staged_recovery = fixture.private / 'p8-recovery-result.json'
             staged_e5 = fixture.private / 'p8-e5-result.json'
@@ -1935,6 +2083,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             else:
                 p8 = (json.loads(p8_path.read_text()) if getattr(fixture, 'paper_p8_e4_remote_warm', False) and p8_path.exists() else
                       json.loads(p8_path.read_text()) if prepare_only and prepare_experiment == 'E3' and p8_path.exists() else
+                      json.loads(p8_path.read_text()) if is_e2_equal and prepare_only and p8_path.exists() else
                       {'status':'PASS' if remote_outcome == 'VALIDATED' and not failure and cleanup_verified else
                        'PREPARATION_ONLY' if remote_outcome == 'NOT_RUN' and not failure and cleanup_verified else 'FAIL',
                        'full_p8_accepted':False,'workload_status':remote_outcome,
@@ -2004,6 +2153,21 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     run['p8_e1_preparation' if prepare_only else 'p8_e1'] = p8
                 elif getattr(fixture, 'paper_p8_e2', False):
                     run['p8_e2'] = p8
+                    if is_e2_equal:
+                        img_dict = {name: val for name, val in images.items()}
+                        bin_bytes = Path(paperload_binary).read_bytes() if paperload_binary and Path(paperload_binary).is_file() else None
+                        bin_hash = hashlib.sha256(bin_bytes).hexdigest() if bin_bytes else p8.get('binary_sha256')
+                        p8.update(
+                            image_ids=img_dict,
+                            images={name: {'id': val} for name, val in img_dict.items()},
+                            binary_sha256=bin_hash,
+                            paperload_binary_sha256=bin_hash,
+                            binary_path='bin/paperload',
+                            source_fingerprint=paper_p8_support()._source_fingerprint(ROOT),
+                            cleanup_provenance={'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts},
+                            exact_cleanup_verified=cleanup_verified,
+                            cleanup_verified=cleanup_verified,
+                        )
                     p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                         status='PASS' if (not failure and cleanup_verified and ((prepare_only and remote_outcome in ('VALIDATED', 'NOT_RUN')) or
                             (paper_p8_e5_acceptance(p8, evidence.get('paper_p8_e5', {}), cleanup_verified) if getattr(fixture, 'paper_p8_e5', None) else
@@ -2016,6 +2180,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                            paper_p8_e2_cleanup_acceptance(fixture, evidence.get('paper_p8_e2', {}),
                              cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e2', False)
                                else p8.get('status') == 'PASS'))) else 'FAIL')
+                    durable_json(p8_path, p8)
                 if getattr(fixture, 'paper_p8_e3_prepare_only', False):
                     p8.update(workload_status='NOT_RUN', full_p8_accepted=False,
                               generator_colocated=True, physical_ab='NOT RUN')
@@ -4322,10 +4487,60 @@ def paper_p8_e1_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
                                             cleanup_counts, cleanup_verified, registry))
 
 
+def paper_p8_e2_validate_fixture_flags(effective, *, workload='steady_burst', e2_support=None):
+    if e2_support is None:
+        e2_support = paper_p8_e2_support()
+    if workload == 'equal_samples':
+        allowed = ('WEBSOCKET_ENABLED', 'STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED',
+            'MQTT_SHAPER_ENABLED', 'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED',
+            'MQTT_SHAPER_RATE_PER_SECOND', 'MQTT_SHAPER_BURST', 'MQTT_MICROBATCH_MAX_MESSAGES',
+            'MQTT_MICROBATCH_MAX_ROWS', 'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES', 'MQTT_MICROBATCH_MAX_WAIT')
+        env = effective.get('services', {}).get('backend', {}).get('environment', {})
+        flags = {key: env[key] for key in allowed if key in env}
+        expected = {
+            'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
+            'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'false',
+            'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
+            'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+            'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20), 'MQTT_MICROBATCH_MAX_WAIT': '50ms'
+        }
+        normalized = {key: str(value).lower() for key, value in flags.items()}
+        if any(normalized.get(key) != value for key, value in expected.items()):
+            raise ValueError('p8_e2_effective_fixture_flags_mismatch')
+        return flags
+    return e2_support._validate_fixture_flags(effective)
+
+
 def paper_p8_e2_profiles_valid(evidence):
     profiles = evidence.get('profiles') if isinstance(evidence, dict) else None
     if not isinstance(profiles, list) or len(profiles) != 2:
         return False
+    workload_type = evidence.get('workload_type') or evidence.get('workload')
+    if workload_type == 'equal_samples':
+        e2_mod = paper_p8_e2_support()
+        if hasattr(e2_mod, 'paper_p8_e2_equal_samples_profiles_valid'):
+            return e2_mod.paper_p8_e2_equal_samples_profiles_valid(evidence)
+        found = set()
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                return False
+            samples = profile.get('samples_per_message')
+            validation = profile.get('validation')
+            workloads = profile.get('workloads')
+            if (samples not in (100, 1) or samples in found or profile.get('status') != 'PASS'
+                    or not isinstance(validation, dict) or validation.get('valid') is not True
+                    or validation.get('failures') != [] or not isinstance(workloads, dict)):
+                return False
+            found.add(samples)
+            for arm in ('A', 'B'):
+                workload = workloads.get(arm)
+                telemetry = workload.get('telemetry') if isinstance(workload, dict) else None
+                if not isinstance(telemetry, dict) or telemetry.get('pending_messages') != 0:
+                    return False
+                if telemetry.get('application_acks') != telemetry.get('generated_unique'):
+                    return False
+        return found == {100, 1}
+
     found = set()
     for profile in profiles:
         if not isinstance(profile, dict):
@@ -4372,9 +4587,13 @@ def paper_p8_prepare_only_report(fixture, *, remote_outcome, cleanup_verified, c
         experiment = 'E2' if getattr(fixture, 'paper_p8_e2', False) else 'E1'
     if experiment == 'E2':
         phase_id = remote_session.get('phase_id')
-        artifact = (f'p8-e2-{phase_id}-remote-result.json'
-                    if remote_outcome == 'VALIDATED' and isinstance(phase_id, str)
-                    else 'p8-e2-pilot.json')
+        workload = remote_session.get('workload') or getattr(fixture, 'paper_p8_e2_workload', 'steady_burst')
+        if remote_outcome == 'VALIDATED' and isinstance(phase_id, str):
+            artifact = f'p8-e2-{phase_id}-remote-result.json'
+        elif workload == 'equal_samples':
+            artifact = 'p8-e2-equal-samples-pilot.json'
+        else:
+            artifact = 'p8-e2-pilot.json'
         evidence_name = artifact
         workload_field = 'p8_e2_workload_verified'
     elif experiment == 'E3':
@@ -5786,6 +6005,9 @@ def main():
     parser.add_argument('--p8-e2-prepare-hold', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-bundle-root', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-samples-per-message', choices=('100', '1'), help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-workload', choices=('steady_burst', 'equal_samples'), default='steady_burst', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-context', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-prepare-hold', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-bundle-root', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-workload', choices=('low_load', 'mixed'), help=argparse.SUPPRESS)
@@ -5822,6 +6044,9 @@ def main():
     parser.add_argument('--paper-p8-load', action='store_true', help='Run only the local E2 telemetry100 20-batch paperload smoke')
     parser.add_argument('--paper-p8-e1', action='store_true', help='Run the bounded P8 E1 WebSocket + MQTT pilot workload')
     parser.add_argument('--paper-p8-e2', action='store_true', help='Run the bounded P8 E2 shaper + microbatch telemetry pilot')
+    parser.add_argument('--paper-p8-e2-workload', choices=('steady_burst', 'equal_samples'), default='steady_burst', help=argparse.SUPPRESS)
+    parser.add_argument('--paper-p8-e2-context', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--paper-p8-e2-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--paper-p8-e3', choices=('polling', 'wakeup'), help='Run the bounded P8 E3 fresh-command pilot arm')
     parser.add_argument('--paper-p8-e3-low-load', action='store_true', help='Use the bounded low-load E3 profile; requires --paper-p8-e3')
     parser.add_argument('--paper-p8-e4', choices=('on', 'off'), help='Run the bounded P8 E4 warm RAM-dedup pilot arm')
@@ -5877,9 +6102,15 @@ def main():
             parser.error('--p8-lifecycle-hold cannot be combined with another fixture lane')
         if args.p8_e1_prepare_hold and (args.p8_experiment != 'E1' or args.p8_e1_bundle_root is None):
             parser.error('--p8-e1-prepare-hold requires E1 and --p8-e1-bundle-root')
-        if args.p8_e2_prepare_hold and (args.p8_experiment != 'E2' or args.p8_e2_bundle_root is None
-                or args.p8_e2_samples_per_message is None):
-            parser.error('--p8-e2-prepare-hold requires E2, --p8-e2-bundle-root and an explicit sample profile')
+        if args.p8_e2_prepare_hold:
+            if args.p8_experiment != 'E2' or args.p8_e2_bundle_root is None or args.p8_e2_samples_per_message is None:
+                parser.error('--p8-e2-prepare-hold requires E2, --p8-e2-bundle-root and an explicit sample profile')
+            if args.p8_e2_workload == 'steady_burst':
+                if args.p8_e2_context is not None or args.p8_e2_reference is not None:
+                    parser.error('--p8-e2-prepare-hold steady_burst does not accept context or reference')
+            elif args.p8_e2_workload == 'equal_samples':
+                if args.p8_e2_context is None:
+                    parser.error('--p8-e2-prepare-hold equal_samples requires --p8-e2-context')
         if args.p8_e3_prepare_hold and (args.p8_experiment != 'E3' or args.p8_e3_bundle_root is None
                 or args.p8_arm not in ('polling', 'wakeup') or args.p8_e3_workload is None):
             parser.error('--p8-e3-prepare-hold requires E3, dispatch arm, workload and bundle root')
@@ -5909,8 +6140,9 @@ def main():
             parser.error('invalid P8 lifecycle arm/deadline')
     elif (args.p8_e1_prepare_hold or args.p8_e1_bundle_root is not None
           or args.p8_e2_prepare_hold or args.p8_e2_bundle_root is not None
-          or args.p8_e2_samples_per_message is not None or args.p8_e3_prepare_hold
-          or args.p8_e3_bundle_root is not None or args.p8_e3_workload is not None
+          or args.p8_e2_samples_per_message is not None or args.p8_e2_workload != 'steady_burst'
+          or args.p8_e2_context is not None or args.p8_e2_reference is not None
+          or args.p8_e3_prepare_hold or args.p8_e3_bundle_root is not None or args.p8_e3_workload is not None
           or args.p8_e4_prepare_hold or args.p8_e4_bundle_root is not None
           or args.p8_e5_prepare_hold or args.p8_e5_bundle_root is not None
           or args.p8_e5_context is not None or args.p8_e5_reference is not None):
@@ -6030,6 +6262,9 @@ def main():
                               paper_p8_load=args.paper_p8_load,
                                  paper_p8_e1=(args.paper_p8_e1 or args.p8_e1_prepare_hold),
                                  paper_p8_e2=(args.paper_p8_e2 or args.p8_e2_prepare_hold),
+                                 paper_p8_e2_workload=(args.p8_e2_workload if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_workload', 'steady_burst')),
+                                 paper_p8_e2_context=(args.p8_e2_context if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_context', None)),
+                                 paper_p8_e2_reference=(args.p8_e2_reference if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_reference', None)),
                                    paper_p8_e3=paper_p8_e3_selector(args),
                                   paper_p8_e3_workload=(args.p8_e3_workload if args.p8_e3_prepare_hold else
                                       'low_load' if args.paper_p8_e3_low_load else 'mixed'),
@@ -6104,13 +6339,60 @@ def main():
                             output_leaf=bundle_root, wait_seconds=90, workload_seconds=30)
                     elif experiment == 'E2':
                         e2 = paper_p8_e2_support()
-                        prepared = e2.prepare_remote(sys.modules[__name__], fixture, endpoint, registry,
-                            containers, images, state, session_id=session_id,
-                            samples_per_message=int(args.p8_e2_samples_per_message),
-                            output_root=fixture.private / f'p8-e2-prepared-{args.p8_e2_samples_per_message}',
-                            bundle_root=bundle_root, arm=args.p8_arm)
-                        prepared_bundle = prepared['bundle']
+                        e2_workload = getattr(args, 'p8_e2_workload', 'steady_burst')
+                        e2_phase_id = (f'equal-samples-{args.p8_e2_samples_per_message}'
+                                       if e2_workload == 'equal_samples'
+                                       else f'samples-{args.p8_e2_samples_per_message}')
+                        output_root = (fixture.private / f'p8-e2-equal-prepared-{args.p8_e2_samples_per_message}'
+                                       if e2_workload == 'equal_samples'
+                                       else fixture.private / f'p8-e2-prepared-{args.p8_e2_samples_per_message}')
+                        if e2_workload == 'equal_samples':
+                            ctx = e2.validate_e2_equal_samples_context(
+                                json.loads(Path(args.p8_e2_context).read_text()), check_freshness=True)
+                            duration_seconds = ctx['duration_seconds']
+                            wall_budget = duration_seconds + 20 + 10
+                            prepared = e2.prepare_remote(
+                                sys.modules[__name__], fixture, endpoint, registry,
+                                containers, images, state,
+                                session_id=session_id,
+                                samples_per_message=int(args.p8_e2_samples_per_message),
+                                output_root=output_root,
+                                bundle_root=bundle_root,
+                                arm=args.p8_arm,
+                                workload=e2_workload,
+                                context_path=args.p8_e2_context,
+                                reference_path=args.p8_e2_reference,
+                                context=ctx,
+                                check_freshness=True,
+                            )
+                        else:
+                            prepared = e2.prepare_remote(
+                                sys.modules[__name__], fixture, endpoint, registry,
+                                containers, images, state,
+                                session_id=session_id,
+                                samples_per_message=int(args.p8_e2_samples_per_message),
+                                output_root=output_root,
+                                bundle_root=bundle_root,
+                                arm=args.p8_arm,
+                                workload='steady_burst',
+                            )
                         prepared['e2_support'] = e2
+                        prepared['workload'] = e2_workload
+                        if e2_workload == 'equal_samples':
+                            prepared['phase_id'] = e2_phase_id
+                            prepared['context_path'] = args.p8_e2_context
+                            prepared['reference_path'] = args.p8_e2_reference
+                            prepared['duration_seconds'] = duration_seconds
+                            prepared['wall_budget'] = wall_budget
+                            durable_json(fixture.artifacts / 'p8-e2-equal-samples-pilot.json', {
+                                'schema_version': 1, 'status': 'PREPARATION_ONLY',
+                                'workload_status': 'NOT_RUN', 'experiment': 'E2',
+                                'workload': 'equal_samples',
+                                'samples_per_message': int(args.p8_e2_samples_per_message),
+                                'run_id': prepared.get('run_id'), 'session_id': session_id,
+                                'phase_id': e2_phase_id, 'full_p8_accepted': False,
+                                'generator_colocated': True, 'physical_ab': 'NOT RUN'})
+                        prepared_bundle = prepared['bundle']
                     elif experiment == 'E3':
                         e3 = paper_p8_e3_support()
                         prepared = e3.prepare(sys.modules[__name__], fixture, endpoint, registry,
@@ -6235,7 +6517,9 @@ def main():
                                      if experiment == 'E3' else {}),
                                   'effective_flags': (helper.safe_effective_flags(prepared['effective'])
                                       if experiment == 'E1' else
-                                      prepared['e2_support']._validate_fixture_flags(prepared['effective'])
+                                      paper_p8_e2_validate_fixture_flags(prepared['effective'],
+                                          workload=prepared.get('workload', 'steady_burst'),
+                                          e2_support=prepared['e2_support'])
                                        if experiment == 'E2' else
                                        prepared['e3_support']._validate_e3_fixture_flags(
                                            prepared['effective'], prepared['arm']) if experiment == 'E3' else
@@ -6258,7 +6542,8 @@ def main():
                             + (['cold-replay'] if args.p8_e4_cold_replay else [])
                             + (['durable-fault','durable-reopen'] if args.p8_e4_durable_reopen else [])
                             + (['conflicts'] if args.p8_e4_conflicts else [])) if experiment == 'E4' else None,
-                        e5_phase_plan=['initial', 'warm_replay', 'control'] if experiment == 'E5' else None)
+                        e5_phase_plan=['initial', 'warm_replay', 'control'] if experiment == 'E5' else None,
+                        workload=(prepared.get('workload') if experiment == 'E2' else None))
                 else:
                     session['state'] = supervisor.initialize(fixture.private, experiment=args.p8_experiment,
                         arm=args.p8_arm, seed=args.p8_seed, deadline_seconds=args.p8_deadline_seconds,
@@ -6297,9 +6582,12 @@ def main():
                             return paper_p8_e1_support().begin_remote_collection(
                                 sys.modules[__name__], fixture, endpoint, registry, containers,
                                 prepared, phase_id=request['phase_id'])
-                        return prepared['e2_support'].begin_remote_collection(
-                            sys.modules[__name__], fixture, endpoint, registry, containers,
-                            prepared, phase_id=request['phase_id'])
+                        if experiment == 'E2':
+                            if request.get('phase_id') != prepared['phase_id']:
+                                raise ValueError('e2_phase_id_mismatch')
+                            return prepared['e2_support'].begin_remote_collection(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, phase_id=request['phase_id'])
                     def replace_for_cold_replay(request, session_state):
                         if (experiment != 'E4' or request.get('phase_id') != 'cold-replay'
                                 or prepared.get('include_cold_replay') is not True
@@ -6418,7 +6706,9 @@ def main():
                             result = helper.finish_remote_collection(sys.modules[__name__], fixture,
                                 endpoint, registry, containers, prepared, request.get('results'),
                                 phase_id=request['phase_id'], paperload_binary=paperload_binary)
-                            report_path = fixture.artifacts / f'p8-e2-samples-{prepared["samples_per_message"]}-remote-result.json'
+                            report_path = (fixture.artifacts / f'p8-e2-{request["phase_id"]}-remote-result.json'
+                                           if request.get('phase_id') in ('equal-samples-1', 'equal-samples-100')
+                                           else fixture.artifacts / f'p8-e2-samples-{prepared["samples_per_message"]}-remote-result.json')
                         durable_json(report_path, {
                             'schema_version': 1, 'session_id': prepared['session_id'],
                             'run_id': prepared['run_id'], 'phase_id': request['phase_id'],
@@ -6426,7 +6716,8 @@ def main():
                             'experiment': experiment,
                             'schema': prepared['schema'], 'quota': prepared['quota'],
                             'effective_flags': (helper.safe_effective_flags(prepared['effective'])
-                                if experiment == 'E1' else helper._validate_fixture_flags(prepared['effective'])),
+                                if experiment == 'E1' else paper_p8_e2_validate_fixture_flags(prepared['effective'],
+                                    workload=prepared.get('workload', 'steady_burst'), e2_support=helper)),
                             'source': session['state'].get('source_metadata'),
                             'images': images, 'bundle_sha256': prepared['bundle_sha256'],
                             **({'manifest_sha256': [hashlib.sha256(path.read_bytes()).hexdigest()

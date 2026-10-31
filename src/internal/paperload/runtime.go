@@ -54,6 +54,67 @@ type RunResult struct {
 	PhaseEvents         []PhaseEvent           `json:"phase_events,omitempty"`
 	PhaseObservation    string                 `json:"phase_observation_status,omitempty"`
 	E4                  *E4RuntimeSummary      `json:"e4,omitempty"`
+	EqualSamples        *EqualSamplesSummary   `json:"equal_samples,omitempty"`
+}
+
+// EqualSamplesSummary holds the bounded equal_samples projection in RunResult.
+type EqualSamplesSummary struct {
+	ContextSHA256         string `json:"context_sha256"`
+	WorkloadType          string `json:"workload_type"`
+	LogicalProducer       string `json:"logical_producer"`
+	TotalSamples          int    `json:"total_samples"`
+	SampleRate            int    `json:"sample_rate"`
+	DurationSeconds       int    `json:"duration_seconds"`
+	ProducerSampleRate    int    `json:"producer_sample_rate"`
+	SampleIntervalUS      int64  `json:"sample_interval_us"`
+	SamplesPerMessage     int    `json:"samples_per_message"`
+	ExpectedSamples       int    `json:"expected_samples"`
+	ExpectedMessages      int    `json:"expected_messages"`
+	GeneratedSamples      int64  `json:"generated_samples"`
+	GeneratedMessages     int64  `json:"generated_messages"`
+	OfferedUniqueSamples  int64  `json:"offered_unique_samples"`
+	OfferedUniqueMessages int64  `json:"offered_unique_messages"`
+	ApplicationACKs       int64  `json:"application_acks"`
+	OfferedUniqueBytes    int64  `json:"offered_unique_bytes"`
+	AttemptedBytes        int64  `json:"attempted_bytes"`
+	ScheduleMisses        int64  `json:"schedule_misses"`
+	SchedulingLagMaxNS    int64  `json:"scheduling_lag_max_ns"`
+	CompletedOnTime       bool   `json:"completed_on_time"`
+	SamplingQualification string `json:"sampling_qualification"`
+}
+
+func makeEqualSamplesSummary(m Manifest, c TelemetryCounters, status string) *EqualSamplesSummary {
+	if m.EqualSamples == nil {
+		return nil
+	}
+	eq := m.EqualSamples
+	sPerMsg := int64(m.SamplesPerMessage)
+	gen := c.Generated
+	offered := c.OfferedUnique
+	return &EqualSamplesSummary{
+		ContextSHA256:         eq.ContextSHA256,
+		WorkloadType:          eq.WorkloadType,
+		LogicalProducer:       m.Arm,
+		TotalSamples:          eq.TotalSamples,
+		SampleRate:            eq.SampleRate,
+		DurationSeconds:       eq.DurationSeconds,
+		ProducerSampleRate:    eq.ProducerSampleRate,
+		SampleIntervalUS:      eq.SampleIntervalUS,
+		SamplesPerMessage:     m.SamplesPerMessage,
+		ExpectedSamples:       eq.ExpectedSamples,
+		ExpectedMessages:      eq.ExpectedMessages,
+		GeneratedSamples:      gen * sPerMsg,
+		GeneratedMessages:     gen,
+		OfferedUniqueSamples:  offered * sPerMsg,
+		OfferedUniqueMessages: offered,
+		ApplicationACKs:       c.ApplicationACKs,
+		OfferedUniqueBytes:    c.OfferedUniquePayloadBytes,
+		AttemptedBytes:        c.AttemptedPayloadBytes,
+		ScheduleMisses:        c.Missed,
+		SchedulingLagMaxNS:    c.SchedulingLagMaxNS,
+		CompletedOnTime:       status == "COMPLETE" && c.Missed == 0,
+		SamplingQualification: "logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only",
+	}
 }
 
 // E4RuntimeSummary contains bounded public E4 provenance and accounting.
@@ -70,6 +131,9 @@ type E4RuntimeSummary struct {
 // waits for its own positive ACK SUBACK, then executes a bounded synthetic run.
 func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir string, observers ...func(PhaseEvent) error) (result RunResult, retErr error) {
 	result = RunResult{Implementation: "P8.4b telemetry synthetic-load; no durable restart assurance", Experiment: m.Experiment, Arm: m.Arm, Profile: m.Profile, Mode: m.Mode, RunID: m.RunID, DurabilityMode: m.DurabilityMode, DurableGatewayCount: 0, ConfiguredPhases: m.Phases, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), IdentitySampling: "header_sha256_only; maximum 20 globally; not every payload; not a full-content audit"}
+	if m.EqualSamples != nil {
+		result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, "INITIALIZING")
+	}
 	if strings.TrimSpace(outputDir) == "" {
 		return result, errors.New("output_directory_required")
 	}
@@ -114,6 +178,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 			result.Status = "FAILED"
 			result.PrimaryError = "e4_journal_rejected"
 			result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			if m.EqualSamples != nil {
+				result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
+			}
 			_ = writeResult(outputDir, result)
 			return result, err
 		}
@@ -133,6 +200,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 				result.E4.Headers = journal.Headers()
 				if len(result.E4.Headers) > 20 {
 					result.E4.Headers = result.E4.Headers[:20]
+				}
+				if m.EqualSamples != nil {
+					result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
 				}
 				_ = writeResult(outputDir, result)
 			}
@@ -158,6 +228,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 			result.Status = "FAILED"
 			result.PrimaryError = "gateway_credential_rejected"
 			result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			if m.EqualSamples != nil {
+				result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
+			}
 			_ = writeResult(outputDir, result)
 			return result, errors.New("gateway_credential_rejected")
 		}
@@ -168,6 +241,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 			result.Status = "FAILED"
 			result.PrimaryError = "mqtt_tls_configuration_rejected"
 			result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			if m.EqualSamples != nil {
+				result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
+			}
 			_ = writeResult(outputDir, result)
 			return result, errors.New("mqtt_tls_configuration_rejected")
 		}
@@ -178,6 +254,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 		result.Status = "FAILED"
 		result.PrimaryError = "engine_initialization_failed"
 		result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if m.EqualSamples != nil {
+			result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
+		}
 		_ = writeResult(outputDir, result)
 		return result, err
 	}
@@ -202,6 +281,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 			result.Status = "FAILED"
 			result.PrimaryError = "mqtt_start_failed"
 			result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			if m.EqualSamples != nil {
+				result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
+			}
 			_ = writeResult(outputDir, result)
 			return result, errors.New("mqtt_start_failed")
 		}
@@ -219,6 +301,9 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 	if result.E4 != nil {
 		result.E4.IgnoredValidACKs = result.Counters.IgnoredValidACKs
 		result.E4.ReplayApplicationACKs = result.Counters.ReplayApplicationACKs
+	}
+	if m.EqualSamples != nil {
+		result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, result.Status)
 	}
 	result.IdentitySamples = engine.IdentitySamples()
 	result.CleanupErrors = append(result.CleanupErrors, engine.CleanupErrors()...)

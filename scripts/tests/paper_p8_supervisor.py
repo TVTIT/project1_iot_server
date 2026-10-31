@@ -113,7 +113,7 @@ def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
                source_metadata=None, image_metadata=None, endpoint_metadata=None,
                project=None, lock=None, session_id=None, artifacts=None,
                preparation_status='LIFECYCLE_READY', cold_replay_enabled=False,
-               e4_phase_plan=None, e5_phase_plan=None):
+               e4_phase_plan=None, e5_phase_plan=None, workload=None):
     root = _root(root)
     if (not isinstance(experiment, str) or not re.fullmatch(r'E[1-5]', experiment)
             or not isinstance(arm, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', arm)
@@ -124,7 +124,8 @@ def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
             or artifacts is not None and (not isinstance(artifacts, list) or len(artifacts) > 64)
             or preparation_status not in ('LIFECYCLE_READY', 'E1_PREPARED', 'E2_PREPARED', 'E3_PREPARED', 'E4_PREPARED', 'E5_PREPARED')
             or session_id is not None and not re.fullmatch(r'[a-f0-9]{32}', session_id)
-            or project is not None and not re.fullmatch(r'ncs_[a-f0-9]{12}', project)):
+            or project is not None and not re.fullmatch(r'ncs_[a-f0-9]{12}', project)
+            or workload is not None and (not isinstance(workload, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', workload))):
         raise ValueError('session_metadata_rejected')
     if type(cold_replay_enabled) is not bool or cold_replay_enabled and experiment != 'E4':
         raise ValueError('session_metadata_rejected')
@@ -168,6 +169,8 @@ def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
             'phase_id': (e4_phase_plan[0] if experiment == 'E4' and e4_phase_plan else
                          e5_phase_plan[0] if experiment == 'E5' and e5_phase_plan else None),
             'cleanup_outcome': 'PENDING'}
+        if workload is not None:
+            state['workload'] = workload
         _atomic_json(state_path, state, no_replace=True)
         state['phase'] = 'READY'
         state['deadline_monotonic'] = time.monotonic() + float(deadline_seconds)

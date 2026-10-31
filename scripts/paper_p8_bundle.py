@@ -27,8 +27,26 @@ SAFE_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 MANIFEST_TOP = {'schema_version','experiment','arm','profile','mode','run_id','seed','roles',
     'samples_per_message','topology','targets','subscriptions','traffic','phases','limits','tls',
     'identity_files','gateway_identity_files','bundle_path','durability_mode','retry_interval_ms',
-    'publish_timeout_ms','viewer','commands','e4'}
+    'publish_timeout_ms','viewer','commands','e4','equal_samples'}
 RUN_SPEC_KEYS = {'paperload','gateways','stop_timeout_seconds'}
+
+E2_EQUAL_SAMPLES_CONTEXT_KEYS = frozenset({
+    'schema_version', 'workload_type', 'seed', 'total_samples', 'sample_rate',
+    'duration_seconds', 'logical_producers', 'samples_per_producer',
+    'producer_sample_rate', 'sample_interval_us', 'stream_sequence_start',
+    'timestamp_anchor', 'max_context_age_seconds', 'context_sha256',
+})
+E2_EQUAL_SAMPLES_MANIFEST_KEYS = frozenset(
+    set(E2_EQUAL_SAMPLES_CONTEXT_KEYS) | {
+        'expected_samples', 'expected_messages', 'sample_stream_version',
+    }
+)
+E2_EQUAL_SAMPLES_WORKLOAD_KEYS = frozenset({
+    'experiment', 'arm', 'phase', 'profile', 'workload', 'workload_type',
+    'seed', 'samples_per_message', 'duration_seconds', 'drain_seconds',
+    'grace_seconds', 'wall_seconds', 'context_sha256', 'expected_counts',
+    'context', 'generator_colocated',
+})
 
 
 def _fail(code):
@@ -202,7 +220,175 @@ def _strict_manifest(value, experiment, arm):
         rows=value.get(field,[])
         if type(rows) is not list or any(type(row) is not dict or set(row)-allowed for row in rows):
             _fail('bundle_manifest_fields_rejected')
+    if 'equal_samples' in value and value['equal_samples'] is not None:
+        if experiment != 'E2' or value.get('experiment') != 'E2':
+            _fail('bundle_manifest_contract_rejected')
+        _validate_equal_samples_manifest_obj(value['equal_samples'], value.get('samples_per_message'), value.get('seed'))
     return value
+
+
+def _validate_equal_samples_manifest_obj(eq, S, seed):
+    if type(eq) is not dict or set(eq) != E2_EQUAL_SAMPLES_MANIFEST_KEYS:
+        _fail('bundle_manifest_fields_rejected')
+    int_fields = (
+        'schema_version', 'seed', 'total_samples', 'sample_rate', 'duration_seconds',
+        'samples_per_producer', 'producer_sample_rate', 'sample_interval_us',
+        'stream_sequence_start', 'max_context_age_seconds', 'expected_samples',
+        'expected_messages', 'sample_stream_version'
+    )
+    for field in int_fields:
+        if type(eq.get(field)) is not int:
+            _fail('bundle_manifest_contract_rejected')
+    if (eq['schema_version'] != 1
+            or eq['workload_type'] != 'equal_samples'
+            or eq['sample_stream_version'] != 1
+            or eq['logical_producers'] != ['A', 'B']
+            or eq['stream_sequence_start'] != 0):
+        _fail('bundle_manifest_contract_rejected')
+    if seed is not None and eq['seed'] != seed:
+        _fail('bundle_manifest_contract_rejected')
+    if not (0 <= eq['seed'] <= (1 << 63) - 1):
+        _fail('bundle_manifest_contract_rejected')
+    if eq['total_samples'] <= 0 or eq['total_samples'] > 60000 or eq['total_samples'] % 200 != 0:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['sample_rate'] < 2 or eq['sample_rate'] > 200 or eq['sample_rate'] % 2 != 0:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['total_samples'] % eq['sample_rate'] != 0:
+        _fail('bundle_manifest_contract_rejected')
+    duration_seconds = eq['total_samples'] // eq['sample_rate']
+    if eq['duration_seconds'] != duration_seconds or not (10 <= duration_seconds <= 120):
+        _fail('bundle_manifest_contract_rejected')
+    if 2_000_000 % eq['sample_rate'] != 0:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['sample_interval_us'] != 2_000_000 // eq['sample_rate']:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['samples_per_producer'] != eq['total_samples'] // 2:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['producer_sample_rate'] != eq['sample_rate'] // 2:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['max_context_age_seconds'] <= 0 or eq['max_context_age_seconds'] > 2592000:
+        _fail('bundle_manifest_contract_rejected')
+    if S not in (1, 100):
+        _fail('bundle_manifest_contract_rejected')
+    if eq['expected_samples'] != eq['samples_per_producer']:
+        _fail('bundle_manifest_contract_rejected')
+    if eq['expected_messages'] != eq['samples_per_producer'] // S:
+        _fail('bundle_manifest_contract_rejected')
+    ctx_part = {k: v for k, v in eq.items() if k in E2_EQUAL_SAMPLES_CONTEXT_KEYS and k != 'context_sha256'}
+    canonical_bytes = json.dumps(ctx_part, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    expected_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    if eq.get('context_sha256') != expected_sha256:
+        _fail('bundle_manifest_contract_rejected')
+
+
+def _validate_e2_equal_samples_workload(workload):
+    if type(workload) is not dict or set(workload) != E2_EQUAL_SAMPLES_WORKLOAD_KEYS:
+        _fail('bundle_workload_metadata_rejected')
+    if (workload.get('experiment') != 'E2'
+            or workload.get('workload') != 'equal_samples'
+            or workload.get('workload_type') != 'equal_samples'
+            or workload.get('profile') not in ('pilot', 'official')
+            or not isinstance(workload.get('arm'), str) or not SAFE_ID.fullmatch(workload['arm'])
+            or not isinstance(workload.get('phase'), str) or not SAFE_ID.fullmatch(workload['phase'])):
+        _fail('bundle_workload_metadata_rejected')
+    if (type(workload.get('seed')) is not int or not (0 <= workload['seed'] <= (1 << 63) - 1)
+            or type(workload.get('samples_per_message')) is not int
+            or workload['samples_per_message'] not in (1, 100)
+            or type(workload.get('duration_seconds')) is not int
+            or not (10 <= workload['duration_seconds'] <= 120)
+            or type(workload.get('drain_seconds')) is not int
+            or not (0 <= workload['drain_seconds'] <= 60)
+            or type(workload.get('grace_seconds')) is not int
+            or not (0 <= workload['grace_seconds'] <= 60)
+            or type(workload.get('wall_seconds')) is not int
+            or workload['wall_seconds'] != workload['duration_seconds'] + workload['drain_seconds'] + workload['grace_seconds']):
+        _fail('bundle_workload_metadata_rejected')
+    if (not isinstance(workload.get('context_sha256'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', workload['context_sha256'])):
+        _fail('bundle_workload_metadata_rejected')
+    if workload.get('generator_colocated') not in ('unverified', True, False, 'true', 'false'):
+        _fail('bundle_workload_metadata_rejected')
+
+    ctx = workload.get('context')
+    if type(ctx) is not dict or set(ctx) != E2_EQUAL_SAMPLES_CONTEXT_KEYS:
+        _fail('bundle_workload_metadata_rejected')
+    int_fields = (
+        'schema_version', 'seed', 'total_samples', 'sample_rate', 'duration_seconds',
+        'samples_per_producer', 'producer_sample_rate', 'sample_interval_us',
+        'stream_sequence_start', 'max_context_age_seconds'
+    )
+    for field in int_fields:
+        if type(ctx.get(field)) is not int:
+            _fail('bundle_workload_metadata_rejected')
+    if (ctx['schema_version'] != 1
+            or ctx['workload_type'] != 'equal_samples'
+            or ctx['logical_producers'] != ['A', 'B']
+            or ctx['stream_sequence_start'] != 0):
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['seed'] != workload['seed']:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['duration_seconds'] != workload['duration_seconds']:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['total_samples'] <= 0 or ctx['total_samples'] > 60000 or ctx['total_samples'] % 200 != 0:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['sample_rate'] < 2 or ctx['sample_rate'] > 200 or ctx['sample_rate'] % 2 != 0:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['total_samples'] % ctx['sample_rate'] != 0:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['duration_seconds'] != ctx['total_samples'] // ctx['sample_rate']:
+        _fail('bundle_workload_metadata_rejected')
+    if 2_000_000 % ctx['sample_rate'] != 0:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['sample_interval_us'] != 2_000_000 // ctx['sample_rate']:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['samples_per_producer'] != ctx['total_samples'] // 2:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['producer_sample_rate'] != ctx['sample_rate'] // 2:
+        _fail('bundle_workload_metadata_rejected')
+    if ctx['max_context_age_seconds'] <= 0 or ctx['max_context_age_seconds'] > 2592000:
+        _fail('bundle_workload_metadata_rejected')
+    ctx_payload = {k: v for k, v in ctx.items() if k != 'context_sha256'}
+    canonical_bytes = json.dumps(ctx_payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    expected_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    if ctx.get('context_sha256') != expected_sha256 or workload['context_sha256'] != expected_sha256:
+        _fail('bundle_workload_metadata_rejected')
+
+    exp = workload.get('expected_counts')
+    allowed_counts_keys = {
+        'samples_per_message', 'total_samples', 'total_messages',
+        'total_raw_rows', 'total_ledger_rows', 'total_temporal_rows',
+        'total_configuration_delta', 'per_role'
+    }
+    if type(exp) is not dict or set(exp) != allowed_counts_keys:
+        _fail('bundle_workload_metadata_rejected')
+    S = workload['samples_per_message']
+    total_samples = ctx['total_samples']
+    total_messages = total_samples // S
+    if (exp['samples_per_message'] != S
+            or exp['total_samples'] != total_samples
+            or exp['total_messages'] != total_messages
+            or exp['total_raw_rows'] != total_samples
+            or exp['total_ledger_rows'] != total_messages
+            or exp['total_temporal_rows'] != total_messages
+            or exp['total_configuration_delta'] != 0):
+        _fail('bundle_workload_metadata_rejected')
+    per_role = exp.get('per_role')
+    if type(per_role) is not dict or set(per_role) != {'A', 'B'}:
+        _fail('bundle_workload_metadata_rejected')
+    allowed_role_keys = {'samples', 'messages', 'raw_rows', 'ledger_rows', 'temporal_rows', 'configuration_delta'}
+    for role in ('A', 'B'):
+        r = per_role[role]
+        if type(r) is not dict or set(r) != allowed_role_keys:
+            _fail('bundle_workload_metadata_rejected')
+        role_samples = ctx['samples_per_producer']
+        role_messages = role_samples // S
+        if (r['samples'] != role_samples
+                or r['messages'] != role_messages
+                or r['raw_rows'] != role_samples
+                or r['ledger_rows'] != role_messages
+                or r['temporal_rows'] != role_messages
+                or r['configuration_delta'] != 0):
+            _fail('bundle_workload_metadata_rejected')
 
 
 def _e5_context_projection(value):
@@ -429,6 +615,9 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
                 or type(workload.get('security')) is not dict):
             _fail('bundle_workload_metadata_rejected')
         _validate_e5_workload(workload, e5_context)
+    elif experiment == 'E2' and isinstance(workload, dict) and (
+            workload.get('workload_type') == 'equal_samples' or workload.get('workload') == 'equal_samples'):
+        _validate_e2_equal_samples_workload(workload)
     elif (type(workload) is not dict or set(workload)-workload_keys
             or any(type(x) not in (str,int,float,bool) or type(x) is float and not math.isfinite(x)
                    for x in workload.values())):
@@ -703,7 +892,8 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
                     'ready_timeout_seconds': timeout,
                 })
             stop=supplied.get('stop_timeout_seconds',30)
-            if type(stop) is not int or not 1 <= stop <= 60: _fail('bundle_run_spec_rejected')
+            max_stop = 300 if experiment == 'E2' else 60
+            if type(stop) is not int or not 1 <= stop <= max_stop: _fail('bundle_run_spec_rejected')
             spec['stop_timeout_seconds']=stop
             if experiment != 'E5' and {job['manifest'] for job in spec['paperload']} != set(manifest_refs.values()):
                 _fail('bundle_run_spec_reference_rejected')
@@ -1013,7 +1203,8 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
         if seen_env != set(env_map):
             _fail('bundle_run_spec_reference_rejected')
         stop_timeout = portable_spec['stop_timeout_seconds']
-        if type(stop_timeout) is not int or not 1 <= stop_timeout <= 60:
+        max_stop = 300 if metadata['session']['experiment'] == 'E2' else 60
+        if type(stop_timeout) is not int or not 1 <= stop_timeout <= max_stop:
             _fail('bundle_run_spec_rejected')
         bound_spec = {
             'paperload': bound_jobs,
@@ -1240,6 +1431,10 @@ def inspect_bundle(root):
                 or plan.get('phases') != ['initial','warm_replay','control']):
             _fail('bundle_e5_phase_plan_rejected')
         _validate_e5_lifecycle(plan['viewer_lifecycle'])
+    if session.get('experiment') == 'E2':
+        wl = metadata.get('workload')
+        if isinstance(wl, dict) and (wl.get('workload_type') == 'equal_samples' or wl.get('workload') == 'equal_samples'):
+            _validate_e2_equal_samples_workload(wl)
     return {'schema_version':SCHEMA_VERSION,'valid':True,'files':len(seen),'total_bytes':declared_total,
             'session':metadata.get('session')}
 

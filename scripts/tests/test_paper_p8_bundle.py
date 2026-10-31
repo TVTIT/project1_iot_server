@@ -549,5 +549,226 @@ class PortableBundleTests(unittest.TestCase):
             cleanup_verified=True,cleanup_counts={})
         self.assertNotEqual(rejected['status'],'PASS')
 
+    def test_e2_equal_samples_bundle_export_relocate_and_bind(self):
+        from scripts.tests.paper_p8_e2_support import (
+            build_e2_equal_samples_context,
+            calculate_e2_equal_samples_expected_counts,
+            e2_equal_samples_manifests,
+        )
+        fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx = build_e2_equal_samples_context(total_samples=6000, sample_rate=100, seed=84, now_utc=fixed_now)
+        common = {
+            'mode': 'remote', 'publish_timeout_ms': 3000,
+            'tls': {'https_endpoint': 'https://fixture.test:14443', 'https_ca_file': str(self.src / 'https-ca.pem'),
+                    'mqtt_tls_endpoint': 'mqtts://fixture.test:18884', 'mqtt_tls_ca_file': str(self.src / 'mqtt-ca.pem'),
+                    'mqtt_tls_server_name': 'localhost'},
+        }
+        gw_files = {'gw-1': str(self.src / 'gw-1.json'), 'gw-2': str(self.src / 'gw-1.json')}
+        write(self.src / 'gw-2.json', {'username': 'gw-2', 'password': 'pass-2'})
+        gw_files['gw-2'] = str(self.src / 'gw-2.json')
+        tele_files = {'A': str(self.src / 'telemetry.json'), 'B': str(self.src / 'telemetry.json')}
+        targets = [{'gateway_id': 'gw-1', 'sensor_id': 's-1'}, {'gateway_id': 'gw-2', 'sensor_id': 's-2'}]
+
+        all_manifests = e2_equal_samples_manifests(
+            context=ctx, common=common, targets=targets,
+            gateway_identity_files=gw_files, telemetry_identity_files=tele_files, now_utc=fixed_now)
+
+        pair = all_manifests['profiles']['100']
+        ma_path = write(self.src / 'A.manifest.json', pair['A'])
+        mb_path = write(self.src / 'B.manifest.json', pair['B'])
+        expected_counts = calculate_e2_equal_samples_expected_counts(ctx, 100)
+
+        workload = {
+            'experiment': 'E2',
+            'arm': 'E2-pilot',
+            'phase': 'equal-samples-100',
+            'profile': 'pilot',
+            'workload': 'equal_samples',
+            'workload_type': 'equal_samples',
+            'seed': ctx['seed'],
+            'samples_per_message': 100,
+            'duration_seconds': ctx['duration_seconds'],
+            'drain_seconds': 20,
+            'grace_seconds': 10,
+            'wall_seconds': ctx['duration_seconds'] + 20 + 10,
+            'context_sha256': ctx['context_sha256'],
+            'expected_counts': expected_counts,
+            'context': ctx,
+            'generator_colocated': 'unverified',
+        }
+        run_spec = write(self.src / 'e2-run-spec.json', {
+            'paperload': [
+                {'manifest': str(ma_path), 'output_dir': '/A/output/A', 'role': 'telemetry', 'ready_timeout_seconds': 90},
+                {'manifest': str(mb_path), 'output_dir': '/A/output/B', 'role': 'telemetry', 'ready_timeout_seconds': 90},
+            ],
+            'stop_timeout_seconds': 90,
+        })
+
+        out = bundle.export_bundle(
+            output_leaf=self.parent / 'e2-equal-samples-bundle',
+            session_id='sess-e2-equal',
+            experiment='E2',
+            arm='E2-pilot',
+            phase='equal-samples-100',
+            manifests={'A': ma_path, 'B': mb_path},
+            identity_files={'A:telemetry': self.src / 'telemetry.json', 'B:telemetry': self.src / 'telemetry.json'},
+            gateway_identity_files={'gw-1': self.src / 'gw-1.json', 'gw-2': self.src / 'gw-2.json'},
+            gateway_env_files={},
+            ca_files={'https': self.src / 'https-ca.pem', 'mqtt': self.src / 'mqtt-ca.pem'},
+            role_metadata={
+                'roles': {'A:telemetry': {'role': 'telemetry', 'principals': []},
+                          'B:telemetry': {'role': 'telemetry', 'principals': []}},
+                'gateways': {'gw-1': {'role': 'gateway', 'gateway_id': 'gw-1', 'username': 'gw-user'},
+                             'gw-2': {'role': 'gateway', 'gateway_id': 'gw-2', 'username': 'gw-2'}}},
+            wait_seconds=90,
+            workload_seconds=90,
+            topology={'gateways': 2, 'sensors': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
+            workload=workload,
+            run_spec=run_spec,
+        )
+
+        root = Path(out['bundle_root'])
+        self.assertTrue(bundle.inspect_bundle(root)['valid'])
+
+        # Relocation test
+        relocated = self.root / 'relocated-e2-bundle'
+        shutil.copytree(root, relocated)
+        self.assertTrue(bundle.inspect_bundle(relocated)['valid'])
+
+        # Bind test
+        workspace = self.root / 'e2-workspace'
+        binding = bundle.bind_bundle(bundle_root=relocated, workspace_leaf=workspace)
+        self.assertTrue((workspace / 'runtime/bundle-metadata.json').is_file())
+        bound_meta = json.loads((workspace / 'runtime/bundle-metadata.json').read_text())
+        self.assertEqual(bound_meta['workload']['workload_type'], 'equal_samples')
+        self.assertEqual(bound_meta['workload']['context_sha256'], ctx['context_sha256'])
+        bound_ma = json.loads((workspace / 'inputs/manifests/A.json').read_text())
+        self.assertEqual(bound_ma['equal_samples']['sample_stream_version'], 1)
+        self.assertEqual(bound_ma['equal_samples']['context_sha256'], ctx['context_sha256'])
+
+    def test_e2_equal_samples_bundle_negatives(self):
+        from scripts.tests.paper_p8_e2_support import (
+            build_e2_equal_samples_context,
+            calculate_e2_equal_samples_expected_counts,
+            e2_equal_samples_manifests,
+        )
+        fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx = build_e2_equal_samples_context(total_samples=6000, sample_rate=100, seed=84, now_utc=fixed_now)
+        common = {
+            'mode': 'remote', 'publish_timeout_ms': 3000,
+            'tls': {'https_endpoint': 'https://fixture.test:14443', 'https_ca_file': str(self.src / 'https-ca.pem'),
+                    'mqtt_tls_endpoint': 'mqtts://fixture.test:18884', 'mqtt_tls_ca_file': str(self.src / 'mqtt-ca.pem'),
+                    'mqtt_tls_server_name': 'localhost'},
+        }
+        write(self.src / 'gw-2.json', {'username': 'gw-2', 'password': 'pass-2'})
+        gw_files = {'gw-1': str(self.src / 'gw-1.json'), 'gw-2': str(self.src / 'gw-2.json')}
+        tele_files = {'A': str(self.src / 'telemetry.json'), 'B': str(self.src / 'telemetry.json')}
+        targets = [{'gateway_id': 'gw-1', 'sensor_id': 's-1'}, {'gateway_id': 'gw-2', 'sensor_id': 's-2'}]
+
+        all_manifests = e2_equal_samples_manifests(
+            context=ctx, common=common, targets=targets,
+            gateway_identity_files=gw_files, telemetry_identity_files=tele_files, now_utc=fixed_now)
+
+        pair = all_manifests['profiles']['100']
+        ma_path = write(self.src / 'neg_A.manifest.json', pair['A'])
+        mb_path = write(self.src / 'neg_B.manifest.json', pair['B'])
+        expected_counts = calculate_e2_equal_samples_expected_counts(ctx, 100)
+
+        def make_workload(**overrides):
+            wl = {
+                'experiment': 'E2',
+                'arm': 'E2-pilot',
+                'phase': 'equal-samples-100',
+                'profile': 'pilot',
+                'workload': 'equal_samples',
+                'workload_type': 'equal_samples',
+                'seed': ctx['seed'],
+                'samples_per_message': 100,
+                'duration_seconds': ctx['duration_seconds'],
+                'drain_seconds': 20,
+                'grace_seconds': 10,
+                'wall_seconds': ctx['duration_seconds'] + 20 + 10,
+                'context_sha256': ctx['context_sha256'],
+                'expected_counts': expected_counts,
+                'context': ctx,
+                'generator_colocated': 'unverified',
+            }
+            wl.update(overrides)
+            return wl
+
+        run_spec = write(self.src / 'neg-e2-run-spec.json', {
+            'paperload': [
+                {'manifest': str(ma_path), 'output_dir': '/A/output/A', 'role': 'telemetry', 'ready_timeout_seconds': 90},
+                {'manifest': str(mb_path), 'output_dir': '/A/output/B', 'role': 'telemetry', 'ready_timeout_seconds': 90},
+            ],
+            'stop_timeout_seconds': 90,
+        })
+
+        def do_export(leaf_name, wl, m_a=ma_path, m_b=mb_path):
+            return bundle.export_bundle(
+                output_leaf=self.parent / leaf_name,
+                session_id='sess-e2-neg',
+                experiment='E2',
+                arm='E2-pilot',
+                phase='equal-samples-100',
+                manifests={'A': m_a, 'B': m_b},
+                identity_files={'A:telemetry': self.src / 'telemetry.json', 'B:telemetry': self.src / 'telemetry.json'},
+                gateway_identity_files={'gw-1': self.src / 'gw-1.json', 'gw-2': self.src / 'gw-2.json'},
+                gateway_env_files={},
+                ca_files={'https': self.src / 'https-ca.pem', 'mqtt': self.src / 'mqtt-ca.pem'},
+                role_metadata={
+                    'roles': {'A:telemetry': {'role': 'telemetry', 'principals': []},
+                              'B:telemetry': {'role': 'telemetry', 'principals': []}},
+                    'gateways': {'gw-1': {'role': 'gateway', 'gateway_id': 'gw-1', 'username': 'gw-user'},
+                                 'gw-2': {'role': 'gateway', 'gateway_id': 'gw-2', 'username': 'gw-2'}}},
+                wait_seconds=90,
+                workload_seconds=90,
+                topology={'gateways': 2, 'sensors': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
+                workload=wl,
+                run_spec=run_spec,
+            )
+
+        # 1. Wrong workload_type
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+            do_export('neg1', make_workload(workload_type='invalid_type'))
+
+        # 2. Context hash mismatch
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+            do_export('neg2', make_workload(context_sha256='0' * 64))
+
+        # 3. Wrong profile
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+            do_export('neg3', make_workload(profile='unsupported'))
+
+        # 4. Unknown nested key in context
+        bad_ctx = dict(ctx, unexpected_key=123)
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+            do_export('neg4', make_workload(context=bad_ctx))
+
+        # 5. Unknown nested key in expected_counts
+        bad_counts = dict(expected_counts, unexpected_key=456)
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+            do_export('neg5', make_workload(expected_counts=bad_counts))
+
+        # 6. Count mismatch in expected_counts
+        mismatched_counts = dict(expected_counts, total_samples=9999)
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+            do_export('neg6', make_workload(expected_counts=mismatched_counts))
+
+        # 7. Manifest with tampered sample_stream_version
+        bad_ma_data = dict(pair['A'])
+        bad_ma_data['equal_samples'] = dict(bad_ma_data['equal_samples'], sample_stream_version=2)
+        bad_ma_path = write(self.src / 'bad_ver_A.json', bad_ma_data)
+        with self.assertRaises(ValueError):
+            do_export('neg7', make_workload(), m_a=bad_ma_path)
+
+        # 8. Manifest with unknown nested key in equal_samples
+        bad_ma_data2 = dict(pair['A'])
+        bad_ma_data2['equal_samples'] = dict(bad_ma_data2['equal_samples'], unknown_key=True)
+        bad_ma_path2 = write(self.src / 'bad_keys_A.json', bad_ma_data2)
+        with self.assertRaises(ValueError):
+            do_export('neg8', make_workload(), m_a=bad_ma_path2)
+
+
 
 if __name__=='__main__': unittest.main()

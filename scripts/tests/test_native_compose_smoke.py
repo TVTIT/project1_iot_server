@@ -4712,5 +4712,229 @@ class AllocationTests(unittest.TestCase):
             self.assertFalse(rep["cleanup_verified"])
 
 
+class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
+    def setUp(self):
+        from scripts import paper_p8_server
+        self.server = paper_p8_server
+        from scripts.tests.paper_p8_e2_support import (
+            build_e2_equal_samples_context,
+            validate_e2_equal_samples_context,
+        )
+        self.build_ctx = build_e2_equal_samples_context
+        self.validate_ctx = validate_e2_equal_samples_context
+
+    def test_e2_context_command_creates_private_valid_context_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / 'e2-context.json'
+            ret = self.server.main(['e2-context', '--output', str(output)])
+            self.assertEqual(ret, 0)
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            ctx = json.loads(output.read_text())
+            validated = self.validate_ctx(ctx, check_freshness=False)
+            self.assertEqual(validated['total_samples'], 6000)
+            self.assertEqual(validated['sample_rate'], 100)
+            self.assertEqual(validated['seed'], 84)
+            self.assertEqual(validated['duration_seconds'], 60)
+            self.assertEqual(validated['workload_type'], 'equal_samples')
+
+    def test_e2_context_command_custom_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / 'e2-custom-context.json'
+            ret = self.server.main([
+                'e2-context', '--output', str(output),
+                '--total-samples', '12000',
+                '--sample-rate', '200',
+                '--seed', '42'
+            ])
+            self.assertEqual(ret, 0)
+            ctx = json.loads(output.read_text())
+            validated = self.validate_ctx(ctx, check_freshness=False)
+            self.assertEqual(validated['total_samples'], 12000)
+            self.assertEqual(validated['sample_rate'], 200)
+            self.assertEqual(validated['seed'], 42)
+            self.assertEqual(validated['duration_seconds'], 60)
+
+    def test_e2_context_command_rejects_existing_output_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / 'exists.json'
+            output.write_text('{}')
+            with self.assertRaises(ValueError):
+                self.server.main(['e2-context', '--output', str(output)])
+
+            sym_dir = Path(td) / 'symdir'
+            sym_dir.symlink_to(Path(td))
+            with self.assertRaises(ValueError):
+                self.server.main(['e2-context', '--output', str(sym_dir / 'out.json')])
+
+    def _valid_net_config(self, td):
+        net_config = Path(td) / 'net.json'
+        net_config.write_text(json.dumps({
+            'schema_version': 1, 'bind_ip': '10.0.0.1', 'advertised_host': '10.0.0.1',
+            'https_port': 8443, 'mqtt_tls_port': 8883,
+            'required_san_dns': ['localhost', 'nginx', 'mosquitto'],
+            'required_san_ips': ['127.0.0.1', '10.0.0.1'],
+        }))
+        net_config.chmod(0o600)
+        return net_config
+
+    def test_serve_e2_workload_omitted_is_steady_burst(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / 'server'
+            net_config = self._valid_net_config(td)
+            captured_cmd = []
+            with patch.object(self.server.remote, 'preflight_bind'), \
+                 patch('subprocess.Popen') as mock_popen:
+                mock_proc = Mock(wait=Mock(return_value=0))
+                def fake_popen(cmd, **kwargs):
+                    captured_cmd.extend(cmd)
+                    return mock_proc
+                mock_popen.side_effect = fake_popen
+                ret = self.server.main(['serve', '--root', str(root), '--network-config', str(net_config),
+                                        '--experiment', 'E2', '--samples-per-message', '100'])
+                self.assertEqual(ret, 0)
+                self.assertIn('--p8-e2-workload', captured_cmd)
+                idx = captured_cmd.index('--p8-e2-workload')
+                self.assertEqual(captured_cmd[idx + 1], 'steady_burst')
+
+            # steady_burst rejects --context and --reference
+            with self.assertRaisesRegex(ValueError, 'E2 steady_burst does not accept --context or --reference'):
+                self.server.main(['serve', '--root', str(Path(td) / 's2'), '--network-config', str(net_config),
+                                  '--experiment', 'E2', '--samples-per-message', '100',
+                                  '--workload', 'steady_burst', '--context', str(Path(td) / 'any.json')])
+
+    def test_serve_e2_workload_equal_samples_requires_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+
+            # Missing --context
+            with self.assertRaisesRegex(ValueError, 'E2 equal_samples requires --context'):
+                self.server.main(['serve', '--root', str(Path(td) / 'server_missing'), '--network-config', str(net_config),
+                                  '--experiment', 'E2', '--workload', 'equal_samples',
+                                  '--samples-per-message', '100'])
+
+            # Valid context
+            ctx_path = Path(td) / 'valid_ctx.json'
+            ctx = self.build_ctx(total_samples=6000, sample_rate=100, seed=84)
+            ctx_path.write_text(json.dumps(ctx))
+            ctx_path.chmod(0o600)
+
+            captured_cmd = []
+            with patch.object(self.server.remote, 'preflight_bind'), \
+                 patch('subprocess.Popen') as mock_popen:
+                mock_proc = Mock(wait=Mock(return_value=0))
+                def fake_popen(cmd, **kwargs):
+                    captured_cmd.extend(cmd)
+                    return mock_proc
+                mock_popen.side_effect = fake_popen
+                ret = self.server.main(['serve', '--root', str(Path(td) / 'server_valid'), '--network-config', str(net_config),
+                                        '--experiment', 'E2', '--workload', 'equal_samples',
+                                        '--samples-per-message', '100',
+                                        '--context', str(ctx_path)])
+                self.assertEqual(ret, 0)
+                self.assertIn('--p8-e2-workload', captured_cmd)
+                idx = captured_cmd.index('--p8-e2-workload')
+                self.assertEqual(captured_cmd[idx + 1], 'equal_samples')
+                self.assertIn('--p8-e2-context', captured_cmd)
+                c_idx = captured_cmd.index('--p8-e2-context')
+                self.assertEqual(captured_cmd[c_idx + 1], str(ctx_path))
+
+    def test_serve_rejects_mixing_and_unrelated_flags(self):
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+
+            # E1 with --workload rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's1'), '--network-config', str(net_config),
+                                  '--experiment', 'E1', '--workload', 'equal_samples'])
+
+            # E4 with --workload rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's2'), '--network-config', str(net_config),
+                                  '--experiment', 'E4', '--workload', 'equal_samples'])
+
+            # E3 with equal_samples rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's3'), '--network-config', str(net_config),
+                                  '--experiment', 'E3', '--dispatch-mode', 'polling',
+                                  '--workload', 'equal_samples'])
+
+            # E2 with --arm rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's4'), '--network-config', str(net_config),
+                                  '--experiment', 'E2', '--samples-per-message', '100',
+                                  '--arm', 'optimized'])
+
+    def test_smoke_e2_fixture_equal_samples_disables_only_shaper(self):
+        with tempfile.TemporaryDirectory() as td:
+            ctx_path = Path(td) / 'context.json'
+            ctx = self.build_ctx(total_samples=6000, sample_rate=100, seed=84)
+            ctx_path.write_text(json.dumps(ctx))
+            ctx_path.chmod(0o600)
+
+            fixture_steady = smoke.prepare(Path(td) / 'f_steady', paper_p8_e2=True,
+                                           paper_p8_e2_workload='steady_burst')
+            self.assertEqual(fixture_steady.values['MQTT_SHAPER_ENABLED'], 'true')
+            self.assertEqual(fixture_steady.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture_steady.values['MQTT_MICROBATCH_MAX_WAIT'], '50ms')
+
+            fixture_equal = smoke.prepare(Path(td) / 'f_equal', paper_p8_e2=True,
+                                          paper_p8_e2_workload='equal_samples',
+                                          paper_p8_e2_context=str(ctx_path))
+            self.assertEqual(fixture_equal.values['MQTT_SHAPER_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_MESSAGES'], '32')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_ROWS'], '500')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_PAYLOAD_BYTES'], '4194304')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_WAIT'], '50ms')
+            self.assertEqual(fixture_equal.values['MQTT_RAM_DEDUP_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['STAGE5_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['STAGE5_WAKEUP_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['WEBSOCKET_ENABLED'], 'false')
+
+    def test_smoke_e2_prepare_only_report_for_equal_samples(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fixture = type('Fixture', (), {'paper_p8_e2': True, 'paper_p8_e2_workload': 'equal_samples',
+                'project': 'e2-test', 'private': root / 'private', 'artifacts': root / 'artifacts'})()
+            fixture.private.mkdir()
+            fixture.artifacts.mkdir()
+            (fixture.private / 'session.json').write_text(json.dumps(
+                {'experiment': 'E2', 'phase_id': 'equal-samples-100', 'workload': 'equal_samples'}))
+            (fixture.artifacts / 'p8-e2-equal-samples-100-remote-result.json').write_text(json.dumps(
+                {'status': 'PASS', 'validation': {'valid': True}}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='VALIDATED',
+                cleanup_verified=True, cleanup_counts={})
+            self.assertEqual(report['status'], 'PAPER_P8_E2_WORKLOAD_VERIFIED')
+            self.assertEqual(report['artifact'], 'p8-e2-equal-samples-100-remote-result.json')
+            self.assertTrue(report['p8_e2_workload_verified'])
+
+    def test_paper_p8_e2_profiles_valid_for_equal_samples(self):
+        # Equal samples profile with equal steady counts (e.g. 30 messages each for S=100)
+        profile_100 = {
+            'samples_per_message': 100,
+            'status': 'PASS',
+            'validation': {'valid': True, 'failures': []},
+            'workloads': {
+                'A': {'telemetry': {'generated_unique': 30, 'application_acks': 30, 'pending_messages': 0}},
+                'B': {'telemetry': {'generated_unique': 30, 'application_acks': 30, 'pending_messages': 0}},
+            }
+        }
+        profile_1 = {
+            'samples_per_message': 1,
+            'status': 'PASS',
+            'validation': {'valid': True, 'failures': []},
+            'workloads': {
+                'A': {'telemetry': {'generated_unique': 3000, 'application_acks': 3000, 'pending_messages': 0}},
+                'B': {'telemetry': {'generated_unique': 3000, 'application_acks': 3000, 'pending_messages': 0}},
+            }
+        }
+        evidence = {
+            'workload_type': 'equal_samples',
+            'profiles': [profile_100, profile_1]
+        }
+        self.assertTrue(smoke.paper_p8_e2_profiles_valid(evidence))
+
+
 if __name__ == "__main__":
     unittest.main()

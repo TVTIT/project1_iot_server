@@ -389,6 +389,22 @@ class SupervisorStateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'recovery_receipt_incomplete'):
             supervisor.recover_cleanup(root, project=project, runner=mock.Mock())
 
+    def test_initialize_stores_and_reads_e2_workload(self):
+        root = self.private_root()
+        state = supervisor.initialize(root, experiment='E2', arm='E2-pilot', seed=84,
+                                      deadline_seconds=1800, receipts=[],
+                                      workload='equal_samples')
+        self.assertEqual(state.get('workload'), 'equal_samples')
+        read = supervisor.read_state(root)
+        self.assertEqual(read.get('workload'), 'equal_samples')
+
+        root2 = self.private_root()
+        with self.assertRaisesRegex(ValueError, 'session_metadata_rejected'):
+            supervisor.initialize(root2, experiment='E2', arm='E2-pilot', seed=84,
+                                  deadline_seconds=1800, receipts=[],
+                                  workload='invalid workload!')
+
+
 
 if __name__ == '__main__':
     unittest.main()

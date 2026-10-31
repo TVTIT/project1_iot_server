@@ -8,6 +8,7 @@ and already-provisioned durable Gateway simulator environment files.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,14 @@ import subprocess
 import sys
 import threading
 import time
+
+try:
+    from scripts.paper_p8_bundle import _validate_equal_samples_manifest_obj
+except ImportError:
+    try:
+        from paper_p8_bundle import _validate_equal_samples_manifest_obj
+    except ImportError:
+        _validate_equal_samples_manifest_obj = None
 
 
 MAX_CHILD_TIMEOUT_SECONDS = 30
@@ -153,6 +162,48 @@ def invoke_paperload(binary, manifest, output_dir, *, official=False, timeout=20
     return result
 
 
+def _is_e2_equal_samples_manifest(manifest):
+    if not isinstance(manifest, dict) or manifest.get('experiment') != 'E2':
+        return False
+    eq = manifest.get('equal_samples')
+    if not isinstance(eq, dict):
+        return False
+    limits = manifest.get('limits')
+    if not isinstance(limits, dict):
+        return False
+    wall_seconds = limits.get('wall_seconds')
+    if isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or not math.isfinite(wall_seconds) or wall_seconds <= 0:
+        return False
+    if _validate_equal_samples_manifest_obj is not None:
+        try:
+            _validate_equal_samples_manifest_obj(eq, manifest.get('samples_per_message'), manifest.get('seed'))
+            return True
+        except (ValueError, TypeError, KeyError):
+            return False
+    # Structural fallback if bundle validator is not importable
+    if (eq.get('schema_version') != 1
+            or eq.get('workload_type') != 'equal_samples'
+            or eq.get('sample_stream_version') != 1
+            or eq.get('logical_producers') != ['A', 'B']
+            or eq.get('stream_sequence_start') != 0):
+        return False
+    seed = eq.get('seed')
+    if type(seed) is not int or not (0 <= seed <= (1 << 63) - 1):
+        return False
+    total_samples = eq.get('total_samples')
+    sample_rate = eq.get('sample_rate')
+    duration_seconds = eq.get('duration_seconds')
+    if type(total_samples) is not int or total_samples <= 0 or total_samples > 60000 or total_samples % 200 != 0:
+        return False
+    if type(sample_rate) is not int or sample_rate < 2 or sample_rate > 200 or sample_rate % 2 != 0:
+        return False
+    if total_samples % sample_rate != 0:
+        return False
+    if type(duration_seconds) is not int or duration_seconds != (total_samples // sample_rate) or not (10 <= duration_seconds <= 120):
+        return False
+    return True
+
+
 def _read_spec(path, manifest, output_dir):
     if path:
         spec_path = Path(_safe_path(path, must_exist=True))
@@ -201,21 +252,33 @@ def _read_spec(path, manifest, output_dir):
     if not jobs:
         raise PaperloadInputError('run spec must include at least one paperload producer')
     profiles = []
+    manifests = []
     for job in jobs:
         try:
             if Path(job['manifest']).stat().st_size > 1 << 20:
                 raise PaperloadInputError('manifest exceeds size limit')
             public_manifest = json.loads(Path(job['manifest']).read_text(encoding='utf-8'))
             profiles.append(public_manifest.get('profile') if isinstance(public_manifest, dict) else None)
+            manifests.append(public_manifest if isinstance(public_manifest, dict) else {})
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise PaperloadInputError('manifest is not readable JSON') from None
     if profiles and all(profile == 'pilot' for profile in profiles) and len(gateway_items) > 2:
         raise PaperloadInputError('pilot mode is capped at two durable Gateway processes')
-    if not isinstance(stop_timeout, (int, float)) or stop_timeout <= 0 or stop_timeout > 60:
-        raise PaperloadInputError('stop timeout must be between 0 and 60 seconds')
+    is_e2_equal_samples = (
+        len(gateway_items) == 0
+        and len(jobs) > 0
+        and all(_is_e2_equal_samples_manifest(m) for m in manifests)
+    )
+    max_stop_timeout = 300 if is_e2_equal_samples else 60
+    if (isinstance(stop_timeout, bool)
+            or not isinstance(stop_timeout, (int, float))
+            or not math.isfinite(stop_timeout)
+            or stop_timeout <= 0
+            or stop_timeout > max_stop_timeout):
+        raise PaperloadInputError(f'stop timeout must be between 0 and {max_stop_timeout} seconds')
     for child in gateway_items:
         value = child['ready_timeout_seconds']
-        if not isinstance(value, (int, float)) or value <= 0 or value > 60:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 or value > 60:
             raise PaperloadInputError('Gateway readiness timeout must be between 0 and 60 seconds')
     return jobs, gateway_items, float(stop_timeout), path
 
@@ -349,6 +412,12 @@ def _pump_lines(pipe, lines, done, child_label=None, phase_events=None, phase_er
 def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_timeout=30,
                    run_artifact, official=False, popen=subprocess.Popen):
     """Run producers, then boundedly drain and join every owned durable child."""
+    if (isinstance(stop_timeout, bool)
+            or not isinstance(stop_timeout, (int, float))
+            or not math.isfinite(stop_timeout)
+            or stop_timeout <= 0):
+        raise PaperloadInputError('stop timeout must be positive finite number')
+    stop_timeout = float(stop_timeout)
     started = time.time()
     started_monotonic_ns = time.monotonic_ns()
     source = []

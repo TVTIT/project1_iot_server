@@ -107,6 +107,7 @@ type TelemetryEngine struct {
 	replayIndex     int
 	ignoreACKBudget int
 	fatalGeneration error
+	anchorTime      time.Time
 }
 
 // PhaseEvent is a bounded, identity-free phase snapshot. elapsed_ns is local
@@ -170,7 +171,15 @@ func NewTelemetryEngine(m Manifest, transports map[string]TelemetryTransport) (*
 			boot[id] = uuid.New()
 		}
 	}
-	return &TelemetryEngine{m: m, transports: transports, pending: map[uuid.UUID]*pendingMessage{}, jobs: make(chan uuid.UUID, m.Limits.PendingMessages), acks: make(chan ackInput, m.Limits.PendingMessages), boot: boot, nextSequence: map[string]int64{}, targets: byGateway}, nil
+	var anchorTime time.Time
+	if m.EqualSamples != nil {
+		var err error
+		anchorTime, err = ParseRFC3339Anchor(m.EqualSamples.TimestampAnchor)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &TelemetryEngine{m: m, transports: transports, pending: map[uuid.UUID]*pendingMessage{}, jobs: make(chan uuid.UUID, m.Limits.PendingMessages), acks: make(chan ackInput, m.Limits.PendingMessages), boot: boot, nextSequence: map[string]int64{}, targets: byGateway, anchorTime: anchorTime}, nil
 }
 
 // Admit is safe for a Paho callback: bounded copy/enqueue only. Parsing occurs
@@ -241,7 +250,11 @@ func (e *TelemetryEngine) Run(ctx context.Context) (string, error) {
 	e.observePhase("warmup_end")
 	if !e.stopGeneration.Load() {
 		e.observePhase("measure_begin")
-		_ = e.runOpenLoop(runCtx, time.Duration(e.m.Phases.MeasureSeconds)*time.Second, time.Duration(e.m.Traffic.RampSeconds)*time.Second, false)
+		if e.m.EqualSamples != nil {
+			_ = e.runEqualSamples(runCtx)
+		} else {
+			_ = e.runOpenLoop(runCtx, time.Duration(e.m.Phases.MeasureSeconds)*time.Second, time.Duration(e.m.Traffic.RampSeconds)*time.Second, false)
+		}
 		e.observePhase("measure_end")
 	}
 	if !e.stopGeneration.Load() {
@@ -319,6 +332,9 @@ drained:
 	want := int64(math.Ceil(e.m.Traffic.RatePerSecond*float64(e.m.Phases.MeasureSeconds))) +
 		int64(math.Ceil(e.m.Traffic.RatePerSecond*float64(e.m.Phases.WarmupSeconds))) +
 		int64(e.m.Traffic.BurstMessages)
+	if e.m.EqualSamples != nil {
+		want = int64(e.m.EqualSamples.ExpectedMessages)
+	}
 	counters := e.Counters()
 	if e.m.E4.Mode == "replay" {
 		if counters.ReplayScheduled != int64(len(e.replay)) || counters.ReplayOffered != int64(len(e.replay)) || counters.ReplayApplicationACKs != int64(len(e.replay)) {
@@ -328,6 +344,94 @@ drained:
 		return "FAILED", errors.New("telemetry_generation_incomplete")
 	}
 	return "COMPLETE", nil
+}
+
+func (e *TelemetryEngine) runEqualSamples(ctx context.Context) bool {
+	eq := e.m.EqualSamples
+	if eq == nil {
+		return false
+	}
+	totalMessages := eq.ExpectedMessages
+	if totalMessages <= 0 {
+		return ctx.Err() == nil
+	}
+	s := int64(e.m.SamplesPerMessage)
+	intervalUS := eq.SampleIntervalUS
+	duration := time.Duration(eq.DurationSeconds) * time.Second
+
+	// Separate measure generation deadline with bounded startup/lateness grace
+	latenessGrace := 5 * time.Second
+	measureDeadlineDuration := duration + latenessGrace
+
+	start := time.Now()
+	measureDeadline := start.Add(measureDeadlineDuration)
+	if d, ok := ctx.Deadline(); ok && d.Before(measureDeadline) {
+		measureDeadline = d
+	}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	nextIndex := 0
+	for !e.stopGeneration.Load() && nextIndex < totalMessages {
+		select {
+		case a := <-e.acks:
+			e.handleACK(a)
+		case <-ctx.Done():
+			e.stopGeneration.Store(true)
+			return false
+		case now := <-ticker.C:
+			for {
+				select {
+				case a := <-e.acks:
+					e.handleACK(a)
+				default:
+					goto acksDrained
+				}
+			}
+		acksDrained:
+			if now.After(measureDeadline) {
+				e.counts.missed.Add(int64(totalMessages - nextIndex))
+				e.fatalGeneration = errors.New("equal_samples_schedule_deadline_exceeded")
+				e.stopGeneration.Store(true)
+				return false
+			}
+
+			for nextIndex < totalMessages && !e.stopGeneration.Load() {
+				dueOffset := EqualSamplesDueOffset(nextIndex, int(s), intervalUS)
+				due := start.Add(dueOffset)
+				if now.Before(due) {
+					break
+				}
+
+				lag := now.Sub(due).Nanoseconds()
+				if lag > e.counts.lag.Load() {
+					e.counts.lag.Store(lag)
+				}
+				if lag > int64(time.Second) {
+					e.counts.missed.Add(1)
+				}
+
+				e.counts.scheduled.Add(1)
+				e.counts.measureScheduled.Add(1)
+
+				before := e.counts.generated.Load()
+				if err := e.generate(now, "measure"); err != nil {
+					e.counts.deferred.Add(1)
+					e.fatalGeneration = err
+					e.stopGeneration.Store(true)
+					return false
+				}
+				if e.counts.generated.Load() > before {
+					e.counts.measureGenerated.Add(1)
+				}
+				nextIndex++
+			}
+			e.retryDue(now)
+		}
+	}
+
+	return ctx.Err() == nil && e.fatalGeneration == nil && nextIndex == totalMessages
 }
 
 func remainingBudget(ctx context.Context, configured time.Duration) time.Duration {
@@ -578,22 +682,38 @@ func (e *TelemetryEngine) generate(now time.Time, cohort string) error {
 	targets := e.targets[gw]
 	target := targets[(e.counts.generated.Load()/int64(len(gateways)))%int64(len(targets))]
 	key := gw + "\x00" + target.SensorID
-	interval := int64(500000) // 2 Hz synthetic samples, independent from offered batch rate.
+
+	var first time.Time
+	var interval int64
 	seq := e.nextSequence[key]
-	// Backdate the entire finite stream by its maximum possible span. Each
-	// Sensor's sequence then advances monotonically without ever entering the
-	// future, even when batches are injected much faster than sample Hz.
-	sampleBound, horizon, err := syntheticStreamBounds(e.m)
-	if err != nil {
-		return errors.New("synthetic_horizon_rejected")
-	}
-	const intervalNS int64 = 500 * int64(time.Millisecond)
 	sampleCount := int64(e.m.SamplesPerMessage)
-	if seq < 0 || sampleCount > math.MaxInt64-seq || seq > sampleBound-sampleCount || seq > (int64(horizon)-int64(time.Second))/intervalNS {
-		return errors.New("sequence_range_exhausted")
+
+	if e.m.EqualSamples != nil {
+		expectedMessages := int64(e.m.EqualSamples.ExpectedMessages)
+		expectedSamples := int64(e.m.EqualSamples.ExpectedSamples)
+		if e.counts.generated.Load() >= expectedMessages {
+			return errors.New("equal_samples_count_exhausted")
+		}
+		if seq < 0 || sampleCount > math.MaxInt64-seq || seq+sampleCount > expectedSamples {
+			return errors.New("sequence_range_exhausted")
+		}
+		interval = e.m.EqualSamples.SampleIntervalUS
+		offsetUS := seq * interval
+		first = e.anchorTime.Add(time.Duration(offsetUS) * time.Microsecond).UTC()
+	} else {
+		interval = int64(500000) // 2 Hz synthetic samples, independent from offered batch rate.
+		sampleBound, horizon, err := syntheticStreamBounds(e.m)
+		if err != nil {
+			return errors.New("synthetic_horizon_rejected")
+		}
+		const intervalNS int64 = 500 * int64(time.Millisecond)
+		if seq < 0 || sampleCount > math.MaxInt64-seq || seq > sampleBound-sampleCount || seq > (int64(horizon)-int64(time.Second))/intervalNS {
+			return errors.New("sequence_range_exhausted")
+		}
+		offset := time.Duration(seq * intervalNS)
+		first = now.Add(-horizon).Add(offset).UTC().Truncate(time.Microsecond)
 	}
-	offset := time.Duration(seq * intervalNS)
-	first := now.Add(-horizon).Add(offset).UTC().Truncate(time.Microsecond)
+
 	messageID, err := uuid.NewV7()
 	if err != nil {
 		messageID = uuid.New()
@@ -602,18 +722,21 @@ func (e *TelemetryEngine) generate(now time.Time, cohort string) error {
 	if err != nil {
 		return errors.New("synthetic_batch_rejected")
 	}
-	e.nextSequence[key] = seq + int64(e.m.SamplesPerMessage)
+	e.nextSequence[key] = seq + sampleCount
 	if int64(len(batch.Payload)) > e.m.Limits.PendingBytes {
+		e.nextSequence[key] = seq
 		return errors.New("pending_byte_cap")
 	}
 	e.mu.Lock()
 	if len(e.pending) >= e.m.Limits.PendingMessages || e.pendingBytes+int64(len(batch.Payload)) > e.m.Limits.PendingBytes {
 		e.mu.Unlock()
+		e.nextSequence[key] = seq
 		return errors.New("pending_cap")
 	}
 	if e.journal != nil {
 		if err := e.journal.Append(batch); err != nil {
 			e.mu.Unlock()
+			e.nextSequence[key] = seq
 			e.fatalGeneration = err
 			e.stopGeneration.Store(true)
 			return err
@@ -644,6 +767,7 @@ func (e *TelemetryEngine) generate(now time.Time, cohort string) error {
 		e.mu.Lock()
 		delete(e.pending, messageID)
 		e.pendingBytes -= int64(len(batch.Payload))
+		e.nextSequence[key] = seq
 		e.mu.Unlock()
 		return errors.New("publish_queue_full")
 	}

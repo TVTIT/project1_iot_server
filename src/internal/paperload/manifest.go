@@ -2,6 +2,7 @@
 package paperload
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -34,31 +36,32 @@ var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 // Manifest is the deliberately small schema-v1 P8 workload input.
 type Manifest struct {
-	SchemaVersion        int               `json:"schema_version"`
-	Experiment           string            `json:"experiment"`
-	Arm                  string            `json:"arm"`
-	Profile              string            `json:"profile"`
-	Mode                 string            `json:"mode"`
-	RunID                string            `json:"run_id"`
-	Seed                 uint64            `json:"seed"`
-	Roles                []string          `json:"roles"`
-	SamplesPerMessage    int               `json:"samples_per_message"`
-	Topology             Topology          `json:"topology"`
-	Targets              []Target          `json:"targets"`
-	Subscriptions        []Subscription    `json:"subscriptions"`
-	Traffic              Traffic           `json:"traffic"`
-	Phases               Phases            `json:"phases"`
-	Limits               Limits            `json:"limits"`
-	TLS                  TLS               `json:"tls"`
-	IdentityFiles        map[string]string `json:"identity_files"`
-	GatewayIdentityFiles map[string]string `json:"gateway_identity_files"`
-	BundlePath           string            `json:"bundle_path"`
-	DurabilityMode       string            `json:"durability_mode"`
-	RetryIntervalMS      int               `json:"retry_interval_ms"`
-	PublishTimeoutMS     int               `json:"publish_timeout_ms"`
-	Viewer               ViewerSettings    `json:"viewer,omitempty"`
-	Commands             []ControlCommand  `json:"commands,omitempty"`
-	E4                   E4Settings        `json:"e4,omitempty"`
+	SchemaVersion        int                   `json:"schema_version"`
+	Experiment           string                `json:"experiment"`
+	Arm                  string                `json:"arm"`
+	Profile              string                `json:"profile"`
+	Mode                 string                `json:"mode"`
+	RunID                string                `json:"run_id"`
+	Seed                 uint64                `json:"seed"`
+	Roles                []string              `json:"roles"`
+	SamplesPerMessage    int                   `json:"samples_per_message"`
+	Topology             Topology              `json:"topology"`
+	Targets              []Target              `json:"targets"`
+	Subscriptions        []Subscription        `json:"subscriptions"`
+	Traffic              Traffic               `json:"traffic"`
+	Phases               Phases                `json:"phases"`
+	Limits               Limits                `json:"limits"`
+	TLS                  TLS                   `json:"tls"`
+	IdentityFiles        map[string]string     `json:"identity_files"`
+	GatewayIdentityFiles map[string]string     `json:"gateway_identity_files"`
+	BundlePath           string                `json:"bundle_path"`
+	DurabilityMode       string                `json:"durability_mode"`
+	RetryIntervalMS      int                   `json:"retry_interval_ms"`
+	PublishTimeoutMS     int                   `json:"publish_timeout_ms"`
+	Viewer               ViewerSettings        `json:"viewer,omitempty"`
+	Commands             []ControlCommand      `json:"commands,omitempty"`
+	E4                   E4Settings            `json:"e4,omitempty"`
+	EqualSamples         *EqualSamplesSettings `json:"equal_samples,omitempty"`
 }
 
 // E4Settings describes a finite unique/replay experiment. It is inert until
@@ -174,6 +177,13 @@ func Decode(r io.Reader) (Manifest, error) {
 	if err != nil || len(data) > maxManifestBytes {
 		return m, errors.New("manifest_json_invalid")
 	}
+	var rawTop map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawTop); err != nil {
+		return m, errors.New("manifest_json_invalid")
+	}
+	if raw, ok := rawTop["equal_samples"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return m, errors.New("manifest_json_invalid")
+	}
 	d := json.NewDecoder(strings.NewReader(string(data)))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&m); err != nil {
@@ -188,6 +198,11 @@ func Decode(r io.Reader) (Manifest, error) {
 
 // Validate checks manifest bounds and combinations without file or network access.
 func Validate(m Manifest, officialOptIn bool) (Estimate, error) {
+	return ValidateAt(m, officialOptIn, time.Now().UTC())
+}
+
+// ValidateAt checks manifest bounds and combinations against a specific wall clock time.
+func ValidateAt(m Manifest, officialOptIn bool, now time.Time) (Estimate, error) {
 	bad := func() (Estimate, error) { return Estimate{}, errors.New("manifest_contract_rejected") }
 	if m.SchemaVersion != 1 || !contains([]string{"E1", "E2", "E3", "E4", "E5"}, m.Experiment) || !safeID.MatchString(m.Arm) || !safeID.MatchString(m.RunID) {
 		return bad()
@@ -197,6 +212,14 @@ func Validate(m Manifest, officialOptIn bool) (Estimate, error) {
 	}
 	if m.Profile == "official" && !officialOptIn {
 		return Estimate{}, errors.New("official_profile_requires_opt_in")
+	}
+	if m.EqualSamples != nil {
+		if m.Experiment != "E2" {
+			return bad()
+		}
+		if err := ValidateEqualSamples(m, now, true); err != nil {
+			return bad()
+		}
 	}
 	controlOnly := len(m.Roles) == 1 && m.Roles[0] == "control"
 	if !controlOnly && m.SamplesPerMessage != 1 && m.SamplesPerMessage != 100 {

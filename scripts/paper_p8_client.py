@@ -88,7 +88,7 @@ def _safe_phase_events(value):
         event = {key: item[key] for key in ('child', 'event', 'elapsed_ns', 'child_elapsed_ns', 'observed_at_runner_monotonic_ns',
                                              'command_ordinal', 'clock_qualification') if key in item}
         if 'child' in event and (not isinstance(event['child'], str) or len(event['child']) > 160
-                or not re.fullmatch(r'(?:paperload-telemetry:(?:[A-B]|telemetry|unique|replay|cold-replay|initial|warm_replay|initial-replay|warm-replay)(?:\.manifest)?\.json|paperload-viewer:viewer(?:\.manifest)?\.json|paperload-control:control(?:\.manifest)?\.json)', event['child'])):
+                or not re.fullmatch(r'(?:paperload-telemetry:(?:[A-B]|telemetry|unique|replay|cold-replay|initial|warm_replay|initial-replay|warm-replay|samples-(?:1|100)|equal-samples-(?:1|100))(?:\.manifest)?\.json|paperload-viewer:viewer(?:\.manifest)?\.json|paperload-control:control(?:\.manifest)?\.json)', event['child'])):
             raise ValueError('result phase event schema rejected')
         for key in ('event', 'clock_qualification'):
             if key in event and (not isinstance(event[key], str) or len(event[key]) > 120
@@ -129,6 +129,102 @@ def _safe_counter_tree(value, depth=0):
         else:
             raise ValueError('result counter schema rejected')
     return output
+
+
+EQUAL_SAMPLES_FIELDS = (
+    'context_sha256', 'workload_type', 'logical_producer',
+    'total_samples', 'sample_rate', 'duration_seconds', 'producer_sample_rate',
+    'sample_interval_us', 'samples_per_message', 'expected_samples', 'expected_messages',
+    'generated_samples', 'generated_messages', 'offered_unique_samples', 'offered_unique_messages',
+    'application_acks', 'offered_unique_bytes', 'attempted_bytes',
+    'schedule_misses', 'scheduling_lag_max_ns', 'completed_on_time', 'sampling_qualification'
+)
+
+
+def _safe_equal_samples(value, *, role=None):
+    if not isinstance(value, dict) or set(value) != set(EQUAL_SAMPLES_FIELDS):
+        raise ValueError('equal_samples schema rejected')
+    safe = {}
+    context_sha256 = value['context_sha256']
+    if not isinstance(context_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', context_sha256):
+        raise ValueError('equal_samples context sha256 rejected')
+    safe['context_sha256'] = context_sha256
+
+    workload_type = value['workload_type']
+    if workload_type != 'equal_samples':
+        raise ValueError('equal_samples workload type rejected')
+    safe['workload_type'] = workload_type
+
+    logical_producer = value['logical_producer']
+    if logical_producer not in ('A', 'B'):
+        raise ValueError('equal_samples logical producer rejected')
+    if role in ('A', 'B') and logical_producer != role:
+        raise ValueError('equal_samples logical producer mismatch')
+    safe['logical_producer'] = logical_producer
+
+    total_samples = value['total_samples']
+    if type(total_samples) is not int or not 0 < total_samples <= 60000:
+        raise ValueError('equal_samples total_samples rejected')
+    safe['total_samples'] = total_samples
+
+    sample_rate = value['sample_rate']
+    if type(sample_rate) is not int or not 2 <= sample_rate <= 200:
+        raise ValueError('equal_samples sample_rate rejected')
+    safe['sample_rate'] = sample_rate
+
+    duration_seconds = value['duration_seconds']
+    if type(duration_seconds) is not int or not 10 <= duration_seconds <= 120:
+        raise ValueError('equal_samples duration_seconds rejected')
+    safe['duration_seconds'] = duration_seconds
+
+    producer_sample_rate = value['producer_sample_rate']
+    if type(producer_sample_rate) is not int or not 1 <= producer_sample_rate <= 100:
+        raise ValueError('equal_samples producer_sample_rate rejected')
+    safe['producer_sample_rate'] = producer_sample_rate
+
+    sample_interval_us = value['sample_interval_us']
+    if type(sample_interval_us) is not int or not 0 < sample_interval_us <= (1 << 53):
+        raise ValueError('equal_samples sample_interval_us rejected')
+    safe['sample_interval_us'] = sample_interval_us
+
+    samples_per_message = value['samples_per_message']
+    if type(samples_per_message) is not int or samples_per_message not in (1, 100):
+        raise ValueError('equal_samples samples_per_message rejected')
+    safe['samples_per_message'] = samples_per_message
+
+    expected_samples = value['expected_samples']
+    if type(expected_samples) is not int or not 0 < expected_samples <= 60000:
+        raise ValueError('equal_samples expected_samples rejected')
+    safe['expected_samples'] = expected_samples
+
+    expected_messages = value['expected_messages']
+    if type(expected_messages) is not int or not 0 < expected_messages <= 60000:
+        raise ValueError('equal_samples expected_messages rejected')
+    safe['expected_messages'] = expected_messages
+
+    for key in ('generated_samples', 'generated_messages', 'offered_unique_samples', 'offered_unique_messages',
+                'application_acks', 'offered_unique_bytes', 'attempted_bytes',
+                'schedule_misses', 'scheduling_lag_max_ns'):
+        val = value[key]
+        if type(val) is not int or not 0 <= val <= (1 << 53):
+            raise ValueError(f'equal_samples {key} counter rejected')
+        safe[key] = val
+
+    completed_on_time = value['completed_on_time']
+    if type(completed_on_time) is not bool:
+        raise ValueError('equal_samples completed_on_time rejected')
+    safe['completed_on_time'] = completed_on_time
+
+    sampling_qualification = value['sampling_qualification']
+    if (not isinstance(sampling_qualification, str) or len(sampling_qualification) > 256
+            or '/' in sampling_qualification or '\\' in sampling_qualification
+            or sampling_qualification not in (
+                'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+            )):
+        raise ValueError('equal_samples sampling_qualification rejected')
+    safe['sampling_qualification'] = sampling_qualification
+
+    return safe
 
 
 def _safe_workload(value, *, role=None):
@@ -320,6 +416,10 @@ def _safe_workload(value, *, role=None):
                 if key in projected and type(projected[key]) is not int:
                     raise ValueError('command result counter rejected')
             safe['commands'].append(projected)
+    if 'equal_samples' in value:
+        eq = value['equal_samples']
+        if eq is not None:
+            safe['equal_samples'] = _safe_equal_samples(eq, role=role)
     for key in ('planned', 'sent', 'skipped', 'pending', 'connection_attempts',
                 'connected_distinct_viewers', 'reconnections', 'subscribed_distinct_viewers',
                 'receiving_distinct_viewers', 'unique_events', 'duplicates', 'wrong_namespace',
@@ -369,6 +469,133 @@ def _safe_runner(value):
             if key != 'status' and type(item) in (int, float, bool):
                 result['resource_sampling'][key] = item
     return result
+
+
+def _safe_generator_resources(value):
+    if not isinstance(value, dict):
+        raise ValueError('generator_resources_schema_rejected')
+    if value.get('schema_version') != 1:
+        raise ValueError('generator_resources_version_rejected')
+    if value.get('role') != 'generator_B':
+        raise ValueError('generator_resources_role_rejected')
+    if value.get('cpu_normalization') not in ('host_percent', 'core_percent'):
+        raise ValueError('generator_resources_cpu_norm_rejected')
+
+    host_cpus = value.get('host_cpus')
+    if type(host_cpus) is not int or host_cpus <= 0:
+        raise ValueError('generator_resources_host_cpus_rejected')
+    clk_tck = value.get('clk_tck')
+    if type(clk_tck) is not int or clk_tck <= 0:
+        raise ValueError('generator_resources_clk_tck_rejected')
+
+    safe = {
+        'schema_version': 1,
+        'role': 'generator_B',
+        'cpu_normalization': value['cpu_normalization'],
+        'cpu_normalization_description': str(value.get('cpu_normalization_description', ''))[:200],
+        'host_cpus': host_cpus,
+        'clk_tck': clk_tck,
+    }
+
+    scopes = value.get('scopes')
+    if not isinstance(scopes, dict):
+        raise ValueError('generator_resources_scopes_rejected')
+    allowed_scope_keys = {'process_tree_scope', 'fd_scope', 'rss_scope', 'cpu_scope'}
+    safe['scopes'] = {}
+    for k, v in scopes.items():
+        if k not in allowed_scope_keys or not isinstance(v, str) or len(v) > 200:
+            raise ValueError('generator_resources_scope_field_rejected')
+        safe['scopes'][k] = v
+
+    units = value.get('units')
+    if not isinstance(units, dict):
+        raise ValueError('generator_resources_units_rejected')
+    allowed_unit_keys = {'rss_bytes', 'cpu_percent', 'elapsed_seconds', 'interval_seconds',
+                         'delta_ticks', 'process_count', 'current_fd_count'}
+    safe['units'] = {}
+    for k, v in units.items():
+        if k not in allowed_unit_keys or not isinstance(v, str) or len(v) > 200:
+            raise ValueError('generator_resources_unit_field_rejected')
+        safe['units'][k] = v
+
+    clock = value.get('clock')
+    if not isinstance(clock, dict):
+        raise ValueError('generator_resources_clock_rejected')
+    mono_start = clock.get('monotonic_start')
+    if mono_start is not None and (type(mono_start) not in (int, float) or isinstance(mono_start, bool) or not math.isfinite(mono_start)):
+        raise ValueError('generator_resources_clock_mono_rejected')
+    interval = clock.get('sample_interval_seconds')
+    if type(interval) not in (int, float) or isinstance(interval, bool) or not math.isfinite(interval) or interval <= 0:
+        raise ValueError('generator_resources_clock_interval_rejected')
+    deadline = clock.get('deadline_seconds')
+    if type(deadline) not in (int, float) or isinstance(deadline, bool) or not math.isfinite(deadline) or deadline <= 0:
+        raise ValueError('generator_resources_clock_deadline_rejected')
+    max_snaps = clock.get('max_snapshots')
+    if type(max_snaps) is not int or max_snaps <= 0 or max_snaps > 128:
+        raise ValueError('generator_resources_clock_max_snaps_rejected')
+
+    safe['clock'] = {
+        'monotonic_start': float(mono_start) if mono_start is not None else None,
+        'sample_interval_seconds': float(interval),
+        'deadline_seconds': float(deadline),
+        'max_snapshots': max_snaps,
+    }
+
+    summary = value.get('summary')
+    if not isinstance(summary, dict):
+        raise ValueError('generator_resources_summary_rejected')
+    for num_field in ('total_samples', 'available_samples', 'unavailable_samples', 'cpu_available_samples'):
+        v = summary.get(num_field)
+        if type(v) is not int or v < 0:
+            raise ValueError(f'generator_resources_summary_{num_field}_rejected')
+    max_rss = summary.get('max_sample_rss_bytes')
+    if max_rss is not None and (type(max_rss) is not int or max_rss < 0):
+        raise ValueError('generator_resources_summary_max_rss_rejected')
+
+    missing_reasons = summary.get('missing_reasons', [])
+    if not isinstance(missing_reasons, list) or any(not isinstance(r, str) or len(r) > 100 for r in missing_reasons):
+        raise ValueError('generator_resources_summary_missing_reasons_rejected')
+    errors = summary.get('errors', [])
+    if not isinstance(errors, list) or any(not isinstance(e, str) or len(e) > 100 for e in errors):
+        raise ValueError('generator_resources_summary_errors_rejected')
+
+    safe['summary'] = {
+        'total_samples': summary['total_samples'],
+        'available_samples': summary['available_samples'],
+        'unavailable_samples': summary['unavailable_samples'],
+        'cpu_available_samples': summary['cpu_available_samples'],
+        'max_sample_rss_bytes': max_rss,
+        'max_sample_rss_qualification': str(summary.get('max_sample_rss_qualification', ''))[:200],
+        'fd_scope': str(summary.get('fd_scope', ''))[:100],
+        'missing_reasons': sorted(missing_reasons),
+        'errors': list(errors),
+    }
+
+    raw_samples = value.get('samples', [])
+    if not isinstance(raw_samples, list) or len(raw_samples) > 128:
+        raise ValueError('generator_resources_samples_count_rejected')
+    allowed_sample_keys = {'sample_index', 'timestamp', 'elapsed_seconds', 'interval_seconds',
+                          'available', 'cpu_percent', 'delta_ticks', 'rss_bytes', 'process_count',
+                          'current_fd_count', 'reason'}
+    sanitized_samples = []
+    for s in raw_samples:
+        if not isinstance(s, dict) or set(s) - allowed_sample_keys:
+            raise ValueError('generator_resources_sample_fields_rejected')
+        sample = {k: s[k] for k in allowed_sample_keys if k in s}
+        for num_key in ('elapsed_seconds', 'interval_seconds', 'cpu_percent', 'delta_ticks',
+                        'rss_bytes', 'process_count', 'current_fd_count', 'sample_index'):
+            v = sample.get(num_key)
+            if v is not None:
+                if type(v) not in (int, float) or isinstance(v, bool) or not math.isfinite(v):
+                    raise ValueError('generator_resources_sample_non_finite_rejected')
+        if sample.get('available') is not None and type(sample['available']) is not bool:
+            raise ValueError('generator_resources_sample_available_rejected')
+        if sample.get('reason') is not None and (not isinstance(sample['reason'], str) or len(sample['reason']) > 100):
+            raise ValueError('generator_resources_sample_reason_rejected')
+        sanitized_samples.append(sample)
+
+    safe['samples'] = sanitized_samples
+    return safe
 
 
 def _write_new(path, data):
@@ -790,6 +1017,9 @@ def _export_results(workspace, output):
     else:
         files = [('runner/run.json', root / 'outputs/run.json', 'runner')]
         files.append(('runner/provenance.json', root / 'runtime/runner-provenance.json', 'provenance'))
+        gen_res_path = root / 'outputs/resources-generator.json'
+        if gen_res_path.is_file():
+            files.append(('runner/resources-generator.json', gen_res_path, 'generator_resources'))
     for job in run_spec.get('paperload', []):
         role = job.get('role')
         if role not in ('viewer', 'telemetry', 'control'):
@@ -881,6 +1111,8 @@ def _export_results(workspace, output):
             safe = parsed
         elif kind == 'runner':
             safe = _safe_runner(parsed)
+        elif kind == 'generator_resources':
+            safe = _safe_generator_resources(parsed)
         else:
             safe = _safe_workload(parsed, role=kind)
         entries.append((rel, json.dumps(safe, sort_keys=True, separators=(',', ':')).encode()))
@@ -2611,12 +2843,39 @@ def main(argv=None):
                             raise ValueError('run artifact already exists')
                         _write_new(root / 'runtime/runner-provenance.json',
                                    json.dumps(provenance, sort_keys=True).encode())
-                    if e4 and phase_resumed:
-                        status, report = 'COMPLETE', _private_json(artifact)
-                    else:
-                        status, report = paper_p8.run_supervised(binary=args.binary,
-                            gateway_binary=args.gateway_binary, jobs=selected, gateways=gateways,
-                            stop_timeout=stop_timeout, run_artifact=str(artifact))
+                    sampler = None
+                    is_equal_samples_e2 = (
+                        not e4
+                        and binding.get('session', {}).get('experiment') == 'E2'
+                        and (
+                            binding.get('session', {}).get('workload') == 'equal_samples'
+                            or str(binding.get('session', {}).get('phase', '')).startswith('equal-samples-')
+                            or any(
+                                isinstance(_private_json(Path(j['manifest'])), dict)
+                                and 'equal_samples' in _private_json(Path(j['manifest']))
+                                for j in selected
+                                if Path(j.get('manifest', '')).is_file()
+                            )
+                        )
+                    )
+                    if is_equal_samples_e2:
+                        sampler = GeneratorResourceSampler(interval=1.0)
+                        sampler.start()
+                    try:
+                        if e4 and phase_resumed:
+                            status, report = 'COMPLETE', _private_json(artifact)
+                        else:
+                            status, report = paper_p8.run_supervised(binary=args.binary,
+                                gateway_binary=args.gateway_binary, jobs=selected, gateways=gateways,
+                                stop_timeout=stop_timeout, run_artifact=str(artifact))
+                    finally:
+                        if sampler is not None:
+                            gen_report = sampler.stop()
+                            sampler.write_csv(root / 'outputs/resources-generator.csv')
+                            _write_new(
+                                root / 'outputs/resources-generator.json',
+                                json.dumps(gen_report, sort_keys=True).encode(),
+                            )
                     if e4:
                         if status != 'COMPLETE':
                             state['last_failed_phase'] = args.phase

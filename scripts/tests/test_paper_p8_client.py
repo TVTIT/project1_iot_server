@@ -550,6 +550,379 @@ class ResultProjectionTests(unittest.TestCase):
         exported_text = '\n'.join(path.read_text() for path in out.rglob('*.json'))
         self.assertNotIn('/private', exported_text)
 
+    def test_export_results_preserves_equal_samples_workload(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        ctx_hash = 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792'
+        for job in spec['paperload']:
+            output = Path(job['output_dir'])
+            output.mkdir(mode=0o700)
+            role = job['role']
+            value = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'A' if role == 'telemetry' else 'baseline',
+                     'run_id': 'run-1', 'started_at': '2026-10-30T00:00:00Z',
+                     'finished_at': '2026-10-30T00:00:01Z',
+                     'telemetry': {'generated_unique': 20, 'offered_unique': 20,
+                                   'application_acks': 20, 'pending_messages': 0,
+                                   'pending_bytes': 0},
+                     'phase_events': [{'event': 'measure_end', 'elapsed_ns': 10,
+                                       'counters': {'offered_unique': 20}}]}
+            value['implementation_status'] = ('P8.4c viewer-only client; no control/durable/server orchestration'
+                if role == 'viewer' else 'P8.4b telemetry synthetic-load; no durable restart assurance')
+            if role == 'viewer':
+                value.update({'connected_distinct_viewers': 64,
+                              'viewers': [{'id': 'viewer-00000', 'events': 2,
+                                            'unique_events': 2, 'duplicates': 0, 'bytes': 300}],
+                              'identity_samples': [{'viewer_id':'viewer-001','gateway_id':'gw-a',
+                                'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                                'first_sequence':'1','sample_count':100,'header_sha256':'c'*64}]})
+            else:
+                value['phase_observation_status'] = 'observed_process_local_elapsed; runner_pipe_observation_lag_unknown'
+                value['identity_samples'] = [{'viewer_id':'','gateway_id':'gw-a',
+                    'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                    'first_sequence':'1','sample_count':100,'header_sha256':'d'*64}]
+                value['equal_samples'] = {
+                    'context_sha256': ctx_hash, 'workload_type': 'equal_samples',
+                    'logical_producer': 'A', 'total_samples': 6000, 'sample_rate': 100,
+                    'duration_seconds': 60, 'producer_sample_rate': 50, 'sample_interval_us': 20000,
+                    'samples_per_message': 100, 'expected_samples': 3000, 'expected_messages': 30,
+                    'generated_samples': 3000, 'generated_messages': 30, 'offered_unique_samples': 3000,
+                    'offered_unique_messages': 30, 'application_acks': 30, 'offered_unique_bytes': 15000,
+                    'attempted_bytes': 15000, 'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000,
+                    'completed_on_time': True,
+                    'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only'
+                }
+            path = output / 'workload.json'
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        runner = workspace / 'outputs/run.json'
+        runner.write_text(json.dumps({'status': 'COMPLETE', 'children': [],
+                                      'phase_observations': {'status': 'observed', 'events': []},
+                                      'resource_sampling': {'status': 'not_collected_in_P8.4'}}))
+        runner.chmod(0o600)
+        provenance = workspace / 'runtime/runner-provenance.json'
+        provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                          'binary_os': 'linux', 'binary_arch': 'amd64'}))
+        provenance.chmod(0o600)
+        out = fixture.root / 'safe-equal-results'
+        client._export_results(workspace, out)
+        telemetry = json.loads((out / 'results/workloads/telemetry/workload.json').read_text())
+        self.assertIn('equal_samples', telemetry)
+        self.assertEqual(len(telemetry['equal_samples']), 22)
+        self.assertEqual(telemetry['equal_samples']['context_sha256'], ctx_hash)
+        self.assertEqual(telemetry['equal_samples']['expected_messages'], 30)
+
+    def test_safe_generator_resources_validation_and_rejection(self):
+        valid = {
+            'schema_version': 1,
+            'role': 'generator_B',
+            'cpu_normalization': 'host_percent',
+            'cpu_normalization_description': 'ticks / CLK_TCK / interval / cpus * 100',
+            'host_cpus': 4,
+            'clk_tck': 100,
+            'scopes': {
+                'process_tree_scope': 'owned_children_capped_at_32',
+                'fd_scope': 'root_process_only',
+                'rss_scope': 'sum_sampled_RSS_may_double_count_shared_pages_not_peak',
+                'cpu_scope': 'monotonic_process_tree_ticks_delta_same_keys_only',
+            },
+            'units': {
+                'rss_bytes': 'bytes',
+                'cpu_percent': 'percent',
+                'elapsed_seconds': 'seconds',
+                'interval_seconds': 'seconds',
+                'delta_ticks': 'ticks',
+                'process_count': 'count',
+                'current_fd_count': 'count',
+            },
+            'clock': {
+                'monotonic_start': 100.0,
+                'sample_interval_seconds': 1.0,
+                'deadline_seconds': 120.0,
+                'max_snapshots': 128,
+            },
+            'summary': {
+                'total_samples': 1,
+                'available_samples': 1,
+                'unavailable_samples': 0,
+                'cpu_available_samples': 1,
+                'max_sample_rss_bytes': 1024,
+                'max_sample_rss_qualification': 'not_peak',
+                'fd_scope': 'root_process_only',
+                'missing_reasons': [],
+                'errors': [],
+            },
+            'samples': [
+                {
+                    'sample_index': 0,
+                    'timestamp': '2026-01-01T12:00:00Z',
+                    'elapsed_seconds': 0.0,
+                    'interval_seconds': None,
+                    'available': True,
+                    'cpu_percent': 10.0,
+                    'delta_ticks': 10,
+                    'rss_bytes': 1024,
+                    'process_count': 2,
+                    'current_fd_count': 5,
+                    'reason': None,
+                }
+            ],
+        }
+        safe = client._safe_generator_resources(valid)
+        self.assertEqual(safe['role'], 'generator_B')
+        self.assertEqual(safe['clk_tck'], 100)
+        self.assertEqual(len(safe['samples']), 1)
+
+        # Rejections
+        with self.assertRaisesRegex(ValueError, 'generator_resources_version_rejected'):
+            client._safe_generator_resources(dict(valid, schema_version=2))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_role_rejected'):
+            client._safe_generator_resources(dict(valid, role='generator_A'))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_cpu_norm_rejected'):
+            client._safe_generator_resources(dict(valid, cpu_normalization='invalid'))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_host_cpus_rejected'):
+            client._safe_generator_resources(dict(valid, host_cpus=0))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_clock_max_snaps_rejected'):
+            client._safe_generator_resources(dict(valid, clock=dict(valid['clock'], max_snapshots=200)))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_sample_fields_rejected'):
+            bad_samples = [dict(valid['samples'][0], unknown_field='bad')]
+            client._safe_generator_resources(dict(valid, samples=bad_samples))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_sample_non_finite_rejected'):
+            bad_samples = [dict(valid['samples'][0], cpu_percent=float('nan'))]
+            client._safe_generator_resources(dict(valid, samples=bad_samples))
+
+    def test_export_results_includes_generator_resources(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        for job in spec['paperload']:
+            output = Path(job['output_dir'])
+            output.mkdir(mode=0o700)
+            role = job['role']
+            value = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'A' if role == 'telemetry' else 'baseline',
+                     'run_id': 'run-1', 'started_at': '2026-10-30T00:00:00Z',
+                     'finished_at': '2026-10-30T00:00:01Z',
+                     'telemetry': {'generated_unique': 20, 'offered_unique': 20,
+                                   'application_acks': 20, 'pending_messages': 0,
+                                   'pending_bytes': 0},
+                     'phase_events': [{'event': 'measure_end', 'elapsed_ns': 10,
+                                       'counters': {'offered_unique': 20}}]}
+            value['implementation_status'] = ('P8.4c viewer-only client; no control/durable/server orchestration'
+                if role == 'viewer' else 'P8.4b telemetry synthetic-load; no durable restart assurance')
+            if role == 'viewer':
+                value.update({'connected_distinct_viewers': 64,
+                              'viewers': [{'id': 'viewer-00000', 'events': 2,
+                                            'unique_events': 2, 'duplicates': 0, 'bytes': 300}],
+                              'identity_samples': [{'viewer_id':'viewer-001','gateway_id':'gw-a',
+                                'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                                'first_sequence':'1','sample_count':100,'header_sha256':'c'*64}]})
+            else:
+                value['phase_observation_status'] = 'observed_process_local_elapsed; runner_pipe_observation_lag_unknown'
+                value['identity_samples'] = [{'viewer_id':'','gateway_id':'gw-a',
+                    'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                    'first_sequence':'1','sample_count':100,'header_sha256':'d'*64}]
+            path = output / 'workload.json'
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        runner = workspace / 'outputs/run.json'
+        runner.write_text(json.dumps({'status': 'COMPLETE', 'children': [],
+                                      'phase_observations': {'status': 'observed', 'events': []},
+                                      'resource_sampling': {'status': 'not_collected_in_P8.4'}}))
+        runner.chmod(0o600)
+        provenance = workspace / 'runtime/runner-provenance.json'
+        provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                          'binary_os': 'linux', 'binary_arch': 'amd64'}))
+        provenance.chmod(0o600)
+
+        # Place generator resources in outputs
+        gen_data = {
+            'schema_version': 1,
+            'role': 'generator_B',
+            'cpu_normalization': 'host_percent',
+            'cpu_normalization_description': 'desc',
+            'host_cpus': 2,
+            'clk_tck': 100,
+            'scopes': {
+                'process_tree_scope': 'owned_children_capped_at_32',
+                'fd_scope': 'root_process_only',
+                'rss_scope': 'sum_sampled_RSS_may_double_count_shared_pages_not_peak',
+                'cpu_scope': 'monotonic_process_tree_ticks_delta_same_keys_only',
+            },
+            'units': {
+                'rss_bytes': 'bytes',
+                'cpu_percent': 'percent',
+                'elapsed_seconds': 'seconds',
+                'interval_seconds': 'seconds',
+                'delta_ticks': 'ticks',
+                'process_count': 'count',
+                'current_fd_count': 'count',
+            },
+            'clock': {
+                'monotonic_start': 100.0,
+                'sample_interval_seconds': 1.0,
+                'deadline_seconds': 120.0,
+                'max_snapshots': 128,
+            },
+            'summary': {
+                'total_samples': 1,
+                'available_samples': 1,
+                'unavailable_samples': 0,
+                'cpu_available_samples': 1,
+                'max_sample_rss_bytes': 2048,
+                'max_sample_rss_qualification': 'not_peak',
+                'fd_scope': 'root_process_only',
+                'missing_reasons': [],
+                'errors': [],
+            },
+            'samples': [
+                {
+                    'sample_index': 0,
+                    'timestamp': '2026-01-01T12:00:00Z',
+                    'elapsed_seconds': 0.0,
+                    'interval_seconds': None,
+                    'available': True,
+                    'cpu_percent': 5.0,
+                    'delta_ticks': 5,
+                    'rss_bytes': 2048,
+                    'process_count': 1,
+                    'current_fd_count': 3,
+                    'reason': None,
+                }
+            ],
+        }
+        (workspace / 'outputs/resources-generator.json').write_text(json.dumps(gen_data))
+        (workspace / 'outputs/resources-generator.json').chmod(0o600)
+
+        out = fixture.root / 'safe-res-results'
+        client._export_results(workspace, out)
+        summary = json.loads((out / 'results.json').read_text())
+        file_paths = {f['path'] for f in summary['files']}
+        self.assertIn('results/runner/resources-generator.json', file_paths)
+        res_file = out / 'results/runner/resources-generator.json'
+        self.assertTrue(res_file.is_file())
+        parsed_res = json.loads(res_file.read_text())
+        self.assertEqual(parsed_res['role'], 'generator_B')
+        self.assertEqual(parsed_res['clk_tck'], 100)
+
+    def test_client_run_starts_generator_sampler_for_e2_equal_samples(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+
+        # Mutate binding to E2 equal-samples-100
+        binding_path = workspace / 'runtime/binding.json'
+        binding = json.loads(binding_path.read_text())
+        binding['session']['experiment'] = 'E2'
+        binding['session']['phase'] = 'equal-samples-100'
+        binding['session']['workload'] = 'equal_samples'
+        binding_path.write_text(json.dumps(binding))
+
+        bin_file = fixture.root / 'paperload_bin'
+        bin_file.write_bytes(b'dummy-binary')
+        bin_file.chmod(0o700)
+
+        started_samplers = []
+        stopped_samplers = []
+
+        class SpySampler:
+            def __init__(self, interval=1.0):
+                self.interval = interval
+                started_samplers.append(self)
+            def start(self):
+                pass
+            def stop(self):
+                stopped_samplers.append(self)
+                return {
+                    'schema_version': 1,
+                    'role': 'generator_B',
+                    'cpu_normalization': 'host_percent',
+                    'cpu_normalization_description': 'desc',
+                    'host_cpus': 2,
+                    'clk_tck': 100,
+                    'scopes': {
+                        'process_tree_scope': 'owned_children_capped_at_32',
+                        'fd_scope': 'root_process_only',
+                        'rss_scope': 'sum_sampled_RSS_may_double_count_shared_pages_not_peak',
+                        'cpu_scope': 'monotonic_process_tree_ticks_delta_same_keys_only',
+                    },
+                    'units': {
+                        'rss_bytes': 'bytes',
+                        'cpu_percent': 'percent',
+                        'elapsed_seconds': 'seconds',
+                        'interval_seconds': 'seconds',
+                        'delta_ticks': 'ticks',
+                        'process_count': 'count',
+                        'current_fd_count': 'count',
+                    },
+                    'clock': {
+                        'monotonic_start': 100.0,
+                        'sample_interval_seconds': 1.0,
+                        'deadline_seconds': 120.0,
+                        'max_snapshots': 128,
+                    },
+                    'summary': {
+                        'total_samples': 1,
+                        'available_samples': 1,
+                        'unavailable_samples': 0,
+                        'cpu_available_samples': 1,
+                        'max_sample_rss_bytes': 1024,
+                        'max_sample_rss_qualification': 'not_peak',
+                        'fd_scope': 'root_process_only',
+                        'missing_reasons': [],
+                        'errors': [],
+                    },
+                    'samples': [{
+                        'sample_index': 0,
+                        'timestamp': '2026-01-01T12:00:00Z',
+                        'elapsed_seconds': 0.0,
+                        'interval_seconds': None,
+                        'available': True,
+                        'cpu_percent': 5.0,
+                        'delta_ticks': 5,
+                        'rss_bytes': 1024,
+                        'process_count': 1,
+                        'current_fd_count': 3,
+                        'reason': None,
+                    }],
+                }
+            def write_csv(self, path):
+                Path(path).write_text('csv-header\n')
+
+        def fake_run_supervised(**kwargs):
+            art = Path(kwargs['run_artifact'])
+            art.parent.mkdir(parents=True, exist_ok=True)
+            art.write_text(json.dumps({'status': 'COMPLETE'}))
+            return 'COMPLETE', {'status': 'COMPLETE'}
+
+        with mock.patch.object(client, 'GeneratorResourceSampler', SpySampler), \
+                mock.patch.object(client.paper_p8, 'run_supervised', fake_run_supervised):
+            exit_code = client.main(['run', '--workspace', str(workspace), '--binary', str(bin_file)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(started_samplers), 1)
+        self.assertEqual(len(stopped_samplers), 1)
+        res_json = workspace / 'outputs/resources-generator.json'
+        self.assertTrue(res_json.is_file())
+        res_csv = workspace / 'outputs/resources-generator.csv'
+        self.assertTrue(res_csv.is_file())
+
     def test_e4_phase_selection_keeps_viewer_and_exactly_one_telemetry_writer(self):
         jobs = [
             {'role': 'telemetry', 'manifest': '/b/manifests/unique.json', 'output_dir': '/b/outputs/unique'},
@@ -863,3 +1236,198 @@ class ResultProjectionTests(unittest.TestCase):
             results_summary = json.loads((results_out / 'results.json').read_text())
             self.assertEqual(results_summary['phase'], 'conflicts')
             self.assertEqual(results_summary['proof']['path'], 'conflicts-proof.json')
+
+    def test_safe_phase_events_accepts_equal_samples_and_samples_child_labels(self):
+        phase_children = [
+            'paperload-telemetry:equal-samples-100.json',
+            'paperload-telemetry:equal-samples-100.manifest.json',
+            'paperload-telemetry:equal-samples-1.json',
+            'paperload-telemetry:equal-samples-1.manifest.json',
+            'paperload-telemetry:samples-100.json',
+            'paperload-telemetry:samples-100.manifest.json',
+            'paperload-telemetry:samples-1.json',
+            'paperload-telemetry:samples-1.manifest.json',
+            'paperload-telemetry:A.manifest.json',
+            'paperload-telemetry:B.manifest.json',
+        ]
+        for child in phase_children:
+            with self.subTest(child=child):
+                events = client._safe_phase_events([{'child': child,
+                    'event': 'measure_begin', 'elapsed_ns': 100,
+                    'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}])
+                self.assertEqual(events[0]['child'], child)
+
+    def test_equal_samples_safe_projection_preserves_exact_22_fields(self):
+        raw = {
+            'status': 'COMPLETE',
+            'implementation_status': 'P8.4b telemetry synthetic-load; no durable restart assurance',
+            'experiment': 'E2',
+            'arm': 'A',
+            'profile': 'pilot',
+            'mode': 'remote',
+            'run_id': 'golden-run-100',
+            'durability_mode': 'synthetic-load',
+            'durable_gateway_count': 0,
+            'started_at': '2026-10-31T12:00:00.000000000Z',
+            'finished_at': '2026-10-31T12:01:00.000000000Z',
+            'configured_phases': {'warmup_seconds': 0, 'measure_seconds': 60, 'drain_seconds': 20, 'cooldown_seconds': 0},
+            'telemetry': {'scheduled_opportunities': 30, 'generated_unique': 30, 'offered_unique': 30,
+                          'application_acks': 30, 'pending_messages': 0, 'pending_bytes': 0},
+            'equal_samples': {
+                'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+                'workload_type': 'equal_samples',
+                'logical_producer': 'A',
+                'total_samples': 6000,
+                'sample_rate': 100,
+                'duration_seconds': 60,
+                'producer_sample_rate': 50,
+                'sample_interval_us': 20000,
+                'samples_per_message': 100,
+                'expected_samples': 3000,
+                'expected_messages': 30,
+                'generated_samples': 3000,
+                'generated_messages': 30,
+                'offered_unique_samples': 3000,
+                'offered_unique_messages': 30,
+                'application_acks': 30,
+                'offered_unique_bytes': 15000,
+                'attempted_bytes': 15000,
+                'schedule_misses': 0,
+                'scheduling_lag_max_ns': 1250000,
+                'completed_on_time': True,
+                'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+            }
+        }
+        projected = client._safe_workload(raw, role='telemetry')
+        self.assertIn('equal_samples', projected)
+        eq = projected['equal_samples']
+        self.assertEqual(len(eq), 22)
+        self.assertEqual(eq['context_sha256'], 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792')
+        self.assertEqual(eq['workload_type'], 'equal_samples')
+        self.assertEqual(eq['logical_producer'], 'A')
+        self.assertEqual(eq['total_samples'], 6000)
+        self.assertEqual(eq['sample_rate'], 100)
+        self.assertEqual(eq['duration_seconds'], 60)
+        self.assertEqual(eq['producer_sample_rate'], 50)
+        self.assertEqual(eq['sample_interval_us'], 20000)
+        self.assertEqual(eq['samples_per_message'], 100)
+        self.assertEqual(eq['expected_samples'], 3000)
+        self.assertEqual(eq['expected_messages'], 30)
+        self.assertEqual(eq['generated_samples'], 3000)
+        self.assertEqual(eq['generated_messages'], 30)
+        self.assertEqual(eq['offered_unique_samples'], 3000)
+        self.assertEqual(eq['offered_unique_messages'], 30)
+        self.assertEqual(eq['application_acks'], 30)
+        self.assertEqual(eq['offered_unique_bytes'], 15000)
+        self.assertEqual(eq['attempted_bytes'], 15000)
+        self.assertEqual(eq['schedule_misses'], 0)
+        self.assertEqual(eq['scheduling_lag_max_ns'], 1250000)
+        self.assertIs(eq['completed_on_time'], True)
+        self.assertEqual(eq['sampling_qualification'], 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only')
+
+    def test_equal_samples_safe_projection_rejects_unknown_fields(self):
+        raw = {
+            'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'run-1',
+            'equal_samples': {
+                'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+                'workload_type': 'equal_samples', 'logical_producer': 'A',
+                'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+                'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+                'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+                'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+                'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+                'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+                'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+                'unknown_extra_key': 999,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, 'equal_samples schema rejected'):
+            client._safe_workload(raw, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_omissions(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        for key_to_remove in ('completed_on_time', 'context_sha256', 'expected_samples', 'application_acks'):
+            with self.subTest(removed=key_to_remove):
+                corrupted = dict(valid_eq)
+                del corrupted[key_to_remove]
+                raw = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'run-1', 'equal_samples': corrupted}
+                with self.assertRaisesRegex(ValueError, 'equal_samples schema rejected'):
+                    client._safe_workload(raw, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_nan_and_floats(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        for bad_val in (float('nan'), float('inf'), 30.5, '3000'):
+            with self.subTest(bad_val=bad_val):
+                corrupted = dict(valid_eq, generated_samples=bad_val)
+                raw = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'run-1', 'equal_samples': corrupted}
+                with self.assertRaises(ValueError):
+                    client._safe_workload(raw, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_negative_and_unbounded(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, generated_samples=-1)}, role='telemetry')
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, generated_samples=(1 << 54))}, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_malformed_identities(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, context_sha256='not-hex')}, role='telemetry')
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, logical_producer='invalid-producer')}, role='telemetry')
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, logical_producer='B')}, role='A')
+
+    def test_equal_samples_legacy_absent_behavior_unchanged(self):
+        raw = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r'}
+        projected = client._safe_workload(raw, role='telemetry')
+        self.assertNotIn('equal_samples', projected)
+        raw_none = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r', 'equal_samples': None}
+        projected_none = client._safe_workload(raw_none, role='telemetry')
+        self.assertNotIn('equal_samples', projected_none)
