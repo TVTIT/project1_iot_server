@@ -83,6 +83,8 @@ type ViewerResult struct {
 	PrimaryError             string                 `json:"primary_error,omitempty"`
 	IdentitySamples          []ViewerIdentitySample `json:"identity_samples,omitempty"`
 	IdentitySampling         string                 `json:"identity_sampling_qualification"`
+	PlannedStop              bool                   `json:"planned_stop,omitempty"`
+	PlannedStopReason        string                 `json:"planned_stop_reason,omitempty"`
 }
 
 // ViewerIdentitySample is header/hash provenance only; full telemetry values are never retained.
@@ -199,6 +201,20 @@ func viewerClaims(token string) (viewerIdentity, error) {
 // RunViewer starts a bounded viewer-only run. Handshake concurrency is separately
 // limited by workers; a successful handshake releases that slot while its reader lives.
 func RunViewer(ctx context.Context, m Manifest, manifestPath, outputDir string) (ViewerResult, error) {
+	return runViewer(ctx, m, manifestPath, outputDir, nil)
+}
+
+// RunViewerWithPlannedStop permits an explicit operator stop after every viewer
+// has connected, subscribed, started its reader, and published the ready marker.
+// Ordinary context cancellation and the manifest wall limit remain failures.
+func RunViewerWithPlannedStop(ctx context.Context, m Manifest, manifestPath, outputDir string, stop <-chan struct{}) (ViewerResult, error) {
+	if stop == nil {
+		return ViewerResult{}, errors.New("planned_stop_channel_required")
+	}
+	return runViewer(ctx, m, manifestPath, outputDir, stop)
+}
+
+func runViewer(ctx context.Context, m Manifest, manifestPath, outputDir string, plannedStop <-chan struct{}) (ViewerResult, error) {
 	r := ViewerResult{Status: "FAILED", Implementation: "P8.4c viewer-only client; no control/durable/server orchestration", Experiment: m.Experiment, Arm: m.Arm, Profile: m.Profile, Mode: m.Mode, RunID: m.RunID, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), CloseReasons: map[string]int{}, LatencyUnavailableReason: "publisher_origin_not_available_in_viewer_role", IdentitySampling: "header_sha256_only; max 20 globally and 1 per viewer; not a full-payload audit"}
 	if e := os.Mkdir(outputDir, 0700); e != nil {
 		return r, errors.New("output_directory_must_be_fresh")
@@ -347,13 +363,20 @@ func RunViewer(ctx context.Context, m Manifest, manifestPath, outputDir string) 
 	}
 	// The marker is an atomic, private rendezvous: every subscribe ACK was validated
 	// and every reader goroutine was launched before this point.
-	if err := writeViewerReady(outputDir, viewerReady{Status: "ready", Connected: len(byID), Subscribed: len(byID), Principals: len(principals), Mode: m.Viewer.Mode, MonotonicOrigin: "process_local_time_since_start; not comparable across processes/hosts"}); err != nil {
+	stoppedBeforeReady, err := publishViewerReady(outputDir, viewerReady{Status: "ready", Connected: len(byID), Subscribed: len(byID), Principals: len(principals), Mode: m.Viewer.Mode, MonotonicOrigin: "process_local_time_since_start; not comparable across processes/hosts"}, plannedStop, nil)
+	if stoppedBeforeReady {
+		stopAll("planned_stop_before_ready")
+		return viewerFailure(outputDir, shared, "planned_stop_before_ready")
+	}
+	if err != nil {
 		stopAll("ready_write_failed")
 		return viewerFailure(outputDir, shared, "viewer_ready_write_failed")
 	}
-	if !viewerWait(wall, time.Duration(m.Phases.WarmupSeconds)*time.Second, errs) {
+	if stopped, ok := viewerWaitWithPlannedStop(wall, time.Duration(m.Phases.WarmupSeconds)*time.Second, errs, plannedStop); !ok {
 		stopAll("warmup_failed")
 		return viewerFailure(outputDir, shared, "viewer_transport_failed")
+	} else if stopped {
+		return completePlannedViewer(wall, outputDir, shared, errs, stopAll)
 	}
 	if m.Viewer.Mode == "reconnect" {
 		for i := 0; i < m.Viewer.ReconnectCount; i++ {
@@ -367,15 +390,19 @@ func RunViewer(ctx context.Context, m Manifest, manifestPath, outputDir string) 
 			shared.mu.Unlock()
 		}
 	}
-	if !viewerWait(wall, time.Duration(m.Phases.MeasureSeconds)*time.Second, errs) {
+	if stopped, ok := viewerWaitWithPlannedStop(wall, time.Duration(m.Phases.MeasureSeconds)*time.Second, errs, plannedStop); !ok {
 		stopAll("measure_failed")
 		return viewerFailure(outputDir, shared, "viewer_transport_failed")
+	} else if stopped {
+		return completePlannedViewer(wall, outputDir, shared, errs, stopAll)
 	}
 	// Keep readers alive through the publisher's finite drain window; readiness,
 	// handshake/ramp and steady measurement remain separate lifecycle phases.
-	if !viewerWait(wall, time.Duration(m.Phases.DrainSeconds)*time.Second, errs) {
+	if stopped, ok := viewerWaitWithPlannedStop(wall, time.Duration(m.Phases.DrainSeconds)*time.Second, errs, plannedStop); !ok {
 		stopAll("drain_failed")
 		return viewerFailure(outputDir, shared, "viewer_transport_failed")
+	} else if stopped {
+		return completePlannedViewer(wall, outputDir, shared, errs, stopAll)
 	}
 	select {
 	case <-errs:
@@ -597,6 +624,83 @@ func viewerWait(ctx context.Context, d time.Duration, errs <-chan error) bool {
 		return false
 	}
 }
+
+// viewerWaitWithPlannedStop distinguishes a deliberate stop from every bounded
+// failure. Failure signals are checked before and after selecting the operator
+// channel so a simultaneous transport error or wall deadline cannot become PASS.
+func viewerWaitWithPlannedStop(ctx context.Context, d time.Duration, errs <-chan error, planned <-chan struct{}) (stopped, ok bool) {
+	if planned == nil {
+		return false, viewerWait(ctx, d, errs)
+	}
+	if ctx.Err() != nil {
+		return false, false
+	}
+	select {
+	case <-errs:
+		return false, false
+	default:
+	}
+	if d <= 0 {
+		return false, true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return false, ctx.Err() == nil
+	case <-ctx.Done():
+		return false, false
+	case <-errs:
+		return false, false
+	case <-planned:
+		if ctx.Err() != nil {
+			return false, false
+		}
+		select {
+		case <-errs:
+			return false, false
+		default:
+		}
+		return true, true
+	}
+}
+
+func completePlannedViewer(wall context.Context, dir string, shared *viewerShared, errs <-chan error, stopAll func(string)) (ViewerResult, error) {
+	if wall.Err() != nil {
+		stopAll("wall_limit")
+		return viewerFailure(dir, shared, "viewer_transport_failed")
+	}
+	select {
+	case <-errs:
+		stopAll("transport_failed")
+		return viewerFailure(dir, shared, "viewer_transport_failed")
+	default:
+	}
+	stopAll("stopped_by_operator")
+	if wall.Err() != nil {
+		return viewerFailure(dir, shared, "viewer_transport_failed")
+	}
+	select {
+	case <-errs:
+		return viewerFailure(dir, shared, "viewer_transport_failed")
+	default:
+	}
+	_ = os.Remove(filepath.Join(dir, "ready.json"))
+	shared.mu.Lock()
+	r := shared.result
+	for _, summary := range shared.summaries {
+		r.Viewers = append(r.Viewers, *summary)
+	}
+	r.PlannedStop = true
+	r.PlannedStopReason = "stopped_by_operator"
+	shared.mu.Unlock()
+	r.Status = "COMPLETE"
+	r.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := writeViewerResult(dir, r); err != nil {
+		return r, errors.New("result_artifact_write_failed")
+	}
+	return r, nil
+}
 func viewerFailure(dir string, s *viewerShared, reason string) (ViewerResult, error) {
 	_ = os.Remove(filepath.Join(dir, "ready.json"))
 	s.mu.Lock()
@@ -660,15 +764,18 @@ func writeViewerResult(dir string, r ViewerResult) error {
 	return os.WriteFile(filepath.Join(dir, "workload.json"), append(b, '\n'), 0600)
 }
 
-func writeViewerReady(dir string, ready viewerReady) error {
+// publishViewerReady stages and syncs the marker, checks for an early operator
+// stop at the publication boundary, then atomically renames it into readiness.
+// afterPublish is an unexported deterministic test seam for the boundary.
+func publishViewerReady(dir string, ready viewerReady, stop <-chan struct{}, afterPublish func()) (stoppedBeforeReady bool, err error) {
 	b, err := json.Marshal(ready)
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmp := filepath.Join(dir, "ready.json.tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err = f.Write(append(b, '\n')); err == nil {
 		err = f.Sync()
@@ -679,7 +786,20 @@ func writeViewerReady(dir string, ready viewerReady) error {
 	}
 	if err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return false, err
 	}
-	return os.Rename(tmp, filepath.Join(dir, "ready.json"))
+	select {
+	case <-stop:
+		_ = os.Remove(tmp)
+		return true, nil
+	default:
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, "ready.json")); err != nil {
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	if afterPublish != nil {
+		afterPublish()
+	}
+	return false, nil
 }

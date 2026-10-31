@@ -131,6 +131,149 @@ func TestViewerTLSRunValidatesSubscribeAndCountsIdentity(t *testing.T) {
 	}
 }
 
+func TestViewerPlannedStopCompletesAfterReadyAndEvents(t *testing.T) {
+	var served atomic.Int32
+	var active atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"iot.telemetry.v1"}})
+		if err != nil {
+			return
+		}
+		active.Add(1)
+		defer func() {
+			_ = c.Close(websocket.StatusNormalClosure, "done")
+			active.Add(-1)
+		}()
+		_, req, err := c.Read(r.Context())
+		if err != nil {
+			return
+		}
+		var sub struct {
+			RequestID string                  `json:"request_id"`
+			Targets   []telemetryws.TargetKey `json:"targets"`
+		}
+		if json.Unmarshal(req, &sub) != nil {
+			return
+		}
+		ack, _ := json.Marshal(struct {
+			ProtocolVersion int64                   `json:"protocol_version"`
+			MessageType     string                  `json:"message_type"`
+			RequestID       string                  `json:"request_id"`
+			Action          string                  `json:"action"`
+			Targets         []telemetryws.TargetKey `json:"targets"`
+		}{1, "ack", sub.RequestID, "subscribe", sub.Targets})
+		if c.Write(r.Context(), websocket.MessageText, ack) != nil {
+			return
+		}
+		event := fmt.Sprintf(`{"protocol_version":1,"message_type":"telemetry","entity_id":"urn:ngsi-ld:Sensor:gw-a:s-a","gateway_id":"gw-a","sensor_id":"s-a","message_id":"00000000-0000-4000-8000-00000000000%d","boot_id":"00000000-0000-4000-8000-000000000002","first_sequence":"1","sample_count":1,"measured_at":"2026-10-28T00:00:00Z","sample_interval_us":1000000,"samples":[1]}`, served.Add(1))
+		_ = c.Write(r.Context(), websocket.MessageText, []byte(event))
+		_, _, _ = c.Read(r.Context())
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	ca := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(ca, cert, 0600); err != nil {
+		t.Fatal(err)
+	}
+	identity := filepath.Join(dir, "viewer.json")
+	token := testViewerJWT("principal", time.Now().Add(time.Hour).Unix())
+	if err := os.WriteFile(identity, []byte(fmt.Sprintf(`{"u1":%q,"u2":%q}`, token, token)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	host := strings.TrimPrefix(srv.URL, "https://")
+	m := Manifest{Experiment: "E5", Arm: "reference", Profile: "pilot", Mode: "remote", RunID: "planned-stop", Topology: Topology{Users: 2, Viewers: 2}, IdentityFiles: map[string]string{"viewer": identity}, TLS: TLS{HTTPEndpoint: "https://" + host, HTTPCAFile: ca}, Limits: Limits{Workers: 2, Connections: 2, WallSeconds: 20}, Phases: Phases{MeasureSeconds: 15}, Viewer: ViewerSettings{MaxMessages: 10, MaxBytes: 10000}}
+	for i := 1; i <= 2; i++ {
+		m.Subscriptions = append(m.Subscriptions, Subscription{ViewerID: fmt.Sprintf("v%d", i), UserID: fmt.Sprintf("u%d", i), GatewayID: "gw-a", SensorID: "s-a"})
+	}
+	manifest := filepath.Join(dir, "manifest.json")
+	if err := os.WriteFile(manifest, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	resultCh := make(chan struct {
+		r   ViewerResult
+		err error
+	}, 1)
+	go func() {
+		r, err := RunViewerWithPlannedStop(context.Background(), m, manifest, filepath.Join(dir, "out"), stop)
+		resultCh <- struct {
+			r   ViewerResult
+			err error
+		}{r, err}
+	}()
+	ready := filepath.Join(dir, "out", "ready.json")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil && served.Load() == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("viewers did not become ready and receive their events")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // allow the viewer readers to account for the sent events
+	close(stop)
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.r.Status != "COMPLETE" || got.r.PlannedStopReason != "stopped_by_operator" || got.r.Messages != 2 || len(got.r.IdentitySamples) != 2 || len(got.r.Viewers) != 2 || len(got.r.LifetimesMS) != 2 {
+			t.Fatalf("planned stop result=%+v err=%v", got.r, got.err)
+		}
+		closedBy := time.Now().Add(time.Second)
+		for active.Load() != 0 && time.Now().Before(closedBy) {
+			time.Sleep(time.Millisecond)
+		}
+		if active.Load() != 0 {
+			t.Fatalf("server still has %d viewer sockets after return", active.Load())
+		}
+		if _, err := os.Stat(ready); err == nil {
+			t.Fatal("ready marker remained after termination")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("planned stop did not close and join viewers promptly")
+	}
+	early := make(chan struct{})
+	close(early)
+	failed, err := RunViewerWithPlannedStop(context.Background(), m, manifest, filepath.Join(dir, "out-early"), early)
+	if err == nil || failed.Status == "COMPLETE" || failed.PrimaryError != "planned_stop_before_ready" {
+		t.Fatalf("premature stop was accepted: result=%+v err=%v", failed, err)
+	}
+}
+
+func TestViewerPlannedStopDoesNotMaskFailures(t *testing.T) {
+	stop := make(chan struct{})
+	close(stop)
+	errs := make(chan error, 1)
+	errs <- fmt.Errorf("transport failure")
+	if stopped, ok := viewerWaitWithPlannedStop(context.Background(), time.Hour, errs, stop); stopped || ok {
+		t.Fatal("planned stop masked an observed transport failure")
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if stopped, ok := viewerWaitWithPlannedStop(ctx, time.Hour, nil, stop); stopped || ok {
+		t.Fatal("planned stop masked an expired wall context")
+	}
+}
+
+func TestViewerStopDeliveredAtReadyPublicationUsesPlannedPath(t *testing.T) {
+	stop := make(chan struct{})
+	dir := t.TempDir()
+	stoppedBeforeReady, err := publishViewerReady(dir, viewerReady{Status: "ready"}, stop, func() {
+		close(stop) // deterministic delivery after the ready marker's publication point
+	})
+	if err != nil || stoppedBeforeReady {
+		t.Fatalf("publication rejected a post-publication stop: stopped=%t err=%v", stoppedBeforeReady, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ready.json")); err != nil {
+		t.Fatalf("ready marker was not published: %v", err)
+	}
+	stopped, ok := viewerWaitWithPlannedStop(context.Background(), time.Hour, nil, stop)
+	if !ok || !stopped {
+		t.Fatalf("post-publication stop did not take planned path: stopped=%t ok=%t", stopped, ok)
+	}
+}
+
 func TestViewerJWTInsufficientExpiryRejected(t *testing.T) {
 	if _, err := viewerClaims(testViewerJWT("u", time.Now().Add(-time.Second).Unix())); err == nil {
 		t.Fatal("expired JWT accepted")

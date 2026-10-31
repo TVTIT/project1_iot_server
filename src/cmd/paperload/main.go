@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"syscall"
 
 	"iot-platform/internal/paperload"
 )
@@ -25,6 +24,8 @@ network, start Docker/simulators, create artifacts, or inspect private files.
 --run supports telemetry synthetic-load, viewer-only, or control-only REST role.
 Viewer/control require a private role_jwts identity file; control uses HTTPS only.
 --official-opt-in is required for profile=official.
+--viewer-stop-on-sigusr1 is Linux-only and opts a viewer run into planned
+SIGUSR1 termination after readiness; SIGINT/SIGTERM and wall limits still fail.
 `
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -38,6 +39,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	dryRun := fs.Bool("dry-run", false, "alias for --preflight")
 	runFlag := fs.Bool("run", false, "execute selected workload")
 	official := fs.Bool("official-opt-in", false, "explicitly permit official profile preflight")
+	viewerPlannedStop := fs.Bool("viewer-stop-on-sigusr1", false, "Linux viewer-only planned stop on SIGUSR1 after readiness")
 	fs.Usage = func() { _, _ = fmt.Fprint(stdout, help) }
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -89,7 +91,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintln(stderr, "only one telemetry, viewer, or control role is implemented")
 			return 3
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	}
+	if *viewerPlannedStop && (!*runFlag || len(manifest.Roles) != 1 || manifest.Roles[0] != "viewer") {
+		_, _ = fmt.Fprintln(stderr, "--viewer-stop-on-sigusr1 requires --run with the viewer role")
+		return 2
+	}
+	if *runFlag {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, terminationSignal())
 		defer stop()
 		var result any
 		var status string
@@ -106,8 +114,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 			})
 			result, status, runErr = v, v.Status, e
 		case "viewer":
-			v, e := paperload.RunViewer(ctx, manifest, *manifestPath, *outputDir)
-			result, status, runErr = v, v.Status, e
+			if *viewerPlannedStop {
+				planned, stopPlanned, err := notifyPlannedViewerStop()
+				if err != nil {
+					_, _ = fmt.Fprintln(stderr, err)
+					return 2
+				}
+				defer stopPlanned()
+				v, e := paperload.RunViewerWithPlannedStop(ctx, manifest, *manifestPath, *outputDir, planned)
+				result, status, runErr = v, v.Status, e
+			} else {
+				v, e := paperload.RunViewer(ctx, manifest, *manifestPath, *outputDir)
+				result, status, runErr = v, v.Status, e
+			}
 		case "telemetry":
 			v, e := paperload.RunTelemetry(ctx, manifest, *manifestPath, *outputDir, func(event paperload.PhaseEvent) error {
 				data, marshalErr := json.Marshal(event)

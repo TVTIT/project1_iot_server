@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"iot-platform/internal/paperload"
 )
@@ -35,6 +36,43 @@ func writeManifest(t *testing.T, profile string) string {
 	}
 	return path
 }
+
+func TestViewerPlannedStopFlagRequiresRunViewer(t *testing.T) {
+	manifest := writeManifest(t, "pilot")
+	var stdout, stderr bytes.Buffer
+	for _, args := range [][]string{
+		{"--manifest", manifest, "--preflight", "--viewer-stop-on-sigusr1"},
+		{"--manifest", manifest, "--run", "--output-dir", filepath.Join(t.TempDir(), "out"), "--viewer-stop-on-sigusr1"},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := run(args, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "requires --run with the viewer role") {
+			t.Fatalf("code=%d stderr=%s", code, stderr.String())
+		}
+	}
+	if !strings.Contains(help, "--viewer-stop-on-sigusr1") {
+		t.Fatal("planned-stop opt-in absent from help")
+	}
+}
+
+func TestSignalStopChannelIsOneShotAndCancelable(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	stop, cancel := signalStopChannel(signals)
+	signals <- fakeSignal("SIGUSR1")
+	select {
+	case <-stop:
+	case <-time.After(time.Second):
+		t.Fatal("signal did not become planned stop")
+	}
+	cancel()
+	_, cancelUnused := signalStopChannel(make(chan os.Signal))
+	cancelUnused()
+}
+
+type fakeSignal string
+
+func (s fakeSignal) Signal()        {}
+func (s fakeSignal) String() string { return string(s) }
 
 func TestPreflightWritesEstimateOnlyAndOfficialNeedsFlag(t *testing.T) {
 	manifest := writeManifest(t, "pilot")
