@@ -52,7 +52,44 @@ Lượt phục hồi cuối P8.13 có đủ tám phase PASS và cleanup chính x
 - Ma trận/repeats chính thức E1–E5 (≥3), high-load/capacity/soak, A/B trên máy vật lý từ xa, TTL wall-clock thực 600s, AM5728/HIL, cảm biến vật lý và live rollout: **NOT RUN**.
 - Remote GitHub CI: **NOT RUN**. Các CI job legacy supervisor/reloader được hoãn: **DEFERRED**, không phải PASS. Không push để lấy remote CI.
 - Không chạy full Python discovery tại source checkpoint cuối; failures/errors của discovery lịch sử vẫn là lịch sử. Nguyên nhân migration-readiness failure đầu tiên chưa biết. Auth failure ban đầu được xử lý bằng lượt retry; lỗi lịch sử vẫn được lưu.
-- E5 fanout activation và command-window timeline vẫn INCONCLUSIVE, không phải zero. Không chạy whole-run happy mocked E5 test; workload native thực đã chạy. Một pilot colocated và snapshot CPU/RAM thưa không phải bằng chứng capacity.
+- E5 fanout activation và command-window timeline trong bộ kết quả 29/10/2026 ở trên vẫn INCONCLUSIVE, không phải zero. Không chạy whole-run happy mocked E5 test; workload native thực đã chạy. Một pilot colocated và snapshot CPU/RAM thưa không phải bằng chứng capacity.
 - Deployment settings giữ nguyên và false. Kết quả raw P7 và trạng thái raw P8 không bị viết lại. Không tuyên bố Stage 5 hoàn tất toàn bộ: board/HIL, full CI requirement/remote lane và live rollout còn là phụ thuộc.
+
+---
+
+## Phụ lục Checkpoint Helper CLI & E5 Ablation Matrix (31/10/2026)
+
+**Trạng thái cập nhật (31/10/2026): `P8_E5_HELPER_PILOT_COMPLETE_QUALIFIED`.**
+Hoàn tất việc chạy tuần tự độc lập cả 6 arm ma trận E5 qua quy trình A/B helper CLI (`paper_p8_server.py`, `paper_p8_client.py`, `native_compose_smoke.py`), cùng với việc chuẩn hóa bộ adapter đối chiếu báo cáo offline (`paper_p8_comparison.py`).
+
+### 1. Dấu vân tay mã nguồn và đầu vào bất biến
+- **Mã nguồn thực thi native của 6 lượt chạy:** Revision `8dc3c38865d12a7ca78c0cebf82b0d6c0c1e4244`, branch `feat/paper-requirement`, `dirty_source_sha256`: `9a1e11276048f6e2c88bc14949bdae3a3c4b2c11b4c1d51cfe4fb9fa61f5eff0`.
+- **Mã nguồn công cụ adapter báo cáo offline sau khi sửa:** Revision `8dc3c38865d12a7ca78c0cebf82b0d6c0c1e4244`, `dirty_source_sha256`: `f3bf86d35e8e94658579dc0dc0bf8393973f6969a30157641227e98c3e985457` (không chạy lại native sau khi sửa adapter báo cáo).
+- **Context ghim:** Seed 805, Dataset SHA-256 `2411c01b9ea1be35ddb44ee449b311e8460f99cbdfe01fa2d41a335bd1500175`, 35.684 bytes.
+- **Binaries ghim:**
+  - `paperload`: SHA-256 `f562ba9bfacbd351718d0c8b81d1fe77c337864265e5d324f706ea69d95cc63f`
+  - `gateway`: SHA-256 `3be849df6522f437e26bbc2d978b84b828b4712c8d2ef7e19ce184eda435c247`
+- **Tái sử dụng Image IDs:** 100% container image IDs từ arm `optimized` được tái sử dụng byte-for-byte qua cờ `--reference`, không rebuild bất kỳ container image nào.
+
+### 2. Kết quả thực thi 6 Arm Ma trận Native E5
+Mỗi arm đều hoàn tất đủ 3 phase (`initial` → `warm_replay` → `control`), server A và viewer holder B đều thoát mã 0, và dọn dẹp chính xác 12 containers / 1 network / 5 volumes per-run:
+
+| Arm | Vai trò | Trạng thái | Báo cáo Artifact | SHA-256 Artifact | Đánh giá Kích hoạt Cơ chế |
+|---|---|:---:|---|---|---|
+| `optimized` | Reference | **PASS** | `p8-e5-optimized.json` | `3f6617d0e80cd913ad399cd13bf86c73dd8efec98e7ce18af89909994cabb876` | Tham chiếu cơ sở đầy đủ |
+| `ram_dedup_off` | Ablation 1 | **PASS** | `p8-e5-ram_dedup_off.json` | `1d0fece293e012ec5aa546062097438a32c4dceff6fe9066a4ea3d206aec0661` | `ELIGIBLE` (`lookup_hit_total: 10`) |
+| `fanout_scan` | Ablation 2 | **PASS** | `p8-e5-fanout_scan.json` | `1ca3528b241396170c5d61f86455643b3c1dfbf6f6ec81f64236d86f89fdaee1` | `ELIGIBLE` (`indexed: 0, scan: 40`) |
+| `shaper_off` | Ablation 3 | **PASS** | `p8-e5-shaper_off.json` | `a88d2c95c6be0cf049eaba14febf60a61445c25d54acb64d26f06a122969868b` | `ELIGIBLE` (`ShaperRateLimited: 0` vs `24`) |
+| `microbatch_off` | Ablation 4 | **PASS** | `p8-e5-microbatch_off.json` | `88ea478cfe0b2dc0c0feb7416139bab6d227e3b035109a8d9e0c65e9c02e881d` | `ELIGIBLE` (`groups: 0` vs `16`) |
+| `polling` | Ablation 5 | **PASS** | `p8-e5-polling.json` | `01f58ccde39544221c50ca0d9f522abcd99feb5341eafe95fea43d96ee5f7473` | `ELIGIBLE` (`notifications: 0` vs `4`, `scans: 17`) |
+
+### 3. Kết quả xuất bản Báo cáo Tổng kết (Sanitized Summary Export)
+Bộ so sánh `scripts/paper_p8_comparison.py` xuất khẩu thành công tại `results/p8/helper-e5-20261031/`:
+- `e5-summary.json` (SHA-256: `78047b28328411df029f7ce6559a5e6dd568ee15674264426b6d84e4e2c26a6c`): Báo cáo JSON đã kiểm tra an toàn, loại bỏ toàn bộ chuỗi mật khẩu, token và thông tin nhạy cảm.
+- `e5-runs.csv` (SHA-256: `63e1daa0974c961a8897d6ce6b65c646914996430a00df078bcbe152576d8111`): Bảng dữ liệu 6 lượt chạy.
+- `e5-pairs.csv` (SHA-256: `25bd5c8026360ba8773ea8c3fe91fa9f3ceb98b785fd6be2376f3e36e428de31`): Bảng đối chiếu 5 cặp ablation với `optimized`; cả 5 cặp đều đạt `comparability: COMPARABLE`.
+- Bằng chứng lịch sử: Toàn bộ 9 lượt native FAIL trước đó được bảo toàn nguyên vẹn nhãn FAIL. Ranh giới tiêu chuẩn tiếp tục giữ `full_p8_accepted: false`, `physical_ab: NOT RUN`.
+
+---
 
 Xem [sổ tay công cụ tải P8](paper-p8-load-tools.md) để biết cách gọi lại, ngữ nghĩa abort/drain/cleanup, ràng buộc A/B an toàn và đề xuất ma trận chính thức. Các giới hạn chung được lưu trong [backlog trung tâm](../dynsec/limitations-and-backlog.md).
