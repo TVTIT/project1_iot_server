@@ -21,6 +21,52 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_e2_helper_import_without_pythonpath_from_outside_repository(self):
+        import subprocess
+        import textwrap
+
+        code = textwrap.dedent('''
+            import importlib.util
+            import json
+            from pathlib import Path
+            import sys
+            from unittest.mock import patch
+
+            native_path = Path(sys.argv[1])
+            sys.path.insert(0, str(native_path.parent))
+            name = 'native_compose_smoke' if sys.argv[2] == 'native' else 'paper_p8_e2_support'
+            path = native_path if sys.argv[2] == 'native' else native_path.with_name('paper_p8_e2_support.py')
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            with patch('subprocess.run', side_effect=AssertionError('unexpected external command')), \
+                 patch('subprocess.Popen', side_effect=AssertionError('unexpected child process')):
+                spec.loader.exec_module(module)
+                helper = module.paper_p8_e2_support() if sys.argv[2] == 'native' else module
+                context = helper.build_e2_equal_samples_context()
+                helper.validate_e2_equal_samples_context(context)
+                print(json.dumps({
+                    'messages_1': helper.calculate_e2_equal_samples_expected_counts(context, 1)['total_messages'],
+                    'messages_100': helper.calculate_e2_equal_samples_expected_counts(context, 100)['total_messages'],
+                    'legacy_messages': sum(helper.PILOT_MESSAGES.values()),
+                    'client_loaded': callable(helper.paper_p8_client._safe_equal_samples),
+                    'bundle_loaded': callable(helper.paper_p8_client.paper_p8_bundle.bind_bundle),
+                }))
+        ''')
+        env = dict(os.environ)
+        env.pop('PYTHONPATH', None)
+        with tempfile.TemporaryDirectory(prefix='p8-import-', dir='/var/tmp/opencode') as directory:
+            for entrypoint in ('native', 'helper'):
+                with self.subTest(entrypoint=entrypoint):
+                    result = subprocess.run(
+                        [sys.executable, '-I', '-c', code, str(MODULE.resolve()), entrypoint],
+                        cwd=directory, env=env, capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {
+                        'messages_1': 6000, 'messages_100': 60, 'legacy_messages': 24,
+                        'client_loaded': True, 'bundle_loaded': True,
+                    })
+
     def test_e4_warm_acceptance_reads_nested_phase_workload_counters(self):
         report = {
             'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_WARM_SUBSET',

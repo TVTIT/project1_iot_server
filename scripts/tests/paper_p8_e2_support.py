@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -24,8 +25,16 @@ verify_pilot_raw = _support.verify_pilot_raw
 
 try:
     from scripts import paper_p8_client
-except ModuleNotFoundError:
-    import paper_p8_client
+except ModuleNotFoundError as exc:
+    if exc.name != 'scripts':
+        raise
+    # The native CLI starts with scripts/tests on sys.path, not the repo root.
+    # Resolve our sibling package from this file rather than the caller's cwd
+    # or an externally supplied PYTHONPATH.
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from scripts import paper_p8_client
 
 PILOT_SAMPLES = (100, 1)
 OFFICIAL_RATES = (100, 1000, 5000, 20000)
