@@ -176,6 +176,9 @@ def validate_run_comparability(report_ref: Dict[str, Any], report_arm: Dict[str,
         if cleanup is not True:
             return {'comparable': False, 'reason': 'cleanup_unverified'}
 
+    if meta_ref.get('contradictory_binary_alias') or meta_arm.get('contradictory_binary_alias'):
+        return {'comparable': False, 'reason': 'contradictory_binary_fingerprint'}
+
     required_fingerprints = (
         'source_revision',
         'binary_sha256',
@@ -212,6 +215,35 @@ def validate_run_comparability(report_ref: Dict[str, Any], report_arm: Dict[str,
     for image_map in (meta_ref['image_ids'], meta_arm['image_ids']):
         if not image_map or any(not isinstance(v, str) or not v.strip() for v in image_map.values()):
             return {'comparable': False, 'reason': 'image_fingerprint_invalid'}
+
+    # Constituent client binaries must be valid and match
+    is_e5 = (
+        report_ref.get('experiment') == 'E5'
+        or report_arm.get('experiment') == 'E5'
+        or (report_ref.get('metadata') or {}).get('experiment') == 'E5'
+        or (report_arm.get('metadata') or {}).get('experiment') == 'E5'
+        or (report_ref.get('metadata') or {}).get('b_declared') is not None
+        or (report_arm.get('metadata') or {}).get('b_declared') is not None
+    )
+    if is_e5:
+        for key in ('paperload_binary_sha256', 'gateway_binary_sha256'):
+            v_ref = meta_ref.get(key)
+            v_arm = meta_arm.get(key)
+            if not v_ref or not v_arm:
+                return {'comparable': False, 'reason': f'missing_fingerprint_{key}'}
+            if v_ref != v_arm:
+                return {'comparable': False, 'reason': f'{key}_mismatch'}
+            if not isinstance(v_ref, str) or not re.fullmatch(r'[0-9a-f]{64}', str(v_ref)):
+                return {'comparable': False, 'reason': f'{key}_invalid'}
+    else:
+        for key in ('paperload_binary_sha256', 'gateway_binary_sha256'):
+            v_ref = meta_ref.get(key)
+            v_arm = meta_arm.get(key)
+            if v_ref is not None or v_arm is not None:
+                if not v_ref or not v_arm or v_ref != v_arm:
+                    return {'comparable': False, 'reason': f'{key}_mismatch'}
+                if not isinstance(v_ref, str) or not re.fullmatch(r'[0-9a-f]{64}', str(v_ref)):
+                    return {'comparable': False, 'reason': f'{key}_invalid'}
 
     if meta_ref['source_revision'] != meta_arm['source_revision']:
         return {'comparable': False, 'reason': 'source_revision_mismatch'}
@@ -308,22 +340,54 @@ def _comparison_metadata(report: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         meta = {}
     mapped = dict(meta)
+
+    # Detect contradictory canonical binary vs combined alias if both provided
+    can_bin = meta.get('binary_sha256') or report.get('binary_sha256')
+    comb_bin = meta.get('combined_binary_sha256') or report.get('combined_binary_sha256')
+    if (
+        can_bin and comb_bin
+        and isinstance(can_bin, str) and isinstance(comb_bin, str)
+        and can_bin != comb_bin
+    ):
+        mapped['contradictory_binary_alias'] = True
+
+    resolved_binary = can_bin or comb_bin
+
+    # Remote E5 reports provide b_declared with declared_measurement_windows
+    b_decl = meta.get('b_declared')
+    has_remote_e5_declared = isinstance(b_decl, dict) and 'declared_measurement_windows' in b_decl
+    if has_remote_e5_declared:
+        decl_win = b_decl['declared_measurement_windows']
+        mapped['observed_phase_seconds'] = meta.get('phase_seconds') or b_decl.get('observed_measurement_windows')
+        expected_phases = {'initial', 'warm_replay', 'control'}
+        if (
+            isinstance(decl_win, dict)
+            and set(decl_win.keys()) == expected_phases
+            and all(type(v) is not bool and isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in decl_win.values())
+        ):
+            mapped['phase_seconds'] = decl_win
+        else:
+            mapped['phase_seconds'] = 'INVALID_DECLARED_WINDOWS'
+
     aliases = {
-        'source_revision': report.get('source_revision'),
-        'binary_sha256': meta.get('binary_sha256'),
+        'source_revision': report.get('source_revision') or (report.get('source_fingerprint') or {}).get('revision'),
+        'binary_sha256': resolved_binary,
+        'paperload_binary_sha256': meta.get('paperload_binary_sha256') or report.get('paperload_binary_sha256'),
+        'gateway_binary_sha256': meta.get('gateway_binary_sha256') or report.get('gateway_binary_sha256'),
+        'combined_binary_sha256': comb_bin,
         'paperload_source_sha256': report.get('paperload_source_sha256', meta.get('source_sha256')),
         'image_ids': report.get('image_ids', meta.get('image_ids')),
-        'schema': report.get('schema_terminal', meta.get('actual_schema')),
-        'quota': report.get('backend_quota', meta.get('backend_quota')),
-        'security_mode': meta.get('tls', {}).get('mode') if isinstance(meta.get('tls'), dict) else None,
-        'workers': meta.get('caps', {}).get('workers') if isinstance(meta.get('caps'), dict) else None,
-        'topology': meta.get('topology'),
-        'seed': meta.get('seed'),
-        'phase_seconds': meta.get('phases', meta.get('sampling', {}).get('effective_window')),
-        'cohort': meta.get('cohort'),
-        'dirty_tree_hash': report.get('dirty_tree_hash'),
-        'dirty_worktree': report.get('dirty_worktree'),
-        'workload': meta.get('workload'),
+        'schema': report.get('schema_terminal', meta.get('actual_schema', report.get('schema'))),
+        'quota': report.get('backend_quota', meta.get('backend_quota', report.get('quota'))),
+        'security_mode': meta.get('tls', {}).get('mode') if isinstance(meta.get('tls'), dict) else (meta.get('security_mode') or report.get('security_mode')),
+        'workers': meta.get('caps', {}).get('workers') if isinstance(meta.get('caps'), dict) else (meta.get('workers') or report.get('workers')),
+        'topology': meta.get('topology') or report.get('topology'),
+        'seed': meta.get('seed') or (report.get('context') or {}).get('seed'),
+        'phase_seconds': None if has_remote_e5_declared else meta.get('phases', meta.get('sampling', {}).get('effective_window')),
+        'cohort': meta.get('cohort') or report.get('cohort'),
+        'dirty_tree_hash': report.get('dirty_tree_hash') or (report.get('source_fingerprint') or {}).get('dirty_source_sha256'),
+        'dirty_worktree': report.get('dirty_worktree') or (report.get('source_fingerprint') or {}).get('dirty'),
+        'workload': meta.get('workload') or report.get('workload'),
         'effective_flags': report.get('effective_flags', meta.get('effective_flags')),
     }
     for key, value in aliases.items():
@@ -724,12 +788,34 @@ def _safe_persistence_delta(
 def _e5_adapter(report: Dict[str, Any]) -> Dict[str, Any]:
     """Map frozen E5 schema to the existing strict pair/activation helpers."""
     meta = dict(report.get('metadata') or {})
-    combined_binary = meta.get('binary_sha256') or report.get('metadata', {}).get('binary_sha256')
+    can_bin = meta.get('binary_sha256') or report.get('binary_sha256')
+    comb_bin = meta.get('combined_binary_sha256') or report.get('combined_binary_sha256')
+    if can_bin and comb_bin and isinstance(can_bin, str) and isinstance(comb_bin, str) and can_bin != comb_bin:
+        meta['contradictory_binary_alias'] = True
+
+    combined_binary = can_bin or comb_bin
+
+    b_decl = meta.get('b_declared')
+    decl_win = None
+    has_remote_e5_declared = isinstance(b_decl, dict) and 'declared_measurement_windows' in b_decl
+    if has_remote_e5_declared:
+        dw = b_decl['declared_measurement_windows']
+        expected_phases = {'initial', 'warm_replay', 'control'}
+        if (
+            isinstance(dw, dict)
+            and set(dw.keys()) == expected_phases
+            and all(type(v) is not bool and isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in dw.values())
+        ):
+            decl_win = dw
+        else:
+            decl_win = 'INVALID_DECLARED_WINDOWS'
+
     meta.update({
-        'source_revision': report.get('source_revision') or meta.get('source_revision'),
+        'source_revision': report.get('source_revision') or meta.get('source_revision') or (report.get('source_fingerprint') or {}).get('revision'),
         'binary_sha256': combined_binary,
-        'paperload_binary_sha256': report.get('paperload_binary_sha256'),
-        'gateway_binary_sha256': report.get('gateway_binary_sha256'),
+        'paperload_binary_sha256': meta.get('paperload_binary_sha256') or report.get('paperload_binary_sha256'),
+        'gateway_binary_sha256': meta.get('gateway_binary_sha256') or report.get('gateway_binary_sha256'),
+        'combined_binary_sha256': comb_bin or can_bin,
         'paperload_source_sha256': meta.get('paperload_source_sha256'),
         'image_ids': report.get('image_ids') or meta.get('image_ids'),
         'schema': report.get('schema') or meta.get('schema'),
@@ -741,7 +827,8 @@ def _e5_adapter(report: Dict[str, Any]) -> Dict[str, Any]:
         'dirty_tree_hash': (report.get('source_fingerprint') or {}).get('dirty_source_sha256', meta.get('dirty_tree_hash')),
         'topology': meta.get('topology'),
         'seed': meta.get('seed'),
-        'phase_seconds': meta.get('phase_seconds'),
+        'phase_seconds': decl_win if has_remote_e5_declared else meta.get('phase_seconds'),
+        'observed_phase_seconds': meta.get('phase_seconds') or (b_decl.get('observed_measurement_windows') if isinstance(b_decl, dict) else None),
         'cohort': meta.get('cohort'),
         'quota': report.get('quota') or meta.get('quota'),
         'workers': meta.get('workers'),
@@ -749,10 +836,12 @@ def _e5_adapter(report: Dict[str, Any]) -> Dict[str, Any]:
     })
     return {
         'status': report.get('status'),
-        'cleanup_verified': report.get('exact_cleanup_verified'),
+        'cleanup_verified': report.get('cleanup_verified', report.get('exact_cleanup_verified')),
+        'exact_cleanup_verified': report.get('exact_cleanup_verified', report.get('cleanup_verified')),
         'metadata': meta,
         'accounting': report.get('accounting'),
-        'mechanism_metrics': report.get('mechanisms'),
+        'mechanism_metrics': report.get('mechanisms') or report.get('mechanism_metrics'),
+        'mechanisms': report.get('mechanisms') or report.get('mechanism_metrics'),
     }
 
 
@@ -801,9 +890,13 @@ def build_e5_summary(
         if not comp.get('comparable'):
             raise ValueError('pair_noncomparable_' + arm + ':' + str(comp.get('reason')))
         # Strict individual Gateway and paperload binary check
-        if arm_r.get('gateway_binary_sha256') != opt_r.get('gateway_binary_sha256'):
+        gw_arm = arm_r.get('gateway_binary_sha256') or arm_r.get('metadata', {}).get('gateway_binary_sha256')
+        gw_opt = opt_r.get('gateway_binary_sha256') or opt_r.get('metadata', {}).get('gateway_binary_sha256')
+        if not gw_arm or not gw_opt or gw_arm != gw_opt:
             raise ValueError('pair_noncomparable_' + arm + ':gateway_binary_sha256_mismatch')
-        if arm_r.get('paperload_binary_sha256') != opt_r.get('paperload_binary_sha256'):
+        pl_arm = arm_r.get('paperload_binary_sha256') or arm_r.get('metadata', {}).get('paperload_binary_sha256')
+        pl_opt = opt_r.get('paperload_binary_sha256') or opt_r.get('metadata', {}).get('paperload_binary_sha256')
+        if not pl_arm or not pl_opt or pl_arm != pl_opt:
             raise ValueError('pair_noncomparable_' + arm + ':paperload_binary_sha256_mismatch')
         activation = check_mechanism_activation(arm, opt_adapted, arm_adapted)
         paired.append({'arm': arm, 'comparability': comp, 'activation': activation})
@@ -830,7 +923,7 @@ def build_e5_summary(
         d = r.get('accounting') or {}
         delta = (d.get('ingress_delta') or {}).get('delta') or {}
         viewer = (r.get('viewer') or {}).get('result') or {}
-        mechanisms = r.get('mechanisms') or {}
+        mechanisms = r.get('mechanisms') or r.get('mechanism_metrics') or {}
         mm = mechanisms.get('microbatch') or {}
         ram = mechanisms.get('ram_dedup') or {}
 
@@ -847,19 +940,20 @@ def build_e5_summary(
             disp_cnt = None
             e2e_cnt = None
 
+        flags = r.get('effective_flags') or r.get('metadata', {}).get('effective_flags') or {}
         run_rows.append({
             'arm': arm,
             'status': r['status'],
             'full_p8_accepted': False,
             'cleanup_verified': r['cleanup_verified'],
             'exact_cleanup_verified': r['exact_cleanup_verified'],
-            'cleanup_counts': _sanitize_cleanup_counts(r.get('cleanup_counts')),
-            'flags': {k: v for k, v in r['effective_flags'].items() if k in MECHANISM_FLAGS},
-            'source_revision': r.get('source_revision'),
-            'source_dirty_sha256': (r.get('source_fingerprint') or {}).get('dirty_source_sha256'),
-            'paperload_binary_sha256': r.get('paperload_binary_sha256'),
-            'gateway_binary_sha256': r.get('gateway_binary_sha256'),
-            'image_ids': _sanitize_image_ids(r.get('image_ids')),
+            'cleanup_counts': _sanitize_cleanup_counts(r.get('cleanup_counts') or r.get('metadata', {}).get('cleanup_counts')),
+            'flags': {k: v for k, v in flags.items() if k in MECHANISM_FLAGS},
+            'source_revision': r.get('source_revision') or r.get('metadata', {}).get('source_revision'),
+            'source_dirty_sha256': (r.get('source_fingerprint') or {}).get('dirty_source_sha256') or r.get('metadata', {}).get('dirty_tree_hash'),
+            'paperload_binary_sha256': r.get('paperload_binary_sha256') or r.get('metadata', {}).get('paperload_binary_sha256'),
+            'gateway_binary_sha256': r.get('gateway_binary_sha256') or r.get('metadata', {}).get('gateway_binary_sha256'),
+            'image_ids': _sanitize_image_ids(r.get('image_ids') or r.get('metadata', {}).get('image_ids')),
             'journal_sha256': r.get('journal_sha256'),
             'workload_sha256': r.get('workload_sha256'),
             'raw_report_sha256': raw_hashes[arm],
@@ -977,8 +1071,8 @@ def build_e5_summary(
                 'ablation_warm_transactions': d_ref_att,
                 'optimized_warm_transactions': d_opt_att,
                 'gamma_warm_transactions': gamma_attempts,
-                'ablation_warm_db_calls_avoided': _e5_num(r.get('mechanisms', {}).get('ram_dedup'), 'database_calls_avoided_total'),
-                'optimized_warm_db_calls_avoided': _e5_num(o.get('mechanisms', {}).get('ram_dedup'), 'database_calls_avoided_total'),
+                'ablation_warm_db_calls_avoided': _e5_num((r.get('mechanisms') or r.get('mechanism_metrics') or {}).get('ram_dedup'), 'database_calls_avoided_total'),
+                'optimized_warm_db_calls_avoided': _e5_num((o.get('mechanisms') or o.get('mechanism_metrics') or {}).get('ram_dedup'), 'database_calls_avoided_total'),
                 'raw_samples_retained_ablation': _sanitize_database_delta(r.get('phases', {}).get('warm_replay', {}).get('database_delta')).get('raw'),
                 'raw_samples_retained_optimized': _sanitize_database_delta(o.get('phases', {}).get('warm_replay', {}).get('database_delta')).get('raw'),
                 'interpretation_limit': '100% only warm repository/transaction work reflected by this counter; not all SQL/storage/RSS/latency/throughput',
@@ -992,7 +1086,7 @@ def build_e5_summary(
             })
         if arm == 'fanout_scan':
             def fanout_evidence(report):
-                fm = report.get('mechanisms', {}).get('fanout', {})
+                fm = (report.get('mechanisms') or report.get('mechanism_metrics') or {}).get('fanout', {})
                 vr = report.get('viewer', {}).get('result', {})
                 return {
                     'subscriptions_ready_counter': _e5_num(fm, 'subscriptions_ready'),
