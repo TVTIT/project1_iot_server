@@ -8,6 +8,7 @@ The CLI optionally verifies phased startup. No deployment env is read.
 from __future__ import annotations
 
 import argparse
+import csv
 import base64
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -252,7 +253,13 @@ def generate_fixture_tls(fixture):
     run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=mosquitto",
          "-keyout", str(server_key), "-out", str(fixture.private / "server.csr")])
     ext = fixture.private / "tls.ext"
-    private_write(ext, "subjectAltName=DNS:mosquitto,DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+    remote_profile = getattr(fixture, 'remote_network_config', None)
+    if remote_profile:
+        san = ','.join([*(f'DNS:{name}' for name in remote_profile['required_san_dns']),
+                        *(f'IP:{address}' for address in remote_profile['required_san_ips'])])
+    else:
+        san = 'DNS:mosquitto,DNS:localhost,IP:127.0.0.1'
+    private_write(ext, f"subjectAltName={san}\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
     run(["openssl", "x509", "-req", "-in", str(fixture.private / "server.csr"), "-CA", str(certs / "ca.crt"),
          "-CAkey", str(ca_key), "-set_serial", str(secrets.randbits(128)), "-days", "2",
          "-extfile", str(ext), "-out", str(certs / "server.crt")])
@@ -591,6 +598,13 @@ def paper_p8_support():
     return module
 
 
+def paper_p8_remote_support():
+    spec = importlib.util.spec_from_file_location('paper_p8_remote', Path(__file__).with_name('paper_p8_remote.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def paper_p8_slow_support():
     spec = importlib.util.spec_from_file_location('paper_p8_slow_support', Path(__file__).with_name('paper_p8_slow_support.py'))
     module = importlib.util.module_from_spec(spec)
@@ -747,8 +761,13 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             paper_p5b_control_regression=False, paper_p5b=None, paper_p6=None,
              paper_p8_sessions=False, paper_p8_slow=False, paper_p8_load=False, paper_p8_e1=False,
              paper_p8_e2=False, paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e4=None,
-              paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
-              paper_p8_recovery=False):
+               paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
+               paper_p8_recovery=False, remote_network_config=None):
+    if remote_network_config is not None:
+        paper_p2 = True
+        # Re-validate the canonical profile's exact input fields before it affects config.
+        raw_profile = {key: remote_network_config[key] for key in paper_p8_remote_support().CONFIG_KEYS}
+        remote_network_config = paper_p8_remote_support().validate_config(raw_profile)
     if paper_p8_recovery:
         if any((paper_p8_e5, paper_p8_e5_context, paper_p8_e5_reference,
                 paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p7, paper_p3,
@@ -777,7 +796,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
              bool(paper_p8_e1), bool(paper_p8_e2), bool(paper_p8_e3), bool(paper_p8_e4), bool(paper_p8_e5))) > 1:
         raise ValueError('paper_p8_mode_rejected')
     if paper_p8_sessions or paper_p8_slow or paper_p8_load:
-        if any((paper_p0, paper_p1, paper_p2_spike, paper_p2, paper_p7, paper_p3, paper_p4,
+        if any((paper_p0, paper_p1, paper_p2_spike, paper_p2 and remote_network_config is None,
+                paper_p7, paper_p3, paper_p4,
                 paper_p5a is not None, paper_p5b is not None, paper_p6 is not None, not metrics_enabled)):
             raise ValueError('paper_p8_mode_rejected')
         paper_p2 = True
@@ -866,6 +886,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         _, paper_p8_e5_context = driver.prepare_repeat(context_root, 1, 813)
     project = "ncs_" + secrets.token_hex(6)
     values = dict(DEFAULTS)
+    if remote_network_config is not None:
+        values['API_DOMAIN'] = remote_network_config['advertised_host']
     if paper_profile:
         values.update(MQTT_INGRESS_ENABLED='true', DATABASE_MAX_CONNS='10',
                       MQTT_MAX_PAYLOAD_BYTES='65536')
@@ -1001,6 +1023,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     object.__setattr__(fixture, 'paper_p8_e5_reference', str(paper_p8_e5_reference) if paper_p8_e5_reference else None)
     object.__setattr__(fixture, 'paper_p8_recovery', paper_p8_recovery)
     object.__setattr__(fixture, 'paper_p8_e1', paper_p8_e1)
+    object.__setattr__(fixture, 'remote_network_config', remote_network_config)
     if paper_p5b is not None:
         object.__setattr__(fixture, 'paper_p5b', True)
         object.__setattr__(fixture, 'paper_p5b_cache_mode', paper_p5b[0])
@@ -1155,6 +1178,9 @@ def validate_effective_model(fixture, model):
         volume_mounts['nginx'] = {('auth_socket', '/run/iot-auth', True)}
         dependencies['auth-socket-init'] = {}
         dependencies['backend'].update({'supabase-envoy': 'service_started', 'auth-socket-init': 'service_completed_successfully'})
+    paper_p8_remote_support().validate_effective_ports(services,
+        remote_config=getattr(fixture, 'remote_network_config', None), paper_p2=fixture.paper_p2,
+        paper_p8_load=getattr(fixture, 'paper_p8_load', False))
     for name, service in services.items():
         if (service.get("container_name") or service.get("restart") != "no"
                 or service.get("privileged") or service.get("devices") or service.get("cap_add")
@@ -1167,19 +1193,6 @@ def validate_effective_model(fixture, model):
             raise ValueError("effective_image_rejected")
         if {k: v.get("condition") for k, v in service.get("depends_on", {}).items()} != dependencies[name]:
             raise ValueError("effective_dependencies_rejected")
-        ports = service.get("ports", [])
-        if name == "nginx":
-            if (len(ports) != 1 or ports[0].get("host_ip") != "127.0.0.1"
-                    or str(ports[0].get("published")) != "0" or ports[0].get("target") != (443 if fixture.paper_p2 else 80)
-                    or ports[0].get("protocol") != "tcp"):
-                raise ValueError("effective_ports_rejected")
-        elif name == 'mosquitto' and getattr(fixture, 'paper_p8_load', False):
-            if (len(ports) != 1 or ports[0].get('host_ip') != '127.0.0.1'
-                    or str(ports[0].get('published')) != '0' or ports[0].get('target') != 8883
-                    or ports[0].get('protocol') != 'tcp'):
-                raise ValueError('effective_ports_rejected')
-        elif ports:
-            raise ValueError("effective_ports_rejected")
         actual_binds, actual_volumes = {}, set()
         for mount in service.get("volumes", []):
             if mount.get("type") == "bind" and mount.get("read_only") is True:
@@ -1433,8 +1446,9 @@ def _reuse_e5_image(registry, image_ids, role, tag, create_tag=True):
     return expected
 
 
-def startup_only(fixture, registry=None, positive_http=False, role_http=False, full_http=False):
-    """Phased real startup. Optionally runs positive HTTP smoke slice."""
+def startup_only(fixture, registry=None, positive_http=False, role_http=False, full_http=False,
+                 hold_callback=None, finalization_callback=None):
+    """Phased real startup; optional hold returns through the same cleanup finally."""
     lifecycle = bootstrap_lifecycle()
     if registry is None:
         registry = ResourceRegistry(fixture)
@@ -1604,10 +1618,31 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         evidence['schema_exact'] = True
                     durable_json(fixture.private / 'startup-progress.json', {'phase': phase, 'evidence': evidence})
                 obj = registry.resolve(containers['nginx'])
-                ports = obj['NetworkSettings']['Ports'].get('443/tcp' if fixture.paper_p2 else '80/tcp') or []
-                if len(ports) != 1 or ports[0]['HostIp'] != '127.0.0.1' or not 0 < int(ports[0]['HostPort']) < 65536:
-                    raise ValueError('mapped_endpoint_rejected')
-                url = ('https' if fixture.paper_p2 else 'http') + '://127.0.0.1:' + ports[0]['HostPort']
+                remote_profile = getattr(fixture, 'remote_network_config', None)
+                if remote_profile:
+                    https_port = paper_p8_remote_support().validate_runtime_mapping(
+                        'nginx', obj['NetworkSettings'].get('Ports') or {}, remote_profile)
+                    broker = registry.resolve(containers['mosquitto'])
+                    mqtt_port = paper_p8_remote_support().validate_runtime_mapping(
+                        'mosquitto', broker['NetworkSettings'].get('Ports') or {}, remote_profile)
+                    ca_file = fixture.private / 'p2-ca.crt'
+                    paper_p8_remote_support().probe_tls(remote_profile['bind_ip'], https_port,
+                        remote_profile['advertised_host'], ca_file)
+                    paper_p8_remote_support().probe_tls(remote_profile['bind_ip'], mqtt_port,
+                        remote_profile['advertised_host'], fixture.private / 'certs' / 'ca.crt')
+                    url = f"https://{remote_profile['bind_ip']}:{https_port}"
+                    evidence['remote_endpoints'] = {
+                        'https': remote_profile['advertised_https'],
+                        'mqtt_tls': remote_profile['advertised_mqtt_tls'],
+                        'internal_https_probe': url,
+                        'runtime_bind_ip': remote_profile['bind_ip'],
+                        'runtime_https_port': https_port, 'runtime_mqtt_tls_port': mqtt_port,
+                        'https_hostname_verified': True, 'mqtt_tls_hostname_verified': True}
+                else:
+                    ports = obj['NetworkSettings']['Ports'].get('443/tcp' if fixture.paper_p2 else '80/tcp') or []
+                    if len(ports) != 1 or ports[0]['HostIp'] != '127.0.0.1' or not 0 < int(ports[0]['HostPort']) < 65536:
+                        raise ValueError('mapped_endpoint_rejected')
+                    url = ('https' if fixture.paper_p2 else 'http') + '://127.0.0.1:' + ports[0]['HostPort']
                 endpoint = HTTPSEndpoint(url, fixture.private / 'p2-ca.crt') if fixture.paper_p2 else url
                 evidence['endpoint'] = url
                 if fixture.paper_p5a:
@@ -1647,7 +1682,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     phase = 'paper_p8_slow_viewer'
                     evidence['paper_p8_slow'] = paper_p8_slow_support().run(
                         sys.modules[__name__], fixture, endpoint, registry, containers, images, state)
-                elif getattr(fixture, 'paper_p8_load', False):
+                elif getattr(fixture, 'paper_p8_load', False) and not getattr(fixture, 'paper_p8_prepare_only', False):
                     if getattr(fixture, 'paper_p8_e5', None):
                         phase = 'paper_p8_e5_' + fixture.paper_p8_e5
                         evidence['paper_p8_e5'] = dispatch_paper_p8_load(
@@ -1678,7 +1713,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         evidence['paper_p8_load'] = dispatch_paper_p8_load(
                             fixture, sys.modules[__name__], endpoint, registry, containers, images,
                             state, paperload_binary)
-                elif fixture.paper_p2:
+                elif fixture.paper_p2 and not getattr(fixture, 'paper_p8_prepare_only', False):
                     phase = 'paper_p2'
                     evidence['paper_p2'] = dispatch_paper_fixture(fixture, paper_p2_support(),
                         sys.modules[__name__], fixture,
@@ -1712,6 +1747,13 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                             fixture, registry, endpoint, containers['postgres']['receipt']['id'],
                             role_evidence['gateway_id'], role_evidence['existing_sensor'])
                     durable_json(fixture.private / 'positive-http-progress.json', {'phase': phase, 'evidence': evidence})
+                # P8 foreground adapter hook: preparation can complete before
+                # READY; returning (or raising) still enters exact-receipt cleanup.
+                if hold_callback is not None:
+                    phase = 'ready_hold'
+                    hold_callback(fixture=fixture, registry=registry, containers=containers,
+                                  images=images, evidence=evidence, endpoint=endpoint, state=state,
+                                  paperload_binary=paperload_binary)
             except BaseException as exc:
                 failure = exc
                 code = sanitize_failure_code(exc)
@@ -1775,6 +1817,13 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                     cleanup_verified = True
                 except Exception as cl_exc:
                     cleanup_verified = False
+                    if finalization_callback is not None:
+                        try:
+                            finalization_callback(cleanup_verified=False,
+                                cleanup_error=sanitize_failure_code(cl_exc),
+                                workload_error=primary_failure)
+                        except Exception:
+                            pass
                     try:
                         durable_json(fixture.artifacts / 'startup-summary.json', {'status': 'CLEANUP_UNRESOLVED', 'phase': phase, 'http_accepted': False})
                     except Exception:
@@ -1795,6 +1844,11 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         resource_kind=cleanup_target_kind,
                     )
                     raise FailureDiagnostic(fail_report, cause=cleanup_failure) from cl_exc
+                # Session-state persistence is not Docker cleanup. Keep the
+                # verified resource result intact if this optional hook fails.
+                if finalization_callback is not None:
+                    finalization_callback(cleanup_verified=True, cleanup_error=None,
+                                          workload_error=primary_failure)
                 if state.signum is not None:
                     failure = lifecycle.RunnerInterrupted(state.signum)
     except FailureDiagnostic:
@@ -1815,23 +1869,36 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             'schema_version': 1, 'run_id': fixture.project,
             'mode': (fixture.paper_p5a_mode if fixture.paper_p5a else
                      fixture.paper_p4_mode if fixture.paper_p4 else fixture.paper_p1)}
-        e1_cleanup_accepted = (paper_p8_e1_cleanup_acceptance(
-            fixture, evidence.get('paper_p8_e1', {}), cleanup_counts, cleanup_verified, registry)
-            if getattr(fixture, 'paper_p8_e1', False) else None)
+        prepare_only = getattr(fixture, 'paper_p8_prepare_only', False)
+        remote_session = (json.loads((fixture.private / 'session.json').read_text())
+                          if prepare_only and (fixture.private / 'session.json').is_file() else {})
+        remote_outcome = remote_session.get('workload_outcome', 'NOT_RUN')
+        prepare_experiment = remote_session.get('experiment',
+            'E5' if getattr(fixture, 'paper_p8_e5_prepare_only', False) else
+            'E4' if getattr(fixture, 'paper_p8_e4_prepare_only', False) else
+            'E3' if getattr(fixture, 'paper_p8_e3_prepare_only', False) else
+            'E2' if getattr(fixture, 'paper_p8_e2', False) else 'E1')
+        e1_cleanup_accepted = (cleanup_verified if prepare_only else
+            paper_p8_e1_cleanup_acceptance(fixture, evidence.get('paper_p8_e1', {}),
+                cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e1', False) else None)
         e2_cleanup_accepted = (paper_p8_e2_cleanup_acceptance(
             fixture, evidence.get('paper_p8_e2', {}), cleanup_counts, cleanup_verified, registry)
             if getattr(fixture, 'paper_p8_e2', False) else None)
         e3_cleanup_accepted = (paper_p8_e3_cleanup_acceptance(
             fixture, evidence.get('paper_p8_e3', {}), cleanup_counts, cleanup_verified, registry)
             if getattr(fixture, 'paper_p8_e3', None) else None)
-        e4_cleanup_accepted = (paper_p8_e4_cleanup_acceptance(
-            fixture, evidence.get('paper_p8_e4', {}), cleanup_counts, cleanup_verified, registry)
+        e4_cleanup_accepted = (cleanup_verified if prepare_only and prepare_experiment == 'E4' else
+            paper_p8_e4_cleanup_acceptance(
+                fixture, evidence.get('paper_p8_e4', {}), cleanup_counts, cleanup_verified, registry)
             if getattr(fixture, 'paper_p8_e4', None) else None)
-        run.update(status=('WORKLOAD_COMPLETE_PENDING_CLEANUP' if fixture.paper_p7_mode == 'p6_ws'
+        e5_cleanup_accepted = (cleanup_verified if prepare_only and prepare_experiment == 'E5' else None)
+        run.update(status=(paper_p8_prepare_only_run_status(prepare_experiment, failed=bool(failure),
+                           cleanup_verified=cleanup_verified, remote_outcome=remote_outcome) if prepare_only else
+                           'WORKLOAD_COMPLETE_PENDING_CLEANUP' if fixture.paper_p7_mode == 'p6_ws'
                            and not failure and cleanup_verified else
                            'FAIL' if failure or not cleanup_verified or e1_cleanup_accepted is False
                              or e2_cleanup_accepted is False or e3_cleanup_accepted is False
-                             or e4_cleanup_accepted is False else 'PASS'),
+                             or e4_cleanup_accepted is False or e5_cleanup_accepted is False else 'PASS'),
                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                    error=sanitize_failure_code(failure) if failure else None)
         if fixture.paper_p8_sessions:
@@ -1858,46 +1925,87 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                                            else 'p8-e2-smoke.json')
             staged_recovery = fixture.private / 'p8-recovery-result.json'
             staged_e5 = fixture.private / 'p8-e5-result.json'
-            p8 = (json.loads(staged_recovery.read_text()) if getattr(fixture, 'paper_p8_recovery', False) and staged_recovery.exists()
-                  else json.loads(staged_e5.read_text()) if getattr(fixture, 'paper_p8_e5', None) and staged_e5.exists()
-                  else json.loads(p8_path.read_text()) if p8_path.exists() else {})
-            if getattr(fixture, 'paper_p8_recovery', False):
-                p8['workload_status'] = p8.get('status')
-                p8['full_p8_accepted'] = False
-                p8['exact_cleanup_verified'] = cleanup_verified
-                p8['cleanup_counts'] = cleanup_counts
-                phase_pass = bool(p8.get('phases')) and all(
-                    isinstance(row, dict) and row.get('status') == 'PASS'
-                    for row in p8['phases'].values()) and p8.get('all_children_stopped') is True
-                p8.update(cleanup_verified=cleanup_verified,
-                    status='PASS' if not failure and cleanup_verified and phase_pass and
-                    p8.get('workload_status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP' else 'FAIL')
-                durable_json(p8_path, p8)
-                run['p8_recovery'] = p8
-            elif getattr(fixture, 'paper_p8_e5', None):
-                p8['workload_status'] = p8.get('status')
-                p8['lane_marker'] = 'PAPER_P8_E5_ARM_PILOT'
-                p8['full_p8_accepted'] = False
-                p8['exact_cleanup_verified'] = cleanup_verified
-                p8['cleanup_counts'] = cleanup_counts
-            elif getattr(fixture, 'paper_p8_e4', None):
-                p8['workload_status'] = p8.get('status')
-                p8['full_p8_accepted'] = False
-                p8['exact_cleanup_verified'] = cleanup_verified
-                p8['cleanup_counts'] = cleanup_counts
-            elif getattr(fixture, 'paper_p8_e3', None):
-                p8['workload_status'] = p8.get('status')
-                p8['full_p8_accepted'] = False
-                p8['lane_marker'] = 'PAPER_P8_E3_PILOT'
-            elif fixture.paper_p8_e1:
-                p8['workload_status'] = p8.get('status')
-                p8['full_p8_accepted'] = False
-            elif getattr(fixture, 'paper_p8_e2', False):
-                p8['workload_status'] = p8.get('status')
-                p8['full_p8_accepted'] = False
-            if not getattr(fixture, 'paper_p8_recovery', False):
-                p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
-                      status='PASS' if (not failure and cleanup_verified and
+            if getattr(fixture, 'paper_p8_e5', None):
+                p8 = paper_p8_e5_post_cleanup_artifact(
+                    fixture, p8_path=p8_path, staged_e5=staged_e5,
+                    remote_outcome=remote_outcome, failure=failure,
+                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                )
+                run['p8_e5'] = p8
+            else:
+                p8 = (json.loads(p8_path.read_text()) if getattr(fixture, 'paper_p8_e4_remote_warm', False) and p8_path.exists() else
+                      json.loads(p8_path.read_text()) if prepare_only and prepare_experiment == 'E3' and p8_path.exists() else
+                      {'status':'PASS' if remote_outcome == 'VALIDATED' and not failure and cleanup_verified else
+                       'PREPARATION_ONLY' if remote_outcome == 'NOT_RUN' and not failure and cleanup_verified else 'FAIL',
+                       'full_p8_accepted':False,'workload_status':remote_outcome,
+                       'exact_cleanup_verified':cleanup_verified,
+                       'cleanup_counts':cleanup_counts}
+                      if prepare_only else
+                      json.loads(staged_recovery.read_text()) if getattr(fixture, 'paper_p8_recovery', False) and staged_recovery.exists()
+                      else json.loads(p8_path.read_text()) if p8_path.exists() else {})
+                if getattr(fixture, 'paper_p8_recovery', False):
+                    p8['workload_status'] = p8.get('status')
+                    p8['full_p8_accepted'] = False
+                    p8['exact_cleanup_verified'] = cleanup_verified
+                    p8['cleanup_counts'] = cleanup_counts
+                    phase_pass = bool(p8.get('phases')) and all(
+                        isinstance(row, dict) and row.get('status') == 'PASS'
+                        for row in p8['phases'].values()) and p8.get('all_children_stopped') is True
+                    p8.update(cleanup_verified=cleanup_verified,
+                        status='PASS' if not failure and cleanup_verified and phase_pass and
+                        p8.get('workload_status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP' else 'FAIL')
+                    durable_json(p8_path, p8)
+                    run['p8_recovery'] = p8
+                elif getattr(fixture, 'paper_p8_e4', None):
+                    if not getattr(fixture, 'paper_p8_e4_remote_warm', False):
+                        p8['workload_status'] = p8.get('status')
+                        p8['full_p8_accepted'] = False
+                        p8['exact_cleanup_verified'] = cleanup_verified
+                        p8['cleanup_counts'] = cleanup_counts
+                elif getattr(fixture, 'paper_p8_e3', None):
+                    p8['workload_status'] = p8.get('status')
+                    p8['full_p8_accepted'] = False
+                    p8['lane_marker'] = 'PAPER_P8_E3_PILOT'
+                elif fixture.paper_p8_e1 and not prepare_only:
+                    p8['workload_status'] = p8.get('status')
+                    p8['full_p8_accepted'] = False
+                elif getattr(fixture, 'paper_p8_e2', False):
+                    p8['workload_status'] = p8.get('status')
+                    p8['full_p8_accepted'] = False
+                if not getattr(fixture, 'paper_p8_recovery', False):
+                    if getattr(fixture, 'paper_p8_e4_remote_warm', False):
+                        p8.update(cleanup_verified=cleanup_verified, exact_cleanup_verified=cleanup_verified,
+                                  cleanup_counts=cleanup_counts)
+                        p8['status'] = 'PASS' if (not failure and
+                            paper_p8_e4_warm_subset_acceptance(p8, cleanup_verified)) else 'FAIL'
+                    else:
+                        p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                            status='PASS' if (not failure and cleanup_verified and ((prepare_only and remote_outcome in ('VALIDATED', 'NOT_RUN')) or
+                                (paper_p8_e4_cleanup_acceptance(fixture, evidence.get('paper_p8_e4', {}),
+                                   cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e4', None) else
+                                paper_p8_e3_cleanup_acceptance(fixture, evidence.get('paper_p8_e3', {}),
+                                  cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e3', None) else
+                                paper_p8_e1_cleanup_acceptance(fixture, evidence.get('paper_p8_e1', {}),
+                                 cleanup_counts, cleanup_verified, registry) if fixture.paper_p8_e1 else
+                               paper_p8_e2_cleanup_acceptance(fixture, evidence.get('paper_p8_e2', {}),
+                                 cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e2', False)
+                                   else p8.get('status') == 'PASS'))) else 'FAIL')
+                    if getattr(fixture, 'paper_p8_e3_prepare_only', False):
+                        p8.update(workload_status='NOT_RUN', full_p8_accepted=False,
+                                  generator_colocated=True, physical_ab='NOT RUN')
+                    durable_json(p8_path, p8)
+                if getattr(fixture, 'paper_p8_recovery', False):
+                    run['p8_recovery'] = p8
+                elif getattr(fixture, 'paper_p8_e4', None):
+                    run['p8_e4'] = p8
+                elif getattr(fixture, 'paper_p8_e3', None):
+                    run['p8_e3'] = p8
+                elif fixture.paper_p8_e1:
+                    run['p8_e1_preparation' if prepare_only else 'p8_e1'] = p8
+                elif getattr(fixture, 'paper_p8_e2', False):
+                    run['p8_e2'] = p8
+                    p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                        status='PASS' if (not failure and cleanup_verified and ((prepare_only and remote_outcome in ('VALIDATED', 'NOT_RUN')) or
                             (paper_p8_e5_acceptance(p8, evidence.get('paper_p8_e5', {}), cleanup_verified) if getattr(fixture, 'paper_p8_e5', None) else
                             paper_p8_e4_cleanup_acceptance(fixture, evidence.get('paper_p8_e4', {}),
                                cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e4', None) else
@@ -1907,7 +2015,10 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                              cleanup_counts, cleanup_verified, registry) if fixture.paper_p8_e1 else
                            paper_p8_e2_cleanup_acceptance(fixture, evidence.get('paper_p8_e2', {}),
                              cleanup_counts, cleanup_verified, registry) if getattr(fixture, 'paper_p8_e2', False)
-                             else p8.get('status') == 'PASS')) else 'FAIL')
+                               else p8.get('status') == 'PASS'))) else 'FAIL')
+                if getattr(fixture, 'paper_p8_e3_prepare_only', False):
+                    p8.update(workload_status='NOT_RUN', full_p8_accepted=False,
+                              generator_colocated=True, physical_ab='NOT RUN')
                 durable_json(p8_path, p8)
             if getattr(fixture, 'paper_p8_recovery', False):
                 run['p8_recovery'] = p8
@@ -1918,7 +2029,7 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             elif getattr(fixture, 'paper_p8_e3', None):
                 run['p8_e3'] = p8
             elif fixture.paper_p8_e1:
-                run['p8_e1'] = p8
+                run['p8_e1_preparation' if prepare_only else 'p8_e1'] = p8
             elif getattr(fixture, 'paper_p8_e2', False):
                 run['p8_e2'] = p8
         if fixture.paper_p4:
@@ -2161,7 +2272,24 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             if report['status'] == 'FAIL':
                 raise ValueError('paper_p8_slow_viewer_probe_incomplete')
         elif getattr(fixture, 'paper_p8_load', False):
-            if getattr(fixture, 'paper_p8_recovery', False):
+            if getattr(fixture, 'paper_p8_e4_remote_warm', False):
+                name = paper_p8_e4_artifact_name(fixture)
+                p8 = json.loads((fixture.artifacts / name).read_text())
+                p8.update(cleanup_verified=cleanup_verified,
+                          exact_cleanup_verified=cleanup_verified,
+                          cleanup_counts=cleanup_counts)
+                accepted = paper_p8_e4_warm_subset_acceptance(p8, cleanup_verified)
+                p8['status'] = 'PASS' if accepted else p8.get('status', 'FAIL')
+                durable_json(fixture.artifacts / name, p8)
+                report = paper_p8_e4_startup_summary(fixture, p8, accepted,
+                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
+                    artifact_name=name)
+                if not accepted:
+                    raise ValueError('paper_p8_e4_warm_subset_incomplete')
+            elif getattr(fixture, 'paper_p8_prepare_only', False):
+                report = paper_p8_prepare_only_report(fixture, remote_outcome=remote_outcome,
+                    cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts)
+            elif getattr(fixture, 'paper_p8_recovery', False):
                 name = 'p8-recovery.json'
                 p8 = json.loads((fixture.artifacts / name).read_text())
                 accepted = (p8.get('status') == 'PASS' and p8.get('lane_marker') == 'PAPER_P8_RECOVERY_PILOT'
@@ -2227,21 +2355,37 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 low_load = getattr(fixture, 'paper_p8_e3_workload', 'mixed') == 'low_load'
                 name = paper_p8_e3_artifact_name(fixture)
                 p8 = json.loads((fixture.artifacts / name).read_text())
-                accepted = (p8.get('status') == 'PASS' and p8.get('full_p8_accepted') is False
-                            and p8.get('cleanup_verified') is True and cleanup_verified is True
-                            and paper_p8_e3_cleanup_acceptance(fixture, evidence.get('paper_p8_e3', {}),
-                                                               cleanup_counts, cleanup_verified, registry))
-                report = {'schema_version': 1,
-                          'status': 'PAPER_P8_E3_PILOT' if accepted else 'FAIL',
-                          'lane': 'PAPER_P8_E3_PILOT', 'arm': fixture.paper_p8_e3,
-                          'workload': getattr(fixture, 'paper_p8_e3_workload', 'mixed'),
-                          'project': fixture.project, 'native_executed': True,
-                          'p8_e3_pilot_pass': accepted, 'full_p8_accepted': False,
-                          'representative_probes_pending': p8.get('representative_probes_pending'),
-                          'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
-                          'artifact': name}
-                if not accepted:
-                    raise ValueError('paper_p8_e3_pilot_incomplete')
+                if prepare_only:
+                    accepted = (p8.get('status') == 'PASS' and p8.get('workload_status') == 'NOT_RUN'
+                                and p8.get('full_p8_accepted') is False and cleanup_verified is True)
+                    report = {'schema_version': 1,
+                              'status': 'PAPER_P8_E3_PREPARATION_ONLY' if accepted else 'FAIL',
+                              'experiment': 'E3', 'arm': fixture.paper_p8_e3,
+                              'workload': getattr(fixture, 'paper_p8_e3_workload', 'mixed'),
+                              'run_id': p8.get('run_id'), 'phase_id': p8.get('phase_id'),
+                              'project': fixture.project, 'native_executed': True,
+                              'workload_status': 'NOT_RUN', 'full_p8_accepted': False,
+                              'generator_colocated': True, 'physical_ab': 'NOT RUN',
+                              'exact_cleanup_verified': cleanup_verified,
+                              'cleanup_counts': cleanup_counts, 'artifact': name}
+                    if not accepted:
+                        raise ValueError('paper_p8_e3_preparation_cleanup_failed')
+                else:
+                    accepted = (p8.get('status') == 'PASS' and p8.get('full_p8_accepted') is False
+                                and p8.get('cleanup_verified') is True and cleanup_verified is True
+                                and paper_p8_e3_cleanup_acceptance(fixture, evidence.get('paper_p8_e3', {}),
+                                                                   cleanup_counts, cleanup_verified, registry))
+                    report = {'schema_version': 1,
+                              'status': 'PAPER_P8_E3_PILOT' if accepted else 'FAIL',
+                              'lane': 'PAPER_P8_E3_PILOT', 'arm': fixture.paper_p8_e3,
+                              'workload': getattr(fixture, 'paper_p8_e3_workload', 'mixed'),
+                              'project': fixture.project, 'native_executed': True,
+                              'p8_e3_pilot_pass': accepted, 'full_p8_accepted': False,
+                              'representative_probes_pending': p8.get('representative_probes_pending'),
+                              'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+                              'artifact': name}
+                    if not accepted:
+                        raise ValueError('paper_p8_e3_pilot_incomplete')
             elif getattr(fixture, 'paper_p8_e1', False):
                 p8 = json.loads((fixture.artifacts / 'p8-e1-pilot.json').read_text())
                 accepted = paper_p8_e1_report_acceptance(p8, cleanup_verified, e1_cleanup_accepted)
@@ -2623,6 +2767,7 @@ ALLOWED_FAILURE_ERROR_CODES = {
     "envoy_probe_cleanup_unresolved", "native_execution_deferred",
     "paper_p5b_conflict_sensor_provision_failed",
     "paper_p5b_cold_replay_reconciliation_failed", "paper_p5b_functional_smoke_failed",
+    "p8_prepare_report_artifact_missing", "p8_prepare_report_validation_missing",
     "http_body_too_large", "unsafe_summary", "unsafe_failure_report", "unclassified"
 }
 
@@ -4152,6 +4297,18 @@ def paper_p8_e1_report_acceptance(evidence, cleanup_verified, owned_cleanup_acce
             and owned_cleanup_accepted is True)
 
 
+def paper_p8_write_private_csv(path, header, rows):
+    """Create a private CSV artifact without following links or widening mode."""
+    path = Path(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, 'w', newline='') as output:
+        os.fchmod(output.fileno(), 0o600)
+        writer = csv.writer(output)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
 def paper_p8_e1_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
     """E1 is a workload pilot only; require helper validation and exact owned cleanup."""
     workload = evidence.get('workload')
@@ -4206,6 +4363,72 @@ def paper_p8_e2_report_acceptance(evidence, cleanup_verified):
             and cleanup_verified is True)
 
 
+def paper_p8_prepare_only_report(fixture, *, remote_outcome, cleanup_verified, cleanup_counts):
+    """Build the final report for an E1/E2 held session without assuming a workload ran."""
+    session_path = fixture.private / 'session.json'
+    remote_session = json.loads(session_path.read_text()) if session_path.is_file() else {}
+    experiment = remote_session.get('experiment')
+    if experiment not in ('E1', 'E2', 'E3', 'E4', 'E5'):
+        experiment = 'E2' if getattr(fixture, 'paper_p8_e2', False) else 'E1'
+    if experiment == 'E2':
+        phase_id = remote_session.get('phase_id')
+        artifact = (f'p8-e2-{phase_id}-remote-result.json'
+                    if remote_outcome == 'VALIDATED' and isinstance(phase_id, str)
+                    else 'p8-e2-pilot.json')
+        evidence_name = artifact
+        workload_field = 'p8_e2_workload_verified'
+    elif experiment == 'E3':
+        artifact = paper_p8_e3_artifact_name(fixture)
+        if remote_outcome == 'VALIDATED':
+            artifact = artifact.replace('.json', '-remote-result.json')
+        evidence_name = artifact
+        workload_field = 'p8_e3_workload_verified'
+    elif experiment == 'E4':
+        artifact = paper_p8_e4_artifact_name(fixture)
+        evidence_name = artifact
+        workload_field = 'p8_e4_workload_verified'
+    elif experiment == 'E5':
+        artifact = paper_p8_e5_artifact_name(fixture)
+        evidence_name = artifact
+        workload_field = 'p8_e5_workload_verified'
+    else:
+        # Keep E1's established gate: its pilot summary is the acceptance input.
+        artifact = 'p8-e1-remote-result.json'
+        evidence_name = 'p8-e1-pilot.json'
+        workload_field = 'p8_e1_workload_verified'
+
+    artifact_path = fixture.artifacts / evidence_name
+    if not artifact_path.is_file():
+        raise ValueError('p8_prepare_report_artifact_missing')
+    evidence = json.loads(artifact_path.read_text())
+    validation = evidence.get('validation')
+    if experiment in ('E2', 'E3') and remote_outcome == 'VALIDATED' and (not isinstance(validation, dict)
+                                           or validation.get('valid') is not True):
+        raise ValueError('p8_prepare_report_validation_missing')
+    if remote_outcome == 'NOT_RUN' and cleanup_verified:
+        label = f'PAPER_P8_{experiment}_PREPARATION_ONLY'
+    elif remote_outcome == 'VALIDATED' and cleanup_verified and evidence.get('status') == 'PASS':
+        label = f'PAPER_P8_{experiment}_WORKLOAD_VERIFIED'
+    else:
+        label = f'PAPER_P8_{experiment}_WORKLOAD_VALIDATION_FAILED'
+    return {'schema_version': 1, 'status': label, 'project': fixture.project,
+            'native_executed': True, workload_field: remote_outcome == 'VALIDATED',
+            'workload_outcome': remote_outcome, 'full_p8_accepted': False,
+            'exact_cleanup_verified': cleanup_verified, 'cleanup_counts': cleanup_counts,
+            'artifact': artifact}
+
+
+def paper_p8_prepare_only_run_status(experiment, *, failed, cleanup_verified, remote_outcome):
+    prefix = experiment if experiment in ('E1', 'E2', 'E3', 'E4', 'E5') else 'E1'
+    if not failed and cleanup_verified and remote_outcome == 'VALIDATED':
+        return f'{prefix}_WORKLOAD_VERIFICATION_PASS'
+    if not failed and cleanup_verified and remote_outcome == 'NOT_RUN':
+        return f'{prefix}_PREPARATION_ONLY_CLEANUP'
+    if remote_outcome == 'VALIDATION_FAILED':
+        return f'{prefix}_WORKLOAD_VALIDATION_FAILED'
+    return 'FAIL'
+
+
 def paper_p8_e4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
     validation = evidence.get('validation') if isinstance(evidence, dict) else None
     delta = evidence.get('database_delta') if isinstance(evidence, dict) else None
@@ -4236,6 +4459,344 @@ def paper_p8_e4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
             and cleanup_verified is True
             and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
                                             cleanup_counts, cleanup_verified, registry))
+
+
+def paper_p8_e4_conflicts_acceptance(conflicts):
+    """Strict acceptance of E4 representative conflict rejection evidence."""
+    if not isinstance(conflicts, dict) or conflicts.get('status') != 'PASS':
+        return False
+    cases = conflicts.get('cases')
+    if not isinstance(cases, dict):
+        return False
+    required = {'same_id_changed_payload', 'different_first_sequence_overlap'}
+    if set(cases) != required:
+        return False
+    for name in required:
+        c = cases[name]
+        if (not isinstance(c, dict) or c.get('status') != 'PASS'
+                or c.get('schema_valid') is not True
+                or c.get('positive_control_ack_count') != 1
+                or c.get('conflict_ack_count') != 0
+                or c.get('database_unchanged') is not True
+                or not c.get('expected_rejection_reason')
+                or c.get('observed_rejection_reason') != c.get('expected_rejection_reason')
+                or not isinstance(c.get('guard_precondition'), dict)
+                or c['guard_precondition'].get('matched') is not True):
+            return False
+    return True
+
+
+def paper_p8_e4_durable_reopen_acceptance(dgr):
+    """Strict acceptance of gateway reopen proofs following durable-fault."""
+    if not isinstance(dgr, dict) or dgr.get('status') != 'PASS':
+        return False
+    fault = dgr.get('fault')
+    reopen = dgr.get('reopen')
+    if not isinstance(fault, dict) or fault.get('status') != 'PASS' or fault.get('phase') != 'durable-fault':
+        return False
+    if not isinstance(reopen, dict) or reopen.get('status') != 'PASS' or reopen.get('phase') != 'durable-reopen':
+        return False
+
+    pending = fault.get('pending')
+    pending_before = reopen.get('pending_before')
+    if not isinstance(pending, dict) or pending != pending_before:
+        return False
+    payload_sha = pending.get('payload_sha256')
+    msg_id = pending.get('message_id')
+    if (not isinstance(payload_sha, str) or re.fullmatch(r'[0-9a-f]{64}', payload_sha) is None
+            or not isinstance(msg_id, str) or not msg_id
+            or pending.get('sample_count') != 100 or pending.get('interval_us') != 10000):
+        return False
+
+    hdr = pending.get('header')
+    hdr_before = pending_before.get('header')
+    if (not isinstance(hdr, dict) or not isinstance(hdr_before, dict) or hdr != hdr_before
+            or hdr.get('gateway_id') != pending.get('gateway_id')
+            or not isinstance(hdr.get('gateway_id'), str) or not hdr['gateway_id']
+            or hdr.get('sensor_id') != pending.get('sensor_id')
+            or not isinstance(hdr.get('sensor_id'), str) or not hdr['sensor_id']
+            or hdr.get('boot_id') != pending.get('boot_id')
+            or not isinstance(hdr.get('boot_id'), str) or not hdr['boot_id']
+            or hdr.get('first_sequence') != pending.get('sequence')
+            or type(hdr.get('first_sequence')) is not int
+            or hdr.get('sample_count') != 100
+            or hdr.get('sample_interval_us') != 10000
+            or not isinstance(hdr.get('measured_at'), str) or not hdr['measured_at']):
+        return False
+    try:
+        datetime.fromisoformat(hdr['measured_at'].replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return False
+
+    fault_sql = fault.get('sql')
+    if (not isinstance(fault_sql, dict) or fault_sql.get('status') != 'PASS'
+            or fault_sql.get('raw_count') != 100
+            or fault_sql.get('message_id') != msg_id
+            or fault_sql.get('payload_sha256') != payload_sha):
+        return False
+
+    ledger_fp = fault_sql.get('ledger_fingerprint')
+    if not isinstance(ledger_fp, str) or re.fullmatch(r'[0-9a-f]{32}', ledger_fp) is None:
+        return False
+
+    if reopen.get('joined') is not True:
+        return False
+
+    if (fault.get('main_dataset_unchanged') is not True
+            or reopen.get('main_dataset_unchanged') is not True):
+        return False
+
+    binding_sha = fault.get('binding_sha256')
+    if (not isinstance(binding_sha, str) or re.fullmatch(r'[0-9a-f]{64}', binding_sha) is None
+            or reopen.get('binding_sha256') != binding_sha):
+        return False
+
+    expected_delta = {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0}
+    if fault.get('database_delta') != expected_delta or reopen.get('database_delta') != expected_delta:
+        return False
+
+    def _valid_db_snapshot(s):
+        if not isinstance(s, dict):
+            return False
+        for k in ('ledger', 'raw', 'temporal', 'configuration'):
+            if type(s.get(k)) is not int or s[k] < 0:
+                return False
+        fp = s.get('fingerprint')
+        if not isinstance(fp, str) or re.fullmatch(r'[0-9a-f]{32}', fp) is None:
+            return False
+        return True
+
+    fault_before = fault.get('database_before')
+    fault_after = fault.get('database_after')
+    reopen_before = reopen.get('database_before')
+    reopen_after = reopen.get('database_after')
+
+    if (not _valid_db_snapshot(fault_before) or not _valid_db_snapshot(fault_after)
+            or not _valid_db_snapshot(reopen_before) or not _valid_db_snapshot(reopen_after)):
+        return False
+
+    if fault_after != reopen_before:
+        return False
+
+    fault_stage_delta = {k: fault_after[k] - fault_before[k] for k in expected_delta}
+    reopen_stage_delta = {k: reopen_after[k] - reopen_before[k] for k in expected_delta}
+    if fault_stage_delta != expected_delta or reopen_stage_delta != expected_delta:
+        return False
+
+    expected_cumulative_delta = {'ledger': 2, 'raw': 200, 'temporal': 2, 'configuration': 0}
+    cumulative_delta = {k: reopen_after[k] - fault_before[k] for k in expected_cumulative_delta}
+    if cumulative_delta != expected_cumulative_delta:
+        return False
+
+    reopen_sql = reopen.get('sql')
+    if (not isinstance(reopen_sql, dict) or reopen_sql.get('status') != 'PASS'
+            or reopen_sql.get('raw_count') != 100
+            or reopen_sql.get('main_dataset_unchanged') is not True
+            or reopen_sql.get('auxiliary_delta') != {'ledger': 2, 'raw': 200, 'temporal': 2}
+            or reopen_sql.get('interval_us') != 10000
+            or type(reopen_sql.get('first_sequence')) is not int
+            or reopen_sql.get('last_sequence') != reopen_sql['first_sequence'] + 99
+            or not isinstance(reopen_sql.get('first_timestamp'), str) or not reopen_sql['first_timestamp']
+            or not isinstance(reopen_sql.get('last_timestamp'), str) or not reopen_sql['last_timestamp']):
+        return False
+
+    if reopen.get('pending_rows') != 0 or reopen.get('quarantined_rows') != 0:
+        return False
+
+    if type(reopen.get('application_acks')) is not int or reopen['application_acks'] < 2:
+        return False
+
+    return True
+
+
+def paper_p8_e4_startup_summary(fixture, p8, accepted, cleanup_verified, cleanup_counts, artifact_name):
+    cache_off = getattr(fixture, 'paper_p8_e4_cache_mode', None) == 'off'
+    cold_subset = p8.get('workload_status') == 'COLD_REPLAY_SUBSET_VALIDATED'
+    durable_subset = p8.get('workload_status') == 'DURABLE_REOPEN_SUBSET_VALIDATED'
+    conflicts_subset = p8.get('workload_status') in ('CONFLICTS_SUBSET_VALIDATED', 'PILOT_COMPLETE_VALIDATED')
+    pilot_complete = p8.get('workload_status') == 'PILOT_COMPLETE_VALIDATED'
+    lane = ('PAPER_P8_E4_PILOT_COMPLETE' if pilot_complete else
+            'PAPER_P8_E4_CONFLICTS_SUBSET' if conflicts_subset else
+            'PAPER_P8_E4_DURABLE_REOPEN_SUBSET' if durable_subset else
+            'PAPER_P8_E4_COLD_REPLAY_SUBSET' if cold_subset else
+            'PAPER_P8_E4_CACHE_OFF_SUBSET' if cache_off else 'PAPER_P8_E4_WARM_SUBSET')
+    durable_status = (p8['durable_gateway_reopen'].get('status')
+                      if isinstance(p8.get('durable_gateway_reopen'), dict)
+                      else p8.get('durable_gateway_reopen', 'NOT RUN'))
+    conflicts_status = (p8['conflicts'].get('status')
+                        if isinstance(p8.get('conflicts'), dict)
+                        else p8.get('conflicts', 'NOT RUN'))
+    return {'schema_version': 1,
+        'status': ('PAPER_P8_E4_PILOT_COMPLETE_VALIDATED' if pilot_complete else
+                   'PAPER_P8_E4_CONFLICTS_SUBSET_VALIDATED' if conflicts_subset else
+                   'PAPER_P8_E4_DURABLE_REOPEN_SUBSET_VALIDATED' if durable_subset else
+                   'PAPER_P8_E4_COLD_REPLAY_SUBSET_VALIDATED' if cold_subset else
+                   'PAPER_P8_E4_CACHE_OFF_SUBSET_VALIDATED' if cache_off else
+                   'PAPER_P8_E4_WARM_SUBSET_VALIDATED') if accepted else 'FAIL',
+        'lane': lane, 'cache_mode': getattr(fixture, 'paper_p8_e4', None),
+        'project': getattr(fixture, 'project', None), 'native_executed': True,
+        'p8_e4_warm_subset_validated': accepted, 'full_p8_accepted': False,
+        'workload_outcome': ('PILOT_COMPLETE_VALIDATED' if pilot_complete else
+                             'CONFLICTS_SUBSET_VALIDATED' if conflicts_subset else
+                             'DURABLE_REOPEN_SUBSET_VALIDATED' if durable_subset else
+                             'COLD_REPLAY_SUBSET_VALIDATED' if cold_subset else
+                             'CACHE_OFF_SUBSET_VALIDATED' if cache_off else
+                             'WARM_SUBSET_VALIDATED') if accepted else p8.get('workload_status'),
+        'coldrestart': p8.get('coldrestart'),
+        'durable_gateway_reopen': durable_status,
+        'conflicts': conflicts_status, 'exact_cleanup_verified': cleanup_verified,
+        'cleanup_counts': cleanup_counts, 'artifact': artifact_name}
+
+
+def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
+    workloads = evidence.get('workloads') if isinstance(evidence, dict) else None
+    unique = workloads.get('unique', {}) if isinstance(workloads, dict) else {}
+    replay = workloads.get('replay', {}) if isinstance(workloads, dict) else {}
+    unique_workload, replay_workload = unique.get('telemetry'), replay.get('telemetry')
+    ut = unique_workload.get('telemetry') if isinstance(unique_workload, dict) else None
+    rt = replay_workload.get('telemetry') if isinstance(replay_workload, dict) else None
+    delta = evidence.get('database_delta') if isinstance(evidence, dict) else None
+    raw = evidence.get('raw_verification') if isinstance(evidence, dict) else None
+    ws = evidence.get('new_ws_event_proof') if isinstance(evidence, dict) else None
+    validation = evidence.get('validation') if isinstance(evidence, dict) else None
+    cache = evidence.get('cache_window') if isinstance(evidence, dict) else None
+    cold_subset = (isinstance(evidence, dict) and
+                   evidence.get('workload_status') == 'COLD_REPLAY_SUBSET_VALIDATED')
+    cache_off = isinstance(evidence, dict) and evidence.get('cache_mode') == 'off'
+    expected_marker = 'PAPER_P8_E4_CACHE_OFF_SUBSET' if cache_off else 'PAPER_P8_E4_WARM_SUBSET'
+    expected_outcome = 'CACHE_OFF_SUBSET_VALIDATED' if cache_off else 'WARM_SUBSET_VALIDATED'
+    expected_cold = 'NOT APPLICABLE' if cache_off else 'NOT RUN'
+    expected_phases = ['unique', 'replay', 'cold-replay'] if cold_subset else ['unique', 'replay']
+    if cold_subset:
+        expected_marker = 'PAPER_P8_E4_COLD_REPLAY_SUBSET'
+        expected_outcome = 'COLD_REPLAY_SUBSET_VALIDATED'
+        expected_cold = 'PASS'
+    windows = evidence.get('counter_windows') if isinstance(evidence, dict) else None
+    replay_window = windows.get('replay') if isinstance(windows, dict) else None
+    dbproof = replay_window.get('database_proof') if isinstance(replay_window, dict) else None
+    cache_valid = (isinstance(cache, dict) and type(cache.get('attempts')) is int
+        and cache['attempts'] > 0 and type(cache.get('transaction_commits')) is int
+        and cache['transaction_commits'] > 0 and cache.get('database_duplicates') == cache['transaction_commits']
+        and type(cache.get('confirmed_new_rows')) is int and cache['confirmed_new_rows'] == 0
+        and type(cache.get('copy_calls')) is int and cache['copy_calls'] == 0
+        and isinstance(dbproof, dict) and dbproof.get('exact_equal') is True
+        and isinstance(dbproof.get('unique_ack'), list) and len(dbproof['unique_ack']) == 2
+        and dbproof['unique_ack'] == dbproof.get('replay_end')) if cache_off else (
+        isinstance(cache, dict) and type(cache.get('warm_lookup_hits')) is int
+        and cache['warm_lookup_hits'] >= 10 and type(cache.get('repository_calls_avoided')) is int
+        and cache['repository_calls_avoided'] >= 10)
+    cold_ws = (isinstance(ws, dict) and isinstance(ws.get('replay'), dict)
+        and ws['replay'] == {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+            'telemetry_writes_completed': 0, 'drops': 0})
+    cold_window = evidence.get('cold_cache_window') if isinstance(evidence, dict) else None
+    cold_deltas = cold_window.get('persistence_delta') if isinstance(cold_window, dict) else None
+    replacement = evidence.get('replacement_proof') if isinstance(evidence, dict) else None
+    cold_valid = (isinstance(cold_window, dict) and cold_window.get('status') == 'PASS'
+        and cold_window.get('old_process_instance') and cold_window.get('process_instance')
+        and cold_window.get('old_process_instance') != cold_window.get('process_instance')
+        and cold_window.get('cache_entries_before') == 0
+        and type(cold_window.get('cache_miss_delta')) is int and cold_window['cache_miss_delta'] > 0
+        and cold_window.get('cache_hit_delta') == 0
+        and isinstance(cold_deltas, dict) and type(cold_deltas.get('begin_attempts')) is int
+        and cold_deltas['begin_attempts'] > 0 and type(cold_deltas.get('confirmed_commits')) is int
+        and cold_deltas['confirmed_commits'] > 0 and cold_deltas.get('confirmed_new_rows') == 0
+        and cold_deltas.get('copy_calls') == 0 and cold_window.get('application_ack_count') == 10
+        and cold_window.get('database_unchanged') is True
+        and isinstance(replacement, dict) and replacement.get('metrics_readback') is True
+        and replacement.get('process_instance') == cold_window.get('process_instance'))
+    cold_proven = bool(cold_valid and isinstance(ws, dict) and isinstance(ws.get('cold-replay'), dict)
+        and ws['cold-replay'] == {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+            'telemetry_writes_completed': 0, 'drops': 0}
+        and evidence.get('cold_replay_journal_prefix_validated') is True)
+    cold_genuinely_proven = bool(isinstance(evidence, dict)
+        and 'cold-replay' in evidence.get('phase_history', []) and cold_proven)
+    durable_subset = (isinstance(evidence, dict) and
+                      (evidence.get('workload_status') in ('DURABLE_REOPEN_SUBSET_VALIDATED', 'PILOT_COMPLETE_VALIDATED')
+                       or isinstance(evidence.get('durable_gateway_reopen'), dict)))
+    conflicts_subset = (isinstance(evidence, dict) and
+                        (evidence.get('workload_status') in ('CONFLICTS_SUBSET_VALIDATED', 'PILOT_COMPLETE_VALIDATED')
+                         or isinstance(evidence.get('conflicts'), dict)))
+    pilot_complete = (isinstance(evidence, dict) and
+                      evidence.get('workload_status') == 'PILOT_COMPLETE_VALIDATED')
+    if pilot_complete:
+        expected_marker = 'PAPER_P8_E4_PILOT_COMPLETE'
+        expected_outcome = 'PILOT_COMPLETE_VALIDATED'
+        expected_cold = 'PASS' if cold_genuinely_proven else 'NOT RUN'
+        expected_phases = (['unique', 'replay', 'cold-replay'] if cold_genuinely_proven else ['unique', 'replay']) + ['durable-fault', 'durable-reopen', 'conflicts']
+    elif conflicts_subset:
+        expected_marker = 'PAPER_P8_E4_CONFLICTS_SUBSET'
+        expected_outcome = 'CONFLICTS_SUBSET_VALIDATED'
+        expected_cold = 'NOT APPLICABLE' if cache_off else 'PASS' if cold_genuinely_proven else 'NOT RUN'
+        expected_phases = (['unique', 'replay', 'cold-replay'] if cold_genuinely_proven else ['unique', 'replay'])
+        if durable_subset:
+            expected_phases = expected_phases + ['durable-fault', 'durable-reopen']
+        expected_phases = expected_phases + ['conflicts']
+    elif durable_subset:
+        expected_marker = 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET'
+        expected_outcome = 'DURABLE_REOPEN_SUBSET_VALIDATED'
+        expected_cold = 'NOT APPLICABLE' if cache_off else 'PASS' if cold_genuinely_proven else 'NOT RUN'
+        expected_phases = (['unique', 'replay', 'cold-replay', 'durable-fault', 'durable-reopen']
+                           if cold_genuinely_proven else ['unique', 'replay', 'durable-fault', 'durable-reopen'])
+    durable_ok = (paper_p8_e4_durable_reopen_acceptance(evidence.get('durable_gateway_reopen')) if durable_subset
+                  else evidence.get('durable_gateway_reopen') == 'NOT RUN')
+    conflicts_ok = (paper_p8_e4_conflicts_acceptance(evidence.get('conflicts')) if conflicts_subset
+                    else evidence.get('conflicts') == 'NOT RUN')
+    journal_ok = (isinstance(evidence, dict) and isinstance(evidence.get('journal_sha256'), str)
+        and re.fullmatch(r'[0-9a-f]{64}', evidence['journal_sha256']) is not None)
+    return (isinstance(evidence, dict) and evidence.get('status') == 'PASS'
+        and evidence.get('lane_marker') == expected_marker
+        and evidence.get('workload_status') == expected_outcome
+        and evidence.get('phase_history') == expected_phases
+        and evidence.get('full_p8_accepted') is False
+        and evidence.get('coldrestart') == expected_cold
+        and durable_ok
+        and conflicts_ok
+        and evidence.get('physical_ab') == 'NOT RUN'
+        and evidence.get('generator_colocated') is True
+        and evidence.get('runner_stopped') is True
+        and journal_ok
+        and evidence.get('journal_continuity') is True
+        and evidence.get('replay_journal_prefix_validated') is True
+        and (not (cold_subset or (durable_subset and cold_genuinely_proven))
+             or evidence.get('cold_replay_journal_prefix_validated') is True)
+        and evidence.get('cleanup_verified') is True and cleanup_verified is True
+        and isinstance(delta, dict) and delta == {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}
+        and isinstance(validation, dict) and validation.get('valid') is True and validation.get('failures') == []
+        and cache_valid
+        and isinstance(raw, list) and len(raw) == 2
+        and all(isinstance(row, dict) and row.get('verified_exact') is True for row in raw)
+        and isinstance(ut, dict) and isinstance(rt, dict)
+        and ut.get('generated_unique') == 20 and ut.get('application_acks') == 20
+        and ut.get('ignored_valid_acks') == 1 and ut.get('pending_messages') == 0
+        and rt.get('replay_offered') == 10 and rt.get('replay_application_acks') == 10
+        and isinstance(ws, dict) and ws.get('status') == 'PASS'
+        and (not cache_off or cold_ws)
+        and (not (cold_subset or (durable_subset and cold_genuinely_proven))
+             or (cold_valid and isinstance(ws.get('cold-replay'), dict)
+                 and ws['cold-replay'] == {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+                     'telemetry_writes_completed': 0, 'drops': 0}))
+        and all(isinstance(row, dict) and row.get('validation_valid') is True for row in (unique, replay)))
+
+
+def paper_p8_e4_cold_restart_status(evidence, cleanup_verified):
+    """A cold restart is PASS only when the finalized E4 cold subset validates."""
+    if (not isinstance(evidence, dict)
+            or evidence.get('workload_status') != 'COLD_REPLAY_SUBSET_VALIDATED'
+            or evidence.get('lane_marker') != 'PAPER_P8_E4_COLD_REPLAY_SUBSET'
+            or evidence.get('coldrestart') != 'PASS'
+            or not paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified)):
+        return 'FAIL'
+    return 'PASS'
+
+
+def paper_p8_e4_preparation_metadata(phase_run_ids):
+    """Summarize telemetry phases and total manifest count including the viewer."""
+    if not isinstance(phase_run_ids, dict) or not phase_run_ids:
+        raise ValueError('p8_e4_phase_run_ids_rejected')
+    phases = list(phase_run_ids)
+    if phases not in (['unique', 'replay'], ['unique', 'replay', 'cold-replay']):
+        raise ValueError('p8_e4_phase_run_ids_rejected')
+    return {'phase_inputs': phases, 'manifest_count': len(phases) + 1}
 
 
 def paper_p8_e4_artifact_name(fixture):
@@ -4280,6 +4841,213 @@ def paper_p8_e5_acceptance(report, evidence, cleanup_verified):
 
 def paper_p8_e5_artifact_name(fixture):
     return f'p8-e5-{fixture.paper_p8_e5}.json'
+
+
+def paper_p8_hold_callbacks_required(args):
+    """Return True when the lifecycle hold must install begin/finish callbacks.
+
+    Every prepare-hold experiment, E5 included, owns a phase collector and an
+    importer, so a missing selector here silently degrades the run to a bare
+    hold with no collection or import.
+    """
+    return any(getattr(args, name, False) for name in (
+        'p8_e1_prepare_hold', 'p8_e2_prepare_hold', 'p8_e3_prepare_hold',
+        'p8_e4_prepare_hold', 'p8_e5_prepare_hold'))
+
+
+def paper_p8_e5_post_run_status(final_session, evidence):
+    """Return ``(lifecycle_ok, workload_outcome)`` for a finished E5 hold session.
+
+    A never-begun preparation stays PREPARATION_ONLY and reports ``NOT_RUN``;
+    a partial or unverified run keeps the INCOMPLETE/FAIL label written by its
+    artifact and is never rewritten to ``NOT_RUN``.
+    """
+    if not isinstance(final_session, dict) or not isinstance(evidence, dict):
+        raise ValueError('e5_post_run_evidence_rejected')
+    history = final_session.get('phase_history') or []
+    if evidence.get('status') == 'PREPARATION_ONLY':
+        ok = (final_session.get('phase') == 'CLOSED'
+              and final_session.get('workload_outcome') == 'NOT_RUN'
+              and final_session.get('collector_ready') is not True)
+        return ok, final_session.get('workload_outcome', 'NOT_RUN')
+    ok = (final_session.get('phase') == 'CLOSED'
+          and history == ['initial', 'warm_replay', 'control']
+          and final_session.get('workload_outcome') == 'VALIDATED'
+          and final_session.get('cleanup_outcome') == 'VERIFIED'
+          and evidence.get('cleanup_verified') is True
+          and paper_p8_e5_acceptance(evidence, {'arm': evidence.get('arm')},
+                                     evidence.get('cleanup_verified') is True))
+    return ok, evidence.get('workload_status')
+
+
+def paper_p8_e5_begin_phase(smoke, fixture, endpoint, registry, containers, prepared, phase):
+    """Start one ordered E5 A-side phase: baseline snapshot and bounded collector."""
+    import paper_p8_e5_remote as e5_remote
+    if not isinstance(phase, str):
+        raise ValueError('e5_phase_id_rejected')
+    return e5_remote.begin_remote_phase(smoke, fixture, endpoint, registry, containers,
+                                        prepared, phase=phase)
+
+
+def paper_p8_e5_finish_phase(smoke, fixture, endpoint, registry, containers, prepared,
+                             results_path, artifacts, phase):
+    """Import one copied B phase result, verify it on A, and persist evidence.
+
+    The imported file must be the exact ``incoming/<phase>/results.json`` the
+    operator copied into the fixture private tree; nothing named by B is
+    executed or opened.
+    """
+    import paper_p8_e5_import as e5_import
+    import paper_p8_e5_remote as e5_remote
+    if not isinstance(phase, str):
+        raise ValueError('e5_phase_id_rejected')
+    incoming = e5_import.phase_incoming_dir(fixture.private, phase)
+    expected = (Path(incoming) / 'results.json').resolve()
+    supplied = Path(results_path).absolute().resolve(strict=True)
+    if supplied != expected:
+        raise ValueError('e5_result_path_mismatch')
+    imported = e5_import.import_phase_result(prepared, fixture.private, phase=phase)
+    result = e5_remote.finish_remote_phase(
+        smoke, fixture, endpoint, registry, containers, prepared,
+        phase=phase, b_projection=imported['projection'])
+    artifacts = Path(artifacts)
+    stem = f'p8-e5-{prepared["arm"]}-{phase}'
+    generator_csv = e5_import.copy_generator_resources(
+        fixture.private, phase, artifacts / f'{stem}-resources-generator.csv')
+    paper_p8_write_private_csv(artifacts / f'{stem}-server-metrics.csv',
+        ('phase', 'snapshot_json'), ((phase, json.dumps(row, sort_keys=True))
+            for row in result.get('collector_metrics') or []))
+    paper_p8_write_private_csv(artifacts / f'{stem}-resources.csv',
+        ('phase', 'sample_json'), ((phase, json.dumps(row, sort_keys=True))
+            for row in result.get('resource_samples') or []))
+    summary = {
+        'schema_version': 1, 'experiment': 'E5', 'phase': phase,
+        'session_id': imported['session_id'], 'run_id': imported['run_id'],
+        'arm': prepared['arm'], 'status': 'COMPLETE',
+        'b_projection_status': imported['projection'].get('status'),
+        'import': {key: imported.get(key) for key in (
+            'source_bundle_sha256', 'source_inventory_sha256', 'bound_manifest_sha256',
+            'bound_gateway_environment_sha256', 'bound_run_spec_sha256',
+            'bound_e5_context_sha256', 'bound_e5_phase_plan_sha256', 'bound_dataset_sha256',
+            'binding_sha256', 'results_sha256', 'results_bytes', 'projection_sha256',
+            'resource_samples_sha256', 'resources_generator', 'runner_status', 'provenance')},
+        'collector': {
+            'metrics_snapshots': len(result.get('collector_metrics') or []),
+            'resource_samples': len(result.get('resource_samples') or []),
+            'generator_samples': len(result.get('collector_generator_samples') or []),
+            'errors': list(result.get('collector_errors') or []),
+            'generator_csv': generator_csv,
+        },
+        'result': result,
+        'full_p8_accepted': False, 'physical_ab': 'NOT RUN',
+    }
+    report_path = artifacts / f'{stem}-phase.json'
+    durable_json(report_path, summary)
+    result['report'] = str(report_path)
+    return {
+        'phase_id': phase,
+        'workload_outcome': 'VALIDATED',
+        'validation_valid': True,
+        'validation_failures': [],
+        'results_sha256': imported['results_sha256'],
+        'report': str(report_path),
+    }
+
+
+def paper_p8_e5_finalize_report(smoke, fixture, prepared, final_state, *, cleanup_verified):
+    """Build and persist the E5 final artifact without ever claiming acceptance.
+
+    A never-begun preparation keeps its PREPARATION_ONLY artifact. A partial run
+    is written as INCOMPLETE/FAIL, never as NOT_RUN.
+    """
+    import paper_p8_e5_import as e5_import
+    import paper_p8_e5_remote as e5_remote
+    artifacts = Path(fixture.artifacts)
+    artifact_path = artifacts / paper_p8_e5_artifact_name(fixture)
+    state = final_state if isinstance(final_state, dict) else {}
+    history = list(state.get('phase_history') or [])
+    phase_results = prepared.get('phase_results') or {}
+    # Executed phases follow the immutable plan order, never alphabetical order,
+    # so the artifact stays comparable with the declared phase plan.
+    expected = ['initial', 'warm_replay', 'control']
+    observed = set(history) | set(phase_results)
+    executed = [phase for phase in expected if phase in observed] + sorted(
+        observed - set(expected))
+    base = {
+        'schema_version': 1, 'experiment': 'E5', 'arm': prepared.get('arm'),
+        'session_id': prepared.get('session_id'), 'status': 'FAIL',
+        'workload_status': 'INCOMPLETE', 'phase_history': history,
+        'executed_phases': executed, 'cleanup_verified': bool(cleanup_verified),
+        'full_p8_accepted': False, 'physical_ab': 'NOT RUN', 'reason': None,
+    }
+    if history != expected or set(phase_results) != set(expected):
+        base['reason'] = 'e5_incomplete_phase_history'
+        durable_json(artifact_path, base)
+        return base
+    try:
+        receipts = {phase: e5_import.read_receipt(fixture.private, phase)
+                    for phase in expected}
+        control = phase_results['control']
+        projection = control.get('b_projection') or {}
+        correlation = e5_remote.expected_viewer_correlation(prepared, receipts, projection)
+        continuous = e5_remote.validate_continuous_viewer(
+            projection.get('viewer'), prepared['context'], phase_results['initial'],
+            phase_results['initial'].get('ws_window'),
+            phase_results['warm_replay'].get('ws_window'), control.get('ws_window'),
+            control.get('admin_after'),
+            readiness_projection=projection.get('readiness_projection'),
+            lifecycle_proof=projection.get('lifecycle_proof'),
+            expected_correlation=correlation)
+        declared = e5_remote.build_b_declared(
+            smoke, prepared, control, expected_correlation=correlation)
+        report = e5_remote.finalize(
+            smoke, fixture, prepared, phase_results, continuous,
+            b_declared=declared, cleanup_verified=bool(cleanup_verified),
+            expected_correlation=correlation)
+    except (ValueError, OSError, KeyError) as exc:
+        base['reason'] = str(exc.args[0])[:120] if exc.args else 'e5_finalize_failed'
+        durable_json(artifact_path, base)
+        return base
+    report['phase_history'] = history
+    report['executed_phases'] = executed
+    report['cleanup_outcome'] = state.get('cleanup_outcome')
+    durable_json(artifact_path, report)
+    return report
+
+
+def paper_p8_e5_post_cleanup_artifact(fixture, *, p8_path, staged_e5, remote_outcome, failure,
+                                      cleanup_verified, cleanup_counts):
+    """Resolve, merge and persist the E5 artifact during post-cleanup in startup_only."""
+    staged_path = Path(staged_e5)
+    artifact_path = Path(p8_path)
+    if staged_path.exists():
+        p8 = json.loads(staged_path.read_text())
+    elif artifact_path.exists():
+        p8 = json.loads(artifact_path.read_text())
+    else:
+        p8 = {}
+
+    is_prepare_only = bool(getattr(fixture, 'paper_p8_prepare_only', False))
+
+    if not p8.get('workload_status'):
+        p8['workload_status'] = p8.get('status', remote_outcome if is_prepare_only else 'NOT_RUN')
+    p8['lane_marker'] = 'PAPER_P8_E5_ARM_PILOT'
+    p8['full_p8_accepted'] = False
+    p8['exact_cleanup_verified'] = cleanup_verified
+    p8['cleanup_counts'] = cleanup_counts
+
+    p8.update(cleanup_verified=cleanup_verified, exact_cleanup_verified=cleanup_verified,
+              cleanup_counts=cleanup_counts)
+    if is_prepare_only and (p8.get('status') == 'PREPARATION_ONLY' or remote_outcome == 'NOT_RUN'):
+        p8['status'] = 'PREPARATION_ONLY' if (not failure and cleanup_verified and remote_outcome == 'NOT_RUN' and p8.get('status') == 'PREPARATION_ONLY') else 'FAIL'
+    else:
+        arm = p8.get('arm') or getattr(fixture, 'paper_p8_e5', None)
+        p8_accepted = bool(not failure and cleanup_verified
+                           and paper_p8_e5_acceptance(p8, {'arm': arm}, cleanup_verified))
+        p8['status'] = 'PASS' if p8_accepted else 'FAIL'
+
+    durable_json(artifact_path, p8)
+    return p8
 
 
 def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
@@ -4339,6 +5107,23 @@ def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
 def paper_p8_e3_artifact_name(fixture):
     low_load = getattr(fixture, 'paper_p8_e3_workload', 'mixed') == 'low_load'
     return f"p8-e3-{fixture.paper_p8_e3}{'-low-load' if low_load else ''}.json"
+
+
+def paper_p8_e3_selector(args):
+    if args.p8_e3_prepare_hold:
+        return args.p8_arm
+    return args.paper_p8_e3
+
+
+def paper_p8_e3_lifecycle_outcome_accepted(state):
+    """Only preparation-only closure or imported, validated workload may exit zero."""
+    if not isinstance(state, dict) or state.get('phase') != 'CLOSED':
+        return False
+    outcome = state.get('workload_outcome')
+    if outcome == 'NOT_RUN':
+        return state.get('collector_ready') is not True and state.get('begun_at') is None
+    imported = state.get('imported_result')
+    return outcome == 'VALIDATED' and isinstance(imported, dict) and imported.get('validation_valid') is True
 
 
 def paper_p7_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
@@ -4993,6 +5778,35 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", type=Path, required=True, help="New private fixture directory, outside artifacts")
     parser.add_argument('--startup-only', action='store_true', help='Real phased stack startup; HTTP acceptance remains closed')
+    parser.add_argument('--p8-lifecycle-hold', action='store_true',
+                        help='P8 foreground hold; isolated E1-E4 preparation paths')
+    parser.add_argument('--p8-e1-prepare-hold', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e1-bundle-root', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-prepare-hold', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-bundle-root', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-samples-per-message', choices=('100', '1'), help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e3-prepare-hold', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e3-bundle-root', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e3-workload', choices=('low_load', 'mixed'), help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-prepare-hold', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-bundle-root', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-cache-mode', choices=('on', 'off'), default='on', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-cold-replay', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-durable-reopen', action='store_true',
+                        help='include sequential durable Gateway SQLite fault-stop/reopen phases after base E4 phases')
+    parser.add_argument('--p8-e4-conflicts', action='store_true',
+                        help='include representative conflict rejection phase after base/durable phases')
+    parser.add_argument('--p8-e5-prepare-hold', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e5-bundle-root', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e5-context', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e5-reference', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-experiment', choices=('E1', 'E2', 'E3', 'E4', 'E5'), default='E1')
+    parser.add_argument('--p8-arm', default='lifecycle')
+    parser.add_argument('--p8-seed', type=int, default=0)
+    parser.add_argument('--p8-deadline-seconds', type=float, default=900)
+    parser.add_argument('--p8-remote-config', type=Path,
+                        help='Strict opt-in private IPv4 LAN profile JSON for isolated P8 server startup')
     parser.add_argument('--positive-http-only', action='store_true', help='Phased stack startup and positive HTTP login/admin/owner sensor test only')
     parser.add_argument('--role-http-only', action='store_true', help='Phased startup, positive slice, and bounded role denials; JWT acceptance remains false')
     parser.add_argument('--full-http', action='store_true', help='Phased startup, positive proofs, role and JWT denials, and exact cleanup acceptance')
@@ -5040,6 +5854,70 @@ def main():
                         help='P6 dispatch arm; only valid with --paper-p6')
     parser.add_argument('--metrics-off', action='store_true', help='P1 overhead control: no new instrumentation or scraper')
     args = parser.parse_args()
+    remote_profile = None
+    if args.p8_remote_config is not None:
+        if not args.p8_lifecycle_hold:
+            parser.error('--p8-remote-config requires --p8-lifecycle-hold')
+        try:
+            remote_profile = paper_p8_remote_support().load_config(args.p8_remote_config)
+            paper_p8_remote_support().preflight_bind(remote_profile)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.p8_lifecycle_hold:
+        if any((args.paper_p0, args.paper_p1, args.paper_p2_spike, args.paper_p2, args.paper_p7,
+                args.paper_p3, args.paper_p4, args.paper_p5a, args.paper_p5b, args.paper_p6,
+                args.paper_p8_sessions, args.paper_p8_slow_viewer, args.paper_p8_load, args.paper_p8_e1,
+                args.paper_p8_e2, args.paper_p8_e3, args.paper_p8_e4, args.paper_p8_e5,
+                args.paper_p8_recovery, args.paper_p8_e3_low_load,
+                args.startup_only, args.positive_http_only, args.role_http_only,
+                args.full_http, args.metrics_off, args.mode, args.dataset, args.cache_mode,
+                args.dispatch_mode, args.paper_p7_mode, args.paper_p5a_shutdown_smoke,
+                args.paper_p5b_cache_smoke, args.p6_recovery_smoke, args.p5a_control_regression,
+                args.p5b_control_regression)):
+            parser.error('--p8-lifecycle-hold cannot be combined with another fixture lane')
+        if args.p8_e1_prepare_hold and (args.p8_experiment != 'E1' or args.p8_e1_bundle_root is None):
+            parser.error('--p8-e1-prepare-hold requires E1 and --p8-e1-bundle-root')
+        if args.p8_e2_prepare_hold and (args.p8_experiment != 'E2' or args.p8_e2_bundle_root is None
+                or args.p8_e2_samples_per_message is None):
+            parser.error('--p8-e2-prepare-hold requires E2, --p8-e2-bundle-root and an explicit sample profile')
+        if args.p8_e3_prepare_hold and (args.p8_experiment != 'E3' or args.p8_e3_bundle_root is None
+                or args.p8_arm not in ('polling', 'wakeup') or args.p8_e3_workload is None):
+            parser.error('--p8-e3-prepare-hold requires E3, dispatch arm, workload and bundle root')
+        if args.p8_e4_prepare_hold and (args.p8_experiment != 'E4' or args.p8_e4_bundle_root is None
+                or args.p8_arm != 'warm' or args.p8_remote_config is None):
+            parser.error('--p8-e4-prepare-hold requires E4 warm arm, remote config and bundle root')
+        if args.p8_e4_cold_replay and (not args.p8_e4_prepare_hold
+                or args.p8_e4_cache_mode != 'on' or args.p8_experiment != 'E4'):
+            parser.error('--p8-e4-cold-replay requires E4 prepare hold and cache mode on')
+        if args.p8_e4_durable_reopen and (not args.p8_e4_prepare_hold or args.p8_experiment != 'E4'):
+            parser.error('--p8-e4-durable-reopen requires E4 prepare hold')
+        if args.p8_e4_conflicts and (not args.p8_e4_prepare_hold or args.p8_experiment != 'E4'):
+            parser.error('--p8-e4-conflicts requires E4 prepare hold')
+        if args.p8_e5_prepare_hold and (args.p8_experiment != 'E5' or args.p8_e5_bundle_root is None
+                or args.p8_arm not in ('optimized', 'shaper_off', 'microbatch_off', 'ram_dedup_off', 'polling', 'fanout_scan')
+                or args.p8_e5_context is None or args.p8_remote_config is None
+                or (args.p8_arm != 'optimized' and args.p8_e5_reference is None)
+                or (args.p8_arm == 'optimized' and args.p8_e5_reference is not None)):
+            parser.error('--p8-e5-prepare-hold requires E5, valid arm, remote config, context, and reference for ablation only')
+        if sum((args.p8_e1_prepare_hold, args.p8_e2_prepare_hold,
+                args.p8_e3_prepare_hold, args.p8_e4_prepare_hold,
+                args.p8_e5_prepare_hold)) > 1:
+            parser.error('only one P8 experiment may use lifecycle hold')
+        if (not math.isfinite(args.p8_deadline_seconds) or not 1 <= args.p8_deadline_seconds <= 86400
+                or not -(2**31) <= args.p8_seed < 2**31
+                or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', args.p8_arm)):
+            parser.error('invalid P8 lifecycle arm/deadline')
+    elif (args.p8_e1_prepare_hold or args.p8_e1_bundle_root is not None
+          or args.p8_e2_prepare_hold or args.p8_e2_bundle_root is not None
+          or args.p8_e2_samples_per_message is not None or args.p8_e3_prepare_hold
+          or args.p8_e3_bundle_root is not None or args.p8_e3_workload is not None
+          or args.p8_e4_prepare_hold or args.p8_e4_bundle_root is not None
+          or args.p8_e5_prepare_hold or args.p8_e5_bundle_root is not None
+          or args.p8_e5_context is not None or args.p8_e5_reference is not None):
+        parser.error('P8 E1/E2/E3/E4/E5 prepare hold requires --p8-lifecycle-hold')
+    elif (args.p8_remote_config is not None or args.p8_experiment != 'E1' or args.p8_arm != 'lifecycle' or args.p8_seed != 0
+          or args.p8_deadline_seconds != 900):
+        parser.error('P8 lifecycle metadata requires --p8-lifecycle-hold')
     if args.paper_p8_e3_low_load and args.paper_p8_e3 is None:
         parser.error('--paper-p8-e3-low-load requires --paper-p8-e3 polling|wakeup')
     if (args.paper_p8_sessions or args.paper_p8_slow_viewer or args.paper_p8_load or args.paper_p8_e1 or args.paper_p8_e2 or args.paper_p8_e3 or args.paper_p8_e4 or args.paper_p8_e5 or args.paper_p8_recovery) and any((args.paper_p8_e3 is not None and args.paper_p8_e1, args.paper_p0, args.paper_p1, args.paper_p2_spike,
@@ -5136,7 +6014,7 @@ def main():
         fixture = prepare(args.prepare, paper_p0=args.paper_p0,
                           paper_p1=args.mode if args.paper_p1 else None,
                           metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike,
-                          paper_p2=args.paper_p2, paper_p7=args.paper_p7,
+                           paper_p2=args.paper_p2 or remote_profile is not None, paper_p7=args.paper_p7,
                           paper_p7_mode=args.paper_p7_mode, paper_p3=args.paper_p3,
                            paper_p3_microbatch=args.p5a_control_regression,
                            paper_p5b_control_regression=args.p5b_control_regression,
@@ -5149,17 +6027,29 @@ def main():
                                   (args.dispatch_mode, args.dataset) if args.paper_p6 else None),
                              paper_p8_sessions=args.paper_p8_sessions,
                              paper_p8_slow=args.paper_p8_slow_viewer,
-                             paper_p8_load=args.paper_p8_load,
-                               paper_p8_e1=args.paper_p8_e1,
-                               paper_p8_e2=args.paper_p8_e2,
-                                 paper_p8_e3=args.paper_p8_e3,
-                                 paper_p8_e3_workload='low_load' if args.paper_p8_e3_low_load else 'mixed',
-                                 paper_p8_e4=args.paper_p8_e4,
-                                  paper_p8_e5=args.paper_p8_e5, paper_p8_e5_context=args.paper_p8_e5_context,
-                             paper_p8_e5_reference=args.paper_p8_e5_reference,
-                                  paper_p8_recovery=args.paper_p8_recovery)
+                              paper_p8_load=args.paper_p8_load,
+                                 paper_p8_e1=(args.paper_p8_e1 or args.p8_e1_prepare_hold),
+                                 paper_p8_e2=(args.paper_p8_e2 or args.p8_e2_prepare_hold),
+                                   paper_p8_e3=paper_p8_e3_selector(args),
+                                  paper_p8_e3_workload=(args.p8_e3_workload if args.p8_e3_prepare_hold else
+                                      'low_load' if args.paper_p8_e3_low_load else 'mixed'),
+                                  paper_p8_e4=(args.paper_p8_e4 or
+                                      args.p8_e4_cache_mode if args.p8_e4_prepare_hold else args.paper_p8_e4),
+                                  paper_p8_e5=(args.paper_p8_e5 or (args.p8_arm if args.p8_e5_prepare_hold else None)),
+                                  paper_p8_e5_context=(args.paper_p8_e5_context or (args.p8_e5_context if args.p8_e5_prepare_hold else None)),
+                                  paper_p8_e5_reference=(args.paper_p8_e5_reference or (args.p8_e5_reference if args.p8_e5_prepare_hold else None)),
+                                  paper_p8_recovery=args.paper_p8_recovery,
+                          remote_network_config=remote_profile)
         if fixture.paper_p6:
             object.__setattr__(fixture, 'paper_p6_recovery_smoke', args.p6_recovery_smoke)
+        object.__setattr__(fixture, 'paper_p8_prepare_only',
+                           args.p8_e1_prepare_hold or args.p8_e2_prepare_hold
+                           or args.p8_e3_prepare_hold or args.p8_e4_prepare_hold
+                           or args.p8_e5_prepare_hold)
+        object.__setattr__(fixture, 'paper_p8_e3_prepare_only', args.p8_e3_prepare_hold)
+        object.__setattr__(fixture, 'paper_p8_e4_prepare_only', args.p8_e4_prepare_hold)
+        object.__setattr__(fixture, 'paper_p8_e4_cold_replay', args.p8_e4_cold_replay)
+        object.__setattr__(fixture, 'paper_p8_e5_prepare_only', args.p8_e5_prepare_hold)
     except BaseException as exc:
         report = {
             "schema_version": 1,
@@ -5184,6 +6074,505 @@ def main():
         return 1
 
     try:
+        if args.p8_lifecycle_hold:
+            import paper_p8_supervisor as supervisor
+            lock = supervisor.acquire_lock(fixture.private)
+            session = {}
+            def hold_ready_fixture(*, fixture, registry, containers, images, evidence, endpoint, state,
+                                   paperload_binary):
+                receipts = [{key: item.get(key) for key in ('kind', 'name', 'image', 'labels',
+                            'task', 'run', 'nonce', 'receipt', 'allocation_attempted')}
+                            for item in registry.items]
+                prepared_bundle = None
+                if (args.p8_e1_prepare_hold or args.p8_e2_prepare_hold
+                        or args.p8_e3_prepare_hold or args.p8_e4_prepare_hold
+                        or args.p8_e5_prepare_hold):
+                    helper = paper_p8_e1_support()
+                    session_id = secrets.token_hex(16)
+                    experiment = args.p8_experiment
+                    bundle_root = (args.p8_e1_bundle_root if experiment == 'E1' else
+                                    args.p8_e2_bundle_root if experiment == 'E2' else
+                                    args.p8_e3_bundle_root if experiment == 'E3' else
+                                    args.p8_e4_bundle_root if experiment == 'E4' else
+                                    args.p8_e5_bundle_root)
+                    if experiment == 'E1':
+                        prepared = helper.prepare(sys.modules[__name__], fixture, endpoint, registry,
+                            containers, images, state, session_id=session_id, phase='pilot',
+                            mode='remote', arm=args.p8_arm,
+                            output_root=fixture.private / 'p8-e1-prepared')
+                        prepared_bundle = helper.export_prepared_bundle(prepared,
+                            output_leaf=bundle_root, wait_seconds=90, workload_seconds=30)
+                    elif experiment == 'E2':
+                        e2 = paper_p8_e2_support()
+                        prepared = e2.prepare_remote(sys.modules[__name__], fixture, endpoint, registry,
+                            containers, images, state, session_id=session_id,
+                            samples_per_message=int(args.p8_e2_samples_per_message),
+                            output_root=fixture.private / f'p8-e2-prepared-{args.p8_e2_samples_per_message}',
+                            bundle_root=bundle_root, arm=args.p8_arm)
+                        prepared_bundle = prepared['bundle']
+                        prepared['e2_support'] = e2
+                    elif experiment == 'E3':
+                        e3 = paper_p8_e3_support()
+                        prepared = e3.prepare(sys.modules[__name__], fixture, endpoint, registry,
+                            containers, images, state, arm=args.p8_arm,
+                            workload=args.p8_e3_workload, remote_profile=remote_profile,
+                            session_id=session_id)
+                        prepared_bundle = e3.export_prepared_bundle(prepared, output_leaf=bundle_root)
+                        prepared['e3_support'] = e3
+                        durable_json(fixture.artifacts / paper_p8_e3_artifact_name(fixture), {
+                            'schema_version': 1, 'status': 'PREPARATION_ONLY',
+                            'workload_status': 'NOT_RUN', 'experiment': 'E3',
+                            'arm': args.p8_arm, 'workload': args.p8_e3_workload,
+                            'run_id': prepared['run_id'], 'session_id': session_id,
+                            'phase_id': prepared['phase_id'], 'profile': prepared['profile'],
+                            'effective_flags': e3._validate_e3_fixture_flags(
+                                prepared['effective'], prepared['arm']),
+                            'full_p8_accepted': False, 'generator_colocated': True,
+                            'physical_ab': 'NOT RUN'})
+                    if experiment == 'E4':
+                        bundle_parent = Path(bundle_root).absolute().parent
+                        if any(item.is_symlink() for item in (bundle_parent, *bundle_parent.parents)):
+                            raise ValueError('p8_e4_bundle_parent_symlink_rejected')
+                        bundle_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        bundle_parent_stat = bundle_parent.stat()
+                        if (bundle_parent_stat.st_uid != os.getuid()
+                                or bundle_parent_stat.st_mode & 0o077):
+                            raise ValueError('p8_e4_bundle_parent_permissions_rejected')
+                        e4 = paper_p8_e4_support()
+                        prepared = e4.prepare(sys.modules[__name__], fixture, endpoint, registry,
+                            containers, images, state, args.p8_e4_cache_mode,
+                            remote_profile=remote_profile, session_id=session_id,
+                            include_cold_replay=args.p8_e4_cold_replay,
+                            include_durable_reopen=args.p8_e4_durable_reopen,
+                            include_conflicts=args.p8_e4_conflicts)
+                        prepared_bundle = e4.export_prepared_bundle(prepared, output_leaf=bundle_root)
+                        prepared['e4_support'] = e4
+                        phase_names = ('unique', 'replay', 'cold-replay') if prepared.get('include_cold_replay') else ('unique', 'replay')
+                        prepared['phase_run_ids'] = {phase: json.loads(path.read_text())['run_id']
+                            for phase, path in zip(phase_names, prepared['manifests'])}
+                        phase_metadata = paper_p8_e4_preparation_metadata(prepared['phase_run_ids'])
+                        prepared['bundle_root'] = Path(bundle_root)
+                        object.__setattr__(fixture, 'paper_p8_e4_remote_warm', True)
+                        durable_json(fixture.artifacts / paper_p8_e4_artifact_name(fixture), {
+                            'schema_version': 1, 'status': 'PREPARATION_ONLY',
+                            'workload_status': 'NOT_RUN', 'experiment': 'E4',
+                            'arm': prepared['arm'], 'cache_mode': prepared['cache_mode'],
+                            'run_id': prepared['run_id'], 'session_id': session_id,
+                            'phase_id': prepared['phase_id'], 'profile': prepared['profile'],
+                            'mode': prepared['mode'], 'schema': prepared['schema'],
+                            'quota': prepared['quota'], 'effective_flags': prepared['effective_flags'],
+                            **phase_metadata, 'viewer_experiment': 'E1',
+                            'journal_binding': 'same B-owned outputs/e4-journal.sqlite reference',
+                            'coldrestart': 'NOT RUN', 'durable_gateway_reopen': 'NOT RUN',
+                            'conflicts': 'NOT RUN', 'full_p8_accepted': False,
+                            'generator_colocated': True, 'physical_ab': 'NOT RUN'})
+                    elif experiment == 'E5':
+                        bundle_parent = Path(bundle_root).absolute().parent
+                        if any(item.is_symlink() for item in (bundle_parent, *bundle_parent.parents)):
+                            raise ValueError('p8_e5_bundle_parent_symlink_rejected')
+                        bundle_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        bundle_parent_stat = bundle_parent.stat()
+                        if (bundle_parent_stat.st_uid != os.getuid()
+                                or bundle_parent_stat.st_mode & 0o077):
+                            raise ValueError('p8_e5_bundle_parent_permissions_rejected')
+                        import paper_p8_e5_remote as e5_remote
+                        prepared = e5_remote.prepare(
+                            sys.modules[__name__], fixture, endpoint, registry,
+                            containers, images, state, arm=args.p8_arm,
+                            context_path=args.p8_e5_context,
+                            reference_path=args.p8_e5_reference,
+                            remote_profile=remote_profile,
+                        )
+                        prepared['session_id'] = session_id
+                        prepared['phase_id'] = 'initial'
+                        initial_manifest = json.loads(Path(prepared['manifests']['initial']).read_text())
+                        prepared['run_id'] = initial_manifest['run_id']
+                        prepared_bundle = e5_remote.export_prepared_bundle(
+                            prepared, output_leaf=bundle_root,
+                            deadline_seconds=args.p8_deadline_seconds,
+                            session_id=session_id,
+                        )
+                        prepared['bundle_root'] = Path(bundle_root)
+                        object.__setattr__(fixture, 'paper_p8_e5', args.p8_arm)
+                        durable_json(fixture.artifacts / paper_p8_e5_artifact_name(fixture), {
+                            'schema_version': 1, 'status': 'PREPARATION_ONLY',
+                            'workload_status': 'NOT_RUN', 'experiment': 'E5',
+                            'arm': prepared['arm'],
+                            'run_id': prepared['run_id'], 'session_id': session_id,
+                            'phase_id': 'initial', 'schema': prepared['schema'],
+                            'quota': prepared['quota'], 'effective_flags': prepared['effective_flags'],
+                            'full_p8_accepted': False, 'physical_ab': 'NOT RUN'})
+                    prepared['bundle_sha256'] = hashlib.sha256(
+                        (Path(bundle_root) / 'bundle.json').read_bytes()).hexdigest()
+                    bundle_metadata = json.loads((Path(bundle_root) / 'bundle.json').read_text())
+                    prepared['bundle_inventory'] = [{'path':row['path'],'sha256':row['sha256']}
+                                                    for row in bundle_metadata['inputs']]
+                    prepared['bundle_session'] = bundle_metadata['session']
+                    session['prepared'] = prepared
+                    artifacts = [{'kind': 'client_bundle', 'path': str(bundle_root),
+                                  'session_id': session_id, 'run_id': prepared['run_id'],
+                                  'phase': 'pilot' if experiment == 'E1' else prepared['phase_id'],
+                                    'manifest_count': (4 if experiment == 'E5' else
+                                        phase_metadata['manifest_count'] if experiment == 'E4'
+                                        else 3 if experiment == 'E3' else 2), 'gateways': 2,
+                                  'sensors': 2 if experiment in ('E2', 'E4', 'E5') else 4,
+                                   'users': 2 if experiment in ('E1', 'E4', 'E5') else 0,
+                                   'viewers': 2 if experiment in ('E4', 'E5') else 64 if experiment == 'E1' else 0,
+                                  'file_count': prepared_bundle['file_count'],
+                                  'total_bytes': prepared_bundle['total_bytes'],
+                                  'sha256': prepared['bundle_sha256'],
+                                  'schema': prepared['schema'],
+                                  'quota': prepared['quota'],
+                                  **({'dispatch_mode': prepared['arm'],
+                                      'workload': prepared['workload'],
+                                      'executor_count': len(prepared['gateway_env_files']),
+                                      'executor_gateway_ids': [
+                                          json.loads(Path(p).read_text())['GATEWAY_ID']
+                                          for p in prepared['gateway_env_files']],
+                                      'executor_client_ids': [
+                                          json.loads(Path(p).read_text())['GATEWAY_MQTT_CLIENT_ID']
+                                          for p in prepared['gateway_env_files']]}
+                                     if experiment == 'E3' else {}),
+                                  'effective_flags': (helper.safe_effective_flags(prepared['effective'])
+                                      if experiment == 'E1' else
+                                      prepared['e2_support']._validate_fixture_flags(prepared['effective'])
+                                       if experiment == 'E2' else
+                                       prepared['e3_support']._validate_e3_fixture_flags(
+                                           prepared['effective'], prepared['arm']) if experiment == 'E3' else
+                                       prepared['effective_flags']),
+                                  'storage_status': prepared['storage']['status'] if isinstance(prepared.get('storage'), dict) else prepared.get('storage_status', 'healthy')}]
+                    session['state'] = supervisor.initialize(fixture.private,
+                        experiment=experiment, arm=args.p8_arm, seed=args.p8_seed,
+                        deadline_seconds=args.p8_deadline_seconds, receipts=receipts,
+                        image_metadata=images, artifacts=artifacts,
+                        preparation_status=f'{experiment}_PREPARED', session_id=session_id,
+                        source_metadata={'revision': paper_p0_git(fixture, 'rev-parse', 'HEAD'),
+                            'dirty_worktree': bool(paper_p0_git(fixture, 'status', '--porcelain')),
+                            'qualification': 'local source and dirty state; not a release provenance claim'},
+                        endpoint_metadata={'https': remote_profile['advertised_https'],
+                            'mqtt_tls': remote_profile['advertised_mqtt_tls'],
+                            'bind_ip': remote_profile['bind_ip']},
+                        project=fixture.project, lock=lock,
+                        cold_replay_enabled=args.p8_e4_cold_replay,
+                        e4_phase_plan=(['unique','replay']
+                            + (['cold-replay'] if args.p8_e4_cold_replay else [])
+                            + (['durable-fault','durable-reopen'] if args.p8_e4_durable_reopen else [])
+                            + (['conflicts'] if args.p8_e4_conflicts else [])) if experiment == 'E4' else None,
+                        e5_phase_plan=['initial', 'warm_replay', 'control'] if experiment == 'E5' else None)
+                else:
+                    session['state'] = supervisor.initialize(fixture.private, experiment=args.p8_experiment,
+                        arm=args.p8_arm, seed=args.p8_seed, deadline_seconds=args.p8_deadline_seconds,
+                        receipts=receipts, image_metadata=images,
+                        endpoint_metadata=({'https': remote_profile['advertised_https'],
+                            'mqtt_tls': remote_profile['advertised_mqtt_tls'],
+                            'bind_ip': remote_profile['bind_ip']} if remote_profile else {}),
+                        project=fixture.project, lock=lock)
+                if paper_p8_hold_callbacks_required(args):
+                    def begin_collection(request):
+                        if experiment == 'E5':
+                            return paper_p8_e5_begin_phase(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, request.get('phase_id'))
+                        if experiment == 'E4':
+                            if request.get('phase_id') == 'conflicts':
+                                return prepared['e4_support'].begin_remote_conflicts_phase(
+                                    sys.modules[__name__], fixture, registry, prepared)
+                            if request.get('phase_id') in ('durable-fault','durable-reopen'):
+                                return prepared['e4_support'].begin_remote_durable_phase(
+                                    sys.modules[__name__], registry, prepared, request['phase_id'])
+                            if request.get('phase_id') not in ('unique', 'replay', 'cold-replay'):
+                                raise ValueError('p8_e4_phase_id_rejected')
+                            return prepared['e4_support'].begin_remote_phase(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, request['phase_id'])
+                        if experiment == 'E3':
+                            if request.get('phase_id') != prepared['phase_id']:
+                                raise ValueError('e3_phase_id_mismatch')
+                            return paper_p8_e3_support().begin_remote_collection(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, phase_id=request['phase_id'])
+                        if experiment == 'E1':
+                            if request.get('phase_id') != 'pilot':
+                                raise ValueError('e1_phase_id_mismatch')
+                            return paper_p8_e1_support().begin_remote_collection(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, phase_id=request['phase_id'])
+                        return prepared['e2_support'].begin_remote_collection(
+                            sys.modules[__name__], fixture, endpoint, registry, containers,
+                            prepared, phase_id=request['phase_id'])
+                    def replace_for_cold_replay(request, session_state):
+                        if (experiment != 'E4' or request.get('phase_id') != 'cold-replay'
+                                or prepared.get('include_cold_replay') is not True
+                                or prepared.get('cache_mode') != 'on'):
+                            raise ValueError('p8_e4_cold_restart_not_enabled')
+                        warm_window = prepared.get('phase_windows', {}).get('replay', {})
+                        old_metrics = warm_window.get('admin_after') if isinstance(warm_window, dict) else None
+                        old_process = old_metrics.get('process_instance') if isinstance(old_metrics, dict) else None
+                        if not old_process:
+                            raise ValueError('p8_e4_cold_old_process_unavailable')
+                        replacement = prepared['e4_support']._cold.replace_owned_backend(
+                            sys.modules[__name__], fixture, registry, containers, state)
+                        receipts = [{key: item.get(key) for key in ('kind', 'name', 'image', 'labels',
+                            'task', 'run', 'nonce', 'receipt', 'allocation_attempted')}
+                            for item in registry.items]
+                        supervisor.refresh_owned_receipts(fixture.private, session_state, receipts)
+                        durable_json(fixture.private / 'resource-receipts.json', [
+                            {key: (str(value) if isinstance(value, Path) else value)
+                             for key, value in item.items()} for item in registry.items])
+                        deadline = time.monotonic() + 45
+                        last_metrics = None
+                        while time.monotonic() < deadline:
+                            state.checkpoint()
+                            try:
+                                last_metrics = prepared['e4_support']._support._admin_metrics(
+                                    sys.modules[__name__], endpoint, prepared['tokens']['admin'])
+                            except (OSError, ValueError):
+                                time.sleep(.5)
+                                continue
+                            cache = last_metrics.get('ram_dedup') if isinstance(last_metrics, dict) else None
+                            if (last_metrics.get('process_instance') != old_process
+                                    and isinstance(cache, dict) and type(cache.get('entries')) is int
+                                    and cache.get('entries') == 0):
+                                break
+                            time.sleep(.5)
+                        cache = last_metrics.get('ram_dedup') if isinstance(last_metrics, dict) else None
+                        if (not isinstance(last_metrics, dict)
+                                or last_metrics.get('process_instance') == old_process
+                                or not isinstance(cache, dict) or type(cache.get('entries')) is not int
+                                or cache.get('entries') != 0):
+                            raise ValueError('p8_e4_cold_replacement_readiness_unproven')
+                        proof = {'replacement': replacement['replacement'],
+                            'old_process_instance': old_process,
+                            'process_instance': last_metrics['process_instance'],
+                            'cache_entries': cache['entries'], 'metrics_readback': True}
+                        prepared['cold_old_metrics'] = old_metrics
+                        prepared['cold_replacement_proof'] = proof
+                        session_state['replacement_proof'] = proof
+                        return {'replacement_verified': True, 'receipts': receipts,
+                                'replacement_proof': proof}
+                    def finish_import(request):
+                        if experiment == 'E5':
+                            return paper_p8_e5_finish_phase(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, request.get('results'), fixture.artifacts,
+                                request.get('phase_id'))
+                        if experiment == 'E4':
+                            phase = request.get('phase_id')
+                            if phase == 'conflicts':
+                                result = prepared['e4_support'].finish_remote_conflicts_phase(
+                                    sys.modules[__name__], fixture, registry, prepared,
+                                    request.get('results'))
+                                report_path = fixture.artifacts / f'p8-e4-{prepared["cache_mode"]}-conflicts-phase.json'
+                                durable_json(report_path, {'schema_version':1,'experiment':'E4',
+                                    'session_id':session_id,'run_id':prepared['run_id'],
+                                    'result':result,'full_p8_accepted':False,'physical_ab':'NOT RUN'})
+                                result['report'] = str(report_path)
+                                return result
+                            if phase in ('durable-fault','durable-reopen'):
+                                result = prepared['e4_support'].finish_remote_durable_phase(
+                                    sys.modules[__name__], fixture, registry, prepared,
+                                    request.get('results'), phase=phase)
+                                report_path = fixture.artifacts / f'p8-e4-{prepared["cache_mode"]}-{phase}-phase.json'
+                                durable_json(report_path, {'schema_version':1,'experiment':'E4',
+                                    'session_id':session_id,'run_id':prepared['durable_probe']['run_id'],
+                                    'result':result,'full_p8_accepted':False,'physical_ab':'NOT RUN'})
+                                result['report'] = str(report_path)
+                                return result
+                            result = prepared['e4_support'].finish_remote_phase(
+                                sys.modules[__name__], fixture, endpoint, registry, containers,
+                                prepared, request.get('results'), phase=phase)
+                            report_path = fixture.artifacts / f'p8-e4-{prepared["cache_mode"]}-{phase}-phase.json'
+                            phase_data = prepared.get('phase_results', {}).get(phase, {})
+                            durable_json(report_path, {'schema_version': 1, 'experiment': 'E4',
+                                'phase': phase, 'session_id': session_id,
+                                'run_id': prepared['phase_run_ids'][phase],
+                                'cache_mode': prepared['cache_mode'], 'result': result,
+                                'telemetry': (phase_data.get('telemetry') or {}).get('telemetry'),
+                                'viewer': {key: phase_data.get('viewer', {}).get(key) for key in
+                                    ('connected_distinct_viewers', 'subscribed_distinct_viewers',
+                                      'receiving_distinct_viewers', 'unique_events')},
+                                'e4_headers': (phase_data.get('telemetry', {}).get('e4') or {}).get('safe_header_samples', []),
+                                'full_p8_accepted': False, 'physical_ab': 'NOT RUN'})
+                            result['report'] = str(report_path)
+                            return result
+                        if experiment == 'E3':
+                            helper = paper_p8_e3_support()
+                            result = helper.finish_remote_collection(sys.modules[__name__], fixture,
+                                endpoint, registry, containers, prepared, request.get('results'),
+                                phase_id=request['phase_id'], paperload_binary=paperload_binary)
+                            report_path = fixture.artifacts / paper_p8_e3_artifact_name(fixture).replace('.json', '-remote-result.json')
+                            durable_json(report_path, result)
+                            return {'workload_outcome': result['workload_outcome'],
+                                    'validation_valid': result['validation']['valid'],
+                                    'validation_failures': result['validation']['failures'],
+                                    'report': str(report_path)}
+                        helper = paper_p8_e1_support() if experiment == 'E1' else prepared['e2_support']
+                        if experiment == 'E1':
+                            if request.get('phase_id') != 'pilot':
+                                raise ValueError('e1_phase_id_mismatch')
+                            result = helper.finish_remote_collection(sys.modules[__name__], fixture,
+                                endpoint, registry, containers, prepared, request.get('results'),
+                                phase_id=request['phase_id'], paperload_binary=paperload_binary)
+                            report_path = fixture.artifacts / 'p8-e1-remote-result.json'
+                        else:
+                            result = helper.finish_remote_collection(sys.modules[__name__], fixture,
+                                endpoint, registry, containers, prepared, request.get('results'),
+                                phase_id=request['phase_id'], paperload_binary=paperload_binary)
+                            report_path = fixture.artifacts / f'p8-e2-samples-{prepared["samples_per_message"]}-remote-result.json'
+                        durable_json(report_path, {
+                            'schema_version': 1, 'session_id': prepared['session_id'],
+                            'run_id': prepared['run_id'], 'phase_id': request['phase_id'],
+                            'arm': prepared['common']['arm'] if experiment == 'E1' else prepared['arm'],
+                            'experiment': experiment,
+                            'schema': prepared['schema'], 'quota': prepared['quota'],
+                            'effective_flags': (helper.safe_effective_flags(prepared['effective'])
+                                if experiment == 'E1' else helper._validate_fixture_flags(prepared['effective'])),
+                            'source': session['state'].get('source_metadata'),
+                            'images': images, 'bundle_sha256': prepared['bundle_sha256'],
+                            **({'manifest_sha256': [hashlib.sha256(path.read_bytes()).hexdigest()
+                                                for path in prepared['manifest_paths']],
+                                'mapping': prepared['mapping']} if experiment == 'E1' else {}), **result})
+                        if experiment == 'E1':
+                            paper_p8_write_private_csv(fixture.artifacts / 'p8-e1-remote-metrics.csv',
+                            ('phase', 'snapshot_json'), ((row.get('phase'),
+                                json.dumps(row.get('snapshot'), sort_keys=True))
+                                for row in result['collector_metrics']))
+                            paper_p8_write_private_csv(fixture.artifacts / 'p8-e1-remote-resources.csv',
+                            ('phase', 'sample_json'), ((row.get('phase'), json.dumps(row, sort_keys=True))
+                                for row in result['resource_samples']))
+                        return {'workload_outcome':result['workload_outcome'],
+                                'validation_valid':result['validation']['valid'],
+                                'validation_failures':result['validation']['failures'],
+                                'report':str(report_path)}
+                    supervisor.hold(fixture.private, lock=lock,
+                                    on_begin=begin_collection, on_finish=finish_import,
+                                    on_next=replace_for_cold_replay if experiment == 'E4' else None)
+                else:
+                    supervisor.hold(fixture.private, lock=lock)
+            def finalize_session(*, cleanup_verified, cleanup_error, workload_error):
+                if not (fixture.private / 'session.json').exists():
+                    return
+                collector = (session.get('prepared', {}).get('remote_collector')
+                             or session.get('prepared', {}).get('collector'))
+                if collector is not None:
+                    collector.stop(None)
+                for phase_collector in session.get('prepared', {}).get('remote_collectors', {}).values():
+                    phase_collector.stop(None)
+                state = supervisor.read_state(fixture.private)
+                if state.get('phase') != 'FINALIZING':
+                    outcome = state.get('workload_outcome', 'NOT_RUN')
+                    if workload_error and outcome == 'NOT_RUN':
+                        outcome = 'WORKLOAD_FAILED'
+                    state = supervisor.begin_finalizing(fixture.private, outcome)
+                supervisor.finalize(fixture.private, state, cleanup_verified=cleanup_verified,
+                                    cleanup_error=cleanup_error)
+                if getattr(fixture, 'paper_p8_e4_remote_warm', False):
+                    e4 = session.get('prepared', {}).get('e4_support')
+                    prepared = session.get('prepared', {})
+                    final_state = supervisor.read_state(fixture.private)
+                    evidence = e4.finalize_remote_report(prepared, final_state,
+                        cleanup_verified=cleanup_verified, cleanup_counts={})
+                    evidence.update(e4.remote_report_source(sys.modules[__name__], fixture, prepared))
+                    durable_json(fixture.artifacts / paper_p8_e4_artifact_name(fixture), evidence)
+                e5_prepared = session.get('prepared') if args.p8_e5_prepare_hold else None
+                if e5_prepared and (e5_prepared.get('phase_snapshots')
+                                    or (supervisor.read_state(fixture.private).get('phase_history') or [])):
+                    session['e5_final'] = paper_p8_e5_finalize_report(
+                        sys.modules[__name__], fixture, e5_prepared,
+                        supervisor.read_state(fixture.private),
+                        cleanup_verified=cleanup_verified)
+            try:
+                report = startup_only(fixture, hold_callback=hold_ready_fixture,
+                                      finalization_callback=finalize_session)
+            finally:
+                lock.close()
+            e3_lifecycle_ok = True
+            if args.p8_e3_prepare_hold:
+                final_session = supervisor.read_state(fixture.private)
+                e3_lifecycle_ok = paper_p8_e3_lifecycle_outcome_accepted(final_session)
+                report['workload_outcome'] = final_session.get('workload_outcome', 'NOT_RUN')
+                if not e3_lifecycle_ok:
+                    report['status'] = 'FAIL'
+            if args.p8_e4_prepare_hold:
+                final_session = supervisor.read_state(fixture.private)
+                if getattr(fixture, 'paper_p8_e4_remote_warm', False):
+                    expected_phases = (['unique', 'replay', 'cold-replay']
+                        if final_session.get('cold_replay_enabled') is True else ['unique', 'replay'])
+                    durable_enabled = args.p8_e4_durable_reopen
+                    if durable_enabled:
+                        expected_phases += ['durable-fault','durable-reopen']
+                    conflicts_enabled = args.p8_e4_conflicts
+                    if conflicts_enabled:
+                        expected_phases += ['conflicts']
+                    e3_lifecycle_ok = (final_session.get('phase') == 'CLOSED'
+                        and final_session.get('phase_history') == expected_phases
+                        and final_session.get('workload_outcome') == 'VALIDATED'
+                        and final_session.get('cleanup_outcome') == 'VERIFIED')
+                    if durable_enabled:
+                        e3_lifecycle_ok = (e3_lifecycle_ok
+                            and isinstance(final_session.get('imported_result'), dict)
+                            and final_session['imported_result'].get('validation_valid') is True)
+                    if conflicts_enabled:
+                        e3_lifecycle_ok = (e3_lifecycle_ok
+                            and isinstance(final_session.get('imported_result'), dict)
+                            and final_session['imported_result'].get('validation_valid') is True)
+                    cache_off = getattr(fixture, 'paper_p8_e4_cache_mode', 'on') == 'off'
+                    cold_enabled = final_session.get('cold_replay_enabled') is True
+                    cold_status = 'NOT RUN'
+                    if cold_enabled:
+                        finalized = json.loads((fixture.artifacts / paper_p8_e4_artifact_name(fixture)).read_text())
+                        cold_status = paper_p8_e4_cold_restart_status(finalized,
+                            finalized.get('cleanup_verified') is True)
+                        e3_lifecycle_ok = e3_lifecycle_ok and cold_status == 'PASS'
+                    pilot_complete = conflicts_enabled and durable_enabled and cold_enabled
+                    report['workload_outcome'] = (('PILOT_COMPLETE_VALIDATED' if pilot_complete else
+                        'CONFLICTS_SUBSET_VALIDATED' if conflicts_enabled else
+                        'DURABLE_REOPEN_SUBSET_VALIDATED' if durable_enabled else
+                        'COLD_REPLAY_SUBSET_VALIDATED' if cold_enabled else
+                        'CACHE_OFF_SUBSET_VALIDATED' if cache_off else
+                        'WARM_SUBSET_VALIDATED') if e3_lifecycle_ok else final_session.get('workload_outcome'))
+                    report['full_p8_accepted'] = False
+                    report['coldrestart'] = (cold_status if cold_enabled else
+                        'NOT APPLICABLE' if cache_off else 'NOT RUN')
+                    if not durable_enabled:
+                        report['durable_gateway_reopen'] = 'NOT RUN'
+                    elif report.get('durable_gateway_reopen') in (None, 'NOT RUN'):
+                        finalized = json.loads((fixture.artifacts / paper_p8_e4_artifact_name(fixture)).read_text())
+                        report['durable_gateway_reopen'] = (
+                            finalized['durable_gateway_reopen'].get('status')
+                            if isinstance(finalized.get('durable_gateway_reopen'), dict)
+                            else finalized.get('durable_gateway_reopen', 'NOT RUN'))
+                    if not conflicts_enabled:
+                        report['conflicts'] = 'NOT RUN'
+                    elif report.get('conflicts') in (None, 'NOT RUN'):
+                        finalized = json.loads((fixture.artifacts / paper_p8_e4_artifact_name(fixture)).read_text())
+                        report['conflicts'] = (
+                            finalized['conflicts'].get('status')
+                            if isinstance(finalized.get('conflicts'), dict)
+                            else finalized.get('conflicts', 'NOT RUN'))
+                else:
+                    e3_lifecycle_ok = (final_session.get('phase') == 'CLOSED'
+                        and final_session.get('workload_outcome') == 'NOT_RUN'
+                        and final_session.get('collector_ready') is not True)
+                    report['workload_outcome'] = final_session.get('workload_outcome', 'NOT_RUN')
+                if not e3_lifecycle_ok:
+                    report['status'] = 'FAIL'
+            if args.p8_e5_prepare_hold:
+                final_session = supervisor.read_state(fixture.private)
+                evidence = json.loads(
+                    (fixture.artifacts / paper_p8_e5_artifact_name(fixture)).read_text())
+                e3_lifecycle_ok, workload_outcome = paper_p8_e5_post_run_status(
+                    final_session, evidence)
+                if workload_outcome is not None:
+                    report['workload_outcome'] = workload_outcome
+                report['full_p8_accepted'] = False
+                report['physical_ab'] = 'NOT RUN'
+                if not e3_lifecycle_ok:
+                    report['status'] = 'FAIL'
+            print(json.dumps(report))
+            return 0 if (report.get('exact_cleanup_verified', report.get('cleanup_verified'))
+                         and report.get('status') not in ('FAIL', 'STARTUP_FAILED')
+                         and e3_lifecycle_ok) else 1
         if (args.paper_p0 or args.paper_p1 or args.paper_p2_spike or args.paper_p2 or args.paper_p7 or args.paper_p3
                    or args.paper_p4 or args.paper_p5a or args.paper_p5b or args.paper_p6 or args.paper_p8_sessions or args.paper_p8_slow_viewer or args.paper_p8_load or args.paper_p8_e1 or args.paper_p8_e2 or args.paper_p8_e3 or args.paper_p8_e4 or args.paper_p8_e5 or args.paper_p8_recovery):
             report = startup_only(fixture)

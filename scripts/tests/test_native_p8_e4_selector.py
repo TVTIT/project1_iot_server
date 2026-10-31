@@ -2,14 +2,100 @@ import tempfile
 import subprocess
 import sys
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from scripts.tests import native_compose_smoke as smoke
+from scripts import paper_p8_server
 
 
 class P8E4SelectorTests(unittest.TestCase):
+    def test_coldrestart_summary_requires_finalized_accepted_cold_report(self):
+        self.assertEqual(smoke.paper_p8_e4_cold_restart_status({
+            'status': 'FAIL', 'workload_status': 'COLD_REPLAY_SUBSET_VALIDATED',
+            'lane_marker': 'PAPER_P8_E4_COLD_REPLAY_SUBSET', 'coldrestart': 'PASS'}, True), 'FAIL')
+        self.assertEqual(smoke.paper_p8_e4_cold_restart_status({
+            'status': 'PASS', 'workload_status': 'WARM_SUBSET_VALIDATED',
+            'lane_marker': 'PAPER_P8_E4_WARM_SUBSET', 'coldrestart': 'NOT RUN'}, True), 'FAIL')
+
+    def test_cold_preparation_metadata_has_all_phase_inputs_and_viewer_manifest(self):
+        cold = smoke.paper_p8_e4_preparation_metadata({
+            'unique': 'u', 'replay': 'r', 'cold-replay': 'c'})
+        warm = smoke.paper_p8_e4_preparation_metadata({'unique': 'u', 'replay': 'r'})
+        self.assertEqual(cold, {'phase_inputs': ['unique', 'replay', 'cold-replay'],
+            'manifest_count': 4})
+        self.assertEqual(warm['manifest_count'], 3)
+
+    def test_server_rejects_cold_replay_without_cache_on_e4(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp) / 'server'
+            with self.assertRaisesRegex(ValueError, '--cold-replay requires --experiment E4 --cache-mode on'):
+                paper_p8_server.main(['serve', '--root', str(root), '--network-config',
+                    str(Path(tmp) / 'unused-profile.json'), '--experiment', 'E4',
+                    '--cache-mode', 'off', '--cold-replay'])
+            self.assertTrue(root.is_dir())
+
+    def test_e4_prepare_report_is_not_run_and_never_claims_workload(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); artifacts = root / 'artifacts'; artifacts.mkdir(mode=0o700)
+            private = root / 'private'; private.mkdir(mode=0o700)
+            (private / 'session.json').write_text(json.dumps({'experiment': 'E4'}))
+            (artifacts / 'p8-e4-on.json').write_text(json.dumps({
+                'status': 'PREPARATION_ONLY', 'workload_status': 'NOT_RUN',
+                'coldrestart': 'NOT RUN', 'durable_gateway_reopen': 'NOT RUN',
+                'conflicts': 'NOT RUN', 'full_p8_accepted': False}))
+            fixture = SimpleNamespace(private=private, artifacts=artifacts, project='ncs_0123456789ab',
+                                      paper_p8_e4='on', paper_p8_e4_cache_mode='on')
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={'container': 1})
+            self.assertEqual(report['status'], 'PAPER_P8_E4_PREPARATION_ONLY')
+            self.assertEqual(report['workload_outcome'], 'NOT_RUN')
+            self.assertFalse(report['p8_e4_workload_verified'])
+            self.assertFalse(report['full_p8_accepted'])
+            self.assertEqual(smoke.paper_p8_prepare_only_run_status('E4', failed=False,
+                cleanup_verified=True, remote_outcome='NOT_RUN'), 'E4_PREPARATION_ONLY_CLEANUP')
+
+    def test_e4_server_allows_unique_begin_but_rejects_finish_without_active_phase(self):
+        state = {'experiment': 'E4', 'session_id': 'a' * 32, 'phase': 'READY',
+                 'preparation_status': 'E4_PREPARED', 'e4_phase_plan': ['unique', 'replay']}
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); (root / 'fixture/private').mkdir(parents=True, mode=0o700)
+            with patch.object(paper_p8_server, '_state_root', return_value=root / 'fixture/private'), \
+                 patch.object(paper_p8_server.supervisor, 'read_state', return_value=state), \
+                 patch.object(paper_p8_server.supervisor, 'write_request') as publish:
+                paper_p8_server.main(['begin', '--root', str(root), '--experiment', 'E4',
+                    '--session-id', 'a' * 32, '--phase', 'READY', '--phase-id', 'unique'])
+                self.assertEqual(publish.call_args.args[1]['phase_id'], 'unique')
+                publish.reset_mock()
+                with self.assertRaisesRegex(ValueError, 'e4_finish_phase_transition_invalid'):
+                    paper_p8_server.main(['finish-phase', '--root', str(root), '--experiment', 'E4',
+                        '--session-id', 'a' * 32, '--phase', 'READY', '--phase-id', 'unique',
+                        '--results', '/not-used'])
+                publish.assert_not_called()
+
+    def test_e4_server_next_phase_requires_a_validated_unique_import(self):
+        state = {'experiment': 'E4', 'session_id': 'b' * 32, 'phase': 'VERIFYING',
+            'phase_id': 'unique', 'workload_outcome': 'VALIDATED',
+            'phase_history': ['unique'],
+            'imported_result': {'phase_id': 'unique', 'validation_valid': True},
+            'e4_phase_plan': ['unique', 'replay']}
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); private = root / 'fixture/private'; private.mkdir(parents=True, mode=0o700)
+            with patch.object(paper_p8_server, '_state_root', return_value=private), \
+                 patch.object(paper_p8_server.supervisor, 'read_state', return_value=state), \
+                 patch.object(paper_p8_server.supervisor, 'write_request') as publish:
+                paper_p8_server.main(['next-phase', '--root', str(root), '--experiment', 'E4',
+                    '--session-id', 'b' * 32, '--phase', 'VERIFYING', '--phase-id', 'replay'])
+                self.assertEqual(publish.call_args.args[1]['command'], 'next-phase')
+                publish.reset_mock()
+                state['workload_outcome'] = 'VALIDATION_FAILED'
+                with self.assertRaisesRegex(ValueError, 'e4_next_phase_requires_validated_unique'):
+                    paper_p8_server.main(['next-phase', '--root', str(root), '--experiment', 'E4',
+                        '--session-id', 'b' * 32, '--phase', 'VERIFYING', '--phase-id', 'replay'])
+                publish.assert_not_called()
+
     def test_cli_selector_rejects_conflicting_probe_without_running_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = subprocess.run([sys.executable, str(Path(smoke.__file__),), '--prepare',

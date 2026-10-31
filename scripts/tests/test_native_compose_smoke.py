@@ -21,6 +21,578 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_e4_warm_acceptance_reads_nested_phase_workload_counters(self):
+        report = {
+            'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_WARM_SUBSET',
+            'workload_status': 'WARM_SUBSET_VALIDATED',
+            'phase_history': ['unique', 'replay'], 'full_p8_accepted': False,
+            'coldrestart': 'NOT RUN', 'durable_gateway_reopen': 'NOT RUN',
+            'conflicts': 'NOT RUN', 'physical_ab': 'NOT RUN',
+            'journal_sha256': 'c' * 64,
+            'journal_continuity': True, 'replay_journal_prefix_validated': True,
+            'generator_colocated': True, 'runner_stopped': True, 'cleanup_verified': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'new_ws_event_proof': {'status': 'PASS'},
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {
+                    'experiment': 'E4', 'telemetry': {'generated_unique': 20,
+                        'application_acks': 20, 'ignored_valid_acks': 1, 'pending_messages': 0}}},
+                'replay': {'validation_valid': True, 'telemetry': {
+                    'experiment': 'E4', 'telemetry': {'replay_offered': 10,
+                        'replay_application_acks': 10}}}}}
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+        report['workloads']['replay']['telemetry']['telemetry']['replay_application_acks'] = 9
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+        report['workloads']['replay']['telemetry']['telemetry']['replay_application_acks'] = 10
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+    def test_e4_cache_off_acceptance_requires_real_database_duplicate_window(self):
+        report = {
+            'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_CACHE_OFF_SUBSET',
+            'cache_mode': 'off', 'workload_status': 'CACHE_OFF_SUBSET_VALIDATED',
+            'phase_history': ['unique', 'replay'], 'full_p8_accepted': False,
+            'coldrestart': 'NOT APPLICABLE', 'durable_gateway_reopen': 'NOT RUN',
+            'conflicts': 'NOT RUN', 'physical_ab': 'NOT RUN', 'generator_colocated': True,
+            'runner_stopped': True, 'cleanup_verified': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'attempts': 10, 'transaction_commits': 10,
+                'database_duplicates': 10, 'confirmed_new_rows': 0, 'copy_calls': 0,
+                'database_fingerprint_unchanged': True},
+            'counter_windows': {'replay': {'database_proof': {'exact_equal': True,
+                'unique_ack': [{'fingerprint': 'a' * 32}, {'fingerprint': 'b' * 32}],
+                'replay_end': [{'fingerprint': 'a' * 32}, {'fingerprint': 'b' * 32}]}}},
+            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'new_ws_event_proof': {'status': 'PASS', 'replay': {
+                'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+                'telemetry_writes_completed': 0, 'drops': 0}},
+            'journal_sha256': 'a' * 64,
+            'journal_continuity': True, 'replay_journal_prefix_validated': True,
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
+                    'pending_messages': 0}}},
+                'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'replay_offered': 10, 'replay_application_acks': 10}}}}}
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+        for key, value in (('database_duplicates', 0), ('transaction_commits', None),
+                           ('copy_calls', 1), ('confirmed_new_rows', 1)):
+            bad = json.loads(json.dumps(report))
+            bad['cache_window'][key] = value
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), key)
+        bad = json.loads(json.dumps(report)); bad['cache_window'].pop('attempts')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+        bad = json.loads(json.dumps(report))
+        bad['counter_windows']['replay']['database_proof']['replay_end'][0]['fingerprint'] = 'd' * 32
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+    def _make_durable_report_fixture(self):
+        msg_id = '38267d8c-e556-4722-99d8-8951fc8ef607'
+        payload_sha = '42181cd469ab3c5226a27ce4c17cfd929b3c558e965a17fd0e46ae5658202a46'
+        binding_sha = '459c393fc4ec651b6e4d3b106f16420f3a1bd09b7b89a18c418550293ea59a6d'
+        pending = {
+            'boot_id': '07511757-0f33-4db7-ac7a-1035be018577', 'gateway_id': 'gw_p0_a_49007a3f',
+            'sensor_id': 'p8-e4-durable', 'sequence': 0, 'sample_count': 100, 'interval_us': 10000,
+            'message_id': msg_id, 'payload_bytes': 925, 'payload_sha256': payload_sha,
+            'header': {
+                'boot_id': '07511757-0f33-4db7-ac7a-1035be018577', 'first_sequence': 0,
+                'gateway_id': 'gw_p0_a_49007a3f', 'sensor_id': 'p8-e4-durable',
+                'measured_at': '2026-10-30T10:53:45.315242Z', 'sample_count': 100,
+                'sample_interval_us': 10000
+            }
+        }
+        fault_record = {
+            'status': 'PASS', 'phase': 'durable-fault', 'pending': json.loads(json.dumps(pending)),
+            'sql': {
+                'status': 'PASS', 'message_id': msg_id, 'payload_sha256': payload_sha,
+                'ledger_fingerprint': '33230e6bbe497b567bb24f745720edb7', 'raw_count': 100
+            },
+            'database_before': {'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0, 'fingerprint': '8' * 32},
+            'database_after': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0, 'fingerprint': 'c' * 32},
+            'database_delta': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0},
+            'main_dataset_unchanged': True, 'binding_sha256': binding_sha
+        }
+        reopen_record = {
+            'status': 'PASS', 'phase': 'durable-reopen', 'pending_before': json.loads(json.dumps(pending)),
+            'sql': {
+                'status': 'PASS', 'raw_count': 100, 'main_dataset_unchanged': True,
+                'first_sequence': 0, 'last_sequence': 99,
+                'first_timestamp': '2026-10-30T10:53:45.315242+00:00',
+                'last_timestamp': '2026-10-30T10:53:46.305242+00:00',
+                'interval_us': 10000,
+                'auxiliary_delta': {'ledger': 2, 'raw': 200, 'temporal': 2}
+            },
+            'database_before': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0, 'fingerprint': 'c' * 32},
+            'database_after': {'ledger': 2, 'raw': 200, 'temporal': 2, 'configuration': 0, 'fingerprint': '9' * 32},
+            'database_delta': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0},
+            'application_acks': 2, 'pending_rows': 0, 'quarantined_rows': 0, 'joined': True,
+            'main_dataset_unchanged': True, 'binding_sha256': binding_sha
+        }
+        return {
+            'schema_version': 1, 'status': 'PASS', 'experiment': 'E4', 'arm': 'warm', 'cache_mode': 'on',
+            'workload_status': 'DURABLE_REOPEN_SUBSET_VALIDATED',
+            'lane_marker': 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET',
+            'phase_history': ['unique', 'replay', 'durable-fault', 'durable-reopen'],
+            'full_p8_accepted': False, 'coldrestart': 'NOT RUN',
+            'durable_gateway_reopen': {
+                'status': 'PASS', 'fault': fault_record, 'reopen': reopen_record
+            },
+            'conflicts': 'NOT RUN', 'physical_ab': 'NOT RUN', 'generator_colocated': True,
+            'runner_stopped': True, 'cleanup_verified': True,
+            'journal_sha256': 'a' * 64, 'journal_continuity': True,
+            'replay_journal_prefix_validated': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'counter_windows': {'replay': {'database_proof': {'exact_equal': True}}},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'new_ws_event_proof': {'status': 'PASS'},
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
+                    'pending_messages': 0}}},
+                'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'replay_offered': 10, 'replay_application_acks': 10}}}}}
+
+    def test_e4_durable_reopen_acceptance_and_rejections(self):
+        report = self._make_durable_report_fixture()
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+
+        # 1. Bad cleanup
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+        # 2. Wrong stage delta vs total:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['database_delta']['raw'] = 99
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_delta']['raw'] = 101
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['sql']['auxiliary_delta']['raw'] = 300
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 3. Hash changed / mismatch:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['binding_sha256'] = 'f' * 64
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['payload_sha256'] = 'e' * 64
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_before']['message_id'] = 'different-id'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 4. Pending > 0 or quarantined > 0:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_rows'] = 1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['quarantined_rows'] = 1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 5. Missing SQL:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen'].pop('sql')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault'].pop('sql')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 6. Wrong phase history:
+        bad = json.loads(json.dumps(report))
+        bad['phase_history'] = ['unique', 'replay', 'durable-fault']
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 7. Missing base proof:
+        bad = json.loads(json.dumps(report))
+        bad['cache_window']['warm_lookup_hits'] = 9
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['raw_verification'][0]['verified_exact'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['database_delta']['raw'] = 1900
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['workloads']['unique']['telemetry']['telemetry']['application_acks'] = 19
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 8. Missing / invalid ledger_fingerprint:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql'].pop('ledger_fingerprint')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['ledger_fingerprint'] = ''
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['ledger_fingerprint'] = 'not-a-valid-hex-fingerprint!'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['ledger_fingerprint'] = 'a' * 31
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 9. Missing / invalid / mismatched header:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['pending'].pop('header')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_before'].pop('header')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_before']['header']['gateway_id'] = 'gw-different'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        for key, bad_val in (
+            ('gateway_id', 'different_gw'),
+            ('sensor_id', 'different_sensor'),
+            ('boot_id', 'different_boot'),
+            ('first_sequence', 999),
+            ('sample_count', 50),
+            ('sample_interval_us', 5000),
+            ('measured_at', 'not-a-timestamp'),
+        ):
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen']['fault']['pending']['header'][key] = bad_val
+            bad['durable_gateway_reopen']['reopen']['pending_before']['header'][key] = bad_val
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), key)
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['pending']['header'].pop('measured_at')
+        bad['durable_gateway_reopen']['reopen']['pending_before']['header'].pop('measured_at')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 10. Missing / invalid / mismatched database snapshots:
+        for phase, snap_key in (('fault', 'database_before'), ('fault', 'database_after'),
+                                ('reopen', 'database_before'), ('reopen', 'database_after')):
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase].pop(snap_key)
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'missing {phase}.{snap_key}')
+
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase][snap_key]['raw'] = 'not-an-int'
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'non-int count {phase}.{snap_key}')
+
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase][snap_key]['fingerprint'] = 'bad-fp'
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'bad fp {phase}.{snap_key}')
+
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase][snap_key].pop('fingerprint')
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'missing fp {phase}.{snap_key}')
+
+        # 11. Continuity mismatch (fault.database_after != reopen.database_before):
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_before']['raw'] = 105
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_before']['fingerprint'] = 'e' * 32
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 12. Snapshot stage deltas must be 1/100/1/0:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['database_before']['raw'] = 10
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_after']['raw'] = 250
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 13. Cumulative reopen.after minus fault.before must be 2/200/2/0:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_after']['temporal'] = 3
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+    def test_e4_startup_summary_branch(self):
+        fixture = type('Fixture', (), {
+            'paper_p8_e4': 'on', 'paper_p8_e4_cache_mode': 'on', 'project': 'test-project'})()
+        report = self._make_durable_report_fixture()
+
+        # Valid durable subset:
+        summary = smoke.paper_p8_e4_startup_summary(
+            fixture, report, accepted=True, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-on.json')
+        self.assertEqual(summary['status'], 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET_VALIDATED')
+        self.assertEqual(summary['lane'], 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET')
+        self.assertEqual(summary['workload_outcome'], 'DURABLE_REOPEN_SUBSET_VALIDATED')
+        self.assertEqual(summary['durable_gateway_reopen'], 'PASS')
+        self.assertFalse(summary['full_p8_accepted'])
+
+        # Failed durable subset remains failed even with cleanup_verified=True:
+        summary_fail = smoke.paper_p8_e4_startup_summary(
+            fixture, report, accepted=False, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-on.json')
+        self.assertEqual(summary_fail['status'], 'FAIL')
+        self.assertEqual(summary_fail['workload_outcome'], 'DURABLE_REOPEN_SUBSET_VALIDATED')
+
+        # Warm subset behavior unchanged:
+        warm_rep = {'workload_status': 'WARM_SUBSET_VALIDATED', 'coldrestart': 'NOT RUN',
+                    'durable_gateway_reopen': 'NOT RUN'}
+        warm_summary = smoke.paper_p8_e4_startup_summary(
+            fixture, warm_rep, accepted=True, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-on.json')
+        self.assertEqual(warm_summary['status'], 'PAPER_P8_E4_WARM_SUBSET_VALIDATED')
+        self.assertEqual(warm_summary['lane'], 'PAPER_P8_E4_WARM_SUBSET')
+        self.assertEqual(warm_summary['durable_gateway_reopen'], 'NOT RUN')
+
+        # Cache-off subset behavior unchanged:
+        off_fix = type('Fixture', (), {
+            'paper_p8_e4': 'off', 'paper_p8_e4_cache_mode': 'off', 'project': 'test-project'})()
+        off_rep = {'workload_status': 'CACHE_OFF_SUBSET_VALIDATED', 'coldrestart': 'NOT APPLICABLE',
+                   'durable_gateway_reopen': 'NOT RUN'}
+        off_summary = smoke.paper_p8_e4_startup_summary(
+            off_fix, off_rep, accepted=True, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-off.json')
+        self.assertEqual(off_summary['status'], 'PAPER_P8_E4_CACHE_OFF_SUBSET_VALIDATED')
+        self.assertEqual(off_summary['lane'], 'PAPER_P8_E4_CACHE_OFF_SUBSET')
+        self.assertEqual(off_summary['durable_gateway_reopen'], 'NOT RUN')
+
+    def _make_conflicts_report_fixture(self):
+        cases = {
+            'same_id_changed_payload': {
+                'status': 'PASS',
+                'schema_valid': True,
+                'positive_control_ack_count': 1,
+                'conflict_ack_count': 0,
+                'database_unchanged': True,
+                'expected_rejection_reason': 'message_conflict',
+                'observed_rejection_reason': 'message_conflict',
+                'guard_precondition': {'matched': True}
+            },
+            'different_first_sequence_overlap': {
+                'status': 'PASS',
+                'schema_valid': True,
+                'positive_control_ack_count': 1,
+                'conflict_ack_count': 0,
+                'database_unchanged': True,
+                'expected_rejection_reason': 'sequence_overlap',
+                'observed_rejection_reason': 'sequence_overlap',
+                'guard_precondition': {'matched': True}
+            }
+        }
+        return {
+            'schema_version': 1, 'status': 'PASS', 'experiment': 'E4', 'arm': 'warm', 'cache_mode': 'on',
+            'workload_status': 'CONFLICTS_SUBSET_VALIDATED',
+            'lane_marker': 'PAPER_P8_E4_CONFLICTS_SUBSET',
+            'phase_history': ['unique', 'replay', 'conflicts'],
+            'full_p8_accepted': False, 'coldrestart': 'NOT RUN',
+            'durable_gateway_reopen': 'NOT RUN',
+            'conflicts': {'status': 'PASS', 'cases': cases},
+            'physical_ab': 'NOT RUN', 'generator_colocated': True,
+            'runner_stopped': True, 'cleanup_verified': True,
+            'journal_sha256': 'a' * 64, 'journal_continuity': True,
+            'replay_journal_prefix_validated': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'counter_windows': {'replay': {'database_proof': {'exact_equal': True}}},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'new_ws_event_proof': {'status': 'PASS'},
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
+                    'pending_messages': 0}}},
+                'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'replay_offered': 10, 'replay_application_acks': 10}}}}}
+
+    def test_e4_conflicts_acceptance_and_rejections(self):
+        report = self._make_conflicts_report_fixture()
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+
+        # 1. Cleanup not verified
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+        # 2. Conflict ACK observed
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['conflict_ack_count'] = 1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 3. Missing positive control ACK
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['positive_control_ack_count'] = 0
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 4. Schema invalid
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['different_first_sequence_overlap']['schema_valid'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 5. Observed rejection reason mismatch
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['observed_rejection_reason'] = 'wrong_reason'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 6. Database changed
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['different_first_sequence_overlap']['database_unchanged'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 7. Missing required case
+        bad = json.loads(json.dumps(report))
+        del bad['conflicts']['cases']['different_first_sequence_overlap']
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 8. Guard precondition not matched
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['guard_precondition']['matched'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 9. Startup summary
+        fixture = type('Fixture', (), {'paper_p8_e4': 'on', 'paper_p8_e4_cache_mode': 'on', 'project': 'test-project'})()
+        summary = smoke.paper_p8_e4_startup_summary(fixture, report, accepted=True, cleanup_verified=True, cleanup_counts={}, artifact_name='p8-e4-on.json')
+        self.assertEqual(summary['status'], 'PAPER_P8_E4_CONFLICTS_SUBSET_VALIDATED')
+        self.assertEqual(summary['lane'], 'PAPER_P8_E4_CONFLICTS_SUBSET')
+        self.assertEqual(summary['conflicts'], 'PASS')
+        self.assertFalse(summary['full_p8_accepted'])
+
+    def test_e3_hold_uses_requested_arm_for_runtime_flags(self):
+        for arm in ('polling', 'wakeup'):
+            self.assertEqual(smoke.paper_p8_e3_selector(type('Args', (), {
+                'p8_e3_prepare_hold': True, 'p8_arm': arm, 'paper_p8_e3': None})()), arm)
+        self.assertEqual(smoke.paper_p8_e3_selector(type('Args', (), {
+            'p8_e3_prepare_hold': False, 'p8_arm': None, 'paper_p8_e3': 'wakeup'})()), 'wakeup')
+    def test_e3_lifecycle_exit_accepts_only_unstarted_preparation_or_validated_workload(self):
+        self.assertTrue(smoke.paper_p8_e3_lifecycle_outcome_accepted({
+            'phase': 'CLOSED', 'workload_outcome': 'NOT_RUN'}))
+        self.assertTrue(smoke.paper_p8_e3_lifecycle_outcome_accepted({
+            'phase': 'CLOSED', 'workload_outcome': 'VALIDATED',
+            'imported_result': {'validation_valid': True}}))
+        for state in (
+                {'phase': 'CLOSED', 'workload_outcome': 'ABORTED', 'collector_ready': True},
+                {'phase': 'CLOSED', 'workload_outcome': 'VALIDATION_FAILED',
+                 'imported_result': {'validation_valid': False}},
+                {'phase': 'CLOSED', 'workload_outcome': 'NOT_RUN', 'collector_ready': True},
+                {'phase': 'CLOSED', 'workload_outcome': 'VALIDATED',
+                 'imported_result': {'validation_valid': False}}):
+            self.assertFalse(smoke.paper_p8_e3_lifecycle_outcome_accepted(state))
+
+    def test_e2_prepare_only_report_uses_e2_artifacts_and_does_not_require_workload_when_not_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e2':False, 'paper_p8_e1':False,
+                'project':'e2-test', 'private':root/'private', 'artifacts':root/'artifacts'})()
+            fixture.private.mkdir()
+            fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E2','phase_id':'samples-100'}))
+            (fixture.artifacts/'p8-e2-pilot.json').write_text(json.dumps({'status':'PREPARATION_ONLY'}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={'container':12,'network':1,'volume':5})
+            self.assertEqual(report['status'], 'PAPER_P8_E2_PREPARATION_ONLY')
+            self.assertEqual(report['artifact'], 'p8-e2-pilot.json')
+            self.assertFalse(report['p8_e2_workload_verified'])
+            self.assertFalse((fixture.artifacts/'p8-e1-pilot.json').exists())
+
+    def test_e2_prepare_only_report_selects_validated_sample_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e2':False, 'project':'e2-test',
+                'private':root/'private', 'artifacts':root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E2','phase_id':'samples-1'}))
+            (fixture.artifacts/'p8-e2-samples-1-remote-result.json').write_text(json.dumps(
+                {'status':'PASS','validation':{'valid':True}}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='VALIDATED',
+                cleanup_verified=True, cleanup_counts={})
+            self.assertEqual(report['status'], 'PAPER_P8_E2_WORKLOAD_VERIFIED')
+            self.assertEqual(report['artifact'], 'p8-e2-samples-1-remote-result.json')
+            self.assertTrue(report['p8_e2_workload_verified'])
+
+    def test_e1_prepare_only_report_keeps_e1_artifact_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e1':True, 'paper_p8_e2':False,
+                'project':'e1-test', 'private':root/'private', 'artifacts':root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.artifacts/'p8-e1-pilot.json').write_text(json.dumps({'status':'PREPARATION_ONLY'}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={})
+            self.assertEqual(report['status'], 'PAPER_P8_E1_PREPARATION_ONLY')
+            self.assertEqual(report['artifact'], 'p8-e1-remote-result.json')
+
+    def test_prepare_only_run_status_uses_session_experiment_and_separates_failure_states(self):
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=True, remote_outcome='VALIDATED'), 'E2_WORKLOAD_VERIFICATION_PASS')
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=True, remote_outcome='NOT_RUN'), 'E2_PREPARATION_ONLY_CLEANUP')
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=False, remote_outcome='VALIDATED'), 'FAIL')
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=True, remote_outcome='VALIDATION_FAILED'), 'E2_WORKLOAD_VALIDATION_FAILED')
+
+    def test_e3_prepare_report_selects_low_load_artifact_and_keeps_workload_not_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e3': 'polling',
+                'paper_p8_e3_workload': 'low_load', 'project': 'e3-test',
+                'private': root/'private', 'artifacts': root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E3',
+                'phase_id':'e3-low_load-polling', 'workload_outcome':'NOT_RUN'}))
+            (fixture.artifacts/'p8-e3-polling-low-load.json').write_text(json.dumps({
+                'status':'PREPARATION_ONLY', 'workload_status':'NOT_RUN',
+                'experiment':'E3', 'phase_id':'e3-low_load-polling', 'full_p8_accepted':False}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={'container':12,'network':1,'volume':5})
+            self.assertEqual(report['status'], 'PAPER_P8_E3_PREPARATION_ONLY')
+            self.assertEqual(report['artifact'], 'p8-e3-polling-low-load.json')
+            self.assertFalse(report['p8_e3_workload_verified'])
+            self.assertEqual(smoke.paper_p8_prepare_only_run_status('E3', failed=False,
+                cleanup_verified=True, remote_outcome='NOT_RUN'), 'E3_PREPARATION_ONLY_CLEANUP')
+
+    def test_e3_prepare_report_uses_imported_result_for_validated_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e3': 'polling',
+                'paper_p8_e3_workload': 'low_load', 'project': 'e3-test',
+                'private': root/'private', 'artifacts': root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E3',
+                'phase_id':'e3-low_load-polling', 'workload_outcome':'VALIDATED'}))
+            (fixture.artifacts/'p8-e3-polling-low-load.json').write_text(json.dumps(
+                {'status':'PREPARATION_ONLY'}))
+            result_path = fixture.artifacts/'p8-e3-polling-low-load-remote-result.json'
+            result_path.write_text(json.dumps({'status':'PASS','validation':{'valid':True}}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='VALIDATED',
+                cleanup_verified=True, cleanup_counts={'container':12,'network':1,'volume':5})
+            self.assertEqual(report['status'], 'PAPER_P8_E3_WORKLOAD_VERIFIED')
+            self.assertEqual(report['artifact'], result_path.name)
+            self.assertTrue(report['p8_e3_workload_verified'])
+
+    def test_private_csv_writer_creates_mode_0600_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'metrics.csv'
+            smoke.paper_p8_write_private_csv(path, ('phase', 'value'),
+                                             [('workload_start', '{"count":1}')])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.read_text(), 'phase,value\nworkload_start,"{""count"":1}"\n')
+            with self.assertRaises(FileExistsError):
+                smoke.paper_p8_write_private_csv(path, ('phase',), [])
+
+    def test_p8_lifecycle_rejects_unrelated_low_load_selector_before_prepare(self):
+        with patch.object(sys, 'argv', ['native_compose_smoke.py', '--prepare', '/tmp/not-created',
+                                      '--p8-lifecycle-hold', '--paper-p8-e3-low-load']):
+            with self.assertRaises(SystemExit) as raised:
+                smoke.main()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_p8_e1_selector_builds_opt_in_websocket_profile_and_reuses_load_fixture(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True)
@@ -2955,7 +3527,9 @@ class AllocationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             f = smoke.prepare(Path(directory) / "fixture")
             for code in ("paper_p5b_cold_replay_reconciliation_failed",
-                         "paper_p5b_functional_smoke_failed"):
+                         "paper_p5b_functional_smoke_failed",
+                         "p8_prepare_report_artifact_missing",
+                         "p8_prepare_report_validation_missing"):
                 self.assertIn(code, smoke.ALLOWED_FAILURE_ERROR_CODES)
                 self.assertEqual(smoke.sanitize_failure_code(ValueError(code)), code)
                 report = smoke.record_failure_report(f, phase="paper_p5a",
