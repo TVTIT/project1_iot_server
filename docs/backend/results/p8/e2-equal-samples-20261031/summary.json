@@ -1,0 +1,298 @@
+{
+  "schema_version": 2,
+  "experiment": "E2",
+  "workload": "equal_samples",
+  "status": "CONTAMINATED",
+  "full_p8_accepted": false,
+  "physical_ab": "NOT RUN",
+  "generator_colocated": "unverified",
+  "same_host_qualification": "same-host/unverified",
+  "claims_disclaimer": "No acquisition, wire, or absolute-peak claims; backend observed payload bytes; sampled max memory only",
+  "clean_comparison": false,
+  "comparability": true,
+  "cleanup_verified": true,
+  "source_fingerprints": {
+    "native_producer": {
+      "revision": "8917bd9b7f58ef0173db373510b0566642cbb8a3",
+      "dirty_worktree": true,
+      "dirty_source_sha256": "ad75d3696deb2fac438e98d2bf7d8ffcb223a0df3e413318447ff816f85590a4",
+      "qualification": "local source and dirty state; not a release provenance claim"
+    },
+    "audit_postprocessor": {
+      "revision": "8917bd9b7f58ef0173db373510b0566642cbb8a3",
+      "dirty_worktree": true,
+      "mode": "read_only_reassessment_no_native_reexecution",
+      "postprocessor_script": "scripts/tests/paper_p8_e2_support.py",
+      "postprocessor_script_sha256": "d05f47a74b5ed788e965a20bc06902bad1fd66587da4a6b94e9234b80dbe7ac5"
+    }
+  },
+  "context": {
+    "context_sha256": "51d74becb6cfa8ee2b7ae2cb76b2b7c5cd00f55a2538c1084d4fc1c0c6d3081f",
+    "seed": 84,
+    "total_samples": 6000,
+    "sample_rate": 100,
+    "duration_seconds": 60,
+    "producers": {
+      "A": {
+        "samples": 3000,
+        "sample_rate": 50
+      },
+      "B": {
+        "samples": 3000,
+        "sample_rate": 50
+      }
+    }
+  },
+  "immutable_artifacts": {
+    "paperload_binary_sha256": "5cbaf08a0dc23cfbc5e57dc7c03a6783cd9ed1409225d1216e887bd2a80a058a",
+    "core_service_image_ids_identical": true,
+    "services_verified": [
+      "backend",
+      "gateway",
+      "postgres",
+      "mosquitto",
+      "nginx"
+    ]
+  },
+  "artifacts": {
+    "original_native_reports": {
+      "profile_100": {
+        "artifact": "p8-e2-equal-samples-100-remote-result.json",
+        "sha256": "6504243dbea1df89acd489f3c86c1ef8f9d5aa9bd9cb062a459d4a5d2b985397"
+      },
+      "profile_1": {
+        "artifact": "p8-e2-equal-samples-1-remote-result.json",
+        "sha256": "497b4ca8783ba358fc74d3f8373fd4b522f1578acd51f2e485e6b5d7b8722fcf"
+      },
+      "comparison": {
+        "artifact": "e2-comparison.json",
+        "sha256": "8c7180a3aac4aa3f4a1b033ba13ce2a33b46d17c3d058f039ff0a0dd9fd8924a"
+      }
+    },
+    "derived_audit_v2_reports": {
+      "profile_100": {
+        "artifact": "p8-e2-equal-samples-100-derived-audit.json",
+        "sha256": "d33626c789a2f0307ddf066f661b0e54be12e9d966f0acdf5887dd6ff5117e08"
+      },
+      "profile_1": {
+        "artifact": "p8-e2-equal-samples-1-derived-audit.json",
+        "sha256": "da2b72212f81a8d8a09c522bbb67bad881b70b0b489ae36b3a52b74c9858a278"
+      },
+      "comparison": {
+        "artifact": "e2-comparison-derived-audit.json",
+        "sha256": "484af5c86bc06c82b173a2a0baeef473de9e905400c01c61620f6739cf4c4d10"
+      },
+      "manifest": {
+        "artifact": "audit-manifest.json",
+        "sha256": "10319f43ee19beed0041d73501187adf26e3b0ef388066e807a49474f9ee7d43"
+      }
+    },
+    "legacy_steady_burst_regression": {
+      "attempt_1_fail": {
+        "timestamp": "2026-10-31T21:40:00+07:00",
+        "status": "FAIL",
+        "workload_outcome": "ABORTED",
+        "validation_failures": [
+          "database_delta_mismatch"
+        ],
+        "delta_issue": "extra alias keys processed and telemetry in delta dict violated strict dict equality",
+        "retries_arm_b": 27,
+        "artifact": "p8-e2-samples-100-remote-result.json",
+        "sha256": "3e4e99af684ce3fe10b2598b8c739d8d01a0f8c1497ae84ed33a2446add8818a"
+      },
+      "attempt_2_pass": {
+        "timestamp": "2026-10-31T22:15:00+07:00",
+        "status": "PASS",
+        "workload_outcome": "VALIDATED",
+        "validation_valid": true,
+        "validation_failures": [],
+        "database_delta": {
+          "configuration": 0,
+          "ledger": 24,
+          "raw": 2400,
+          "temporal": 24
+        },
+        "retries_arm_b": 26,
+        "shaper_rate_limited_drops": 26,
+        "cleanup_outcome": "VERIFIED",
+        "cleanup_counts": {
+          "container": 12,
+          "network": 1,
+          "volume": 5
+        },
+        "artifact": "p8-e2-samples-100-remote-result.json",
+        "sha256": "ecff1f98b0c220ef58b4d6f1c672b68089bb19a4b449821b2317103af6af965c",
+        "startup_summary_sha256": "6c3ce9286d61eca0968720c6b984736448ccdacd1aa83efab227ecffcf96a13e"
+      }
+    }
+  },
+  "functional_results": {
+    "profile_100": {
+      "status": "PASS",
+      "workload_status": "PASS",
+      "validation_valid": true,
+      "validation_failures": [],
+      "samples_per_message": 100,
+      "total_samples": 6000,
+      "unique_messages_offered": 60,
+      "unique_messages_per_producer": {
+        "A": 30,
+        "B": 30
+      },
+      "attempts_per_producer": {
+        "A": 31,
+        "B": 31
+      },
+      "retries_per_producer": {
+        "A": 1,
+        "B": 1
+      },
+      "application_acks_per_producer": {
+        "A": 30,
+        "B": 30
+      },
+      "pending_at_finish": {
+        "messages": 0,
+        "bytes": 0
+      },
+      "database_counts": {
+        "ledger": 60,
+        "raw": 6000,
+        "temporal": 60,
+        "configuration": 0
+      },
+      "raw_verification": {
+        "value_mismatches": 0,
+        "timestamp_mismatches": 0,
+        "sequence_range_A": [0, 2999],
+        "sequence_range_B": [0, 2999],
+        "verified_exact": true
+      },
+      "cleanup_outcome": "VERIFIED",
+      "cleanup_counts": {
+        "containers": 12,
+        "networks": 1,
+        "volumes": 5
+      },
+      "server_exit_code": 0
+    },
+    "profile_1": {
+      "status": "PASS",
+      "workload_status": "PASS",
+      "validation_valid": true,
+      "validation_failures": [],
+      "samples_per_message": 1,
+      "total_samples": 6000,
+      "unique_messages_offered": 6000,
+      "unique_messages_per_producer": {
+        "A": 3000,
+        "B": 3000
+      },
+      "attempts_per_producer": {
+        "A": 3011,
+        "B": 3010
+      },
+      "retries_per_producer": {
+        "A": 11,
+        "B": 10
+      },
+      "application_acks_per_producer": {
+        "A": 3000,
+        "B": 3000
+      },
+      "pending_at_finish": {
+        "messages": 0,
+        "bytes": 0
+      },
+      "database_counts": {
+        "ledger": 6000,
+        "raw": 6000,
+        "temporal": 6000,
+        "configuration": 0
+      },
+      "raw_verification": {
+        "value_mismatches": 0,
+        "timestamp_mismatches": 0,
+        "sequence_range_A": [0, 2999],
+        "sequence_range_B": [0, 2999],
+        "verified_exact": true
+      },
+      "cleanup_outcome": "VERIFIED",
+      "cleanup_counts": {
+        "containers": 12,
+        "networks": 1,
+        "volumes": 5
+      },
+      "server_exit_code": 0
+    }
+  },
+  "contamination": {
+    "clean_comparison": false,
+    "status": "CONTAMINATED",
+    "causes_identified": false,
+    "speculative_causes_disclaimed": "unknown means unknown; no speculation on root cause",
+    "reasons_profile_100": [
+      "clean_comparison_false",
+      "A_retries_observed:1",
+      "B_retries_observed:1"
+    ],
+    "reasons_profile_1": [
+      "clean_comparison_false",
+      "A_retries_observed:11",
+      "B_retries_observed:10"
+    ]
+  },
+  "metrics_summary": {
+    "headline_speedup": {
+      "available": false,
+      "reason": "contaminated_run_no_headline_speedup"
+    },
+    "bytes_per_sample": {
+      "status": "AVAILABLE",
+      "profile_100_value": 11.082,
+      "profile_1_value": 360.00716666666665,
+      "ratio_100_over_1": 0.030783,
+      "offered_unique_profile_100": 10.664,
+      "offered_unique_profile_1": 358.758,
+      "qualification": "backend_admitted_attempt_bytes; includes_retries_if_admitted; application_payload_bytes_only; not_wire_traffic_not_tls"
+    },
+    "db_transactions_per_sample": {
+      "status": "INCONCLUSIVE",
+      "reason": "db_transactions_counter_not_retained_in_sampler",
+      "note": "under microbatching, multiple deliveries commit in one SQL transaction; ledger rows per sample are 1.0 (S1) vs 0.01 (S100), but ledger != transactions"
+    },
+    "server_active_cpu_seconds_per_sample": {
+      "status": "INCONCLUSIVE",
+      "reason": "final_commit_boundary_not_observed",
+      "note": "Docker stats ~8s sampling interval ended at snapshot 8 before final commits; final commit boundary unobserved in timestamped resource counters"
+    },
+    "server_lifecycle_cpu_seconds_per_sample": {
+      "status": "INCONCLUSIVE",
+      "reason": "lifecycle_cpu_counters_unavailable",
+      "note": "terminal resources were null"
+    },
+    "generator_active_cpu_seconds_per_sample": {
+      "status": "INCONCLUSIVE",
+      "reason": "invalid_delta_ticks_in_active_window:process_appeared",
+      "note": "active interval on Host B monotonic timeline contains Sample 1 at 1.002s with delta_ticks=None due to process_appeared at startup"
+    },
+    "generator_lifecycle_cpu_seconds_per_sample": {
+      "status": "INCONCLUSIVE",
+      "reason": "process_change_samples_lack_delta:process_appeared",
+      "partial_observed_seconds_per_sample": {
+        "profile_100": 0.000865,
+        "profile_1": 0.0014266666666666668
+      },
+      "partial_observed_total_seconds": {
+        "profile_100": 5.19,
+        "profile_1": 8.56
+      }
+    }
+  },
+  "acceptance_verdict": {
+    "es7_local_mvp": "COMPLETED",
+    "full_p8_accepted": false,
+    "production_certification": false,
+    "notes": "Native Attempt 4 equal_samples pair and ES.7c Attempt 2 legacy steady_burst regression complete ES.7 Local MVP. Not full P8 acceptance or production readiness."
+  }
+}
