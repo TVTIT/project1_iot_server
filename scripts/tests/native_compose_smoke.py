@@ -21,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import re
+import resource
 import secrets
 import shutil
 import ssl
@@ -196,8 +197,16 @@ class Fixture:
     paper_p8_e2_workload: str = 'steady_burst'
     paper_p8_e2_context: str | None = None
     paper_p8_e2_reference: str | None = None
+    paper_p8_profile: str = 'pilot'
+    paper_p8_official_opt_in: bool = False
+    paper_p8_e2_offered_rate: int = 100
+    paper_p8_e2_duration_seconds: int = 10
+    paper_p8_e2_burst_messages: int = 0
+    paper_p8_e2_samples_per_message: int = 1
     paper_p8_e3: str | None = None
     paper_p8_e3_workload: str = 'mixed'
+    paper_p8_e3_command_count: int = 4
+    paper_p8_e3_schedule: str = 'smoke'
     paper_p8_e4: str | None = None
     paper_p8_e5: str | None = None
     paper_p8_e5_context: str | None = None
@@ -706,13 +715,21 @@ def dispatch_paper_p8_load(fixture, smoke, endpoint, registry, containers, image
         return paper_p8_e3_support().run(smoke, fixture, endpoint, registry, containers,
                                          images, state, paperload_binary,
                                           gateway_binary or fixture.private / 'bin' / 'gateway', fixture.paper_p8_e3,
-                                          getattr(fixture, 'paper_p8_e3_workload', 'mixed'))
+                                           getattr(fixture, 'paper_p8_e3_workload', 'mixed'),
+                                           command_count=getattr(fixture, 'paper_p8_e3_command_count', 4),
+                                           schedule=getattr(fixture, 'paper_p8_e3_schedule', 'smoke'),
+                                           profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
+                                           official_opt_in=getattr(fixture, 'paper_p8_official_opt_in', False))
     if getattr(fixture, 'paper_p8_e2', False):
         return paper_p8_e2_support().run(smoke, fixture, endpoint, registry, containers, images,
                                          state, paperload_binary)
     if getattr(fixture, 'paper_p8_e1', False):
         return paper_p8_e1_support().run(smoke, fixture, endpoint, registry, containers, images,
-                                         state, paperload_binary)
+                                         state, paperload_binary,
+                                         viewers=getattr(fixture, 'paper_p8_e1_viewers', 64),
+                                         principals=getattr(fixture, 'paper_p8_e1_principals', 2),
+                                         density=getattr(fixture, 'paper_p8_e1_density', 'mixed'),
+                                         messages_per_target=getattr(fixture, 'paper_p8_e1_messages_per_target', 5))
     return paper_p8_support().run_e2_telemetry100(smoke, fixture, endpoint, registry, containers,
                                                    images, state, paperload_binary)
 
@@ -764,10 +781,17 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             paper_p5b_control_regression=False, paper_p5b=None, paper_p6=None,
              paper_p8_sessions=False, paper_p8_slow=False, paper_p8_load=False, paper_p8_e1=False,
              paper_p8_e2=False, paper_p8_e2_workload='steady_burst',
-             paper_p8_e2_context=None, paper_p8_e2_reference=None,
-             paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e4=None,
+              paper_p8_e2_context=None, paper_p8_e2_reference=None,
+              paper_p8_profile='pilot', paper_p8_official_opt_in=False,
+              paper_p8_e2_offered_rate=100, paper_p8_e2_duration_seconds=10,
+              paper_p8_e2_burst_messages=0,
+              paper_p8_e2_samples_per_message=1,
+              paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e3_command_count=4,
+              paper_p8_e3_schedule='smoke', paper_p8_e4=None,
                paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
-               paper_p8_recovery=False, remote_network_config=None):
+                paper_p8_recovery=False, remote_network_config=None,
+                paper_p8_e1_viewers=64, paper_p8_e1_principals=2,
+                paper_p8_e1_density='mixed', paper_p8_e1_messages_per_target=5):
     if remote_network_config is not None:
         paper_p2 = True
         # Re-validate the canonical profile's exact input fields before it affects config.
@@ -787,6 +811,13 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     if paper_p8_e1 or paper_p8_e2 or paper_p8_e3 or paper_p8_e4 or paper_p8_e5:
         paper_p8_load = True
     if paper_p8_e2:
+        if paper_p8_profile not in ('pilot','official') or (paper_p8_profile == 'official' and not paper_p8_official_opt_in):
+            raise ValueError('official_profile_opt_in_required')
+        if (paper_p8_profile == 'official' and (paper_p8_e2_workload != 'steady_burst'
+                or paper_p8_e2_offered_rate not in (100,1000,5000,20000)
+                or type(paper_p8_e2_duration_seconds) is not int or not 1 <= paper_p8_e2_duration_seconds <= 7200
+                or type(paper_p8_e2_burst_messages) is not int or not 0 <= paper_p8_e2_burst_messages <= 100000)):
+            raise ValueError('paper_p8_e2_official_schedule_rejected')
         if paper_p8_e2_workload not in ('steady_burst', 'equal_samples'):
             raise ValueError('paper_p8_e2_workload_rejected')
         if paper_p8_e2_workload == 'steady_burst':
@@ -841,6 +872,11 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         raise ValueError('paper_p8_mode_rejected')
     if paper_p8_e3_workload not in ('mixed', 'low_load') or (paper_p8_e3_workload != 'mixed' and not paper_p8_e3):
         raise ValueError('paper_p8_mode_rejected')
+    if (type(paper_p8_e3_command_count) is not int or not 1 <= paper_p8_e3_command_count <= 30
+            or paper_p8_e3_schedule not in ('smoke', 'steady')
+            or (paper_p8_e3_schedule == 'smoke' and paper_p8_e3_command_count != 4)
+            or (not paper_p8_e3 and (paper_p8_e3_command_count != 4 or paper_p8_e3_schedule != 'smoke'))):
+        raise ValueError('paper_p8_e3_schedule_rejected')
     if paper_p8_e4 not in (None, 'on', 'off'):
         raise ValueError('paper_p8_mode_rejected')
     if sum((bool(paper_p8_sessions), bool(paper_p8_slow), bool(paper_p8_load and not (paper_p8_e1 or paper_p8_e2 or paper_p8_e3 or paper_p8_e4 or paper_p8_e5)),
@@ -917,6 +953,32 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     if paper_p1 not in (None, 'baseline', 'optimized') or paper_p0 and paper_p1:
         raise ValueError('paper_p1_mode_rejected')
     paper_profile = paper_p0 or paper_p1 is not None or paper_p2_spike or paper_p2
+    e1_resource_overlay = None
+    if paper_p8_e1:
+        if paper_p8_profile not in ('pilot', 'official'):
+            raise ValueError('e1_resource_gate_denied:profile')
+        if paper_p8_e1_viewers > 64 and (paper_p8_profile != 'official' or not paper_p8_official_opt_in):
+            raise ValueError('e1_resource_gate_denied:official_opt_in_required')
+        if Path('/proc/meminfo').is_file():
+            meminfo = Path('/proc/meminfo').read_text()
+            match = re.search(r'^MemAvailable:\s+(\d+)\s+kB$', meminfo, re.MULTILINE)
+            memory_available = int(match.group(1)) * 1024 if match else None
+        else:
+            memory_available = None
+        fd_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if fd_soft == resource.RLIM_INFINITY:
+            fd_soft = 2**63 - 1
+        if memory_available is None:
+            raise ValueError('e1_resource_gate_denied:host_memory_unavailable')
+        if type(fd_soft) is not int:
+            raise ValueError('e1_resource_gate_denied:host_fd_unavailable')
+        for source_dir in (ROOT / 'scripts', ROOT / 'scripts/tests'):
+            if str(source_dir) not in sys.path:
+                sys.path.insert(0, str(source_dir))
+        import paper_p8_e1_support as e1_support
+        e1_resource_overlay = e1_support.e1_resource_overlay(paper_p8_e1_viewers,
+            official_opt_in=paper_p8_profile == 'official' and paper_p8_official_opt_in,
+            host_limits={'fd_soft': fd_soft, 'memory_available_bytes': memory_available})
     # Reject ambiguous env-file syntax and symlinked parents before writing.
     base = Path(base).absolute()
     if any(p.is_symlink() for p in (base, *base.parents)) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(base)):
@@ -961,6 +1023,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         values.update(paper_p8_support().profile())
     if paper_p8_e1:
         values.update(paper_p8_support().profile())
+        values['WS_MAX_SESSIONS'] = str(e1_resource_overlay['proposed']['WS_MAX_SESSIONS'])
+        values['WS_SESSION_REFERENCE_BYTES'] = str(e1_resource_overlay['proposed']['WS_SESSION_REFERENCE_BYTES'])
         values.update(WS_HEARTBEAT_INTERVAL='2s', WS_PONG_TIMEOUT='4s', WS_WRITE_TIMEOUT='1s',
                       WS_RECHECK_INTERVAL='5s', WS_RECHECK_SWEEP_BUDGET='2s', WS_RECHECK_CONCURRENCY='2',
                       WS_FANOUT_MODE='indexed')
@@ -972,9 +1036,12 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                           MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
                           STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
         else:
-            values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND='2', MQTT_SHAPER_BURST='4',
+            shaper_rate = (paper_p8_e2_offered_rate + 1) // 2 if paper_p8_profile == 'official' else 2
+            shaper_burst = max((paper_p8_e2_burst_messages + 1)//2, shaper_rate) if paper_p8_profile == 'official' else 4
+            microbatch_rows = min(500, max(1, shaper_rate * paper_p8_e2_samples_per_message)) if paper_p8_profile == 'official' else 500
+            values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND=str(shaper_rate), MQTT_SHAPER_BURST=str(shaper_burst),
                           MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
-                          MQTT_MICROBATCH_MAX_ROWS='500', MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
+                          MQTT_MICROBATCH_MAX_ROWS=str(microbatch_rows), MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
                           MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
                           STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
     if paper_p8_e3:
@@ -1031,6 +1098,22 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     require_inputs(ROOT_COMPOSE.read_text() + template, values)
     env_file, override = private / "fixture.env", private / "compose.yml"
     private_write(env_file, "".join(f"{key}={value}\n" for key, value in sorted(values.items())))
+    nginx_main_config = None
+    if paper_p8_e1:
+        nginx_main_config = private / 'nginx.conf'
+        proposal = e1_resource_overlay['proposed']
+        private_write(nginx_main_config,
+            f"worker_processes {proposal['nginx_worker_processes']};\n"
+            f"worker_rlimit_nofile {proposal['nginx_process_fd_soft']};\n"
+            "events {\n"
+            f"    worker_connections {proposal['nginx_worker_connections']};\n"
+            "}\n"
+            "http {\n"
+            "    include /etc/nginx/mime.types;\n"
+            "    default_type application/octet-stream;\n"
+            "    sendfile on;\n"
+            "    include /etc/nginx/conf.d/*.conf;\n"
+            "}\n")
     # Each generated stanza has a unique service key. Merge template properties
     # under the same stanza rather than emitting duplicate YAML mappings.
     resource_offset = template.index("\nvolumes: !override\n") + 1
@@ -1049,6 +1132,16 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             stanzas.append("    ports: !override []\n")
         stanzas.append(f"    labels:\n      io.iot.native-smoke.run: ${{NCS_RUN:?required}}\n      io.iot.native-smoke.role: {service}\n      test.task: native-compose-startup\n      test.run: ${{NCS_RUN:?required}}\n")
         stanzas.append(extra_by_service.get(service, ""))
+        if paper_p8_e1 and service in ('nginx', 'backend', 'mosquitto'):
+            proposal = e1_resource_overlay['proposed']
+            nofile = (proposal['nginx_process_fd_soft'] if service == 'nginx' else
+                      proposal['backend_process_fd_limit'] if service == 'backend' else
+                      proposal['broker_process_fd_limit'])
+            stanzas.append(f"    ulimits: !override\n      nofile:\n        soft: {nofile}\n        hard: {nofile}\n")
+        if paper_p8_e1 and service == 'nginx':
+            stanzas.append(f"    volumes: !override\n      - type: bind\n        source: {nginx_main_config}\n"
+                           "        target: /etc/nginx/nginx.conf\n        read_only: true\n"
+                           "        bind:\n          create_host_path: false\n")
         if service == 'backend' and paper_p1:
             stanzas.append('    environment:\n      METRICS_ENABLED: ${METRICS_ENABLED:?required}\n')
     private_write(override, "".join(stanzas) + template[resource_offset:])
@@ -1075,8 +1168,16 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     object.__setattr__(fixture, 'paper_p8_e2_workload', paper_p8_e2_workload)
     object.__setattr__(fixture, 'paper_p8_e2_context', str(paper_p8_e2_context) if paper_p8_e2_context else None)
     object.__setattr__(fixture, 'paper_p8_e2_reference', str(paper_p8_e2_reference) if paper_p8_e2_reference else None)
+    object.__setattr__(fixture, 'paper_p8_profile', paper_p8_profile)
+    object.__setattr__(fixture, 'paper_p8_official_opt_in', bool(paper_p8_official_opt_in))
+    object.__setattr__(fixture, 'paper_p8_e2_offered_rate', paper_p8_e2_offered_rate)
+    object.__setattr__(fixture, 'paper_p8_e2_duration_seconds', paper_p8_e2_duration_seconds)
+    object.__setattr__(fixture, 'paper_p8_e2_burst_messages', paper_p8_e2_burst_messages)
+    object.__setattr__(fixture, 'paper_p8_e2_samples_per_message', paper_p8_e2_samples_per_message)
     object.__setattr__(fixture, 'paper_p8_e3', paper_p8_e3)
     object.__setattr__(fixture, 'paper_p8_e3_workload', paper_p8_e3_workload)
+    object.__setattr__(fixture, 'paper_p8_e3_command_count', paper_p8_e3_command_count)
+    object.__setattr__(fixture, 'paper_p8_e3_schedule', paper_p8_e3_schedule)
     object.__setattr__(fixture, 'paper_p8_e4', paper_p8_e4)
     object.__setattr__(fixture, 'paper_p8_e4_cache_mode', paper_p8_e4)
     object.__setattr__(fixture, 'paper_p8_e5', paper_p8_e5)
@@ -1084,6 +1185,12 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     object.__setattr__(fixture, 'paper_p8_e5_reference', str(paper_p8_e5_reference) if paper_p8_e5_reference else None)
     object.__setattr__(fixture, 'paper_p8_recovery', paper_p8_recovery)
     object.__setattr__(fixture, 'paper_p8_e1', paper_p8_e1)
+    object.__setattr__(fixture, 'e1_resource_overlay', e1_resource_overlay)
+    object.__setattr__(fixture, 'e1_nginx_main_config', str(nginx_main_config) if nginx_main_config else None)
+    object.__setattr__(fixture, 'paper_p8_e1_viewers', paper_p8_e1_viewers)
+    object.__setattr__(fixture, 'paper_p8_e1_principals', paper_p8_e1_principals)
+    object.__setattr__(fixture, 'paper_p8_e1_density', paper_p8_e1_density)
+    object.__setattr__(fixture, 'paper_p8_e1_messages_per_target', paper_p8_e1_messages_per_target)
     object.__setattr__(fixture, 'remote_network_config', remote_network_config)
     if paper_p5b is not None:
         object.__setattr__(fixture, 'paper_p5b', True)
@@ -1239,6 +1346,8 @@ def validate_effective_model(fixture, model):
         volume_mounts['nginx'] = {('auth_socket', '/run/iot-auth', True)}
         dependencies['auth-socket-init'] = {}
         dependencies['backend'].update({'supabase-envoy': 'service_started', 'auth-socket-init': 'service_completed_successfully'})
+    if getattr(fixture, 'paper_p8_e1', False):
+        binds['nginx'][fixture.e1_nginx_main_config] = '/etc/nginx/nginx.conf'
     paper_p8_remote_support().validate_effective_ports(services,
         remote_config=getattr(fixture, 'remote_network_config', None), paper_p2=fixture.paper_p2,
         paper_p8_load=getattr(fixture, 'paper_p8_load', False))
@@ -1265,7 +1374,20 @@ def validate_effective_model(fixture, model):
         if (actual_binds != binds[name] or actual_volumes != volume_mounts.get(name, set())
                 or len(service.get("volumes", [])) != len(actual_binds) + len(actual_volumes)):
             raise ValueError("effective_mounts_rejected")
+        if getattr(fixture, 'paper_p8_e1', False) and name in ('nginx', 'backend', 'mosquitto'):
+            proposal = fixture.e1_resource_overlay['proposed']
+            expected_nofile = (proposal['nginx_process_fd_soft'] if name == 'nginx' else
+                proposal['backend_process_fd_limit'] if name == 'backend' else
+                proposal['broker_process_fd_limit'])
+            nofile = service.get('ulimits', {}).get('nofile', {})
+            if nofile.get('soft') != expected_nofile or nofile.get('hard') != expected_nofile:
+                raise ValueError('e1_resource_overlay_compose_ulimit_mismatch:' + name)
     backend = services["backend"]
+    if getattr(fixture, 'paper_p8_e1', False):
+        env = backend.get('environment', {})
+        if (str(env.get('WS_MAX_SESSIONS')) != str(fixture.e1_resource_overlay['proposed']['WS_MAX_SESSIONS'])
+                or str(env.get('WS_SESSION_REFERENCE_BYTES')) != str(fixture.e1_resource_overlay['proposed']['WS_SESSION_REFERENCE_BYTES'])):
+            raise ValueError('e1_resource_overlay_backend_environment_mismatch')
     if fixture.paper_p0 or fixture.paper_p1 or fixture.paper_p2_spike or fixture.paper_p2 or fixture.paper_p6 or fixture.paper_p7 or getattr(fixture, 'paper_p8_e5', None):
         env = backend.get('environment', {})
         expected = {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'true' if fixture.paper_p3 or fixture.paper_p6 or getattr(fixture, 'paper_p8_e3', None) or getattr(fixture, 'paper_p8_e5', None) else 'false',
@@ -3380,6 +3502,74 @@ def db_psql(registry, postgres_cid: str, sql_commands: str, variables=None) -> s
     return result.stdout.decode()
 
 
+def p8_owned_storage_guard(fixture, registry, postgres_item, *, growth_limit_bytes,
+                           minimum_free_bytes=64 << 20, db_size_reader=None,
+                           interval_seconds=1.0):
+    """Return a finite A-local guard scoped to this fixture and its owned DB."""
+    try:
+        from scripts.paper_p8_resources import OwnedStorageGuard
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        from paper_p8_resources import OwnedStorageGuard
+
+    owned_paths = [fixture.private, fixture.artifacts]
+    guard = OwnedStorageGuard(owned_paths, growth_threshold_bytes=growth_limit_bytes,
+        minimum_free_bytes=minimum_free_bytes, interval_seconds=interval_seconds,
+        allowed_root=fixture.base, max_samples=128)
+    db_baseline = None
+    samples = []
+    last_sample_mono = None
+    last_result = None
+
+    def check():
+        nonlocal db_baseline, last_sample_mono, last_result
+        if last_sample_mono is not None and time.monotonic() - last_sample_mono < interval_seconds:
+            return last_result
+        container = registry.resolve(postgres_item)
+        if container is None or not postgres_item.get('receipt'):
+            raise ValueError('owned_postgres_identity_unavailable')
+        cid = postgres_item['receipt']['id']
+        if db_size_reader is None:
+            db_size = int(db_psql(registry, cid,
+                "SELECT pg_database_size('smoke')::bigint").strip())
+        else:
+            db_size = int(db_size_reader(registry, cid))
+        if db_size < 0:
+            raise ValueError('owned_postgres_size_invalid')
+        current = guard._measure()
+        if not current['available']:
+            raise ValueError('owned_fixture_storage_unavailable')
+        if db_baseline is None:
+            db_baseline = db_size
+        file_base = sum(guard.baseline['sizes_bytes'].values())
+        file_now = sum(current['sizes_bytes'].values())
+        growth = max(0, file_now - file_base) + max(0, db_size - db_baseline)
+        reason = ('owned_storage_growth_threshold' if growth >= growth_limit_bytes else
+                  'owned_storage_minimum_free_space'
+                  if current['free_bytes'] <= minimum_free_bytes else None)
+        sample = {'at_unix_ns': time.time_ns(), 'scope': 'fixture_private_artifacts_and_owned_smoke_database',
+            'file_sizes_bytes': {'fixture_private': current['sizes_bytes'][str(fixture.private)],
+                                 'fixture_artifacts': current['sizes_bytes'][str(fixture.artifacts)]},
+            'database_bytes': db_size,
+            'database_growth_bytes': max(0, db_size - db_baseline),
+            'free_bytes': current['free_bytes'], 'growth_bytes': growth, 'stop_reason': reason}
+        samples.append(sample)
+        if len(samples) > 128:
+            del samples[:-128]
+        report = {'status': 'threshold' if reason else 'sampling',
+            'scope': sample['scope'], 'growth_limit_bytes': growth_limit_bytes,
+            'minimum_free_bytes': minimum_free_bytes, 'interval_seconds': interval_seconds,
+            'baseline': {'file_sizes_bytes': {'fixture_private': guard.baseline['sizes_bytes'][str(fixture.private)],
+                'fixture_artifacts': guard.baseline['sizes_bytes'][str(fixture.artifacts)]},
+                'database_bytes': db_baseline}, 'terminal': sample,
+            'samples': samples[-128:], 'remote_b_action': 'operator_stops_B_locally'}
+        durable_json(fixture.private / 'owned-storage-guard.json', report)
+        last_sample_mono = time.monotonic()
+        last_result = {'ok': reason is None, 'reason': reason, 'report': report}
+        return last_result
+    return check
+
+
 def assert_unchanged(before, after):
     """Compare complete ordered row images for every protected table."""
     required = {"sensors", "twin_entities", "twin_relationships", "twin_states"}
@@ -4477,11 +4667,15 @@ def paper_p8_write_private_csv(path, header, rows):
 def paper_p8_e1_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
     """E1 is a workload pilot only; require helper validation and exact owned cleanup."""
     workload = evidence.get('workload')
+    mapping = evidence.get('mapping') if isinstance(evidence, dict) else None
+    expected_unique = sum(mapping.get('messages_per_target', {}).values()) if isinstance(mapping, dict) else None
     return (evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
             and paper_p8_e1_validation_valid(evidence)
-            and evidence.get('sockets') == 64 and isinstance(workload, dict)
+            and isinstance(mapping, dict)
+            and evidence.get('sockets') == mapping.get('counts', {}).get('sockets')
+            and isinstance(workload, dict)
             and isinstance(workload.get('telemetry'), dict)
-            and workload['telemetry'].get('generated_unique') == 20
+            and workload['telemetry'].get('generated_unique') == expected_unique
             and evidence.get('full_p8_accepted') is not True and cleanup_verified is True
             and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
                                             cleanup_counts, cleanup_verified, registry))
@@ -4655,6 +4849,8 @@ def paper_p8_e4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
     unique = (evidence.get('workloads') or {}).get('unique', {}) if isinstance(evidence, dict) else {}
     replay = (evidence.get('workloads') or {}).get('replay', {}) if isinstance(evidence, dict) else {}
     ut, rt = unique.get('telemetry', {}), replay.get('telemetry', {})
+    unique_count = getattr(fixture, 'paper_p8_e4_unique_count', 20)
+    replay_count = getattr(fixture, 'paper_p8_e4_replay_count', 10)
     cold_status = evidence.get('coldrestart') if isinstance(evidence, dict) else None
     expected_cold = 'PASS' if getattr(fixture, 'paper_p8_e4_cache_mode', None) == 'on' else 'NOT APPLICABLE'
     return (isinstance(evidence, dict) and evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
@@ -4668,13 +4864,14 @@ def paper_p8_e4_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
             and isinstance(evidence.get('conflicts'), dict) and evidence['conflicts'].get('status') == 'PASS'
             and isinstance(evidence.get('durable_gateway_reopen'), dict)
             and evidence['durable_gateway_reopen'].get('status') == 'PASS'
-            and isinstance(delta, dict) and delta.get('ledger') == 20 and delta.get('raw') == 2000
-            and delta.get('temporal') == 20
+            and isinstance(delta, dict) and delta.get('ledger') == unique_count
+            and delta.get('raw') == unique_count * 100
+            and delta.get('temporal') == unique_count
             and isinstance(raw, list) and len(raw) == 2
             and all(isinstance(row, dict) and row.get('verified_exact') is True for row in raw)
-            and ut.get('generated_unique') == 20 and ut.get('application_acks') == 20
+            and ut.get('generated_unique') == unique_count and ut.get('application_acks') == unique_count
             and ut.get('ignored_valid_acks') == 1 and ut.get('pending_messages') == 0
-            and rt.get('replay_offered') == 10 and rt.get('replay_application_acks') == 10
+            and rt.get('replay_offered') == replay_count and rt.get('replay_application_acks') == replay_count
             and cleanup_verified is True
             and paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
                                             cleanup_counts, cleanup_verified, registry))
@@ -4881,11 +5078,17 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
     cache = evidence.get('cache_window') if isinstance(evidence, dict) else None
     cold_subset = (isinstance(evidence, dict) and
                    evidence.get('workload_status') == 'COLD_REPLAY_SUBSET_VALIDATED')
+    expiry_subset = (isinstance(evidence, dict) and
+                     evidence.get('workload_status') == 'TTL_EXPIRY_SUBSET_VALIDATED')
     cache_off = isinstance(evidence, dict) and evidence.get('cache_mode') == 'off'
-    expected_marker = 'PAPER_P8_E4_CACHE_OFF_SUBSET' if cache_off else 'PAPER_P8_E4_WARM_SUBSET'
-    expected_outcome = 'CACHE_OFF_SUBSET_VALIDATED' if cache_off else 'WARM_SUBSET_VALIDATED'
+    expected_marker = ('PAPER_P8_E4_CACHE_OFF_SUBSET' if cache_off else
+                       'PAPER_P8_E4_TTL_EXPIRY_SUBSET' if expiry_subset else 'PAPER_P8_E4_WARM_SUBSET')
+    expected_outcome = ('CACHE_OFF_SUBSET_VALIDATED' if cache_off else
+                        'TTL_EXPIRY_SUBSET_VALIDATED' if expiry_subset else 'WARM_SUBSET_VALIDATED')
     expected_cold = 'NOT APPLICABLE' if cache_off else 'NOT RUN'
     expected_phases = ['unique', 'replay', 'cold-replay'] if cold_subset else ['unique', 'replay']
+    if expiry_subset:
+        expected_phases.append('expiry-replay')
     if cold_subset:
         expected_marker = 'PAPER_P8_E4_COLD_REPLAY_SUBSET'
         expected_outcome = 'COLD_REPLAY_SUBSET_VALIDATED'
@@ -4929,6 +5132,12 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
         and evidence.get('cold_replay_journal_prefix_validated') is True)
     cold_genuinely_proven = bool(isinstance(evidence, dict)
         and 'cold-replay' in evidence.get('phase_history', []) and cold_proven)
+    expiry = evidence.get('ttl_expiry') if isinstance(evidence, dict) else None
+    expiry_proven = (isinstance(expiry, dict) and expiry.get('status') == 'PASS'
+        and isinstance(expiry.get('evidence'), dict) and expiry['evidence'].get('status') == 'PASS'
+        and expiry['evidence'].get('confirmed_age_seconds', 0) >= 600)
+    if expiry_subset:
+        expected_cold = 'NOT RUN'
     durable_subset = (isinstance(evidence, dict) and
                       (evidence.get('workload_status') in ('DURABLE_REOPEN_SUBSET_VALIDATED', 'PILOT_COMPLETE_VALIDATED')
                        or isinstance(evidence.get('durable_gateway_reopen'), dict)))
@@ -4968,6 +5177,7 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
         and evidence.get('phase_history') == expected_phases
         and evidence.get('full_p8_accepted') is False
         and evidence.get('coldrestart') == expected_cold
+        and (not expiry_subset or expiry_proven)
         and durable_ok
         and conflicts_ok
         and evidence.get('physical_ab') == 'NOT RUN'
@@ -5013,7 +5223,8 @@ def paper_p8_e4_preparation_metadata(phase_run_ids):
     if not isinstance(phase_run_ids, dict) or not phase_run_ids:
         raise ValueError('p8_e4_phase_run_ids_rejected')
     phases = list(phase_run_ids)
-    if phases not in (['unique', 'replay'], ['unique', 'replay', 'cold-replay']):
+    if phases not in (['unique', 'replay'], ['unique', 'replay', 'cold-replay'],
+                      ['unique', 'replay', 'expiry-replay']):
         raise ValueError('p8_e4_phase_run_ids_rejected')
     return {'phase_inputs': phases, 'manifest_count': len(phases) + 1}
 
@@ -5034,7 +5245,15 @@ def paper_p8_e5_acceptance(report, evidence, cleanup_verified):
     raw = report.get('raw_verification', []) if isinstance(report, dict) else []
     viewer = report.get('viewer', {}) if isinstance(report, dict) else {}
     metadata = report.get('metadata', {}) if isinstance(report, dict) else {}
+    workload = metadata.get('workload', {}) if isinstance(metadata, dict) else {}
+    schedule = workload.get('schedule', {}) if isinstance(workload, dict) else {}
+    telemetry = workload.get('telemetry', {}) if isinstance(workload, dict) else {}
+    initial_count = schedule.get('initial_imported_messages', telemetry.get('messages', 20))
+    warm_count = schedule.get('warm_replay_prefix', 10)
+    samples_per_message = telemetry.get('samples_per_message', 100)
     return (isinstance(report, dict) and isinstance(evidence, dict)
+        and all(type(value) is int and value > 0
+                for value in (initial_count, warm_count, samples_per_message))
         and report.get('status') in ('WORKLOAD_COMPLETE_PENDING_CLEANUP', 'PASS')
         and report.get('workload_status', report.get('status')) == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
         and report.get('arm') == evidence.get('arm')
@@ -5042,10 +5261,12 @@ def paper_p8_e5_acceptance(report, evidence, cleanup_verified):
         and report.get('full_p8_accepted') is False and cleanup_verified is True
         and report.get('processes_stopped') is True and report.get('runner_stopped') is True
         and not report.get('cleanup_errors')
-        and (initial.get('e4') or {}).get('journal_entry_count') == 20
-        and (warm.get('e4') or {}).get('journal_entry_count') == 10
-        and all(delta.get(k) == v for k, v in {'ledger': 20, 'raw': 2000, 'temporal': 20}.items())
-        and accounting.get('imported_input') == 20 and accounting.get('warm_replay') == 10
+        and (initial.get('e4') or {}).get('journal_entry_count') == initial_count
+        and (warm.get('e4') or {}).get('journal_entry_count') == warm_count
+        and all(delta.get(k) == v for k, v in {'ledger': initial_count,
+            'raw': initial_count * samples_per_message, 'temporal': initial_count}.items())
+        and accounting.get('imported_input') == initial_count
+        and accounting.get('warm_replay') == warm_count
         and len(raw) == 2 and all(row.get('verified_exact') is True for row in raw)
         and viewer.get('ready_servers') == 2 and viewer.get('subscriptions') == 3
         and isinstance(commands, dict) and commands.get('status') == 'PASS'
@@ -5270,6 +5491,7 @@ def paper_p8_e5_post_cleanup_artifact(fixture, *, p8_path, staged_e5, remote_out
 
 
 def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_verified, registry):
+    expected_count = getattr(fixture, 'paper_p8_e3_command_count', 4)
     validation = evidence.get('validation') if isinstance(evidence, dict) else None
     accounting = evidence.get('accounting') if isinstance(evidence, dict) else None
     control = accounting.get('control') if isinstance(accounting, dict) else None
@@ -5278,6 +5500,7 @@ def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
     configurations = reconciliation.get('rest_configuration') if isinstance(reconciliation, dict) else None
     executors = reconciliation.get('sqlite_executors') if isinstance(reconciliation, dict) else None
     raw = evidence.get('raw_verification') if isinstance(evidence, dict) else None
+    timeline_window = evidence.get('control_timeline_window') if isinstance(evidence, dict) else None
     probes = evidence.get('representative_probes') if isinstance(evidence, dict) else None
     probe_operations = probes.get('operations') if isinstance(probes, dict) else None
     expected_probes = {
@@ -5285,6 +5508,7 @@ def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
         'same_key_replay': 202,
         'busy': 409,
         'stale': 409,
+        'online_fresh_apply': 202,
         'noop': 200,
         'noop_replay': 200,
     }
@@ -5298,6 +5522,13 @@ def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
         and probes.get('auxiliary_command_count') == 1
         and probes.get('receipt_count') == 2
         and probes.get('outside_fresh_command_measurement') is True
+        and isinstance(probes.get('offline_qualification'), dict)
+        and probes['offline_qualification'].get('executor_running') is False
+        and probes['offline_qualification'].get('receipt_verified') is True
+        and probes['offline_qualification'].get('terminal_status') in ('pending', 'published')
+        and probes['offline_qualification'].get('outbox_status') in ('pending', 'published')
+        and probes['offline_qualification'].get('same_key_replay_bytes_match') is True
+        and probes['offline_qualification'].get('delivery_guarantee') == 'none'
     )
     return (isinstance(evidence, dict)
             and evidence.get('status') == 'WORKLOAD_COMPLETE_PENDING_CLEANUP'
@@ -5307,11 +5538,20 @@ def paper_p8_e3_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
             and isinstance(validation, dict) and validation.get('valid') is True
             and validation.get('failures') == []
             and evidence.get('runner_stopped') is True
-            and isinstance(control, dict) and control.get('planned') == 4
-            and control.get('sent') == 4 and control.get('pending') == 0
+            and isinstance(control, dict) and control.get('planned') == expected_count
+            and control.get('sent') == expected_count and control.get('pending') == 0
             and isinstance(receipts, dict) and receipts.get('verified') is True
             and isinstance(receipts.get('verified_idempotency_keys'), list)
-            and len(receipts['verified_idempotency_keys']) == 4
+            and len(receipts['verified_idempotency_keys']) == expected_count
+            and isinstance(timeline_window, dict)
+            and timeline_window.get('availability') == 'available'
+            and isinstance(timeline_window.get('histograms'), dict)
+            and timeline_window['histograms'].get('d_dispatch', {}).get('count') == expected_count
+            and timeline_window['histograms'].get('d_e2e_succeeded', {}).get('count') == expected_count
+            and timeline_window['histograms'].get('pending_origins') == 0
+            and timeline_window['histograms'].get('missing_origin') == 0
+            and timeline_window['histograms'].get('missing_dispatch') == 0
+            and timeline_window['histograms'].get('overflow') == 0
             and isinstance(configurations, dict) and len(configurations) == 2
             and all(isinstance(value, dict) for value in configurations.values())
             and isinstance(executors, list) and len(executors) == 2
@@ -6002,19 +6242,31 @@ def main():
     parser.add_argument('--p8-e1-prepare-hold', action='store_true',
                         help=argparse.SUPPRESS)
     parser.add_argument('--p8-e1-bundle-root', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e1-viewers', type=int, default=64, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e1-principals', type=int, default=2, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e1-density', choices=('mixed','sparse','dense','overlap'), default='mixed', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e1-messages-per-target', type=int, default=5, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-prepare-hold', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-bundle-root', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-samples-per-message', choices=('100', '1'), help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-workload', choices=('steady_burst', 'equal_samples'), default='steady_burst', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-offered-rate', type=int, choices=(100, 1000, 5000, 20000), default=100, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-duration-seconds', type=int, default=10, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-burst-messages', type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-context', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-prepare-hold', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-bundle-root', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-workload', choices=('low_load', 'mixed'), help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e3-command-count', type=int, default=4, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e3-schedule', choices=('smoke', 'steady'), default='smoke', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e4-prepare-hold', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e4-bundle-root', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e4-cache-mode', choices=('on', 'off'), default='on', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-unique-count', type=int, default=20, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-replay-count', type=int, default=10, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e4-cold-replay', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e4-expiry-replay', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-e4-durable-reopen', action='store_true',
                         help='include sequential durable Gateway SQLite fault-stop/reopen phases after base E4 phases')
     parser.add_argument('--p8-e4-conflicts', action='store_true',
@@ -6026,6 +6278,8 @@ def main():
     parser.add_argument('--p8-experiment', choices=('E1', 'E2', 'E3', 'E4', 'E5'), default='E1')
     parser.add_argument('--p8-arm', default='lifecycle')
     parser.add_argument('--p8-seed', type=int, default=0)
+    parser.add_argument('--p8-profile', choices=('pilot', 'official'), default='pilot', help=argparse.SUPPRESS)
+    parser.add_argument('--p8-official-opt-in', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--p8-deadline-seconds', type=float, default=900)
     parser.add_argument('--p8-remote-config', type=Path,
                         help='Strict opt-in private IPv4 LAN profile JSON for isolated P8 server startup')
@@ -6049,6 +6303,8 @@ def main():
     parser.add_argument('--paper-p8-e2-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--paper-p8-e3', choices=('polling', 'wakeup'), help='Run the bounded P8 E3 fresh-command pilot arm')
     parser.add_argument('--paper-p8-e3-low-load', action='store_true', help='Use the bounded low-load E3 profile; requires --paper-p8-e3')
+    parser.add_argument('--paper-p8-e3-command-count', type=int, choices=range(1, 31), default=4)
+    parser.add_argument('--paper-p8-e3-schedule', choices=('smoke', 'steady'), default='smoke')
     parser.add_argument('--paper-p8-e4', choices=('on', 'off'), help='Run the bounded P8 E4 warm RAM-dedup pilot arm')
     parser.add_argument('--paper-p8-e5', choices=('optimized', 'shaper_off', 'microbatch_off', 'ram_dedup_off', 'polling', 'fanout_scan'), help='Run one bounded E5 native mechanism arm')
     parser.add_argument('--paper-p8-e5-context', type=Path, help='Private repeat context JSON required by E5')
@@ -6102,6 +6358,14 @@ def main():
             parser.error('--p8-lifecycle-hold cannot be combined with another fixture lane')
         if args.p8_e1_prepare_hold and (args.p8_experiment != 'E1' or args.p8_e1_bundle_root is None):
             parser.error('--p8-e1-prepare-hold requires E1 and --p8-e1-bundle-root')
+        if args.p8_e1_prepare_hold and (args.p8_profile == 'official' and not args.p8_official_opt_in):
+            parser.error('official E1 requires --p8-official-opt-in')
+        if args.p8_profile == 'official' and not args.p8_official_opt_in:
+            parser.error('official P8 profile requires explicit --p8-official-opt-in')
+        if (args.p8_profile != 'pilot' or args.p8_official_opt_in) and not any((
+                args.p8_e1_prepare_hold, args.p8_e2_prepare_hold, args.p8_e3_prepare_hold,
+                args.p8_e4_prepare_hold, args.p8_e5_prepare_hold)):
+            parser.error('P8 profile options require a P8 prepare-hold lane')
         if args.p8_e2_prepare_hold:
             if args.p8_experiment != 'E2' or args.p8_e2_bundle_root is None or args.p8_e2_samples_per_message is None:
                 parser.error('--p8-e2-prepare-hold requires E2, --p8-e2-bundle-root and an explicit sample profile')
@@ -6114,12 +6378,20 @@ def main():
         if args.p8_e3_prepare_hold and (args.p8_experiment != 'E3' or args.p8_e3_bundle_root is None
                 or args.p8_arm not in ('polling', 'wakeup') or args.p8_e3_workload is None):
             parser.error('--p8-e3-prepare-hold requires E3, dispatch arm, workload and bundle root')
+        if args.p8_e3_prepare_hold and (not 1 <= args.p8_e3_command_count <= 30
+                or args.p8_e3_schedule not in ('smoke', 'steady')
+                or (args.p8_e3_schedule == 'smoke' and args.p8_e3_command_count != 4)):
+            parser.error('E3 command count/schedule is invalid')
         if args.p8_e4_prepare_hold and (args.p8_experiment != 'E4' or args.p8_e4_bundle_root is None
                 or args.p8_arm != 'warm' or args.p8_remote_config is None):
             parser.error('--p8-e4-prepare-hold requires E4 warm arm, remote config and bundle root')
         if args.p8_e4_cold_replay and (not args.p8_e4_prepare_hold
                 or args.p8_e4_cache_mode != 'on' or args.p8_experiment != 'E4'):
             parser.error('--p8-e4-cold-replay requires E4 prepare hold and cache mode on')
+        if args.p8_e4_expiry_replay and (not args.p8_e4_prepare_hold
+                or args.p8_e4_cache_mode != 'on' or args.p8_e4_cold_replay
+                or args.p8_e4_durable_reopen or args.p8_e4_conflicts):
+            parser.error('--p8-e4-expiry-replay requires E4 prepare hold/cache on and excludes cold, durable, and conflicts')
         if args.p8_e4_durable_reopen and (not args.p8_e4_prepare_hold or args.p8_experiment != 'E4'):
             parser.error('--p8-e4-durable-reopen requires E4 prepare hold')
         if args.p8_e4_conflicts and (not args.p8_e4_prepare_hold or args.p8_experiment != 'E4'):
@@ -6260,14 +6532,26 @@ def main():
                              paper_p8_sessions=args.paper_p8_sessions,
                              paper_p8_slow=args.paper_p8_slow_viewer,
                               paper_p8_load=args.paper_p8_load,
-                                 paper_p8_e1=(args.paper_p8_e1 or args.p8_e1_prepare_hold),
+                                  paper_p8_e1=(args.paper_p8_e1 or args.p8_e1_prepare_hold),
+                                  paper_p8_e1_viewers=args.p8_e1_viewers,
+                                  paper_p8_e1_principals=args.p8_e1_principals,
+                                  paper_p8_e1_density=args.p8_e1_density,
+                                  paper_p8_e1_messages_per_target=args.p8_e1_messages_per_target,
                                  paper_p8_e2=(args.paper_p8_e2 or args.p8_e2_prepare_hold),
                                  paper_p8_e2_workload=(args.p8_e2_workload if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_workload', 'steady_burst')),
                                  paper_p8_e2_context=(args.p8_e2_context if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_context', None)),
-                                 paper_p8_e2_reference=(args.p8_e2_reference if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_reference', None)),
+                                  paper_p8_e2_reference=(args.p8_e2_reference if args.p8_e2_prepare_hold else getattr(args, 'paper_p8_e2_reference', None)),
+                                  paper_p8_profile=args.p8_profile,
+                                  paper_p8_official_opt_in=args.p8_official_opt_in,
+                                  paper_p8_e2_offered_rate=args.p8_e2_offered_rate,
+                                  paper_p8_e2_duration_seconds=args.p8_e2_duration_seconds,
+                                  paper_p8_e2_burst_messages=args.p8_e2_burst_messages,
+                                  paper_p8_e2_samples_per_message=int(args.p8_e2_samples_per_message or 1),
                                    paper_p8_e3=paper_p8_e3_selector(args),
-                                  paper_p8_e3_workload=(args.p8_e3_workload if args.p8_e3_prepare_hold else
-                                      'low_load' if args.paper_p8_e3_low_load else 'mixed'),
+                                   paper_p8_e3_workload=(args.p8_e3_workload if args.p8_e3_prepare_hold else
+                                       'low_load' if args.paper_p8_e3_low_load else 'mixed'),
+                                   paper_p8_e3_command_count=args.p8_e3_command_count if args.p8_e3_prepare_hold else args.paper_p8_e3_command_count,
+                                   paper_p8_e3_schedule=args.p8_e3_schedule if args.p8_e3_prepare_hold else args.paper_p8_e3_schedule,
                                   paper_p8_e4=(args.paper_p8_e4 or
                                       args.p8_e4_cache_mode if args.p8_e4_prepare_hold else args.paper_p8_e4),
                                   paper_p8_e5=(args.paper_p8_e5 or (args.p8_arm if args.p8_e5_prepare_hold else None)),
@@ -6284,6 +6568,9 @@ def main():
         object.__setattr__(fixture, 'paper_p8_e3_prepare_only', args.p8_e3_prepare_hold)
         object.__setattr__(fixture, 'paper_p8_e4_prepare_only', args.p8_e4_prepare_hold)
         object.__setattr__(fixture, 'paper_p8_e4_cold_replay', args.p8_e4_cold_replay)
+        object.__setattr__(fixture, 'paper_p8_e4_expiry_replay', args.p8_e4_expiry_replay)
+        object.__setattr__(fixture, 'paper_p8_e4_unique_count', args.p8_e4_unique_count)
+        object.__setattr__(fixture, 'paper_p8_e4_replay_count', args.p8_e4_replay_count)
         object.__setattr__(fixture, 'paper_p8_e5_prepare_only', args.p8_e5_prepare_hold)
     except BaseException as exc:
         report = {
@@ -6334,7 +6621,11 @@ def main():
                         prepared = helper.prepare(sys.modules[__name__], fixture, endpoint, registry,
                             containers, images, state, session_id=session_id, phase='pilot',
                             mode='remote', arm=args.p8_arm,
-                            output_root=fixture.private / 'p8-e1-prepared')
+                            output_root=fixture.private / 'p8-e1-prepared',
+                            profile=args.p8_profile, official_opt_in=args.p8_official_opt_in,
+                            viewers=args.p8_e1_viewers, principals=args.p8_e1_principals,
+                            density=args.p8_e1_density,
+                            messages_per_target=args.p8_e1_messages_per_target)
                         prepared_bundle = helper.export_prepared_bundle(prepared,
                             output_leaf=bundle_root, wait_seconds=90, workload_seconds=30)
                     elif experiment == 'E2':
@@ -6375,6 +6666,11 @@ def main():
                                 bundle_root=bundle_root,
                                 arm=args.p8_arm,
                                 workload='steady_burst',
+                                profile=args.p8_profile,
+                                official_opt_in=args.p8_official_opt_in,
+                                offered_rate=args.p8_e2_offered_rate,
+                                duration_seconds=args.p8_e2_duration_seconds,
+                                burst_messages=args.p8_e2_burst_messages,
                             )
                         prepared['e2_support'] = e2
                         prepared['workload'] = e2_workload
@@ -6398,7 +6694,11 @@ def main():
                         prepared = e3.prepare(sys.modules[__name__], fixture, endpoint, registry,
                             containers, images, state, arm=args.p8_arm,
                             workload=args.p8_e3_workload, remote_profile=remote_profile,
-                            session_id=session_id)
+                            session_id=session_id,
+                            command_count=args.p8_e3_command_count,
+                            schedule=args.p8_e3_schedule,
+                            profile=args.p8_profile,
+                            official_opt_in=args.p8_official_opt_in)
                         prepared_bundle = e3.export_prepared_bundle(prepared, output_leaf=bundle_root)
                         prepared['e3_support'] = e3
                         durable_json(fixture.artifacts / paper_p8_e3_artifact_name(fixture), {
@@ -6425,11 +6725,17 @@ def main():
                             containers, images, state, args.p8_e4_cache_mode,
                             remote_profile=remote_profile, session_id=session_id,
                             include_cold_replay=args.p8_e4_cold_replay,
+                            include_expiry_replay=args.p8_e4_expiry_replay,
                             include_durable_reopen=args.p8_e4_durable_reopen,
-                            include_conflicts=args.p8_e4_conflicts)
+                            include_conflicts=args.p8_e4_conflicts,
+                            unique_count=args.p8_e4_unique_count,
+                            replay_count=args.p8_e4_replay_count,
+                            profile=args.p8_profile, official_opt_in=args.p8_official_opt_in,
+                            session_seconds=args.p8_deadline_seconds)
                         prepared_bundle = e4.export_prepared_bundle(prepared, output_leaf=bundle_root)
                         prepared['e4_support'] = e4
-                        phase_names = ('unique', 'replay', 'cold-replay') if prepared.get('include_cold_replay') else ('unique', 'replay')
+                        phase_names = (['unique', 'replay'] + (['cold-replay'] if prepared.get('include_cold_replay') else [])
+                            + (['expiry-replay'] if prepared.get('include_expiry_replay') else []))
                         prepared['phase_run_ids'] = {phase: json.loads(path.read_text())['run_id']
                             for phase, path in zip(phase_names, prepared['manifests'])}
                         phase_metadata = paper_p8_e4_preparation_metadata(prepared['phase_run_ids'])
@@ -6530,6 +6836,7 @@ def main():
                         deadline_seconds=args.p8_deadline_seconds, receipts=receipts,
                         image_metadata=images, artifacts=artifacts,
                         preparation_status=f'{experiment}_PREPARED', session_id=session_id,
+                        profile=args.p8_profile, official_opt_in=args.p8_official_opt_in,
                         source_metadata={'revision': paper_p0_git(fixture, 'rev-parse', 'HEAD'),
                             'dirty_worktree': bool(paper_p0_git(fixture, 'status', '--porcelain')),
                             'qualification': 'local source and dirty state; not a release provenance claim'},
@@ -6537,17 +6844,20 @@ def main():
                             'mqtt_tls': remote_profile['advertised_mqtt_tls'],
                             'bind_ip': remote_profile['bind_ip']},
                         project=fixture.project, lock=lock,
-                        cold_replay_enabled=args.p8_e4_cold_replay,
+                         cold_replay_enabled=args.p8_e4_cold_replay,
+                         expiry_replay_enabled=args.p8_e4_expiry_replay,
                         e4_phase_plan=(['unique','replay']
                             + (['cold-replay'] if args.p8_e4_cold_replay else [])
                             + (['durable-fault','durable-reopen'] if args.p8_e4_durable_reopen else [])
-                            + (['conflicts'] if args.p8_e4_conflicts else [])) if experiment == 'E4' else None,
+                            + (['conflicts'] if args.p8_e4_conflicts else [])
+                            + (['expiry-replay'] if args.p8_e4_expiry_replay else [])) if experiment == 'E4' else None,
                         e5_phase_plan=['initial', 'warm_replay', 'control'] if experiment == 'E5' else None,
                         workload=(prepared.get('workload') if experiment == 'E2' else None))
                 else:
                     session['state'] = supervisor.initialize(fixture.private, experiment=args.p8_experiment,
                         arm=args.p8_arm, seed=args.p8_seed, deadline_seconds=args.p8_deadline_seconds,
                         receipts=receipts, image_metadata=images,
+                        profile=args.p8_profile, official_opt_in=args.p8_official_opt_in,
                         endpoint_metadata=({'https': remote_profile['advertised_https'],
                             'mqtt_tls': remote_profile['advertised_mqtt_tls'],
                             'bind_ip': remote_profile['bind_ip']} if remote_profile else {}),
@@ -6565,7 +6875,7 @@ def main():
                             if request.get('phase_id') in ('durable-fault','durable-reopen'):
                                 return prepared['e4_support'].begin_remote_durable_phase(
                                     sys.modules[__name__], registry, prepared, request['phase_id'])
-                            if request.get('phase_id') not in ('unique', 'replay', 'cold-replay'):
+                            if request.get('phase_id') not in ('unique', 'replay', 'cold-replay', 'expiry-replay'):
                                 raise ValueError('p8_e4_phase_id_rejected')
                             return prepared['e4_support'].begin_remote_phase(
                                 sys.modules[__name__], fixture, endpoint, registry, containers,
@@ -6735,9 +7045,22 @@ def main():
                                 'validation_valid':result['validation']['valid'],
                                 'validation_failures':result['validation']['failures'],
                                 'report':str(report_path)}
+                    prepared = session.get('prepared') or {}
+                    declared_growth = []
+                    candidates = prepared.get('manifests')
+                    if isinstance(candidates, dict):
+                        for manifest in candidates.values():
+                            if isinstance(manifest, dict):
+                                value = (manifest.get('limits') or {}).get('disk_growth_bytes')
+                                if type(value) is int and value > 0:
+                                    declared_growth.append(value)
+                    growth_limit = min(declared_growth) if declared_growth else 64 << 20
+                    owned_guard = p8_owned_storage_guard(fixture, registry, containers['postgres'],
+                        growth_limit_bytes=growth_limit)
                     supervisor.hold(fixture.private, lock=lock,
                                     on_begin=begin_collection, on_finish=finish_import,
-                                    on_next=replace_for_cold_replay if experiment == 'E4' else None)
+                                    on_next=replace_for_cold_replay if experiment == 'E4' else None,
+                                    owned_guard=owned_guard)
                 else:
                     supervisor.hold(fixture.private, lock=lock)
             def finalize_session(*, cleanup_verified, cleanup_error, workload_error):
@@ -6789,6 +7112,8 @@ def main():
                 if getattr(fixture, 'paper_p8_e4_remote_warm', False):
                     expected_phases = (['unique', 'replay', 'cold-replay']
                         if final_session.get('cold_replay_enabled') is True else ['unique', 'replay'])
+                    if args.p8_e4_expiry_replay:
+                        expected_phases.append('expiry-replay')
                     durable_enabled = args.p8_e4_durable_reopen
                     if durable_enabled:
                         expected_phases += ['durable-fault','durable-reopen']

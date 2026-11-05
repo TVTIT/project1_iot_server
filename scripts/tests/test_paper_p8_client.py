@@ -221,6 +221,15 @@ class IdentityAndProbeTests(unittest.TestCase):
             'command_ordinal': 1}])
         self.assertEqual(events[0]['child'], 'paperload-control:control.manifest.json')
 
+    def test_e3_phase_projection_bounds_full_thirty_command_lifecycle(self):
+        event = {'child': 'paperload-control:control.manifest.json',
+                 'event': 'request_begin', 'elapsed_ns': 10,
+                 'clock_qualification': 'runner observed pipe receipt; observation lag unknown',
+                 'command_ordinal': 1}
+        self.assertEqual(len(client._safe_phase_events([event] * 96)), 96)
+        with self.assertRaisesRegex(ValueError, 'phase event schema rejected'):
+            client._safe_phase_events([event] * 3101)
+
     def test_e1_safe_phase_events_accepts_telemetry_child_labels(self):
         for child in ('paperload-telemetry:telemetry.json',
                       'paperload-telemetry:telemetry.manifest.json'):
@@ -291,6 +300,11 @@ class IdentityAndProbeTests(unittest.TestCase):
                 'observed; maximum 9 command ordinals sampled; process-local clock'}, role='control')
         self.assertEqual(result['phase_observation_status'],
             'observed; maximum 9 command ordinals sampled; process-local clock')
+        complete = client._safe_workload({'status': 'COMPLETE', 'experiment': 'E3',
+            'arm': 'control', 'phase_observation_status':
+                'observed; all command ordinals; process-local clock'}, role='control')
+        self.assertEqual(complete['phase_observation_status'],
+            'observed; all command ordinals; process-local clock')
 
     def test_viewer_map_probes_all_bounded_principals_for_rest_and_ws(self):
         fixture = PortableBundleTests()
@@ -950,6 +964,14 @@ class ResultProjectionTests(unittest.TestCase):
         self.assertEqual({Path(item['manifest']).stem for item in selected}, {'cold-replay', 'viewer'})
         with self.assertRaisesRegex(ValueError, 'E4 phase input rejected'):
             client._select_e4_phase_jobs(jobs[:-2] + jobs[-1:], 'cold-replay', replay_validated=True)
+
+    def test_e4_expiry_phase_selects_its_manifest_and_viewer(self):
+        jobs = [{'role': 'telemetry', 'manifest': '/b/manifests/unique.json'},
+                {'role': 'telemetry', 'manifest': '/b/manifests/replay.json'},
+                {'role': 'telemetry', 'manifest': '/b/manifests/expiry-replay.json'},
+                {'role': 'viewer', 'manifest': '/b/manifests/viewer.json'}]
+        selected = client._select_e4_phase_jobs(jobs, 'expiry-replay', replay_validated=True)
+        self.assertEqual({Path(item['manifest']).stem for item in selected}, {'expiry-replay', 'viewer'})
 
     def test_e4_safe_projection_preserves_phase_proof_without_private_material(self):
         payload = {'status': 'COMPLETE', 'experiment': 'E4', 'run_id': 'e4-unique',

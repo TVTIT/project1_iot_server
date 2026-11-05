@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -13,6 +14,26 @@ import paper_p8_comparison as comparison
 
 ARMS = comparison.ARM_NAMES
 MAX_JOURNAL_BYTES = 1 << 20
+WORKLOAD_PRESETS = {
+    'pilot': {'profile': 'pilot', 'telemetry_messages': 20, 'samples_per_message': 100,
+        'initial_replay_count': 20, 'warm_replay_prefix': 10, 'command_count': 4, 'viewer_count': 2,
+        'initial_replay_rate_per_second': 1},
+    'representative': {'profile': 'representative', 'telemetry_messages': 8, 'samples_per_message': 100,
+        'initial_replay_count': 8, 'warm_replay_prefix': 2, 'command_count': 4, 'viewer_count': 2,
+        'initial_replay_rate_per_second': 1},
+}
+
+
+def workload_preset(name):
+    if name not in WORKLOAD_PRESETS:
+        raise ValueError('e5_workload_preset_invalid')
+    return dict(WORKLOAD_PRESETS[name])
+
+
+def selection_sha256(selection):
+    if selection not in WORKLOAD_PRESETS.values():
+        raise ValueError('e5_workload_selection_invalid')
+    return hashlib.sha256(json.dumps(selection, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 _ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')
 
 
@@ -23,9 +44,11 @@ def _uuid4(rng):
     return str(uuid.UUID(bytes=bytes(raw)))
 
 
-def build_dataset(*, seed, sensor_ids, anchor, path):
+def build_dataset(*, seed, sensor_ids, anchor, path, message_count=20, samples_per_message=100):
     """Write one bounded deterministic E4-compatible JSONL journal, private/exclusive."""
-    if type(seed) is not int or seed < 0 or not isinstance(sensor_ids, (list, tuple)) or len(sensor_ids) != 2:
+    if (type(seed) is not int or seed < 0 or not isinstance(sensor_ids, (list, tuple)) or len(sensor_ids) != 2
+            or type(message_count) is not int or not 1 <= message_count <= 20
+            or type(samples_per_message) is not int or samples_per_message != 100):
         raise ValueError('e5_dataset_inputs_invalid')
     if any(not isinstance(value, str) or not _ID.fullmatch(value) for value in sensor_ids):
         raise ValueError('e5_sensor_id_invalid')
@@ -48,21 +71,21 @@ def build_dataset(*, seed, sensor_ids, anchor, path):
     boot_ids = {(gateway, sensor): _uuid4(rng)
                 for gateway, sensor in zip(gateway_ids, sensor_ids)}
     records = []
-    for index in range(20):
+    for index in range(message_count):
         gw_index = index % 2
         gateway_id, sensor_id = gateway_ids[gw_index], sensor_ids[index % 2]
         first_sequence = str((index // 2) * 100 + 1)
         measured_at = (instant + timedelta(seconds=index)).isoformat(timespec='microseconds').replace('+00:00', 'Z')
         first = int(first_sequence)
         samples = []
-        for sequence in range(first, first + 100):
+        for sequence in range(first, first + samples_per_message):
             position = sequence % 2000
             if position > 1000:
                 position = 2000 - position
             samples.append(20 + position / 100.0)
         payload_obj = {'protocol_version': 1, 'message_id': _uuid4(rng),
             'message_type': 'telemetry_batch', 'gateway_id': gateway_id, 'sensor_id': sensor_id,
-            'boot_id': boot_ids[(gateway_id, sensor_id)], 'first_sequence': first, 'sample_count': 100,
+            'boot_id': boot_ids[(gateway_id, sensor_id)], 'first_sequence': first, 'sample_count': samples_per_message,
             'measured_at': measured_at, 'sample_interval_us': 10000, 'samples': samples}
         payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False).encode()
         digest = hashlib.sha256(payload).hexdigest()
@@ -113,27 +136,33 @@ def command_idempotency_keys(seed):
     return [_uuid4(rng) for _ in range(4)]
 
 
-def workload_manifest(*, journal_sha256, journal_bytes, command_ids, sensor_ids, viewer_targets, anchor):
+def workload_manifest(*, journal_sha256, journal_bytes, command_ids, sensor_ids, viewer_targets, anchor, selection=None):
     """Normalized paired workload declaration; values are declarative, never executed here."""
+    selection = selection or workload_preset('pilot')
     if (not re.fullmatch(r'[0-9a-f]{64}', str(journal_sha256)) or
             type(journal_bytes) is not int or journal_bytes < 1 or
-            not isinstance(command_ids, (list, tuple)) or len(command_ids) != 4 or
+            selection not in WORKLOAD_PRESETS.values() or
+            not isinstance(command_ids, (list, tuple)) or len(command_ids) != selection['command_count'] or
             not isinstance(sensor_ids, (list, tuple)) or len(sensor_ids) != 2 or
-            not isinstance(viewer_targets, (list, tuple)) or len(viewer_targets) not in (2, 3)):
+            not isinstance(viewer_targets, (list, tuple)) or len(viewer_targets) not in (2, 3)
+            or selection['viewer_count'] != 2):
         raise ValueError('e5_workload_manifest_inputs_invalid')
-    return {'workload_type': 'p8_e5_prebuilt_journal', 'journal_sha256': journal_sha256,
-        'journal_bytes': journal_bytes, 'schedule': {'initial_imported_messages': 20,
-            'initial_replay': {'rate_per_second': 1, 'measure_seconds': 1, 'burst_messages': 19},
-            'warm_replay_prefix': 10, 'replay_after_commit_ack_baseline': True,
+    messages = selection['telemetry_messages']
+    replay = selection['initial_replay_count']
+    return {'workload_type': 'p8_e5_prebuilt_journal', 'profile': selection['profile'],
+        'workload_selection_sha256': selection_sha256(selection), 'journal_sha256': journal_sha256,
+        'journal_bytes': journal_bytes, 'schedule': {'initial_imported_messages': messages,
+            'initial_replay': {'rate_per_second': selection['initial_replay_rate_per_second'], 'measure_seconds': 1, 'burst_messages': max(0, replay - 1)},
+            'warm_replay_prefix': selection['warm_replay_prefix'], 'replay_after_commit_ack_baseline': True,
             'generated_unique': 0},
         'telemetry': {'gateway_ids': ['p8-e5-a', 'p8-e5-b'], 'sensor_ids': list(sensor_ids),
-            'messages': 20, 'samples_per_message': 100, 'sample_interval_us': 10000,
+            'messages': messages, 'samples_per_message': selection['samples_per_message'], 'sample_interval_us': 10000,
             'dataset_anchor': anchor},
         'commands': {'gateway_id': 'p8-e5-a', 'command_sensor_ids': ['p8-e5-command-a', 'p8-e5-command-b'],
-            'idempotency_keys': list(command_ids), 'count': 4,
+            'idempotency_keys': list(command_ids), 'count': len(command_ids),
             'frequencies_hz': [2, 4], 'versions': {'initial': 0, 'after_each_sensor': 1},
             'executor': 'existing_e3_sqlite_executor'},
-        'subscriptions': list(viewer_targets), 'viewer_count': 2,
+        'subscriptions': list(viewer_targets), 'viewer_count': selection['viewer_count'],
         'security': {'tls': True, 'jwt': True, 'acl': True, 'application_commit_ack': True}}
 
 
@@ -168,6 +197,64 @@ def _window_delta(before, after, section, fields):
             return {'status': 'INCONCLUSIVE', 'reason': 'counter_reset_' + source}
         result[name] = b - a
     return {'status': 'AVAILABLE', 'delta': result}
+
+
+def control_timeline_window(before, after, *, expected_commands):
+    """Delta the real ControlTimelineSnapshot over the control phase only."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {'status': 'INCONCLUSIVE', 'reason': 'timeline_snapshot_missing'}
+    process = before.get('process_instance')
+    if not isinstance(process, str) or not process.strip() or process != after.get('process_instance'):
+        return {'status': 'INCONCLUSIVE', 'reason': 'timeline_process_missing_or_changed'}
+    old, new = before.get('command_timeline'), after.get('command_timeline')
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return {'status': 'INCONCLUSIVE', 'reason': 'timeline_section_missing'}
+    result = {'status': 'AVAILABLE', 'process_instance': process,
+              'window': 'control_before..terminal_after_result_drain'}
+    for name in ('d_dispatch', 'd_e2e_succeeded'):
+        a, b = old.get(name), new.get(name)
+        fields = ('count', 'overflow', 'sum_seconds')
+        if (not isinstance(a, dict) or not isinstance(b, dict)
+                or a.get('upper_seconds') != b.get('upper_seconds')
+                or not isinstance(a.get('buckets'), list) or len(a['buckets']) != len(b.get('buckets', []))
+                or type(a.get('count')) is not int or type(b.get('count')) is not int
+                or type(a.get('overflow')) is not int or type(b.get('overflow')) is not int
+                or any(type(a.get(k)) not in (int, float) or type(b.get(k)) not in (int, float)
+                       or not math.isfinite(a[k]) or not math.isfinite(b[k]) or a[k] < 0 or b[k] < a[k]
+                       for k in fields)
+                or any(type(x) is not int or type(y) is not int or x < 0 or y < x
+                       for x, y in zip(a['buckets'], b['buckets']))):
+            return {'status': 'INCONCLUSIVE', 'reason': 'timeline_histogram_invalid_or_reset_' + name}
+        bounds = a['upper_seconds']
+        if (not isinstance(bounds, list) or len(bounds) != len(a['buckets'])
+                or any(type(x) not in (int, float) or not math.isfinite(x) or x <= 0 for x in bounds)
+                or any(right <= left for left, right in zip(bounds, bounds[1:]))):
+            return {'status': 'INCONCLUSIVE', 'reason': 'timeline_histogram_bounds_invalid_' + name}
+        result[name] = {'count': b['count'] - a['count'], 'sum_seconds': b['sum_seconds'] - a['sum_seconds'],
+            'overflow': b['overflow'] - a['overflow'], 'buckets': [y-x for x, y in zip(a['buckets'], b['buckets'])],
+            'upper_seconds': list(b['upper_seconds'])}
+        if (result[name]['count'] != sum(result[name]['buckets']) + result[name]['overflow']
+                or a['count'] != sum(a['buckets']) + a['overflow']
+                or b['count'] != sum(b['buckets']) + b['overflow']):
+            return {'status': 'INCONCLUSIVE', 'reason': 'timeline_histogram_count_invariant_' + name}
+    for key in ('missing_origin', 'missing_dispatch', 'missing_result', 'overflow'):
+        a, b = old.get(key), new.get(key)
+        if type(a) is not int or type(b) is not int or a < 0 or b < a:
+            return {'status': 'INCONCLUSIVE', 'reason': 'timeline_counter_missing_or_reset_' + key}
+        result[key] = b-a
+    pending = new.get('pending_origins')
+    if type(pending) is not int or pending < 0:
+        return {'status': 'INCONCLUSIVE', 'reason': 'timeline_pending_missing'}
+    result['pending_origins'] = pending
+    if type(expected_commands) is not int or expected_commands < 0:
+        return {'status': 'INCONCLUSIVE', 'reason': 'timeline_expected_command_count_missing'}
+    result['expected_commands'] = expected_commands
+    result['count_matches_expected'] = (result['d_dispatch']['count'] == expected_commands
+        and result['d_e2e_succeeded']['count'] == expected_commands
+        and all(result[key] == 0 for key in ('missing_origin', 'missing_dispatch', 'missing_result', 'overflow'))
+        and result['d_dispatch']['overflow'] == 0 and result['d_e2e_succeeded']['overflow'] == 0
+        and pending == 0)
+    return result
 
 
 def adapt_mechanism_counters(before, after, *, arm, verified_commands=0, viewer_readiness=None):

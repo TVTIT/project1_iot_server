@@ -46,6 +46,7 @@ phase_names = PHASE_NAMES
 REQUIRED_CONTEXT_KEYS = (
     'dataset_path', 'sha256', 'bytes', 'seed', 'anchor',
     'sensor_ids', 'gateway_ids', 'command_keys', 'viewer_subscriptions',
+    'workload_selection', 'workload_selection_sha256',
 )
 
 
@@ -78,6 +79,8 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, arm,
         raise ValueError('e5_dataset_context_invalid') from None
 
     if not isinstance(context, dict) or any(k not in context for k in REQUIRED_CONTEXT_KEYS):
+        raise ValueError('e5_dataset_context_invalid')
+    if context.get('workload_selection_sha256') != e5.selection_sha256(context.get('workload_selection')):
         raise ValueError('e5_dataset_context_invalid')
 
     # Validate backing dataset
@@ -187,6 +190,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, arm,
         'sensor_ids': context['sensor_ids'],
         'seed': context['seed'],
         'anchor': context['anchor'],
+        'workload_selection_sha256': context['workload_selection_sha256'],
     }
     prepared_inputs = prepare_inputs(
         smoke=smoke,
@@ -205,6 +209,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, arm,
         root=root,
         command_keys=context['command_keys'],
         viewer_subscriptions=context['viewer_subscriptions'],
+        workload_selection=context['workload_selection'],
         recovery_mode=False,
     )
 
@@ -347,7 +352,7 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=10, workload_s
         'mode': 'continuous',
         'viewer_count': 2,
         'phases': ['initial', 'warm_replay', 'control'],
-        'deadline_seconds': min(int(deadline_seconds), 3600),
+        'deadline_seconds': int(deadline_seconds),
         'idle_transfer_excluded': True,
     }
 
@@ -1257,8 +1262,8 @@ def finalize(smoke, fixture, prepared, phase_results, continuous_viewer_result, 
     mechanisms['command'] = e5.adapt_mechanism_counters(
         control_admin_before, control_admin_after, arm=arm, verified_commands=len(declared_keys))['command']
 
-    command_timeline = e5._window_delta(
-        control_admin_before, control_admin_after, 'command_timeline', {'events': 'events', 'retries': 'retries'})
+    command_timeline = e5.control_timeline_window(
+        control_admin_before, control_admin_after, expected_commands=len(declared_keys))
     mechanisms['command']['timeline_window'] = command_timeline
     mechanisms['fanout']['window'] = initial_res.get('ws_window', {})
     if (two_viewer_readiness and isinstance(mechanisms.get('fanout'), dict)
@@ -1493,6 +1498,7 @@ def finalize(smoke, fixture, prepared, phase_results, continuous_viewer_result, 
             'sha256': prepared['context']['sha256'],
             'seed': prepared['context']['seed'],
             'anchor': prepared['context']['anchor'],
+            'workload_selection_sha256': prepared['context']['workload_selection_sha256'],
         },
     }
     collector_evidence = {}

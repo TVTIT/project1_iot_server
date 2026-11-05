@@ -69,6 +69,46 @@ class DatasetTests(unittest.TestCase):
 
 
 class ProfileAndAdapterTests(unittest.TestCase):
+    def test_control_timeline_uses_real_histogram_and_counter_schema(self):
+        def snapshot(count, total, missing=0, pending=0, process='proc-a'):
+            hist = {'count': count, 'sum_seconds': total, 'buckets': [count, 0],
+                    'upper_seconds': [0.5, 1.0], 'overflow': 0}
+            return {'process_instance': process, 'command_timeline': {
+                'd_dispatch': hist, 'd_e2e_succeeded': hist,
+                'missing_origin': missing, 'missing_dispatch': 0, 'missing_result': 0,
+                'overflow': 0, 'pending_origins': pending}}
+        result = e5.control_timeline_window(snapshot(0, 0), snapshot(4, 2.0), expected_commands=4)
+        self.assertEqual(result['status'], 'AVAILABLE')
+        self.assertEqual(result['d_dispatch']['count'], 4)
+        self.assertEqual(result['d_dispatch']['sum_seconds'], 2.0)
+        self.assertEqual(result['missing_origin'], 0)
+        self.assertTrue(result['count_matches_expected'])
+        pending = e5.control_timeline_window(snapshot(0, 0), snapshot(0, 0, pending=1), expected_commands=0)
+        self.assertFalse(pending['count_matches_expected'])
+
+    def test_control_timeline_rejects_wrong_layer_restart_reset_and_corruption(self):
+        hist = {'count': 0, 'sum_seconds': 0.0, 'buckets': [0],
+                'upper_seconds': [1.0], 'overflow': 0}
+        before = {'process_instance': 'p', 'command_timeline': {
+            'd_dispatch': hist, 'd_e2e_succeeded': hist, 'missing_origin': 0,
+            'missing_dispatch': 0, 'missing_result': 0, 'overflow': 0, 'pending_origins': 0}}
+        after = json.loads(json.dumps(before))
+        self.assertEqual(e5.control_timeline_window({'snapshot': before}, {'snapshot': before}, expected_commands=0)['status'], 'INCONCLUSIVE')
+        after['process_instance'] = 'new'
+        self.assertEqual(e5.control_timeline_window(before, after, expected_commands=0)['status'], 'INCONCLUSIVE')
+        after = json.loads(json.dumps(before)); after['command_timeline']['d_dispatch']['count'] = -1
+        self.assertEqual(e5.control_timeline_window(before, after, expected_commands=0)['status'], 'INCONCLUSIVE')
+        after = json.loads(json.dumps(before)); after['command_timeline']['d_dispatch']['buckets'] = [1]
+        self.assertEqual(e5.control_timeline_window(before, after, expected_commands=0)['status'], 'INCONCLUSIVE')
+
+    def test_control_timeline_no_command_window_is_available_zero_delta(self):
+        hist = {'count': 0, 'sum_seconds': 0.0, 'buckets': [0],
+                'upper_seconds': [1.0], 'overflow': 0}
+        snap = {'process_instance': 'p', 'command_timeline': {
+            'd_dispatch': hist, 'd_e2e_succeeded': hist, 'missing_origin': 0,
+            'missing_dispatch': 0, 'missing_result': 0, 'overflow': 0, 'pending_origins': 0}}
+        self.assertEqual(e5.control_timeline_window(snap, snap, expected_commands=0)['status'], 'AVAILABLE')
+
     def test_all_profiles_reserve_combined_pool_budget_with_only_mechanism_variance(self):
         # Config reserves dispatch + result + publisher + ingress workers, then
         # one extra connection when credential management is enabled: 8 + 3 = 11.
@@ -187,14 +227,15 @@ class PrepareInputsTests(unittest.TestCase):
                 mqtt_broker_url='mqtts://localhost:8883', mqtt_manifest_endpoint='mqtts://localhost:8883',
                 mqtt_ca_file=Path(td)/'mqtt-ca.pem', journal_path=source,
                 journal_context={**dataset, 'anchor': '2026-10-28T00:00:00Z', 'seed': 91},
-                seed=91, anchor='2026-10-28T00:00:00Z', root=root,
-                command_keys=e5.command_idempotency_keys(91), viewer_subscriptions=subscriptions,
-                command_versions={'p8-e5-command-a': '0', 'p8-e5-command-b': '0'})
+             seed=91, anchor='2026-10-28T00:00:00Z', root=root,
+             command_keys=e5.command_idempotency_keys(91), viewer_subscriptions=subscriptions,
+             command_versions={'p8-e5-command-a': '0', 'p8-e5-command-b': '0'},
+             workload_selection=e5.workload_preset('representative'))
             manifests = {name: json.loads(Path(result['manifests'][key]).read_text())
                 for name, key in (('initial', 'initial'), ('warm', 'warm_replay'),
                                   ('viewer', 'viewer'), ('control', 'control'))}
-            self.assertEqual(manifests['initial']['e4']['replay_count'], 20)
-            self.assertEqual(manifests['warm']['e4']['replay_count'], 10)
+            self.assertEqual(manifests['initial']['e4']['replay_count'], 8)
+            self.assertEqual(manifests['warm']['e4']['replay_count'], 2)
             self.assertEqual(manifests['viewer']['schema_version'], 1)
             for name in ('initial', 'warm', 'viewer', 'control'):
                 self.assertEqual(manifests[name]['schema_version'], 1, name)
@@ -203,8 +244,10 @@ class PrepareInputsTests(unittest.TestCase):
                 traffic, phases = manifest['traffic'], manifest['phases']
                 offered = traffic['rate_per_second'] * phases['measure_seconds'] + traffic['burst_messages']
                 self.assertEqual(offered, manifest['e4']['replay_count'], name)
+            self.assertEqual(manifests['warm']['traffic'],
+                             {'rate_per_second': 1, 'ramp_seconds': 0, 'burst_messages': 0})
             self.assertEqual(manifests['initial']['traffic'],
-                             {'rate_per_second': 1, 'ramp_seconds': 0, 'burst_messages': 19})
+                             {'rate_per_second': 1, 'ramp_seconds': 0, 'burst_messages': 7})
             self.assertEqual(manifests['warm']['e4']['journal_path'], manifests['initial']['e4']['journal_path'])
             self.assertEqual(manifests['initial']['experiment'], 'E4')
             self.assertEqual(manifests['control']['experiment'], 'E3')
@@ -212,11 +255,11 @@ class PrepareInputsTests(unittest.TestCase):
             self.assertEqual(len(manifests['viewer']['subscriptions']), 3)
             self.assertEqual(set(json.loads(Path(manifests['viewer']['identity_files']['viewer']).read_text())),
                              {'user-a', 'user-b'})
-            self.assertEqual(result['expected'], {'main_messages': 20, 'raw_samples': 2000, 'temporal': 20,
-                'initial_schedule': {'rate_per_second': 1, 'measure_seconds': 1, 'burst_messages': 19},
+            self.assertEqual(result['expected'], {'main_messages': 8, 'raw_samples': 800, 'temporal': 8,
+                'initial_schedule': {'rate_per_second': 1, 'measure_seconds': 1, 'burst_messages': 7},
                 'viewers': 2, 'commands': 4})
             self.assertEqual(result['workload']['schedule']['initial_replay'],
-                {'rate_per_second': 1, 'measure_seconds': 1, 'burst_messages': 19})
+                {'rate_per_second': 1, 'measure_seconds': 1, 'burst_messages': 7})
             self.assertEqual(len(smoke.calls), 4)
             for path in [*result['manifests'].values()]:
                 if isinstance(path, list):
@@ -350,10 +393,12 @@ class StagedRuntimeGateTests(unittest.TestCase):
             dataset = e5.build_dataset(seed=7, sensor_ids=['a', 'b'],
                 anchor='2026-10-28T00:00:00Z', path=dataset_dir / 'journal.jsonl')
             context = root / 'context.json'
+            selection = e5.workload_preset('pilot')
             context.write_text(json.dumps({**dataset, 'dataset_path': str(dataset_dir / 'journal.jsonl'),
                 'seed': 7, 'anchor': '2026-10-28T00:00:00Z', 'sensor_ids': ['a', 'b'],
                 'gateway_ids': list(e5_fixture.GATEWAYS), 'command_keys': e5.command_idempotency_keys(7),
-                'viewer_subscriptions': []}))
+                'viewer_subscriptions': [], 'workload_selection': selection,
+                'workload_selection_sha256': e5.selection_sha256(selection)}))
             context.chmod(0o600)
             report = e5_fixture.run(Smoke(), fixture, None, None, None, None, None,
                 'paperload', 'gateway', 'optimized', context)

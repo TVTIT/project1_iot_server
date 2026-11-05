@@ -88,7 +88,9 @@ class P8E3SelectorTests(unittest.TestCase):
             result = smoke.dispatch_paper_p8_load(fixture, None, None, None, None, None,
                                                   None, '/paperload', '/gateway')
         support.run.assert_called_once_with(None, fixture, None, None, None, None, None,
-                                            '/paperload', '/gateway', 'wakeup', 'mixed')
+                                            '/paperload', '/gateway', 'wakeup', 'mixed',
+                                            command_count=4, schedule='smoke',
+                                            profile='pilot', official_opt_in=False)
         self.assertEqual(result['status'], 'WORKLOAD_COMPLETE_PENDING_CLEANUP')
 
     def test_cleanup_rejects_missing_or_partial_validation(self):
@@ -113,15 +115,21 @@ class P8E3SelectorTests(unittest.TestCase):
                 'receipt_verification': {'verified': True, 'verified_idempotency_keys': [1, 2, 3, 4]},
                 'rest_configuration': {'a': {}, 'b': {}}, 'sqlite_executors': [{}, {}]},
             'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'control_timeline_window': {'availability': 'available', 'histograms': {
+                'd_dispatch': {'count': 4}, 'd_e2e_succeeded': {'count': 4},
+                'pending_origins': 0, 'missing_origin': 0, 'missing_dispatch': 0, 'overflow': 0}},
             'representative_probes': {
                 'valid': True, 'failures': [],
                 'operations': [
                     {'kind': kind, 'expected': status, 'actual': status, 'match': True}
                     for kind, status in [('offline_admission', 202), ('same_key_replay', 202),
-                                         ('busy', 409), ('stale', 409), ('noop', 200),
+                                         ('busy', 409), ('stale', 409), ('online_fresh_apply', 202), ('noop', 200),
                                          ('noop_replay', 200)]],
                 'auxiliary_command_count': 1, 'receipt_count': 2,
-                'outside_fresh_command_measurement': True},
+                'outside_fresh_command_measurement': True,
+                'offline_qualification': {'executor_running': False, 'receipt_verified': True,
+                                          'terminal_status': 'published', 'outbox_status': 'published',
+                                          'same_key_replay_bytes_match': True, 'delivery_guarantee': 'none'}},
         }
         with patch.object(smoke, 'paper_p4_cleanup_acceptance', return_value=True):
             self.assertTrue(smoke.paper_p8_e3_cleanup_acceptance(fixture, evidence, {}, True, registry))

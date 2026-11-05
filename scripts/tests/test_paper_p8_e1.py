@@ -102,6 +102,8 @@ class E1MappingTests(unittest.TestCase):
             for role in ('viewer','telemetry'):
                 p=root/(role+'.json'); p.write_text(json.dumps({'roles':[role],'profile':'pilot','mode':'remote','seed':9,'phases':{'drain_seconds':20},'tls':{'https_endpoint':'https://endpoint.test','https_ca_file':'ca.pem'},'identity_files':{role:'identities.json'},'limits':{'workers':2,'connections':64,'pending_messages':100,'pending_bytes':10000},'targets':[{'gateway_id':'g-a','sensor_id':'s-a'}]})); p.chmod(0o600); paths.append(p)
             result=build_e1_execution_plan(output_dir=root/'out',viewer_manifest=paths[0],telemetry_manifest=paths[1],seed=9,mode='remote')
+            self.assertEqual(result['viewer_readiness_budget_seconds'], 20)
+            self.assertEqual(json.loads(Path(result['run_spec']).read_text())['paperload'][0]['ready_timeout_seconds'], 20)
             self.assertEqual(result['native_execution'],'NOT RUN')
             spec=json.loads(Path(result['run_spec']).read_text()); self.assertEqual([j['role'] for j in spec['paperload']],['viewer','telemetry'])
 

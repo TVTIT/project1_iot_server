@@ -774,8 +774,12 @@ def sample_remote_e5_report(
     }
     rep['metadata']['phase_seconds'] = observed_windows
     if fanout_readiness_verified:
-        rep['mechanisms']['fanout']['readiness_verified'] = True
-        rep['mechanism_metrics']['fanout']['readiness_verified'] = True
+        rep['viewer'] = {
+            'ready_servers': 2, 'subscriptions': 3, 'sockets': 2,
+            'validation': {'valid': True, 'failures': []},
+            'result': {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+                'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2},
+        }
     rep['accounting']['ingress_delta']['delta']['ShaperRateLimited'] = 24 if arm == 'optimized' else 0
     rep['accounting']['ingress_delta']['delta']['ShaperPassed'] = 20
     rep['mechanisms']['microbatch']['max_members'] = 2 if arm == 'optimized' else 0
@@ -1017,14 +1021,21 @@ class CliInterfaceTests(unittest.TestCase):
         base = Path(temporary.name)
         paths = {arm: base / f'{arm}.json' for arm in p8c.ARM_NAMES}
         for arm, path in paths.items():
-            path.write_text(json.dumps(sample_e5_report(arm)))
+            report = sample_e5_report(arm)
+            report['viewer'] = {
+                'ready_servers': 2, 'subscriptions': 3, 'sockets': 2,
+                'validation': {'valid': True, 'failures': []},
+                'result': {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+                    'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2},
+            }
+            path.write_text(json.dumps(report))
         before = {a: hashlib.sha256(p.read_bytes()).hexdigest() for a,p in paths.items()}
         summary = p8c.build_e5_summary(paths)
         self.assertEqual(summary['status'], 'PILOT_RUNS_COMPLETE_QUALIFIED')
         self.assertFalse(summary['full_p8_accepted'])
         fan = next(p for p in summary['pairs'] if p['arm'] == 'fanout_scan')
-        self.assertEqual(fan['activation_status'], 'INCONCLUSIVE')
-        self.assertEqual(fan['activation_reason'], 'fanout_viewer_readiness_unverified')
+        self.assertEqual(fan['activation_status'], 'ELIGIBLE')
+        self.assertIsNone(fan['activation_reason'])
         micro = next(p for p in summary['pairs'] if p['arm'] == 'microbatch_off')
         self.assertAlmostEqual(micro['gamma_copy_calls']['gamma_red_percent'], 20.0)
         self.assertEqual(micro['raw_samples_retained_ablation'], 2000)

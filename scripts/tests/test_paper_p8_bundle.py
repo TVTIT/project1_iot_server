@@ -97,6 +97,8 @@ class PortableBundleTests(unittest.TestCase):
         self.assertEqual(spec['paperload'][0]['manifest'],'manifests/viewer.json')
         self.assertEqual(spec['paperload'][0]['output_dir'],'outputs/viewer')
         self.assertNotIn('/A/',(copied/'execution/run-spec.json').read_text())
+        self.assertEqual(bundle.inspect_bundle(copied)['session']['profile'], 'pilot')
+
         env=json.loads((copied/'gateway-env/gw-1.json').read_text())
         self.assertNotIn('GATEWAY_MQTT_PASSWORD',env)
         self.assertEqual(env['GATEWAY_MQTT_CA_FILE'],'certs/mqtt-ca.pem')
@@ -117,6 +119,10 @@ class PortableBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'bundle_checksum_mismatch'):
             bundle.inspect_bundle(root)
 
+    def test_bundle_rejects_profile_mismatch_between_workload_and_manifests(self):
+        with self.assertRaisesRegex(ValueError, 'bundle_profile_mismatch'):
+            self.export(leaf=self.parent/'profile-mismatch', workload={'profile':'official'})
+
     def test_bind_creates_absolute_runtime_paths_and_preserves_input_bundle(self):
         bundle_root = Path(self.export()['bundle_root'])
         relocated = self.root / 'B' / 'copied' / 'bundle'
@@ -130,6 +136,8 @@ class PortableBundleTests(unittest.TestCase):
         env = json.loads(Path(spec['gateways'][0]['env_file']).read_text())
         self.assertTrue(Path(env['GATEWAY_OUTBOX_PATH']).is_absolute())
         self.assertFalse(Path(env['GATEWAY_OUTBOX_PATH']).exists())
+        self.assertEqual(spec['disk_guard']['growth_threshold_bytes'], 64 << 10)
+        self.assertEqual(spec['disk_guard']['allowed_root'], str((workspace / 'outputs').absolute()))
         self.assertEqual(result['session']['session_id'], 'session-actual-1')
         binding = json.loads((workspace / 'runtime/binding.json').read_text())
         self.assertEqual(binding['immutable_root'], 'inputs/')
@@ -211,12 +219,31 @@ class PortableBundleTests(unittest.TestCase):
                 'telemetry':{'role':'telemetry','principals':[]}},'gateways':{'gw-1':{
                     'role':'gateway','gateway_id':'gw-1','username':'gw-user'}}})
 
+    def test_planned_lifetime_does_not_substitute_for_issued_jwt_expiry(self):
+        write(self.src/'viewer.json', {'user-a':token(int(time.time())+3600),
+            'user-b':token(int(time.time())+3600)})
+        with self.assertRaisesRegex(ValueError, 'bundle_identity_near_expiry'):
+            self.export(leaf=self.parent/'insufficient-issued-token', workload_seconds=4200,
+                wait_seconds=0)
+
+    def test_bind_rechecks_actual_exp_after_late_transfer(self):
+        issued_at = int(time.time())
+        write(self.src/'viewer.json', {'user-a':token(issued_at+30),
+            'user-b':token(issued_at+30)})
+        exported=self.export(leaf=self.parent/'late-bind', wait_seconds=0, workload_seconds=20)
+        (self.root/'B').mkdir(mode=0o700)
+        with patch.object(bundle.time, 'time', return_value=issued_at+25):
+            with self.assertRaisesRegex(ValueError, 'bundle_identity_near_expiry'):
+                bundle.bind_bundle(bundle_root=exported['bundle_root'],
+                    workspace_leaf=self.root/'B'/'late-workspace', elapsed_transfer_wait_seconds=25)
+
     def test_e3_control_and_executor_gateway_environment_references_are_bounded(self):
         arm_a={**self.telemetry,'experiment':'E2','arm':'A','targets':[{'gateway_id':'gw-1','sensor_id':'sensor-1'}]}
         arm_b={**self.telemetry,'experiment':'E2','arm':'B','targets':[{'gateway_id':'gw-1','sensor_id':'sensor-2'}],
                'gateway_identity_files':{'gw-1':'/A/private/gw-1.json'}}
         control={**self.telemetry,'experiment':'E3','arm':'control','roles':['control'],
             'identity_files':{'control':'/A/private/control.json'},'gateway_identity_files':{}}
+        control['profile']='official'
         control['tls']={'https_endpoint':'https://fixture.test:14443','https_ca_file':'/A/ca.pem'}
         write(self.src/'arm-a.json',arm_a); write(self.src/'arm-b.json',arm_b); write(self.src/'control.json',control)
         write(self.src/'control-id.json',{'operator-a':token(self.exp)})
@@ -242,8 +269,14 @@ class PortableBundleTests(unittest.TestCase):
                 'B:telemetry':{'role':'telemetry','principals':[]},
                 'control':{'role':'control','principals':['operator-a']}},
                 'gateways':{'gw-1':{'role':'gateway','gateway_id':'gw-1','username':'gw-user'}}},
-            run_spec=self.src/'e3-run-spec.json')
+             run_spec=self.src/'e3-run-spec.json',
+             workload={'experiment':'E3','profile':'official','workload':'low_load',
+                 'dispatch_mode':'polling','seed':89,'generator_colocated':'unverified'})
         root=Path(out['bundle_root'])
+        metadata=json.loads((root/'bundle.json').read_text())
+        self.assertEqual(metadata['session']['profile'],'official')
+        self.assertEqual(json.loads((root/'manifests/control.json').read_text())['profile'],'official')
+        self.assertEqual(json.loads((root/'manifests/A.json').read_text())['profile'],'pilot')
         spec=json.loads((root/'execution/run-spec.json').read_text())
         self.assertEqual({x['role'] for x in spec['paperload']},{'telemetry','control'})
         self.assertEqual({x['role'] for x in spec['gateways']},{'executor'})

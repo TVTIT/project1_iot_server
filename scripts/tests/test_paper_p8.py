@@ -5,6 +5,7 @@ from pathlib import Path
 import io
 import json
 import os
+import sqlite3
 from unittest import mock
 
 import paper_p8
@@ -12,6 +13,16 @@ import math
 
 
 class PaperP8EntrypointTests(unittest.TestCase):
+    def test_local_resource_preflight_reports_actual_and_unavailable_host_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'manifest.json'
+            manifest.write_text(json.dumps({'roles':['viewer'], 'topology':{'viewers':2},
+                                            'limits':{'connections':3}}))
+            report = paper_p8.local_resource_preflight([{'manifest':str(manifest), 'role':'viewer'}])
+        self.assertEqual(report['scope'], 'B_runner_process_and_host_readonly')
+        self.assertEqual(report['roles'][0]['estimated_fds'], 71)
+        self.assertIn('ephemeral_port_range_count', report)
+
     def test_phase_prefix_validation_and_safe_capture(self):
         event = {'event':'measure_begin','elapsed_ns':7,'configured_phases':{},
                  'counters':{key:0 for key in paper_p8.PHASE_COUNTERS}}
@@ -174,7 +185,7 @@ class FakeChild:
 
 class PaperP8LifecycleTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir='/var/tmp/opencode')
         self.root = Path(self.temp.name)
         self.binary = self.root / 'paperload'
         self.gateway = self.root / 'gateway'
@@ -201,6 +212,19 @@ class PaperP8LifecycleTests(unittest.TestCase):
             binary=str(self.binary), gateway_binary=str(self.gateway), jobs=jobs,
             gateways=gateways if gateways is not None else [{'env_file': str(self.env_file), 'role': 'executor', 'ready_timeout_seconds': .05}],
             stop_timeout=30, run_artifact=str(self.artifact), popen=fake_factory)
+
+    @mock.patch.object(paper_p8.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', ''))
+    def test_official_opt_in_reaches_actual_control_child_argv(self, _count):
+        children = []
+        def factory(argv, **kwargs):
+            output = Path(argv[argv.index('--output-dir') + 1])
+            child = FakeChild(argv, artifact=output / 'workload.json')
+            children.append(child)
+            return child
+        job = {'manifest':str(self.manifest), 'output_dir':str(self.root/'control'), 'role':'control'}
+        paper_p8.run_supervised(binary=str(self.binary), jobs=[job], gateways=[], stop_timeout=30,
+            run_artifact=str(self.artifact), popen=factory, official=True)
+        self.assertIn('--official-opt-in', children[0].argv)
 
     @mock.patch.object(paper_p8.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0,
                  'pending_rows=1 pending_bytes=22 quarantined_rows=0 quarantined_bytes=0\n', ''))
@@ -242,6 +266,114 @@ class PaperP8LifecycleTests(unittest.TestCase):
         self.assertEqual(terminations, ['run'])
         self.assertEqual([child.argv[-1] for child in children], ['run', '--run'])
         self.assertTrue(report['actual_stop_confirmed'])
+
+    @mock.patch.object(paper_p8.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0,
+                 'pending_rows=1 pending_bytes=22 quarantined_rows=0 quarantined_bytes=0\n', ''))
+    def test_storage_guard_real_threshold_stops_and_flushes_owned_child(self, _count):
+        child = []
+        workload = self.root / 'guard-output' / 'workload.json'
+        def factory(argv, **kwargs):
+            item = FakeChild(argv, artifact=workload)
+            child.append(item)
+            return item
+        status, report = paper_p8.run_supervised(binary=str(self.binary), jobs=[
+            {'manifest':str(self.manifest), 'output_dir':str(self.root/'guard-output')}],
+            gateways=[], stop_timeout=30, run_artifact=str(self.artifact), popen=factory,
+            disk_guard={'growth_threshold_bytes':1, 'minimum_free_bytes':0,
+                        'allowed_root':str(self.root), 'interval_seconds':.01})
+        self.assertEqual(status, 'PARTIAL')
+        self.assertIn('owned storage guard stopped workload', report['primary_error'])
+        self.assertTrue(report['actual_stop_confirmed'])
+        self.assertEqual(report['storage_guard']['stop_reason'], 'owned_storage_growth_threshold')
+        self.assertEqual(report['pending_outbox_readback'], [])
+        self.assertTrue(workload.is_file())
+        self.assertIsNotNone(child[0].returncode)
+
+    def test_storage_guard_threshold_reads_real_pending_sqlite_after_child_join(self):
+        message_id = 'a1111111-1111-4111-8111-111111111111'
+        payload = b'{"sensor":"sensor-real","samples":[1,2,3]}'
+        self.outbox.unlink()
+        with sqlite3.connect(self.outbox) as db:
+            db.executescript('''
+                CREATE TABLE outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE,
+                    gateway_id TEXT NOT NULL, sensor_id TEXT NOT NULL, boot_id TEXT NOT NULL,
+                    topic TEXT NOT NULL, payload BLOB NOT NULL, byte_size INTEGER NOT NULL,
+                    first_sequence INTEGER NOT NULL, sample_count INTEGER NOT NULL,
+                    sample_interval_us INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending','quarantined')),
+                    reason TEXT, enqueued_at TEXT NOT NULL
+                );
+                INSERT INTO outbox (message_id,gateway_id,sensor_id,boot_id,topic,payload,byte_size,
+                    first_sequence,sample_count,sample_interval_us,status,enqueued_at)
+                VALUES ('a1111111-1111-4111-8111-111111111111','gw-real','sensor-real','boot',
+                    'telemetry','',0,1,1,10000,'pending','2026-11-05T00:00:00Z');
+            ''')
+            db.execute('UPDATE outbox SET payload=?, byte_size=? WHERE message_id=?',
+                       (payload, len(payload), message_id))
+
+        children = []
+        workload = self.root / 'guard-output' / 'workload.json'
+
+        class GrowingChild(FakeChild):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                self.first_wait = True
+
+            def wait(self, timeout=None):
+                if self.argv[-1] == '--run' and self.first_wait:
+                    self.first_wait = False
+                    (self.root / 'growth.bin').write_bytes(b'x' * 128)
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                return super().wait(timeout)
+
+            def terminate(self):
+                super().terminate()
+                if self.argv[-1] == '--run':
+                    self.artifact.parent.mkdir(parents=True, exist_ok=True)
+                    self.artifact.write_text('{"status":"FLUSHED_ON_STOP"}')
+
+        def factory(argv, **kwargs):
+            child = GrowingChild(argv, artifact=workload)
+            child.root = self.root
+            children.append(child)
+            return child
+
+        def run_command(argv, **kwargs):
+            if argv[-1] == '--preflight':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            with sqlite3.connect(self.outbox) as db:
+                rows, byte_count = db.execute(
+                    "SELECT count(*), coalesce(sum(byte_size),0) FROM outbox WHERE status='pending'"
+                ).fetchone()
+                quarantined, quarantine_bytes = db.execute(
+                    "SELECT count(*), coalesce(sum(byte_size),0) FROM outbox WHERE status='quarantined'"
+                ).fetchone()
+            output = (f'pending_rows={rows} pending_bytes={byte_count} '
+                      f'quarantined_rows={quarantined} quarantined_bytes={quarantine_bytes}\n')
+            return subprocess.CompletedProcess(argv, 0, output, '')
+
+        with mock.patch.object(paper_p8.subprocess, 'run', side_effect=run_command):
+            status, report = paper_p8.run_supervised(binary=str(self.binary), gateway_binary=str(self.gateway),
+                jobs=[{'manifest':str(self.manifest), 'output_dir':str(self.root/'guard-output')}],
+                gateways=[{'env_file':str(self.env_file), 'role':'executor', 'ready_timeout_seconds':.05}],
+                stop_timeout=30, run_artifact=str(self.artifact), popen=factory,
+                disk_guard={'growth_threshold_bytes':1, 'minimum_free_bytes':0,
+                            'allowed_root':str(self.root.parent), 'interval_seconds':.01})
+
+        self.assertEqual(status, 'PARTIAL')
+        self.assertIn('owned storage guard stopped workload', report['primary_error'])
+        self.assertEqual(report['storage_guard']['stop_reason'], 'owned_storage_growth_threshold')
+        self.assertTrue(report['actual_stop_confirmed'])
+        self.assertTrue(all(child.returncode is not None for child in children))
+        self.assertTrue(workload.is_file(), 'owned child artifact must flush during join')
+        self.assertEqual(report['pending_outbox_readback'][0]['status'], 'readback')
+        self.assertEqual(report['pending_outbox_readback'][0]['pending_rows'], 1)
+        self.assertEqual(report['pending_outbox_readback'][0]['pending_bytes'], len(payload))
+        with sqlite3.connect(self.outbox) as db:
+            row = db.execute('SELECT message_id,payload,byte_size,status FROM outbox').fetchone()
+        self.assertEqual(row, (message_id, payload, len(payload), 'pending'))
+        self.assertEqual(report['cleanup_errors'], [])
 
     @mock.patch.object(paper_p8.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', ''))
     def test_run_supervised_launches_viewer_before_telemetry_even_if_input_reversed(self, _count):

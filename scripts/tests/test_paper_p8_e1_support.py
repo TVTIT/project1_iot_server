@@ -12,6 +12,9 @@ from scripts.tests.paper_p8_e1_support import (
     export_prepared_bundle,
     _load_result_bundle,
 )
+from scripts.tests.paper_p8_support import (
+    e1_expected_deliveries, MAX_MANIFEST_BYTES,
+)
 
 
 class E1PilotSupportTests(unittest.TestCase):
@@ -30,6 +33,70 @@ class E1PilotSupportTests(unittest.TestCase):
             gateway = 'g-a' if row['user_id'] == 'user-000' else 'g-b'
             self.assertTrue(all(f['gateway_id'] == gateway for f in row['filters']))
 
+    def test_parameterized_mapping_preserves_socket_principal_and_recipient_counts(self):
+        mapping = mixed_e1_mapping(self.targets, viewers=128, principals=4,
+                                   density='overlap', messages_per_target=7)
+        self.assertEqual(mapping['counts']['sockets'], 128)
+        self.assertEqual(mapping['counts']['principals'], 4)
+        self.assertEqual(len({row['user_id'] for row in mapping['viewers']}), 4)
+        self.assertEqual(set(mapping['expected_deliveries_by_target'].values()),
+                         {len(ids) * 7 for ids in mapping['expected_recipients_by_target'].values()})
+        for target, recipients in mapping['expected_recipients_by_target'].items():
+            self.assertEqual(len(recipients), len(set(recipients)), target)
+        self.assertTrue(all(all(f['gateway_id'] == ('g-a' if row['user_id'] in ('user-000','user-002') else 'g-b')
+                                for f in row['filters']) for row in mapping['viewers']))
+
+    def test_sparse_dense_and_overlap_recipient_sets_are_unique_and_authorized(self):
+        counts = {}
+        for density in ('sparse', 'dense', 'overlap'):
+            mapping = mixed_e1_mapping(self.targets, viewers=128, principals=2, density=density)
+            counts[density] = sum(map(len, mapping['expected_recipients_by_target'].values()))
+            for row in mapping['viewers']:
+                gateway = 'g-a' if row['user_id'] == 'user-000' else 'g-b'
+                self.assertTrue(all(f['gateway_id'] == gateway for f in row['filters']))
+            self.assertTrue(all(len(ids) == len(set(ids)) for ids in mapping['expected_recipients_by_target'].values()))
+        self.assertLess(counts['sparse'], counts['dense'])
+        self.assertGreater(counts['overlap'], counts['sparse'])
+
+    def test_official_mapping_serialization_fits_bounded_manifest_and_result_caps(self):
+        import json
+        from scripts import paper_p8_bundle, paper_p8_client
+        for viewers in (5000, 10000):
+            mapping = mixed_e1_mapping(self.targets, viewers=viewers, principals=2,
+                density='dense', seed=86, messages_per_target=5)
+            subscriptions = [
+                {'viewer_id': row['viewer_id'], 'user_id': row['user_id'], **filter_row}
+                for row in mapping['viewers'] for filter_row in row['filters']
+            ]
+            viewer_manifest, telemetry_manifest = e1_role_manifests({
+                'schema_version': 1, 'profile': 'official', 'arm': 'reference',
+                'mode': 'remote', 'run_id': f'e1-{viewers}', 'seed': 86,
+                'topology': {'gateways': 2, 'sensors_per_gateway': 2,
+                    'users': 2, 'viewers': viewers}, 'targets': self.targets,
+                'traffic': {'rate_per_second': 1, 'ramp_seconds': 0, 'burst_messages': 0},
+                'tls': {'https_endpoint': 'https://example.invalid',
+                    'mqtt_tls_endpoint': 'mqtts://example.invalid'},
+                'gateway_identity_files': {},
+            }, subscriptions=subscriptions, viewer_identity='viewer.json',
+                telemetry_identity='telemetry.json', gateway_refs={}, root='bundle')
+            mapping_bytes = json.dumps(mapping, sort_keys=True, separators=(',', ':')).encode()
+            manifest_bytes = json.dumps(viewer_manifest, sort_keys=True, separators=(',', ':')).encode()
+            projection = {'seed': mapping['seed'], 'counts': mapping['counts'],
+                'expected_recipients_by_target': mapping['expected_recipients_by_target']}
+            result = {'profile': 'official', 'mapping': projection,
+                'expected_deliveries_by_target': e1_expected_deliveries(mapping,
+                    {key: 5 for key in mapping['expected_recipients_by_target']})}
+            projection_bytes = json.dumps(projection, sort_keys=True, separators=(',', ':')).encode()
+            result_bytes = json.dumps(result, sort_keys=True, separators=(',', ':')).encode()
+            self.assertLessEqual(len(mapping_bytes), MAX_MANIFEST_BYTES)
+            self.assertLessEqual(len(mapping_bytes), paper_p8_bundle.MAX_FILE_BYTES)
+            self.assertLessEqual(len(manifest_bytes), MAX_MANIFEST_BYTES)
+            self.assertLessEqual(len(projection_bytes), paper_p8_client.MAX_RESULT_FILE_BYTES)
+            self.assertLessEqual(len(result_bytes), paper_p8_client.MAX_RESULT_FILE_BYTES)
+            self.assertEqual(len(mapping['viewers']), viewers)
+            self.assertEqual(viewer_manifest['limits']['connections'], viewers)
+            self.assertLessEqual(viewer_manifest['limits']['workers'], 32)
+
     def test_e1_role_manifests_keep_synthetic_load_on_telemetry_only(self):
         viewer, telemetry = e1_role_manifests(
             {'schema_version': 1, 'durability_mode': 'synthetic-load'},
@@ -38,6 +105,22 @@ class E1PilotSupportTests(unittest.TestCase):
         self.assertNotIn('durability_mode', viewer)
         self.assertEqual(viewer['viewer'], {'mode': 'healthy'})
         self.assertEqual(telemetry['durability_mode'], 'synthetic-load')
+
+    def test_role_manifest_budgets_follow_selected_mapping_without_buffer_scaling(self):
+        mapping = mixed_e1_mapping(self.targets, viewers=512, principals=2,
+                                   density='sparse', messages_per_target=9)
+        viewer, telemetry = e1_role_manifests(
+            {'schema_version': 1, 'topology': {'viewers': 512}},
+            subscriptions=[], viewer_identity='viewer.json', telemetry_identity='telemetry.json',
+            gateway_refs={}, root='run', mapping=mapping,
+            phases={'warmup_seconds': 2, 'measure_seconds': 20, 'drain_seconds': 10, 'cooldown_seconds': 1})
+        self.assertEqual(viewer['limits']['connections'], 512)
+        self.assertEqual(viewer['topology']['viewers'], 512)
+        self.assertEqual(viewer['topology']['users'], 2)
+        self.assertLessEqual(viewer['limits']['workers'], 32)
+        self.assertEqual(viewer['limits']['pending_messages'], 64)
+        self.assertEqual(viewer['phases']['measure_seconds'], 20)
+        self.assertEqual(telemetry['phases']['measure_seconds'], 9)
 
     def test_remote_export_passes_exact_prepared_roles_and_session_correlation(self):
         from unittest import mock
@@ -139,14 +222,15 @@ class E1PilotSupportTests(unittest.TestCase):
                 _load_result_bundle(root,prepared,phase_id='pilot',binary_sha256=binary)
 
     def valid_inputs(self):
-        mapping = mixed_e1_mapping(self.targets)
+        mapping = mixed_e1_mapping(self.targets, viewers=32, principals=2, messages_per_target=5)
         viewers = [{'id': r['viewer_id'], 'unique_events': sum(5 for ids in mapping['expected_recipients_by_target'].values()
             if r['viewer_id'] in ids), 'duplicates': 0, 'wrong_namespace': 0} for r in mapping['viewers']]
-        return (mapping, {'status': 'COMPLETE', 'telemetry': {'generated_unique': 20,
-            'offered_unique': 20, 'publish_attempts': 20, 'broker_pubacks': 20,
-            'application_acks': 20, 'pending_messages': 0, 'pending_bytes': 0}},
-            {'status': 'COMPLETE','connected_distinct_viewers': 64,'subscribed_distinct_viewers': 64,
-             'receiving_distinct_viewers': 64,'duplicates': 0,'wrong_namespace': 0,'viewers': viewers,
+        expected_unique = sum(mapping['messages_per_target'].values())
+        return (mapping, {'status': 'COMPLETE', 'samples_per_message': 100, 'telemetry': {'generated_unique': expected_unique,
+            'offered_unique': expected_unique, 'publish_attempts': expected_unique, 'broker_pubacks': expected_unique,
+            'application_acks': expected_unique, 'pending_messages': 0, 'pending_bytes': 0}},
+            {'status': 'COMPLETE','connected_distinct_viewers': mapping['counts']['sockets'],'subscribed_distinct_viewers': mapping['counts']['sockets'],
+             'receiving_distinct_viewers': mapping['counts']['receiving_viewers'],'duplicates': 0,'wrong_namespace': 0,'viewers': viewers,
              'identity_samples': [{'viewer_id': mapping['viewers'][0]['viewer_id'],
                 'gateway_id': mapping['viewers'][0]['filters'][0]['gateway_id'],
                 'sensor_id': mapping['viewers'][0]['filters'][0].get('sensor_id','s0'),
@@ -167,6 +251,34 @@ class E1PilotSupportTests(unittest.TestCase):
                 'producer-0':{'message_id':'producer-0','gateway_id':self.targets[0]['gateway_id'],
                 'sensor_id':self.targets[0]['sensor_id'],'boot_id':'boot-0','first_sequence':'0','sample_count':100}})
         self.assertTrue(result['valid'],result['failures'])
+
+    def test_result_validator_accepts_selected_128_viewer_sampled_raw_and_bounded_headers(self):
+        mapping = mixed_e1_mapping(self.targets, viewers=128, principals=2,
+                                   density='mixed', messages_per_target=2)
+        viewers = [{'id': row['viewer_id'], 'unique_events': sum(
+            mapping['messages_per_target'][key] for key, ids in mapping['expected_recipients_by_target'].items()
+            if row['viewer_id'] in ids), 'duplicates': 0, 'wrong_namespace': 0}
+            for row in mapping['viewers']]
+        headers = {'producer-0': {'message_id':'producer-0','gateway_id':'g-a','sensor_id':'s0',
+            'boot_id':'boot-0','first_sequence':'0','sample_count':100}}
+        sessions = {'status':'COMPLETE','connected_distinct_viewers':128,
+            'subscribed_distinct_viewers':128,'receiving_distinct_viewers':128,
+            'duplicates':0,'wrong_namespace':0,'viewers':viewers,
+            'identity_samples':[{'viewer_id':'viewer-00000','message_id':'producer-0',
+                'gateway_id':'g-a','sensor_id':'s0','boot_id':'boot-0','first_sequence':'0',
+                'sample_count':100} for _ in range(20)]}
+        expected_unique = sum(mapping['messages_per_target'].values())
+        result = validate_e1_result({'status':'COMPLETE','samples_per_message':100,
+            'telemetry':{'generated_unique':expected_unique,'offered_unique':expected_unique,
+                'publish_attempts':expected_unique,'broker_pubacks':expected_unique,
+                'application_acks':expected_unique,'pending_messages':0,'pending_bytes':0}},
+            mapping, database_delta={'ledger':expected_unique,'raw':expected_unique*100,
+                'temporal':expected_unique,'configuration':0},
+            raw_verification=[{'verified_sample':True,'ledger_count':2,
+                'raw_identity_value_mismatches':0} for _ in range(4)],
+            viewer_sessions=sessions,sampled_headers=sessions['identity_samples'],
+            expected_headers=headers)
+        self.assertTrue(result['valid'], result['failures'])
 
     def test_result_validator_accepts_native_viewer_rows_without_per_viewer_namespace_counter(self):
         mapping, workload, sessions = self.valid_inputs()
@@ -190,6 +302,16 @@ class E1PilotSupportTests(unittest.TestCase):
         self.assertFalse(result['valid'])
         self.assertTrue({'viewer_delivery_counts','database_delta','raw_identity',
             'websocket_producer_headers'} <= set(result['failures']))
+
+    def test_result_validator_rejects_incomplete_delivery_even_when_actuals_agree(self):
+        mapping, workload, sessions = self.valid_inputs()
+        sessions['viewers'][0]['unique_events'] -= 1
+        result = validate_e1_result(workload, mapping,
+            database_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
+            raw_verification=[{'verified_exact':True,'ledger_count':5,'raw_identity_value_mismatches':0}]*4,
+            viewer_sessions=sessions, sampled_headers=['producer-0'], expected_headers=['producer-0'])
+        self.assertFalse(result['valid'])
+        self.assertIn('viewer_delivery_counts', result['failures'])
 
     def test_role_artifact_validation_uses_role_output_paths_and_requires_complete(self):
         with tempfile.TemporaryDirectory() as tmp:

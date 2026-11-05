@@ -124,6 +124,38 @@ class PortableE5BundleTests(unittest.TestCase):
                 'idle_transfer_excluded': True},
         }
 
+    def test_representative_selection_reaches_manifests_and_portable_bundle(self):
+        repeat_dir, context_path = e5_driver.prepare_repeat(
+            self.repeat_root, 2, 814, 'representative')
+        context = json.loads(context_path.read_text())
+        alternate_root = self.private / 'representative-prepared'
+        alternate_root.mkdir(mode=0o700)
+        self.prepared = e5_fixture.prepare_inputs(
+            smoke=FakeSmoke(), fixture=self.fixture, endpoint=self.endpoint,
+            specs=self.specs, passwords=self.passwords, tokens=self.tokens,
+            mqtt_broker_url='ssl://fixture-a.lan:18884',
+            mqtt_manifest_endpoint='mqtts://fixture-a.lan:18884', mqtt_ca_file=self.mqtt_ca,
+            journal_path=context['dataset_path'],
+            journal_context={k: context[k] for k in ('sha256','bytes','gateway_ids','sensor_ids',
+                'seed','anchor','workload_selection_sha256')},
+            seed=context['seed'], anchor=context['anchor'], root=alternate_root,
+            command_keys=context['command_keys'], viewer_subscriptions=context['viewer_subscriptions'],
+            workload_selection=context['workload_selection'])
+        self.context = context
+        initial = json.loads(Path(self.prepared['manifests']['initial']).read_text())
+        warm = json.loads(Path(self.prepared['manifests']['warm_replay']).read_text())
+        self.assertEqual(initial['profile'], 'pilot')
+        self.assertEqual(initial['e4']['replay_count'], 8)
+        self.assertEqual(warm['e4']['replay_count'], 2)
+        self.assertEqual(self.prepared['expected']['main_messages'], 8)
+        result = bundle.export_bundle(**self._export_args(self.base / 'A' / 'representative-bundle'))
+        root = Path(result['bundle_root'])
+        self.assertTrue(bundle.inspect_bundle(root)['valid'])
+        metadata = json.loads((root / 'bundle.json').read_text())
+        self.assertEqual(metadata['session']['profile'], 'representative')
+        self.assertEqual(metadata['workload']['telemetry']['messages'], 8)
+        self.assertEqual(metadata['workload']['schedule']['warm_replay_prefix'], 2)
+
     def test_export_relocate_inspect_bind_preserves_immutable_inputs_and_role_contracts(self):
         source_journal = Path(self.context['dataset_path']).read_bytes()
         result = bundle.export_bundle(**self._export_args(self.base / 'A' / 'bundle'))

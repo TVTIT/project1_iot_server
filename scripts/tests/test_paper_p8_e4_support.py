@@ -49,6 +49,74 @@ def sample(mode='on'):
 
 
 class E4SupportTests(unittest.TestCase):
+    def test_expiry_requires_confirmed_commit_age_same_process_and_same_journal_bytes(self):
+        self.assertEqual(e4.e4_expiry_evidence(
+            commit_time=100.0, now=701.0, ttl_seconds=600, process_before='p1',
+            process_after='p1', journal_sha_before='a' * 64, journal_sha_after='a' * 64,
+            commit_confirmed=True)['status'], 'PASS')
+        for changes, reason in [
+            ({'now': 699.0}, 'expiry_age_unconfirmed'),
+            ({'process_after': 'p2'}, 'expiry_process_changed'),
+            ({'journal_sha_after': 'b' * 64}, 'expiry_journal_changed'),
+            ({'commit_confirmed': False}, 'expiry_commit_unconfirmed')]:
+            args = dict(commit_time=100.0, now=701.0, ttl_seconds=600,
+                process_before='p1', process_after='p1', journal_sha_before='a' * 64,
+                journal_sha_after='a' * 64, commit_confirmed=True)
+            args.update(changes)
+            self.assertIn(reason, e4.e4_expiry_evidence(**args)['failures'])
+
+    def test_expiry_budget_rejects_short_session_and_token_before_workload(self):
+        with self.assertRaisesRegex(ValueError, 'expiry_session_budget_insufficient'):
+            e4.validate_e4_expiry_budget(session_seconds=700, token_seconds=1200,
+                workload_seconds=200, drain_seconds=100, import_seconds=30,
+                cleanup_seconds=30)
+        with self.assertRaisesRegex(ValueError, 'expiry_token_lifetime_insufficient'):
+            e4.validate_e4_expiry_budget(session_seconds=1400, token_seconds=650,
+                workload_seconds=200, drain_seconds=100, import_seconds=30,
+                cleanup_seconds=30)
+
+    def test_expiry_manifest_is_optional_and_reuses_journal_with_production_ttl(self):
+        common = {'run_id': 'e4-run', 'profile': 'official',
+            'phases': {'measure_seconds': 4}, 'topology': {'gateways': 2}}
+        expiry = e4.e4_phase_manifest(common, 'outputs/e4-journal.sqlite', 'expiry-replay',
+            unique_count=1000, replay_count=100, official_opt_in=True)
+        self.assertEqual(expiry['e4']['journal_path'], 'outputs/e4-journal.sqlite')
+        self.assertEqual(expiry['e4']['replay_count'], 100)
+        self.assertEqual(expiry['e4']['expiry_ttl_seconds'], 600)
+        self.assertNotIn('wait_for_expiry_seconds', expiry['phases'])
+
+    def test_e4_counts_are_explicit_and_flow_into_phase_manifests(self):
+        common = {'run_id': 'e4-run', 'phases': {'measure_seconds': 4},
+                  'topology': {'gateways': 2}}
+        unique = e4.e4_phase_manifest(common, 'journal', 'unique', unique_count=38, replay_count=11)
+        replay = e4.e4_phase_manifest(common, 'journal', 'replay', unique_count=38, replay_count=11)
+        self.assertEqual(unique['e4']['max_messages'], 38)
+        self.assertEqual(replay['e4']['replay_count'], 11)
+        self.assertEqual(replay['e4']['max_messages'], 38)
+        self.assertEqual(unique['phases']['measure_seconds'], 4)
+        self.assertEqual(unique['traffic']['rate_per_second'] * 4, 38)
+        self.assertEqual(replay['phases']['measure_seconds'], 2)
+        self.assertEqual(replay['traffic']['rate_per_second'] * 2, 11)
+        self.assertEqual(e4.validate_e4_dataset_counts(1000, 100, profile='official', official_opt_in=True),
+                         {'unique_count': 1000, 'replay_count': 100})
+        official = e4.e4_phase_manifest({**common, 'profile': 'official'},
+            'outputs/e4-journal.sqlite', 'replay', unique_count=1000, replay_count=100,
+            official_opt_in=True)
+        self.assertEqual(official['e4']['max_messages'], 1000)
+        self.assertEqual(official['e4']['replay_count'], 100)
+        self.assertLessEqual(official['e4']['max_bytes'], 64 << 20)
+        with self.assertRaisesRegex(ValueError, 'official_profile_requires_opt_in'):
+            e4.validate_e4_dataset_counts(1000, 100, profile='official', official_opt_in=False)
+
+    def test_e4_replay_validator_rejects_expected_count_mismatch(self):
+        unique, replay, uw, rw = sample()
+        result = e4.validate_e4_results(unique, replay, db_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
+            scoped_delta={'available': {'a':{'ledger':10,'raw':1000,'temporal':10},'b':{'ledger':10,'raw':1000,'temporal':10}}},
+            raw_checks=[{'verified_exact':True,'ledger_count':10}]*2, unique_window=uw, replay_window=rw,
+            cache_mode='on', unique_count=20, replay_count=9, samples_per_message=100)
+        self.assertFalse(result['valid'])
+        self.assertIn('replay_replay_offered', result['failures'])
+
     def test_durable_a_side_sql_validators_require_committed_and_exact_raw_evidence(self):
         pending={'gateway_id':'gw1','sensor_id':'p8-e4-durable','message_id':'m1',
             'sample_count':100,'payload_sha256':'a'*64}

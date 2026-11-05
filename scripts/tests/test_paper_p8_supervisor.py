@@ -11,11 +11,46 @@ import paper_p8_supervisor as supervisor
 
 
 class SupervisorStateTests(unittest.TestCase):
+    def test_e4_expiry_phase_plan_is_last_and_excludes_cold(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode/p8-remote-step1') as directory:
+            root = Path(directory); root.chmod(0o700)
+            state = supervisor.initialize(root, experiment='E4', arm='warm', seed=89,
+                deadline_seconds=900, receipts=[], preparation_status='E4_PREPARED',
+                expiry_replay_enabled=True,
+                e4_phase_plan=['unique', 'replay', 'expiry-replay'])
+            self.assertEqual(state['phase_id'], 'unique')
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode/p8-remote-step1') as bad:
+            with self.assertRaisesRegex(ValueError, 'session_e4_phase_plan_rejected'):
+                supervisor.initialize(Path(bad), experiment='E4', arm='warm', seed=89,
+                    deadline_seconds=900, receipts=[], preparation_status='E4_PREPARED',
+                    expiry_replay_enabled=True,
+                    e4_phase_plan=['unique', 'replay', 'cold-replay', 'expiry-replay'])
+
     def private_root(self):
         path = Path(tempfile.mkdtemp(dir='/var/tmp/opencode/p8-remote-step1'))
         path.chmod(0o700)
         self.addCleanup(shutil.rmtree, path)
         return path
+
+    def test_profile_metadata_defaults_to_pilot_and_is_portable(self):
+        root = self.private_root()
+        state = supervisor.initialize(root, experiment='E1', arm='baseline', seed=7,
+            deadline_seconds=10, receipts=[])
+        self.assertEqual(state['profile'], 'pilot')
+        self.assertNotIn(str(root), json.dumps(state))
+
+    def test_official_profile_requires_explicit_opt_in(self):
+        root = self.private_root()
+        with self.assertRaisesRegex(ValueError, 'official_profile_opt_in_required'):
+            supervisor.initialize(root, experiment='E1', arm='baseline', seed=7,
+                deadline_seconds=10, receipts=[], profile='official')
+
+    def test_invalid_profile_rejected_before_session_file(self):
+        root = self.private_root()
+        with self.assertRaisesRegex(ValueError, 'session_metadata_rejected'):
+            supervisor.initialize(root, experiment='E1', arm='baseline', seed=7,
+                deadline_seconds=10, receipts=[], profile='ignored')
+        self.assertFalse((root / 'session.json').exists())
 
     def test_refresh_owned_receipts_requires_exact_registry_receipt_set(self):
         root = self.private_root()
@@ -43,6 +78,51 @@ class SupervisorStateTests(unittest.TestCase):
             closed = supervisor.finalize(root, result, cleanup_verified=True)
             self.assertEqual(closed['phase'], 'CLOSED')
             self.assertEqual(closed['cleanup_outcome'], 'VERIFIED')
+
+    def test_owned_guard_preflight_threshold_aborts_and_preserves_cleanup_outcome(self):
+        root = self.private_root()
+        state = supervisor.initialize(root, experiment='E2', arm='official', seed=84,
+            deadline_seconds=30, receipts=[])
+        guard = lambda: {'ok': False, 'reason': 'tiny_growth_limit',
+            'report': {'status': 'threshold', 'growth_limit_bytes': 1, 'terminal': {'growth_bytes': 1}}}
+        stopped = supervisor.hold(root, poll_seconds=0, owned_guard=guard)
+        self.assertEqual(stopped['phase'], 'FINALIZING')
+        self.assertEqual(stopped['primary_stop_reason'], 'tiny_growth_limit')
+        self.assertEqual(stopped['workload_outcome'], 'ABORTED')
+        self.assertEqual(stopped['owned_storage_pending_status'], 'NOT_VERIFIED')
+        self.assertEqual(stopped['remote_b_stop_instruction'], 'STOP_LOCALLY_ON_HOST_B')
+        closed = supervisor.finalize(root, stopped, cleanup_verified=False,
+            cleanup_error='owned fixture cleanup failed')
+        self.assertEqual(closed['primary_stop_reason'], 'tiny_growth_limit')
+        self.assertEqual(closed['cleanup_outcome'], 'FAILED')
+        self.assertEqual(closed['cleanup_error'], 'owned fixture cleanup failed')
+
+    def test_owned_guard_threshold_during_hold_aborts_active_measurement(self):
+        root = self.private_root()
+        state = supervisor.initialize(root, experiment='E2', arm='pilot', seed=84,
+            deadline_seconds=30, receipts=[])
+        calls = {'count': 0}
+        def guard():
+            calls['count'] += 1
+            return {'ok': calls['count'] < 3, 'reason': 'owned_db_growth_limit',
+                'report': {'status': 'sampling' if calls['count'] < 3 else 'threshold'}}
+        supervisor.write_request(root, {'session_id': state['session_id'],
+            'command': 'begin', 'phase': 'READY', 'phase_id': 'samples-1'})
+        with mock.patch.object(supervisor.time, 'sleep', return_value=None):
+            stopped = supervisor.hold(root, poll_seconds=0, on_begin=lambda _: {}, owned_guard=guard)
+        self.assertEqual(stopped['phase'], 'FINALIZING')
+        self.assertEqual(stopped['primary_stop_reason'], 'owned_db_growth_limit')
+        self.assertEqual(stopped['phase_id'], 'samples-1')
+
+    def test_owned_guard_measurement_failure_fails_closed_before_load(self):
+        root = self.private_root()
+        supervisor.initialize(root, experiment='E1', arm='pilot', seed=86,
+            deadline_seconds=30, receipts=[])
+        stopped = supervisor.hold(root, poll_seconds=0,
+            owned_guard=lambda: (_ for _ in ()).throw(OSError('reader down')))
+        self.assertEqual(stopped['primary_stop_reason'], 'OWNED_STORAGE_MEASUREMENT_UNAVAILABLE')
+        self.assertEqual(stopped['owned_storage_guard']['status'], 'measurement_unavailable')
+        self.assertEqual(stopped['workload_outcome'], 'ABORTED')
 
     def test_e3_finalize_after_collector_started_marks_unfinished_workload_aborted(self):
         with tempfile.TemporaryDirectory(dir='/var/tmp/opencode/p8-remote-step1') as directory:

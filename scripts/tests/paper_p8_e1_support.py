@@ -112,19 +112,30 @@ def websocket_metrics_window(before, after, histogram_helper, expected_deliverie
     return result
 
 
-def mixed_e1_mapping(targets, *, seed=86):
-    """Compose three deterministic density plans without crossing user gateways."""
-    mappings = [build_e1_mapping(targets=targets, viewers=64, users=2,
-                                 density=density, seed=seed)
-                for density in ('sparse', 'dense', 'overlap')]
+def mixed_e1_mapping(targets, *, seed=86, viewers=64, principals=2,
+                     density='mixed', messages_per_target=5):
+    """Compose deterministic density plans while retaining principal ACL scope."""
+    if density not in ('mixed', 'sparse', 'dense', 'overlap'):
+        raise ValueError('e1_density_or_seed_rejected')
+    if type(viewers) is not int or type(principals) is not int or type(messages_per_target) is not int:
+        raise ValueError('e1_workload_count_rejected')
+    if principals < 2 or principals > viewers or messages_per_target < 1:
+        raise ValueError('e1_workload_count_rejected')
+    gateways = sorted({t['gateway_id'] for t in targets})
+    users = {f'user-{i:03d}': gateways[i % len(gateways)] for i in range(principals)}
+    densities = ('sparse', 'dense', 'overlap') if density == 'mixed' else (density,)
     rows = []
-    for index in range(64):
-        source = mappings[index % len(mappings)]['viewers'][index]
-        row = {'viewer_id': source['viewer_id'], 'user_id': source['user_id'],
-               'filters': [dict(item) for item in source['filters']]}
-        rows.append(row)
+    for density_index, selected_density in enumerate(densities):
+        mapping = build_e1_mapping(targets=targets, viewers=viewers, users=principals,
+            density=selected_density, seed=seed + density_index,
+            official_opt_in=viewers > 64, user_gateways=users)
+        selected_rows = mapping['viewers'] if len(densities) == 1 else mapping['viewers'][density_index::len(densities)]
+        for row in selected_rows:
+            index = len(rows)
+            rows.append({'viewer_id': f'viewer-{index:05d}', 'user_id': row['user_id'],
+                         'filters': [dict(item) for item in row['filters']]})
     recipients = {f"{t['gateway_id']}\0{t['sensor_id']}": [] for t in targets}
-    owner_gateway = {f'user-{i:03d}': gw for i, gw in enumerate(sorted({t['gateway_id'] for t in targets}))}
+    owner_gateway = users
     for row in rows:
         if any(f['gateway_id'] != owner_gateway[row['user_id']] for f in row['filters']):
             raise ValueError('e1_cross_gateway_filter_rejected')
@@ -135,11 +146,80 @@ def mixed_e1_mapping(targets, *, seed=86):
                 recipients[f"{target['gateway_id']}\0{target['sensor_id']}"].append(row['viewer_id'])
     if any(not values for values in recipients.values()):
         raise ValueError('e1_target_without_recipients')
-    return {'seed': seed, 'targets': targets, 'viewers': rows,
+    return {'seed': seed, 'density': density, 'targets': targets, 'viewers': rows,
             'expected_recipients_by_target': recipients,
-            'expected_deliveries_by_target': {key: len(value) * 5 for key, value in recipients.items()},
-             'counts': {'sockets': 64, 'users': 2, 'targets': len(targets),
-                        'receiving_viewers': len({v for values in recipients.values() for v in values})}}
+             'messages_per_target': {key: messages_per_target for key in recipients},
+             'expected_deliveries_by_target': {key: len(value) * messages_per_target for key, value in recipients.items()},
+              'counts': {'sockets': viewers, 'principals': principals, 'users': principals,
+                          'filters': sum(len(v['filters']) for v in rows), 'targets': len(targets),
+                          'receiving_viewers': len({v for values in recipients.values() for v in values})}}
+
+
+def require_e1_resource_gate(resources, *, viewers, session_cap, reserve_connections=32):
+    """Refuse an E1 rung unless effective owned-process limits cover the selected load."""
+    if type(viewers) is not int or not 1 <= viewers <= 10000:
+        raise ValueError('e1_resource_gate_denied:viewer_count')
+    if type(session_cap) is not int or session_cap < 1:
+        raise ValueError('e1_resource_gate_denied:backend_ws_session_cap_unavailable')
+    if session_cap < viewers:
+        raise ValueError(f'e1_resource_gate_denied:backend_ws_session_cap:required={viewers}:available={session_cap}')
+    nginx = resources.get('nginx') if isinstance(resources, dict) else None
+    if not isinstance(nginx, dict) or type(nginx.get('worker_connections')) is not int:
+        raise ValueError('e1_resource_gate_denied:nginx_worker_connections_unavailable')
+    if type(nginx.get('worker_processes')) is not int or nginx['worker_processes'] < 1:
+        raise ValueError('e1_resource_gate_denied:nginx_worker_processes_unavailable')
+    required_slots = 2 * viewers + 2 + reserve_connections  # two telemetry producer sockets
+    per_worker_required = (required_slots + nginx['worker_processes'] - 1) // nginx['worker_processes']
+    if nginx['worker_connections'] < per_worker_required:
+        raise ValueError(f'e1_resource_gate_denied:nginx_worker_connections:required={per_worker_required}:available={nginx["worker_connections"]}')
+    nginx_fd = resources.get('process_fd_limits')
+    if not isinstance(nginx_fd, dict) or (nginx_fd.get('soft') is not None and type(nginx_fd.get('soft')) is not int):
+        raise ValueError('e1_resource_gate_denied:nginx_fd_limit_unavailable')
+    if nginx_fd.get('soft') is not None and nginx_fd['soft'] < per_worker_required:
+        raise ValueError(f'e1_resource_gate_denied:nginx_fd_limit:required={per_worker_required}:available={nginx_fd["soft"]}')
+    for key, required in (('backend_fd_availability', viewers + reserve_connections),
+                          ('broker_fd_availability', 2 + reserve_connections)):
+        state = resources.get(key)
+        if not isinstance(state, dict) or (state.get('available') is not None and type(state.get('available')) is not int):
+            raise ValueError(f'e1_resource_gate_denied:{key}_unavailable')
+        if state.get('available') is None:
+            raise ValueError(f'e1_resource_gate_denied:{key}_unavailable')
+        if state['available'] < required:
+            raise ValueError(f'e1_resource_gate_denied:{key}:required={required}:available={state["available"]}')
+    return {'status': 'RESOURCE_GATE_PASSED', 'viewers': viewers,
+            'proxy_slots_total_required': required_slots,
+            'proxy_slots_per_worker_required': per_worker_required,
+            'reserve_connections': reserve_connections,
+            'backend_fds_required': viewers + reserve_connections,
+            'broker_fds_required': 2 + reserve_connections,
+            'native_executed': False}
+
+
+def e1_resource_overlay(viewers, *, official_opt_in, host_limits=None, reserve_connections=32):
+    """Return a finite fixture-only proposal for one selected E1 viewer rung."""
+    if type(viewers) is not int or not 1 <= viewers <= 10000:
+        raise ValueError('e1_resource_gate_denied:viewer_count')
+    if viewers > 64 and not official_opt_in:
+        raise ValueError('e1_resource_gate_denied:official_opt_in_required')
+    workers = min(32, max(1, (viewers + 63) // 64))
+    proxy_slots = 2 * viewers + 2 + reserve_connections
+    per_worker = (proxy_slots + workers - 1) // workers
+    # Reference/session memory is a fixed ceiling, not multiplied by viewers;
+    # per-session queues and pending limits intentionally remain unchanged.
+    proposed = {'WS_MAX_SESSIONS': viewers, 'WS_SESSION_REFERENCE_BYTES': 8 * 1024 * 1024,
+        'nginx_worker_processes': workers, 'nginx_worker_connections': per_worker,
+        'nginx_process_fd_soft': per_worker, 'backend_process_fd_required': viewers + reserve_connections,
+        'backend_process_fd_limit': viewers + reserve_connections + 64,
+        'broker_process_fd_required': 2 + reserve_connections,
+        'broker_process_fd_limit': 2 + reserve_connections + 64, 'proxy_slots_total': proxy_slots,
+        'reserve_connections': reserve_connections}
+    limits = host_limits or {}
+    if type(limits.get('fd_soft')) is int and limits['fd_soft'] < proxy_slots:
+        raise ValueError(f"e1_resource_gate_denied:host_fd:required={proxy_slots}:available={limits['fd_soft']}")
+    if type(limits.get('memory_available_bytes')) is int and limits['memory_available_bytes'] < proposed['WS_SESSION_REFERENCE_BYTES']:
+        raise ValueError('e1_resource_gate_denied:host_memory:required=8388608:available=' + str(limits['memory_available_bytes']))
+    return {'viewers': viewers, 'proposed': proposed, 'estimated_only': True,
+        'readback': None, 'queues_scaled_with_viewers': False}
 
 
 def role_artifacts(root):
@@ -170,20 +250,42 @@ def safe_effective_flags(effective):
 
 
 def e1_role_manifests(common, *, subscriptions, viewer_identity, telemetry_identity,
-                      gateway_refs, root):
+                      gateway_refs, root, mapping=None, phases=None,
+                      messages_per_target=None):
     """Build E1 role inputs without assigning telemetry-only settings to viewers."""
     viewer_common = {key: value for key, value in common.items() if key != 'durability_mode'}
+    topology = common.get('topology', {})
+    viewer_count = mapping['counts']['sockets'] if mapping else topology.get('viewers', 64)
+    phase_values = dict(phases or {'warmup_seconds': 0, 'measure_seconds': 14,
+                                   'drain_seconds': 8, 'cooldown_seconds': 0})
+    if any(type(phase_values.get(k)) is not int or phase_values[k] < 0
+           for k in ('warmup_seconds','measure_seconds','drain_seconds','cooldown_seconds')):
+        raise ValueError('e1_phase_budget_rejected')
+    if phase_values['measure_seconds'] < 1 or phase_values['drain_seconds'] < 1:
+        raise ValueError('e1_phase_budget_rejected')
+    workers = min(32, max(1, (viewer_count + 63) // 64))
+    wall = sum(phase_values.values()) + 8
+    viewer_topology = dict(topology)
+    if mapping:
+        viewer_topology.update(viewers=viewer_count, users=mapping['counts']['principals'])
+    viewer_traffic = dict(common.get('traffic', {}))
+    viewer_traffic['ramp_seconds'] = min(120, max(1, viewer_count // 50))
     viewer = dict(viewer_common, experiment='E1', roles=['viewer'], subscriptions=subscriptions,
-        phases={'warmup_seconds': 0, 'measure_seconds': 14, 'drain_seconds': 8, 'cooldown_seconds': 0},
+        topology=viewer_topology, traffic=viewer_traffic, phases=phase_values,
         viewer={'mode': 'healthy'},
-        limits={'workers': 2, 'connections': 64, 'pending_messages': 64, 'pending_bytes': 1048576,
-                'wall_seconds': 30, 'retries': 2, 'disk_growth_bytes': 16777216},
+        limits={'workers': workers, 'connections': viewer_count, 'pending_messages': 64, 'pending_bytes': 1048576,
+                'wall_seconds': wall, 'retries': 2, 'disk_growth_bytes': 16777216},
         identity_files={'viewer': str(viewer_identity)}, bundle_path=str(root))
+    messages_per_target = messages_per_target or (mapping['messages_per_target'] if mapping else None)
+    message_count = max(messages_per_target.values(), default=5) if isinstance(messages_per_target, dict) else (messages_per_target or 5)
+    total_messages = sum(messages_per_target.values()) if isinstance(messages_per_target, dict) else message_count
+    telemetry_rate = max(1, (total_messages + message_count - 1) // message_count)
     telemetry = dict(common, experiment='E2', roles=['telemetry'], subscriptions=[],
         topology={'gateways': 2, 'sensors_per_gateway': 2, 'users': 0, 'viewers': 0},
-        phases={'warmup_seconds': 0, 'measure_seconds': 4, 'drain_seconds': 8, 'cooldown_seconds': 0},
+        traffic={**common.get('traffic', {}), 'rate_per_second': telemetry_rate},
+        phases={'warmup_seconds': 0, 'measure_seconds': max(1, message_count), 'drain_seconds': phase_values['drain_seconds'], 'cooldown_seconds': 0},
         limits={'workers': 2, 'connections': 2, 'pending_messages': 64, 'pending_bytes': 1048576,
-                'wall_seconds': 30, 'retries': 2, 'disk_growth_bytes': 16777216},
+                'wall_seconds': max(30, message_count + phase_values['drain_seconds'] + 8), 'retries': 2, 'disk_growth_bytes': 16777216},
         identity_files={'telemetry': str(telemetry_identity)},
         gateway_identity_files=gateway_refs, bundle_path=str(root),
         durability_mode='synthetic-load')
@@ -196,31 +298,40 @@ def validate_e1_result(workload, mapping, *, database_delta, raw_verification,
     telemetry = workload.get('telemetry', {}) if isinstance(workload, dict) else {}
     counters = workload.get('viewer', {}) if isinstance(workload, dict) else {}
     failures = []
-    wanted = {'generated_unique': 20, 'offered_unique': 20, 'publish_attempts': 20,
-              'broker_pubacks': 20, 'application_acks': 20, 'pending_messages': 0,
+    messages = mapping.get('messages_per_target', {})
+    expected_unique = sum(messages.values())
+    wanted = {'generated_unique': expected_unique, 'offered_unique': expected_unique, 'publish_attempts': expected_unique,
+              'broker_pubacks': expected_unique, 'application_acks': expected_unique, 'pending_messages': 0,
               'pending_bytes': 0}
     failures += [f'telemetry_{key}' for key, value in wanted.items() if telemetry.get(key) != value]
     if workload.get('status') != 'COMPLETE': failures.append('workload_status')
-    if (viewer_sessions.get('connected_distinct_viewers') != 64 or
-            viewer_sessions.get('subscribed_distinct_viewers') != 64 or
-            viewer_sessions.get('receiving_distinct_viewers') != 64):
+    socket_count = mapping['counts']['sockets']
+    expected_receiving = mapping['counts']['receiving_viewers']
+    if (viewer_sessions.get('connected_distinct_viewers') != socket_count or
+            viewer_sessions.get('subscribed_distinct_viewers') != socket_count or
+            viewer_sessions.get('receiving_distinct_viewers') != expected_receiving):
         failures.append('viewer_session_totals')
     rows = viewer_sessions.get('viewers', [])
     viewers = {r.get('id'): r for r in rows if isinstance(r, dict)}
-    if (len(viewers) != 64 or set(viewers) != {r['viewer_id'] for r in mapping['viewers']} or
+    if (len(viewers) != socket_count or set(viewers) != {r['viewer_id'] for r in mapping['viewers']} or
             viewer_sessions.get('duplicates') != 0 or viewer_sessions.get('wrong_namespace') != 0 or
             any(r.get('duplicates') != 0 or r.get('wrong_namespace', 0) != 0 for r in viewers.values())):
         failures.append('viewer_identity_set')
     else:
-        expected = {r['viewer_id']: sum(5 for key, ids in mapping['expected_recipients_by_target'].items()
+        expected = {r['viewer_id']: sum(mapping['messages_per_target'][key] for key, ids in mapping['expected_recipients_by_target'].items()
                                          if r['viewer_id'] in ids) for r in mapping['viewers']}
         if {k: v.get('unique_events') for k, v in viewers.items()} != expected:
             failures.append('viewer_delivery_counts')
-    if database_delta != {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}:
+    expected_db = {'ledger': expected_unique, 'raw': expected_unique * workload.get('samples_per_message', 100),
+                   'temporal': expected_unique, 'configuration': 0}
+    if database_delta != expected_db:
         failures.append('database_delta')
-    if (len(raw_verification) != 4 or not all(
-            x.get('verified_exact') and x.get('ledger_count') == 5 and
-            x.get('raw_identity_value_mismatches') == 0 for x in raw_verification)):
+    pilot_exact = socket_count <= 64 and len(mapping['targets']) <= 4
+    if (not raw_verification or (pilot_exact and len(raw_verification) != len(mapping['targets'])) or not all(
+            x.get('ledger_count') == messages.get(x.get('target_key'), max(messages.values(), default=0)) and
+            x.get('raw_identity_value_mismatches') == 0 and
+            (x.get('verified_exact') if pilot_exact else x.get('verified_sample'))
+            for x in raw_verification)):
         failures.append('raw_identity')
     header_ids = set(expected_headers) if not isinstance(expected_headers, dict) else set(expected_headers)
     sampled_ids = {x.get('message_id') if isinstance(x,dict) else x for x in sampled_headers}
@@ -251,14 +362,59 @@ def validate_e1_result(workload, mapping, *, database_delta, raw_verification,
 
 
 def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
-            session_id=None, phase='pilot', mode=None, arm='armpilot-e1', output_root=None):
+            session_id=None, phase='pilot', mode=None, arm='armpilot-e1', output_root=None,
+            profile='pilot', official_opt_in=False, viewers=64, principals=2,
+            density='mixed', messages_per_target=5):
     """Provision E1's two Gateway/four Sensor inputs and build its Go plan.
 
     This seam is shared by the historical local E1 lane and the remote-prepared
     server path. It does not start the paperload child or a producer.
     """
+    # Fixture provisioning currently creates exactly two memberships and JWTs.
+    # Refuse other principal counts before any fixture work; do not alias users.
+    if type(principals) is not int or principals != 2:
+        raise ValueError('e1_fixture_principal_topology_unsupported')
+    if (type(viewers) is not int or viewers < 1
+            or (profile == 'pilot' and viewers > 64)
+            or profile not in ('pilot', 'official')
+            or (profile == 'official' and not official_opt_in)):
+        raise ValueError('e1_pilot_viewer_limit')
     pg, quota, effective, resources, storage_status, tokens, specs, passwords, sensor_path = (
         smoke.prepare_paper_workload(fixture, registry, endpoint, containers, images, state))
+    def exec_owned_service(service, command):
+        if service not in ('nginx', 'backend', 'mosquitto') or service not in containers:
+            raise ValueError('fixture_resource_service_rejected')
+        result = registry.command(['exec', containers[service]['name'], *command])
+        if result.returncode:
+            raise ValueError('fixture_resource_readback_failed')
+        return result.stdout.decode(errors='replace')
+    fixture_resources = _support.read_owned_fixture_resources(
+        exec_owned_service, viewers=viewers, role_connections={'viewer': viewers, 'telemetry': 2})
+    smoke.private_write(fixture.private / 'e1-resource-readback.json',
+                        json.dumps(fixture_resources, sort_keys=True, separators=(',', ':')))
+    effective_flags = safe_effective_flags(effective)
+    try:
+        session_cap = int(effective_flags['WS_MAX_SESSIONS'])
+    except (KeyError, TypeError, ValueError):
+        session_cap = None
+    overlay = getattr(fixture, 'e1_resource_overlay', None)
+    if not isinstance(overlay, dict):
+        raise ValueError('e1_resource_overlay_missing')
+    proposed = overlay['proposed']
+    nginx_readback = fixture_resources.get('nginx', {})
+    fd_readback = fixture_resources.get('process_fd_limits', {})
+    if (session_cap != proposed['WS_MAX_SESSIONS']
+            or effective_flags.get('WS_SESSION_REFERENCE_BYTES') != str(proposed['WS_SESSION_REFERENCE_BYTES'])
+            or nginx_readback.get('worker_processes') != proposed['nginx_worker_processes']
+            or nginx_readback.get('worker_connections') != proposed['nginx_worker_connections']
+            or fd_readback.get('soft') != proposed['nginx_process_fd_soft']):
+        raise ValueError('e1_resource_overlay_runtime_readback_mismatch')
+    for key, expected in (('backend_fd_availability', proposed['backend_process_fd_limit']),
+                          ('broker_fd_availability', proposed['broker_process_fd_limit'])):
+        actual = fixture_resources.get(key, {}).get('soft')
+        if actual != expected:
+            raise ValueError(f'e1_resource_overlay_runtime_fd_mismatch:{key}')
+    resource_gate = require_e1_resource_gate(fixture_resources, viewers=viewers, session_cap=session_cap)
     schema = smoke.db_psql(registry, pg,
         'SELECT version::text || \':\' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;').strip()
     if schema != '24:telemetry_ledger_timestamp': raise ValueError('p8_schema_terminal_rejected')
@@ -271,7 +427,10 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
     for spec in specs:
         targets.extend([{'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id},
                         {'gateway_id': spec.gateway_id, 'sensor_id': 'p8_e1_second'}])
-    mapping = mixed_e1_mapping(targets)
+    if profile not in ('pilot','official') or (profile == 'official' and not official_opt_in):
+        raise ValueError('e1_official_opt_in_required')
+    mapping = mixed_e1_mapping(targets, viewers=viewers, principals=principals,
+                               density=density, messages_per_target=messages_per_target)
     broker = registry.resolve(containers['mosquitto'])
     ports = broker.get('NetworkSettings', {}).get('Ports', {}).get('8883/tcp') or []
     if len(ports) != 1: raise ValueError('p8_mqtt_mapping_readback_rejected')
@@ -300,7 +459,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
                                   if t['sensor_id'] != 'p8_e1_second' else f"urn:ngsi-ld:Sensor:{t['gateway_id']}:p8_e1_second") for t in targets]
     # Private identity files stay mode 0600 and are role separated.
     viewer_identity = root / 'viewer-identities.json'
-    smoke.private_write(viewer_identity, json.dumps({f'user-{i:03d}': tokens['a' if i == 0 else 'b'] for i in range(2)}, sort_keys=True))
+    smoke.private_write(viewer_identity, json.dumps({f'user-{i:03d}': tokens['a' if i % 2 == 0 else 'b'] for i in range(principals)}, sort_keys=True))
     telemetry_identity = root / 'telemetry-identities.json'; smoke.private_write(telemetry_identity, '{}')
     gateway_refs = {}
     for s, password in zip(specs, passwords):
@@ -313,19 +472,21 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
     subscriptions = [{'viewer_id': row['viewer_id'], 'user_id': row['user_id'],
                       'gateway_id': f['gateway_id'], **({'sensor_id': f['sensor_id']} if f.get('sensor_id') else {})}
                      for row in mapping['viewers'] for f in row['filters']]
-    common = {'schema_version': 1, 'arm': arm, 'profile': 'pilot', 'mode': mode,
+    common = {'schema_version': 1, 'arm': arm, 'profile': profile, 'mode': mode,
         'run_id': run_id, 'seed': 86, 'samples_per_message': 100,
-        'topology': {'gateways': 2, 'sensors_per_gateway': 2, 'users': 2, 'viewers': 64},
+        'topology': {'gateways': 2, 'sensors_per_gateway': 2, 'users': principals, 'viewers': viewers},
         'targets': targets, 'traffic': {'rate_per_second': 5, 'ramp_seconds': 0, 'burst_messages': 0},
         'tls': tls, 'retry_interval_ms': 200, 'publish_timeout_ms': 3000,
         'bundle_path': str(root)}
     viewer, telemetry = e1_role_manifests(common, subscriptions=subscriptions,
         viewer_identity=viewer_identity, telemetry_identity=telemetry_identity,
-        gateway_refs=gateway_refs, root=root)
+        gateway_refs=gateway_refs, root=root, mapping=mapping,
+        messages_per_target=mapping['messages_per_target'])
     paths=[]
     for name, value in (('viewer', viewer), ('telemetry', telemetry)):
         p=root/f'{name}.json'; smoke.private_write(p, json.dumps(value, sort_keys=True, separators=(',', ':'))); paths.append(p)
-    plan=build_e1_execution_plan(output_dir=root/'plan', viewer_manifest=paths[0], telemetry_manifest=paths[1], seed=86, mode=mode)
+    plan=build_e1_execution_plan(output_dir=root/'plan', viewer_manifest=paths[0], telemetry_manifest=paths[1],
+        seed=86, mode=mode, official_opt_in=official_opt_in)
     return {'pg':pg, 'quota':quota, 'effective':effective, 'resources':resources,
         'storage_status':storage_status, 'tokens':tokens, 'specs':specs, 'passwords':passwords,
         'sensor_path':sensor_path, 'targets':targets, 'targets_db':targets_db, 'mapping':mapping,
@@ -335,6 +496,9 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
         'gateway_refs':gateway_refs, 'mode':mode, 'tls':tls, 'subscriptions':subscriptions,
         'common':common, 'viewer_manifest':viewer, 'telemetry_manifest':telemetry,
         'manifest_paths':paths, 'plan':plan, 'session_id':session_id, 'phase':phase,
+        'profile': profile,
+        'fixture_resources': fixture_resources, 'effective_ws_flags': effective_flags,
+        'resource_gate': resource_gate,
         'schema':schema}
 
 
@@ -373,10 +537,20 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
                  'telemetry': json.loads(Path(prepared['plan']['run_spec']).read_text())['paperload'][1]['manifest']}
     # The builder's generated manifest paths are the exact source inputs in its run-spec.
     spec = json.loads(Path(prepared['plan']['run_spec']).read_text())
+    mapping = prepared.get('mapping') or {'seed': 86,
+        'messages_per_target': {f"{t['gateway_id']}\0{t['sensor_id']}": 5 for t in prepared['targets']},
+        'counts': {'sockets': prepared['common']['topology']['viewers'], 'principals': prepared['common']['topology']['users']},
+        'density': 'mixed', 'expected_deliveries_by_target': {}}
     workload = {'experiment': 'E1', 'arm': prepared['common']['arm'],
-        'phase': prepared['phase'], 'profile': 'pilot', 'workload': 'e1-wss-mqtt-pilot',
-        'seed': 86, 'samples_per_message': 100, 'unique_batches': 20,
-        'rate_per_second': 5, 'measure_seconds': 4,
+        'phase': prepared['phase'], 'profile': prepared.get('profile', prepared['common'].get('profile', 'pilot')), 'workload': 'e1-wss-mqtt',
+        'seed': mapping['seed'], 'samples_per_message': 100,
+        'unique_batches': sum(mapping['messages_per_target'].values()),
+        'rate_per_second': prepared['common'].get('traffic', {}).get('rate_per_second', 5),
+        'measure_seconds': sum(mapping['messages_per_target'].values()),
+        'viewer_count': mapping['counts']['sockets'],
+        'principal_count': mapping['counts']['principals'],
+        'density': mapping['density'],
+        'expected_deliveries_by_target': mapping['expected_deliveries_by_target'],
         'generator_colocated': 'unverified'}
     return paper_p8_bundle.export_bundle(output_leaf=root,
         session_id=prepared['session_id'], experiment='E1', arm=prepared['common']['arm'],
@@ -484,7 +658,7 @@ def _load_result_bundle(results_root, prepared, *, phase_id, binary_sha256):
                     or value.get('experiment') != wanted_experiment
                     or value.get('arm') != prepared['common']['arm']
                     or value.get('run_id') != prepared['run_id']
-                    or value.get('mode') != 'remote' or value.get('profile') != 'pilot'):
+                    or value.get('mode') != 'remote' or value.get('profile') != prepared.get('profile', prepared['common'].get('profile', 'pilot'))):
                 raise ValueError('result_workload_correlation_rejected')
             values[role] = value
         elif role == 'runner' and (not isinstance(value, dict) or value.get('status') not in ('COMPLETE','PARTIAL','FAILED')):
@@ -522,8 +696,10 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
             {'gw':sensor.gateway_id,'sensor':sensor.sensor_id,'urn':sensor.sensor_urn}).strip())
         sensors.append({'gateway_id':sensor.gateway_id,'sensor_id':sensor.sensor_id,'counts':counts})
     baseline = _admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+    collector_budget = prepared['viewer_manifest']['limits']['wall_seconds'] + 10
     collector = BoundedCollector(scrape=lambda: _admin_metrics(smoke, endpoint, prepared['tokens']['admin']),
-        interval=0.5, max_snapshots=64, deadline_seconds=60, baseline_metrics=baseline,
+        interval=0.5, max_snapshots=min(20000, collector_budget * 2 + 2),
+        deadline_seconds=collector_budget, baseline_metrics=baseline,
         baseline_server=smoke.paper_p0_stats(registry, containers, 'workload_start'))
     collector.start(None)
     prepared['remote_collector'] = collector
@@ -579,7 +755,11 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
     if collector.errors:
         validation['valid'] = False
         validation['failures'].append('collector_incomplete:' + ','.join(collector.errors))
-    if any(row.get('ledger') != 5 or row.get('raw') != 500 or row.get('temporal') != 5
+    target_messages = prepared['mapping']['messages_per_target']
+    target_count = lambda row: target_messages.get(row.get('key', '').replace('/', '\0', 1))
+    if any(row.get('ledger') != target_count(row)
+            or row.get('raw') != target_count(row) * 100
+            or row.get('temporal') != target_count(row)
            or row.get('configuration') != 0 for row in per_target):
         validation['valid'] = False
         validation['failures'].append('per_target_database_delta')
@@ -598,8 +778,13 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
     return result
 
 
-def run(smoke, fixture, endpoint, registry, containers, images, state, paperload_binary):
-    prepared = prepare(smoke, fixture, endpoint, registry, containers, images, state)
+def run(smoke, fixture, endpoint, registry, containers, images, state, paperload_binary, *,
+        viewers=64, principals=2, density='mixed', messages_per_target=5):
+    prepared = prepare(smoke, fixture, endpoint, registry, containers, images, state,
+        profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
+        official_opt_in=getattr(fixture, 'paper_p8_official_opt_in', False),
+        viewers=viewers, principals=principals, density=density,
+        messages_per_target=messages_per_target)
     pg, quota, effective, resources = (prepared['pg'], prepared['quota'],
         prepared['effective'], prepared['resources'])
     schema = prepared['schema']
@@ -622,15 +807,19 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
             {'gw':s.gateway_id,'sensor':s.sensor_id,'urn':s.sensor_urn}).strip())
         before_sensors.append({'gateway_id':s.gateway_id,'sensor_id':s.sensor_id,'counts':counts})
     baseline=_admin_metrics(smoke, endpoint, tokens['admin'])
+    collector_budget=viewer['limits']['wall_seconds'] + 10
     collector=BoundedCollector(scrape=lambda:_admin_metrics(smoke,endpoint,tokens['admin']), interval=0.5,
-        max_snapshots=64, deadline_seconds=60, baseline_metrics=baseline,
+        max_snapshots=min(20000, collector_budget * 2 + 2), deadline_seconds=collector_budget, baseline_metrics=baseline,
         baseline_server=smoke.paper_p0_stats(registry, containers, 'workload_start'))
     log=root/'runner.log'; proc=None; primary=None
     with log.open('xb') as stream:
         log.chmod(0o600)
         try:
-            proc=subprocess.Popen(['python3', str(smoke.ROOT/'scripts/paper_p8.py'), '--run', '--binary', str(paperload_binary),
-                '--run-spec', plan['run_spec'], '--run-artifact', str(root/'run.json')], cwd=smoke.ROOT,
+            command = ['python3', str(smoke.ROOT/'scripts/paper_p8.py'), '--run', '--binary', str(paperload_binary),
+                '--run-spec', plan['run_spec'], '--run-artifact', str(root/'run.json')]
+            if getattr(fixture, 'paper_p8_official_opt_in', False):
+                command.append('--official-opt-in')
+            proc=subprocess.Popen(command, cwd=smoke.ROOT,
                 stdout=stream, stderr=subprocess.STDOUT, env=smoke.process_env(fixture), close_fds=True)
             collector.start(proc.pid)
             try: proc.wait(timeout=90)
@@ -665,11 +854,16 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
     for item in per_target:
         gw,sensor=item['key'].split('/',1)
         item['configuration']=after_config.get((gw,sensor),-1)-before_config.get((gw,sensor),-1)
-    raw_checks=[verify_pilot_raw(smoke,registry,pg,s) for s in targets_db]
+    producer_headers = role_workloads['telemetry'].get('identity_samples', [])
+    raw_checks=[]
+    for sensor in targets_db:
+        message_ids = [row.get('message_id') for row in producer_headers
+            if row.get('gateway_id') == sensor.gateway_id and row.get('sensor_id') == sensor.sensor_id]
+        raw_checks.append(verify_pilot_raw(smoke, registry, pg, sensor,
+            message_ids=None if viewers <= 64 else message_ids))
     # Header identities are sampled from producer headers; each sampled websocket
     # record must carry an exact producer identity and satisfy that viewer's filters.
     ws = role_workloads['viewer']
-    producer_headers = role_workloads['telemetry'].get('identity_samples', [])
     expected_header_ids = {x.get('message_id'):x for x in producer_headers if isinstance(x,dict)}
     ws_samples = ws.get('identity_samples', [])
     sampled_ids = ws_samples
@@ -690,7 +884,12 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
     if collector.errors:
         validation['failures'].append('collector_incomplete:' + ','.join(collector.errors))
         validation['valid'] = False
-    if any(x.get('ledger') != 5 or x.get('raw') != 500 or x.get('temporal') != 5 or x.get('configuration') != 0 for x in per_target):
+    expected_target_messages = mapping['messages_per_target']
+    target_count = lambda row: expected_target_messages.get(row.get('key', '').replace('/', '\0', 1), -1)
+    if any(x.get('ledger') != target_count(x)
+           or x.get('raw') != target_count(x) * 100
+           or x.get('temporal') != target_count(x)
+           or x.get('configuration') != 0 for x in per_target):
         validation['failures'].append('per_target_database_delta'); validation['valid']=False
     if not validation['valid']:
         raise ValueError('p8_e1_validation_failed:' + ','.join(validation['failures']))
@@ -705,7 +904,9 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
         'collector_generator_samples':collector.generator_samples,'terminal_admin_metrics':admin_terminal,
         'terminal_server_resources':server_terminal,
         'websocket_metrics_window':ws_metrics_window,
-        'mode':mode,'generator_colocated':True,'cross_process_latency':'unavailable','principals':2,'sockets':64,
+         'mode':mode,'generator_colocated':True,'cross_process_latency':'unavailable',
+         'principals':mapping['counts']['principals'],'sockets':mapping['counts']['sockets'],
+         'physical_ab':'NOT RUN',
         'workload':workload,'generated_at':datetime.now(timezone.utc).isoformat()}
     smoke.paper_p1_metrics_csv(fixture.artifacts/'metrics.csv',collector.metrics)
     smoke.paper_p1_resources_csv(fixture.artifacts/'resources.csv',[r for r in collector.resources if r.get('services') and not r.get('error')],resources)

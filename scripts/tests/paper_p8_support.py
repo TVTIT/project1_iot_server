@@ -1,7 +1,18 @@
 """Bounded disposable fixture orchestration for the P8 native WSS session probe."""
 import json
+import importlib.util
 import os
 from pathlib import Path
+try:
+    from scripts.paper_p8_resources import disk_guard_config
+except ModuleNotFoundError:
+    _resources_path = Path(__file__).resolve().parents[1] / 'paper_p8_resources.py'
+    _resources_spec = importlib.util.spec_from_file_location('paper_p8_resources', _resources_path)
+    if _resources_spec is None or _resources_spec.loader is None:
+        raise ImportError('paper_p8_resources_unavailable') from None
+    _resources = importlib.util.module_from_spec(_resources_spec)
+    _resources_spec.loader.exec_module(_resources)
+    disk_guard_config = _resources.disk_guard_config
 import signal
 import subprocess
 import time
@@ -20,6 +31,7 @@ HEARTBEAT_SECONDS = 20
 PILOT_LIMIT_SECONDS = 175
 MAX_EVENTS = 10000
 MAX_BYTES = 16 * 1024 * 1024
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 COLLECTOR_INTERVAL_SECONDS = 0.5
 COLLECTOR_MAX_SNAPSHOTS = 32
 E1_OFFICIAL_VIEWER_RUNGS = (32, 64, 128, 512, 1000, 2000, 5000, 10000)
@@ -104,7 +116,7 @@ def build_e1_execution_plan(*, output_dir, viewer_manifest, telemetry_manifest, 
     loaded={}
     for name, path, role in (('viewer',viewer_manifest,'viewer'),('telemetry',telemetry_manifest,'telemetry')):
         source=Path(path)
-        if source.is_symlink() or not source.is_file() or source.stat().st_mode & 0o077 or source.stat().st_size > 1<<20:
+        if source.is_symlink() or not source.is_file() or source.stat().st_mode & 0o077 or source.stat().st_size > MAX_MANIFEST_BYTES:
             raise ValueError('e1_manifest_input_rejected')
         raw=json.loads(source.read_text(encoding='utf-8'))
         if (not isinstance(raw,dict) or raw.get('roles') != [role]
@@ -134,21 +146,31 @@ def build_e1_execution_plan(*, output_dir, viewer_manifest, telemetry_manifest, 
     for key in ('https_endpoint','https_ca_file'):
         if viewer['tls'].get(key) != telemetry['tls'].get(key):
             raise ValueError('e1_security_profile_mismatch')
-    for key in ('workers','pending_messages','pending_bytes'):
+    # Worker pools are role-specific (viewer socket fanout vs telemetry
+    # publishers); only the bounded queue policy must match across roles.
+    for key in ('pending_messages','pending_bytes'):
         if viewer['limits'].get(key) != telemetry['limits'].get(key):
             raise ValueError('e1_worker_queue_policy_mismatch')
     if viewer.get('targets') != telemetry.get('targets'):
         raise ValueError('e1_target_topology_mismatch')
-    spec={'paperload':[{'manifest':str(path),'output_dir':str(root/(out)),'role':role,'ready_timeout_seconds':90}
+    # The viewer must have time to establish every selected socket and receive
+    # each broker SUBACK before telemetry is allowed to start. Keep this finite
+    # and derived from the manifest's configured measurement/drain window.
+    readiness_budget = min(120, max(5, sum(viewer['phases'].get(key, 0)
+        for key in ('warmup_seconds', 'measure_seconds', 'drain_seconds'))))
+    spec={'paperload':[{'manifest':str(path),'output_dir':str(root/(out)),'role':role,
+                        'ready_timeout_seconds': readiness_budget if role == 'viewer' else 90}
                        for (role,path),out in zip(manifests,(viewer_output,telemetry_output))],
-          'stop_timeout_seconds':30}
+          'stop_timeout_seconds':30,
+          'disk_guard': disk_guard_config([viewer, telemetry])}
     run_spec=root/'e1-run-spec.json'
     with run_spec.open('x',encoding='utf-8') as f: json.dump(spec,f,sort_keys=True,indent=2)
     run_spec.chmod(0o600)
     return {'run_spec':str(run_spec),'roles':['viewer','telemetry'],'seed':seed,
             'requested_mode':mode,'generator_colocated':mode == 'local',
             'actual_remote_execution':False,
-            'start_contract':'viewer ready marker gates telemetry startup; viewer finite window includes configured drain',
+            'start_contract':'all selected viewer subscriptions must be acknowledged before telemetry startup; bounded viewer-ready budget',
+            'viewer_readiness_budget_seconds': readiness_budget,
             'native_execution':'NOT RUN'}
 
 
@@ -157,8 +179,8 @@ class BoundedCollector:
     def __init__(self, *, scrape, interval=COLLECTOR_INTERVAL_SECONDS,
                  max_snapshots=COLLECTOR_MAX_SNAPSHOTS, deadline_seconds=30,
                  baseline_metrics=None, baseline_server=None):
-        if (not 0.1 <= interval <= 5 or not 2 <= max_snapshots <= 64
-                or not 5 <= deadline_seconds <= 120):
+        if (not 0.1 <= interval <= 5 or type(max_snapshots) is not int or not 2 <= max_snapshots <= 20000
+                or not 5 <= deadline_seconds <= 86400):
             raise ValueError('collector_bounds_rejected')
         self.scrape = scrape
         self.interval = interval
@@ -178,24 +200,27 @@ class BoundedCollector:
         self._thread = None
 
     def _sample(self, phase, process_pid):
-        if (self._started_monotonic is not None and
+        if (phase != 'terminal' and self._started_monotonic is not None and
                 time.monotonic() - self._started_monotonic > self.deadline_seconds):
             if 'collector_deadline_exceeded' not in self.errors:
                 self.errors.append('collector_deadline_exceeded')
             return
-        if len(self.metrics) >= self.max_snapshots:
-            self.errors.append('snapshot_cap_reached')
-            return
         stamp = datetime.now(timezone.utc).isoformat()
+        metric_sample = None
         if self.scrape:
             try:
                 snap = self.scrape()
                 if not isinstance(snap, dict):
                     raise ValueError('metrics_shape_invalid')
-                self.metrics.append({'phase': phase, 'snapshot': snap})
+                metric_sample = {'phase': phase, 'snapshot': snap, 'sampled_at': stamp,
+                                 'monotonic_seconds': time.monotonic()}
             except Exception as exc:
-                self.metrics.append({'phase': phase, 'snapshot': None,
-                                     'error': 'scrape_' + type(exc).__name__})
+                metric_sample = {'phase': phase, 'snapshot': None,
+                                 'error': 'scrape_' + type(exc).__name__, 'sampled_at': stamp,
+                                 'monotonic_seconds': time.monotonic()}
+        if metric_sample is not None:
+            self.metrics.append(metric_sample)
+            self._bound_samples(self.metrics)
         proc = process_tree_resources(process_pid) if process_pid else _unavailable('generator_process_unavailable')
         if isinstance(proc, dict) and proc.get('available'):
             now = time.monotonic()
@@ -207,16 +232,15 @@ class BoundedCollector:
                     prev_p = previous_proc.get('processes', {})
                     curr_p = proc.get('processes', {})
                     ticks_delta = 0
-                    reset = False
+                    reset = set(prev_p) != set(curr_p)
                     for p_key, p_curr in curr_p.items():
-                        if p_key in prev_p:
-                            d = p_curr['ticks'] - prev_p[p_key]['ticks']
-                            if d < 0:
-                                reset = True
-                                break
-                            ticks_delta += d
-                        else:
-                            ticks_delta += p_curr['ticks']
+                        if reset:
+                            break
+                        d = p_curr['ticks'] - prev_p[p_key]['ticks']
+                        if d < 0:
+                            reset = True
+                            break
+                        ticks_delta += d
                     if not reset:
                         host_cpus = max(1, os.cpu_count() or 1)
                         cpu_percent = (ticks_delta / os.sysconf('SC_CLK_TCK') / elapsed / host_cpus * 100)
@@ -228,7 +252,8 @@ class BoundedCollector:
                     else:
                         self.generator_samples.append({
                             'phase': phase, 'available': None,
-                            'reason': 'generator_counter_reset_negative_delta'
+                            'reason': ('generator_process_set_changed' if set(prev_p) != set(curr_p)
+                                       else 'generator_counter_reset_negative_delta')
                         })
                 else:
                     self.generator_samples.append({
@@ -257,6 +282,16 @@ class BoundedCollector:
         else:
             self.generator_samples.append({'phase': phase, 'available': None,
                 'reason': proc.get('reason', 'generator_resources_unavailable')})
+        self._bound_samples(self.generator_samples)
+
+    def _bound_samples(self, samples):
+        if len(samples) <= self.max_snapshots:
+            return
+        # Keep original baseline and the newest window, reserving a slot for terminal.
+        if samples and samples[0].get('phase') in ('workload_start', 'baseline'):
+            samples[:] = [samples[0]] + samples[-(self.max_snapshots - 1):]
+        else:
+            samples[:] = samples[-self.max_snapshots:]
 
     def start(self, process_pid):
         self._started_monotonic = time.monotonic()
@@ -277,6 +312,8 @@ class BoundedCollector:
             self._thread.join(timeout=12)
             if self._thread.is_alive():
                 self.errors.append('collector_join_timeout')
+        self._sample('terminal', process_pid)
+        self._bound_samples(self.metrics)
 
 
 def process_tree_resources(root_pid, *, proc_root=Path('/proc')):
@@ -447,7 +484,9 @@ SELECT count(*) FROM processed_messages p WHERE p.gateway_id=:'gw' AND p.sensor_
         'identity_ranges': [{'message_id': row['message_id'],
             'first_sequence': row['first_sequence'], 'last_sequence': row['last_sequence'],
             'sample_count': row['sample_count']} for row in rows],
-        'verified_exact': bool(rows) and int(mismatch) == 0}
+        'verified_exact': message_ids is None and bool(rows) and int(mismatch) == 0,
+        'verified_sample': message_ids is not None and bool(rows) and len(rows) == len(set(message_ids))
+            and int(mismatch) == 0}
 
 
 def _unavailable(reason):
@@ -524,25 +563,65 @@ def resource_estimate(generator_limits, *, ephemeral_range, pilot_viewers, propo
 
 def fixture_process_preflight(*, worker_processes, worker_connections, process_fd_limits,
                               backend_fd_availability=None, broker_fd_availability=None,
-                              viewers=64, proxied_websockets=True):
+                              viewers=64, proxied_websockets=True, role_connections=None,
+                              reserve_connections=32):
     """Validate/report owned fixture process limits; Nginx WS uses downstream+upstream slots."""
     if not isinstance(viewers, int) or viewers < 1 or viewers > 10000:
         raise ValueError('finite_budget_rejected')
-    slots_per_viewer = 2 if proxied_websockets else 1
-    required_slots = viewers * slots_per_viewer + 32
+    if type(reserve_connections) is not int or not 0 <= reserve_connections <= 100000:
+        raise ValueError('finite_budget_rejected')
+    roles = role_connections or {'viewer': viewers}
+    if (not isinstance(roles, dict) or not roles or any(type(count) is not int or count < 0
+            or count > 10000 for count in roles.values())):
+        raise ValueError('finite_budget_rejected')
+    viewer_connections = roles.get('viewer', viewers)
+    other_connections = sum(count for role, count in roles.items() if role != 'viewer')
+    required_slots = viewer_connections * (2 if proxied_websockets else 1) + other_connections + reserve_connections
+    workers = worker_processes if type(worker_processes) is int and worker_processes > 0 else 1
+    per_worker_required = (required_slots + workers - 1) // workers
     nginx = {'worker_processes': worker_processes, 'worker_connections': worker_connections,
-             'required_connections_per_worker': required_slots,
-             'fits': isinstance(worker_connections, int) and worker_connections >= required_slots}
+             'required_connections_total': required_slots,
+             'required_connections_per_worker': per_worker_required,
+             'role_connections': roles, 'reserve_connections': reserve_connections,
+             'fits': isinstance(worker_connections, int) and worker_connections >= per_worker_required}
     if worker_processes is None:
         nginx['worker_processes_reason'] = 'nginx_worker_processes_readback_unavailable'
     if worker_connections is None:
         nginx['worker_connections_reason'] = 'nginx_worker_connections_readback_unavailable'
     def availability(value, reason):
-        return value if isinstance(value, dict) and isinstance(value.get('soft'), int) else _unavailable(reason)
+        known_limit = (isinstance(value, dict) and
+                       (type(value.get('soft')) is int or
+                        value.get('soft') is None and type(value.get('available')) is int))
+        return value if known_limit else _unavailable(reason)
     return {'nginx': nginx,
             'process_fd_limits': process_fd_limits if isinstance(process_fd_limits, dict) else _unavailable('fixture_process_fd_limits_unavailable'),
             'backend_fd_availability': availability(backend_fd_availability, 'backend_fd_readback_unavailable'),
-            'broker_fd_availability': availability(broker_fd_availability, 'broker_fd_readback_unavailable')}
+             'broker_fd_availability': availability(broker_fd_availability, 'broker_fd_readback_unavailable')}
+
+
+LIFECYCLE_OVERHEAD_SECONDS = {
+    'preparation_readiness': 300,
+    'bundle_transfer': 120,
+    'import_verification': 240,
+    'cleanup': 240,
+}
+
+
+def lifecycle_budget(*, workload_seconds, session_deadline_seconds, overhead=None):
+    """Require explicit finite session headroom around the measured workload."""
+    values = (workload_seconds, session_deadline_seconds)
+    if any(type(value) is not int or value < 0 for value in values):
+        raise ValueError('lifecycle_budget_invalid')
+    components = overhead or LIFECYCLE_OVERHEAD_SECONDS
+    if not isinstance(components, dict) or any(type(value) is not int or value < 0
+                                               for value in components.values()):
+        raise ValueError('lifecycle_budget_invalid')
+    required = workload_seconds + sum(components.values())
+    if session_deadline_seconds < required:
+        raise ValueError(f'lifecycle_deadline_insufficient: required {required} seconds')
+    return {'workload_seconds': workload_seconds, 'overhead_seconds': dict(components),
+            'required_session_seconds': required, 'session_deadline_seconds': session_deadline_seconds,
+            'measured_throughput_excludes_overhead': True}
 
 
 def parse_process_limits(text):
@@ -555,7 +634,7 @@ def parse_process_limits(text):
     return None
 
 
-def read_owned_fixture_resources(exec_owned_service, *, viewers=64):
+def read_owned_fixture_resources(exec_owned_service, *, viewers=64, role_connections=None):
     """Read only the named owned services; failures are explicit null/reason records."""
     def read(service, command):
         try:
@@ -576,20 +655,24 @@ def read_owned_fixture_resources(exec_owned_service, *, viewers=64):
     backend_limits = parse_process_limits(read('backend', ['cat', '/proc/1/limits']) or '')
     broker_limits = parse_process_limits(read('mosquitto', ['cat', '/proc/1/limits']) or '')
     def availability(limits, service):
-        if not isinstance(limits, dict) or limits.get('soft') is None:
+        if not isinstance(limits, dict):
             return _unavailable(service + '_fd_readback_unavailable')
-        raw_open = read(service, ['ls', '-U', '/proc/1/fd'])
-        if raw_open is None or len(raw_open.splitlines()) < 3:
+        raw_open = read(service, ['sh', '-c', 'set -- /proc/1/fd/*; echo $#'])
+        try:
+            opened = int(raw_open.strip()) if raw_open is not None else 0
+        except ValueError:
+            opened = 0
+        if opened < 3:
             return {'available': None, 'reason': service + '_open_fd_readback_unavailable',
                     'soft': limits['soft'], 'hard': limits.get('hard')}
-        opened = len(raw_open.splitlines())
-        return {'available': max(0, limits['soft'] - opened), 'soft': limits['soft'],
+        available = (2**63 - 1) if limits.get('soft') is None else max(0, limits['soft'] - opened)
+        return {'available': available, 'soft': limits['soft'],
                 'hard': limits.get('hard'), 'open': opened}
     return fixture_process_preflight(worker_processes=directive('worker_processes'),
         worker_connections=directive('worker_connections'), process_fd_limits=nginx_limits,
         backend_fd_availability=availability(backend_limits, 'backend'),
         broker_fd_availability=availability(broker_limits, 'mosquitto'),
-        viewers=viewers, proxied_websockets=True)
+        viewers=viewers, proxied_websockets=True, role_connections=role_connections)
 
 
 def validate_mqtt_mapping(mapping, *, owned_service):

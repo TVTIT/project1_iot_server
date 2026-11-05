@@ -21,6 +21,32 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_p8_owned_storage_guard_combines_tiny_owned_files_and_injected_database_size(self):
+        class Registry:
+            def resolve(self, item):
+                return {'Id': item['receipt']['id']}
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode/p8-supplement/guards') as tmp:
+            base = Path(tmp); private = base / 'private'; artifacts = base / 'artifacts'
+            private.mkdir(mode=0o700); artifacts.mkdir(mode=0o700)
+            fixture = dataclasses.make_dataclass('FixtureStub', ('base','private','artifacts'))(
+                base, private, artifacts)
+            pg_item = {'receipt': {'id': 'a' * 64}}
+            db_size = {'value': 1000}
+            check = smoke.p8_owned_storage_guard(fixture, Registry(), pg_item,
+                growth_limit_bytes=1, minimum_free_bytes=0,
+                interval_seconds=0.001,
+                db_size_reader=lambda _registry, _cid: db_size['value'])
+            self.assertTrue(check()['ok'])
+            db_size['value'] += 1
+            time.sleep(0.003)
+            result = check()
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['reason'], 'owned_storage_growth_threshold')
+            self.assertEqual(result['report']['baseline']['database_bytes'], 1000)
+            self.assertEqual(result['report']['terminal']['database_growth_bytes'], 1)
+            self.assertTrue((private / 'owned-storage-guard.json').is_file())
+
     def test_e2_helper_import_without_pythonpath_from_outside_repository(self):
         import subprocess
         import textwrap
@@ -658,6 +684,33 @@ class PreparationTests(unittest.TestCase):
                 ('STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED', 'MQTT_SHAPER_ENABLED',
                  'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED')))
 
+    def test_selected_e1_overlay_is_written_only_to_owned_fixture_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e1_viewers=128, paper_p8_e1_messages_per_target=2)
+            self.assertEqual(fixture.values['WS_MAX_SESSIONS'], '128')
+            self.assertEqual(fixture.e1_resource_overlay['proposed']['nginx_worker_connections'], 145)
+            config = fixture.private / 'nginx.conf'
+            self.assertTrue(config.is_file())
+            self.assertIn('worker_processes 2;', config.read_text())
+            self.assertIn('worker_connections 145;', config.read_text())
+            compose = fixture.override.read_text()
+            for service in ('nginx', 'backend', 'mosquitto'):
+                self.assertIn(f'  {service}:', compose)
+                self.assertIn('nofile:', compose)
+            for expected in ('soft: 145', 'soft: 224', 'soft: 98',
+                             'WS_MAX_SESSIONS=128', 'WS_SESSION_REFERENCE_BYTES=8388608'):
+                self.assertIn(expected, compose + fixture.env_file.read_text())
+            self.assertIn(str(config), compose)
+
+    def test_e1_selected_overlay_requires_official_optin_before_fixture_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'fixture'
+            with self.assertRaisesRegex(ValueError, 'official_opt_in_required'):
+                smoke.prepare(root, paper_p8_e1=True, paper_p8_e1_viewers=128)
+            self.assertFalse(root.exists())
+
     def test_p8_e1_rejects_mixed_probe_and_e2_selector(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
@@ -691,6 +744,19 @@ class PreparationTests(unittest.TestCase):
                     smoke.main()
                 self.assertEqual(raised.exception.code, 2)
 
+    def test_official_e2_fixture_is_optin_and_shaper_tracks_selected_offer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'official_profile_opt_in_required'):
+                smoke.prepare(Path(directory) / 'denied', paper_p8_e2=True,
+                              paper_p8_profile='official')
+            fixture = smoke.prepare(Path(directory) / 'official', paper_p8_e2=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e2_offered_rate=1000, paper_p8_e2_duration_seconds=20,
+                paper_p8_e2_burst_messages=11, paper_p8_e2_samples_per_message=100)
+            self.assertEqual(fixture.values['MQTT_SHAPER_RATE_PER_SECOND'], '500')
+            self.assertEqual(fixture.values['MQTT_SHAPER_BURST'], '500')
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_ROWS'], '500')
+
     def test_p8_e1_acceptance_requires_complete_workload_and_exact_owned_cleanup(self):
         fixture = type('Fixture', (), {'project': 'run'})()
         item = {'kind': 'container', 'run': 'run', 'task': 'native-compose-allocation',
@@ -699,6 +765,7 @@ class PreparationTests(unittest.TestCase):
         registry = type('Registry', (), {'items': [item]})()
         counts = {'container': 1, 'network': 0, 'volume': 0}
         complete = {'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP', 'sockets': 64,
+                    'mapping': {'counts': {'sockets': 64}, 'messages_per_target': {'target-a': 10, 'target-b': 10}},
                     'workload': {'telemetry': {'generated_unique': 20}},
                     'validation': {'valid': True, 'failures': []}, 'full_p8_accepted': False}
         self.assertTrue(smoke.paper_p8_e1_cleanup_acceptance(fixture, complete, counts, True, registry))
@@ -718,7 +785,8 @@ class PreparationTests(unittest.TestCase):
             args = (smoke, e1_fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
             result = smoke.dispatch_paper_p8_load(e1_fixture, smoke, 'endpoint', 'registry', {}, {}, 'state', 'binary')
             self.assertIs(result, sentinel)
-            helper.run.assert_called_once_with(*args)
+            helper.run.assert_called_once_with(*args, viewers=64, principals=2,
+                                               density='mixed', messages_per_target=5)
             e2.run_e2_telemetry100.assert_not_called()
             smoke.dispatch_paper_p8_load(e2_fixture, smoke, 'endpoint', 'registry', {}, {}, 'state', 'binary')
             e2.run_e2_telemetry100.assert_called_once_with(smoke, e2_fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
@@ -4849,6 +4917,23 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
                                   '--experiment', 'E2', '--samples-per-message', '100',
                                   '--workload', 'steady_burst', '--context', str(Path(td) / 'any.json')])
 
+    def test_serve_official_e2_propagates_explicit_optin(self):
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+            captured = []
+            with patch.object(self.server.remote, 'preflight_bind'), \
+                 patch('subprocess.Popen') as mock_popen:
+                mock_popen.side_effect = lambda cmd, **kwargs: (captured.extend(cmd) or Mock(wait=Mock(return_value=0)))
+                self.server.main(['serve','--root',str(Path(td)/'server'),'--network-config',str(net_config),
+                    '--experiment','E2','--profile','official','--official-opt-in',
+                    '--samples-per-message','100','--e2-offered-rate','1000',
+                    '--e2-duration-seconds','20','--e2-burst-messages','11',
+                    '--deadline-seconds','1200'])
+            self.assertIn('--p8-official-opt-in',captured)
+            self.assertIn('--p8-profile',captured)
+            self.assertEqual(captured[captured.index('--p8-profile')+1],'official')
+            self.assertEqual(captured[captured.index('--p8-e2-offered-rate')+1],'1000')
+
     def test_serve_e2_workload_equal_samples_requires_context(self):
         with tempfile.TemporaryDirectory() as td:
             net_config = self._valid_net_config(td)
@@ -4874,6 +4959,7 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
                     return mock_proc
                 mock_popen.side_effect = fake_popen
                 ret = self.server.main(['serve', '--root', str(Path(td) / 'server_valid'), '--network-config', str(net_config),
+                                        '--deadline-seconds', '1200',
                                         '--experiment', 'E2', '--workload', 'equal_samples',
                                         '--samples-per-message', '100',
                                         '--context', str(ctx_path)])

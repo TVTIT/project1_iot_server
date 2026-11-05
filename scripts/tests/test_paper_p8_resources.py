@@ -113,7 +113,7 @@ class TestPaperP8Resources(unittest.TestCase):
 
         sampler.stop()
         report = sampler.report()
-        self.assertEqual(len(report['samples']), 2)
+        self.assertEqual(len(report['samples']), 3)
         s1 = report['samples'][1]
         self.assertTrue(s1['available'])
         self.assertEqual(s1['delta_ticks'], 150)
@@ -121,13 +121,15 @@ class TestPaperP8Resources(unittest.TestCase):
         self.assertAlmostEqual(s1['cpu_percent'], 150.0, places=4)
         self.assertIsNone(s1['reason'])
         self.assertEqual(s1['rss_bytes'], 35 * 1024 * 1024)
+        self.assertEqual(report['samples'][-1]['phase'], 'terminal')
 
         summary = report['summary']
-        self.assertEqual(summary['total_samples'], 2)
-        self.assertEqual(summary['available_samples'], 2)
+        self.assertEqual(summary['total_samples'], 3)
+        self.assertEqual(summary['available_samples'], 3)
         self.assertEqual(summary['cpu_available_samples'], 1)
         self.assertEqual(summary['max_sample_rss_bytes'], 35 * 1024 * 1024)
-        self.assertEqual(summary['missing_reasons'], ['first_sample_baseline_unavailable'])
+        self.assertEqual(summary['missing_reasons'],
+                         ['first_sample_baseline_unavailable', 'invalid_elapsed_duration'])
 
         # Verify safe JSON export without NaN/Inf, PIDs, cmdlines, or secrets
         report_json = json.dumps(report, allow_nan=False)
@@ -259,7 +261,7 @@ class TestPaperP8Resources(unittest.TestCase):
         sampler.stop()
         report = sampler.report()
         samples = report['samples']
-        self.assertEqual(len(samples), 3)
+        self.assertEqual(len(samples), 4)
 
         # Sample 1 must mark process_appeared and NOT attribute 5000 ticks to the interval
         self.assertIsNone(samples[1]['cpu_percent'])
@@ -270,6 +272,7 @@ class TestPaperP8Resources(unittest.TestCase):
         self.assertEqual(samples[2]['delta_ticks'], 50)
         self.assertAlmostEqual(samples[2]['cpu_percent'], 100.0, places=4)
         self.assertIsNone(samples[2]['reason'])
+        self.assertEqual(samples[-1]['phase'], 'terminal')
 
     def test_baseline_and_counter_reset(self):
         """Verify counter reset (negative delta) marks CPU unavailable with exact reason."""
@@ -370,7 +373,7 @@ class TestPaperP8Resources(unittest.TestCase):
 
         report = sampler.report()
         samples = report['samples']
-        self.assertEqual(len(samples), 4)
+        self.assertEqual(len(samples), 5)
 
         self.assertTrue(samples[0]['available'])
         self.assertIsNone(samples[0]['cpu_percent'])
@@ -389,6 +392,7 @@ class TestPaperP8Resources(unittest.TestCase):
         self.assertIsNotNone(samples[3]['cpu_percent'])
         self.assertEqual(samples[3]['delta_ticks'], 20)
         self.assertIsNone(samples[3]['reason'])
+        self.assertEqual(samples[-1]['phase'], 'terminal')
 
     def test_reader_exception_handled_without_crashing(self):
         """Verify reader throwing OSError or other exception is safely captured."""
@@ -655,9 +659,12 @@ class TestPaperP8Resources(unittest.TestCase):
         self.assertIsInstance(serialized, str)
 
     def test_max_samples_cap(self):
-        """Verify snapshot cap is strictly enforced and capped at <= 128."""
+        """Verify finite snapshot cap allows selected long-window budgets."""
         s_large = GeneratorResourceSampler(max_snapshots=500)
-        self.assertEqual(s_large.max_snapshots, 128)
+        self.assertEqual(s_large.max_snapshots, 500)
+        long_window = GeneratorResourceSampler(deadline_seconds=7200, max_snapshots=14402)
+        self.assertEqual(long_window.deadline_seconds, 7200)
+        self.assertEqual(long_window.max_snapshots, 14402)
 
         state = {'time': 10.0}
         dummy_proc = {'available': True, 'rss_bytes': 100, 'cpu_ticks': 10, 'process_count': 1, 'processes': {}}
@@ -676,7 +683,8 @@ class TestPaperP8Resources(unittest.TestCase):
         sampler.stop()
 
         report = sampler.report()
-        self.assertEqual(len(report['samples']), 3)
+        self.assertLessEqual(len(report['samples']), 4)  # bounded samples plus terminal
+        self.assertEqual(report['samples'][-1]['phase'], 'terminal')
         self.assertIn('snapshot_cap_reached', report['summary']['errors'])
 
     def test_finite_thread_join_and_idempotent_stop(self):
@@ -721,6 +729,57 @@ class TestPaperP8Resources(unittest.TestCase):
 
         self.assertIsNone(_safe_fd_count(-1))
         self.assertIsNone(_safe_fd_count(999999999))
+
+    def test_owned_storage_guard_stops_at_tiny_growth_threshold(self):
+        from scripts.paper_p8_resources import OwnedStorageGuard
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+            root = Path(directory)
+            target = root / 'owned-output'
+            target.mkdir()
+            guard = OwnedStorageGuard([target], growth_threshold_bytes=4,
+                                      minimum_free_bytes=0, interval_seconds=0.01, allowed_root=root)
+            (target / 'journal').write_bytes(b'1234')
+            self.assertFalse(guard.sample())
+            report = guard.report()
+            self.assertEqual(report['scope'], 'explicit_owned_paths_under_allowed_root')
+            self.assertEqual(report['baseline']['sizes_bytes'][str(target.resolve())], 0)
+            self.assertEqual(report['stop_reason'], 'owned_storage_growth_threshold')
+
+    def test_owned_storage_guard_rejects_symlinks_and_unavailable_measurements(self):
+        from scripts.paper_p8_resources import OwnedStorageGuard
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+            root = Path(directory)
+            owned = root / 'owned'; owned.mkdir()
+            outside = root / 'outside'; outside.mkdir()
+            (outside / 'data').write_bytes(b'x')
+            (owned / 'link').symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                OwnedStorageGuard([owned / 'link'], growth_threshold_bytes=4,
+                                  minimum_free_bytes=0, interval_seconds=.01,
+                                  allowed_root=owned)
+            guard = OwnedStorageGuard([owned], growth_threshold_bytes=4,
+                                      minimum_free_bytes=0, interval_seconds=.01,
+                                      allowed_root=root)
+            (owned / 'broken').symlink_to(outside / 'data')
+            self.assertFalse(guard.sample())
+            self.assertEqual(guard.stop_reason, 'owned_storage_unavailable')
+            report = guard.report()
+            self.assertLessEqual(len(report['samples']), 3)
+
+    def test_owned_storage_guard_sample_history_is_bounded_and_keeps_terminal(self):
+        from scripts.paper_p8_resources import OwnedStorageGuard
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+            root = Path(directory); owned = root / 'owned'; owned.mkdir()
+            guard = OwnedStorageGuard([owned], growth_threshold_bytes=100,
+                                      minimum_free_bytes=0, interval_seconds=.01,
+                                      allowed_root=root, max_samples=3)
+            (owned / 'growth').write_bytes(b'x' * 100)
+            for _ in range(8):
+                guard.sample()
+            report = guard.report()
+            self.assertLessEqual(len(report['samples']), 3)
+            self.assertEqual(report['samples'][0]['kind'], 'baseline')
+            self.assertEqual(report['samples'][-1]['kind'], 'terminal')
 
     def test_real_own_process_smoke(self):
         """Short real own-process smoke test (< 2 seconds) with no loops outside collector."""

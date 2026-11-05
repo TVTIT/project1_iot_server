@@ -59,7 +59,7 @@ _RUNNER_NUMERIC_KEYS = {
 _RESOURCE_SAMPLE_KEYS = {
     'sample_index', 'timestamp', 'elapsed_seconds', 'interval_seconds', 'available',
     'cpu_percent', 'delta_ticks', 'rss_bytes', 'process_count', 'current_fd_count',
-    'reason',
+    'reason', 'phase',
 }
 
 _PINNED_KEYS = (
@@ -275,6 +275,8 @@ def _validate_resource_samples(samples):
                 _finite(sample[key], code, minimum=-1e18)
         if 'available' in sample and sample['available'] is not None and type(sample['available']) is not bool:
             raise ValueError(code)
+        if sample.get('phase') is not None and sample['phase'] not in ('sample', 'terminal'):
+            raise ValueError(code)
     return samples
 
 
@@ -320,6 +322,13 @@ def _bundle_identity(prepared):
     dataset_sha = context.get('sha256')
     if not isinstance(dataset_sha, str) or not _HEX.fullmatch(dataset_sha):
         raise ValueError('e5_a_dataset_identity_missing')
+    selection = context.get('workload_selection')
+    selection_sha = (hashlib.sha256(json.dumps(selection, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest() if isinstance(selection, dict) else None)
+    if (not isinstance(selection, dict)
+            or context.get('workload_selection_sha256') != selection_sha
+            or session.get('profile', 'pilot') != selection.get('profile')):
+        raise ValueError('e5_a_workload_selection_mismatch')
     return session, bundle_sha, normalized, dataset_sha
 
 

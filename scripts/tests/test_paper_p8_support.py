@@ -137,7 +137,7 @@ class PaperP8FixtureSupportTests(unittest.TestCase):
             process_fd_limits={'soft': 1024, 'hard': 1024}, viewers=64,
             backend_fd_availability={'soft': 1024, 'open': 12},
             broker_fd_availability={'soft': 1024, 'open': 12})
-        self.assertEqual(result['nginx']['required_connections_per_worker'], 160)
+        self.assertEqual(result['nginx']['required_connections_per_worker'], 80)
         self.assertTrue(result['nginx']['fits'])
         self.assertIsNone(result['process_fd_limits'].get('available'))
         below = p8.fixture_process_preflight(worker_processes=1, worker_connections=159,
@@ -148,13 +148,27 @@ class PaperP8FixtureSupportTests(unittest.TestCase):
         self.assertEqual(p8.parse_process_limits('Max open files            64                  128                 files'),
                          {'soft': 64, 'hard': 128})
 
+    def test_lifecycle_budget_rejects_short_deadline_and_allows_two_hour_workload(self):
+        with self.assertRaisesRegex(ValueError, 'lifecycle_deadline_insufficient'):
+            p8.lifecycle_budget(workload_seconds=7200, session_deadline_seconds=8000)
+        budget = p8.lifecycle_budget(workload_seconds=7200, session_deadline_seconds=8100)
+        self.assertEqual(budget['required_session_seconds'], 8100)
+        self.assertEqual(budget['workload_seconds'], 7200)
+
+    def test_fixture_fd_estimate_uses_actual_roles_and_reserve(self):
+        result = p8.fixture_process_preflight(worker_processes=2, worker_connections=248,
+            process_fd_limits={'soft': 1024, 'hard': 1024}, viewers=100,
+            role_connections={'viewer': 100, 'telemetry': 16}, reserve_connections=32)
+        self.assertEqual(result['nginx']['required_connections_per_worker'], 124)
+        self.assertTrue(result['nginx']['fits'])
+
     def test_owned_fixture_readback_queries_only_nginx_backend_and_broker(self):
         def fake(service, command):
             if command[:2] == ['nginx', '-T']:
                 return 'worker_processes 2;\nevents {\n worker_connections 160;\n}'
             if command[0] == 'cat':
                 return 'Max open files 1024 2048 files'
-            return '\n'.join(str(index) for index in range(10)) + '\n'
+            return '10\n'
         result = p8.read_owned_fixture_resources(fake)
         self.assertEqual(result['nginx']['worker_processes'], 2)
         self.assertEqual(result['nginx']['worker_connections'], 160)
@@ -321,6 +335,21 @@ class PaperP8FixtureSupportTests(unittest.TestCase):
         self.assertLessEqual(len(collector.metrics), 2)
         self.assertFalse(collector._thread.is_alive())
         self.assertEqual(collector.generator_samples[0]['reason'], 'generator_process_unavailable')
+
+    def test_collector_keeps_baseline_terminal_and_rejects_process_set_reset(self):
+        collector = p8.BoundedCollector(scrape=lambda: {'process_instance': 'backend-1'},
+            interval=0.1, max_snapshots=3, baseline_metrics={'process_instance': 'backend-1'})
+        proc = {'available': True, 'rss_bytes': 10, 'cpu_ticks': 20, 'process_count': 1,
+                'processes': {(1, 10): {'ticks': 20}}}
+        changed = {'available': True, 'rss_bytes': 10, 'cpu_ticks': 25, 'process_count': 1,
+                   'processes': {(1, 10): {'ticks': 20}, (2, 11): {'ticks': 5}}}
+        with mock.patch.object(p8, 'process_tree_resources', side_effect=[proc, changed]):
+            collector.start(1)
+            collector.stop(1)
+        self.assertEqual(collector.metrics[0]['phase'], 'workload_start')
+        self.assertEqual(collector.metrics[-1]['phase'], 'terminal')
+        self.assertTrue(any(sample.get('reason') == 'generator_process_set_changed'
+                            for sample in collector.generator_samples))
 
 
 class PaperP8SlowViewerTests(unittest.TestCase):

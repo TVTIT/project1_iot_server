@@ -16,6 +16,7 @@ from scripts import paper_p8_bundle
 
 from scripts.tests.paper_p8_e2_support import (
     build_e2_execution_plan, e2_fixture_profile, e2_official_estimate, e2_pilot_manifests,
+    e2_official_manifests,
     validate_e2_result,
     validate_e2_equal_samples_result,
     verify_e2_equal_samples_raw,
@@ -108,6 +109,40 @@ class E2SupportTests(unittest.TestCase):
             e2_official_estimate(rate_per_second=100, duration_seconds=10,
                 samples_per_message=1, payload_bytes=100)
 
+    def test_official_schedule_splits_total_rate_and_accounts_both_sample_sizes(self):
+        for samples, expected_raw in ((100, 100_000), (1, 1_000)):
+            manifests = e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
+                'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost', 'mqtt_tls_ca_file':'ca'}},
+                targets=self.targets, gateway_identity_files={'gw-a':'a','gw-b':'b'},
+                telemetry_identity_files={'A':'ia','B':'ib'}, samples_per_message=samples,
+                offered_rate=100, duration_seconds=10, burst_messages=7)
+            pair = manifests['profiles'][str(samples)]
+            self.assertEqual(pair['A']['traffic']['rate_per_second'] +
+                             pair['B']['traffic']['rate_per_second'], 100)
+            self.assertEqual(manifests['raw_rows_per_profile'], expected_raw)
+            self.assertEqual(pair['B']['traffic']['burst_messages'], 7)
+            self.assertEqual(pair['A']['traffic']['burst_messages'], 0)
+
+    def test_official_plan_requires_optin_and_rejects_oversize_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pair = e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
+                'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost', 'mqtt_tls_ca_file':'ca'}},
+                targets=self.targets, gateway_identity_files={'gw-a':'a','gw-b':'b'},
+                telemetry_identity_files={'A':'ia','B':'ib'}, samples_per_message=1,
+                offered_rate=100, duration_seconds=10)
+            paths=[]
+            for arm in ('A','B'):
+                path=root/f'{arm}.json'; path.write_text(json.dumps(pair['profiles']['1'][arm])); path.chmod(0o600); paths.append(path)
+            with self.assertRaisesRegex(ValueError, 'official_profile_requires_opt_in'):
+                build_e2_execution_plan(output_dir=root/'no-opt', manifest_a=paths[0], manifest_b=paths[1], profile='official')
+            plan=build_e2_execution_plan(output_dir=root/'yes', manifest_a=paths[0], manifest_b=paths[1], profile='official', official_opt_in=True)
+            self.assertEqual(plan['expected_counts'], {'unique':1000,'raw':1000,'temporal':1000,'ack':1000})
+            bad=json.loads(paths[1].read_text()); bad['traffic']['total_rate_per_second']=20000
+            paths[1].write_text(json.dumps(bad))
+            with self.assertRaisesRegex(ValueError, 'distribution_mismatch'):
+                build_e2_execution_plan(output_dir=root/'bad', manifest_a=paths[0], manifest_b=paths[1], profile='official', official_opt_in=True)
+
     def test_phase_overlap_and_accounting_fail_closed(self):
         a = {'status': 'COMPLETE', 'telemetry': {
             'generated_unique': 8, 'offered_unique': 8, 'publish_attempts': 8, 'broker_pubacks': 8,
@@ -139,6 +174,50 @@ class E2SupportTests(unittest.TestCase):
         self.assertFalse(result['valid'])
         self.assertEqual(result['phase_overlap']['available'], None)
         self.assertEqual(result['received']['available'], None)
+
+    def test_official_accounting_uses_declared_nonpilot_counts_and_keeps_retries(self):
+        pair = e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
+            'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost','mqtt_tls_ca_file':'ca'}},
+            targets=self.targets, gateway_identity_files={'gw-a':'a','gw-b':'b'},
+            telemetry_identity_files={'A':'ia','B':'ib'}, samples_per_message=100,
+            offered_rate=100, duration_seconds=1, burst_messages=3)['profiles']['100']
+        role_counts = {'A':50,'B':53}
+        def child(arm, retry=0):
+            n=role_counts[arm]
+            return {'status':'COMPLETE','telemetry':{'generated_unique':n,'offered_unique':n,
+                'publish_attempts':n+retry,'broker_pubacks':n+retry,'application_acks':n,
+                'pending_messages':0,'pending_bytes':0,'retries':retry,'invalid_acks':0}}
+        ingress = {'available':True,'delta':{'Received':105,'Accepted':104,'Committed':103,
+            'DuplicateCommitted':1,'SamplesNew':10300,'ACKPublished':104,
+            'ShaperRateLimited':2,**dict.fromkeys(('RejectedNotRunning','RejectedStopping',
+            'RejectedRetained','RejectedOversized','RejectedInvalidTopic','QueueFull','ByteBudgetFull'),0)}}
+        phases=[{'child':f'paperload-telemetry:{arm}.manifest.json','event':event,
+            'observed_at_runner_monotonic_ns':stamp} for arm,event,stamp in
+            [('A','measure_begin',10),('A','measure_end',100),('B','burst_begin',50),('B','burst_end',70)]]
+        result=validate_e2_result(workload_a=child('A',2),workload_b=child('B',1),
+            ingress_delta=ingress,database_delta={'ledger':103,'raw':10300,'temporal':103,'configuration':0},
+            database_by_gateway={'gw-a':{'ledger':50,'raw':5000,'temporal':50,'configuration':0},
+                'gw-b':{'ledger':53,'raw':5300,'temporal':53,'configuration':0}},
+            phase_events=phases,raw_verification=[{'count_verified':True,'gateway_id':'gw-a','sensor_id':'s-a','ledger_count':50,'raw_count':5000},
+                {'count_verified':True,'gateway_id':'gw-b','sensor_id':'s-b','ledger_count':53,'raw_count':5300}],
+            execution_context={'profile':'official','samples_per_message':100,
+                'role_to_target':{'A':self.targets[0],'B':self.targets[1]},'role_manifests':pair})
+        self.assertTrue(result['valid'],result['failures'])
+        self.assertEqual(result['database_expected']['ledger'],103)
+        self.assertEqual(result['actual_accounting']['publish_attempts'],106)
+        self.assertEqual(result['actual_accounting']['duplicate_committed'],1)
+        missing_ack=child('A',2)
+        missing_ack['telemetry']['application_acks'] -= 1
+        rejected=validate_e2_result(workload_a=missing_ack,workload_b=child('B',1),
+            ingress_delta=ingress,database_delta={'ledger':103,'raw':10300,'temporal':103,'configuration':0},
+            database_by_gateway={'gw-a':{'ledger':50,'raw':5000,'temporal':50,'configuration':0},
+                'gw-b':{'ledger':53,'raw':5300,'temporal':53,'configuration':0}},
+            phase_events=phases,raw_verification=[{'count_verified':True,'gateway_id':'gw-a','sensor_id':'s-a','ledger_count':50,'raw_count':5000},
+                {'count_verified':True,'gateway_id':'gw-b','sensor_id':'s-b','ledger_count':53,'raw_count':5300}],
+            execution_context={'profile':'official','samples_per_message':100,
+                'role_to_target':{'A':self.targets[0],'B':self.targets[1]},'role_manifests':pair})
+        self.assertFalse(rejected['valid'])
+        self.assertIn('A_application_acks',rejected['failures'])
 
     def test_official_preflight_bounds_database_storage_not_only_payload(self):
         with self.assertRaisesRegex(ValueError, 'predicted_bound_exceeded'):
@@ -891,10 +970,13 @@ class E2SupportTests(unittest.TestCase):
                 spec = json.loads(Path(plan['run_spec']).read_text())
                 self.assertEqual(len(spec['paperload']), 2)
                 self.assertEqual([x['role'] for x in spec['paperload']], ['telemetry', 'telemetry'])
-                self.assertEqual(spec['stop_timeout_seconds'], 60 + 20 + 10)
+                self.assertEqual(spec['stop_timeout_seconds'], 30)
                 # Verify written manifests in plan output
                 written_a = json.loads((root / f'plan-{S}/A.manifest.json').read_text())
                 written_b = json.loads((root / f'plan-{S}/B.manifest.json').read_text())
+                self.assertEqual(written_a['equal_samples']['duration_seconds'], 60)
+                self.assertEqual(written_a['limits']['wall_seconds'], 90)
+                self.assertNotEqual(written_a['limits']['wall_seconds'], spec['stop_timeout_seconds'])
                 self.assertEqual(written_a['equal_samples']['sample_stream_version'], 1)
                 self.assertEqual(written_b['equal_samples']['sample_stream_version'], 1)
                 self.assertEqual(written_a['equal_samples']['context_sha256'], ctx['context_sha256'])
@@ -1103,6 +1185,26 @@ class E2SupportTests(unittest.TestCase):
             self.assertEqual(prepared_sb['workload'], 'steady_burst')
             self.assertNotIn('context', prepared_sb)
             self.assertTrue(Path(prepared_sb['bundle']['bundle_root']).is_dir())
+
+            # Official workload must pass the real portable export/schema path with
+            # counts derived from manifests rather than the 24-message pilot.
+            out_off = root / 'out-official'
+            bnd_off = root / 'bnd-official'
+            prepared_off = prepare_remote(
+                smoke, FakeFixture, FakeEndpoint, registry, {'mosquitto': 'mosq'}, test_images, {},
+                session_id='sess-official', samples_per_message=100,
+                output_root=out_off, bundle_root=bnd_off, profile='official',
+                official_opt_in=True, offered_rate=100, duration_seconds=10, burst_messages=7)
+            portable = json.loads((bnd_off / 'bundle.json').read_text())
+            from scripts import paper_p8_bundle
+            self.assertTrue(paper_p8_bundle.inspect_bundle(bnd_off)['valid'])
+            self.assertEqual(prepared_off['plan']['expected_counts'],
+                {'unique':1007,'raw':100700,'temporal':1007,'ack':1007})
+            self.assertEqual(portable['workload']['producer_rates_per_second'], {'A':50,'B':50})
+            self.assertEqual(portable['workload']['expected_counts'], prepared_off['plan']['expected_counts'])
+            with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+                bad_workload = dict(portable['workload'], offered_rate_per_second=200)
+                paper_p8_bundle._validate_e2_official_workload(bad_workload)
 
     def _create_test_equal_samples_bundle(self, root, ctx, *, binary_bytes=b'binary-123',
                                           session_id='sess-e2', run_id='p8e2-sess-100', arm='e2-test',
@@ -1332,6 +1434,28 @@ class E2SupportTests(unittest.TestCase):
             hist_bundle, hist_bin, hist_prep = self._create_test_equal_samples_bundle(root / 'hist', hist_ctx)
             hist_imported = e2._load_e2_result_bundle(hist_bundle, hist_prep, hist_bin)
             self.assertEqual(hist_imported['A']['equal_samples']['context_sha256'], hist_ctx['context_sha256'])
+
+    def test_load_e2_result_bundle_accepts_portable_session_profile(self):
+        fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx = build_e2_equal_samples_context(total_samples=6000, sample_rate=100, seed=84, now_utc=fixed_now)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def add_profile(summary):
+                summary['session']['profile'] = 'pilot'
+
+            bundle_dir, binary_file, prepared = self._create_test_equal_samples_bundle(
+                root, ctx, summary_mod=add_profile)
+            e2._load_e2_result_bundle(bundle_dir, prepared, binary_file)
+
+            def add_wrong_profile(summary):
+                summary['session']['profile'] = 'official'
+
+            bad_bundle, bad_binary, bad_prepared = self._create_test_equal_samples_bundle(
+                root / 'wrong-profile', ctx, summary_mod=add_wrong_profile)
+            with self.assertRaisesRegex(ValueError, 'e2_result_correlation_rejected'):
+                e2._load_e2_result_bundle(bad_bundle, bad_prepared, bad_binary)
 
     def test_load_e2_result_bundle_equal_samples_negatives(self):
         fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -2807,6 +2931,68 @@ class E2SupportTests(unittest.TestCase):
         self.assertEqual(sampler.errors, [])
         self.assertGreater(len(sampler.retained_snapshots), 64)
 
+    def test_e2_compact_sampler_retains_real_db_counters_and_process_windows(self):
+        counters = {'begin_attempts': 4, 'begin_succeeded': 3, 'confirmed_commits': 2,
+                    'copy_calls': 1, 'copy_returned_rows': 100, 'confirmed_new_rows': 100}
+        baseline = {'process_instance': 'proc-a', 'monotonic': 10,
+                    'persistence': counters, 'resources': {'backend': {
+                        'cpu_cumulative_seconds': 2.0, 'memory_bytes': 100}}}
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: {
+            'process_instance': 'proc-a', 'persistence': counters}, baseline_metrics=baseline,
+            baseline_resources=baseline['resources'])
+        sampler.start_manual()
+        counters.update(begin_attempts=9, begin_succeeded=8, confirmed_commits=7,
+                        copy_calls=3, copy_returned_rows=500, confirmed_new_rows=500)
+        sampler.sample_step()
+        sampler.record_terminal({'process_instance': 'proc-a', 'monotonic': 12,
+                                 'persistence': counters}, {'backend': {
+                                     'cpu_cumulative_seconds': 5.0, 'memory_bytes': 200}})
+
+        self.assertEqual(sampler.baseline_metrics['persistence']['begin_attempts'], 4)
+        self.assertEqual(sampler.terminal_metrics['persistence']['confirmed_commits'], 7)
+        self.assertEqual(sampler.terminal_metrics['persistence']['copy_calls'], 3)
+        self.assertEqual(sampler.baseline_metrics['process_instance'], 'proc-a')
+        self.assertEqual(sampler.terminal_metrics['process_instance'], 'proc-a')
+        self.assertEqual(sampler.baseline_resources['backend']['cpu_cumulative_seconds'], 2.0)
+        self.assertEqual(sampler.terminal_resources['backend']['cpu_cumulative_seconds'], 5.0)
+
+    def test_e2_terminal_process_reset_and_missing_resources_stay_unavailable(self):
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: {
+            'process_instance': 'proc-a', 'persistence': {'confirmed_commits': 1}},
+            baseline_metrics={'process_instance': 'proc-a', 'persistence': {'confirmed_commits': 0}},
+            baseline_resources={'backend': {'cpu_cumulative_seconds': 1.0, 'available': True}})
+        sampler.start_manual()
+        sampler.record_terminal({'process_instance': 'proc-b', 'persistence': {'confirmed_commits': 2}}, None)
+        self.assertEqual(sampler.terminal_metrics['process_instance'], 'proc-b')
+        self.assertIsNone(sampler.terminal_resources)
+        self.assertIsNone(sampler.terminal_metrics.get('resources'))
+
+    def test_e2_db_counter_window_uses_real_counters_and_refuses_reset_or_process_change(self):
+        before = {'process_instance': 'p1', 'persistence': {
+            'begin_attempts': 2, 'begin_succeeded': 2, 'confirmed_commits': 1,
+            'copy_calls': 0, 'copy_returned_rows': 0, 'confirmed_new_rows': 0,
+            'fallback_attempts': 0, 'rollback_attempts': 0, 'confirmed_rollbacks': 0,
+            'commit_unconfirmed': 0}}
+        after = {'process_instance': 'p1', 'persistence': {
+            'begin_attempts': 5, 'begin_succeeded': 4, 'confirmed_commits': 3,
+            'copy_calls': 1, 'copy_returned_rows': 200, 'confirmed_new_rows': 200,
+            'fallback_attempts': 1, 'rollback_attempts': 1, 'confirmed_rollbacks': 1,
+            'commit_unconfirmed': 0}}
+        result = e2.e2_database_counter_window(before, after)
+        self.assertTrue(result['available'])
+        self.assertEqual(result['deltas']['begin_attempts'], 3)
+        self.assertEqual(result['deltas']['confirmed_commits'], 2)
+        self.assertEqual(result['deltas']['copy_calls'], 1)
+        self.assertEqual(result['deltas']['copy_returned_rows'], 200)
+        self.assertFalse(e2.e2_database_counter_window(
+            before, dict(after, process_instance='p2'))['available'])
+        reset = dict(after, persistence=dict(after['persistence'], confirmed_commits=0))
+        self.assertEqual(e2.e2_database_counter_window(before, reset)['reason'],
+                         'db_counter_missing_or_reset:confirmed_commits')
+        missing = dict(after, persistence=dict(after['persistence']))
+        del missing['persistence']['begin_attempts']
+        self.assertFalse(e2.e2_database_counter_window(before, missing)['available'])
+
     def test_e2_compact_sampler_ring_eviction_preserves_baseline_and_terminal(self):
         """Ring buffer eviction drops oldest rolling samples but keeps baseline/terminal outside ring."""
         clock = {'mono': 100.0, 'wall': datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)}
@@ -3471,11 +3657,12 @@ class E2SupportTests(unittest.TestCase):
             self.assertNotIn('processed', result['database_delta'])
             self.assertNotIn('telemetry', result['database_delta'])
 
-            # Assert validation PASSES without database_delta_mismatch
-            self.assertEqual(result['status'], 'PASS')
-            self.assertEqual(result['workload_outcome'], 'VALIDATED')
-            self.assertTrue(result['validation']['valid'])
-            self.assertEqual(result['validation']['failures'], [])
+            # Canonical counts alone do not prove exact raw retention. This legacy
+            # fixture only verifies sampled identity ranges, so acceptance fails closed.
+            self.assertEqual(result['status'], 'FAIL')
+            self.assertEqual(result['workload_outcome'], 'VALIDATION_FAILED')
+            self.assertFalse(result['validation']['valid'])
+            self.assertEqual(result['validation']['failures'], ['pilot_raw_retention_verification'])
             self.assertTrue(collector.stopped)
 
     def test_finish_remote_collection_nonzero_configuration_triggers_failure(self):

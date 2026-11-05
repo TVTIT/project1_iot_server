@@ -53,7 +53,8 @@ def _validate_reference(smoke, path, context):
     old_context = report.get('context')
     metadata = report.get('metadata') if isinstance(report.get('metadata'), dict) else {}
     workload = metadata.get('workload') if isinstance(metadata.get('workload'), dict) else {}
-    context_matches = (all(old_context.get(k) == context.get(k) for k in ('sha256', 'seed', 'anchor'))
+    context_matches = (all(old_context.get(k) == context.get(k) for k in
+        ('sha256', 'seed', 'anchor', 'workload_selection_sha256'))
         if isinstance(old_context, dict) else workload.get('journal_sha256') == context.get('sha256')
         and metadata.get('seed') == context.get('seed')
         and (workload.get('telemetry') or {}).get('dataset_anchor') == context.get('anchor'))
@@ -99,7 +100,8 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             if any(images.get(k) != reference.get('image_ids', {}).get(k) for k in ('backend', 'gateway')):
                 raise ValueError('e5_reference_image_mismatch')
         required = ('dataset_path', 'sha256', 'bytes', 'seed', 'anchor', 'sensor_ids',
-                    'gateway_ids', 'command_keys', 'viewer_subscriptions')
+                    'gateway_ids', 'command_keys', 'viewer_subscriptions', 'workload_selection',
+                    'workload_selection_sha256')
         if not isinstance(context, dict) or any(k not in context for k in required):
             raise ValueError('e5_dataset_context_invalid')
         dataset = Path(context['dataset_path'])
@@ -128,7 +130,8 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             'published': int(mappings[0]['HostPort'])}, owned_service='mosquitto')
         journal_context = {'sha256': context['sha256'], 'bytes': context['bytes'],
             'gateway_ids': context['gateway_ids'], 'sensor_ids': context['sensor_ids'],
-            'seed': context['seed'], 'anchor': context['anchor']}
+            'seed': context['seed'], 'anchor': context['anchor'],
+            'workload_selection_sha256': context['workload_selection_sha256']}
         mqtt_broker_url = f"ssl://127.0.0.1:{mappings[0]['HostPort']}"
         mqtt_manifest_endpoint = f"mqtts://127.0.0.1:{mappings[0]['HostPort']}"
         prepared = prepare_inputs(smoke=smoke, fixture=fixture, endpoint=endpoint,
@@ -137,6 +140,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             mqtt_ca_file=fixture.private / 'certs/ca.crt', journal_path=dataset,
             journal_context=journal_context, seed=context['seed'], anchor=context['anchor'], root=root,
             command_keys=context['command_keys'], viewer_subscriptions=context['viewer_subscriptions'],
+            workload_selection=context['workload_selection'],
             recovery_mode=recovery_context_out is not None)
         if recovery_context_out is not None:
             if not isinstance(recovery_context_out, dict) or recovery_context_out:
@@ -329,16 +333,19 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             arm=arm)['ram_dedup']
         mechanisms['command'] = e5.adapt_mechanism_counters(control_metrics_before, control_metrics_after,
             arm=arm, verified_commands=len(declared_keys))['command']
-        command_timeline = e5._window_delta(control_metrics_before, control_metrics_after,
-            'command_timeline', {'events': 'events', 'retries': 'retries'})
+        command_timeline = e5.control_timeline_window(control_metrics_before, control_metrics_after,
+            expected_commands=len(declared_keys))
         mechanisms['command']['timeline_window'] = command_timeline
         mechanisms['fanout']['window'] = e4._e4_ws_window(initial_metrics_before, initial_metrics_after)
         mechanisms['command']['window'] = e4._e4_ws_window(control_metrics_before, control_metrics_after)
         mechanisms['activation_status'] = 'AVAILABLE' if all(isinstance(mechanisms.get(k), dict)
             and 'status' not in mechanisms[k] for k in ('microbatch','ram_dedup','command','fanout','shaper')) else 'INCONCLUSIVE'
         validation_failures = []
-        if len(raw_ids) != 20: validation_failures.append('initial_header_count')
-        for phase_name, expected_count in (('initial', 20), ('warm_replay', 10)):
+        selection = context['workload_selection']
+        unique_count = selection['telemetry_messages']
+        warm_count = selection['warm_replay_prefix']
+        if len(raw_ids) != unique_count: validation_failures.append('initial_header_count')
+        for phase_name, expected_count in (('initial', selection['initial_replay_count']), ('warm_replay', warm_count)):
             workload = phases[phase_name].get('e4') or {}
             telemetry = phases[phase_name].get('telemetry') or {}
             if not e5.replay_accounting_matches(workload, telemetry, expected_count):
@@ -348,7 +355,9 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
                        for before, after in zip(phases['initial']['database_counts'], phases['warm_replay']['database_counts']))):
             validation_failures.append('warm_replay_changed_main_fingerprint')
         initial_delta = phases['initial'].get('database_delta', {})
-        if any(initial_delta.get(k) != v for k, v in {'ledger':20,'raw':2000,'temporal':20,'configuration':0}.items()):
+        if any(initial_delta.get(k) != v for k, v in {'ledger':unique_count,
+                'raw':unique_count * selection['samples_per_message'],
+                'temporal':unique_count,'configuration':0}.items()):
             validation_failures.append('initial_database_delta')
         if any(row.get('verified_exact') is not True for row in raw_proof): validation_failures.append('main_raw_fingerprint')
         if before_raw != after_raw: validation_failures.append('main_raw_fingerprint_changed')
@@ -378,13 +387,14 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             'gateway_binary_sha256': hashlib.sha256(Path(gateway_binary).read_bytes()).hexdigest(),
             'image_ids': images, 'workload': prepared['workload'], 'workload_sha256': prepared['workload_sha256'],
              'journal_sha256': prepared['journal_sha256'], 'manifest_paths_private': prepared['manifests'],
-             'context': {'sha256': context['sha256'], 'seed': context['seed'], 'anchor': context['anchor']},
+             'context': {'sha256': context['sha256'], 'seed': context['seed'], 'anchor': context['anchor'],
+                'workload_selection_sha256': context['workload_selection_sha256']},
             'runner_logs_private': [str(runtime_logs / f'p810c-runtime-{fixture.project}-{arm}-{phase}.log') for phase in ('initial', 'warm_replay', 'control')] + [str(viewer_log)],
             'runner_stopped': all(p.poll() is not None for p in procs), 'actual_stop_confirmed': True,
             'processes_stopped': all(p.poll() is not None for p in procs)})
         report['mechanism_metrics'] = mechanisms
         report['accounting'] = {'ingress_delta': windows['initial']['ingress_delta'],
-            'imported_input': 20, 'warm_replay': 10,
+            'imported_input': unique_count, 'warm_replay': warm_count,
             'main_dataset_delta': {'ledger': initial_delta.get('ledger'),
                 'raw': initial_delta.get('raw'), 'temporal': initial_delta.get('temporal')},
             'command_receipts_verified': len(pg_receipts),
@@ -477,20 +487,22 @@ def _validate_e5_viewer(result, context, initial, initial_ws, warm_ws, end_metri
     if (result.get('connected_distinct_viewers') != 2 or result.get('subscribed_distinct_viewers') != 2
             or result.get('receiving_distinct_viewers') != 2):
         failures.append('viewer_readiness')
-    if result.get('unique_events') != 20 or result.get('duplicates') != 0 or result.get('wrong_namespace') != 0:
+    selection = context.get('workload_selection') or e5.workload_preset('pilot')
+    unique_count = selection['telemetry_messages']
+    if result.get('unique_events') != unique_count or result.get('duplicates') != 0 or result.get('wrong_namespace') != 0:
         failures.append('viewer_event_accounting')
     viewers = result.get('viewers')
     subscriptions = context.get('viewer_subscriptions') or []
     expected_ids = {row.get('viewer_id') for row in subscriptions}
     counts = {row.get('id'): row.get('unique_events') for row in viewers if isinstance(row, dict)} if isinstance(viewers, list) else {}
-    if set(counts) != expected_ids or any(value != 10 for value in counts.values()):
+    if set(counts) != expected_ids or any(value != unique_count // len(expected_ids) for value in counts.values()):
         failures.append('viewer_per_identity_accounting')
     headers = (initial.get('e4') or {}).get('safe_header_samples', [])
     expected = {row.get('message_id') for row in headers if isinstance(row, dict)}
     observed = {row.get('message_id') for row in result.get('identity_samples', []) if isinstance(row, dict)}
     if not expected or not observed or not observed.issubset(expected):
         failures.append('viewer_header_provenance')
-    for name, window, expected_new in (('initial', initial_ws, 20), ('warm', warm_ws, 0)):
+    for name, window, expected_new in (('initial', initial_ws, unique_count), ('warm', warm_ws, 0)):
         if not isinstance(window, dict) or any(window.get(k) != v for k, v in {
                 'new_events': expected_new, 'telemetry_writes_completed': expected_new,
                 'deliveries_enqueued': expected_new, 'drops': 0}.items()):
@@ -558,7 +570,7 @@ def _write(path, data):
 def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_broker_url,
                    mqtt_manifest_endpoint, mqtt_ca_file, journal_path, journal_context,
                    seed, anchor, root, command_keys, viewer_subscriptions, command_versions=None,
-                   recovery_mode=False):
+                   workload_selection=None, recovery_mode=False):
     """Create byte-preserving journal copy, four private role inputs, and run-spec.
 
     ``journal_context`` is the one shared repeat context: ``sha256``, ``bytes``,
@@ -568,7 +580,10 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
     if len(specs) != 2 or [s.gateway_id for s in specs] != list(GATEWAYS):
         raise ValueError('e5_gateway_identity_mismatch')
     sensor_ids = [s.sensor_id for s in specs]
-    if len(passwords) != 2 or len(command_keys) != 4 or len(set(command_keys)) != 4 or any(not _UUID4.fullmatch(k) for k in command_keys):
+    workload_selection = workload_selection or e5.workload_preset('pilot')
+    if (e5.selection_sha256(workload_selection) != e5.selection_sha256(e5.workload_preset(workload_selection.get('profile')))
+            or len(passwords) != 2 or len(command_keys) != workload_selection['command_count']
+            or len(set(command_keys)) != len(command_keys) or any(not _UUID4.fullmatch(k) for k in command_keys)):
         raise ValueError('e5_repeat_inputs_invalid')
     if (journal_context.get('gateway_ids') != list(GATEWAYS) or
             journal_context.get('sensor_ids') != sensor_ids or
@@ -585,7 +600,9 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
         raise ValueError('e5_source_journal_not_private')
     raw = source.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
-    if digest != journal_context.get('sha256') or len(raw) != journal_context.get('bytes'):
+    selection_digest = e5.selection_sha256(workload_selection)
+    if (digest != journal_context.get('sha256') or len(raw) != journal_context.get('bytes')
+            or journal_context.get('workload_selection_sha256', selection_digest) != selection_digest):
         raise ValueError('e5_journal_context_mismatch')
     copied = root / 'dataset.jsonl'
     fd = os.open(copied, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -635,7 +652,7 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
 
     common = {'schema_version': 1, 'mode': 'local', 'run_id': f'{fixture.project}-e5', 'seed': seed, 'arm': 'warm',
               'bundle_path': str(root), 'publish_timeout_ms': 3000, 'retry_interval_ms': 500,
-              'profile': 'pilot', 'samples_per_message': 100,
+              'profile': 'pilot', 'samples_per_message': workload_selection['samples_per_message'],
               'topology': {'gateways': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
               'tls': {'https_endpoint': endpoint.url, 'https_ca_file': str(endpoint.ca_file),
                       'mqtt_tls_endpoint': mqtt_manifest_endpoint,
@@ -646,9 +663,10 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
             'roles': ['telemetry'],
             'targets': [{'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id} for spec in specs],
             'subscriptions': [], 'e4': {'mode': 'replay', 'journal_path': str(copied),
-                'replay_count': 20, 'ignore_first_valid_acks': 0,
-                'max_messages': 20, 'max_bytes': 1 << 20},
-            'traffic': {'rate_per_second': 1, 'ramp_seconds': 0, 'burst_messages': 19},
+                'replay_count': workload_selection['initial_replay_count'], 'ignore_first_valid_acks': 0,
+                'max_messages': workload_selection['initial_replay_count'], 'max_bytes': 1 << 20},
+            'traffic': {'rate_per_second': workload_selection['initial_replay_rate_per_second'], 'ramp_seconds': 0,
+                'burst_messages': max(0, workload_selection['initial_replay_count'] - 1)},
             # paperload requires a positive measurement window even for E4 replay;
             # the replay count, not the generated-offer estimate, bounds its input.
             'phases': {'warmup_seconds': 0, 'measure_seconds': 1, 'drain_seconds': 12, 'cooldown_seconds': 0},
@@ -660,10 +678,14 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
             'identity_files': {'telemetry': _write(root / 'telemetry-identities.json', {})},
             }
     # A separate bounded warm-replay input references the exact same private bytes.
-    warm = dict(telemetry, e4={'mode': 'replay', 'journal_path': str(copied), 'replay_count': 10,
-        'ignore_first_valid_acks': 0, 'max_messages': 10, 'max_bytes': 1 << 20},
-        traffic={'rate_per_second': 5, 'ramp_seconds': 0, 'burst_messages': 0},
-        phases={'warmup_seconds': 0, 'measure_seconds': 2, 'drain_seconds': 12, 'cooldown_seconds': 0})
+    warm_measure_seconds = 2
+    warm_rate_per_second = workload_selection['warm_replay_prefix'] // warm_measure_seconds
+    warm = dict(telemetry, e4={'mode': 'replay', 'journal_path': str(copied),
+        'replay_count': workload_selection['warm_replay_prefix'],
+        'ignore_first_valid_acks': 0, 'max_messages': workload_selection['warm_replay_prefix'], 'max_bytes': 1 << 20},
+        traffic={'rate_per_second': warm_rate_per_second, 'ramp_seconds': 0, 'burst_messages': 0},
+        phases={'warmup_seconds': 0, 'measure_seconds': warm_measure_seconds,
+                'drain_seconds': 12, 'cooldown_seconds': 0})
     viewer_identity = _write(root / 'viewer-identities.json',
                               {'user-a': tokens['a'], 'user-b': tokens['b']})
     viewer_common = {**common, 'topology': {**common['topology'], 'users': 2, 'viewers': 2},
@@ -716,13 +738,16 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
     _write(root / 'viewer.manifest.json', viewer)
     _write(root / 'control.manifest.json', control)
     # Control-only runner specification. Invocation belongs to a later runtime slice.
+    from scripts.paper_p8_resources import disk_guard_config
     run_spec = {'paperload': [{'manifest': str(root / 'control.manifest.json'),
         'output_dir': str(root / 'control-output'), 'role': 'control', 'ready_timeout_seconds': 90}],
         'gateways': [{'env_file': p, 'role': 'executor', 'ready_timeout_seconds': 30} for p in env_paths],
-        'stop_timeout_seconds': 30}
+        'stop_timeout_seconds': 30,
+        'disk_guard': disk_guard_config([telemetry, warm, viewer, control])}
     run_spec_path = _write(root / 'control-run-spec.json', run_spec)
     workload = e5.workload_manifest(journal_sha256=digest, journal_bytes=len(raw),
-        command_ids=command_keys, sensor_ids=sensor_ids, viewer_targets=viewer_subscriptions, anchor=anchor)
+        command_ids=command_keys, sensor_ids=sensor_ids, viewer_targets=viewer_subscriptions,
+        anchor=anchor, selection=workload_selection)
     return {'root': str(root), 'dataset_path': str(copied), 'journal_sha256': digest,
         'workload': workload, 'workload_sha256': e5.comparison_metadata(workload=workload,
             journal_sha256=digest)['workload_sha256'], 'manifests': {'initial': str(root/'initial-replay.manifest.json'),
@@ -730,6 +755,10 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
             'control': str(root/'control.manifest.json'), 'gateway_env': env_paths, 'run_spec': run_spec_path,
             **({'recovery_aux_env_file': str(aux_env_path), 'recovery_aux_db_path': aux_db_path}
                if recovery_mode else {})},
-        'expected': {'main_messages': 20, 'raw_samples': 2000, 'temporal': 20,
-            'initial_schedule': {'rate_per_second': 1, 'measure_seconds': 1, 'burst_messages': 19},
-            'viewers': 2, 'commands': 4}, 'execution': 'NOT RUN'}
+        'expected': {'main_messages': workload_selection['telemetry_messages'],
+            'raw_samples': workload_selection['telemetry_messages'] * workload_selection['samples_per_message'],
+            'temporal': workload_selection['telemetry_messages'],
+            'initial_schedule': {'rate_per_second': workload_selection['initial_replay_rate_per_second'],
+                'measure_seconds': 1, 'burst_messages': max(0, workload_selection['initial_replay_count'] - 1)},
+            'viewers': workload_selection['viewer_count'], 'commands': workload_selection['command_count']},
+        'execution': 'NOT RUN'}

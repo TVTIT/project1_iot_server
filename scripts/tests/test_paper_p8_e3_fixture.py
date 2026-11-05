@@ -37,14 +37,25 @@ class E3FixtureTests(unittest.TestCase):
         run_id = 'p8e3-session-polling'
         for role in ('A', 'B'):
             self.assertTrue(e3_fixture._e3_workload_provenance_valid(
-                {'experiment': 'E2', 'arm': role, 'run_id': run_id, 'mode': 'remote'},
+                {'experiment': 'E2', 'arm': role, 'run_id': run_id, 'mode': 'remote', 'profile':'pilot'},
                 role, run_id))
         self.assertTrue(e3_fixture._e3_workload_provenance_valid(
-            {'experiment': 'E3', 'arm': 'control', 'run_id': run_id}, 'control', run_id))
+            {'experiment': 'E3', 'arm': 'control', 'run_id': run_id, 'profile':'official'},
+            'control', run_id, 'official'))
+        self.assertFalse(e3_fixture._e3_workload_provenance_valid(
+            {'experiment': 'E3', 'arm': 'control', 'run_id': run_id, 'profile':'pilot'},
+            'control', run_id, 'official'))
         self.assertFalse(e3_fixture._e3_workload_provenance_valid(
             {'experiment': 'E3', 'arm': 'A', 'run_id': run_id, 'mode': 'remote'}, 'A', run_id))
         self.assertFalse(e3_fixture._e3_workload_provenance_valid(
             {'experiment': 'E2', 'arm': 'B', 'run_id': 'stale', 'mode': 'remote'}, 'B', run_id))
+
+    def test_e3_result_session_profile_must_match_selected_profile(self):
+        expected = {'session_id':'s'*32, 'run_ids':['r'], 'experiment':'E3',
+            'arm':'polling', 'phase':'e3-low_load-polling', 'profile':'official'}
+        self.assertTrue(e3_fixture._e3_result_session_matches(dict(expected), expected))
+        self.assertFalse(e3_fixture._e3_result_session_matches(
+            {**expected, 'profile':'pilot'}, expected))
 
     def test_prepare_seam_is_explicitly_preparation_only_and_accepts_profile_arguments(self):
         with patch.object(e3_fixture, 'run', return_value={'experiment': 'E3'}) as runner:
@@ -52,14 +63,17 @@ class E3FixtureTests(unittest.TestCase):
                 'containers', 'images', 'state', arm='polling', workload='low_load',
                 remote_profile={'advertised_https': 'https://example.invalid',
                                 'advertised_mqtt_tls': 'mqtts://example.invalid:8883'},
-                session_id='0123456789abcdef0123456789abcdef')
+                session_id='0123456789abcdef0123456789abcdef', command_count=30,
+                schedule='steady', seed=123, profile='official', official_opt_in=True)
         self.assertEqual(result, {'experiment': 'E3'})
         args, kwargs = runner.call_args
         self.assertEqual(args[7:9], (None, None))
         self.assertEqual(kwargs, {'prepare_only': True, 'remote_profile': {
             'advertised_https': 'https://example.invalid',
             'advertised_mqtt_tls': 'mqtts://example.invalid:8883'},
-            'session_id': '0123456789abcdef0123456789abcdef'})
+            'session_id': '0123456789abcdef0123456789abcdef', 'command_count': 30,
+            'schedule': 'steady', 'background_profile': None, 'seed': 123,
+            'profile': 'official', 'official_opt_in': True})
 
     def test_e3_bundle_export_keeps_three_roles_and_two_executor_envs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -76,6 +90,7 @@ class E3FixtureTests(unittest.TestCase):
                 'gateway_env_files':[root/'env-a.json',root/'env-b.json'],
                 'plan':{'run_spec':str(root/'run-spec.json')},'session_id':'s'*32,
                 'arm':'polling','phase_id':'e3-low_load-polling','workload':'low_load'}
+            prepared['profile'] = 'official'
             with patch('scripts.paper_p8_bundle.export_bundle', return_value={'file_count':12}) as export:
                 result=e3_fixture.export_prepared_bundle(prepared,output_leaf=root/'bundle')
             self.assertEqual(result['file_count'],12)
@@ -85,6 +100,7 @@ class E3FixtureTests(unittest.TestCase):
             self.assertEqual(len(kwargs['gateway_env_files']),2)
             self.assertEqual(set(kwargs['identity_files']),{'A:telemetry','B:telemetry','control:control'})
             self.assertEqual(kwargs['workload']['workload'],'low_load')
+            self.assertEqual(kwargs['workload']['profile'],'official')
 
     def test_representative_probe_status_classification_is_literal_and_distinguishes_conflicts(self):
         self.assertTrue(e3_fixture._probe_status_classification('busy', 409)['match'])
@@ -93,18 +109,32 @@ class E3FixtureTests(unittest.TestCase):
         self.assertFalse(e3_fixture._probe_status_classification('noop', 202)['match'])
 
     def test_representative_probe_classification_order_and_metric_separation(self):
-        kinds = ('offline_admission', 'same_key_replay', 'busy', 'stale', 'noop', 'noop_replay')
-        statuses = (202, 202, 409, 409, 200, 200)
+        kinds = ('offline_admission', 'same_key_replay', 'busy', 'stale',
+                 'online_fresh_apply', 'noop', 'noop_replay')
+        statuses = (202, 202, 409, 409, 202, 200, 200)
         ops = [{'kind': k, **e3_fixture._probe_status_classification(k, s)}
-               for k, s in zip(kinds, statuses)]
+               for k, s in zip(kinds, statuses) if k != 'online_fresh_apply']
+        ops.insert(4, {'kind': 'online_fresh_apply', 'expected': 202, 'actual': 202, 'match': True})
         self.assertEqual([row['expected'] for row in ops], list(statuses))
         counts = {'ledger': 5, 'raw': 5, 'temporal': 5}
-        self.assertTrue(e3_fixture._representative_probe_accounting(ops, counts, counts, 0))
-        self.assertFalse(e3_fixture._representative_probe_accounting(ops, counts, counts, 1))
+        offline = {'executor_running': False, 'receipt_verified': True,
+                   'terminal_status': 'published', 'outbox_status': 'published',
+                   'same_key_replay_bytes_match': True}
+        self.assertTrue(e3_fixture._representative_probe_accounting(ops, counts, counts, 0, offline))
+        self.assertFalse(e3_fixture._representative_probe_accounting(ops, counts, counts, 1, offline))
+        self.assertFalse(e3_fixture._representative_probe_accounting(ops, counts, counts, 0))
         self.assertFalse(e3_fixture._representative_probe_accounting(
-            [{**ops[2], 'actual': 202, 'match': False}, *ops[1:]], counts, counts, 0))
-        self.assertFalse(e3_fixture._representative_probe_accounting(ops, counts, {**counts, 'raw': 6}, 0))
+            [{**ops[2], 'actual': 202, 'match': False}, *ops[1:]], counts, counts, 0, offline))
+        self.assertFalse(e3_fixture._representative_probe_accounting(ops, counts, {**counts, 'raw': 6}, 0, offline))
         self.assertTrue(e3_fixture.run_representative_probes.__doc__.find('outside E3 measurement') >= 0)
+
+    def test_wakeup_probe_orders_executor_readiness_before_online_admission(self):
+        source = Path(e3_fixture.__file__).read_text(encoding='utf-8')
+        helper = source[source.index('def run_representative_probes'):source.index('\ndef _probe_http_request_with_headers')]
+        self.assertLess(helper.index('READY_MARKER in'), helper.index('online_status, online_raw'))
+        self.assertLess(helper.index("'executor_running': False"), helper.index('online_status, online_raw'))
+        self.assertIn("'delivery_guarantee': 'none'", helper)
+        self.assertIn("'terminal_status': offline_proof['terminal_status']", helper)
 
     def test_post_stop_drain_gate_accepts_only_clean_pending_partial(self):
         artifact = {'status': 'PARTIAL', 'primary_error': None,

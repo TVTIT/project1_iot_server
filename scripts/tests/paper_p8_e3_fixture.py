@@ -117,54 +117,91 @@ def _probe_http(endpoint, method, path, token, body=None):
 
 
 def _probe_status_classification(kind, status):
-    expected = {'offline_admission': 202, 'same_key_replay': 202,
+    expected = {'offline_admission': 202, 'same_key_replay': 202, 'online_fresh_apply': 202,
                 'busy': 409, 'stale': 409, 'noop': 200, 'noop_replay': 200}
     return {'expected': expected[kind], 'actual': status, 'match': status == expected[kind]}
 
 
-def _representative_probe_accounting(operations, before, after, pending):
-    expected = ('offline_admission', 'same_key_replay', 'busy', 'stale', 'noop', 'noop_replay')
+def _representative_probe_accounting(operations, before, after, pending,
+                                     offline_qualification=None):
+    expected = ('offline_admission', 'same_key_replay', 'busy', 'stale',
+                'online_fresh_apply', 'noop', 'noop_replay')
+    offline_ok = (isinstance(offline_qualification, dict)
+                  and offline_qualification.get('executor_running') is False
+                  and offline_qualification.get('receipt_verified') is True
+                  and offline_qualification.get('terminal_status') in ('pending', 'published')
+                  and offline_qualification.get('outbox_status') in ('pending', 'published')
+                  and offline_qualification.get('same_key_replay_bytes_match') is True)
     return (tuple(row.get('kind') for row in operations) == expected
             and all(row.get('match') is True for row in operations)
-            and before == after and pending == 0)
+            and before == after and pending == 0 and offline_ok)
 
 
 def run_representative_probes(smoke, fixture, endpoint, registry, pg, token, gateway_binary,
                               executor_env_file, executor_db_path, gateway_id, sensor_id,
-                              sensor_urn):
+                              sensor_urn, admin_token, offline_sensor_id, offline_sensor_urn):
     """Bounded no-op/replay/busy/stale probes; intentionally outside E3 measurement."""
     report = {'valid': False, 'failures': [], 'operations': [], 'auxiliary_command_count': 0,
               'receipt_count': 0, 'outside_fresh_command_measurement': True}
+    key = offline_key = None
+    proc = None
     try:
         path = f'/v1/digital-twins/{sensor_urn}'
-        status, _, current = smoke.http_request(endpoint, 'GET', path + '?format=simplified', token=token)
+        offline_path = f'/v1/digital-twins/{offline_sensor_urn}'
+        status, _, current = smoke.http_request(endpoint, 'GET', offline_path + '?format=simplified', token=token)
         if status != 200 or not isinstance(current, dict):
-            raise ValueError('probe_current_state_unavailable')
-        version = int(current.get('desired_version') or current.get('desired_state', {}).get('desired_version'))
-        key = secrets.token_hex(16)
-        request = {'frequency_hz': 4, 'expected_desired_version': str(version)}
+            raise ValueError('probe_offline_current_state_unavailable')
+        offline_version = int(current.get('desired_version') or current.get('desired_state', {}).get('desired_version'))
+        offline_key = secrets.token_hex(16)
+        offline_request = {'frequency_hz': 4, 'expected_desired_version': str(offline_version)}
         # Keep the body and idempotency key identical for receipt replay.
-        status, raw, body = _probe_http_request_with_headers(endpoint, path, token, key, request)
+        status, raw, body = _probe_http_request_with_headers(endpoint, offline_path, token, offline_key, offline_request)
         report['operations'].append({'kind': 'offline_admission', **_probe_status_classification('offline_admission', status),
                                      'command_id': body.get('command_id') if isinstance(body, dict) else None})
         if status != 202 or not isinstance(body, dict) or not body.get('command_id'):
             raise ValueError('probe_offline_admission_rejected')
-        command_id = body['command_id']
         admitted_bytes = raw
-        status, replay_raw, replay_body = _probe_http_request_with_headers(endpoint, path, token, key, request)
+        status, replay_raw, _ = _probe_http_request_with_headers(endpoint, offline_path, token, offline_key, offline_request)
         report['operations'].append({'kind': 'same_key_replay', **_probe_status_classification('same_key_replay', status)})
         if status != 202 or replay_raw != admitted_bytes:
             raise ValueError('probe_admission_replay_mismatch')
         busy_key = secrets.token_hex(16)
-        busy_status, _, _ = _probe_http_request_with_headers(endpoint, path, token, busy_key,
-            {'frequency_hz': 5, 'expected_desired_version': str(version + 1)})
+        busy_status, _, _ = _probe_http_request_with_headers(endpoint, offline_path, token, busy_key,
+            {'frequency_hz': 5, 'expected_desired_version': str(offline_version + 1)})
         report['operations'].append({'kind': 'busy', **_probe_status_classification('busy', busy_status)})
-        stale_status, _, _ = _probe_http_request_with_headers(endpoint, path, token, secrets.token_hex(16),
-            {'frequency_hz': 5, 'expected_desired_version': str(version)})
+        stale_status, _, _ = _probe_http_request_with_headers(endpoint, offline_path, token, secrets.token_hex(16),
+            {'frequency_hz': 5, 'expected_desired_version': str(offline_version)})
         report['operations'].append({'kind': 'stale', **_probe_status_classification('stale', stale_status)})
         if busy_status != 409 or stale_status != 409:
             raise ValueError('probe_busy_or_stale_status_mismatch')
 
+        offline_proof = smoke.db_psql(registry, pg, """SELECT json_build_object(
+          'receipt_count',count(r.idempotency_key),'receipt_md5',min(md5(r.response_bytes)),
+          'terminal_status',min(c.status),'outbox_status',min(o.status),
+          'command_version',min(c.desired_version)::text,
+          'desired_version',(SELECT s.desired_version::text FROM twin_states s
+            JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn'))::text
+          FROM twin_command_requests r JOIN twin_commands c ON c.command_id=r.command_id
+          JOIN twin_outbox o ON o.command_id=c.command_id WHERE r.idempotency_key=:'key';""",
+          {'key': offline_key, 'urn': offline_sensor_urn}).strip()
+        offline_proof = json.loads(offline_proof) if offline_proof else {}
+        if (offline_proof.get('receipt_count') != 1
+                or offline_proof.get('receipt_md5') != hashlib.md5(admitted_bytes).hexdigest()
+                or offline_proof.get('desired_version') != str(offline_version + 1)
+                or offline_proof.get('command_version') != str(offline_version + 1)
+                or offline_proof.get('terminal_status') not in ('pending', 'published')):
+            raise ValueError('probe_offline_receipt_or_terminal_mismatch')
+        report['offline_qualification'] = {
+            'executor_running': False, 'receipt_verified': True,
+            'terminal_status': offline_proof['terminal_status'],
+            'outbox_status': offline_proof.get('outbox_status'),
+            'delivery_guarantee': 'none', 'same_key_replay_bytes_match': True}
+
+        path = f'/v1/digital-twins/{sensor_urn}'
+        status, _, current = smoke.http_request(endpoint, 'GET', path + '?format=simplified', token=token)
+        if status != 200 or not isinstance(current, dict):
+            raise ValueError('probe_online_current_state_unavailable')
+        version = int(current.get('desired_version') or current.get('desired_state', {}).get('desired_version'))
         env = _gateway_environment(executor_env_file)
         env['GATEWAY_SAMPLES_PER_BATCH'] = '1'
         env['GATEWAY_MQTT_CLIENT_ID'] += '_representative_probe'
@@ -173,16 +210,28 @@ def run_representative_probes(smoke, fixture, endpoint, registry, pg, token, gat
         stdout = probe_env_file.with_suffix('.log')
         with stdout.open('xb') as stream:
             stdout.chmod(0o600)
-            proc = subprocess.Popen([str(gateway_binary), 'run', '--batches', '1',
-                                     '--completion-timeout', '30s'], cwd=smoke.ROOT,
-                                    stdout=stream, stderr=subprocess.STDOUT,
-                                    env={**smoke.process_env(fixture),
-                                         **_gateway_environment(str(probe_env_file))}, close_fds=True)
-            try:
-                proc.wait(timeout=40)
-            except subprocess.TimeoutExpired:
-                _stop(proc)
-                raise ValueError('probe_executor_timeout') from None
+            proc = subprocess.Popen([str(gateway_binary), 'run', '--completion-timeout', '30s'], cwd=smoke.ROOT,
+                                     stdout=stream, stderr=subprocess.STDOUT,
+                                     env={**smoke.process_env(fixture),
+                                          **_gateway_environment(str(probe_env_file))}, close_fds=True)
+        from paper_p8 import READY_MARKER
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise ValueError('probe_executor_exited_before_ready')
+            if READY_MARKER in stdout.read_text(encoding='utf-8', errors='replace'):
+                break
+            time.sleep(.02)
+        else:
+            raise ValueError('probe_executor_readiness_timeout')
+        key = secrets.token_hex(16)
+        online_request = {'frequency_hz': 4, 'expected_desired_version': str(version)}
+        online_status, online_raw, _ = _probe_http_request_with_headers(endpoint, path, token, key, online_request)
+        report['operations'].append({'kind': 'online_fresh_apply', 'expected': 202,
+                                     'actual': online_status, 'match': online_status == 202})
+        if online_status != 202:
+            raise ValueError('probe_online_admission_rejected')
+        admitted_bytes = online_raw
         before_noop = _target_counts(smoke, registry, pg, SimpleNamespace(
             gateway_id=gateway_id, sensor_id=sensor_id, sensor_urn=sensor_urn))
         deadline = time.monotonic() + 30
@@ -194,8 +243,11 @@ def run_representative_probes(smoke, fixture, endpoint, registry, pg, token, gat
                 applied = detail
                 break
             time.sleep(.25)
-        if proc.returncode != 0 or applied is None:
+        if applied is None:
             raise ValueError('probe_apply_or_result_not_confirmed')
+        _stop(proc, timeout=5)
+        if proc.poll() is None:
+            raise ValueError('probe_executor_unjoined_after_apply')
         noop_key = secrets.token_hex(16)
         noop_request = {'frequency_hz': 4, 'expected_desired_version': str(version + 1)}
         noop_status, noop_raw, noop_body = _probe_http_request_with_headers(endpoint, path, token, noop_key, noop_request)
@@ -234,15 +286,53 @@ def run_representative_probes(smoke, fixture, endpoint, registry, pg, token, gat
                 'applied_at': config.get('configuration', {}).get('applied_at')}:
             raise ValueError('probe_executor_not_drained_or_config_mismatch')
         if not _representative_probe_accounting(report['operations'], before_noop, after_noop,
-                                                config.get('pending_outbox')):
+                                                config.get('pending_outbox'), report.get('offline_qualification')):
             raise ValueError('probe_accounting_or_pending_mismatch')
         report.update({'valid': True, 'auxiliary_command_count': command_proof['command_count'], 'receipt_count': len(receipts),
                        'desired_version': str(version + 1), 'sample_interval_us': 250000,
-                       'admission_response_sha256': hashlib.sha256(admitted_bytes).hexdigest(),
+                        'offline_admission_response_sha256': hashlib.sha256(raw).hexdigest(),
+                        'online_admission_response_sha256': hashlib.sha256(online_raw).hexdigest(),
                        'noop_response_sha256': hashlib.sha256(noop_raw).hexdigest(),
                        'database_counts_before_noop': before_noop, 'database_counts_after_noop': after_noop})
     except Exception as exc:
         report['failures'].append(str(exc) if str(exc).startswith('probe_') else 'probe_execution_failed')
+        # Capture narrow, owned evidence before fixture cleanup: this is specifically
+        # needed to distinguish missed wake-up discovery from publish/result failure.
+        try:
+            if offline_key is not None:
+                snapshot = smoke.db_psql(registry, pg, """SELECT COALESCE(json_agg(json_build_object(
+                  'command_id',c.command_id::text,'status',c.status,'desired_version',c.desired_version::text,
+                  'sample_interval_us',(c.parameters->>'sample_interval_us')::bigint,
+                  'outbox_status',o.status) ORDER BY c.issued_at),'[]')::text
+                  FROM twin_command_requests r LEFT JOIN twin_commands c ON c.command_id=r.command_id
+                  LEFT JOIN twin_outbox o ON o.command_id=c.command_id
+                  WHERE r.idempotency_key=:'key';""", {'key': offline_key}).strip()
+                smoke.private_write(Path(executor_env_file).with_name('representative-probe-server-snapshot.json'), snapshot)
+            metrics_status, _, metrics = smoke.http_request(endpoint, 'GET', '/v1/admin/metrics',
+                                                              token=admin_token, timeout=3)
+            safe_metrics = metrics if metrics_status == 200 and isinstance(metrics, dict) else {'http_status': metrics_status}
+            smoke.private_write(Path(executor_env_file).with_name('representative-probe-metrics.json'),
+                                json.dumps(safe_metrics, sort_keys=True))
+            for item in registry.items:
+                if item.get('kind') != 'container' or not any(word in item.get('name', '').lower()
+                                                                for word in ('backend', 'server', 'api')):
+                    continue
+                result = registry.command(['logs', '--tail', '300', item['name']])
+                text = (result.stdout + result.stderr).decode(errors='replace')[:65536]
+                text = re.sub(r'(?i)(authorization|password|secret|token|private[_ -]?key)(\s*[=:]\s*)([^\s,;}]+)',
+                              r'\1\2[REDACTED]', text)
+                smoke.private_write(Path(executor_env_file).with_name('representative-probe-server.log'), text)
+                break
+        except Exception:
+            report['diagnostics_capture'] = 'capture_failed'
+        else:
+            report['diagnostics_capture'] = 'captured'
+    finally:
+        if proc is not None:
+            _stop(proc, timeout=5)
+            if proc.poll() is None:
+                report['failures'].append('probe_executor_unjoined')
+                report['valid'] = False
     return report
 
 
@@ -402,8 +492,8 @@ def _verify_control_receipts(sqlite_summaries, commands, postgres_receipts, rest
         expected_ids = set(expected_by_id)
         actual_ids = [r.get('command_id') for r in data.get('receipts', [])]
         expected_ids_by_executor.append(expected_ids)
-        if (data.get('completed_receipts_count') != 2 or data.get('pending_outbox') != 0
-                or set(actual_ids) != expected_ids or len(actual_ids) != 2):
+        if (data.get('completed_receipts_count') != len(executor_commands) or data.get('pending_outbox') != 0
+                or set(actual_ids) != expected_ids or len(actual_ids) != len(executor_commands)):
             verified = False
         for receipt in data.get('receipts', []):
             pair = expected_by_id.get(receipt.get('command_id'))
@@ -620,11 +710,16 @@ def _drain_executor_outboxes(smoke, fixture, registry, pg, gateway_binary, env_f
 
 
 def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
-            arm, workload='mixed', remote_profile=None, session_id=None):
+            arm, workload='mixed', remote_profile=None, session_id=None,
+            command_count=4, schedule='smoke', background_profile=None, seed=89,
+            profile='pilot', official_opt_in=False):
     """Provision E3 inputs only; no producer, executor, or command is started."""
     return run(smoke, fixture, endpoint, registry, containers, images, state,
                None, None, arm, workload, prepare_only=True,
-               remote_profile=remote_profile, session_id=session_id)
+                remote_profile=remote_profile, session_id=session_id,
+                command_count=command_count, schedule=schedule,
+                background_profile=background_profile, seed=seed,
+                profile=profile, official_opt_in=official_opt_in)
 
 
 def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_seconds=60):
@@ -660,7 +755,7 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
             for gateway_id, path in prepared['gateway_files'].items()}}
     spec = json.loads(Path(prepared['plan']['run_spec']).read_text(encoding='utf-8'))
     workload = {'experiment': 'E3', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
-        'profile': 'pilot', 'workload': prepared['workload'], 'seed': 89,
+        'profile': prepared['profile'], 'workload': prepared['workload'], 'seed': 89,
         'generator_colocated': 'unverified', 'dispatch_mode': prepared['arm']}
     return paper_p8_bundle.export_bundle(output_leaf=output_leaf,
         session_id=prepared['session_id'], experiment='E3', arm=prepared['arm'],
@@ -706,8 +801,10 @@ def _load_e3_result_bundle(results_root, prepared, paperload_binary):
     summary = json.loads(summary_path.read_text(encoding='utf-8'))
     roles = ['A', 'B', 'control']
     expected_session = {'session_id': prepared['session_id'], 'run_ids': [prepared['run_id']],
-                        'experiment': 'E3', 'arm': prepared['arm'], 'phase': prepared['phase_id']}
-    if (summary.get('session') != expected_session or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
+                        'experiment': 'E3', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
+                        'profile': prepared['profile']}
+    if (not _e3_result_session_matches(summary.get('session'), expected_session)
+            or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
             or summary.get('expected_workload_roles') != roles or summary.get('present_workload_roles') != roles
             or summary.get('missing_workload_roles') != [] or summary.get('full_p8_accepted') is not False
             or summary.get('physical_ab') != 'NOT RUN'):
@@ -736,7 +833,7 @@ def _load_e3_result_bundle(results_root, prepared, paperload_binary):
         value = json.loads(data)
         kind = expected[rel]
         if kind in ('A', 'B', 'control') and not _e3_workload_provenance_valid(
-                value, kind, prepared['run_id']):
+                value, kind, prepared['run_id'], prepared['profile']):
             raise ValueError('e3_workload_provenance_mismatch')
         if kind == 'provenance':
             if (not isinstance(value, dict) or set(value) != {'binary_sha256', 'binary_os', 'binary_arch'}
@@ -763,7 +860,11 @@ def _load_e3_result_bundle(results_root, prepared, paperload_binary):
     return values
 
 
-def _e3_workload_provenance_valid(value, role, run_id):
+def _e3_result_session_matches(actual, expected):
+    return isinstance(actual, dict) and actual == expected
+
+
+def _e3_workload_provenance_valid(value, role, run_id, selected_profile='pilot'):
     """E3 carries E2 A/B telemetry children alongside its E3 control child."""
     if not isinstance(value, dict) or role not in ('A', 'B', 'control'):
         return False
@@ -771,6 +872,7 @@ def _e3_workload_provenance_valid(value, role, run_id):
     return (value.get('experiment') == expected_experiment
             and value.get('arm') == role
             and value.get('run_id') == run_id
+            and value.get('profile') == (selected_profile if role == 'control' else 'pilot')
             and (role == 'control' or value.get('mode') == 'remote'))
 
 
@@ -818,7 +920,8 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         rest[sid] = _e3_reported_configuration(body)
     receipts_ok = _verify_control_receipts(sqlite, prepared['manifests']['control']['commands'],
         pg_receipts, rest, [target.sensor_id for target in control_targets])
-    receipt_verification = {'verified': receipts_ok and len(pg_receipts) == 4,
+    expected_count = len(prepared['manifests']['control']['commands'])
+    receipt_verification = {'verified': receipts_ok and len(pg_receipts) == expected_count,
                             'verified_idempotency_keys': list(pg_receipts)}
     workload = prepared['workload']
     raw_checks = []
@@ -833,7 +936,9 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         control_receipt_verification=receipt_verification,
         runner_stopped=imported['runner'].get('actual_stop_confirmed') is True,
         declared_idempotency_keys=prepared['manifests']['idempotency_keys'], raw_checks=raw_checks,
-        workload=workload, collector_metrics=collector.metrics)
+        workload=workload, collector_metrics=collector.metrics,
+        expected_command_count=expected_count,
+        expected_messages=prepared['manifests']['background_messages'])
     if collector.errors:
         validation['valid'] = False
         validation.setdefault('failures', []).append('collector_incomplete')
@@ -842,7 +947,8 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         'experiment': 'E3', 'arm': prepared['arm'], 'workload': workload, 'dispatch_mode': prepared['arm'],
         'session_id': prepared['session_id'], 'run_id': prepared['run_id'], 'phase_id': phase_id,
         'database_delta': delta, 'background_database_delta': bg_delta,
-        'command_database_delta': command_delta, 'collector_metrics': collector.metrics,
+        'command_database_delta': command_delta, 'raw_checks': raw_checks,
+        'collector_metrics': collector.metrics,
         'collector_resources': collector.resources, 'collector_errors': collector.errors,
         'validation': validation, 'full_p8_accepted': False, 'generator_colocated': True,
         'physical_ab': 'NOT RUN'}
@@ -850,13 +956,20 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
 
 def run(smoke, fixture, endpoint, registry, containers, images, state,
         paperload_binary, gateway_binary, arm, workload='mixed', *,
-        prepare_only=False, remote_profile=None, session_id=None):
+        prepare_only=False, remote_profile=None, session_id=None,
+        command_count=4, schedule='smoke', background_profile=None, seed=89,
+        profile='pilot', official_opt_in=False):
     """Execute E3 pilot workload for given arm (polling or wakeup) in disposable fixture."""
     pilot_arms = e3_pilot_arms()
     if arm not in pilot_arms:
         raise ValueError(f'p8_e3_arm_rejected:{arm}')
     if workload not in ('mixed', 'low_load'):
         raise ValueError('p8_e3_workload_rejected')
+    if profile not in ('pilot', 'official') or (profile == 'official' and not official_opt_in):
+        raise ValueError('p8_e3_profile_opt_in_rejected')
+    if profile == 'official' and (command_count not in (3, 30) or schedule != 'steady'
+            or command_count == 3 and workload != 'low_load'):
+        raise ValueError('p8_e3_official_requires_30_or_low_load_3_steady_commands')
     artifact_name = f"p8-e3-{arm}{'-low-load' if workload == 'low_load' else ''}.json"
     arm_profile = pilot_arms[arm]
 
@@ -909,6 +1022,8 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
     gw_id = specs[0].gateway_id
     cmd_sensor_names = ('a', 'b')
     cmd_sensor_ids = [f'p8-e3-command-{x}' for x in cmd_sensor_names]
+    offline_sensor_id = 'p8-e3-offline-probe'
+    offline_sensor_urn = f'urn:ngsi-ld:Sensor:{gw_id}:{offline_sensor_id}'
     initial_versions = {}
     control_targets = []
 
@@ -933,6 +1048,12 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             raise ValueError(f'p8_e3_initial_desired_version_unavailable:{sid}')
         initial_versions[sid] = str(version)
         control_targets.append({'gateway_id': gw_id, 'sensor_id': sid})
+
+    put_status, _, put_body = smoke.http_request(
+        endpoint, 'PUT', f'/v1/gateways/{gw_id}/sensors/{offline_sensor_id}',
+        token=tokens['a'], body={'name': 'P8 E3 Offline Admission Probe', 'unit': specs[0].sensor_unit})
+    if put_status != 201 or put_body.get('entity_id') != offline_sensor_urn:
+        raise ValueError('p8_e3_offline_probe_sensor_provision_failed')
 
     background_targets = [
         {'gateway_id': specs[0].gateway_id, 'sensor_id': specs[0].sensor_id},
@@ -975,6 +1096,9 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         control_identity_file=str(control_token_file),
         tls=tls_config,
         workload=workload,
+        command_count=command_count, schedule=schedule,
+        background_profile=background_profile, seed=seed,
+        profile=profile, official_opt_in=official_opt_in,
     )
     manifest_bundle['control']['mode'] = execution_mode
 
@@ -1024,7 +1148,8 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
     prepared = {
         'experiment': 'E3', 'session_id': session_id, 'run_id': common['run_id'],
         'phase_id': f'e3-{workload}-{arm}', 'arm': arm, 'workload': workload,
-        'mode': execution_mode, 'profile': arm_profile, 'schema': schema,
+        'command_count': command_count, 'schedule': schedule, 'seed': seed,
+        'mode': execution_mode, 'profile': profile, 'official_opt_in': official_opt_in, 'schema': schema,
         'quota': quota, 'effective': effective, 'resources': resources,
         'storage_status': storage_status, 'tokens': tokens, 'specs': specs,
         'passwords': passwords, 'pg': pg, 'root': root, 'control_targets': control_targets,
@@ -1065,13 +1190,16 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
     with log.open('xb') as stream:
         log.chmod(0o600)
         try:
-            proc = subprocess.Popen([
+            runner_command = [
                 'python3', str(smoke.ROOT / 'scripts/paper_p8.py'), '--run',
                 '--binary', str(paperload_binary),
                 '--gateway-binary', str(gateway_binary),
                 '--run-spec', plan['run_spec'],
                 '--run-artifact', str(run_artifact),
-            ], cwd=smoke.ROOT, stdout=stream, stderr=subprocess.STDOUT,
+            ]
+            if profile == 'official' and official_opt_in:
+                runner_command.append('--official-opt-in')
+            proc = subprocess.Popen(runner_command, cwd=smoke.ROOT, stdout=stream, stderr=subprocess.STDOUT,
                env=smoke.process_env(fixture), close_fds=True)
             collector.start(proc.pid)
             try:
@@ -1226,16 +1354,15 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         sqlite_data = _inspect_executor_sqlite(db_path)
         sqlite_summaries.append(sqlite_data)
 
-    expected_final_configs = {
-        cmd_sensor_ids[0]: {
-            'desired_version': manifest_bundle['expected_versions_after'][cmd_sensor_ids[0]],
-            'sample_interval_us': 500000,
-        },
-        cmd_sensor_ids[1]: {
-            'desired_version': manifest_bundle['expected_versions_after'][cmd_sensor_ids[1]],
-            'sample_interval_us': 1333333,
-        },
-    }
+    expected_final_configs = {}
+    for command in manifest_bundle['control']['commands']:
+        frequency = Fraction(str(command['frequency_hz']))
+        numerator = 1_000_000 * frequency.denominator
+        quotient, remainder = divmod(numerator, frequency.numerator)
+        expected_final_configs[command['sensor_id']] = {
+            'desired_version': str(int(command['expected_desired_version']) + 1),
+            'sample_interval_us': quotient + (2 * remainder >= frequency.numerator),
+        }
     rest_configurations = {}
     for sid in cmd_sensor_ids:
         urn = f'urn:ngsi-ld:Sensor:{gw_id}:{sid}'
@@ -1258,7 +1385,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         sqlite_summaries, manifest_bundle['control']['commands'], postgres_receipts,
         rest_configurations, cmd_sensor_ids)
     control_receipt_verification = {
-        'verified': (len(verified_idempotency_keys) == 4 and sqlite_receipts_verified),
+        'verified': (len(verified_idempotency_keys) == command_count and sqlite_receipts_verified),
         'verified_idempotency_keys': verified_idempotency_keys,
     }
 
@@ -1292,12 +1419,18 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         declared_idempotency_keys=declared_keys,
         raw_checks=raw_checks,
         workload=workload,
+        collector_metrics=collector.metrics,
+        expected_command_count=command_count,
+        expected_messages=manifest_bundle['background_messages'],
     )
 
     if not validation['valid']:
         smoke.durable_json(fixture.artifacts / artifact_name, {
             'status': 'FAIL', 'failure': 'validation_failed', 'arm': arm,
-            'failures': validation['failures'], 'full_p8_accepted': False,
+            'failures': validation['failures'], 'validation': validation,
+            'control_workload': control_workload, 'command_database_delta': cmd_delta,
+            'background_database_delta': bg_delta, 'runner_stopped': runner_stopped,
+            'full_p8_accepted': False,
         })
         raise ValueError('p8_e3_validation_failed:' + ','.join(validation['failures']))
 
@@ -1306,7 +1439,8 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
     representative_probes = run_representative_probes(
         smoke, fixture, endpoint, registry, pg, tokens['a'], gateway_binary,
         gateway_env_files[0], executor_outbox_paths[0], gw_id, cmd_sensor_ids[0],
-        f'urn:ngsi-ld:Sensor:{gw_id}:{cmd_sensor_ids[0]}')
+        f'urn:ngsi-ld:Sensor:{gw_id}:{cmd_sensor_ids[0]}', tokens['admin'],
+        offline_sensor_id, offline_sensor_urn)
 
     histogram_windows = {}
     for group in ('command_admission', 'command_dispatch', 'command_timeline', 'command_result'):
@@ -1372,6 +1506,12 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             'histogram_windows': histogram_windows,
             'missing_origin': missing_origin,
             'note': 'missing origin counts remain missing; HTTP RTT never substituted',
+        },
+        'control_timeline_window': {
+            'histograms': validation.get('server_dispatch_e2e_histograms'),
+            'latency': validation.get('server_origin_latency'),
+            'availability': validation.get('server_origin_latency_availability'),
+            'reconciled_commands': control_workload.get('planned'),
         },
         'collector_resources': collector.resources,
         'collector_generator_samples': collector.generator_samples,

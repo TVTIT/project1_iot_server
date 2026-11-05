@@ -112,7 +112,9 @@ def _read_json(path, limit, code, *, max_links=1):
 def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
                source_metadata=None, image_metadata=None, endpoint_metadata=None,
                project=None, lock=None, session_id=None, artifacts=None,
-               preparation_status='LIFECYCLE_READY', cold_replay_enabled=False,
+               preparation_status='LIFECYCLE_READY', profile='pilot',
+                official_opt_in=False, cold_replay_enabled=False,
+                expiry_replay_enabled=False,
                e4_phase_plan=None, e5_phase_plan=None, workload=None):
     root = _root(root)
     if (not isinstance(experiment, str) or not re.fullmatch(r'E[1-5]', experiment)
@@ -125,9 +127,14 @@ def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
             or preparation_status not in ('LIFECYCLE_READY', 'E1_PREPARED', 'E2_PREPARED', 'E3_PREPARED', 'E4_PREPARED', 'E5_PREPARED')
             or session_id is not None and not re.fullmatch(r'[a-f0-9]{32}', session_id)
             or project is not None and not re.fullmatch(r'ncs_[a-f0-9]{12}', project)
-            or workload is not None and (not isinstance(workload, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', workload))):
+            or workload is not None and (not isinstance(workload, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', workload))
+            or profile not in ('pilot', 'official') or type(official_opt_in) is not bool):
         raise ValueError('session_metadata_rejected')
+    if profile == 'official' and not official_opt_in:
+        raise ValueError('official_profile_opt_in_required')
     if type(cold_replay_enabled) is not bool or cold_replay_enabled and experiment != 'E4':
+        raise ValueError('session_metadata_rejected')
+    if type(expiry_replay_enabled) is not bool or expiry_replay_enabled and experiment != 'E4':
         raise ValueError('session_metadata_rejected')
     if e4_phase_plan is None and experiment == 'E4':
         e4_phase_plan = ['unique', 'replay'] + (['cold-replay'] if cold_replay_enabled else [])
@@ -138,9 +145,14 @@ def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
             ['unique','replay','conflicts'],
             ['unique','replay','cold-replay','conflicts'],
             ['unique','replay','durable-fault','durable-reopen','conflicts'],
-            ['unique','replay','cold-replay','durable-fault','durable-reopen','conflicts'])
+            ['unique','replay','cold-replay','durable-fault','durable-reopen','conflicts'],
+            ['unique','replay','expiry-replay'],
+            ['unique','replay','durable-fault','durable-reopen','expiry-replay'],
+            ['unique','replay','conflicts','expiry-replay'])
         if (experiment != 'E4' or type(e4_phase_plan) is not list or e4_phase_plan not in allowed_plans
-                or ('cold-replay' in e4_phase_plan) != cold_replay_enabled):
+            or ('cold-replay' in e4_phase_plan) != cold_replay_enabled
+            or ('expiry-replay' in e4_phase_plan) != expiry_replay_enabled
+            or 'expiry-replay' in e4_phase_plan and 'cold-replay' in e4_phase_plan):
             raise ValueError('session_e4_phase_plan_rejected')
     if e5_phase_plan is None and experiment == 'E5':
         e5_phase_plan = ['initial', 'warm_replay', 'control']
@@ -157,13 +169,15 @@ def initialize(root, *, experiment, arm, seed, deadline_seconds, receipts,
             raise ValueError('session_already_initialized')
         now = time.time()
         state = {'schema_version': SCHEMA_VERSION, 'session_id': session_id or secrets.token_hex(16),
-            'experiment': experiment, 'arm': arm, 'seed': seed, 'project': project,
+            'experiment': experiment, 'arm': arm, 'profile': profile,
+            'seed': seed, 'project': project,
             'source_metadata': source_metadata or {}, 'image_metadata': image_metadata or {},
             'endpoint_metadata': endpoint_metadata or {},
             'preparation_status': preparation_status,
             'phase': 'PREPARING', 'created_at': now, 'deadline_at': now + float(deadline_seconds),
             'receipts': receipts, 'artifacts': artifacts or [], 'workload_outcome': 'NOT_RUN',
             'cold_replay_enabled': cold_replay_enabled,
+            'expiry_replay_enabled': expiry_replay_enabled,
             'e4_phase_plan': e4_phase_plan if experiment == 'E4' else None,
             'e5_phase_plan': e5_phase_plan if experiment == 'E5' else None,
             'phase_id': (e4_phase_plan[0] if experiment == 'E4' and e4_phase_plan else
@@ -364,7 +378,7 @@ def _consume_request(root, state):
         error = e5_phase_transition_error(state, request.get('command'), request.get('phase_id'))
     elif request.get('command') == 'next-phase' and (
             state.get('experiment') != 'E4' or state.get('phase') != 'VERIFYING'
-            or request.get('phase_id') not in ('replay', 'cold-replay','durable-fault','durable-reopen','conflicts')
+            or request.get('phase_id') not in ('replay', 'cold-replay','durable-fault','durable-reopen','conflicts','expiry-replay')
             or state.get('workload_outcome') != 'VALIDATED'
             or not isinstance(state.get('imported_result'), dict)
             or state['imported_result'].get('phase_id') != state.get('phase_id')
@@ -373,6 +387,10 @@ def _consume_request(root, state):
                 or state.get('phase_history') != ['unique'])
             or request.get('phase_id') == 'cold-replay' and (
                 state.get('cold_replay_enabled') is not True or state.get('phase_id') != 'replay'
+                or state.get('phase_history') != ['unique', 'replay']
+                or state['imported_result'].get('children_stopped_verified') is not True)
+            or request.get('phase_id') == 'expiry-replay' and (
+                state.get('expiry_replay_enabled') is not True or state.get('phase_id') != 'replay'
                 or state.get('phase_history') != ['unique', 'replay']
                 or state['imported_result'].get('children_stopped_verified') is not True)
             or not _e4_next_phase_matches(state, request.get('phase_id'))):
@@ -399,7 +417,8 @@ def _consume_request(root, state):
     return request
 
 
-def hold(root, *, poll_seconds=0.2, lock=None, on_begin=None, on_finish=None, on_next=None):
+def hold(root, *, poll_seconds=0.2, lock=None, on_begin=None, on_finish=None, on_next=None,
+         owned_guard=None):
     root = _root(root)
     if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)) or not math.isfinite(poll_seconds) or not 0 <= poll_seconds <= 1:
         raise ValueError('poll_interval_rejected')
@@ -416,6 +435,33 @@ def hold(root, *, poll_seconds=0.2, lock=None, on_begin=None, on_finish=None, on
         deadline = state.get('deadline_monotonic')
         if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
             raise ValueError('session_deadline_invalid')
+        if owned_guard is not None and not callable(owned_guard):
+            raise ValueError('owned_storage_guard_invalid')
+
+        def check_owned_guard():
+            if owned_guard is None:
+                return None
+            try:
+                result = owned_guard()
+                if not isinstance(result, dict) or type(result.get('ok')) is not bool:
+                    raise ValueError('owned_storage_measurement_unavailable')
+                state['owned_storage_guard'] = result.get('report')
+                state['owned_storage_pending_status'] = 'NOT_VERIFIED'
+                state['remote_b_stop_instruction'] = 'STOP_LOCALLY_ON_HOST_B'
+                _atomic_json(root / 'session.json', state)
+                if result['ok']:
+                    return None
+                state['primary_stop_reason'] = str(result.get('reason') or 'OWNED_STORAGE_THRESHOLD')[:120]
+            except Exception as exc:
+                state['owned_storage_guard'] = {'status': 'measurement_unavailable',
+                    'reason': str(exc.args[0])[:120] if exc.args else 'owned_storage_measurement_unavailable'}
+                state['owned_storage_pending_status'] = 'NOT_VERIFIED'
+                state['remote_b_stop_instruction'] = 'STOP_LOCALLY_ON_HOST_B'
+                state['primary_stop_reason'] = 'OWNED_STORAGE_MEASUREMENT_UNAVAILABLE'
+            state['workload_outcome'] = 'ABORTED'
+            state['workload_abort_reason'] = state['primary_stop_reason']
+            return _set_finalizing(root, state, 'ABORTED')
+
         interrupted = []
         previous = {}
         def on_signal(signum, _frame):
@@ -424,12 +470,18 @@ def hold(root, *, poll_seconds=0.2, lock=None, on_begin=None, on_finish=None, on
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, on_signal)
         try:
+            stopped_for_guard = check_owned_guard()
+            if stopped_for_guard is not None:
+                return stopped_for_guard
             while True:
                 if interrupted:
                     state['interrupted'] = True
                     return _set_finalizing(root, state, 'INTERRUPTED')
                 if time.monotonic() >= deadline:
                     return _set_finalizing(root, state, 'DEADLINE')
+                stopped_for_guard = check_owned_guard()
+                if stopped_for_guard is not None:
+                    return stopped_for_guard
                 command = _consume_request(root, state)
                 if command:
                     operation = command['command']

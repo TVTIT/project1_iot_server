@@ -76,16 +76,57 @@ def e2_pilot_manifests(*, common, targets, gateway_identity_files, telemetry_ide
             'execution': 'NOT RUN'}
 
 
-def e2_fixture_profile(*, microbatch_wait_ms):
+def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_identity_files,
+                          samples_per_message, offered_rate, duration_seconds, burst_messages=0):
+    """Build two role manifests whose rates sum to the selected run-wide offer."""
+    if (len(targets) != 2 or len({t.get('gateway_id') for t in targets}) != 2
+            or samples_per_message not in PILOT_SAMPLES or offered_rate not in OFFICIAL_RATES
+            or type(duration_seconds) is not int or duration_seconds < 1
+            or type(burst_messages) is not int or not 0 <= burst_messages <= 100000):
+        raise ValueError('e2_official_workload_rejected')
+    rates = {'A': offered_rate // 2, 'B': offered_rate - offered_rate // 2}
+    pair = {}
+    for arm, target in zip(('A', 'B'), targets):
+        if target['gateway_id'] not in gateway_identity_files or arm not in telemetry_identity_files:
+            raise ValueError('e2_gateway_credentials_mismatch')
+        pair[arm] = {**common, 'schema_version': 1, 'experiment': 'E2', 'arm': arm,
+            'run_id': f"{common.get('run_id', 'e2')}-{samples_per_message}-{offered_rate}",
+            'profile': 'official', 'roles': ['telemetry'], 'seed': common.get('seed', PILOT_SEED),
+            'samples_per_message': samples_per_message, 'targets': [dict(target)], 'subscriptions': [],
+            'topology': {'gateways': 1, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
+            'traffic': {'rate_per_second': rates[arm], 'total_rate_per_second': offered_rate,
+                        'ramp_seconds': 0, 'burst_messages': burst_messages if arm == 'B' else 0},
+            'phases': {'warmup_seconds': 0, 'measure_seconds': duration_seconds,
+                       'drain_seconds': 30, 'cooldown_seconds': 0},
+            'limits': {'retries': 16, 'workers': 2, 'connections': 1,
+                       'pending_messages': 64, 'pending_bytes': 1 << 20,
+                       'disk_growth_bytes': 10 << 30, 'wall_seconds': duration_seconds + 60},
+            'gateway_identity_files': {target['gateway_id']: gateway_identity_files[target['gateway_id']]},
+            'identity_files': {'telemetry': telemetry_identity_files[arm]},
+            'durability_mode': 'synthetic-load', 'retry_interval_ms': 500}
+    return {'profiles': {str(samples_per_message): pair}, 'profile': 'official',
+            'offered_rate_per_second': offered_rate, 'producer_rates_per_second': rates,
+            'duration_seconds': duration_seconds, 'unique_messages_per_profile': offered_rate * duration_seconds,
+            'raw_rows_per_profile': offered_rate * duration_seconds * samples_per_message,
+            'execution': 'NOT RUN'}
+
+
+def e2_fixture_profile(*, microbatch_wait_ms, profile='pilot', offered_rate=2,
+                       burst_messages=4, samples_per_message=1):
     """Proposed next-fixture-only flags/caps; does not mutate deployment defaults."""
     if microbatch_wait_ms not in (50, 100):
         raise ValueError('e2_microbatch_wait_rejected')
+    if profile not in ('pilot','official') or samples_per_message not in PILOT_SAMPLES:
+        raise ValueError('e2_fixture_profile_rejected')
+    rate = (offered_rate + 1) // 2 if profile == 'official' else 2
+    burst = max((burst_messages + 1) // 2, rate) if profile == 'official' else 4
+    max_rows = min(500, max(1, rate * samples_per_message)) if profile == 'official' else 500
     return {'effective_fixture_flags': {'MQTT_SHAPER_ENABLED': True,
             'MQTT_MICROBATCH_ENABLED': True, 'MQTT_RAM_DEDUP_ENABLED': False,
             'STAGE5_ENABLED': False, 'STAGE5_WAKEUP_ENABLED': False,
             'WEBSOCKET_ENABLED': False},
-            'shaper': {'rate_per_second': 2, 'burst': 4},
-            'microbatch': {'max_messages': 32, 'max_rows': 500,
+            'shaper': {'rate_per_second': rate, 'burst': burst},
+            'microbatch': {'max_messages': 32, 'max_rows': max_rows,
                            'max_bytes': 4 << 20, 'wait_ms': microbatch_wait_ms},
             'scope': 'proposed disposable E2 fixture only; deployment defaults unchanged'}
 
@@ -94,12 +135,23 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
                    session_id, samples_per_message, output_root, bundle_root,
                    arm='E2-pilot', workload='steady_burst', context_path=None,
                    reference_path=None, context=None, grace_seconds=10,
-                   check_freshness=True, now_utc=None):
+                   check_freshness=True, now_utc=None, profile='pilot',
+                   official_opt_in=False, offered_rate=100, duration_seconds=10,
+                   burst_messages=0):
     """Prepare one bounded E2 profile for the existing A/B helper lifecycle."""
     if samples_per_message not in PILOT_SAMPLES:
         raise ValueError('e2_samples_profile_rejected')
     if workload not in ('steady_burst', 'equal_samples'):
         raise ValueError('e2_workload_rejected')
+    if profile not in ('pilot', 'official'):
+        raise ValueError('e2_profile_rejected')
+    if profile == 'official' and not official_opt_in:
+        raise ValueError('official_profile_requires_opt_in')
+    if profile == 'official' and workload != 'steady_burst':
+        raise ValueError('official_equal_samples_not_supported')
+    estimate = (e2_official_estimate(rate_per_second=offered_rate,
+        duration_seconds=duration_seconds, samples_per_message=samples_per_message,
+        payload_bytes=4096, official_opt_in=True) if profile == 'official' else None)
 
     validated_ctx = None
     if workload == 'equal_samples':
@@ -157,8 +209,12 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
             'tls': {'https_endpoint': endpoint.url, 'https_ca_file': str(endpoint.ca_file),
                 'mqtt_tls_endpoint': f'mqtts://{mqtt_host}:{published}',
                 'mqtt_tls_ca_file': str(ca_path), 'mqtt_tls_server_name': 'localhost'}}
-        manifests = e2_pilot_manifests(common=common, targets=targets,
-            gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files)
+        manifests = (e2_official_manifests(common=common, targets=targets,
+            gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files,
+            samples_per_message=samples_per_message, offered_rate=offered_rate,
+            duration_seconds=duration_seconds, burst_messages=burst_messages)
+            if profile == 'official' else e2_pilot_manifests(common=common, targets=targets,
+            gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files))
         pair = manifests['profiles'][str(samples_per_message)]
         phase_id = f'samples-{samples_per_message}'
         expected_counts = None
@@ -185,9 +241,11 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
         manifest_paths[role_arm] = path
     plan_root = root / 'plan'
     plan = build_e2_execution_plan(output_dir=plan_root, manifest_a=manifest_paths['A'],
-                                   manifest_b=manifest_paths['B'], seed=seed)
+                                   manifest_b=manifest_paths['B'], seed=seed,
+                                   profile=profile, official_opt_in=official_opt_in)
     prepared = {'session_id': session_id, 'run_id': run_id, 'arm': arm,
-        'samples_per_message': samples_per_message, 'profile': 'pilot', 'workload': workload,
+        'samples_per_message': samples_per_message, 'profile': profile, 'workload': workload,
+        'official_estimate': estimate,
         'root': root, 'bundle_root': Path(bundle_root), 'plan': plan, 'manifest_paths': manifest_paths,
         'manifests': pair, 'pg': pg, 'quota': quota, 'effective': effective,
         'resources': resources, 'storage_status': storage_status, 'tokens': tokens,
@@ -276,11 +334,33 @@ def export_prepared_bundle(prepared, *, wait_seconds=90, workload_seconds=None):
         }
     else:
         eff_workload_seconds = workload_seconds if workload_seconds is not None else 30
-        workload = {'experiment': 'E2', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
-            'profile': 'pilot', 'workload': 'e2-telemetry-ab-pilot', 'seed': PILOT_SEED,
-            'samples_per_message': prepared['samples_per_message'], 'unique_batches': 24,
-            'rate_per_second': 1, 'measure_seconds': 8, 'offered_messages': 24,
-            'generator_colocated': 'unverified'}
+        if prepared['profile'] == 'official':
+            a, b = prepared['manifests']['A'], prepared['manifests']['B']
+            offered = a['traffic']['total_rate_per_second']
+            duration = a['phases']['measure_seconds']
+            workload = {'experiment': 'E2', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
+                'profile': 'official', 'workload': 'e2-telemetry-ab-official', 'seed': prepared['seed'],
+                'samples_per_message': prepared['samples_per_message'],
+                'producer_rates_per_second': {'A': a['traffic']['rate_per_second'],
+                                              'B': b['traffic']['rate_per_second']},
+                'offered_rate_per_second': offered, 'measure_seconds': duration,
+                'burst_messages': b['traffic']['burst_messages'],
+                'expected_counts': prepared['plan']['expected_counts'],
+                'estimate': prepared['official_estimate'], 'durability_mode': 'synthetic-load',
+                'generator_colocated': 'unverified'}
+            eff_workload_seconds = duration + 60 if workload_seconds is None else workload_seconds
+        else:
+            a, b = prepared['manifests']['A'], prepared['manifests']['B']
+            official = prepared['profile'] == 'official'
+            workload = {'experiment': 'E2', 'arm': prepared['arm'], 'phase': prepared['phase_id'],
+                'profile': 'official' if official else 'pilot',
+                'workload': 'e2-telemetry-ab-official' if official else 'e2-telemetry-ab-pilot',
+                'seed': prepared['seed'], 'samples_per_message': prepared['samples_per_message'],
+                'unique_batches': prepared['plan']['expected_counts']['unique'] if official else 24,
+                'rate_per_second': a['traffic']['total_rate_per_second'] if official else 1,
+                'measure_seconds': a['phases']['measure_seconds'] if official else 8,
+                'offered_messages': prepared['plan']['expected_counts']['unique'] if official else 24,
+                'generator_colocated': 'unverified'}
     return paper_p8_bundle.export_bundle(output_leaf=prepared['bundle_root'],
         session_id=prepared['session_id'], experiment='E2', arm=prepared['arm'],
         phase=prepared['phase_id'], manifests=manifests, identity_files=identities,
@@ -295,7 +375,7 @@ class EqualSamplesCompactSampler:
     """Bounded compact rolling sampler for equal_samples server-side metrics.
 
     Maintains baseline and terminal snapshots strictly outside the ring buffer.
-    Retains up to max_snapshots (default <= 3600, interval 1s) in a rolling deque,
+    Retains a finite rolling window (up to 20,000 snapshots) in a rolling deque,
     evicting the oldest entries when either the snapshot count or the explicit byte cap
     is exceeded. Records coverage, timestamps, errors, and evicted count/bytes.
     """
@@ -305,11 +385,11 @@ class EqualSamplesCompactSampler:
                  wall_fn=lambda: datetime.now(timezone.utc).isoformat()):
         if not (0.1 <= interval <= 5.0):
             raise ValueError('sampler_interval_out_of_bounds')
-        if not (2 <= max_snapshots <= 3600):
+        if not (2 <= max_snapshots <= 20000):
             raise ValueError('sampler_max_snapshots_out_of_bounds')
         if not (1024 <= byte_cap <= 16 * 1024 * 1024):
             raise ValueError('sampler_byte_cap_out_of_bounds')
-        if not (5.0 <= deadline_seconds <= 3600.0):
+        if not (5.0 <= deadline_seconds <= 86400.0):
             raise ValueError('sampler_deadline_out_of_bounds')
 
         self.scrape = scrape
@@ -1450,6 +1530,29 @@ def calculate_canonical_database_delta(before, after):
     return delta
 
 
+def e2_database_counter_window(baseline, terminal):
+    """Return real backend persistence-counter deltas, never ledger-derived counts."""
+    fields = ('begin_attempts', 'begin_succeeded', 'confirmed_commits', 'copy_calls',
+              'copy_returned_rows', 'confirmed_new_rows', 'fallback_attempts',
+              'rollback_attempts', 'confirmed_rollbacks', 'commit_unconfirmed')
+    if not isinstance(baseline, dict) or not isinstance(terminal, dict):
+        return {'available': False, 'reason': 'db_counter_snapshot_missing', 'deltas': {}}
+    before_p, after_p = baseline.get('persistence'), terminal.get('persistence')
+    if not isinstance(before_p, dict) or not isinstance(after_p, dict):
+        return {'available': False, 'reason': 'db_counter_snapshot_missing', 'deltas': {}}
+    before_instance, after_instance = baseline.get('process_instance'), terminal.get('process_instance')
+    if not before_instance or not after_instance or before_instance != after_instance:
+        return {'available': False, 'reason': 'process_instance_missing_or_changed', 'deltas': {}}
+    deltas = {}
+    for field in fields:
+        b, a = before_p.get(field), after_p.get(field)
+        if type(b) is not int or type(a) is not int or b < 0 or a < b:
+            return {'available': False, 'reason': 'db_counter_missing_or_reset:' + field, 'deltas': {}}
+        deltas[field] = a - b
+    return {'available': True, 'reason': None, 'process_instance': before_instance,
+            'deltas': deltas}
+
+
 def _target_counts(smoke, registry, pg, spec):
     sql = """SELECT json_build_object(
  'ledger',(SELECT count(*) FROM processed_messages WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
@@ -1526,9 +1629,15 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             counts['configuration'] = (after_targets[index]['configuration']
                                        - prepared['before_targets'][index]['configuration'])
             by_gateway[spec.gateway_id] = counts
-            producer_ids = [sample['message_id'] for sample in imported[role].get('identity_samples', [])
-                            if isinstance(sample, dict) and isinstance(sample.get('message_id'), str)]
-            raw.append(verify_pilot_raw(smoke, registry, prepared['pg'], spec, message_ids=producer_ids))
+            if prepared.get('profile') == 'official':
+                raw.append({'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id,
+                    'ledger_count': counts.get('ledger'), 'raw_count': counts.get('raw'),
+                    'verified_exact': False, 'count_verified': True,
+                    'verification_scope': 'transactional scoped DB delta; not per-row content audit'})
+            else:
+                producer_ids = [sample['message_id'] for sample in imported[role].get('identity_samples', [])
+                                if isinstance(sample, dict) and isinstance(sample.get('message_id'), str)]
+                raw.append(verify_pilot_raw(smoke, registry, prepared['pg'], spec, message_ids=producer_ids))
     ingress = _support.calculate_ingress_delta(prepared['baseline'], after_admin)
     runner = imported['runner']
     events = runner.get('phase_observations', {}).get('events', [])
@@ -1536,6 +1645,8 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         'samples_per_message': prepared['samples_per_message'],
         'role_to_target': mapping,
     }
+    if prepared.get('profile') == 'official':
+        exec_ctx.update(profile='official', role_manifests=prepared['manifests'])
 
     # Generator resources on B (ES.5b)
     gen_data = imported.get('generator_resources') or prepared.get('generator_resources')
@@ -1615,6 +1726,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         # Genuine cumulative transaction commit counter baseline->terminal if retained and monotonic
         base_pers = baseline_snap.get('persistence', {}) if isinstance(baseline_snap, dict) else {}
         term_pers = terminal_snap.get('persistence', {}) if isinstance(terminal_snap, dict) else {}
+        db_counter_window = e2_database_counter_window(baseline_snap, terminal_snap)
         base_commits = base_pers.get('confirmed_commits')
         term_commits = term_pers.get('confirmed_commits')
 
@@ -1736,7 +1848,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
                     t_cpu = t_svcs.get(svc, {}).get('cpu_cumulative_seconds') if isinstance(t_svcs.get(svc), dict) else None
                     key = 'db' if svc == 'postgres' else ('broker' if svc == 'mosquitto' else ('proxy' if svc == 'nginx' else svc))
                     if isinstance(b_cpu, (int, float)) and isinstance(t_cpu, (int, float)):
-                        server_res['lifecycle_cpu_seconds'][key] = max(0.0, t_cpu - b_cpu)
+                        server_res['lifecycle_cpu_seconds'][key] = (t_cpu - b_cpu) if t_cpu >= b_cpu else None
                 if all(server_res['lifecycle_cpu_seconds'][k] is not None for k in ('backend', 'db', 'broker', 'proxy')):
                     server_res['lifecycle_cpu_seconds']['total'] = sum(server_res['lifecycle_cpu_seconds'][k] for k in ('backend', 'db', 'broker', 'proxy'))
 
@@ -1756,7 +1868,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         eff_flags = prepared.get('effective_flags')
         if not eff_flags and prepared.get('effective'):
             try:
-                eff_flags = _validate_fixture_flags(prepared['effective'])
+                eff_flags = _validate_fixture_flags(prepared['effective'], fixture)
             except Exception:
                 eff_flags = None
         if not eff_flags:
@@ -1807,6 +1919,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             'ingress_delta': ingress,
             'validation': validation,
             'measurement_quality': measurement_quality,
+            'database_counter_window': db_counter_window,
             'normalized_metrics': measurement_quality.get('normalized_metrics'),
             'resources': resources_dict,
             'collector_errors': collector.errors,
@@ -1868,9 +1981,12 @@ def _load_e2_result_bundle(results_root, prepared, paperload_binary):
         raise ValueError('e2_result_summary_rejected')
     summary = json.loads(summary_path.read_text())
     expected_roles = ['A', 'B']
-    if (summary.get('session') != {'session_id': prepared['session_id'],
+    expected_session = {'session_id': prepared['session_id'],
             'run_ids': [prepared['run_id']], 'experiment': 'E2', 'arm': prepared['arm'],
-            'phase': prepared['phase_id']} or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
+            'phase': prepared['phase_id']}
+    portable_session = {**expected_session, 'profile': prepared['profile']}
+    if (summary.get('session') not in (expected_session, portable_session)
+            or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
             or summary.get('expected_workload_roles') != expected_roles
             or summary.get('present_workload_roles') != expected_roles
             or summary.get('missing_workload_roles') != [] or summary.get('physical_ab') != 'NOT RUN'
@@ -2173,6 +2289,16 @@ def build_e2_execution_plan(*, output_dir, manifest_a, manifest_b, seed=None,
                     or m.get('limits', {}).get('workers') != 2
                     or m.get('limits', {}).get('connections') != 1):
                 raise ValueError('e2_pilot_bounds_rejected')
+            if profile == 'official':
+                traffic, phases = m.get('traffic'), m.get('phases')
+                if (m.get('samples_per_message') not in PILOT_SAMPLES
+                        or type(m.get('samples_per_message')) is not int
+                        or not isinstance(traffic, dict) or type(traffic.get('rate_per_second')) is not int
+                        or type(traffic.get('total_rate_per_second')) is not int
+                        or traffic.get('total_rate_per_second') not in OFFICIAL_RATES
+                        or type(phases.get('measure_seconds')) is not int or phases['measure_seconds'] < 1
+                        or traffic.get('burst_messages', -1) < 0):
+                    raise ValueError('e2_official_bounds_rejected')
         loaded[arm] = m
 
     a, b = loaded['A'], loaded['B']
@@ -2186,8 +2312,20 @@ def build_e2_execution_plan(*, output_dir, manifest_a, manifest_b, seed=None,
     if a.get('limits', {}).get('connections') != 1:
         raise ValueError('e2_connection_bound_rejected')
     if a.get('traffic', {}).get('rate_per_second') != b.get('traffic', {}).get('rate_per_second'):
-        raise ValueError('e2_rate_mismatch')
-    if is_equal_samples:
+        if profile != 'official':
+            raise ValueError('e2_rate_mismatch')
+    stop_timeout_seconds = 30
+    if profile == 'official':
+        if (a['traffic']['total_rate_per_second'] != b['traffic']['total_rate_per_second']
+                or a['traffic']['rate_per_second'] + b['traffic']['rate_per_second']
+                    != a['traffic']['total_rate_per_second']
+                or a['phases']['measure_seconds'] != b['phases']['measure_seconds']):
+            raise ValueError('e2_official_rate_distribution_mismatch')
+    if profile == 'official':
+        # The lifecycle stop/drain budget is deliberately independent from the
+        # (potentially two-hour) producer wall. Bundle validation caps it at 300s.
+        stop_timeout_seconds = 30
+    elif is_equal_samples:
         eq_a = a['equal_samples']
         eq_b = b['equal_samples']
         if eq_a['context_sha256'] != eq_b['context_sha256']:
@@ -2207,16 +2345,27 @@ def build_e2_execution_plan(*, output_dir, manifest_a, manifest_b, seed=None,
                         'ready_timeout_seconds': 90})
     if is_equal_samples:
         duration_seconds = a['equal_samples']['duration_seconds']
-        stop_timeout_seconds = a.get('limits', {}).get('wall_seconds', duration_seconds + 30)
-    else:
+        # Workload wall governs production only; shutdown/drain remains bounded.
         stop_timeout_seconds = 30
-    spec = {'paperload': outputs, 'stop_timeout_seconds': stop_timeout_seconds}
+    from scripts.paper_p8_resources import disk_guard_config
+    spec = {'paperload': outputs, 'stop_timeout_seconds': stop_timeout_seconds,
+            'disk_guard': disk_guard_config([a, b])}
     run_spec = root / 'e2-run-spec.json'
     with run_spec.open('x', encoding='utf-8') as out:
         json.dump(spec, out, sort_keys=True, indent=2)
     run_spec.chmod(0o600)
     return {'run_spec': str(run_spec), 'roles': ['telemetry:A', 'telemetry:B'],
-            'seed': effective_seed, 'execution': 'NOT RUN', 'official_opt_in': bool(official_opt_in)}
+            'seed': effective_seed, 'execution': 'NOT RUN', 'official_opt_in': bool(official_opt_in),
+            'profile': profile,
+            'expected_counts': ({'unique': a['traffic']['total_rate_per_second'] * a['phases']['measure_seconds']
+                    + b['traffic'].get('burst_messages', 0),
+                'raw': (a['traffic']['total_rate_per_second'] * a['phases']['measure_seconds']
+                    + b['traffic'].get('burst_messages', 0)) * a['samples_per_message'],
+                'temporal': a['traffic']['total_rate_per_second'] * a['phases']['measure_seconds']
+                    + b['traffic'].get('burst_messages', 0),
+                'ack': a['traffic']['total_rate_per_second'] * a['phases']['measure_seconds']
+                    + b['traffic'].get('burst_messages', 0)}
+                if profile == 'official' else None)}
 
 
 def e2_official_estimate(*, rate_per_second, duration_seconds, samples_per_message,
@@ -2825,7 +2974,17 @@ def validate_e2_result(*, workload_a, workload_b, ingress_delta, database_delta,
     samples = execution_context.get('samples_per_message') if isinstance(execution_context, dict) else None
     if samples not in PILOT_SAMPLES:
         failures.append('samples_per_message_missing_or_invalid')
-    for arm, counters, expected in (('A', ca, 8), ('B', cb, 16)):
+    manifest_pair = execution_context.get('role_manifests') if isinstance(execution_context, dict) else None
+    if isinstance(manifest_pair, dict) and set(manifest_pair) == {'A', 'B'}:
+        expected_by_role = {arm: (m['traffic']['rate_per_second'] * m['phases']['measure_seconds']
+            + m['traffic'].get('burst_messages', 0)) for arm, m in manifest_pair.items()}
+        official = execution_context.get('profile') == 'official'
+    else:
+        expected_by_role = {'A': 8, 'B': 16}
+        official = False
+    expected_total_messages = sum(expected_by_role.values())
+    for arm, counters in (('A', ca), ('B', cb)):
+        expected = expected_by_role[arm]
         for field, value in (('generated_unique', expected), ('offered_unique', expected),
                              ('application_acks', expected), ('pending_messages', 0), ('pending_bytes', 0)):
             if counters.get(field) != value: failures.append(f'{arm}_{field}')
@@ -2834,7 +2993,8 @@ def validate_e2_result(*, workload_a, workload_b, ingress_delta, database_delta,
         if (type(attempts) is not int or type(retries) is not int or retries < 0
                 or retries > attempts or type(invalid_acks) is not int or invalid_acks != 0):
             failures.append(f'{arm}_retry_or_invalid_ack_metrics')
-    for arm, counters, minimum in (('A', ca, 8), ('B', cb, 16)):
+    for arm, counters in (('A', ca), ('B', cb)):
+        minimum = expected_by_role[arm]
         for field in ('publish_attempts', 'broker_pubacks'):
             value = counters.get(field)
             if type(value) is not int or value < minimum: failures.append(f'{arm}_{field}')
@@ -2854,8 +3014,9 @@ def validate_e2_result(*, workload_a, workload_b, ingress_delta, database_delta,
         except ValueError as exc:
             phase = {'available': None, 'reason': str(exc)}
             failures.append('phase_overlap_inconclusive')
-    expected_total = {'ledger': 24, 'raw': 24 * samples if samples in PILOT_SAMPLES else None,
-                      'temporal': 24, 'configuration': 0}
+    expected_total = {'ledger': expected_total_messages,
+                      'raw': expected_total_messages * samples if samples in PILOT_SAMPLES else None,
+                      'temporal': expected_total_messages, 'configuration': 0}
     if database_delta != expected_total: failures.append('database_delta_mismatch')
     mapping = execution_context.get('role_to_target') if isinstance(execution_context, dict) else None
     mapped_a_gateway = mapping.get('A', {}).get('gateway_id') if isinstance(mapping, dict) and isinstance(mapping.get('A'), dict) else None
@@ -2869,53 +3030,77 @@ def validate_e2_result(*, workload_a, workload_b, ingress_delta, database_delta,
     elif (isinstance(mapping, dict) and set(mapping) == {'A', 'B'} and
             all(isinstance(mapping.get(arm), dict) and mapping[arm].get('gateway_id') for arm in ('A', 'B')) and
             set(database_by_gateway) == {mapping['A']['gateway_id'], mapping['B']['gateway_id']}):
-        expected_scopes = {mapping['A']['gateway_id']: 8, mapping['B']['gateway_id']: 16}
+        expected_scopes = {mapping[arm]['gateway_id']: expected_by_role[arm] for arm in ('A', 'B')}
         if samples not in PILOT_SAMPLES or any(database_by_gateway[g] != {'ledger': n, 'raw': n * samples,
                 'temporal': n, 'configuration': 0} for g, n in expected_scopes.items()):
             failures.append('database_gateway_delta_mismatch')
     else:
         failures.append('database_gateway_scope_mismatch')
-    if (not isinstance(raw_verification, list) or len(raw_verification) != 2 or
-            any(not isinstance(row, dict) or not row.get('verified_exact') or
-                row.get('ledger_count') not in (8, 16) or
-                (row.get('ledger_count') != (8 if row.get('gateway_id') == mapped_a_gateway else 16)) or
-                not isinstance(mapping, dict) or row.get('gateway_id') not in
-                (mapping.get('A', {}).get('gateway_id'), mapping.get('B', {}).get('gateway_id')) or
-                (row.get('gateway_id'), row.get('sensor_id')) not in
-                    ((mapping.get('A', {}).get('gateway_id'), mapping.get('A', {}).get('sensor_id')),
-                     (mapping.get('B', {}).get('gateway_id'), mapping.get('B', {}).get('sensor_id')))
-                for row in raw_verification) or
-            (isinstance(raw_verification, list) and len({r.get('gateway_id') for r in raw_verification
-             if isinstance(r, dict)}) != 2) or
-            (isinstance(raw_verification, list) and sorted(r.get('ledger_count') for r in raw_verification
-             if isinstance(r, dict)) != [8, 16])):
-        failures.append('pilot_raw_retention_verification')
+    if official:
+        raw_ok = (isinstance(raw_verification, list) and len(raw_verification) == 2 and
+            all(isinstance(row, dict) and row.get('count_verified') is True and
+                row.get('ledger_count') == expected_by_role[arm] and
+                row.get('raw_count') == expected_by_role[arm] * samples and
+                row.get('gateway_id') == mapping[arm].get('gateway_id') and
+                row.get('sensor_id') == mapping[arm].get('sensor_id') for arm, row in zip(('A','B'), raw_verification)))
+    else:
+        raw_ok = isinstance(raw_verification, list) and len(raw_verification) == 2
+        if raw_ok:
+            for row in raw_verification:
+                arm = next((a for a in ('A','B') if mapping.get(a, {}).get('gateway_id') == row.get('gateway_id')),
+                           None) if isinstance(row, dict) and isinstance(mapping, dict) else None
+                if (arm is None or row.get('verified_exact') is not True
+                        or row.get('ledger_count') != expected_by_role[arm]
+                        or row.get('sensor_id') != mapping[arm].get('sensor_id')):
+                    raw_ok = False
+                    break
+        if raw_ok:
+            raw_ok = (len({r.get('gateway_id') for r in raw_verification}) == 2
+                      and sorted(r.get('ledger_count') for r in raw_verification)
+                          == sorted(expected_by_role.values()))
+    if not raw_ok:
+        failures.append('official_raw_counts_mismatch' if official else 'pilot_raw_retention_verification')
     ingress = ingress_delta.get('delta') if isinstance(ingress_delta, dict) and ingress_delta.get('available') else None
     if ingress is None:
         received = admitted = rejected = drops = {'available': None, 'reason': 'ingress_delta_unavailable'}
     else:
-        for field, minimum in (('Committed', 24), ('SamplesNew', expected_total['raw'])):
+        for field, minimum in (('Committed', expected_total_messages), ('SamplesNew', expected_total['raw'])):
             if minimum is None or type(ingress.get(field)) is not int or ingress[field] != minimum:
                 failures.append('ingress_' + field)
-        for field, minimum in (('ACKPublished', 24), ('Received', 24), ('Accepted', 24)):
+        for field, minimum in (('ACKPublished', expected_total_messages), ('Received', expected_total_messages), ('Accepted', expected_total_messages)):
             if type(ingress.get(field)) is not int or ingress[field] < minimum:
                 failures.append('ingress_' + field)
+        if type(ingress.get('DuplicateCommitted')) is not int or ingress.get('DuplicateCommitted', -1) < 0:
+            failures.append('ingress_metric_DuplicateCommitted')
         for field in ('RejectedNotRunning','RejectedStopping','RejectedRetained','RejectedOversized',
                       'RejectedInvalidTopic','QueueFull','ByteBudgetFull','ShaperRateLimited'):
             if type(ingress.get(field)) is not int or ingress[field] < 0:
                 failures.append('ingress_metric_' + field)
-        if type(ingress.get('ShaperRateLimited')) is not int or ingress.get('ShaperRateLimited', 0) <= 0:
+        if not official and (type(ingress.get('ShaperRateLimited')) is not int or ingress.get('ShaperRateLimited', 0) <= 0):
             failures.append('ingress_burst_not_rate_limited')
         received = {'available': ingress.get('Received')}
         admitted = {'available': ingress.get('Accepted')}
         rejected = {'available': {k: ingress.get(k) for k in ('RejectedNotRunning','RejectedStopping','RejectedRetained','RejectedOversized','RejectedInvalidTopic','QueueFull','ByteBudgetFull','ShaperRateLimited')}}
         drops = {'available': ingress.get('ShaperRateLimited')}
     if ingress is None: failures.append('ingress_delta_unavailable')
+    def counter_sum(field):
+        left, right = ca.get(field), cb.get(field)
+        return left + right if type(left) is int and type(right) is int else None
     return {'valid': not failures, 'failures': failures,
             'availability': 'available' if phase.get('available') and ingress is not None else 'inconclusive',
             'phase_overlap': phase, 'received': received, 'admitted': admitted,
             'rejected': rejected, 'actual_shaper_drops': drops,
-            'database_expected': expected_total, 'queue_histogram_windows': histogram_windows,
+             'database_expected': expected_total, 'queue_histogram_windows': histogram_windows,
+             'actual_accounting': {'generated_unique': counter_sum('generated_unique'),
+                 'offered_unique': counter_sum('offered_unique'),
+                 'publish_attempts': counter_sum('publish_attempts'),
+                 'broker_pubacks': counter_sum('broker_pubacks'),
+                 'retries': counter_sum('retries'),
+                 'application_acks': counter_sum('application_acks'),
+                 'committed_unique': ingress.get('Committed') if isinstance(ingress, dict) else None,
+                 'duplicate_committed': ingress.get('DuplicateCommitted') if isinstance(ingress, dict) else None,
+                 'pending_messages': counter_sum('pending_messages'),
+                 'pending_bytes': counter_sum('pending_bytes')},
             'resource_roles': resources, 'fairness': {'status': 'not_proven',
                 'reason': 'runner phase events provide timestamps, not cross-child counter snapshots'},
              'durability': 'synthetic-load; not durable gateway outbox'}
@@ -2930,13 +3115,18 @@ def _safe_flags(effective):
     return {key: env[key] for key in allowed if key in env}
 
 
-def _validate_fixture_flags(effective):
+def _validate_fixture_flags(effective, fixture=None):
     flags = _safe_flags(effective)
     expected = {'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
         'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
         'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
-        'MQTT_SHAPER_RATE_PER_SECOND': '2', 'MQTT_SHAPER_BURST': '4',
-        'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+            'MQTT_SHAPER_RATE_PER_SECOND': str((getattr(fixture, 'paper_p8_e2_offered_rate', 2) + 1)//2
+            if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 2),
+        'MQTT_SHAPER_BURST': str(max((getattr(fixture, 'paper_p8_e2_burst_messages', 0) + 1)//2,
+            (getattr(fixture, 'paper_p8_e2_offered_rate', 2) + 1)//2) if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 4),
+        'MQTT_MICROBATCH_MAX_MESSAGES': '32',
+        'MQTT_MICROBATCH_MAX_ROWS': str(min(500, max(1, ((getattr(fixture, 'paper_p8_e2_offered_rate', 2) + 1)//2)
+            * getattr(fixture, 'paper_p8_e2_samples_per_message', 1))) if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 500),
         'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20), 'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
     normalized = {key: str(value).lower() for key, value in flags.items()}
     if any(normalized.get(key) != value for key, value in expected.items()):
@@ -3028,9 +3218,12 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
         with log.open('xb') as stream:
             log.chmod(0o600)
             try:
-                proc = subprocess.Popen(['python3', str(smoke.ROOT / 'scripts/paper_p8.py'), '--run',
+                runner_command = ['python3', str(smoke.ROOT / 'scripts/paper_p8.py'), '--run',
                     '--binary', str(paperload_binary), '--run-spec', plan['run_spec'],
-                    '--run-artifact', str(plan_dir / 'run.json')], cwd=smoke.ROOT,
+                    '--run-artifact', str(plan_dir / 'run.json')]
+                if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official':
+                    runner_command.append('--official-opt-in')
+                proc = subprocess.Popen(runner_command, cwd=smoke.ROOT,
                     stdout=stream, stderr=subprocess.STDOUT, env=smoke.process_env(fixture), close_fds=True)
                 collector.start(proc.pid)
                 try:
@@ -3151,8 +3344,13 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
         resources_path = fixture.artifacts / f'resources-{sample_key}.csv'
         smoke.paper_p1_resources_csv(resources_path, collector.resources + [terminal_server], {})
     result = {'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP', 'profiles': profiles,
-        'schema': schema, 'quota': quota, 'effective_flags': _validate_fixture_flags(effective),
-        'fixture_profile': e2_fixture_profile(microbatch_wait_ms=50), 'storage_status': storage_status,
+        'schema': schema, 'quota': quota, 'effective_flags': _validate_fixture_flags(effective, fixture),
+        'fixture_profile': e2_fixture_profile(microbatch_wait_ms=50,
+            profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
+            offered_rate=getattr(fixture, 'paper_p8_e2_offered_rate', 2),
+            burst_messages=getattr(fixture, 'paper_p8_e2_burst_messages', 4),
+            samples_per_message=getattr(fixture, 'paper_p8_e2_samples_per_message', 1)),
+        'storage_status': storage_status,
         'source_revision': smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'),
         'source_fingerprint': _support._source_fingerprint(smoke.ROOT),
         'binary_sha256': hashlib.sha256(Path(paperload_binary).read_bytes()).hexdigest(),

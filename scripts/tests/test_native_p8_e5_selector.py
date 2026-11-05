@@ -159,6 +159,19 @@ class E5SelectorTests(unittest.TestCase):
         report['phases']['initial']['database_delta']['raw'] = 1999
         self.assertFalse(smoke.paper_p8_e5_acceptance(report, {}, True))
 
+        report['phases']['initial']['database_delta']['raw'] = 800
+        report['phases']['initial']['database_delta'].update(ledger=8, temporal=8)
+        report['phases']['initial']['e4']['journal_entry_count'] = 8
+        report['phases']['warm_replay']['e4']['journal_entry_count'] = 2
+        report['accounting'].update(imported_input=8, warm_replay=2)
+        report['metadata']['workload'] = {
+            'schedule': {'initial_imported_messages': 8, 'warm_replay_prefix': 2},
+            'telemetry': {'messages': 8, 'samples_per_message': 100},
+        }
+        self.assertTrue(smoke.paper_p8_e5_acceptance(report, {'arm': 'optimized'}, True))
+        report['phases']['warm_replay']['e4']['journal_entry_count'] = 3
+        self.assertFalse(smoke.paper_p8_e5_acceptance(report, {'arm': 'optimized'}, True))
+
     def test_driver_prepare_only_creates_repeat_context_without_native_invocation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / 'scratch'

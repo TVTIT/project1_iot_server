@@ -24,13 +24,13 @@ from scripts import paper_p8_server as server
 from datetime import datetime, timezone, timedelta
 
 def _make_sample_context():
-    anchor = datetime(2026, 10, 31, 0, 0, 0, tzinfo=timezone.utc)
-    now_utc = anchor + timedelta(seconds=120)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    anchor = now_utc - timedelta(seconds=120)
     return e2.build_e2_equal_samples_context(
         total_samples=6000,
         sample_rate=100,
         seed=42,
-        timestamp_anchor='2026-10-31T00:00:00Z',
+        timestamp_anchor=anchor.strftime('%Y-%m-%dT%H:%M:%SZ'),
         max_context_age_seconds=86400,
         now_utc=now_utc,
     )
@@ -396,7 +396,7 @@ class E2ReferenceReuseTests(unittest.TestCase):
             support_mock = SimpleNamespace(_source_fingerprint=lambda root: dict(self.source_fp))
 
             # Case A: S=1 was first, now running S=100 with S=1 reference
-            ref_s1, _, _ = _make_sample_reference(td_path / 'run_s1', samples_per_message=1)
+            ref_s1, _, _ = _make_sample_reference(td_path / 'run_s1', samples_per_message=1, context=self.ctx)
             fix_s100 = smoke.prepare(
                 td_path / 'fix_s100',
                 paper_p8_e2=True,
@@ -410,7 +410,7 @@ class E2ReferenceReuseTests(unittest.TestCase):
                 self.assertEqual(loaded['report']['samples_per_message'], 1)
 
             # Case B: S=100 was first, now running S=1 with S=100 reference
-            ref_s100, _, _ = _make_sample_reference(td_path / 'run_s100', samples_per_message=100)
+            ref_s100, _, _ = _make_sample_reference(td_path / 'run_s100', samples_per_message=100, context=self.ctx)
             fix_s1 = smoke.prepare(
                 td_path / 'fix_s1',
                 paper_p8_e2=True,

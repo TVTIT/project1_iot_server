@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 import subprocess
 import sqlite3
@@ -25,7 +26,8 @@ verify_pilot_raw = _support.verify_pilot_raw
 
 
 def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
-                        unique_window, replay_window, cache_mode):
+                        unique_window, replay_window, cache_mode, unique_count=20,
+                        replay_count=10, samples_per_message=100):
     """Validate actual Go result JSON and separated same-process accounting windows."""
     failures = []
     if cache_mode not in ('on', 'off'):
@@ -39,34 +41,34 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
             failures.append(label + '_cleanup_failure')
     uc = unique.get('telemetry', {}) if isinstance(unique, dict) else {}
     rc = replay.get('telemetry', {}) if isinstance(replay, dict) else {}
-    for key, expected in (('generated_unique', 20), ('offered_unique', 20),
-                          ('application_acks', 20), ('pending_messages', 0), ('pending_bytes', 0)):
+    for key, expected in (('generated_unique', unique_count), ('offered_unique', unique_count),
+                          ('application_acks', unique_count), ('pending_messages', 0), ('pending_bytes', 0)):
         if type(uc.get(key)) is not int or uc[key] != expected:
             failures.append('unique_' + key)
     ue = unique.get('e4') if isinstance(unique, dict) else None
-    if not isinstance(ue, dict) or ue.get('mode') != 'unique' or ue.get('journal_entry_count') != 20:
+    if not isinstance(ue, dict) or ue.get('mode') != 'unique' or ue.get('journal_entry_count') != unique_count:
         failures.append('unique_journal_proof')
     if uc.get('ignored_valid_acks') != 1 or type(uc.get('retries')) is not int or uc['retries'] < 1:
         failures.append('ignored_ack_retry_proof')
     for key, expected in (('generated_unique', 0), ('offered_unique', 0),
-                          ('replay_offered', 10), ('replay_application_acks', 10),
+                          ('replay_offered', replay_count), ('replay_application_acks', replay_count),
                           ('application_acks', 0), ('pending_messages', 0), ('pending_bytes', 0)):
         if type(rc.get(key)) is not int or rc[key] != expected:
             failures.append('replay_' + key)
     re4 = replay.get('e4') if isinstance(replay, dict) else None
-    if not isinstance(re4, dict) or re4.get('mode') != 'replay' or re4.get('journal_entry_count') != 10:
+    if not isinstance(re4, dict) or re4.get('mode') != 'replay' or re4.get('journal_entry_count') != replay_count:
         failures.append('replay_journal_proof')
     for label, result in (('unique', unique), ('replay', replay)):
         counters = result.get('telemetry', {}) if isinstance(result, dict) else {}
-        if type(counters.get('broker_pubacks')) is not int or counters['broker_pubacks'] < (20 if label == 'unique' else 10):
+        if type(counters.get('broker_pubacks')) is not int or counters['broker_pubacks'] < (unique_count if label == 'unique' else replay_count):
             failures.append(label + '_puback_count')
-    if db_delta != {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}:
+    if db_delta != {'ledger': unique_count, 'raw': unique_count * samples_per_message, 'temporal': unique_count, 'configuration': 0}:
         failures.append('database_delta_mismatch')
     if not isinstance(scoped_delta, dict) or not isinstance(scoped_delta.get('available'), dict) or len(scoped_delta['available']) != 2 or any(
-            counts != {'ledger': 10, 'raw': 1000, 'temporal': 10} for counts in scoped_delta['available'].values()):
+            counts != {'ledger': unique_count // 2, 'raw': unique_count // 2 * samples_per_message, 'temporal': unique_count // 2} for counts in scoped_delta['available'].values()):
         failures.append('sensor_scope_mismatch')
     if not isinstance(raw_checks, list) or len(raw_checks) != 2 or any(
-            not isinstance(x, dict) or x.get('verified_exact') is not True or x.get('ledger_count') != 10
+            not isinstance(x, dict) or x.get('verified_exact') is not True or x.get('ledger_count') != unique_count // 2
             for x in raw_checks):
         failures.append('raw_identity_mismatch')
     for label, window in (('unique', unique_window), ('replay', replay_window)):
@@ -74,12 +76,12 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
         if not isinstance(delta, dict):
             failures.append(label + '_counter_window_unavailable')
             continue
-        expected = {'Committed': 20, 'SamplesNew': 2000} if label == 'unique' else {
+        expected = {'Committed': unique_count, 'SamplesNew': unique_count * samples_per_message} if label == 'unique' else {
             'Committed': 0, 'SamplesNew': 0}
         for key, value in expected.items():
             if type(delta.get(key)) is not int or delta[key] != value:
                 failures.append(f'{label}_ingress_{key}')
-        min_acks = 21 if label == 'unique' else 10
+        min_acks = unique_count + 1 if label == 'unique' else replay_count
         if type(delta.get('ACKPublished')) is not int or delta['ACKPublished'] < min_acks:
             failures.append(label + '_ingress_ACKPublished')
         for key in ('Committed', 'SamplesNew', 'DuplicateCommitted', 'ACKPublished'):
@@ -93,8 +95,8 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
     if not isinstance(tx, dict):
         failures.append('cache_counters_unavailable')
     elif cache_mode == 'on':
-        if not (type(tx.get('warm_lookup_hits')) is int and tx['warm_lookup_hits'] >= 10 and
-                type(tx.get('repository_calls_avoided')) is int and tx['repository_calls_avoided'] >= 10):
+        if not (type(tx.get('warm_lookup_hits')) is int and tx['warm_lookup_hits'] >= replay_count and
+                type(tx.get('repository_calls_avoided')) is int and tx['repository_calls_avoided'] >= replay_count):
             failures.append('cache_warm_hit_unproven')
         if any(type(tx.get(field)) is not int or tx[field] != 0 for field in
                ('database_duplicates', 'confirmed_new_rows', 'copy_calls', 'transaction_commits', 'attempts')):
@@ -104,9 +106,9 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
               type(tx.get('copy_calls')) is int and tx['copy_calls'] == 0 and
               type(tx.get('confirmed_new_rows')) is int and tx['confirmed_new_rows'] == 0):
         failures.append('cache_off_database_path_unproven')
-    if not (type(unique_delta.get('Committed')) is int and unique_delta['Committed'] == 20 and
-            type(unique_delta.get('SamplesNew')) is int and unique_delta['SamplesNew'] == 2000 and
-            type(unique_delta.get('ACKPublished')) is int and unique_delta['ACKPublished'] >= 21):
+    if not (type(unique_delta.get('Committed')) is int and unique_delta['Committed'] == unique_count and
+            type(unique_delta.get('SamplesNew')) is int and unique_delta['SamplesNew'] == unique_count * samples_per_message and
+            type(unique_delta.get('ACKPublished')) is int and unique_delta['ACKPublished'] >= unique_count + 1):
         failures.append('unique_ignored_ack_path_unproven')
     # DuplicateCommitted is an ingress result counter; it may include RAM-cache
     # re-ACKs and is not evidence of a database duplicate transaction. The
@@ -114,7 +116,7 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
     if isinstance(replay, dict):
         uh = (ue or {}).get('safe_header_samples') if isinstance(ue, dict) else None
         rh = (re4 or {}).get('safe_header_samples') if isinstance(re4, dict) else None
-        if not isinstance(uh, list) or not isinstance(rh, list) or len(uh) < 10 or len(rh) != 10 or uh[:10] != rh:
+        if not isinstance(uh, list) or not isinstance(rh, list) or len(uh) < replay_count or len(rh) != replay_count or uh[:replay_count] != rh:
             failures.append('replay_journal_content_mismatch')
     snapshots = replay_window.get('database_proof') if isinstance(replay_window, dict) else None
     def valid_snapshot(value):
@@ -165,7 +167,7 @@ def _replay_headers_match_manifest_prefix(prepared, unique_telemetry, replay_tel
         return False
     e4_manifest = manifest.get('e4') if isinstance(manifest, dict) else None
     replay_count = e4_manifest.get('replay_count') if isinstance(e4_manifest, dict) else None
-    if type(replay_count) is not int or replay_count <= 0 or replay_count > 20:
+    if type(replay_count) is not int or replay_count <= 0 or replay_count > 10000:
         return False
     unique_e4 = unique_telemetry.get('e4') if isinstance(unique_telemetry, dict) else None
     replay_e4 = replay_telemetry.get('e4') if isinstance(replay_telemetry, dict) else None
@@ -1333,24 +1335,101 @@ def _flag_profile(effective, cache_mode):
     return {key: env[key] for key in names}
 
 
-def e4_phase_manifest(common, journal, phase):
+def validate_e4_dataset_counts(unique_count, replay_count, *, profile='pilot', official_opt_in=False):
+    """Validate explicit counts; unique batches split evenly over E4's two Sensors."""
+    if profile not in ('pilot', 'official'):
+        raise ValueError('p8_e4_profile_rejected')
+    if profile == 'official' and not official_opt_in:
+        raise ValueError('official_profile_requires_opt_in')
+    if (type(unique_count) is not int or type(replay_count) is not int or
+            unique_count < 2 or unique_count > 10000 or unique_count % 2 != 0
+            or replay_count < 1 or replay_count > unique_count):
+        raise ValueError('p8_e4_dataset_count_rejected')
+    if profile == 'pilot' and (unique_count > 256 or replay_count > 256):
+        raise ValueError('p8_e4_pilot_count_rejected')
+    return {'unique_count': unique_count, 'replay_count': replay_count}
+
+
+def validate_e4_expiry_budget(*, session_seconds, token_seconds, workload_seconds,
+                              drain_seconds, import_seconds, cleanup_seconds,
+                              readiness_seconds=120, ttl_seconds=600,
+                              journal_bytes=0, journal_limit=64 << 20,
+                              output_bytes=0, output_limit=1 << 20):
+    """Fail before launch unless the real TTL and all declared work fits credentials/session."""
+    values = (session_seconds, token_seconds, workload_seconds, drain_seconds,
+              import_seconds, cleanup_seconds, readiness_seconds, ttl_seconds)
+    if any(type(value) not in (int, float) or value < 0 for value in values):
+        raise ValueError('expiry_budget_invalid')
+    required = ttl_seconds + workload_seconds + drain_seconds + import_seconds + cleanup_seconds + readiness_seconds
+    if session_seconds < required:
+        raise ValueError('expiry_session_budget_insufficient')
+    if token_seconds < required:
+        raise ValueError('expiry_token_lifetime_insufficient')
+    if (type(journal_bytes) is not int or type(journal_limit) is not int
+            or journal_bytes < 0 or journal_bytes > journal_limit):
+        raise ValueError('expiry_journal_budget_insufficient')
+    if (type(output_bytes) is not int or type(output_limit) is not int
+            or output_bytes < 0 or output_bytes > output_limit):
+        raise ValueError('expiry_output_budget_insufficient')
+    return {'required_seconds': required, 'ttl_seconds': ttl_seconds,
+            'journal_bytes': journal_bytes, 'journal_limit_bytes': journal_limit,
+            'output_bytes': output_bytes, 'output_limit_bytes': output_limit}
+
+
+def _jwt_remaining_seconds(token):
+    try:
+        payload = token.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload.encode()))['exp']
+        return max(0, int(exp - time.time()))
+    except (AttributeError, IndexError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return 0
+
+
+def e4_expiry_evidence(*, commit_time, now, ttl_seconds, process_before, process_after,
+                       journal_sha_before, journal_sha_after, commit_confirmed):
+    failures = []
+    if commit_confirmed is not True:
+        failures.append('expiry_commit_unconfirmed')
+    if not isinstance(commit_time, (int, float)) or not isinstance(now, (int, float)) or now - commit_time < ttl_seconds:
+        failures.append('expiry_age_unconfirmed')
+    if not process_before or process_before != process_after:
+        failures.append('expiry_process_changed')
+    if not isinstance(journal_sha_before, str) or journal_sha_before != journal_sha_after:
+        failures.append('expiry_journal_changed')
+    return {'status': 'PASS' if not failures else 'FAIL', 'failures': failures,
+            'confirmed_age_seconds': max(0, now - commit_time) if isinstance(now, (int, float)) and isinstance(commit_time, (int, float)) else None}
+
+
+def e4_phase_manifest(common, journal, phase, *, unique_count=20, replay_count=10,
+                      official_opt_in=False):
     """Create a distinct immutable phase manifest over the shared E4 journal."""
-    specs = {'unique': ('unique', 4, 0, 1), 'replay': ('replay', 2, 10, 0),
-             'cold-replay': ('replay', 2, 10, 0)}
+    validate_e4_dataset_counts(unique_count, replay_count, profile=common.get('profile', 'pilot'),
+                               official_opt_in=official_opt_in)
+    specs = {'unique': ('unique', 4, 0, 1), 'replay': ('replay', 2, replay_count, 0),
+             'cold-replay': ('replay', 2, replay_count, 0),
+             'expiry-replay': ('replay', 2, replay_count, 0)}
     if phase not in specs or not isinstance(common, dict):
         raise ValueError('p8_e4_manifest_phase_rejected')
     mode, seconds, replay_count, ignored = specs[phase]
-    return {**common, 'run_id': common['run_id'] + '-' + phase,
+    phase_count = unique_count if mode == 'unique' else replay_count
+    phase_common = {**common, 'traffic': {**common.get('traffic', {}),
+        'rate_per_second': phase_count / seconds}}
+    return {**phase_common, 'run_id': common['run_id'] + '-' + phase,
         'phases': {**common['phases'], 'measure_seconds': seconds},
-        'e4': {'mode': mode, 'journal_path': str(journal), 'max_messages': 20,
-               'max_bytes': 1 << 20, 'replay_count': replay_count,
-               'ignore_first_valid_acks': ignored}}
+        'e4': {'mode': mode, 'journal_path': str(journal), 'max_messages': unique_count,
+                'max_bytes': min(64 << 20, max(1 << 20, unique_count * (48 << 10))), 'replay_count': replay_count,
+                'ignore_first_valid_acks': ignored,
+                **({'expiry_ttl_seconds': 600} if phase == 'expiry-replay' else {})},
+        **({'phases': {**common['phases'], 'measure_seconds': seconds}}
+           if phase == 'expiry-replay' else {})}
 
 
 def prepare(smoke, fixture, endpoint, registry, containers, images, state,
             cache_mode='on', *, remote_profile=None, session_id=None,
-            include_cold_replay=False, include_durable_reopen=False,
-            include_conflicts=False):
+            include_cold_replay=False, include_expiry_replay=False, include_durable_reopen=False,
+            include_conflicts=False, unique_count=20, replay_count=10,
+            profile='pilot', official_opt_in=False, session_seconds=0):
     """Provision E4's owned fixture and create its immutable workload inputs.
 
     This is preparation only: it never starts paperload, a viewer, or a collector.
@@ -1359,8 +1438,12 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
     """
     if cache_mode not in ('on', 'off'):
         raise ValueError('p8_e4_cache_mode_rejected')
+    counts = validate_e4_dataset_counts(unique_count, replay_count, profile=profile,
+                                        official_opt_in=official_opt_in)
     if type(include_cold_replay) is not bool or include_cold_replay and cache_mode != 'on':
         raise ValueError('p8_e4_cold_replay_requires_cache_on')
+    if type(include_expiry_replay) is not bool or include_expiry_replay and cache_mode != 'on':
+        raise ValueError('p8_e4_expiry_replay_requires_cache_on')
     if type(include_durable_reopen) is not bool:
         raise ValueError('p8_e4_durable_reopen_flag_rejected')
     if type(include_conflicts) is not bool:
@@ -1369,6 +1452,13 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
         fixture, registry, endpoint, containers, images, state)
     if len(specs) != 2 or len(passwords) != 2:
         raise ValueError('p8_e4_two_gateway_specs_required')
+    if include_expiry_replay:
+        token_lifetime = min(_jwt_remaining_seconds(tokens[key]) for key in ('a', 'b', 'admin'))
+        journal_bound = min(64 << 20, max(1 << 20, unique_count * (48 << 10)))
+        validate_e4_expiry_budget(session_seconds=session_seconds,
+            token_seconds=token_lifetime, workload_seconds=368, drain_seconds=16,
+            import_seconds=30, cleanup_seconds=30, readiness_seconds=120,
+            journal_bytes=journal_bound, output_bytes=1 << 20)
     flags = _flag_profile(effective, cache_mode)
     schema = smoke.db_psql(registry, pg,
         'SELECT version::text || \':\' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;').strip()
@@ -1416,7 +1506,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
     viewer_identity = root / 'viewer-identities.json'
     smoke.private_write(viewer_identity, json.dumps({'user-000': tokens['a'], 'user-001': tokens['b']}))
     run_id = f'p8e4-{session_id}-warm' if session_id else fixture.project + '-e4'
-    common = {'schema_version': 1, 'experiment': 'E4', 'arm': 'warm', 'profile': 'pilot',
+    common = {'schema_version': 1, 'experiment': 'E4', 'arm': 'warm', 'profile': profile,
         'mode': mode, 'run_id': run_id, 'seed': 89, 'roles': ['telemetry'],
         'samples_per_message': 100,
         'topology': {'gateways': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
@@ -1432,11 +1522,11 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
                 'mqtt_tls_server_name': mqtt_server_name},
         'identity_files': {'telemetry': str(identity)}, 'gateway_identity_files': cred_files,
         'bundle_path': str(root), 'durability_mode': 'synthetic-load',
-        'retry_interval_ms': 500, 'publish_timeout_ms': 3000}
+         'retry_interval_ms': 500, 'publish_timeout_ms': 3000}
     manifests = []
-    phase_specs = ['unique', 'replay'] + (['cold-replay'] if include_cold_replay else [])
+    phase_specs = ['unique', 'replay'] + (['cold-replay'] if include_cold_replay else []) + (['expiry-replay'] if include_expiry_replay else [])
     for phase in phase_specs:
-        manifest = e4_phase_manifest(common, journal, phase)
+        manifest = e4_phase_manifest(common, journal, phase, official_opt_in=official_opt_in, **counts)
         path = root / f'{phase}.manifest.json'
         smoke.private_write(path, json.dumps(manifest, sort_keys=True))
         manifests.append(path)
@@ -1462,9 +1552,11 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
     viewer_manifest_path = root / 'viewer.manifest.json'
     smoke.private_write(viewer_manifest_path, json.dumps(viewer_manifest, sort_keys=True))
     prepared = {'experiment': 'E4', 'session_id': session_id,
-        'phase_id': f'e4-warm-{cache_mode}', 'arm': 'warm', 'profile': 'pilot',
+        'phase_id': f'e4-warm-{cache_mode}', 'arm': 'warm', 'profile': profile,
         'mode': mode, 'cache_mode': cache_mode, 'run_id': run_id,
+        'unique_count': unique_count, 'replay_count': replay_count,
         'include_cold_replay': include_cold_replay,
+        'include_expiry_replay': include_expiry_replay,
         'pg': pg, 'quota': quota, 'effective': effective, 'effective_flags': flags,
         'resources': resources, 'storage': storage, 'tokens': tokens, 'specs': specs,
         'image_ids': dict(images),
@@ -1513,6 +1605,8 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
     manifests = {'unique': str(prepared['manifests'][0].resolve()),
                  'replay': str(prepared['manifests'][1].resolve()),
                  'viewer': str(prepared['viewer_manifest_path'].resolve())}
+    if prepared.get('include_expiry_replay'):
+        manifests['expiry-replay'] = str(prepared['manifests'][-1].resolve())
     if prepared.get('include_cold_replay'):
         manifests['cold-replay'] = str(prepared['manifests'][2].resolve())
     identities = {'unique:telemetry': prepared['identity'],
@@ -1520,12 +1614,16 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
                   'viewer': prepared['viewer_identity']}
     if prepared.get('include_cold_replay'):
         identities['cold-replay:telemetry'] = prepared['identity']
+    if prepared.get('include_expiry_replay'):
+        identities['expiry-replay:telemetry'] = prepared['identity']
     gateway_files = prepared['cred_files']
     role_metadata = {'roles': {
         'unique:telemetry': {'role': 'telemetry', 'principals': []},
         'replay:telemetry': {'role': 'telemetry', 'principals': []},
-        **({'cold-replay:telemetry': {'role': 'telemetry', 'principals': []}}
-           if prepared.get('include_cold_replay') else {}),
+         **({'cold-replay:telemetry': {'role': 'telemetry', 'principals': []}}
+            if prepared.get('include_cold_replay') else {}),
+         **({'expiry-replay:telemetry': {'role': 'telemetry', 'principals': []}}
+            if prepared.get('include_expiry_replay') else {}),
         'viewer': {'role': 'viewer', 'principals': ['user-000', 'user-001']}},
         'gateways': {gateway_id: {'role': 'gateway', 'gateway_id': gateway_id,
             'username': json.loads(Path(path).read_text(encoding='utf-8'))['username']}
@@ -1534,12 +1632,21 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
     jobs = [{'manifest': path, 'output_dir': f'outputs/{label}', 'role':
              ('viewer' if label == 'viewer' else 'telemetry'), 'ready_timeout_seconds': 30}
             for label, path in manifests.items()]
+    from scripts.paper_p8_resources import disk_guard_config
     run_spec.write_text(json.dumps({'paperload': jobs, 'gateways': [],
-        'stop_timeout_seconds': 30}, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+        'stop_timeout_seconds': 30, 'disk_guard': disk_guard_config(list(manifests.values()))},
+        sort_keys=True, separators=(',', ':')), encoding='utf-8')
     run_spec.chmod(0o600)
     workload = {'experiment': 'E4', 'arm': prepared['arm'], 'run_id': prepared['run_id'],
         'cache_mode': prepared['cache_mode'], 'phase': prepared['phase_id'],
-        'profile': prepared['profile'], 'seed': 89, 'generator_colocated': True}
+        'profile': prepared['profile'], 'seed': 89, 'generator_colocated': True,
+        'expiry_replay_enabled': prepared.get('include_expiry_replay') is True}
+    if prepared.get('include_expiry_replay') is True:
+        workload['expiry_required_lifetime_seconds'] = 600 + 368 + 16 + 30 + 30 + 120
+    if prepared.get('include_expiry_replay') is True:
+        workload['expiry_budget'] = validate_e4_expiry_budget(
+            session_seconds=86400, token_seconds=86400, workload_seconds=368,
+            drain_seconds=16, import_seconds=30, cleanup_seconds=30)
     return paper_p8_bundle.export_bundle(output_leaf=output_leaf,
         session_id=prepared['session_id'], experiment='E4', arm=prepared['arm'],
         phase=prepared['phase_id'], manifests=manifests, identity_files=identities,
@@ -1615,7 +1722,7 @@ def _read_e4_result_bundle(results_path, *, phase, session_id, run_id, bundle_sh
     return summary, by_path
 
 
-def _validate_e4_phase_samples(phase, telemetry, viewer):
+def _validate_e4_phase_samples(phase, telemetry, viewer, *, unique_count=20, replay_count=10):
     failures = []
     tcounts = telemetry.get('telemetry', {}) if isinstance(telemetry, dict) else {}
     vcounts = viewer if isinstance(viewer, dict) else {}
@@ -1624,8 +1731,8 @@ def _validate_e4_phase_samples(phase, telemetry, viewer):
                    for key, value in expected.items())
     if phase == 'unique':
         if (telemetry.get('experiment') != 'E4' or telemetry.get('e4', {}).get('mode') != 'unique'
-                or not exact_counts(tcounts, {'generated_unique': 20, 'offered_unique': 20,
-                    'application_acks': 20, 'ignored_valid_acks': 1,
+                or not exact_counts(tcounts, {'generated_unique': unique_count, 'offered_unique': unique_count,
+                    'application_acks': unique_count, 'ignored_valid_acks': 1,
                     'pending_messages': 0, 'pending_bytes': 0})
                 or type(tcounts.get('retries')) is not int or tcounts['retries'] < 1):
             failures.append('unique_telemetry_result')
@@ -1650,13 +1757,13 @@ def _validate_e4_phase_samples(phase, telemetry, viewer):
                     matched_viewers.add(sample.get('viewer_id'))
         if (viewer.get('status') != 'COMPLETE'
                 or not exact_counts(vcounts, {'connected_distinct_viewers': 2,
-                    'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2, 'unique_events': 20})
+                    'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2, 'unique_events': unique_count})
                 or recipients != {'e4-viewer-a', 'e4-viewer-b'}
                 or matched_viewers != {'e4-viewer-a', 'e4-viewer-b'}):
             failures.append('unique_viewer_subscribed_and_received')
     else:
         if (telemetry.get('experiment') != 'E4' or telemetry.get('e4', {}).get('mode') != 'replay'
-                or not exact_counts(tcounts, {'replay_offered': 10, 'replay_application_acks': 10,
+                or not exact_counts(tcounts, {'replay_offered': replay_count, 'replay_application_acks': replay_count,
                     'generated_unique': 0, 'offered_unique': 0, 'application_acks': 0,
                     'pending_messages': 0, 'pending_bytes': 0})):
             failures.append('replay_telemetry_result')
@@ -1671,7 +1778,7 @@ def _validate_e4_phase_samples(phase, telemetry, viewer):
 
 
 def begin_remote_phase(smoke, fixture, endpoint, registry, containers, prepared, phase):
-    if phase not in ('unique', 'replay', 'cold-replay'):
+    if phase not in ('unique', 'replay', 'cold-replay', 'expiry-replay'):
         raise ValueError('p8_e4_phase_rejected')
     state = prepared.get('phase_results', {})
     if phase == 'unique' and state:
@@ -1682,7 +1789,28 @@ def begin_remote_phase(smoke, fixture, endpoint, registry, containers, prepared,
             or prepared.get('cache_mode') != 'on' or set(state) != {'unique', 'replay'}
             or prepared.get('cold_replacement_proof', {}).get('metrics_readback') is not True):
         raise ValueError('p8_e4_cold_phase_before_replacement')
+    if phase == 'expiry-replay':
+        if (prepared.get('include_expiry_replay') is not True or prepared.get('cache_mode') != 'on'
+                or set(state) != {'unique', 'replay'} or prepared.get('cold_replacement_proof')):
+            raise ValueError('p8_e4_expiry_phase_precondition_rejected')
+        commit_time = prepared.get('a_confirmed_commit_time')
+        if not isinstance(commit_time, (int, float)):
+            raise ValueError('p8_e4_expiry_commit_time_missing')
+        unique_journal = prepared.get('phase_windows', {}).get('unique', {}).get('journal_sha256')
+        replay_journal = prepared.get('phase_windows', {}).get('replay', {}).get('journal_sha256')
+        if not isinstance(unique_journal, str) or unique_journal != replay_journal:
+            raise ValueError('p8_e4_expiry_journal_precondition_mismatch')
+        before_wait = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+        if before_wait.get('process_instance') != prepared.get('expiry_commit_process_instance'):
+            raise ValueError('p8_e4_expiry_process_changed_before_wait')
+        remaining = 600 - (time.time() - commit_time)
+        if remaining > 0:
+            time.sleep(remaining)
     metrics = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+    if phase == 'expiry-replay' and metrics.get('process_instance') != prepared.get('expiry_commit_process_instance'):
+        raise ValueError('p8_e4_expiry_process_changed_during_wait')
+    if phase == 'unique' and prepared.get('include_expiry_replay'):
+        prepared['a_confirmed_commit_time'] = time.time()
     if phase == 'cold-replay':
         proof = prepared.get('cold_replacement_proof', {})
         cache_state = metrics.get('ram_dedup') if isinstance(metrics, dict) else None
@@ -1705,7 +1833,7 @@ def begin_remote_phase(smoke, fixture, endpoint, registry, containers, prepared,
 
 def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared,
                         results_path, *, phase):
-    if phase not in ('unique', 'replay', 'cold-replay'):
+    if phase not in ('unique', 'replay', 'cold-replay', 'expiry-replay'):
         raise ValueError('p8_e4_phase_rejected')
     baseline = prepared.get('phase_baselines', {}).get(phase)
     collector = prepared.get('remote_collectors', {}).get(phase)
@@ -1721,12 +1849,14 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
         bundle_sha256=prepared['bundle_sha256'])
     telemetry = files[f'results/phases/{phase}/workloads/{phase}/workload.json']
     viewer = files[f'results/phases/{phase}/workloads/viewer/workload.json']
-    validation_phase = 'replay' if phase == 'cold-replay' else phase
-    phase_validation = _validate_e4_phase_samples(validation_phase, telemetry, viewer)
+    validation_phase = 'replay' if phase in ('cold-replay', 'expiry-replay') else phase
+    unique_count, replay_count = prepared.get('unique_count', 20), prepared.get('replay_count', 10)
+    phase_validation = _validate_e4_phase_samples(validation_phase, telemetry, viewer,
+        unique_count=unique_count, replay_count=replay_count)
     journal_sha256 = summary.get('journal_sha256')
     if not isinstance(journal_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', journal_sha256):
         phase_validation['failures'].append('journal_proof_unavailable')
-    if phase in ('replay', 'cold-replay'):
+    if phase in ('replay', 'cold-replay', 'expiry-replay'):
         unique_window = prepared.get('phase_windows', {}).get('unique')
         expected_journal = unique_window.get('journal_sha256') if isinstance(unique_window, dict) else None
         if (not isinstance(expected_journal, str) or journal_sha256 != expected_journal
@@ -1734,14 +1864,14 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
             phase_validation['failures'].append('replay_journal_continuity_mismatch')
     after_metrics = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
     before_ws = baseline['admin_metrics'].get('websocket_metrics', {})
-    expected_deliveries = before_ws.get('deliveries_enqueued', 0) + (20 if phase == 'unique' else 0)
+    expected_deliveries = before_ws.get('deliveries_enqueued', 0) + (unique_count if phase == 'unique' else 0)
     after_metrics = _wait_e4_ws_drain(
         lambda: _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin']),
         expected_deliveries, timeout=8)
     ws_delta = _e4_ws_window(baseline['admin_metrics'], after_metrics)
     after_db = [_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
     db_delta = _database_delta(baseline['database'], after_db)
-    expected_db = {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0} if phase == 'unique' else {
+    expected_db = {'ledger': unique_count, 'raw': unique_count * 100, 'temporal': unique_count, 'configuration': 0} if phase == 'unique' else {
         'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}
     if db_delta != expected_db:
         phase_validation['failures'].append('database_delta_mismatch')
@@ -1750,37 +1880,40 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
     if not isinstance(delta, dict):
         phase_validation['failures'].append('ingress_window_unavailable')
     else:
-        required = {'Committed': 20, 'SamplesNew': 2000} if phase == 'unique' else {'Committed': 0, 'SamplesNew': 0}
+        required = {'Committed': unique_count, 'SamplesNew': unique_count * 100} if phase == 'unique' else {'Committed': 0, 'SamplesNew': 0}
         if phase == 'cold-replay':
-            required['DuplicateCommitted'] = 10
+            required['DuplicateCommitted'] = replay_count
         if any(delta.get(key) != value for key, value in required.items()):
             phase_validation['failures'].append('ingress_delta_mismatch')
-        if type(delta.get('ACKPublished')) is not int or delta['ACKPublished'] < (21 if phase == 'unique' else 10):
+        if type(delta.get('ACKPublished')) is not int or delta['ACKPublished'] < (unique_count + 1 if phase == 'unique' else replay_count):
             phase_validation['failures'].append('ingress_ack_window_mismatch')
-    cache = _cache_counter_window(baseline['admin_metrics'], after_metrics) if phase in ('replay', 'cold-replay') else None
+    cache = _cache_counter_window(baseline['admin_metrics'], after_metrics) if phase in ('replay', 'cold-replay', 'expiry-replay') else None
     if phase == 'replay' and prepared['cache_mode'] == 'on' and (
             not isinstance(cache, dict) or type(cache.get('warm_lookup_hits')) is not int
-            or cache.get('warm_lookup_hits') < 10 or type(cache.get('repository_calls_avoided')) is not int
-            or cache.get('repository_calls_avoided') < 10):
+            or cache.get('warm_lookup_hits') < replay_count or type(cache.get('repository_calls_avoided')) is not int
+            or cache.get('repository_calls_avoided') < replay_count):
         phase_validation['failures'].append('replay_cache_window_unproven')
-    if phase == 'replay' and prepared['cache_mode'] == 'off' and (
+    if phase in ('replay', 'expiry-replay') and (phase == 'expiry-replay' or prepared['cache_mode'] == 'off') and (
             not isinstance(cache, dict) or type(cache.get('attempts')) is not int or cache['attempts'] <= 0
             or type(cache.get('transaction_commits')) is not int or cache['transaction_commits'] <= 0
+            or phase == 'expiry-replay' and (type(cache.get('lookup_misses')) is not int
+                or cache.get('lookup_misses') < replay_count)
             or type(cache.get('copy_calls')) is not int or cache['copy_calls'] != 0
             or type(cache.get('confirmed_new_rows')) is not int or cache['confirmed_new_rows'] != 0):
         phase_validation['failures'].append('replay_cache_off_database_path_unproven')
-    if phase == 'replay' and isinstance(cache, dict):
+    if phase in ('replay', 'expiry-replay') and isinstance(cache, dict):
         cache['ingress_duplicate_outcomes'] = (delta or {}).get('DuplicateCommitted')
         cache['database_duplicates'] = (cache.get('transaction_commits')
             if prepared['cache_mode'] == 'off' else
-            0 if cache.get('repository_calls_avoided') == 10 else None)
+            0 if cache.get('repository_calls_avoided') == replay_count else None)
     cold_evidence = None
     if phase == 'cold-replay':
         telemetry_counts = telemetry.get('telemetry') if isinstance(telemetry, dict) else None
         cold_evidence = _cold.cold_window_evidence(prepared.get('cold_old_metrics'),
             baseline['admin_metrics'], after_metrics, before_db=baseline['database'],
             after_db=after_db,
-            application_ack_count=(telemetry_counts or {}).get('replay_application_acks'))
+            application_ack_count=(telemetry_counts or {}).get('replay_application_acks'),
+            offered_count=replay_count)
         if after_db != prepared.get('unique_database_snapshot'):
             cold_evidence['reasons'].append('cold_replay_unique_snapshot_mismatch')
             cold_evidence['status'] = 'FAIL'
@@ -1788,8 +1921,8 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
         if cold_evidence.get('status') != 'PASS':
             phase_validation['failures'].extend('cold_' + reason
                 for reason in cold_evidence.get('reasons', []))
-    expected_ws = {'submissions': 20, 'new_events': 20, 'deliveries_enqueued': 20,
-        'telemetry_writes_completed': 20, 'drops': 0} if phase == 'unique' else {
+    expected_ws = {'submissions': unique_count, 'new_events': unique_count, 'deliveries_enqueued': unique_count,
+        'telemetry_writes_completed': unique_count, 'drops': 0} if phase == 'unique' else {
         'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
         'telemetry_writes_completed': 0, 'drops': 0}
     if any(ws_delta.get(key) != value for key, value in expected_ws.items()):
@@ -1803,19 +1936,29 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
         if len(raw) != 2 or any(item.get('verified_exact') is not True for item in raw):
             phase_validation['failures'].append('raw_identity_not_verified')
     previous = prepared.get('phase_results', {}).get('unique')
-    if phase in ('replay', 'cold-replay'):
+    if phase in ('replay', 'cold-replay', 'expiry-replay'):
         previous_telemetry = previous.get('telemetry') if isinstance(previous, dict) else None
         if (not isinstance(previous, dict) or not _replay_headers_match_manifest_prefix(
                 prepared, previous_telemetry, telemetry)):
             phase_validation['failures'].append('replay_journal_content_mismatch')
-        if phase == 'replay' and after_db != prepared.get('unique_database_snapshot'):
+        if phase in ('replay', 'expiry-replay') and after_db != prepared.get('unique_database_snapshot'):
             phase_validation['failures'].append('replay_unique_snapshot_mismatch')
+        if phase == 'expiry-replay':
+            proof = e4_expiry_evidence(commit_time=prepared.get('a_confirmed_commit_time'),
+                now=time.time(), ttl_seconds=600,
+                process_before=prepared.get('expiry_commit_process_instance'),
+                process_after=after_metrics.get('process_instance'),
+                journal_sha_before=prepared.get('phase_windows', {}).get('unique', {}).get('journal_sha256'),
+                journal_sha_after=journal_sha256, commit_confirmed=True)
+            prepared['expiry_evidence'] = proof
+            if proof['status'] != 'PASS':
+                phase_validation['failures'].extend(proof['failures'])
     phase_validation['valid'] = not phase_validation['failures']
     phase_validation['workload_outcome'] = 'VALIDATED' if phase_validation['valid'] else 'VALIDATION_FAILED'
     prepared.setdefault('phase_results', {})[phase] = {'telemetry': telemetry, 'viewer': viewer,
         'validation_valid': phase_validation['valid'], 'cold_evidence': cold_evidence}
     database_proof = None
-    if phase in ('replay', 'cold-replay'):
+    if phase in ('replay', 'cold-replay', 'expiry-replay'):
         unique_snapshot = prepared.get('unique_database_snapshot')
         database_proof = {'unique_ack': unique_snapshot, 'replay_end': after_db,
             'exact_equal': isinstance(unique_snapshot, list) and unique_snapshot == after_db}
@@ -1824,8 +1967,10 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
         'ingress_delta': delta, 'admin_before': baseline['admin_metrics'],
         'admin_after': after_metrics, 'ws_delta': ws_delta, 'cache': cache, 'raw': raw,
         'bundle_sha256': summary['source_bundle_sha256'], 'journal_sha256': journal_sha256,
-        **({'database_proof': database_proof} if phase in ('replay', 'cold-replay') else {}),
+        **({'database_proof': database_proof} if phase in ('replay', 'cold-replay', 'expiry-replay') else {}),
         **({'cold_evidence': cold_evidence} if phase == 'cold-replay' else {})}
+    if phase == 'unique' and prepared.get('include_expiry_replay'):
+        prepared['expiry_commit_process_instance'] = after_metrics.get('process_instance')
     if phase_validation['valid']:
         if phase == 'unique':
             prepared['unique_database_snapshot'] = after_db
@@ -1853,7 +1998,8 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
                 db_delta=all_db, scoped_delta=all_scoped,
                 raw_checks=unique_window.get('raw', []),
                 unique_window=window_for(unique_window), replay_window=replay_window,
-                cache_mode=prepared['cache_mode'])
+                cache_mode=prepared['cache_mode'], unique_count=unique_count,
+                replay_count=replay_count, samples_per_message=100)
             prepared['overall_validation'] = overall
             if not overall['valid']:
                 phase_validation['failures'].extend('overall_' + code for code in overall['failures'])
@@ -1873,6 +2019,7 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
         'cache_window': cache, 'raw_verified': all(item.get('verified_exact') is True for item in raw) if raw else None,
         'overall_validation': prepared.get('overall_validation') if phase == 'replay' else None,
         'cold_evidence': cold_evidence,
+        'expiry_evidence': prepared.get('expiry_evidence') if phase == 'expiry-replay' else None,
         'children_stopped_verified': summary.get('runner_status') == 'COMPLETE',
         'bundle_sha256': summary['source_bundle_sha256'], 'journal_sha256': journal_sha256}
 
@@ -1890,9 +2037,13 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
     results = prepared.get('phase_results', {})
     windows = prepared.get('phase_windows', {})
     cold_enabled = prepared.get('include_cold_replay') is True
+    expiry_enabled = prepared.get('include_expiry_replay') is True
     durable_enabled = prepared.get('include_durable_reopen') is True
     conflicts_enabled = prepared.get('include_conflicts') is True
+    unique_count, replay_count = prepared.get('unique_count', 20), prepared.get('replay_count', 10)
     expected_phases = ['unique', 'replay', 'cold-replay'] if cold_enabled else ['unique', 'replay']
+    if expiry_enabled:
+        expected_phases.append('expiry-replay')
     expected_history = (expected_phases
         + (['durable-fault','durable-reopen'] if durable_enabled else [])
         + (['conflicts'] if conflicts_enabled else []))
@@ -1902,21 +2053,27 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
     unique_db = windows.get('unique', {}).get('database_delta', {})
     replay_db = windows.get('replay', {}).get('database_delta', {})
     cold_db = windows.get('cold-replay', {}).get('database_delta', {})
+    expiry_db = windows.get('expiry-replay', {}).get('database_delta', {})
     db = {key: unique_db.get(key, 0) + replay_db.get(key, 0)
           + (cold_db.get(key, 0) if cold_enabled else 0)
+          + (expiry_db.get(key, 0) if expiry_enabled else 0)
           for key in ('ledger', 'raw', 'temporal', 'configuration')}
     unique_ws = windows.get('unique', {}).get('ws_delta', {})
     replay_ws = windows.get('replay', {}).get('ws_delta', {})
     cold_ws = windows.get('cold-replay', {}).get('ws_delta', {})
-    ws_ok = (unique_ws == {'submissions': 20, 'new_events': 20, 'deliveries_enqueued': 20,
-                 'telemetry_writes_completed': 20, 'drops': 0}
+    expiry_ws = windows.get('expiry-replay', {}).get('ws_delta', {})
+    ws_ok = (unique_ws == {'submissions': unique_count, 'new_events': unique_count, 'deliveries_enqueued': unique_count,
+                 'telemetry_writes_completed': unique_count, 'drops': 0}
              and replay_ws == {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
                  'telemetry_writes_completed': 0, 'drops': 0}
              and (not cold_enabled or cold_ws == {'submissions': 0, 'new_events': 0,
-                 'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0}))
+                  'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0})
+             and (not expiry_enabled or expiry_ws == {'submissions': 0, 'new_events': 0,
+                  'deliveries_enqueued': 0, 'telemetry_writes_completed': 0, 'drops': 0}))
     cache = windows.get('replay', {}).get('cache')
     replay_db_proof = windows.get('replay', {}).get('database_proof')
     cold_evidence = windows.get('cold-replay', {}).get('cold_evidence')
+    expiry_evidence = prepared.get('expiry_evidence')
     if cold_enabled:
         persistence = cold_evidence.get('persistence_delta') if isinstance(cold_evidence, dict) else None
         cache_ok = (prepared['cache_mode'] == 'on' and isinstance(cold_evidence, dict)
@@ -1932,13 +2089,26 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
             and type(persistence.get('begin_attempts')) is int and persistence['begin_attempts'] > 0
             and type(persistence.get('confirmed_commits')) is int and persistence['confirmed_commits'] > 0
             and persistence.get('confirmed_new_rows') == 0 and persistence.get('copy_calls') == 0
-            and cold_evidence.get('application_ack_count') == 10
+            and cold_evidence.get('application_ack_count') == replay_count
             and cold_evidence.get('database_unchanged') is True
             and results.get('cold-replay', {}).get('validation_valid') is True
             and prepared.get('cold_replacement_proof', {}).get('metrics_readback') is True)
         cold_status = 'PASS' if cache_ok else 'FAIL'
         lane_marker = 'PAPER_P8_E4_COLD_REPLAY_SUBSET'
         workload_status = 'COLD_REPLAY_SUBSET_VALIDATED'
+    elif expiry_enabled:
+        expiry_window = windows.get('expiry-replay', {})
+        cache_ok = (prepared['cache_mode'] == 'on' and isinstance(expiry_evidence, dict)
+            and expiry_evidence.get('status') == 'PASS'
+            and expiry_evidence.get('confirmed_age_seconds', 0) >= 600
+            and results.get('expiry-replay', {}).get('validation_valid') is True
+            and isinstance(expiry_window.get('cache'), dict)
+            and expiry_window['cache'].get('lookup_misses', 0) >= replay_count
+            and expiry_window['cache'].get('transaction_commits', 0) > 0
+            and expiry_window.get('database_proof', {}).get('exact_equal') is True)
+        cold_status = 'PASS' if cache_ok else 'FAIL'
+        lane_marker = 'PAPER_P8_E4_TTL_EXPIRY_SUBSET'
+        workload_status = 'TTL_EXPIRY_SUBSET_VALIDATED'
     elif prepared['cache_mode'] == 'off':
         cache_ok = (isinstance(cache, dict)
             and type(cache.get('attempts')) is int and cache['attempts'] > 0
@@ -1953,22 +2123,24 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
         workload_status = 'CACHE_OFF_SUBSET_VALIDATED'
     else:
         cache_ok = (isinstance(cache, dict) and type(cache.get('warm_lookup_hits')) is int
-            and cache['warm_lookup_hits'] >= 10
+            and cache['warm_lookup_hits'] >= replay_count
             and type(cache.get('repository_calls_avoided')) is int
-            and cache['repository_calls_avoided'] >= 10)
+            and cache['repository_calls_avoided'] >= replay_count)
         cold_status = 'NOT RUN'
         lane_marker = 'PAPER_P8_E4_WARM_SUBSET'
         workload_status = 'WARM_SUBSET_VALIDATED'
     unique_journal = windows.get('unique', {}).get('journal_sha256')
     replay_journal = windows.get('replay', {}).get('journal_sha256')
     cold_journal = windows.get('cold-replay', {}).get('journal_sha256')
+    expiry_journal = windows.get('expiry-replay', {}).get('journal_sha256')
     journal_continuity = (isinstance(unique_journal, str) and re.fullmatch(r'[0-9a-f]{64}', unique_journal)
         is not None and unique_journal == replay_journal
-        and (not cold_enabled or unique_journal == cold_journal))
+        and (not cold_enabled or unique_journal == cold_journal)
+        and (not expiry_enabled or unique_journal == expiry_journal))
     replay_prefix_validated = results.get('replay', {}).get('validation_valid') is True
     cold_prefix_validated = results.get('cold-replay', {}).get('validation_valid') is True if cold_enabled else None
     base_valid = (complete and cleanup_verified is True and db == {
-        'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0} and ws_ok
+        'ledger': unique_count, 'raw': unique_count * 100, 'temporal': unique_count, 'configuration': 0} and ws_ok
         and cache_ok and journal_continuity and replay_prefix_validated
         and all(row.get('validation_valid') is True for row in results.values())
         and isinstance(prepared.get('overall_validation'), dict)
@@ -2033,6 +2205,8 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
             'unique': unique_ws, 'replay': replay_ws, **({'cold-replay': cold_ws} if cold_enabled else {})},
         'cache_window': windows.get('replay', {}).get('cache'),
         'cold_cache_window': cold_evidence if cold_enabled else None,
+        'ttl_expiry': ({'status': 'PASS' if expiry_enabled and cache_ok else 'FAIL',
+                        'evidence': expiry_evidence} if expiry_enabled else 'NOT RUN'),
         'journal_sha256': windows.get('replay', {}).get('journal_sha256'),
         'journal_continuity': journal_continuity,
         'replay_journal_prefix_validated': replay_prefix_validated,
@@ -2066,12 +2240,12 @@ def e4_viewer_manifest(common, *, subscriptions, viewer_identity, root):
     return viewer_common
 
 
-def validate_e4_ws_proof(*, unique_delta, replay_delta, state, expected_viewers=2):
+def validate_e4_ws_proof(*, unique_delta, replay_delta, state, expected_viewers=2, expected_unique=20):
     """Validate actual paperload ViewerResult and same-process server metrics."""
     failures = []
     if expected_viewers != 2:
         failures.append('viewer_recipient_count')
-    for name, counts, expected in (('unique', unique_delta, 20), ('replay', replay_delta, 0)):
+    for name, counts, expected in (('unique', unique_delta, expected_unique), ('replay', replay_delta, 0)):
         if not isinstance(counts, dict):
             failures.append(name + '_ws_metrics_unavailable')
             continue
@@ -2088,13 +2262,13 @@ def validate_e4_ws_proof(*, unique_delta, replay_delta, state, expected_viewers=
             state.get('subscribed_distinct_viewers') != 2 or
             state.get('receiving_distinct_viewers') != 2 or
             not isinstance(peers, list) or len(peers) != 2 or state.get('primary_error') or
-            state.get('unique_events') != 20 or state.get('duplicates') != 0 or
+            state.get('unique_events') != expected_unique or state.get('duplicates') != 0 or
             state.get('wrong_namespace') != 0):
         failures.append('viewer_state_totals')
     else:
         if {peer.get('id') for peer in peers if isinstance(peer, dict)} != {'e4-viewer-a', 'e4-viewer-b'}:
             failures.append('viewer_identity_set')
-        if any(not isinstance(peer, dict) or peer.get('unique_events') != 10 or
+        if any(not isinstance(peer, dict) or peer.get('unique_events') != expected_unique // expected_viewers or
                peer.get('duplicates') != 0 or peer.get('close_reason') not in ('measurement_complete', None)
                for peer in peers):
             failures.append('viewer_recipient_delivery')
@@ -2114,8 +2288,11 @@ def start_e4_viewer(*, paperload_binary, manifest_path, output_dir, log_path,
             raise
         # The native CLI is executed by file path, so scripts/ is not necessarily
         # importable as a package. Load the existing runner by its repository path.
+        scripts_dir = Path(__file__).resolve().parents[1]
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
         spec = importlib.util.spec_from_file_location(
-            'paper_p8', Path(__file__).resolve().parents[1] / 'paper_p8.py')
+            'paper_p8', scripts_dir / 'paper_p8.py')
         if spec is None or spec.loader is None:
             raise RuntimeError('p8_e4_runner_import_unavailable') from None
         paper_p8 = importlib.util.module_from_spec(spec)
@@ -2217,7 +2394,11 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
     collector = None
     viewer_proc = None
     try:
-        prepared = prepare(smoke, fixture, endpoint, registry, containers, images, state, cache_mode)
+        prepared = prepare(smoke, fixture, endpoint, registry, containers, images, state, cache_mode,
+            unique_count=getattr(fixture, 'paper_p8_e4_unique_count', 20),
+            replay_count=getattr(fixture, 'paper_p8_e4_replay_count', 10),
+            profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
+            official_opt_in=getattr(fixture, 'paper_p8_official_opt_in', False))
         pg, quota, effective, resources, storage = (prepared[key] for key in
             ('pg', 'quota', 'effective', 'resources', 'storage'))
         tokens, specs, passwords = (prepared[key] for key in ('tokens', 'specs', 'passwords'))
@@ -2280,7 +2461,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             after_metrics = _support._admin_metrics(smoke, endpoint, tokens['admin'])
             drained_ws = _wait_e4_ws_drain(
                 lambda: _support._admin_metrics(smoke, endpoint, tokens['admin']),
-                20, timeout=8)
+                prepared['unique_count'], timeout=8)
             ws_windows[phase] = _e4_ws_window(ws_baseline, drained_ws)
             ws_baseline = drained_ws
             delta = _support.calculate_ingress_delta(baseline, after_metrics)
@@ -2320,7 +2501,8 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
         # terminating it after the workload and mistaking an early stop for success.
         viewer_result = finish_e4_viewer(viewer_proc, viewer_out, timeout=50)
         ws_proof = validate_e4_ws_proof(unique_delta=ws_windows['unique'],
-            replay_delta=ws_windows['replay'], state=viewer_result)
+            replay_delta=ws_windows['replay'], state=viewer_result,
+            expected_unique=prepared['unique_count'])
         unique_headers = ((phase_results.get('unique') or {}).get('e4') or {}).get('safe_header_samples')
         viewer_samples = viewer_result.get('identity_samples')
         expected_headers = {item.get('message_id'): item for item in unique_headers
@@ -2361,11 +2543,12 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
             # DuplicateCommitted is an ingress outcome (including RAM-cache re-ACKs),
             # not proof that PostgreSQL ran its duplicate-transaction path.
             cache_window['ingress_duplicate_outcomes'] = (windows['replay'].get('delta') or {}).get('DuplicateCommitted')
-            cache_window['database_duplicates'] = 0 if cache_window.get('repository_calls_avoided') == 10 else None
+            cache_window['database_duplicates'] = 0 if cache_window.get('repository_calls_avoided') == prepared['replay_count'] else None
             windows['replay']['cache'] = cache_window
         validation = validate_e4_results(phase_results['unique'], phase_results['replay'],
             db_delta=db_delta, scoped_delta=scoped, raw_checks=raw,
-            unique_window=windows['unique'], replay_window=windows['replay'], cache_mode=cache_mode)
+            unique_window=windows['unique'], replay_window=windows['replay'], cache_mode=cache_mode,
+            unique_count=prepared['unique_count'], replay_count=prepared['replay_count'])
         report.update({'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP' if validation['valid'] else 'FAIL',
             'runner_stopped': all(proc.poll() is not None for proc in processes),
             'schema': schema, 'quota': quota, 'storage_status': storage, 'database_delta': db_delta,
@@ -2496,20 +2679,22 @@ def _run_cold_replay(smoke, fixture, endpoint, registry, containers, paperload_b
     after_metrics = _support._admin_metrics(smoke, endpoint, tokens['admin'])
     after_db = [_counts(smoke, registry, pg, s) for s in specs]
     telemetry = result.get('telemetry') if isinstance(result, dict) else {}
+    replay_count = manifest.get('e4', {}).get('replay_count', 10)
     cold = _cold.cold_window_evidence({'process_instance': old_process}, baseline, after_metrics,
         before_db=before_db, after_db=after_db,
-        application_ack_count=telemetry.get('replay_application_acks') if isinstance(telemetry, dict) else None)
+        application_ack_count=telemetry.get('replay_application_acks') if isinstance(telemetry, dict) else None,
+        offered_count=replay_count)
     warm_e4 = warm_replay.get('e4') if isinstance(warm_replay, dict) else {}
     cold_e4 = result.get('e4') if isinstance(result, dict) else {}
     headers = (warm_e4 or {}).get('safe_header_samples')
     cold_headers = (cold_e4 or {}).get('safe_header_samples')
-    if not isinstance(headers, list) or not isinstance(cold_headers, list) or headers[:10] != cold_headers or len(cold_headers) != 10:
+    if not isinstance(headers, list) or not isinstance(cold_headers, list) or headers[:replay_count] != cold_headers or len(cold_headers) != replay_count:
         cold['reasons'].append('cold_replay_header_identity_mismatch')
         cold['status'] = 'FAIL'
     if result.get('status') != 'COMPLETE' or result.get('cleanup_errors'):
         cold['reasons'].append('cold_runner_incomplete')
         cold['status'] = 'FAIL'
-    if (not isinstance(telemetry, dict) or telemetry.get('replay_offered') != 10 or
+    if (not isinstance(telemetry, dict) or telemetry.get('replay_offered') != replay_count or
             telemetry.get('pending_messages') != 0 or telemetry.get('pending_bytes') != 0):
         cold['reasons'].append('cold_replay_pending_or_offer_mismatch')
         cold['status'] = 'FAIL'

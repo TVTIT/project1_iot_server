@@ -24,9 +24,11 @@ class P8E4SelectorTests(unittest.TestCase):
         cold = smoke.paper_p8_e4_preparation_metadata({
             'unique': 'u', 'replay': 'r', 'cold-replay': 'c'})
         warm = smoke.paper_p8_e4_preparation_metadata({'unique': 'u', 'replay': 'r'})
+        expiry = smoke.paper_p8_e4_preparation_metadata({'unique': 'u', 'replay': 'r', 'expiry-replay': 'x'})
         self.assertEqual(cold, {'phase_inputs': ['unique', 'replay', 'cold-replay'],
             'manifest_count': 4})
         self.assertEqual(warm['manifest_count'], 3)
+        self.assertEqual(expiry, {'phase_inputs': ['unique', 'replay', 'expiry-replay'], 'manifest_count': 4})
 
     def test_server_rejects_cold_replay_without_cache_on_e4(self):
         with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
@@ -35,7 +37,16 @@ class P8E4SelectorTests(unittest.TestCase):
                 paper_p8_server.main(['serve', '--root', str(root), '--network-config',
                     str(Path(tmp) / 'unused-profile.json'), '--experiment', 'E4',
                     '--cache-mode', 'off', '--cold-replay'])
-            self.assertTrue(root.is_dir())
+            self.assertFalse(root.exists(), 'invalid expiry/cold combination must fail before side effects')
+
+    def test_server_rejects_combined_cold_and_expiry_before_side_effects(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp) / 'server'
+            with self.assertRaisesRegex(ValueError, '--expiry-replay cannot be combined with --cold-replay'):
+                paper_p8_server.main(['serve', '--root', str(root), '--network-config',
+                    str(Path(tmp) / 'unused-profile.json'), '--experiment', 'E4',
+                    '--cache-mode', 'on', '--cold-replay', '--expiry-replay'])
+            self.assertFalse(root.exists())
 
     def test_e4_prepare_report_is_not_run_and_never_claims_workload(self):
         with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
@@ -173,6 +184,12 @@ class P8E4SelectorTests(unittest.TestCase):
                 self.assertFalse(smoke.paper_p8_e4_cleanup_acceptance(fixture, evidence, {}, True, registry))
                 evidence[key] = original
             self.assertFalse(smoke.paper_p8_e4_cleanup_acceptance(fixture, evidence, {}, False, registry))
+            fixture.paper_p8_e4_unique_count = 8
+            fixture.paper_p8_e4_replay_count = 2
+            evidence['database_delta'] = {'ledger': 8, 'raw': 800, 'temporal': 8}
+            evidence['workloads']['unique']['telemetry'].update(generated_unique=8, application_acks=8)
+            evidence['workloads']['replay']['telemetry'].update(replay_offered=2, replay_application_acks=2)
+            self.assertTrue(smoke.paper_p8_e4_cleanup_acceptance(fixture, evidence, {}, True, registry))
 
 
 if __name__ == '__main__':

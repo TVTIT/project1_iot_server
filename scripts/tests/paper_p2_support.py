@@ -169,11 +169,23 @@ def prepare_perimeter(smoke, fixture):
                                                             or getattr(fixture, 'paper_p8_e1', False)) else ''
     remote_nginx_port = (remote_profile['https_port'] if remote_profile else '0')
     remote_bind = (remote_profile['bind_ip'] if remote_profile else '127.0.0.1')
+    e1_nginx_main = (f"      - {fixture.e1_nginx_main_config}:/etc/nginx/nginx.conf:ro\n"
+                     if getattr(fixture, 'paper_p8_e1', False) else '')
+    e1_backend_limits = (f"      WS_MAX_SESSIONS: '{fixture.e1_resource_overlay['proposed']['WS_MAX_SESSIONS']}'\n"
+                         f"      WS_SESSION_REFERENCE_BYTES: '{fixture.e1_resource_overlay['proposed']['WS_SESSION_REFERENCE_BYTES']}'\n"
+                         if getattr(fixture, 'paper_p8_e1', False) else '')
+    e1_backend_ulimits = (f"    ulimits: !override\n      nofile:\n        soft: {fixture.e1_resource_overlay['proposed']['backend_process_fd_limit']}\n"
+                         f"        hard: {fixture.e1_resource_overlay['proposed']['backend_process_fd_limit']}\n"
+                         if getattr(fixture, 'paper_p8_e1', False) else '')
+    e1_nginx_ulimits = (f"    ulimits: !override\n      nofile:\n        soft: {fixture.e1_resource_overlay['proposed']['nginx_process_fd_soft']}\n"
+                        f"        hard: {fixture.e1_resource_overlay['proposed']['nginx_process_fd_soft']}\n"
+                        if getattr(fixture, 'paper_p8_e1', False) else '')
     text += f'''  backend:
     environment:
       SUPABASE_JWT_SECRET: !reset null
       WEBSOCKET_ENABLED: '{str(bool(fixture.paper_p7 or getattr(fixture, "paper_p8_sessions", False) or getattr(fixture, "paper_p8_slow", False) or getattr(fixture, "paper_p8_e1", False) or getattr(fixture, "paper_p8_e4", False) or getattr(fixture, "paper_p8_e5", False))).lower()}'
 {p8_slow_timers}      CORS_ALLOWED_ORIGINS: 'https://client.example.test'
+{e1_backend_limits}{e1_backend_ulimits}
     volumes:
       - auth_socket:/run/iot-auth
     depends_on:
@@ -191,6 +203,7 @@ def prepare_perimeter(smoke, fixture):
       - {smoke.ROOT / 'config/nginx/paper-p2.conf.template'}:/etc/nginx/templates/default.conf.template:ro
       - {tls}:/etc/nginx/p2-tls:ro
       - auth_socket:/run/iot-auth:ro
+{e1_nginx_main}{e1_nginx_ulimits}
   auth-socket-init:
     image: {smoke.DEFAULTS['MQTT_DYNSEC_IMAGE_REFERENCE']}
     restart: 'no'
