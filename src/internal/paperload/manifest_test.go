@@ -93,6 +93,26 @@ func TestTelemetryOnlyAllowsZeroViewerAndUserTopology(t *testing.T) {
 	}
 }
 
+func TestE3BackgroundTelemetryRequiresPublishTimeout(t *testing.T) {
+	// E3 reuses the bounded E2 telemetry schema; its manifest builder must carry
+	// the E2 publish timeout rather than weakening Validate for offline plans.
+	m := validManifest()
+	m.Experiment, m.Roles = "E2", []string{"telemetry"}
+	m.Topology.Users, m.Topology.Viewers = 0, 0
+	m.Subscriptions = nil
+	m.IdentityFiles = map[string]string{"telemetry": "identity.json"}
+	m.GatewayIdentityFiles = map[string]string{"gw-a": "private/a.json", "gw-b": "private/b.json"}
+	m.DurabilityMode = "synthetic-load"
+	m.PublishTimeoutMS = 0
+	if _, err := Validate(m, false); err == nil || err.Error() != "manifest_contract_rejected" {
+		t.Fatalf("missing E2 publish timeout error = %v, want manifest_contract_rejected", err)
+	}
+	m.PublishTimeoutMS = 3000
+	if _, err := Validate(m, false); err != nil {
+		t.Fatalf("E3-derived E2 manifest with publish timeout rejected: %v", err)
+	}
+}
+
 func e4Manifest() Manifest {
 	m := validManifest()
 	m.Experiment, m.Roles = "E4", []string{"telemetry"}
@@ -124,6 +144,14 @@ func TestE4ManifestSettingsAreOptionalButRoleBoundAndFinite(t *testing.T) {
 	m.E4.IgnoreFirstValidACKs = 1
 	if _, err := Validate(m, false); err != nil {
 		t.Fatal(err)
+	}
+	m.E4.ExpiryTTLSeconds = 600
+	if _, err := Validate(m, false); err != nil {
+		t.Fatalf("production TTL replay manifest rejected: %v", err)
+	}
+	m.E4.ExpiryTTLSeconds = 599
+	if _, err := Validate(m, false); err == nil {
+		t.Fatal("reduced production TTL must be rejected")
 	}
 	for _, mutate := range []func(*Manifest){
 		func(m *Manifest) { m.E4.MaxMessages = 10001 },
@@ -282,5 +310,19 @@ func TestDecodeRejectsUnknownFieldsAndCredentialText(t *testing.T) {
 	}
 	if _, err := Decode(strings.NewReader(strings.Repeat(" ", maxManifestBytes+1))); err == nil {
 		t.Fatal("oversized manifest accepted")
+	}
+}
+
+func TestDecodeAcceptsBoundedManifestAboveLegacyOneMiB(t *testing.T) {
+	raw, err := json.Marshal(validManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := append(raw, []byte(strings.Repeat(" ", (1<<20)+1-len(raw)))...)
+	if len(padded) <= 1<<20 || len(padded) > maxManifestBytes {
+		t.Fatalf("test payload size outside intended bounds: %d", len(padded))
+	}
+	if _, err := Decode(strings.NewReader(string(padded))); err != nil {
+		t.Fatalf("bounded manifest above legacy limit rejected: %v", err)
 	}
 }

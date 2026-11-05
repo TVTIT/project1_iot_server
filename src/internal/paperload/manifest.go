@@ -19,7 +19,9 @@ import (
 	"iot-platform/internal/gateway"
 )
 
-const maxManifestBytes = 1 << 20
+// Viewer subscriptions are serialized per viewer; a valid 10k-viewer E1 plan
+// can exceed 1 MiB. Keep decoding bounded while matching the portable bundle cap.
+const maxManifestBytes = 8 << 20
 
 const (
 	// MaxViewers is the absolute finite viewer bound, reserved for official opt-in.
@@ -73,6 +75,7 @@ type E4Settings struct {
 	MaxBytes             int64  `json:"max_bytes,omitempty"`
 	ReplayCount          int    `json:"replay_count,omitempty"`
 	IgnoreFirstValidACKs int    `json:"ignore_first_valid_acks,omitempty"`
+	ExpiryTTLSeconds     int    `json:"expiry_ttl_seconds,omitempty"`
 }
 
 // ControlCommand is one finite REST command-stream entry. Frequency is kept as
@@ -476,9 +479,10 @@ func validE4Settings(s E4Settings) bool {
 		return false
 	}
 	if s.Mode == "unique" {
-		return s.ReplayCount == 0
+		return s.ReplayCount == 0 && s.ExpiryTTLSeconds == 0
 	}
-	return s.ReplayCount >= 1 && s.ReplayCount <= s.MaxMessages && s.IgnoreFirstValidACKs <= s.MaxMessages
+	return s.ReplayCount >= 1 && s.ReplayCount <= s.MaxMessages && s.IgnoreFirstValidACKs <= s.MaxMessages &&
+		(s.ExpiryTTLSeconds == 0 || s.ExpiryTTLSeconds == 600)
 }
 
 // SafePrivateJournalRef applies the manifest's non-secret relative-file policy.

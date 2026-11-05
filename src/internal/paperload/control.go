@@ -24,6 +24,7 @@ type ControlResult struct {
 	Implementation   string              `json:"implementation_status"`
 	Experiment       string              `json:"experiment"`
 	Arm              string              `json:"arm"`
+	Profile          string              `json:"profile"`
 	RunID            string              `json:"run_id"`
 	StartedAt        string              `json:"started_at"`
 	FinishedAt       string              `json:"finished_at"`
@@ -46,7 +47,7 @@ type ControlPhaseEvent struct {
 	ClockQualification string `json:"clock_qualification"`
 }
 
-const maxControlPhaseEvents = 32
+const maxControlPhaseEvents = 3003 // three lifecycle events per bounded command plus stop events
 
 // ControlRecord contains one bounded command outcome and client-side timing only.
 type ControlRecord struct {
@@ -90,7 +91,7 @@ var errControlResponseTooLarge = errors.New("response_limit_exceeded")
 
 // RunControl submits a finite command stream using only the existing HTTPS REST API.
 func RunControl(ctx context.Context, m Manifest, manifestPath, outputDir string, observers ...func(ControlPhaseEvent) error) (ControlResult, error) {
-	r := ControlResult{Status: "FAILED", Implementation: "P8.4.10 HTTPS REST control producer only; external durable simulator required", Experiment: m.Experiment, Arm: m.Arm, RunID: m.RunID, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), OriginMissing: "unavailable: client cannot observe Go HTTP-entry/PUBACK/result-commit origin", Planned: len(m.Commands)}
+	r := ControlResult{Status: "FAILED", Implementation: "P8.4.10 HTTPS REST control producer only; external durable simulator required", Experiment: m.Experiment, Arm: m.Arm, Profile: m.Profile, RunID: m.RunID, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), OriginMissing: "unavailable: client cannot observe Go HTTP-entry/PUBACK/result-commit origin", Planned: len(m.Commands)}
 	if err := os.Mkdir(outputDir, 0700); err != nil {
 		return r, errors.New("output_directory_must_be_fresh")
 	}
@@ -167,11 +168,8 @@ func RunControl(ctx context.Context, m Manifest, manifestPath, outputDir string,
 		keyPreviouslySent := requestHistory[spec.IdempotencyKey]
 		requestHistory[spec.IdempotencyKey] = true
 		r.Sent++
-		// Preserve all pilot commands; large manifests are explicitly sampled.
-		observeCommand := index < 9
-		if observeCommand {
-			emit("request_begin", index+1)
-		}
+		// Preserve lifecycle evidence for every command; the manifest caps the stream.
+		emit("request_begin", index+1)
 		patchStart := time.Now()
 		body := []byte(fmt.Sprintf(`{"frequency_hz":%s,"expected_desired_version":%q}`, string(spec.FrequencyHz), spec.ExpectedDesiredVersion))
 		path := controlEntityPath(spec.GatewayID, spec.SensorID)
@@ -185,9 +183,7 @@ func RunControl(ctx context.Context, m Manifest, manifestPath, outputDir string,
 			keyPreviouslySent = true
 		}
 		record.RoundTripMS = time.Since(patchStart).Milliseconds()
-		if observeCommand {
-			emit("admission_observed", index+1)
-		}
+		emit("admission_observed", index+1)
 		if requestErr != nil {
 			record.Classification = "admission_unresolved"
 			record.Error = "https_request_failed"
@@ -305,9 +301,7 @@ func RunControl(ctx context.Context, m Manifest, manifestPath, outputDir string,
 		}
 		if terminal {
 			r.Pending--
-			if observeCommand {
-				emit("terminal_observed", index+1)
-			}
+			emit("terminal_observed", index+1)
 		}
 		if pollFailure != "" {
 			record.Classification = "poll_" + pollFailure
@@ -345,7 +339,7 @@ func RunControl(ctx context.Context, m Manifest, manifestPath, outputDir string,
 	} else {
 		r.Status = "COMPLETE"
 	}
-	r.PhaseObservation = "observed; maximum 9 command ordinals sampled; process-local clock"
+	r.PhaseObservation = "observed; all command ordinals; process-local clock"
 	if measurementFailed {
 		r.PhaseObservation = "partial; phase observer failed; command outcomes retained"
 		if r.Status == "COMPLETE" {

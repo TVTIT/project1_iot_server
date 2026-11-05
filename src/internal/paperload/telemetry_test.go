@@ -596,6 +596,34 @@ func TestUniqueJournalFailurePreventsEnqueueAndPublish(t *testing.T) {
 	}
 }
 
+func TestE4UniqueOpenLoopStopsAtParameterizedJournalCount(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := CreateE4Journal(filepath.Join(dir, "unique.jsonl"), 8, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = journal.Close() }()
+	m := telemetryManifest(100)
+	m.Experiment, m.E4.Mode = "E4", "unique"
+	m.E4.MaxMessages, m.E4.MaxBytes = 8, 1<<20
+	m.Targets = []Target{{GatewayID: "gw-a", SensorID: "s-a"}}
+	engine, err := NewTelemetryEngine(m, map[string]TelemetryTransport{"gw-a": &fakeLoadTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.journal = journal
+	if !engine.runOpenLoop(context.Background(), 4*time.Second, 0, false) {
+		t.Fatal("bounded E4 unique phase did not complete")
+	}
+	counters := engine.Counters()
+	if counters.Generated != 8 || counters.Scheduled != 8 || counters.Deferred != 0 {
+		t.Fatalf("E4 unique phase exceeded its parameterized schedule: %+v", counters)
+	}
+}
+
 func TestGeneratedAndOfferedUniqueAreDifferentAtQueueCap(t *testing.T) {
 	m := telemetryManifest(1)
 	m.Targets = []Target{{GatewayID: "gw-a", SensorID: "s-a"}}

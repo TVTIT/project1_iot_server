@@ -77,7 +77,12 @@ func TestRunControlPATCH202PollsRealResultAndReportedConfiguration(t *testing.T)
 	if _, err := Validate(m, false); err != nil {
 		t.Fatalf("control-only manifest rejected: %v", err)
 	}
+	m.Profile = "official"
+	if _, err := Validate(m, true); err != nil {
+		t.Fatalf("opted-in official control manifest rejected: %v", err)
+	}
 	low := m
+	low.Profile = "pilot"
 	low.Commands = append([]ControlCommand(nil), m.Commands...)
 	low.Commands[0].FrequencyHz = json.Number("0.1")
 	low.Commands[0].IdempotencyKey = "19dabc9f-5790-43af-aeac-df1a1e1913a4"
@@ -92,7 +97,7 @@ func TestRunControlPATCH202PollsRealResultAndReportedConfiguration(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "COMPLETE" || len(got.Commands) != 1 || got.Commands[0].Classification != "succeeded" || got.Commands[0].AdmissionClassification != "accepted_202_fresh_key_declared_unverified" || got.Commands[0].RoundTripMeasurement == "" || got.OriginMissing == "" || polls.Load() == 0 {
+	if got.Status != "COMPLETE" || got.Profile != "official" || len(got.Commands) != 1 || got.Commands[0].Classification != "succeeded" || got.Commands[0].AdmissionClassification != "accepted_202_fresh_key_declared_unverified" || got.Commands[0].RoundTripMeasurement == "" || got.OriginMissing == "" || polls.Load() == 0 {
 		t.Fatalf("result: %+v polls=%d", got, polls.Load())
 	}
 	if len(observed) < 6 || observed[0].Event != "request_begin" || observed[1].Event != "admission_observed" || observed[len(observed)-1].Event != "workers_joined" {
@@ -177,7 +182,7 @@ func TestRunControlPhaseEventsCoverNoopAndRejectedAdmission(t *testing.T) {
 	}
 }
 
-func TestRunControlPhaseEventJournalIsBoundedAndSamplesLongStreams(t *testing.T) {
+func TestRunControlPhaseEventJournalIsBoundedAndRecordsLongStreams(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPatch {
 			w.WriteHeader(http.StatusOK)
@@ -200,9 +205,21 @@ func TestRunControlPhaseEventJournalIsBoundedAndSamplesLongStreams(t *testing.T)
 	if len(result.PhaseEvents) > maxControlPhaseEvents || result.PhaseObservation == "" {
 		t.Fatalf("unbounded/unqualified journal: events=%d qualification=%q", len(result.PhaseEvents), result.PhaseObservation)
 	}
+	seen := map[int]map[string]bool{}
 	for _, event := range result.PhaseEvents {
-		if event.CommandOrdinal > 9 {
-			t.Fatalf("unsampled ordinal: %+v", event)
+		if event.CommandOrdinal > 0 {
+			if seen[event.CommandOrdinal] == nil {
+				seen[event.CommandOrdinal] = map[string]bool{}
+			}
+			seen[event.CommandOrdinal][event.Event] = true
+		}
+	}
+	if len(seen) != len(m.Commands) {
+		t.Fatalf("lifecycle events omitted command ordinals: have=%d want=%d", len(seen), len(m.Commands))
+	}
+	for ordinal := 1; ordinal <= len(m.Commands); ordinal++ {
+		if !seen[ordinal]["request_begin"] || !seen[ordinal]["admission_observed"] {
+			t.Fatalf("command %d lacks lifecycle events: %+v", ordinal, seen[ordinal])
 		}
 	}
 }

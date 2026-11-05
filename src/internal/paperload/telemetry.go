@@ -332,6 +332,9 @@ drained:
 	want := int64(math.Ceil(e.m.Traffic.RatePerSecond*float64(e.m.Phases.MeasureSeconds))) +
 		int64(math.Ceil(e.m.Traffic.RatePerSecond*float64(e.m.Phases.WarmupSeconds))) +
 		int64(e.m.Traffic.BurstMessages)
+	if e.m.Experiment == "E4" && e.m.E4.Mode == "unique" {
+		want = int64(e.m.E4.MaxMessages)
+	}
 	if e.m.EqualSamples != nil {
 		want = int64(e.m.EqualSamples.ExpectedMessages)
 	}
@@ -458,7 +461,7 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
 	var opportunity int64
-	for !e.stopGeneration.Load() && time.Since(start) < duration {
+	for !e.stopGeneration.Load() && !e.e4PhaseTargetReached() && time.Since(start) < duration {
 		select {
 		case a := <-e.acks:
 			e.handleACK(a)
@@ -480,7 +483,7 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 					e.counts.measureScheduled.Add(skipped)
 				}
 			}
-			for opportunity < should && !e.stopGeneration.Load() {
+			for opportunity < should && !e.stopGeneration.Load() && !e.e4PhaseTargetReached() {
 				opportunity++
 				e.counts.scheduled.Add(1)
 				if e.m.E4.Mode == "replay" {
@@ -523,6 +526,9 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 			e.retryDue(now)
 		}
 	}
+	if e.e4PhaseTargetReached() {
+		return ctx.Err() == nil
+	}
 	if !e.stopGeneration.Load() && ctx.Err() == nil {
 		should := ScheduledOpportunities(duration, e.m.Traffic.RatePerSecond, ramp)
 		if first, skipped := BoundedOpportunityRange(opportunity, should, 64); skipped > 0 {
@@ -539,7 +545,7 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 			}
 		}
 		now := time.Now()
-		for opportunity < should && !e.stopGeneration.Load() {
+		for opportunity < should && !e.stopGeneration.Load() && !e.e4PhaseTargetReached() {
 			opportunity++
 			e.counts.scheduled.Add(1)
 			if e.m.E4.Mode == "replay" {
@@ -581,6 +587,20 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 		}
 	}
 	return ctx.Err() == nil
+}
+
+func (e *TelemetryEngine) e4PhaseTargetReached() bool {
+	if e.m.Experiment != "E4" {
+		return false
+	}
+	switch e.m.E4.Mode {
+	case "unique":
+		return e.m.E4.MaxMessages > 0 && e.counts.generated.Load() >= int64(e.m.E4.MaxMessages)
+	case "replay":
+		return e.m.E4.ReplayCount > 0 && e.counts.replayScheduled.Load() >= int64(e.m.E4.ReplayCount)
+	default:
+		return false
+	}
 }
 
 // BoundedOpportunityRange skips stale schedule debt instead of allowing a
