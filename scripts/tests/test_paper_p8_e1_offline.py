@@ -42,12 +42,15 @@ class E1OfflineContractTests(unittest.TestCase):
             'replay_new_deliveries': 0})
 
     def test_selected_overlay_sizing_is_finite_and_does_not_scale_queues(self):
-        for viewers in (128, 5000, 10000):
+        for viewers in (64, 128, 1000, 5000, 10000):
             with self.subTest(viewers=viewers):
                 overlay = paper_p8_e1_support.e1_resource_overlay(viewers, official_opt_in=True)
                 self.assertEqual(overlay['proposed']['WS_MAX_SESSIONS'], viewers)
                 workers = min(32, max(1, (viewers + 63) // 64))
-                self.assertEqual(overlay['proposed']['nginx_worker_connections'], (2 * viewers + 34 + workers - 1) // workers)
+                base = (2 * viewers + 34 + workers - 1) // workers
+                connections = max(256, 2 * base + 32)
+                self.assertEqual(overlay['proposed']['nginx_worker_connections'], connections)
+                self.assertEqual(overlay['proposed']['nginx_process_fd_soft'], max(1024, connections + 128))
                 self.assertEqual(overlay['proposed']['nginx_worker_processes'], workers)
                 self.assertEqual(overlay['proposed']['WS_SESSION_REFERENCE_BYTES'], 8 * 1024 * 1024)
                 self.assertEqual(overlay['estimated_only'], True)
@@ -109,22 +112,48 @@ class E1OfflineContractTests(unittest.TestCase):
 
     def test_resource_gate_uses_live_per_worker_readback_for_selected_overlay(self):
         result = paper_p8_e1_support.require_e1_resource_gate({
-            'nginx': {'worker_processes':2,'worker_connections':145},
-            'process_fd_limits': {'soft':145,'hard':145},
+            'nginx': {'worker_processes':2,'worker_connections':322},
+            'process_fd_limits': {'soft':1024,'hard':1024},
+            'nginx_workers': [{'pid': i, 'soft': 1024, 'hard': 1024, 'open': 50, 'available': 974}
+                              for i in (2, 3)],
             'backend_fd_availability': {'available':160,'soft':224,'open':64},
             'broker_fd_availability': {'available':34,'soft':98,'open':64}},
             viewers=128, session_cap=128)
         self.assertEqual(result['proxy_slots_total_required'], 290)
-        self.assertEqual(result['proxy_slots_per_worker_required'], 145)
+        self.assertEqual(result['proxy_slots_per_worker_required'], 322)
+        self.assertEqual(result['nginx_fd_limit_required'], 1024)
         self.assertTrue(result['native_executed'] is False)
 
     def test_resource_gate_rejects_known_nginx_fd_limit(self):
-        resources = {'nginx': {'worker_processes': 1, 'worker_connections': 20034},
+        resources = {'nginx': {'worker_processes': 1, 'worker_connections': 20100},
             'process_fd_limits': {'soft': 4096, 'hard': 4096},
             'backend_fd_availability': {'available': 20000},
             'broker_fd_availability': {'available': 64}}
-        with self.assertRaisesRegex(ValueError, 'nginx_fd_limit:required=10034:available=4096'):
+        with self.assertRaisesRegex(ValueError, 'nginx_fd_limit:required=20228:available=4096'):
             paper_p8_e1_support.require_e1_resource_gate(resources, viewers=5000, session_cap=10000)
+
+    def test_1000_viewer_gate_rejects_old_overlay_and_insufficient_worker_fd(self):
+        resources = {'nginx': {'worker_processes': 16, 'worker_connections': 128},
+            'process_fd_limits': {'soft': 128, 'hard': 128},
+            'backend_fd_availability': {'available': 1084},
+            'broker_fd_availability': {'available': 90}}
+        with self.assertRaisesRegex(ValueError, 'nginx_worker_connections:required=288:available=128'):
+            paper_p8_e1_support.require_e1_resource_gate(resources, viewers=1000, session_cap=1000)
+        resources['nginx']['worker_connections'] = 288
+        resources['process_fd_limits'] = {'soft': 1024, 'hard': 1024}
+        resources['nginx_workers'] = [{'pid': i + 2, 'soft': 1024, 'hard': 1024,
+            'open': 50, 'available': 974} for i in range(16)]
+        self.assertEqual(paper_p8_e1_support.require_e1_resource_gate(resources,
+            viewers=1000, session_cap=1000)['status'], 'RESOURCE_GATE_PASSED')
+        resources['nginx_workers'][0].update(soft=128, available=78)
+        with self.assertRaisesRegex(ValueError, 'nginx_worker_fd_limit'):
+            paper_p8_e1_support.require_e1_resource_gate(resources, viewers=1000, session_cap=1000)
+        resources['nginx_workers'][0].update(soft=1024, open=700, available=324)
+        with self.assertRaisesRegex(ValueError, 'nginx_worker_fd_available'):
+            paper_p8_e1_support.require_e1_resource_gate(resources, viewers=1000, session_cap=1000)
+        resources['nginx_workers'] = None
+        with self.assertRaisesRegex(ValueError, 'nginx_workers_unavailable'):
+            paper_p8_e1_support.require_e1_resource_gate(resources, viewers=1000, session_cap=1000)
 
     def test_resource_gate_rejects_unknown_critical_readback(self):
         with self.assertRaisesRegex(ValueError, 'e1_resource_gate_denied:nginx_worker_connections_unavailable'):

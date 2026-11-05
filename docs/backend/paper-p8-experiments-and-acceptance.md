@@ -475,3 +475,41 @@ cleanup đã xác minh chỉ vì tiến trình bị cưỡng chế dừng. Regre
 thật kiểm tra dừng êm, join và escalation; không hồi tố thay đổi artifact cũ.
 Kiểm tra tập trung dùng `PYTHONPATH=scripts/tests python3 -m unittest test_paper_p8_e5_driver`;
 đây không phải bằng chứng nghiệm thu một arm E5.
+
+## Bổ sung — Sửa ngân sách FD Nginx và pilot E1 1.000 viewer (05/11/2026)
+
+Lượt A/B do operator chạy trước sửa có 825/1.000 viewer connected/subscribed,
+175 `connect_failed`; telemetry chưa được khởi động vì không đạt readiness.
+Log Nginx A trong cùng cửa sổ ghi 175 `socket() failed (24: No file descriptors
+available)` và 365 `accept4() failed (24: No file descriptors available)`.
+Overlay cũ chia 2.034 connection slots cho 16 worker, rồi đặt cả
+`worker_connections` và nofile mỗi worker bằng 128; thiếu dự phòng FD nội bộ
+và phân bố kết nối không đều. Lượt đó giữ nguyên FAIL, không thay đổi raw evidence.
+
+Overlay mới tách connection budget và FD budget: `base = ceil(total_slots / W)`,
+`C = max(256, 2 * base + 32)`, `nofile = max(1024, C + 128)`. Gate đọc cả
+master và từng worker thực, từ chối thiếu worker/thiếu giới hạn hoặc FD khả dụng;
+chỉ master limit cao không còn đủ điều kiện PASS. Queue/reference budgets và
+deployment defaults không thay đổi. Công thức là sizing hữu hạn để kiểm chứng,
+không cam kết mọi phân bố kết nối hoặc mọi rung tải đều hoạt động.
+
+Pilot native mới `native1000-gyk_ajud` dùng source `9d00d08…` cùng dirty changes
+của bản sửa; chạy colocated, profile official opt-in, hai principal, bốn target,
+5 message/target. Readback: 16 worker, C=288, nofile 1.024 ở mọi worker; FD còn
+lại thấp nhất trước workload là 999. Viewer `COMPLETE`: 1.000 attempt,
+1.000 connected/subscribed/receiving, không duplicate/sai namespace hay close
+reason lỗi. Telemetry: 20 generated/offered, 20 PUBACK/application ACK, pending
+0 message / 0 byte. DB delta 20 ledger / 2.000 raw / 20 temporal / 0 configuration;
+WebSocket 8.330 enqueued/completed writes khớp expected 8.330, drops 0.
+Validation PASS, runner COMPLETE không primary/cleanup error; cleanup đã xác minh
+12 containers / 1 network / 5 volumes. Artifact:
+`/var/tmp/opencode/p8-e1-fd-fix/native1000-gyk_ajud/fixture/artifacts/p8-e1-pilot.json`.
+Đây không phải lượt chạy hai máy của operator, capacity/soak hay full acceptance;
+`physical_ab=NOT RUN`, `full_p8_accepted=false` giữ nguyên.
+
+Regression trước sửa tái hiện gate chấp nhận overlay 128/128 và thiếu worker
+readback; sau sửa bộ affected có 382 tests tổng (381 PASS / 1 SKIP), bộ shared
+readback E2/E3/E4 có 162 tests tổng (161 PASS / 1 SKIP). Các lệnh và log ở
+`/var/tmp/opencode/p8-e1-fd-fix/`. Một lần gọi native ban đầu dùng nhầm metadata
+deadline của hold lane bị argparse từ chối trước khi tạo fixture; giữ log riêng
+`native1000-hkmwvbhf/native.log`, không tính là workload FAIL hay PASS.

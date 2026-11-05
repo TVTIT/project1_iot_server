@@ -181,6 +181,36 @@ class PaperP8FixtureSupportTests(unittest.TestCase):
         self.assertIsNone(empty['broker_fd_availability']['available'])
         self.assertIn('reason', empty['broker_fd_availability'])
 
+    def test_owned_nginx_worker_readback_is_bounded_and_not_master_only(self):
+        def fake(service, command):
+            self.assertIn(service, ('nginx', 'backend', 'mosquitto'))
+            if command[:2] == ['nginx', '-T']:
+                return 'worker_processes 2;\nworker_connections 322;'
+            if command[0] == 'cat':
+                return 'Max open files 1024 1024 files'
+            if service == 'nginx':
+                self.assertIn('/proc/1/task/1/children', command[-1])
+                return '2 50 1024 1024\n3 60 128 128\n'
+            return '10\n'
+        result = p8.read_owned_fixture_resources(fake, viewers=128)
+        self.assertEqual(result['nginx_workers'], [
+            {'pid': 2, 'open': 50, 'soft': 1024, 'hard': 1024, 'available': 974},
+            {'pid': 3, 'open': 60, 'soft': 128, 'hard': 128, 'available': 68}])
+
+    def test_owned_nginx_worker_readback_rejects_missing_or_malformed_rows(self):
+        for rows in ('', 'bad row', '2 50 1024 1024\n2 50 1024 1024\n',
+                     '2 50 1024 1024\n' * 33):
+            with self.subTest(rows=rows[:30]):
+                def fake(service, command):
+                    if command[:2] == ['nginx', '-T']:
+                        return 'worker_processes 2;\nworker_connections 322;'
+                    if command[0] == 'cat':
+                        return 'Max open files 1024 1024 files'
+                    return rows if service == 'nginx' else '10\n'
+                result = p8.read_owned_fixture_resources(fake, viewers=128)
+                self.assertIsNone(result['nginx_workers'])
+                self.assertEqual(result['nginx_workers_reason'], 'nginx_worker_fd_readback_unavailable')
+
     def test_bundle_rejects_db_and_admin_identity_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             kwargs = dict(run_id='pilot', endpoints={'https': 'https://a.test',

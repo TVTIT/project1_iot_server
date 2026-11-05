@@ -155,6 +155,14 @@ def mixed_e1_mapping(targets, *, seed=86, viewers=64, principals=2,
                           'receiving_viewers': len({v for values in recipients.values() for v in values})}}
 
 
+def _nginx_worker_budget(viewers, workers, reserve_connections):
+    slots = 2 * viewers + 2 + reserve_connections
+    base = (slots + workers - 1) // workers
+    # Leave room for uneven worker assignment and non-connection descriptors.
+    connections = max(256, 2 * base + 32)
+    return connections, max(1024, connections + 128)
+
+
 def require_e1_resource_gate(resources, *, viewers, session_cap, reserve_connections=32):
     """Refuse an E1 rung unless effective owned-process limits cover the selected load."""
     if type(viewers) is not int or not 1 <= viewers <= 10000:
@@ -166,17 +174,29 @@ def require_e1_resource_gate(resources, *, viewers, session_cap, reserve_connect
     nginx = resources.get('nginx') if isinstance(resources, dict) else None
     if not isinstance(nginx, dict) or type(nginx.get('worker_connections')) is not int:
         raise ValueError('e1_resource_gate_denied:nginx_worker_connections_unavailable')
-    if type(nginx.get('worker_processes')) is not int or nginx['worker_processes'] < 1:
+    if type(nginx.get('worker_processes')) is not int or not 1 <= nginx['worker_processes'] <= 32:
         raise ValueError('e1_resource_gate_denied:nginx_worker_processes_unavailable')
     required_slots = 2 * viewers + 2 + reserve_connections  # two telemetry producer sockets
-    per_worker_required = (required_slots + nginx['worker_processes'] - 1) // nginx['worker_processes']
+    per_worker_required, fd_required = _nginx_worker_budget(viewers, nginx['worker_processes'], reserve_connections)
     if nginx['worker_connections'] < per_worker_required:
         raise ValueError(f'e1_resource_gate_denied:nginx_worker_connections:required={per_worker_required}:available={nginx["worker_connections"]}')
     nginx_fd = resources.get('process_fd_limits')
-    if not isinstance(nginx_fd, dict) or (nginx_fd.get('soft') is not None and type(nginx_fd.get('soft')) is not int):
+    if not isinstance(nginx_fd, dict) or type(nginx_fd.get('soft')) is not int:
         raise ValueError('e1_resource_gate_denied:nginx_fd_limit_unavailable')
-    if nginx_fd.get('soft') is not None and nginx_fd['soft'] < per_worker_required:
-        raise ValueError(f'e1_resource_gate_denied:nginx_fd_limit:required={per_worker_required}:available={nginx_fd["soft"]}')
+    if nginx_fd['soft'] < fd_required:
+        raise ValueError(f'e1_resource_gate_denied:nginx_fd_limit:required={fd_required}:available={nginx_fd["soft"]}')
+    workers = resources.get('nginx_workers')
+    if (not isinstance(workers, list) or len(workers) != nginx['worker_processes']
+            or any(not isinstance(row, dict) or type(row.get('pid')) is not int
+                   or row['pid'] <= 1 for row in workers)
+            or len({row['pid'] for row in workers}) != len(workers)):
+        raise ValueError('e1_resource_gate_denied:nginx_workers_unavailable')
+    for worker in workers:
+        if type(worker.get('soft')) is not int or worker['soft'] < fd_required:
+            raise ValueError('e1_resource_gate_denied:nginx_worker_fd_limit')
+        if (type(worker.get('open')) is not int or worker['open'] < 3
+                or worker['soft'] - worker['open'] < per_worker_required + 128):
+            raise ValueError('e1_resource_gate_denied:nginx_worker_fd_available')
     for key, required in (('backend_fd_availability', viewers + reserve_connections),
                           ('broker_fd_availability', 2 + reserve_connections)):
         state = resources.get(key)
@@ -188,7 +208,8 @@ def require_e1_resource_gate(resources, *, viewers, session_cap, reserve_connect
             raise ValueError(f'e1_resource_gate_denied:{key}:required={required}:available={state["available"]}')
     return {'status': 'RESOURCE_GATE_PASSED', 'viewers': viewers,
             'proxy_slots_total_required': required_slots,
-            'proxy_slots_per_worker_required': per_worker_required,
+             'proxy_slots_per_worker_required': per_worker_required,
+             'nginx_fd_limit_required': fd_required,
             'reserve_connections': reserve_connections,
             'backend_fds_required': viewers + reserve_connections,
             'broker_fds_required': 2 + reserve_connections,
@@ -203,12 +224,12 @@ def e1_resource_overlay(viewers, *, official_opt_in, host_limits=None, reserve_c
         raise ValueError('e1_resource_gate_denied:official_opt_in_required')
     workers = min(32, max(1, (viewers + 63) // 64))
     proxy_slots = 2 * viewers + 2 + reserve_connections
-    per_worker = (proxy_slots + workers - 1) // workers
+    per_worker, fd_limit = _nginx_worker_budget(viewers, workers, reserve_connections)
     # Reference/session memory is a fixed ceiling, not multiplied by viewers;
     # per-session queues and pending limits intentionally remain unchanged.
     proposed = {'WS_MAX_SESSIONS': viewers, 'WS_SESSION_REFERENCE_BYTES': 8 * 1024 * 1024,
         'nginx_worker_processes': workers, 'nginx_worker_connections': per_worker,
-        'nginx_process_fd_soft': per_worker, 'backend_process_fd_required': viewers + reserve_connections,
+        'nginx_process_fd_soft': fd_limit, 'backend_process_fd_required': viewers + reserve_connections,
         'backend_process_fd_limit': viewers + reserve_connections + 64,
         'broker_process_fd_required': 2 + reserve_connections,
         'broker_process_fd_limit': 2 + reserve_connections + 64, 'proxy_slots_total': proxy_slots,

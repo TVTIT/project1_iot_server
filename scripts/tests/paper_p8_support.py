@@ -668,11 +668,48 @@ def read_owned_fixture_resources(exec_owned_service, *, viewers=64, role_connect
         available = (2**63 - 1) if limits.get('soft') is None else max(0, limits['soft'] - opened)
         return {'available': available, 'soft': limits['soft'],
                 'hard': limits.get('hard'), 'open': opened}
-    return fixture_process_preflight(worker_processes=directive('worker_processes'),
+    result = fixture_process_preflight(worker_processes=directive('worker_processes'),
         worker_connections=directive('worker_connections'), process_fd_limits=nginx_limits,
         backend_fd_availability=availability(backend_limits, 'backend'),
         broker_fd_availability=availability(broker_limits, 'mosquitto'),
         viewers=viewers, proxied_websockets=True, role_connections=role_connections)
+    # Only inspect direct children of the owned Nginx master, never host processes.
+    worker_text = read('nginx', ['sh', '-c', r'''
+set -eu
+count=0
+for pid in $(cat /proc/1/task/1/children); do
+    count=$((count + 1))
+    [ "$count" -le 64 ] || exit 1
+    case "$(tr '\000' ' ' < /proc/"$pid"/cmdline)" in
+        'nginx: worker process'*)
+            set -- /proc/"$pid"/fd/*
+            [ "$#" -ge 3 ] || exit 1
+            printf '%s %s ' "$pid" "$#"
+            awk '$1 == "Max" && $2 == "open" && $3 == "files" { print $4, $5; found=1 }
+                 END { if (!found) exit 1 }' /proc/"$pid"/limits
+            ;;
+    esac
+done
+'''])
+    workers = []
+    try:
+        lines = worker_text.splitlines() if worker_text is not None else []
+        if not 1 <= len(lines) <= 32:
+            raise ValueError('worker_count')
+        for line in lines:
+            pid, opened, soft, hard = map(int, line.split())
+            if pid <= 1 or opened < 3 or soft < opened or hard < soft:
+                raise ValueError('worker_limits')
+            workers.append({'pid': pid, 'open': opened, 'soft': soft, 'hard': hard,
+                            'available': soft - opened})
+        if len({row['pid'] for row in workers}) != len(workers):
+            raise ValueError('worker_duplicates')
+    except (ValueError, TypeError):
+        result['nginx_workers'] = None
+        result['nginx_workers_reason'] = 'nginx_worker_fd_readback_unavailable'
+    else:
+        result['nginx_workers'] = workers
+    return result
 
 
 def validate_mqtt_mapping(mapping, *, owned_service):

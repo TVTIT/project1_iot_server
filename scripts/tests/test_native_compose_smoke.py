@@ -690,16 +690,17 @@ class PreparationTests(unittest.TestCase):
                 paper_p8_profile='official', paper_p8_official_opt_in=True,
                 paper_p8_e1_viewers=128, paper_p8_e1_messages_per_target=2)
             self.assertEqual(fixture.values['WS_MAX_SESSIONS'], '128')
-            self.assertEqual(fixture.e1_resource_overlay['proposed']['nginx_worker_connections'], 145)
+            self.assertEqual(fixture.e1_resource_overlay['proposed']['nginx_worker_connections'], 322)
             config = fixture.private / 'nginx.conf'
             self.assertTrue(config.is_file())
             self.assertIn('worker_processes 2;', config.read_text())
-            self.assertIn('worker_connections 145;', config.read_text())
+            self.assertIn('worker_connections 322;', config.read_text())
+            self.assertIn('worker_rlimit_nofile 1024;', config.read_text())
             compose = fixture.override.read_text()
             for service in ('nginx', 'backend', 'mosquitto'):
                 self.assertIn(f'  {service}:', compose)
                 self.assertIn('nofile:', compose)
-            for expected in ('soft: 145', 'soft: 224', 'soft: 98',
+            for expected in ('soft: 1024', 'hard: 1024', 'soft: 224', 'soft: 98',
                              'WS_MAX_SESSIONS=128', 'WS_SESSION_REFERENCE_BYTES=8388608'):
                 self.assertIn(expected, compose + fixture.env_file.read_text())
             self.assertIn(str(config), compose)
