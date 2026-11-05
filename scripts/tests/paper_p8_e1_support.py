@@ -603,11 +603,14 @@ def _load_result_bundle(results_root, prepared, *, phase_id, binary_sha256):
         'results/workloads/telemetry/workload.json': 'telemetry',
     }
     files = summary.get('files') if isinstance(summary, dict) else None
+    expected_session = {'session_id': prepared['session_id'],
+        'run_ids': [prepared['run_id']], 'experiment': 'E1',
+        'arm': prepared['common']['arm'], 'phase': phase_id}
+    profiled_session = dict(expected_session,
+        profile=prepared.get('profile', prepared['common'].get('profile', 'pilot')))
     if (not isinstance(summary, dict) or summary.get('schema_version') != 1 or summary.get('full_p8_accepted') is not False
             or summary.get('physical_ab') != 'NOT RUN'
-            or summary.get('session') != {'session_id': prepared['session_id'],
-                'run_ids': [prepared['run_id']], 'experiment': 'E1',
-                'arm': prepared['common']['arm'], 'phase': phase_id}
+            or summary.get('session') not in (expected_session, profiled_session)
             or summary.get('source_bundle_sha256') != prepared['bundle_sha256']
             or summary.get('runner_status') not in ('COMPLETE','PARTIAL','FAILED')
             or summary.get('expected_workload_roles') != ['telemetry', 'viewer']

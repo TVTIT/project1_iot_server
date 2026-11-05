@@ -153,7 +153,7 @@ class E1PilotSupportTests(unittest.TestCase):
             self.assertNotIn('admin', json.dumps(kwargs['role_metadata']))
 
     def _result_bundle(self, root, *, session_id='a'*32, role='telemetry', unsafe_path=None,
-                       bound_gateway_environment=None):
+                       bound_gateway_environment=None, profile='pilot', session_profile=None):
         root.mkdir(mode=0o700)
         binary = b'paperload-binary'
         digest = hashlib.sha256(binary).hexdigest()
@@ -162,9 +162,9 @@ class E1PilotSupportTests(unittest.TestCase):
             'results/runner/provenance.json': {'binary_sha256':digest,
                 'binary_os':sys.platform,'binary_arch':platform.machine()},
             'results/workloads/viewer/workload.json': {'status':'COMPLETE','experiment':'E1',
-                'arm':'e1-pilot','run_id':'p8e1-'+('a'*32),'mode':'remote','profile':'pilot'},
+                'arm':'e1-pilot','run_id':'p8e1-'+('a'*32),'mode':'remote','profile':profile},
             'results/workloads/telemetry/workload.json': {'status':'COMPLETE','experiment':'E2',
-                'arm':'e1-pilot','run_id':'p8e1-'+('a'*32),'mode':'remote','profile':'pilot'},
+                'arm':'e1-pilot','run_id':'p8e1-'+('a'*32),'mode':'remote','profile':profile},
         }
         rows=[]
         for rel, value in payloads.items():
@@ -184,12 +184,47 @@ class E1PilotSupportTests(unittest.TestCase):
             'files':rows}
         if unsafe_path:
             summary['files'][0]['path']=unsafe_path
+        if session_profile is not None:
+            summary['session']['profile'] = session_profile
         data=json.dumps(summary).encode()
         (root/'results.json').write_bytes(data); (root/'results.json').chmod(0o600)
         prepared={'session_id':'a'*32,'run_id':'p8e1-'+'a'*32,
-            'common':{'arm':'e1-pilot'},'bundle_sha256':'b'*64,'bundle_inventory':[],
+            'common':{'arm':'e1-pilot'},'profile':profile,'bundle_sha256':'b'*64,'bundle_inventory':[],
             'gateway_refs':{'gw-a':'/unused/a','gw-b':'/unused/b'}}
         return prepared,digest
+
+    def test_imported_session_accepts_selected_profile_and_legacy_shape(self):
+        for profile in ('pilot', 'official'):
+            for include_profile in (False, True):
+                with self.subTest(profile=profile, include_profile=include_profile), \
+                        tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+                    root = Path(directory) / 'results'
+                    prepared, binary = self._result_bundle(root, profile=profile,
+                        session_profile=profile if include_profile else None)
+                    # Older prepared metadata stores the profile in common instead.
+                    if profile == 'pilot':
+                        prepared['common']['profile'] = prepared.pop('profile')
+                    loaded = _load_result_bundle(root, prepared, phase_id='pilot', binary_sha256=binary)
+                    self.assertEqual(loaded['viewer']['profile'], profile)
+                    self.assertEqual(loaded['telemetry']['profile'], profile)
+
+    def test_imported_profile_session_rejects_mismatch_and_unknown_fields(self):
+        changes = (
+            {'profile': 'pilot'}, {'profile': None}, {'profile': 'unsupported'},
+            {'session_id': 'c' * 32}, {'run_ids': ['another-run']},
+            {'phase': 'another-phase'}, {'arm': 'another-arm'},
+            {'experiment': 'E3'}, {'unexpected': True},
+        )
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+                root = Path(directory) / 'results'
+                prepared, binary = self._result_bundle(root, profile='official', session_profile='official')
+                summary_path = root / 'results.json'
+                summary = json.loads(summary_path.read_text())
+                summary['session'].update(change)
+                summary_path.write_text(json.dumps(summary))
+                with self.assertRaisesRegex(ValueError, 'result_bundle_correlation_rejected'):
+                    _load_result_bundle(root, prepared, phase_id='pilot', binary_sha256=binary)
 
     def test_imported_result_requires_correlation_all_roles_and_digest_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
