@@ -19,6 +19,7 @@ import urllib.error
 
 SCHEMA_VERSION = 1
 MAX_FILE_BYTES = 8 << 20
+MAX_MANIFEST_BYTES = 8 << 20
 MAX_TOTAL_BYTES = 32 << 20
 MAX_FILES = 96
 MAX_WAIT_SECONDS = 7200
@@ -28,7 +29,7 @@ MANIFEST_TOP = {'schema_version','experiment','arm','profile','mode','run_id','s
     'samples_per_message','topology','targets','subscriptions','traffic','phases','limits','tls',
     'identity_files','gateway_identity_files','bundle_path','durability_mode','retry_interval_ms',
     'publish_timeout_ms','viewer','commands','e4','equal_samples'}
-RUN_SPEC_KEYS = {'paperload','gateways','stop_timeout_seconds'}
+RUN_SPEC_KEYS = {'paperload','gateways','stop_timeout_seconds','disk_guard'}
 
 E2_EQUAL_SAMPLES_CONTEXT_KEYS = frozenset({
     'schema_version', 'workload_type', 'seed', 'total_samples', 'sample_rate',
@@ -62,9 +63,12 @@ def _source(path, *, limit=MAX_FILE_BYTES):
         if (not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > limit
                 or st.st_uid != os.getuid() or st.st_mode & 0o077):
             _fail('bundle_source_file_rejected')
-        data = p.read_bytes()
+        with p.open('rb') as source:
+            data = source.read(limit + 1)
     except OSError:
         _fail('bundle_source_missing')
+    if len(data) > limit:
+        _fail('bundle_source_file_rejected')
     if len(data) != st.st_size:
         _fail('bundle_source_changed')
     return data
@@ -200,7 +204,7 @@ def _strict_manifest(value, experiment, arm):
         _fail('bundle_manifest_identity_mismatch')
     if not isinstance(value.get('run_id'), str) or not SAFE_ID.fullmatch(value['run_id']):
         _fail('bundle_manifest_identity_mismatch')
-    if value.get('profile') not in ('pilot','official') or not isinstance(value.get('roles'),list):
+    if value.get('profile') not in ('pilot','representative','official') or not isinstance(value.get('roles'),list):
         _fail('bundle_manifest_contract_rejected')
     object_fields={'topology':{'gateways','sensors_per_gateway','users','viewers'},
         'traffic':{'rate_per_second','ramp_seconds','burst_messages'},
@@ -209,8 +213,11 @@ def _strict_manifest(value, experiment, arm):
                   'disk_growth_bytes','wall_seconds'},
         'tls':{'https_endpoint','mqtt_tls_endpoint','https_ca_file','mqtt_tls_ca_file','mqtt_tls_server_name'},
         'viewer':{'mode','slow_pause_ms','reconnect_count','identity_window','max_messages','max_bytes'},
-        'e4':{'mode','journal_path','max_messages','max_bytes','replay_count','ignore_first_valid_acks'}}
+        'e4':{'mode','journal_path','max_messages','max_bytes','replay_count','ignore_first_valid_acks',
+              'expiry_ttl_seconds'}}
     for key, allowed in object_fields.items():
+        if key == 'traffic' and experiment == 'E2' and value.get('profile') == 'official':
+            allowed = allowed | {'total_rate_per_second'}
         if key in value and value[key] is not None and (type(value[key]) is not dict or set(value[key])-allowed):
             _fail('bundle_manifest_fields_rejected')
     for field, allowed in (('targets',{'gateway_id','sensor_id'}),
@@ -320,6 +327,8 @@ def _validate_e2_equal_samples_workload(workload):
     for field in int_fields:
         if type(ctx.get(field)) is not int:
             _fail('bundle_workload_metadata_rejected')
+
+
     if (ctx['schema_version'] != 1
             or ctx['workload_type'] != 'equal_samples'
             or ctx['logical_producers'] != ['A', 'B']
@@ -391,10 +400,87 @@ def _validate_e2_equal_samples_workload(workload):
             _fail('bundle_workload_metadata_rejected')
 
 
+def _validate_e2_official_workload(workload):
+    required = {'experiment','arm','phase','profile','workload','seed','samples_per_message',
+        'producer_rates_per_second','offered_rate_per_second','measure_seconds','burst_messages',
+        'expected_counts','estimate','durability_mode','generator_colocated'}
+    if (type(workload) is not dict or set(workload) != required
+            or workload.get('experiment') != 'E2' or workload.get('profile') != 'official'
+            or workload.get('workload') != 'e2-telemetry-ab-official'
+            or not isinstance(workload.get('arm'), str) or not SAFE_ID.fullmatch(workload['arm'])
+            or not isinstance(workload.get('phase'), str) or not SAFE_ID.fullmatch(workload['phase'])
+            or type(workload.get('seed')) is not int or not 0 <= workload['seed'] <= (1 << 63)-1
+            or type(workload.get('samples_per_message')) is not int or workload['samples_per_message'] not in (1,100)
+            or type(workload.get('offered_rate_per_second')) is not int
+            or workload['offered_rate_per_second'] not in (100,1000,5000,20000)
+            or type(workload.get('measure_seconds')) is not int or not 1 <= workload['measure_seconds'] <= 7200
+            or type(workload.get('burst_messages')) is not int or not 0 <= workload['burst_messages'] <= 100000
+            or workload.get('durability_mode') != 'synthetic-load'
+            or workload.get('generator_colocated') not in ('unverified',True,False,'true','false')):
+        _fail('bundle_workload_metadata_rejected')
+    rates = workload['producer_rates_per_second']
+    if (type(rates) is not dict or set(rates) != {'A','B'}
+            or any(type(v) is not int or v < 0 for v in rates.values())
+            or sum(rates.values()) != workload['offered_rate_per_second']):
+        _fail('bundle_workload_metadata_rejected')
+    messages = workload['offered_rate_per_second'] * workload['measure_seconds'] + workload['burst_messages']
+    expected = workload['expected_counts']
+    if (type(expected) is not dict or set(expected) != {'unique','raw','temporal','ack'}
+            or expected != {'unique':messages,'raw':messages*workload['samples_per_message'],
+                            'temporal':messages,'ack':messages}):
+        _fail('bundle_workload_metadata_rejected')
+    estimate = workload['estimate']
+    estimate_keys = {'estimate_only','rate_per_second','duration_seconds','unique_messages_estimate',
+        'raw_rows_estimate','application_payload_bytes_estimate','raw_database_row_index_wal_bytes_estimate',
+        'total_storage_growth_bytes_estimate','pending_retry_memory_bytes_estimate',
+        'application_bandwidth_bytes_per_second_estimate','payload_bytes_wire','payload_size_basis',
+        'estimate_basis','not_measurements'}
+    estimate_messages = workload['offered_rate_per_second'] * workload['measure_seconds']
+    estimate_rows = estimate_messages * workload['samples_per_message']
+    basis = estimate.get('estimate_basis') if isinstance(estimate, dict) else None
+    if (type(estimate) is not dict or set(estimate) != estimate_keys
+            or estimate.get('estimate_only') is not True or estimate.get('not_measurements') is not True
+            or estimate.get('payload_bytes_wire') is not None
+            or estimate.get('rate_per_second') != workload['offered_rate_per_second']
+            or estimate.get('duration_seconds') != workload['measure_seconds']
+            or estimate.get('payload_size_basis') != 'actual_builder_or_conservative_assumption'
+            or estimate.get('unique_messages_estimate') != estimate_messages
+            or estimate.get('raw_rows_estimate') != estimate_rows
+            or any(type(estimate.get(k)) is not int or estimate[k] < 0 for k in (
+                'application_payload_bytes_estimate','raw_database_row_index_wal_bytes_estimate',
+                'total_storage_growth_bytes_estimate','pending_retry_memory_bytes_estimate',
+                'application_bandwidth_bytes_per_second_estimate'))
+            or type(basis) is not dict or set(basis) != {'raw_row_bytes','index_bytes_per_row','wal_multiplier'}
+            or any(type(basis[k]) is not int for k in ('raw_row_bytes','index_bytes_per_row','wal_multiplier'))
+            or estimate.get('application_payload_bytes_estimate') != estimate_messages * 4096
+            or estimate.get('raw_database_row_index_wal_bytes_estimate') != estimate_rows * 320 * 2
+            or estimate.get('total_storage_growth_bytes_estimate') != estimate_messages * 4096 + estimate_rows * 320 * 2
+            or estimate.get('pending_retry_memory_bytes_estimate') != (min(estimate_messages,64)+min(estimate_messages,16))*4096
+            or estimate.get('application_bandwidth_bytes_per_second_estimate') != workload['offered_rate_per_second']*4096
+            or basis != {'raw_row_bytes':256,'index_bytes_per_row':64,'wal_multiplier':2}
+            or estimate.get('total_storage_growth_bytes_estimate') > 10 << 30
+            ):
+        _fail('bundle_workload_metadata_rejected')
+
+
 def _e5_context_projection(value):
     allowed = {'dataset_path', 'sha256', 'bytes', 'seed', 'anchor', 'gateway_ids',
-                'sensor_ids', 'command_keys', 'viewer_subscriptions'}
+                'sensor_ids', 'command_keys', 'viewer_subscriptions', 'workload_selection',
+                'workload_selection_sha256'}
     if type(value) is not dict or set(value) != allowed:
+        _fail('bundle_e5_context_rejected')
+    selection = value.get('workload_selection')
+    if (type(selection) is not dict or set(selection) != {'profile', 'telemetry_messages', 'initial_replay_count',
+            'samples_per_message', 'command_count', 'viewer_count',
+            'initial_replay_rate_per_second', 'warm_replay_prefix'}
+            or selection not in ({'profile': 'pilot', 'telemetry_messages': 20, 'initial_replay_count': 20,
+                'samples_per_message': 100, 'command_count': 4, 'viewer_count': 2,
+                'initial_replay_rate_per_second': 1, 'warm_replay_prefix': 10},
+                {'profile': 'representative', 'telemetry_messages': 8, 'initial_replay_count': 8,
+                'samples_per_message': 100, 'command_count': 4, 'viewer_count': 2,
+                'initial_replay_rate_per_second': 1, 'warm_replay_prefix': 2})
+            or value.get('workload_selection_sha256') != hashlib.sha256(
+                json.dumps(selection, sort_keys=True, separators=(',', ':')).encode()).hexdigest()):
         _fail('bundle_e5_context_rejected')
     # The source path is A-local and must never be portable metadata.
     return {key: value[key] for key in allowed if key != 'dataset_path'}
@@ -416,26 +502,32 @@ def _validate_e5_lifecycle(value):
 def _validate_e5_workload(workload, context):
     required = {'workload_type','journal_sha256','journal_bytes','schedule','telemetry',
                 'commands','subscriptions','viewer_count','security'}
-    if (type(workload) is not dict or set(workload) != required
+    if (type(workload) is not dict or set(workload) != required | {'profile','workload_selection_sha256'}
             or workload.get('workload_type') != 'p8_e5_prebuilt_journal'
             or workload.get('journal_sha256') != context.get('sha256')
             or workload.get('journal_bytes') != context.get('bytes')
-            or workload.get('viewer_count') != 2):
+            or workload.get('viewer_count') != 2
+            or workload.get('profile') != context['workload_selection']['profile']
+            or workload.get('workload_selection_sha256') != context.get('workload_selection_sha256')):
         _fail('bundle_workload_metadata_rejected')
+    selection = context['workload_selection']
     schedule = workload.get('schedule')
     if (type(schedule) is not dict or set(schedule) != {'initial_imported_messages','initial_replay',
             'warm_replay_prefix','replay_after_commit_ack_baseline','generated_unique'}
-            or schedule.get('initial_imported_messages') != 20 or schedule.get('warm_replay_prefix') != 10
+            or schedule.get('initial_imported_messages') != selection['telemetry_messages']
+            or schedule.get('warm_replay_prefix') != selection['warm_replay_prefix']
             or schedule.get('replay_after_commit_ack_baseline') is not True
             or schedule.get('generated_unique') != 0
-            or schedule.get('initial_replay') != {'rate_per_second':1,'measure_seconds':1,'burst_messages':19}):
+            or schedule.get('initial_replay') != {'rate_per_second':selection['initial_replay_rate_per_second'],
+                'measure_seconds':1,'burst_messages':max(0, selection['initial_replay_count'] - 1)}):
         _fail('bundle_workload_metadata_rejected')
     telemetry = workload.get('telemetry')
     if (type(telemetry) is not dict or set(telemetry) != {'gateway_ids','sensor_ids','messages',
             'samples_per_message','sample_interval_us','dataset_anchor'}
             or telemetry.get('gateway_ids') != context.get('gateway_ids')
             or telemetry.get('sensor_ids') != context.get('sensor_ids')
-            or telemetry.get('messages') != 20 or telemetry.get('samples_per_message') != 100
+            or telemetry.get('messages') != selection['telemetry_messages']
+            or telemetry.get('samples_per_message') != selection['samples_per_message']
             or telemetry.get('sample_interval_us') != 10000
             or telemetry.get('dataset_anchor') != context.get('anchor')):
         _fail('bundle_workload_metadata_rejected')
@@ -445,7 +537,7 @@ def _validate_e5_workload(workload, context):
             or commands.get('gateway_id') != 'p8-e5-a'
             or commands.get('command_sensor_ids') != ['p8-e5-command-a','p8-e5-command-b']
             or commands.get('idempotency_keys') != context.get('command_keys')
-            or commands.get('count') != 4 or commands.get('frequencies_hz') != [2,4]
+            or commands.get('count') != selection['command_count'] or commands.get('frequencies_hz') != [2,4]
             or commands.get('versions') != {'initial':0,'after_each_sensor':1}
             or commands.get('executor') != 'existing_e3_sqlite_executor'):
         _fail('bundle_workload_metadata_rejected')
@@ -509,17 +601,18 @@ def _validate_e5_context(context, dataset_source, manifests, arm):
                     or payload_obj.get('sensor_id') != row.get('sensor_id')
                     or payload_obj.get('boot_id') != row.get('boot_id')
                     or str(payload_obj.get('first_sequence')) != str(row.get('first_sequence'))
-                    or payload_obj.get('sample_count') != 100
+            or payload_obj.get('sample_count') != projected['workload_selection']['samples_per_message']
                     or payload_obj.get('sample_interval_us') != 10000
                     or not isinstance(payload_obj.get('samples'), list)
-                    or len(payload_obj['samples']) != 100
+            or len(payload_obj['samples']) != projected['workload_selection']['samples_per_message']
                     or row.get('topic') != f"gateways/{row.get('gateway_id')}/telemetry/{row.get('sensor_id')}"
-                    or row.get('sample_count') != 100):
+            or row.get('sample_count') != projected['workload_selection']['samples_per_message']):
                 _fail('bundle_e5_dataset_record_rejected')
             records.append(row)
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
         _fail('bundle_e5_dataset_record_rejected')
-    if len(records) != 20 or len({row.get('message_id') for row in records}) != 20:
+    message_count = projected['workload_selection']['telemetry_messages']
+    if len(records) != message_count or len({row.get('message_id') for row in records}) != message_count:
         _fail('bundle_e5_dataset_record_count_rejected')
     if any((row.get('gateway_id'), row.get('sensor_id')) not in set(zip(gateway_ids, sensor_ids))
            for row in records):
@@ -539,11 +632,11 @@ def _validate_e5_context(context, dataset_source, manifests, arm):
             return False
 
     if (initial.get('e4', {}).get('mode') != 'replay'
-            or initial.get('e4', {}).get('replay_count') != 20
-            or initial.get('e4', {}).get('max_messages') != 20
+            or initial.get('e4', {}).get('replay_count') != projected['workload_selection']['initial_replay_count']
+            or initial.get('e4', {}).get('max_messages') != projected['workload_selection']['initial_replay_count']
             or warm.get('e4', {}).get('mode') != 'replay'
-            or warm.get('e4', {}).get('replay_count') != 10
-            or warm.get('e4', {}).get('max_messages') != 10
+            or warm.get('e4', {}).get('replay_count') != projected['workload_selection']['warm_replay_prefix']
+            or warm.get('e4', {}).get('max_messages') != projected['workload_selection']['warm_replay_prefix']
             or not replay_source_matches(initial) or not replay_source_matches(warm)):
         _fail('bundle_e5_replay_manifest_rejected')
     command_rows = control.get('commands')
@@ -571,7 +664,7 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             or not math.isfinite(wait_seconds) or not math.isfinite(workload_seconds)
             or wait_seconds < 0 or workload_seconds < 0 or wait_seconds + workload_seconds > MAX_WAIT_SECONDS):
         _fail('bundle_wait_bound_rejected')
-    allowed_manifest_labels = {'viewer','telemetry','control','A','B','unique','replay','cold-replay'}
+    allowed_manifest_labels = {'viewer','telemetry','control','A','B','unique','replay','cold-replay','expiry-replay'}
     if experiment == 'E5':
         allowed_manifest_labels |= {'initial', 'warm_replay'}
     if not isinstance(manifests,dict) or not manifests or set(manifests) - allowed_manifest_labels:
@@ -599,10 +692,10 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
         _fail('bundle_topology_metadata_rejected')
     workload_keys={'experiment','arm','run_id','cache_mode','samples_per_message','unique_batches','rate_per_second',
         'measure_seconds','generator_colocated','profile','workload','seed','phase','offered_messages',
-        'dispatch_mode'}
+        'dispatch_mode','expiry_replay_enabled','expiry_required_lifetime_seconds'}
     if experiment == 'E5':
-        e5_workload_keys = {'workload_type','journal_sha256','journal_bytes','schedule','telemetry',
-                            'commands','subscriptions','viewer_count','security'}
+        e5_workload_keys = {'workload_type','profile','workload_selection_sha256','journal_sha256',
+                            'journal_bytes','schedule','telemetry','commands','subscriptions','viewer_count','security'}
         if (type(workload) is not dict or set(workload) != e5_workload_keys
                 or workload.get('workload_type') != 'p8_e5_prebuilt_journal'
                 or workload.get('journal_sha256') != e5_context.get('sha256')
@@ -615,13 +708,31 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
                 or type(workload.get('security')) is not dict):
             _fail('bundle_workload_metadata_rejected')
         _validate_e5_workload(workload, e5_context)
+    elif experiment == 'E2' and isinstance(workload, dict) and workload.get('profile') == 'official':
+        _validate_e2_official_workload(workload)
     elif experiment == 'E2' and isinstance(workload, dict) and (
             workload.get('workload_type') == 'equal_samples' or workload.get('workload') == 'equal_samples'):
         _validate_e2_equal_samples_workload(workload)
+    elif experiment == 'E1' and isinstance(workload, dict):
+        e1_workload_keys = workload_keys | {'viewer_count', 'principal_count', 'density',
+                                             'expected_deliveries_by_target'}
+        if (set(workload) - e1_workload_keys
+                or any(type(x) not in (str, int, float, bool) or type(x) is float and not math.isfinite(x)
+                       for key, x in workload.items() if key != 'expected_deliveries_by_target')
+                or ('expected_deliveries_by_target' in workload
+                    and (type(workload['expected_deliveries_by_target']) is not dict
+                         or any(not isinstance(k, str) or type(v) is not int or v < 0
+                                for k, v in workload['expected_deliveries_by_target'].items())))):
+            _fail('bundle_workload_metadata_rejected')
     elif (type(workload) is not dict or set(workload)-workload_keys
             or any(type(x) not in (str,int,float,bool) or type(x) is float and not math.isfinite(x)
                    for x in workload.values())):
         _fail('bundle_workload_metadata_rejected')
+    if experiment == 'E4' and ('expiry_replay_enabled' in workload
+            and (type(workload['expiry_replay_enabled']) is not bool
+                 or workload['expiry_replay_enabled'] != ('expiry-replay' in manifests)
+                 or workload['expiry_replay_enabled'] and workload.get('cache_mode') != 'on')):
+        _fail('bundle_e4_expiry_metadata_rejected')
     _public_metadata(topology)
     leaf = Path(output_leaf)
     if leaf.exists() or leaf.is_symlink(): _fail('bundle_output_leaf_exists')
@@ -632,6 +743,9 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
     os.chmod(root,0o700)
     try:
         inventory=[]; manifest_refs={}; manifest_values={}; jwt_expiries=[]; copied_identity_refs={}
+        selected_profile = workload.get('profile', 'pilot') if isinstance(workload, dict) else 'pilot'
+        if selected_profile not in ('pilot', 'representative', 'official'):
+            _fail('bundle_profile_mismatch')
         _copy_input(root, ca_files['https'], 'certs/https-ca.pem', inventory, 'public_ca')
         _copy_input(root, ca_files['mqtt'], 'certs/mqtt-ca.pem', inventory, 'public_ca')
         for role_key, source in identity_files.items():
@@ -673,13 +787,21 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             gateway_refs[gateway_id]=rel
         effective_workload_seconds = (max(workload_seconds, validated_e5_lifecycle['deadline_seconds'])
                                       if experiment == 'E5' else workload_seconds)
-        required_lifetime=wait_seconds+effective_workload_seconds
+        expiry_required = workload.get('expiry_required_lifetime_seconds') if isinstance(workload, dict) else None
+        if expiry_required is not None:
+            if (experiment != 'E4' or type(expiry_required) not in (int, float)
+                    or not math.isfinite(expiry_required) or expiry_required < 0):
+                _fail('bundle_expiry_budget_rejected')
+            required_lifetime = max(wait_seconds + effective_workload_seconds,
+                                    expiry_required)
+        else:
+            required_lifetime=wait_seconds+effective_workload_seconds
         now=time.time()
         if any(exp-now < required_lifetime for _,exp in jwt_expiries): _fail('bundle_identity_near_expiry')
 
         referenced_gateways=set(); referenced_identities=set()
         for label, source in manifests.items():
-            raw=_json_file(source,limit=1<<20)
+            raw=_json_file(source,limit=MAX_MANIFEST_BYTES)
             if (experiment == 'E5' and label in ('initial','warm_replay','viewer')
                     and isinstance(raw, dict) and raw.get('mode') == 'local'):
                 # E5 preparation uses the existing local manifest constructors;
@@ -703,13 +825,20 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
                 'E2' if experiment=='E2' and label in ('A','B') else
                 'E3' if experiment=='E3' and label=='control' else
                 'E2' if experiment=='E3' and label in ('A','B') else
-                'E4' if experiment=='E4' and label in ('viewer','unique','replay','cold-replay') else None)
+                'E4' if experiment=='E4' and label in ('viewer','unique','replay','cold-replay','expiry-replay') else None)
             expected_arm=('control' if experiment == 'E5' and label == 'control' else
                           'warm' if experiment == 'E5' else
                           label if experiment=='E2' and label in ('A','B') else
                           'control' if experiment=='E3' and label=='control' else
                           label if experiment=='E3' and label in ('A','B') else arm)
             _strict_manifest(raw,expected_manifest_experiment,expected_arm)
+            expected_manifest_profile = 'pilot' if experiment == 'E5' else selected_profile
+            # E3 official denotes the 30-command control schedule; its reused E2
+            # telemetry background remains the established pilot manifest.
+            if experiment == 'E3' and selected_profile == 'official' and label in ('A', 'B'):
+                expected_manifest_profile = 'pilot'
+            if raw.get('profile') != expected_manifest_profile:
+                _fail('bundle_profile_mismatch')
             if raw.get('roles') != [expected]: _fail('bundle_manifest_role_mismatch')
             if (type(raw.get('identity_files')) is not dict or set(raw['identity_files']) != {expected}
                     or expected == 'telemetry' and not raw.get('gateway_identity_files')):
@@ -895,6 +1024,28 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             max_stop = 300 if experiment == 'E2' else 60
             if type(stop) is not int or not 1 <= stop <= max_stop: _fail('bundle_run_spec_rejected')
             spec['stop_timeout_seconds']=stop
+            # The guard is always enabled for portable runs. The growth limit is
+            # derived from the selected manifests; paths are reconstructed locally
+            # from owned job/output and Gateway outbox references at bind/run time.
+            growth_limits = [m.get('limits', {}).get('disk_growth_bytes') for m in rewritten.values()]
+            growth_limits = [v for v in growth_limits if type(v) is int and v > 0]
+            if not growth_limits:
+                _fail('bundle_disk_guard_budget_missing')
+            supplied_guard = supplied.get('disk_guard')
+            if supplied_guard is not None and (type(supplied_guard) is not dict or
+                    set(supplied_guard) - {'growth_threshold_bytes','minimum_free_bytes','interval_seconds','max_samples'}):
+                _fail('bundle_disk_guard_rejected')
+            growth = min(growth_limits)
+            free = (supplied_guard or {}).get('minimum_free_bytes', 64 << 20)
+            interval = (supplied_guard or {}).get('interval_seconds', 1.0)
+            max_samples = (supplied_guard or {}).get('max_samples', 128)
+            if (type(free) is not int or free < 0 or free > 1 << 40
+                    or type(interval) not in (int,float) or not math.isfinite(interval) or not .1 <= interval <= 60
+                    or type(max_samples) is not int or not 2 <= max_samples <= 4096
+                    or (supplied_guard is not None and supplied_guard.get('growth_threshold_bytes', growth) != growth)):
+                _fail('bundle_disk_guard_rejected')
+            spec['disk_guard'] = {'growth_threshold_bytes': growth, 'minimum_free_bytes': free,
+                                  'interval_seconds': interval, 'max_samples': max_samples}
             if experiment != 'E5' and {job['manifest'] for job in spec['paperload']} != set(manifest_refs.values()):
                 _fail('bundle_run_spec_reference_rejected')
             if experiment != 'E5' and {job['env_file'] for job in spec['gateways']} != set(env_refs.values()):
@@ -916,6 +1067,14 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
                     'role':role,'ready_timeout_seconds':90})
             for gateway_id, rel in env_refs.items():
                 spec['gateways'].append({'env_file':rel,'role':'durable-telemetry','ready_timeout_seconds':30})
+        if 'disk_guard' not in spec:
+            growth_limits = [value.get('limits', {}).get('disk_growth_bytes') for value in rewritten.values()]
+            growth_limits = [value for value in growth_limits if type(value) is int and value > 0]
+            if not growth_limits:
+                _fail('bundle_disk_guard_budget_missing')
+            spec['disk_guard'] = {'growth_threshold_bytes': min(growth_limits),
+                                  'minimum_free_bytes': 64 << 20,
+                                  'interval_seconds': 1.0, 'max_samples': 128}
         spec_data=json.dumps(spec,sort_keys=True,separators=(',',':')).encode()
         _write(root,'execution/run-spec.json',spec_data)
         _record_inventory(inventory, 'execution/run-spec.json', 'run_spec', spec_data)
@@ -966,7 +1125,7 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             'path_reference_base':'bundle-root',
             'session':{'session_id':session_id,'run_ids':sorted({
                 value['run_id'] for value in rewritten.values()}),
-                'experiment':experiment,'arm':arm,'phase':phase},
+                'experiment':experiment,'arm':arm,'phase':phase,'profile':selected_profile},
             'topology':topology,'workload':portable_workload,
             'endpoints':{'https':first_manifest['tls']['https_endpoint'],
                          'mqtt_tls':first_manifest['tls'].get('mqtt_tls_endpoint')},
@@ -974,6 +1133,7 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             'mutable_outputs':['outputs/'],'identity_expiry_earliest':min((x[1] for x in jwt_expiries),default=None),
             'created_at_unix':time.time(),'wait_seconds':wait_seconds,
             'workload_seconds':effective_workload_seconds,
+            'additional_token_lifetime_seconds':max(0, required_lifetime - wait_seconds - effective_workload_seconds),
             'integrity_note':'SHA-256 chỉ để đối chiếu/tương quan, không phải chữ ký hay bằng chứng nguồn tin cậy.'}
         if experiment == 'E5':
             metadata['e5_context_ref'] = 'contexts/e5-context.json'
@@ -1048,6 +1208,7 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
         elapsed = max(elapsed_transfer_wait_seconds, time.time() - metadata['created_at_unix'])
         required_lifetime = (
             max(0.0, metadata['wait_seconds'] - elapsed) + metadata['workload_seconds']
+            + metadata.get('additional_token_lifetime_seconds', 0)
         )
         expiries = []
         identity_files = [
@@ -1084,7 +1245,7 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
 
         bound_manifest_hashes = {}
         for rel in manifest_paths:
-            raw = _json_file(workspace / 'inputs' / rel, limit=1 << 20)
+            raw = _json_file(workspace / 'inputs' / rel, limit=MAX_MANIFEST_BYTES)
             label = PurePosixPath(rel).stem
             tls = raw.get('tls')
             if type(tls) is not dict:
@@ -1148,7 +1309,7 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
 
         run_spec_rel = 'inputs/execution/run-spec.json'
         portable_spec = _json_file(workspace / run_spec_rel, limit=1 << 20)
-        if (type(portable_spec) is not dict or set(portable_spec) != RUN_SPEC_KEYS
+        if (type(portable_spec) is not dict or set(portable_spec) not in (RUN_SPEC_KEYS, RUN_SPEC_KEYS - {'disk_guard'})
                 or type(portable_spec.get('paperload')) is not list
                 or type(portable_spec.get('gateways')) is not list):
             _fail('bundle_run_spec_rejected')
@@ -1163,7 +1324,7 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
             seen_jobs.add(manifest_rel)
             label = PurePosixPath(manifest_rel).stem
             role = job['role']
-            manifest_input = _json_file(workspace / 'inputs' / manifest_rel, limit=1 << 20)
+            manifest_input = _json_file(workspace / 'inputs' / manifest_rel, limit=MAX_MANIFEST_BYTES)
             if role != manifest_input['roles'][0]:
                 _fail('bundle_run_spec_reference_rejected')
             timeout = job['ready_timeout_seconds']
@@ -1206,10 +1367,27 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
         max_stop = 300 if metadata['session']['experiment'] == 'E2' else 60
         if type(stop_timeout) is not int or not 1 <= stop_timeout <= max_stop:
             _fail('bundle_run_spec_rejected')
+        disk_guard = portable_spec.get('disk_guard')
+        if disk_guard is None:
+            # Legacy pilot bundle qualification: guard defaults from manifest budgets.
+            limits = [_json_file(workspace / 'inputs' / rel, limit=MAX_MANIFEST_BYTES).get('limits', {})
+                      for rel in manifest_paths]
+            growth_values = [item.get('disk_growth_bytes') for item in limits
+                             if type(item.get('disk_growth_bytes')) is int and item['disk_growth_bytes'] > 0]
+            if not growth_values:
+                _fail('bundle_disk_guard_budget_missing')
+            disk_guard = {'growth_threshold_bytes': min(growth_values),
+                          'minimum_free_bytes': 64 << 20, 'interval_seconds': 1.0,
+                          'max_samples': 128, 'qualification': 'legacy_bundle_guard_defaulted'}
+        if (type(disk_guard) is not dict or type(disk_guard.get('growth_threshold_bytes')) is not int
+                or disk_guard['growth_threshold_bytes'] <= 0 or type(disk_guard.get('minimum_free_bytes')) is not int
+                or disk_guard['minimum_free_bytes'] < 0 or not .1 <= disk_guard.get('interval_seconds', 0) <= 60):
+            _fail('bundle_disk_guard_rejected')
         bound_spec = {
             'paperload': bound_jobs,
             'gateways': bound_gateways,
             'stop_timeout_seconds': stop_timeout,
+            'disk_guard': {**disk_guard, 'allowed_root': str((workspace / 'outputs').absolute())},
         }
         spec_data = json.dumps(bound_spec, sort_keys=True, separators=(',', ':')).encode()
         _write(workspace, 'runtime/execution/run-spec.json', spec_data)
@@ -1284,7 +1462,7 @@ def inspect_bundle(root):
     required_metadata = {
         'schema_version', 'contract', 'path_reference_base', 'session', 'topology', 'workload', 'endpoints',
         'inputs', 'immutable_paths', 'mutable_outputs', 'identity_expiry_earliest',
-        'created_at_unix', 'wait_seconds', 'workload_seconds', 'integrity_note',
+        'created_at_unix', 'wait_seconds', 'workload_seconds', 'additional_token_lifetime_seconds', 'integrity_note',
     }
     if type(metadata) is dict and 'durable_probe' in metadata:
         required_metadata.add('durable_probe')
@@ -1298,11 +1476,14 @@ def inspect_bundle(root):
             or type(metadata.get('inputs')) is not list):
         _fail('bundle_metadata_rejected')
     session = metadata.get('session')
-    if (type(session) is not dict or set(session) != {'session_id','run_ids','experiment','arm','phase'}
+    if (type(session) is not dict or set(session) not in (
+                {'session_id','run_ids','experiment','arm','phase'},
+                {'session_id','run_ids','experiment','arm','phase','profile'})
             or not isinstance(session.get('session_id'),str) or not SAFE_ID.fullmatch(session['session_id'])
             or type(session.get('run_ids')) is not list or not session['run_ids']
             or any(not isinstance(run_id,str) or not SAFE_ID.fullmatch(run_id) for run_id in session['run_ids'])
             or session.get('experiment') not in ('E1','E2','E3','E4','E5')
+            or session.get('profile', 'pilot') not in ('pilot','representative','official')
             or not isinstance(session.get('arm'),str) or not SAFE_ID.fullmatch(session['arm'])
             or not isinstance(session.get('phase'),str) or not SAFE_ID.fullmatch(session['phase'])):
         _fail('bundle_session_metadata_rejected')
@@ -1310,8 +1491,11 @@ def inspect_bundle(root):
             or not math.isfinite(metadata['created_at_unix'])
             or type(metadata.get('wait_seconds')) not in (int,float)
             or type(metadata.get('workload_seconds')) not in (int,float)
+            or type(metadata.get('additional_token_lifetime_seconds')) not in (int,float)
             or not math.isfinite(metadata['wait_seconds']) or not math.isfinite(metadata['workload_seconds'])
+            or not math.isfinite(metadata['additional_token_lifetime_seconds'])
             or metadata['wait_seconds'] < 0 or metadata['workload_seconds'] < 0
+            or metadata['additional_token_lifetime_seconds'] < 0
             or metadata['wait_seconds'] + metadata['workload_seconds'] > MAX_WAIT_SECONDS):
         _fail('bundle_metadata_rejected')
     if (type(metadata.get('immutable_paths')) is not list
@@ -1407,6 +1591,16 @@ def inspect_bundle(root):
     if ('public_ca' not in seen_kinds or 'manifest' not in seen_kinds or 'run_spec' not in seen_kinds
             or not {'certs/https-ca.pem','certs/mqtt-ca.pem'} <= seen):
         _fail('bundle_inventory_incomplete')
+    for row in metadata['inputs']:
+        if row.get('kind') == 'manifest':
+            manifest = _json_file(root / row['path'], limit=MAX_MANIFEST_BYTES)
+            expected_manifest_profile = ('pilot' if session.get('experiment') == 'E5' or
+                session.get('experiment') == 'E3' and session.get('profile') == 'official'
+                and Path(row['path']).name in ('A.json', 'B.json')
+                else session.get('profile', 'pilot'))
+            if (type(manifest) is not dict
+                    or manifest.get('profile', 'pilot') != expected_manifest_profile):
+                _fail('bundle_profile_mismatch')
     if session.get('experiment') == 'E5':
         if not {'dataset','e5_context','e5_phase_plan'} <= seen_kinds:
             _fail('bundle_e5_inventory_incomplete')
@@ -1422,7 +1616,7 @@ def inspect_bundle(root):
             path = root / 'manifests' / f'{label}.json'
             if not path.is_file():
                 _fail('bundle_e5_manifest_missing')
-            child_manifests[label] = _json_file(path, limit=1 << 20)
+            child_manifests[label] = _json_file(path, limit=MAX_MANIFEST_BYTES)
         _validate_e5_context(context, root / expected_refs['e5_dataset_ref'], child_manifests,
                              session['arm'])
         plan = _json_file(root / expected_refs['e5_phase_plan_ref'], limit=65536)
@@ -1433,7 +1627,9 @@ def inspect_bundle(root):
         _validate_e5_lifecycle(plan['viewer_lifecycle'])
     if session.get('experiment') == 'E2':
         wl = metadata.get('workload')
-        if isinstance(wl, dict) and (wl.get('workload_type') == 'equal_samples' or wl.get('workload') == 'equal_samples'):
+        if isinstance(wl, dict) and wl.get('profile') == 'official':
+            _validate_e2_official_workload(wl)
+        elif isinstance(wl, dict) and (wl.get('workload_type') == 'equal_samples' or wl.get('workload') == 'equal_samples'):
             _validate_e2_equal_samples_workload(wl)
     return {'schema_version':SCHEMA_VERSION,'valid':True,'files':len(seen),'total_bytes':declared_total,
             'session':metadata.get('session')}

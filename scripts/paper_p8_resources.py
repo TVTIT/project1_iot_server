@@ -9,6 +9,8 @@ import csv
 import json
 import math
 import os
+import queue
+import shutil
 from pathlib import Path
 import sys
 import threading
@@ -18,10 +20,148 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 # Bounded configuration defaults
 DEFAULT_SAMPLE_INTERVAL_SECONDS: float = 0.5
 DEFAULT_MAX_SNAPSHOTS: int = 128
-MAX_ALLOWED_SNAPSHOTS: int = 128
+MAX_ALLOWED_SNAPSHOTS: int = 20000
 DEFAULT_DEADLINE_SECONDS: float = 120.0
-MAX_ALLOWED_DEADLINE_SECONDS: float = 120.0
+MAX_ALLOWED_DEADLINE_SECONDS: float = 86400.0
 DEFAULT_JOIN_TIMEOUT_SECONDS: float = 3.0
+
+
+class OwnedStorageGuard:
+    """Sample only explicitly owned paths; stop when growth/free-space bounds hit."""
+    # A local fixture includes a bounded preloaded Go tool cache under its private
+    # root; leave headroom for it while keeping the filesystem walk finite.
+    MAX_WALK_ENTRIES = 30000
+
+    def __init__(self, paths, *, growth_threshold_bytes, minimum_free_bytes, interval_seconds=1.0,
+                 allowed_root=None, max_samples=128):
+        if (type(growth_threshold_bytes) is not int or growth_threshold_bytes <= 0
+                or type(minimum_free_bytes) is not int or minimum_free_bytes < 0
+                or not isinstance(interval_seconds, (int, float)) or not math.isfinite(interval_seconds)
+                or interval_seconds <= 0 or type(max_samples) is not int or not 2 <= max_samples <= 4096):
+            raise ValueError('storage_guard_bounds_rejected')
+        if not paths or allowed_root is None:
+            raise ValueError('storage_guard_paths_required')
+        self.allowed_root = Path(os.path.abspath(allowed_root))
+        self._reject_symlink_components(self.allowed_root)
+        self.paths = [Path(os.path.abspath(path)) for path in paths]
+        if not self.paths or len(set(self.paths)) != len(self.paths):
+            raise ValueError('storage_guard_paths_required')
+        for path in self.paths:
+            if not path.is_relative_to(self.allowed_root):
+                raise ValueError('owned_storage_path_outside_root')
+            self._reject_symlink_components(path)
+        self.max_samples = max_samples
+        self.growth_threshold_bytes = growth_threshold_bytes
+        self.minimum_free_bytes = minimum_free_bytes
+        self.interval_seconds = float(interval_seconds)
+        self.baseline = self._measure()
+        self.samples = [{'kind': 'baseline', **self.baseline, 'growth_bytes': 0, 'stop_reason': None}]
+        self.stop_reason = None
+
+    @staticmethod
+    def _reject_symlink_components(path):
+        path = Path(os.path.abspath(path))
+        for component in (path, *path.parents):
+            try:
+                if component.is_symlink():
+                    raise ValueError('owned_storage_symlink_rejected')
+            except OSError:
+                raise ValueError('owned_storage_path_unavailable') from None
+
+    def _measure(self):
+        sizes = {}
+        entries_seen = 0
+        unavailable = False
+        for root in self.paths:
+            try:
+                self._reject_symlink_components(root)
+                if not root.exists():
+                    sizes[str(root)] = 0
+                    continue
+                st = root.lstat()
+                if os.path.isfile(root):
+                    sizes[str(root)] = st.st_size
+                elif root.is_dir():
+                    total = 0
+                    for base, dirs, files in os.walk(root, followlinks=False, onerror=lambda _: (_ for _ in ()).throw(OSError('walk_failed'))):
+                        entries_seen += len(dirs) + len(files)
+                        if entries_seen > self.MAX_WALK_ENTRIES:
+                            raise ValueError('owned_storage_entry_cap')
+                        if any((Path(base) / name).is_symlink() for name in dirs + files):
+                            raise ValueError('owned_storage_symlink_rejected')
+                        dirs[:] = dirs
+                        for name in files:
+                            candidate = Path(base) / name
+                            total += candidate.lstat().st_size
+                    sizes[str(root)] = total
+                else:
+                    # Explicitly declared, not-yet-created output leaves are a
+                    # zero-byte baseline; unreadable existing paths still fail.
+                    raise OSError('owned_storage_path_invalid')
+            except (OSError, ValueError):
+                sizes[str(root)] = None
+                unavailable = True
+        try:
+            free = min(shutil.disk_usage(path if path.exists() else path.parent).free for path in self.paths)
+        except OSError:
+            free = None
+        return {'sizes_bytes': sizes, 'free_bytes': free, 'available': not unavailable and free is not None}
+
+    def sample(self):
+        current = self._measure()
+        baseline_total = sum(self.baseline['sizes_bytes'].values()) if self.baseline['available'] else None
+        current_total = sum(current['sizes_bytes'].values()) if current['available'] else None
+        growth = max(0, current_total - baseline_total) if baseline_total is not None and current_total is not None else None
+        reason = None
+        if not current['available'] or growth is None:
+            reason = 'owned_storage_unavailable'
+        elif growth >= self.growth_threshold_bytes:
+            reason = 'owned_storage_growth_threshold'
+        elif current['free_bytes'] is not None and current['free_bytes'] <= self.minimum_free_bytes:
+            reason = 'owned_storage_minimum_free_space'
+        self._append_sample({'kind': 'terminal' if reason else 'sample', **current,
+                             'growth_bytes': growth, 'stop_reason': reason})
+        if reason:
+            self.stop_reason = reason
+            return False
+        return True
+
+    def _append_sample(self, sample):
+        self.samples.append(sample)
+        if len(self.samples) > self.max_samples:
+            # Keep baseline and most recent sample; ordinary middle samples form a ring.
+            self.samples = [self.samples[0], *self.samples[-(self.max_samples - 1):]]
+
+    def report(self):
+        return {'status': 'stopped' if self.stop_reason else 'active',
+                'scope': 'explicit_owned_paths_under_allowed_root', 'allowed_root': str(self.allowed_root),
+                'paths': [str(p) for p in self.paths],
+                'baseline': self.baseline, 'growth_threshold_bytes': self.growth_threshold_bytes,
+                'minimum_free_bytes': self.minimum_free_bytes, 'interval_seconds': self.interval_seconds,
+                'stop_reason': self.stop_reason, 'samples': list(self.samples)}
+
+
+def disk_guard_config(manifests, *, minimum_free_bytes=64 << 20):
+    """Return a finite portable guard budget derived from role manifests."""
+    if type(minimum_free_bytes) is not int or minimum_free_bytes < 0:
+        raise ValueError('storage_guard_bounds_rejected')
+    if not isinstance(manifests, (list, tuple)) or not manifests:
+        raise ValueError('storage_guard_manifests_required')
+    limits = []
+    for manifest in manifests:
+        if isinstance(manifest, (str, Path)):
+            manifest = json.loads(Path(manifest).read_text(encoding='utf-8'))
+        value = manifest.get('limits', {}).get('disk_growth_bytes') if isinstance(manifest, dict) else None
+        if type(value) is int and value > 0:
+            limits.append(value)
+    if not limits:
+        # Legacy pilot manifests predate the declared field; keep them bounded
+        # while making the compatibility default explicit in the run report.
+        return {'growth_threshold_bytes': 64 << 20, 'minimum_free_bytes': minimum_free_bytes,
+                'interval_seconds': 1.0, 'max_samples': 128,
+                'qualification': 'legacy_manifest_bounded_default'}
+    return {'growth_threshold_bytes': min(limits), 'minimum_free_bytes': minimum_free_bytes,
+            'interval_seconds': 1.0, 'max_samples': 128}
 
 GENERATOR_RESOURCES_CSV_COLUMNS: Tuple[str, ...] = (
     'timestamp',
@@ -34,6 +174,7 @@ GENERATOR_RESOURCES_CSV_COLUMNS: Tuple[str, ...] = (
     'process_count',
     'current_fd_count',
     'reason',
+    'phase',
 )
 
 
@@ -162,6 +303,7 @@ class GeneratorResourceSampler:
         self._thread: Optional[threading.Thread] = None
         self._lock: threading.Lock = threading.Lock()
         self._samples: List[Dict[str, Any]] = []
+        self._terminal_sample: Optional[Dict[str, Any]] = None
         self._errors: List[str] = []
         self._last_valid_proc: Optional[Tuple[float, Dict[str, Any]]] = None
         self._started_monotonic: Optional[float] = None
@@ -292,6 +434,7 @@ class GeneratorResourceSampler:
                 'process_count': None,
                 'current_fd_count': current_fd_count,
                 'reason': reason,
+                'phase': 'sample',
             }
             self._samples.append(sample)
             return
@@ -377,6 +520,7 @@ class GeneratorResourceSampler:
             'process_count': process_count,
             'current_fd_count': current_fd_count,
             'reason': sample_reason,
+            'phase': 'sample',
         }
         self._samples.append(sample)
 
@@ -407,12 +551,39 @@ class GeneratorResourceSampler:
                     with self._lock:
                         self._thread = None
 
+        result_queue = queue.Queue(maxsize=1)
+        terminal_thread = threading.Thread(target=lambda: result_queue.put(self._do_reader_io()),
+                                           name='p8-terminal-scrape', daemon=True)
+        terminal_thread.start()
+        terminal_thread.join(timeout=self.join_timeout)
+        if terminal_thread.is_alive():
+            proc, fd_count = {'available': False, 'reason': 'terminal_scrape_timeout'}, None
+        else:
+            proc, fd_count = result_queue.get_nowait()
+        with self._lock:
+            sample_count = len(self._samples)
+            self._stopped = False
+            self._commit_snapshot_locked(proc, fd_count)
+            if len(self._samples) > sample_count:
+                self._terminal_sample = self._samples.pop()
+            else:
+                self._terminal_sample = {
+                    'sample_index': sample_count, 'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'elapsed_seconds': None, 'available': False, 'cpu_percent': None,
+                    'delta_ticks': None, 'rss_bytes': None, 'process_count': None,
+                    'current_fd_count': fd_count, 'reason': 'terminal_after_collector_deadline',
+                }
+            self._terminal_sample['phase'] = 'terminal'
+            self._stopped = True
+
         return self.report()
 
     def report(self) -> Dict[str, Any]:
         """Return JSON-safe descriptive report with declared units, scopes, and samples."""
         with self._lock:
             samples_copy = [dict(s) for s in self._samples[:self.max_snapshots]]
+            if self._terminal_sample is not None:
+                samples_copy.append(dict(self._terminal_sample))
             errors_copy = list(self._errors)
 
         valid_rss = [s['rss_bytes'] for s in samples_copy if s.get('rss_bytes') is not None]
@@ -451,6 +622,7 @@ class GeneratorResourceSampler:
                 'sample_interval_seconds': self.interval,
                 'deadline_seconds': self.deadline_seconds,
                 'max_snapshots': self.max_snapshots,
+                'terminal_snapshot_retained': self._terminal_sample is not None,
             },
             'summary': {
                 'total_samples': len(samples_copy),

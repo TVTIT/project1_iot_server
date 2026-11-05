@@ -834,14 +834,36 @@ def _e5_adapter(report: Dict[str, Any]) -> Dict[str, Any]:
         'workers': meta.get('workers'),
         'durability': meta.get('durability'),
     })
+    mechanisms = report.get('mechanisms') or report.get('mechanism_metrics') or {}
+    mechanisms = dict(mechanisms) if isinstance(mechanisms, dict) else {}
+    fanout = mechanisms.get('fanout')
+    fanout = dict(fanout) if isinstance(fanout, dict) else {}
+    viewer = report.get('viewer') if isinstance(report.get('viewer'), dict) else {}
+    viewer_result = viewer.get('result') if isinstance(viewer.get('result'), dict) else {}
+    viewer_validation = viewer.get('validation') if isinstance(viewer.get('validation'), dict) else {}
+    fanout['readiness_verified'] = (
+        type(viewer.get('ready_servers')) is int and viewer['ready_servers'] == 2
+        and type(viewer.get('sockets')) is int and viewer['sockets'] == 2
+        and viewer_validation.get('valid') is True
+        and viewer_validation.get('failures') == []
+        and viewer_result.get('status') == 'COMPLETE'
+        and type(viewer_result.get('connected_distinct_viewers')) is int
+        and viewer_result['connected_distinct_viewers'] == 2
+        and type(viewer_result.get('subscribed_distinct_viewers')) is int
+        and viewer_result['subscribed_distinct_viewers'] == 2
+        and type(viewer_result.get('receiving_distinct_viewers')) is int
+        and viewer_result['receiving_distinct_viewers'] == 2
+    )
+    mechanisms['fanout'] = fanout
+
     return {
         'status': report.get('status'),
         'cleanup_verified': report.get('cleanup_verified', report.get('exact_cleanup_verified')),
         'exact_cleanup_verified': report.get('exact_cleanup_verified', report.get('cleanup_verified')),
         'metadata': meta,
         'accounting': report.get('accounting'),
-        'mechanism_metrics': report.get('mechanisms') or report.get('mechanism_metrics'),
-        'mechanisms': report.get('mechanisms') or report.get('mechanism_metrics'),
+        'mechanism_metrics': mechanisms,
+        'mechanisms': mechanisms,
     }
 
 
@@ -932,8 +954,8 @@ def build_e5_summary(
         if isinstance(cmd_window, dict) and cmd_window.get('status') == 'AVAILABLE':
             disp_cnt = _e5_num(cmd_window.get('d_dispatch'), 'count')
             e2e_cnt = _e5_num(cmd_window.get('d_e2e_succeeded'), 'count')
-            cmd_status = 'AVAILABLE'
-            cmd_reason = None
+            cmd_status = 'AVAILABLE' if cmd_window.get('count_matches_expected') is True else 'INCONCLUSIVE'
+            cmd_reason = None if cmd_status == 'AVAILABLE' else 'timeline_count_mismatch_or_pending'
         else:
             cmd_status = (cmd_window.get('status') if isinstance(cmd_window, dict) else None) or 'UNAVAILABLE'
             cmd_reason = (cmd_window.get('reason') if isinstance(cmd_window, dict) else None) or 'command_window_timeline_not_recorded'
@@ -986,6 +1008,7 @@ def build_e5_summary(
             'command_timeline_reason': cmd_reason,
             'timeline_dispatch_count': disp_cnt,
             'timeline_e2e_count': e2e_cnt,
+            'timeline_window': cmd_window,
         })
 
     pairs = []
@@ -1140,9 +1163,11 @@ def build_e5_summary(
         'pairs': pairs,
         'qualifications': [
             'Native workloads ran; whole-run happy mocked integration was NOT RUN.',
-            'Command-window timeline is INCONCLUSIVE (counter_field_missing_events); command latency is INCONCLUSIVE and no zero latency or false zero sample counts are claimed.',
+            ('Command-window timeline is available for every arm.' if all(
+                row['command_timeline_status'] == 'AVAILABLE' for row in run_rows) else
+             'Command-window timeline availability varies by arm; see per-run status and reason.'),
             'Resource snapshots are sparse and colocated; not capacity evidence.',
-            'Fanout raw counters/viewer proof are reported alongside conservative helper result; adapter readiness_verified was absent, so activation stays INCONCLUSIVE.',
+            'Fanout readiness is derived from validated viewer/server evidence; raw counters establish mechanism activation, not an end-to-end benefit claim.',
             'This newly generated summary code was not the source executed by these frozen runs.',
         ],
     }

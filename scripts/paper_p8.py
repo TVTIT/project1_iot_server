@@ -13,10 +13,16 @@ import os
 from pathlib import Path
 import re
 import signal
+import resource
 import subprocess
 import sys
 import threading
 import time
+
+try:
+    from scripts.paper_p8_resources import OwnedStorageGuard
+except ImportError:
+    from paper_p8_resources import OwnedStorageGuard
 
 try:
     from scripts.paper_p8_bundle import _validate_equal_samples_manifest_obj
@@ -138,6 +144,52 @@ def _duration_seconds(value):
     return amount * {'ms': .001, 's': 1, 'm': 60, 'h': 3600}[match.group(2)]
 
 
+def local_resource_preflight(jobs):
+    """Read B-local limits without changing host settings; estimates are not capacity claims."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        soft = None if soft == resource.RLIM_INFINITY else int(soft)
+        hard = None if hard == resource.RLIM_INFINITY else int(hard)
+    except (OSError, ValueError, AttributeError):
+        soft = hard = None
+    try:
+        fields = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines() if ':' in line)
+        available_ram = int(fields['MemAvailable'].split()[0]) * 1024
+    except (OSError, ValueError, KeyError, IndexError):
+        available_ram = None
+    try:
+        parts = Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()
+        ports = int(parts[1]) - int(parts[0]) + 1 if len(parts) == 2 else None
+    except (OSError, ValueError, IndexError):
+        ports = None
+    roles = []
+    for job in jobs:
+        try:
+            manifest = json.loads(Path(job['manifest']).read_text(encoding='utf-8'))
+            role = job.get('role') or (manifest.get('roles') or ['unknown'])[0]
+            limits = manifest.get('limits', {})
+            connections = limits.get('connections')
+            viewers = manifest.get('topology', {}).get('viewers', 0)
+            required_fds = 64 + (2 * viewers if role == 'viewer' else 0) + (connections or 0)
+            roles.append({'role': role, 'connections_budget': connections, 'viewers_budget': viewers,
+                          'estimated_fds': required_fds,
+                          'fd_fit': None if soft is None else soft >= required_fds,
+                          'ram_budget_bytes': limits.get('memory_bytes')})
+        except (OSError, ValueError, AttributeError):
+            roles.append({'role': job.get('role', 'unknown'), 'status': 'manifest_unavailable'})
+    result = {'scope': 'B_runner_process_and_host_readonly', 'cpu_count': os.cpu_count(),
+              'available_ram_bytes': available_ram, 'process_fd_limits': {'soft': soft, 'hard': hard},
+              'ephemeral_port_range_count': ports, 'roles': roles}
+    if any(row.get('fd_fit') is False for row in roles):
+        raise PaperloadInputError('B process FD limit is below selected role budget')
+    if ports is not None and sum((row.get('connections_budget') or 0) for row in roles) > ports:
+        raise PaperloadInputError('B ephemeral-port range is below selected connection budget')
+    requested_ram = sum(row.get('ram_budget_bytes') or 0 for row in roles)
+    if available_ram is not None and requested_ram and requested_ram > available_ram:
+        raise PaperloadInputError('B available RAM is below selected role budgets')
+    return result
+
+
 def invoke_paperload(binary, manifest, output_dir, *, official=False, timeout=20, mode='preflight', env=None):
     """Invoke supplied binary with fixed argv; never forward arbitrary CLI flags."""
     if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > MAX_CHILD_TIMEOUT_SECONDS:
@@ -213,7 +265,7 @@ def _read_spec(path, manifest, output_dir):
             spec = json.loads(spec_path.read_text(encoding='utf-8'))
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise PaperloadInputError('run spec is invalid JSON') from None
-        if not isinstance(spec, dict) or set(spec) - {'paperload', 'gateways', 'stop_timeout_seconds'}:
+        if not isinstance(spec, dict) or set(spec) - {'paperload', 'gateways', 'stop_timeout_seconds', 'disk_guard'}:
             raise PaperloadInputError('run spec has unsupported fields')
         def resolve(item):
             if not isinstance(item, str):
@@ -255,7 +307,7 @@ def _read_spec(path, manifest, output_dir):
     manifests = []
     for job in jobs:
         try:
-            if Path(job['manifest']).stat().st_size > 1 << 20:
+            if Path(job['manifest']).stat().st_size > 8 << 20:
                 raise PaperloadInputError('manifest exceeds size limit')
             public_manifest = json.loads(Path(job['manifest']).read_text(encoding='utf-8'))
             profiles.append(public_manifest.get('profile') if isinstance(public_manifest, dict) else None)
@@ -410,7 +462,7 @@ def _pump_lines(pipe, lines, done, child_label=None, phase_events=None, phase_er
 
 
 def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_timeout=30,
-                   run_artifact, official=False, popen=subprocess.Popen):
+                   run_artifact, official=False, popen=subprocess.Popen, disk_guard=None):
     """Run producers, then boundedly drain and join every owned durable child."""
     if (isinstance(stop_timeout, bool)
             or not isinstance(stop_timeout, (int, float))
@@ -430,6 +482,9 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
     phase_events = []
     phase_errors = []
     gateway_configs = []
+    storage_guard = None
+    storage_guard_config = disk_guard
+    preflight_resources = {'status': 'not_collected'}
     previous_handlers = {}
     signal_state = {'cleanup_started': False, 'received_during_cleanup': []}
     if threading.current_thread() is threading.main_thread():
@@ -454,7 +509,7 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
                 'pid': None, 'exit_code': None}
         children.append((item, None, None, None))
         proc = popen(argv, shell=False, env=env, stdout=subprocess.PIPE,
-                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+                     stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
         lines, done = [], threading.Event()
         thread = threading.Thread(target=_pump_lines, args=(proc.stdout, lines, done, role + ':' + name,
                                     phase_events, phase_errors), daemon=True)
@@ -475,6 +530,22 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
             raise PaperloadTimeout(f'{role} readiness timed out')
 
     try:
+        if storage_guard_config is None:
+            growth = []
+            for job in jobs:
+                try:
+                    manifest = json.loads(Path(job['manifest']).read_text(encoding='utf-8'))
+                    value = manifest.get('limits', {}).get('disk_growth_bytes')
+                    if type(value) is int and value > 0:
+                        growth.append(value)
+                except (OSError, ValueError, TypeError):
+                    pass
+            storage_guard_config = {'growth_threshold_bytes': min(growth),
+                                    'minimum_free_bytes': 64 << 20,
+                                    'interval_seconds': 1.0, 'max_samples': 128} if growth else {
+                'growth_threshold_bytes': 64 << 20, 'minimum_free_bytes': 64 << 20,
+                'interval_seconds': 1.0, 'max_samples': 128,
+                'qualification': 'legacy_manifest_bounded_default'}
         gateway_count = len(gateways)
         if gateway_count and not gateway_binary:
             raise PaperloadInputError('Gateway binary is required for durable children')
@@ -500,6 +571,7 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
         # Viewer readiness gates dependent publishers. Fixed role ordering is
         # intentional; this is not a general dependency-graph scheduler.
         ordered_jobs = _ordered_role_jobs(jobs, job_roles)
+        preflight_resources = local_resource_preflight(ordered_jobs)
         for job in ordered_jobs:
             manifest_path = _safe_path(job['manifest'], must_exist=True)
             argv = [executable, '--manifest', manifest_path, '--output-dir',
@@ -524,6 +596,30 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
             raise PaperloadInputError('each Gateway process must own a separate SQLite outbox file')
         if len(set(client_ids)) != len(client_ids):
             raise PaperloadInputError('each Gateway process must use a unique MQTT client ID')
+        if storage_guard_config:
+            owned_paths = [job['output_dir'] for job in jobs]
+            for job in jobs:
+                try:
+                    raw = json.loads(Path(job['manifest']).read_text(encoding='utf-8'))
+                    journal = raw.get('e4', {}).get('journal_path') if isinstance(raw.get('e4'), dict) else None
+                    if journal and not str(journal).startswith(str(raw.get('bundle_path', ''))):
+                        owned_paths.append(str(journal))
+                except (OSError, ValueError, TypeError):
+                    raise PaperloadInputError('storage guard journal path is unavailable') from None
+            for env in gateway_configs:
+                outbox = Path(env['GATEWAY_OUTBOX_PATH'])
+                owned_paths.append(str(outbox.parent))
+            # Collapse nested roots so SQLite DB/WAL/SHM bytes are counted once.
+            canonical = sorted({Path(os.path.abspath(path)) for path in owned_paths}, key=lambda p: len(p.parts))
+            owned_paths = [str(path) for path in canonical
+                           if not any(path != parent and parent in path.parents for parent in canonical)]
+            allowed_root = Path(os.path.commonpath(owned_paths)).parent
+            storage_guard = OwnedStorageGuard(owned_paths,
+                growth_threshold_bytes=storage_guard_config.get('growth_threshold_bytes'),
+                minimum_free_bytes=storage_guard_config.get('minimum_free_bytes'),
+                interval_seconds=storage_guard_config.get('interval_seconds', 1.0),
+                allowed_root=storage_guard_config.get('allowed_root', allowed_root),
+                max_samples=storage_guard_config.get('max_samples', 128))
         # A command producer must not begin until each durable executor is subscribed.
         for index, (gateway, env) in enumerate(zip(gateways, gateway_configs)):
             start([_safe_path(gateway_binary, must_exist=True), 'run'], _clean_env(env),
@@ -562,10 +658,20 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
         for item, proc, _, _ in children:
             if item['role'].startswith('paperload-'):
                 remaining = max(0.01, producer_deadline - time.monotonic())
-                try:
-                    code = proc.wait(timeout=remaining)
-                except subprocess.TimeoutExpired:
-                    raise PaperloadTimeout('paperload producer exceeded bounded run window') from None
+                end = time.monotonic() + remaining
+                while True:
+                    if storage_guard and not storage_guard.sample():
+                        raise PaperloadExitError('owned storage guard stopped workload: ' + storage_guard.stop_reason)
+                    interval = storage_guard.interval_seconds if storage_guard else 0.5
+                    wait_for = min(interval, max(0.01, end - time.monotonic()))
+                    try:
+                        code = proc.wait(timeout=wait_for)
+                        if storage_guard and not storage_guard.sample():
+                            raise PaperloadExitError('owned storage guard stopped workload: ' + storage_guard.stop_reason)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= end:
+                            raise PaperloadTimeout('paperload producer exceeded bounded run window') from None
                 item['exit_code'] = code
                 item['status'] = 'complete' if code == 0 else 'failed'
                 if code != 0:
@@ -589,7 +695,12 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
                 continue
             if item['role'].startswith('paperload-'):
                 try:
-                    proc.terminate()
+                    try:
+                        if not isinstance(proc, subprocess.Popen):
+                            raise ProcessLookupError
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except (AttributeError, ProcessLookupError, PermissionError):
+                        proc.terminate()
                     item['status'] = 'stopping'
                 except OSError as exc:
                     cleanup_errors.append(f"{item['name']} terminate: {type(exc).__name__}")
@@ -601,7 +712,10 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
             except subprocess.TimeoutExpired:
                 cleanup_errors.append(f"{item['name']} drain timed out")
                 try:
-                    proc.kill()
+                    if isinstance(proc, subprocess.Popen):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
                     proc.wait(timeout=remaining_cleanup(5))
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     cleanup_errors.append(f"{item['name']} final join: {type(exc).__name__}")
@@ -611,7 +725,12 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
             if proc is None or not item['role'].startswith('gateway-') or child_poll(item, proc) is not None:
                 continue
             try:
-                proc.terminate()
+                try:
+                    if not isinstance(proc, subprocess.Popen):
+                        raise ProcessLookupError
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (AttributeError, ProcessLookupError, PermissionError):
+                    proc.terminate()
                 item['status'] = 'draining'
             except OSError as exc:
                 cleanup_errors.append(f"{item['name']} terminate: {type(exc).__name__}")
@@ -633,7 +752,12 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
                 cleanup_errors.append(f"{item['name']} join timed out")
                 item['status'] = 'unjoined'
                 try:
-                    proc.kill()
+                    try:
+                        if not isinstance(proc, subprocess.Popen):
+                            raise ProcessLookupError
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (AttributeError, ProcessLookupError, PermissionError):
+                        proc.kill()
                     proc.wait(timeout=remaining_cleanup(5))
                     item['exit_code'] = child_poll(item, proc)
                     item['status'] = 'stopped_after_kill'
@@ -731,8 +855,12 @@ def run_supervised(*, binary, gateway_binary=None, jobs=(), gateways=(), stop_ti
               'timer_driven_gateway_workload': bool(gateways), 'readiness': readiness,
               'actual_stop_confirmed': stopped, 'pending_outbox_readback': outbox_counts,
               'signals_received_during_cleanup': signal_state['received_during_cleanup'],
-              'resource_sampling': {'status': 'not_collected_in_P8.4'},
-               'phase_observations': {'events': phase_events[:(16 * len(telemetry_children) + 32 * len(control_children))],
+               'resource_sampling': {'status': 'not_collected_in_P8.4'},
+               'resource_preflight': preflight_resources,
+               'storage_guard': storage_guard.report() if storage_guard else {'status':'not_configured'},
+                # A control child may emit three events for each of up to 1000
+                # bounded commands, plus three stop/join events.
+                'phase_observations': {'events': phase_events[:(16 * len(telemetry_children) + 3003 * len(control_children))],
                   'status': 'unavailable' if phase_unavailable else ('observed' if telemetry_children else 'not_applicable'),
                   'clock_qualification':'runner monotonic receipt times are descriptive; child process elapsed clocks are not comparable across children; pipe observation lag unknown',
                   'errors': sorted(set(phase_errors))},
@@ -798,8 +926,9 @@ def main(argv=None):
         if not args.run_artifact:
             raise PaperloadInputError('--run-artifact is required for --run')
         status, report = run_supervised(binary=args.binary, gateway_binary=args.gateway_binary,
-                                        jobs=jobs, gateways=gateways, stop_timeout=stop_timeout,
-                                        run_artifact=args.run_artifact, official=args.official_opt_in)
+                                         jobs=jobs, gateways=gateways, stop_timeout=stop_timeout,
+                                         run_artifact=args.run_artifact, official=args.official_opt_in,
+                                         disk_guard=json.loads(Path(spec_path).read_text()).get('disk_guard') if spec_path else None)
         print(json.dumps(report, indent=2))
         return 0 if status == 'COMPLETE' else 1
     except PaperloadInputError as exc:

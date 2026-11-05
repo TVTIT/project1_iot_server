@@ -59,11 +59,11 @@ MAX_VIEWER_PROBE_IDENTITIES = 64
 MAX_RESULT_WALK = 128
 
 
-def _private_json(path):
+def _private_json(path, max_bytes=1 << 20):
     path = Path(path)
     _reject_symlink_chain(path)
     st = path.lstat()
-    if path.is_symlink() or not path.is_file() or st.st_mode & 0o077 or st.st_size > 1 << 20:
+    if path.is_symlink() or not path.is_file() or st.st_mode & 0o077 or st.st_size > max_bytes:
         raise ValueError('private input rejected')
     return json.loads(path.read_text(encoding='utf-8'))
 
@@ -79,7 +79,7 @@ def _safe_number_map(value):
 
 
 def _safe_phase_events(value):
-    if not isinstance(value, list) or len(value) > 64:
+    if not isinstance(value, list) or len(value) > 3100:
         raise ValueError('result phase event schema rejected')
     result = []
     for item in value:
@@ -250,7 +250,8 @@ def _safe_workload(value, *, role=None):
         if key == 'phase_observation_status' and item not in (
                 'observed', 'unavailable', 'not_applicable',
                 'observed_process_local_elapsed; runner_pipe_observation_lag_unknown',
-                'observed; maximum 9 command ordinals sampled; process-local clock'):
+                'observed; maximum 9 command ordinals sampled; process-local clock',
+                'observed; all command ordinals; process-local clock'):
             raise ValueError('workload phase status rejected')
         if key == 'durability_mode' and item not in ('synthetic-load', 'durable', ''):
             raise ValueError('workload durability mode rejected')
@@ -575,8 +576,8 @@ def _safe_generator_resources(value):
     if not isinstance(raw_samples, list) or len(raw_samples) > 128:
         raise ValueError('generator_resources_samples_count_rejected')
     allowed_sample_keys = {'sample_index', 'timestamp', 'elapsed_seconds', 'interval_seconds',
-                          'available', 'cpu_percent', 'delta_ticks', 'rss_bytes', 'process_count',
-                          'current_fd_count', 'reason'}
+                    'available', 'cpu_percent', 'delta_ticks', 'rss_bytes', 'process_count',
+                    'current_fd_count', 'reason', 'phase'}
     sanitized_samples = []
     for s in raw_samples:
         if not isinstance(s, dict) or set(s) - allowed_sample_keys:
@@ -592,6 +593,8 @@ def _safe_generator_resources(value):
             raise ValueError('generator_resources_sample_available_rejected')
         if sample.get('reason') is not None and (not isinstance(sample['reason'], str) or len(sample['reason']) > 100):
             raise ValueError('generator_resources_sample_reason_rejected')
+        if sample.get('phase') is not None and sample['phase'] not in ('sample', 'terminal'):
+            raise ValueError('generator_resources_sample_phase_rejected')
         sanitized_samples.append(sample)
 
     safe['samples'] = sanitized_samples
@@ -640,7 +643,7 @@ def _workspace(workspace):
         if not paper_p8_bundle.SAFE_ID.fullmatch(label) or not re.fullmatch(r'[0-9a-f]{64}', expected):
             raise ValueError('bound manifest inventory rejected')
         path = root / 'runtime/manifests' / f'{label}.json'
-        if hashlib.sha256(_bounded_read(path, 1 << 20)).hexdigest() != expected:
+        if hashlib.sha256(_bounded_read(path, paper_p8_bundle.MAX_FILE_BYTES)).hexdigest() != expected:
             raise ValueError('bound manifest provenance mismatch')
     for label, expected in bound_envs.items():
         if not paper_p8_bundle.SAFE_ID.fullmatch(label) or not re.fullmatch(r'[0-9a-f]{64}', expected):
@@ -732,6 +735,17 @@ def _validate_e4_phase_eligibility(root, binding, jobs, state, phase):
                 or 'cold-replay' not in labels):
             raise ValueError('E4 cold replay phase is not enabled or not next')
         return True
+    if phase == 'expiry-replay':
+        metadata = _verified_bundle_metadata(root, binding)
+        workload = metadata.get('workload', {})
+        labels = {Path(job.get('manifest', '')).stem for job in jobs if isinstance(job, dict)}
+        if (state.get('last_completed_phase') != 'replay'
+                or workload.get('experiment') != 'E4'
+                or workload.get('cache_mode') != 'on'
+                or workload.get('expiry_replay_enabled') is not True
+                or 'expiry-replay' not in labels):
+            raise ValueError('E4 expiry replay phase is not enabled or not next')
+        return True
     if phase == 'replay' and state.get('last_completed_phase') != 'unique':
         raise ValueError('E4 replay phase is not next')
     if phase == 'unique' and state.get('last_completed_phase') is not None:
@@ -775,7 +789,7 @@ def _manifest_endpoints(workspace, run_spec):
     spec = _private_json(run_spec)
     manifests = []
     for job in spec['paperload']:
-        manifest = _private_json(job['manifest'])
+        manifest = _private_json(job['manifest'], paper_p8_bundle.MAX_MANIFEST_BYTES)
         manifests.append(manifest)
     return manifests, spec
 
@@ -1008,7 +1022,7 @@ def _export_results(workspace, output):
     if binding.get('session', {}).get('experiment') == 'E4':
         phase_state = _private_json(root / 'runtime/e4-phase-state.json')
         phase = phase_state.get('last_completed_phase')
-        if phase not in ('unique', 'replay', 'cold-replay'):
+        if phase not in ('unique', 'replay', 'cold-replay', 'expiry-replay'):
             raise ValueError('E4 result phase unavailable')
         files = [(f'phases/{phase}/runner/run.json',
                   root / 'outputs/e4-phases' / phase / 'run.json', 'runner')]
@@ -1026,7 +1040,7 @@ def _export_results(workspace, output):
             raise ValueError('result role rejected')
         label = Path(job['manifest']).stem
         result_role = label if binding['session'].get('experiment') in ('E2', 'E3', 'E4') else role
-        if result_role not in ('A', 'B', 'viewer', 'telemetry', 'control', 'unique', 'replay', 'cold-replay'):
+        if result_role not in ('A', 'B', 'viewer', 'telemetry', 'control', 'unique', 'replay', 'cold-replay', 'expiry-replay'):
             raise ValueError('result role rejected')
         output_dir = (root / 'outputs/e4-phases' / phase / Path(label).stem
                       if phase and label in (phase, 'viewer') else Path(job['output_dir']).absolute())
@@ -1152,7 +1166,7 @@ def _export_results(workspace, output):
                      **({'phase': phase, 'phase_state_sha256': hashlib.sha256(
                          _bounded_read(_phase_state_path(root), 65536)).hexdigest(),
                          'journal_sha256': _private_json(_phase_state_path(root)).get('last_journal_sha256'),
-                          'phase_run_id': next((_private_json(Path(job['manifest'])).get('run_id')
+                          'phase_run_id': next((_private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES).get('run_id')
                               for job in run_spec.get('paperload', [])
                               if Path(job['manifest']).stem == phase), None)}
                         if phase else {}),
@@ -1410,7 +1424,7 @@ def _export_conflict_probe(workspace, output):
         gateway_id=header['gateway_id'], sensor_id=header['sensor_id'])
     manifest_file = root / 'inputs/manifests/unique.json'
     if manifest_file.is_file():
-        manifest = _private_json(manifest_file)
+        manifest = _private_json(manifest_file, paper_p8_bundle.MAX_MANIFEST_BYTES)
         mqtt_endpoint = manifest.get('tls', {}).get('mqtt_tls_endpoint')
     else:
         mqtt_endpoint = binding['session'].get('endpoints', {}).get('mqtt_tls', '')
@@ -1706,9 +1720,9 @@ def _phase_state_path(root):
 
 
 def _select_e4_phase_jobs(jobs, phase, *, replay_validated=False):
-    if phase not in ('unique', 'replay', 'cold-replay'):
+    if phase not in ('unique', 'replay', 'cold-replay', 'expiry-replay'):
         raise ValueError('phase_rejected')
-    if phase in ('replay', 'cold-replay') and not replay_validated:
+    if phase in ('replay', 'cold-replay', 'expiry-replay') and not replay_validated:
         raise ValueError('unique_phase_not_validated')
     if not isinstance(jobs, list):
         raise ValueError('E4 phase input rejected')
@@ -1721,6 +1735,8 @@ def _select_e4_phase_jobs(jobs, phase, *, replay_validated=False):
     expected_labels = {'unique', 'replay', 'viewer'}
     if 'cold-replay' in by_label:
         expected_labels.add('cold-replay')
+    if 'expiry-replay' in by_label:
+        expected_labels.add('expiry-replay')
     if set(by_label) != expected_labels:
         raise ValueError('E4 phase input rejected')
     if phase not in by_label:
@@ -1804,12 +1820,17 @@ def _sanitize_and_write_resource_samples(phase_dir, output_dir):
     data = _private_json(json_path)
     if not isinstance(data, dict):
         raise ValueError('resource_data_rejected')
-    raw_samples = data.get('samples', [])
+    # E5 viewer resources are wrapped with availability/scope metadata; the
+    # sampler's bounded report (not wrapper paths or process internals) owns samples.
+    report = data.get('report', data)
+    if not isinstance(report, dict):
+        raise ValueError('resource_report_rejected')
+    raw_samples = report.get('samples', [])
     if not isinstance(raw_samples, list) or len(raw_samples) > 128:
         raise ValueError('resource_samples_count_rejected')
     allowed_keys = {'sample_index', 'timestamp', 'elapsed_seconds', 'interval_seconds',
                     'available', 'cpu_percent', 'delta_ticks', 'rss_bytes', 'process_count',
-                    'current_fd_count', 'reason'}
+                    'current_fd_count', 'reason', 'phase'}
     sanitized = []
     for s in raw_samples:
         if not isinstance(s, dict) or set(s) - allowed_keys:
@@ -1823,6 +1844,8 @@ def _sanitize_and_write_resource_samples(phase_dir, output_dir):
                     raise ValueError('resource_sample_non_finite_rejected')
         if sample.get('available') is not None and type(sample['available']) is not bool:
             raise ValueError('resource_sample_available_rejected')
+        if sample.get('phase') is not None and sample['phase'] not in ('sample', 'terminal'):
+            raise ValueError('resource_sample_phase_rejected')
         sanitized.append(sample)
     write_generator_resources_csv({'samples': sanitized}, output_dir / 'resources-generator.csv')
     return sanitized
@@ -2006,7 +2029,7 @@ def _run_e5_viewers(workspace, binary, gateway_binary=None, deadline_seconds=Non
     if not viewer_job:
         raise ValueError('viewer_job_missing')
     viewer_manifest_path = Path(viewer_job['manifest']).absolute()
-    viewer_manifest = _private_json(viewer_manifest_path)
+    viewer_manifest = _private_json(viewer_manifest_path, paper_p8_bundle.MAX_MANIFEST_BYTES)
     viewer_manifest_sha = _file_sha256(viewer_manifest_path)
     viewer_run_id = viewer_manifest.get('run_id')
     if not viewer_run_id:
@@ -2251,6 +2274,7 @@ def _run_e5_phase(workspace, phase, binary, gateway_binary=None):
                 gateways=phase_gateways,
                 stop_timeout=spec.get('stop_timeout_seconds', 30),
                 run_artifact=str(phase_artifact),
+                disk_guard=spec.get('disk_guard'),
             )
         finally:
             resource_report = sampler.stop()
@@ -2392,7 +2416,7 @@ def _export_e5_results(workspace, output, phase):
             raise ValueError('initial_job_missing')
         if job.get('role') != 'telemetry':
             raise ValueError('initial_job_role_invalid')
-        job_manifest = _private_json(Path(job['manifest']))
+        job_manifest = _private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
         if job_manifest.get('roles') != ['telemetry']:
             raise ValueError('initial_manifest_role_invalid')
         phase_run_id = job_manifest.get('run_id') or binding['session']['session_id']
@@ -2445,7 +2469,7 @@ def _export_e5_results(workspace, output, phase):
             raise ValueError('warm_replay_job_missing')
         if job.get('role') != 'telemetry':
             raise ValueError('warm_replay_job_role_invalid')
-        job_manifest = _private_json(Path(job['manifest']))
+        job_manifest = _private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
         if job_manifest.get('roles') != ['telemetry']:
             raise ValueError('warm_replay_manifest_role_invalid')
         phase_run_id = job_manifest.get('run_id') or binding['session']['session_id']
@@ -2497,7 +2521,7 @@ def _export_e5_results(workspace, output, phase):
             raise ValueError('control_job_missing')
         if job.get('role') != 'control':
             raise ValueError('control_job_role_invalid')
-        job_manifest = _private_json(Path(job['manifest']))
+        job_manifest = _private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
         if job_manifest.get('roles') != ['control']:
             raise ValueError('control_manifest_role_invalid')
         phase_run_id = job_manifest.get('run_id') or binding['session']['session_id']
@@ -2536,7 +2560,7 @@ def _export_e5_results(workspace, output, phase):
         viewer_job = next((j for j in run_spec.get('paperload', []) if j.get('role') == 'viewer'), None)
         if not viewer_job:
             raise ValueError('viewer_job_missing')
-        viewer_manifest = _private_json(Path(viewer_job['manifest']))
+        viewer_manifest = _private_json(Path(viewer_job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
         if viewer_manifest.get('roles') != ['viewer']:
             raise ValueError('viewer_manifest_role_invalid')
         # ViewerResult emits experiment/arm/profile/mode/run_id; the trusted
@@ -2575,9 +2599,9 @@ def _export_e5_results(workspace, output, phase):
 
         # Measurement windows
         declared_windows = {
-            'initial': _private_json(root / 'runtime/manifests/initial.json').get('phases', {}).get('measure_seconds'),
-            'warm_replay': _private_json(root / 'runtime/manifests/warm_replay.json').get('phases', {}).get('measure_seconds'),
-            'control': _private_json(root / 'runtime/manifests/control.json').get('phases', {}).get('measure_seconds'),
+            'initial': _private_json(root / 'runtime/manifests/initial.json', paper_p8_bundle.MAX_MANIFEST_BYTES).get('phases', {}).get('measure_seconds'),
+            'warm_replay': _private_json(root / 'runtime/manifests/warm_replay.json', paper_p8_bundle.MAX_MANIFEST_BYTES).get('phases', {}).get('measure_seconds'),
+            'control': _private_json(root / 'runtime/manifests/control.json', paper_p8_bundle.MAX_MANIFEST_BYTES).get('phases', {}).get('measure_seconds'),
         }
         observed_windows = {}
         for ph in ('initial', 'warm_replay', 'control'):
@@ -2697,11 +2721,11 @@ def main(argv=None):
     run.add_argument('--workspace', required=True)
     run.add_argument('--binary', required=True)
     run.add_argument('--gateway-binary')
-    run.add_argument('--phase', choices=('unique', 'replay', 'cold-replay', 'initial', 'warm_replay', 'control'))
+    run.add_argument('--phase', choices=('unique', 'replay', 'cold-replay', 'expiry-replay', 'initial', 'warm_replay', 'control'))
     export = commands.add_parser('export-results')
     export.add_argument('--workspace', required=True)
     export.add_argument('--output', required=True)
-    export.add_argument('--phase', choices=('unique', 'replay', 'cold-replay', 'initial', 'warm_replay', 'control'))
+    export.add_argument('--phase', choices=('unique', 'replay', 'cold-replay', 'expiry-replay', 'initial', 'warm_replay', 'control'))
     e5_viewers = commands.add_parser('e5-viewers', help='start foreground E5 continuous viewer holder')
     e5_viewers.add_argument('--workspace', required=True)
     e5_viewers.add_argument('--binary', required=True)
@@ -2745,12 +2769,17 @@ def main(argv=None):
         elif args.command in ('preflight', 'run'):
             root = _workspace(args.workspace)
             spec_path = root / 'runtime/execution/run-spec.json'
+            run_spec = _private_json(spec_path)
             jobs, gateways, stop_timeout, _ = paper_p8._read_spec(str(spec_path), None, None)
             if args.command == 'preflight':
+                binding = _private_json(root / 'runtime/binding.json')
+                official_opt_in = (binding.get('session', {}).get('experiment') == 'E3'
+                    and binding.get('session', {}).get('profile') == 'official')
                 for gateway in gateways:
                     paper_p8._gateway_environment(gateway['env_file'])
                 for job in jobs:
-                    paper_p8.preflight(args.binary, job['manifest'], job['output_dir'])
+                    paper_p8.preflight(args.binary, job['manifest'], job['output_dir'],
+                                       official=official_opt_in)
                 result = {'preflight': 'PASS', 'network': False, 'writes': False,
                           'manifests': len(jobs), 'gateways_validated': len(gateways)}
             else:
@@ -2786,16 +2815,21 @@ def main(argv=None):
                             replay_validated=state.get('unique_validated') is True)
                         manifest_values = []
                         for job in selected:
-                            manifest = _private_json(Path(job['manifest']))
+                            manifest = _private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
                             if manifest.get('experiment') != ('E1' if job['role'] == 'viewer' else 'E4'):
                                 raise ValueError('E4 phase manifest provenance mismatch')
                             manifest_values.append(manifest)
                         telemetry_manifest = next(m for m in manifest_values if m.get('roles') == ['telemetry'])
-                        expected_e4_mode = 'replay' if args.phase == 'cold-replay' else args.phase
+                        expected_e4_mode = 'replay' if args.phase in ('cold-replay', 'expiry-replay') else args.phase
                         if telemetry_manifest.get('e4', {}).get('mode') != expected_e4_mode:
                             raise ValueError('E4 phase manifest mode mismatch')
+                        journal_limit = telemetry_manifest.get('e4', {}).get('max_bytes')
+                        if type(journal_limit) is not int or not 1 <= journal_limit <= (64 << 20):
+                            raise ValueError('E4 journal byte budget rejected')
+                        if shutil.disk_usage(root).free < journal_limit * 2 + (8 << 20):
+                            raise ValueError('E4 output and journal disk budget insufficient')
                         journal_paths = {m.get('e4', {}).get('journal_path') for m in
-                            (_private_json(Path(j['manifest'])) for j in jobs if j.get('role') == 'telemetry')}
+                             (_private_json(Path(j['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES) for j in jobs if j.get('role') == 'telemetry')}
                         if len(journal_paths) != 1 or not next(iter(journal_paths)):
                             raise ValueError('E4 phase journal reference mismatch')
                         journal_path = Path(next(iter(journal_paths)))
@@ -2803,10 +2837,10 @@ def main(argv=None):
                         journal_path = journal_path.resolve(strict=False)
                         if journal_path.is_symlink() or not journal_path.is_relative_to((root / 'outputs').resolve()):
                             raise ValueError('E4 journal path outside workspace')
-                        if args.phase in ('replay', 'cold-replay') and not journal_path.is_file():
+                        if args.phase in ('replay', 'cold-replay', 'expiry-replay') and not journal_path.is_file():
                             raise ValueError('E4 unique journal missing')
                         journal_before = _file_sha256(journal_path) if journal_path.is_file() else None
-                        if args.phase in ('replay', 'cold-replay') and journal_before != state.get('unique_journal_sha256'):
+                        if args.phase in ('replay', 'cold-replay', 'expiry-replay') and journal_before != state.get('unique_journal_sha256'):
                             raise ValueError('E4 journal changed before replay')
                         phase_root = root / 'outputs/e4-phases' / args.phase
                         phase_resumed = phase_root.exists()
@@ -2851,8 +2885,8 @@ def main(argv=None):
                             binding.get('session', {}).get('workload') == 'equal_samples'
                             or str(binding.get('session', {}).get('phase', '')).startswith('equal-samples-')
                             or any(
-                                isinstance(_private_json(Path(j['manifest'])), dict)
-                                and 'equal_samples' in _private_json(Path(j['manifest']))
+                                isinstance(_private_json(Path(j['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES), dict)
+                                and 'equal_samples' in _private_json(Path(j['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
                                 for j in selected
                                 if Path(j.get('manifest', '')).is_file()
                             )
@@ -2865,9 +2899,12 @@ def main(argv=None):
                         if e4 and phase_resumed:
                             status, report = 'COMPLETE', _private_json(artifact)
                         else:
+                            official_opt_in = (binding.get('session', {}).get('experiment') == 'E3'
+                                and binding.get('session', {}).get('profile') == 'official')
                             status, report = paper_p8.run_supervised(binary=args.binary,
                                 gateway_binary=args.gateway_binary, jobs=selected, gateways=gateways,
-                                stop_timeout=stop_timeout, run_artifact=str(artifact))
+                                stop_timeout=stop_timeout, run_artifact=str(artifact),
+                                disk_guard=run_spec.get('disk_guard'), official=official_opt_in)
                     finally:
                         if sampler is not None:
                             gen_report = sampler.stop()
@@ -2887,15 +2924,15 @@ def main(argv=None):
                         viewer_output = Path(viewer_job['output_dir']) / 'workload.json'
                         telemetry = _safe_workload(json.loads(telemetry_output.read_text()), role='telemetry')
                         viewer = _safe_workload(json.loads(viewer_output.read_text()), role='viewer')
-                        validation_phase = 'replay' if args.phase == 'cold-replay' else args.phase
+                        validation_phase = 'replay' if args.phase in ('cold-replay', 'expiry-replay') else args.phase
                         _validate_e4_phase_result(validation_phase, telemetry, viewer)
-                        if (args.phase in ('replay', 'cold-replay') and telemetry['e4']['safe_header_samples']
+                        if (args.phase in ('replay', 'cold-replay', 'expiry-replay') and telemetry['e4']['safe_header_samples']
                                 != state.get('unique_header_samples')):
                             raise ValueError('E4 replay journal headers changed')
-                        if not journal_path.is_file() or journal_path.stat().st_size > (2 << 20):
+                        if not journal_path.is_file() or journal_path.stat().st_size > journal_limit:
                             raise ValueError('E4 journal artifact missing or over bound')
                         journal_after = _file_sha256(journal_path)
-                        if args.phase in ('replay', 'cold-replay') and journal_after != journal_before:
+                        if args.phase in ('replay', 'cold-replay', 'expiry-replay') and journal_after != journal_before:
                             raise ValueError('E4 replay changed journal bytes')
                         state.update(last_completed_phase=args.phase,
                             unique_validated=(args.phase == 'unique' or state.get('unique_validated') is True),
@@ -2978,7 +3015,7 @@ def main(argv=None):
                     raise ValueError('E5 export requires explicit --phase initial|warm_replay|control')
                 result = _export_e5_results(args.workspace, args.output, args.phase)
             elif binding.get('session', {}).get('experiment') == 'E4':
-                if args.phase not in ('unique', 'replay', 'cold-replay'):
+                if args.phase not in ('unique', 'replay', 'cold-replay', 'expiry-replay'):
                     raise ValueError('E4 export requires explicit --phase; phase is E4-only')
                 lock_fd = _e4_phase_lock(root)
                 try:

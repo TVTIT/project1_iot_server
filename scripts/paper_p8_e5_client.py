@@ -20,7 +20,7 @@ try:
 except ImportError:  # package import (scripts.paper_p8_e5_client)
     from scripts.paper_p8_resources import GeneratorResourceSampler
 
-MAX_DEADLINE_SECONDS = 3600
+MAX_DEADLINE_SECONDS = 86400
 MAX_POLL_SECONDS = 0.2
 MAX_PHASE_ACK_SECONDS = 10.0
 CORRELATION_KEYS = ('session_id', 'run_id', 'binding_digest', 'manifest_sha256', 'binary_sha256')
@@ -381,7 +381,8 @@ def run_viewer_holder(binary: str | Path, manifest_path: str | Path, output_dir:
                 raise HolderError('holder_deadline_expired')
             argv = [str(binary), '--manifest', str(manifest_path), '--output-dir', str(output), '--run', '--viewer-stop-on-sigusr1']
             child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-            sampler = GeneratorResourceSampler(root_pid=child.pid, deadline_seconds=min(deadline_seconds, 120), max_snapshots=128)
+            sampler = GeneratorResourceSampler(root_pid=child.pid, deadline_seconds=deadline_seconds,
+                                               max_snapshots=min(20000, int(deadline_seconds / 0.5) + 2))
             sampler.start()
             status('STARTING', child_pid=child.pid)
             event('viewer_child_started', child_pid=child.pid)
