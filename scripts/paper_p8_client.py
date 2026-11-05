@@ -2773,7 +2773,7 @@ def main(argv=None):
             jobs, gateways, stop_timeout, _ = paper_p8._read_spec(str(spec_path), None, None)
             if args.command == 'preflight':
                 binding = _private_json(root / 'runtime/binding.json')
-                official_opt_in = (binding.get('session', {}).get('experiment') == 'E3'
+                official_opt_in = (binding.get('session', {}).get('experiment') in ('E1', 'E3')
                     and binding.get('session', {}).get('profile') == 'official')
                 for gateway in gateways:
                     paper_p8._gateway_environment(gateway['env_file'])
@@ -2899,7 +2899,7 @@ def main(argv=None):
                         if e4 and phase_resumed:
                             status, report = 'COMPLETE', _private_json(artifact)
                         else:
-                            official_opt_in = (binding.get('session', {}).get('experiment') == 'E3'
+                            official_opt_in = (binding.get('session', {}).get('experiment') in ('E1', 'E3')
                                 and binding.get('session', {}).get('profile') == 'official')
                             status, report = paper_p8.run_supervised(binary=args.binary,
                                 gateway_binary=args.gateway_binary, jobs=selected, gateways=gateways,

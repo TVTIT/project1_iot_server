@@ -467,6 +467,40 @@ class IdentityAndProbeTests(unittest.TestCase):
 
 
 class ResultProjectionTests(unittest.TestCase):
+    def test_e1_and_e3_profile_opt_in_reaches_preflight_and_run(self):
+        for experiment in ('E1', 'E3'):
+            for profile in ('pilot', 'official'):
+                with self.subTest(experiment=experiment, profile=profile):
+                    fixture = PortableBundleTests()
+                    fixture.setUp()
+                    self.addCleanup(fixture.doCleanups)
+                    source = Path(fixture.export()['bundle_root'])
+                    parent = fixture.root / 'B'
+                    parent.mkdir(mode=0o700)
+                    workspace = parent / 'workspace'
+                    client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+                    binding_path = workspace / 'runtime/binding.json'
+                    binding = json.loads(binding_path.read_text())
+                    binding['session'].update(experiment=experiment, profile=profile)
+                    binding_path.write_text(json.dumps(binding))
+                    binary = parent / 'paperload'
+                    binary.write_text('test binary')
+                    binary.chmod(0o700)
+                    expected = profile == 'official'
+                    with mock.patch.object(client.paper_p8, 'preflight') as preflight, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(client.main(['preflight', '--workspace', str(workspace),
+                                                      '--binary', str(binary)]), 0)
+                    self.assertEqual(preflight.call_count, 2)
+                    preflight_official = [call.kwargs['official'] for call in preflight.call_args_list]
+                    with mock.patch.object(client.paper_p8, 'run_supervised',
+                                           return_value=('COMPLETE', {'status': 'COMPLETE'})) as run, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(client.main(['run', '--workspace', str(workspace),
+                                                      '--binary', str(binary)]), 0)
+                    self.assertIs(run.call_args.kwargs['official'], expected)
+                    self.assertEqual(preflight_official, [expected, expected])
+
     def test_preflight_uses_all_bound_manifests_without_creating_workload_dirs(self):
         fixture = PortableBundleTests()
         fixture.setUp()
