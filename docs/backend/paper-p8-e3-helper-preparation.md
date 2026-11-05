@@ -1,5 +1,12 @@
 # P8 E3 — profile helper (source-qualified)
 
+> Pure helper ở `scripts/paper_p8_e3_support.py`; native fixture ở
+> `scripts/tests/paper_p8_e3_fixture.py`. Official 30-command validation cần
+> `--official-opt-in`. Offline Sensor chỉ chứng minh
+> committed admission/replay (desired/command/receipt); không chứng minh offline
+> delivery/success. Delivery/result chỉ được kết luận từ online executor sau
+> READY_MARKER/SUBACK. Kết quả từng lượt nằm trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe).
+
 Tài liệu hướng dẫn vận hành và báo cáo bằng chứng cho thử nghiệm P8 E3 (khảo sát năng lực điều khiển Sensor phối hợp viễn trắc qua bốn profile kết hợp giữa hai chế độ tải `low_load` / `mixed` và hai cơ chế dispatch `polling` / `wakeup`). E3 được thực hiện trên cùng nền tảng kiến trúc backend (Go modular monolith, Mosquitto DynSec, TimescaleDB, HTTP/REST và Mosquitto TLS) kết hợp với Gateway simulator executor hai arm độc lập.
 
 Thử nghiệm chạy tuần tự các profile trong từng fixture độc lập; mỗi profile được kiểm định dữ liệu và dọn dẹp tài nguyên độc lập. Báo cáo luôn giữ `full_p8_accepted=false`; pilot cùng máy ghi nhận `generator_colocated=true` (hoặc `same-host/unverified`), `physical_ab=NOT RUN`. Không chứng minh phần cứng HIL (bo mạch AM5728) hay triển khai môi trường live rollout.
@@ -76,8 +83,26 @@ Cần phân biệt rõ ràng hai khái niệm độc lập:
 ### 2.2 Quy trình vận hành chi tiết 8 bước
 
 Áp dụng cho bất kỳ profile nào trong 4 profile E3 bằng cách chọn cặp cờ tương ứng:
-- `--dispatch-mode polling|wakeup`
-- `--workload low_load|mixed`
+- `--dispatch-mode polling|wakeup`: Cơ chế điều phối lệnh (thay đổi cờ `STAGE5_WAKEUP_ENABLED`).
+- `--workload low_load|mixed`: Chế độ tải viễn trắc nền (12 messages ở low_load, 24 messages ở mixed).
+
+**Các tùy chọn số lượng lệnh, lịch trình và hồ sơ vận hành:**
+- **Mặc định:** Tạo 4 lệnh điều khiển (`--e3-command-count 4`), lịch phát dồn `--e3-schedule smoke`, và hồ sơ `--profile pilot` với ngân sách `--deadline-seconds 900`.
+- **Stream hữu hạn (`--e3-command-count` và `--e3-schedule`):**
+  - Hỗ trợ số lượng lệnh từ 1 đến 30 (`--e3-command-count 1..30`).
+  - Lịch phát `--e3-schedule smoke|steady`: Chế độ `smoke` chỉ hợp lệ với đúng 4 lệnh; chế độ `steady` giãn đều lịch phát khai báo 1 giây/lệnh (khoảng cách 1000 ms giữa các `offset_ms`).
+- **Chế độ nghiệm thu chính thức (`--profile official` và `--official-opt-in`):**
+  - Khi chỉ định `--profile official`, bắt buộc phải có cờ chấp thuận tường minh `--official-opt-in`.
+  - Quy tắc ràng buộc nghiệm thu official của E3:
+    - *Official 30 lệnh (`official30`):* `--e3-command-count 30 --e3-schedule steady` (hỗ trợ cả `--workload low_load` lẫn `mixed`; khuyến nghị ngân sách `--deadline-seconds 1200` tương đương 20 phút).
+    - *Bounded official 3 lệnh (`official3`):* `--e3-command-count 3 --e3-schedule steady --workload low_load` (cấu hình kiểm định seam hữu hạn).
+    - Mọi tổ hợp tham số khác khi bật `--profile official` sẽ bị từ chối ngay lập tức trước khi tạo fixture với lỗi `E3_official_requires_30_or_low_load_3_steady_commands`.
+  - **Tách biệt hồ sơ:** Khi chạy official, phiên đo (session) và luồng lệnh điều khiển mang profile `official`, trong khi luồng phát tải viễn trắc nền vẫn duy trì hồ sơ `pilot` (`background_profile` theo E2).
+- **Cơ chế thứ tự pending và terminal:** Lịch khai báo offset (`offset_ms`) không cam đoan gửi lệnh đúng offset tuyệt đối nếu lệnh trước đó trên cùng Sensor chưa đạt trạng thái terminal (`succeeded`, `failed`, v.v.). Producer REST phía client thăm dò theo deadline của lệnh và chỉ phát lệnh tiếp theo khi lệnh trước đã terminal; các lệnh chưa kịp phát hoặc hoãn được ghi nhận là skipped/not-sent, tuyệt đối không ngụy tạo bước nhảy version.
+- **Đo lường timeline và đối soát:**
+  - Viễn trắc nền `low_load` / `mixed` giữ nguyên manifest E2 hiện hành và cùng tải giữa polling/wakeup; chỉ cờ wakeup thay đổi.
+  - E3 đo timeline thông qua cùng-process `ControlTimeline` snapshot tại hai mốc `workload_start` và `terminal` sau khi hoàn tất stop/drain; báo cáo sử dụng hiệu số (delta) histogram/counter, không cộng dồn snapshot tích lũy và không dùng client RTT làm server latency.
+  - Các tập kiểm tra phải đối soát số lượng dispatch/success khớp với fresh commands, missing/overflow bằng 0, và pending origins bằng 0.
 
 Thiết lập thư mục gốc làm việc riêng biệt cho lượt chạy:
 
@@ -102,7 +127,10 @@ chmod 0700 "$BIN_DIR/paperload" "$BIN_DIR/gateway"
 
 #### Bước 1 — Khởi động Server Fixture E3 trên Host A (Terminal A1)
 
-Sử dụng bản sao cấu hình mạng riêng (`private-network-copy.json`), giữ nguyên interface/TLS CA/SAN/hostname và chọn host ports còn trống. Chạy lệnh `serve` (giữ tiến trình này chạy ngầm hoặc trên Terminal A1 riêng biệt):
+Sử dụng bản sao cấu hình mạng riêng (`private-network-copy.json`), giữ nguyên interface/TLS CA/SAN/hostname và chọn host ports còn trống.
+
+**1. Khởi chạy thông thường (Pilot mặc định, 4 lệnh smoke):**
+Chạy lệnh `serve` (giữ tiến trình này chạy ngầm hoặc trên Terminal A1 riêng biệt):
 
 ```sh
 python3 scripts/paper_p8_server.py serve \
@@ -115,6 +143,55 @@ python3 scripts/paper_p8_server.py serve \
 ```
 
 *(Thay thế `--dispatch-mode wakeup` hoặc `--workload mixed` tương ứng với profile cần chạy)*.
+
+**2. Khởi chạy với hồ sơ Official (`--profile official` và `--official-opt-in`):**
+- Đối với luồng `official30` (30 lệnh steady, ngân sách 20 phút):
+```sh
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/A" \
+  --network-config /path/to/private-network-copy.json \
+  --experiment E3 \
+  --profile official \
+  --official-opt-in \
+  --dispatch-mode polling \
+  --workload low_load \
+  --e3-command-count 30 \
+  --e3-schedule steady \
+  --deadline-seconds 1200
+```
+- Đối với bài kiểm tra seam hữu hạn `official3` (3 lệnh steady, bắt buộc `low_load`):
+```sh
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/A" \
+  --network-config /path/to/private-network-copy.json \
+  --experiment E3 \
+  --profile official \
+  --official-opt-in \
+  --dispatch-mode polling \
+  --workload low_load \
+  --e3-command-count 3 \
+  --e3-schedule steady \
+  --deadline-seconds 1200
+```
+
+**3. Kiểm tra hợp đồng offline (Dry-run contract):**
+Kiểm tra tính hợp lệ của manifest và kế hoạch chạy mà không cần khởi tạo fixture, container hay tiến trình mạng (sử dụng thư mục dummy `/not-used`):
+```sh
+python3 scripts/paper_p8_server.py serve --root /not-used \
+  --network-config /not-used --dry-run --experiment E3 --profile official \
+  --official-opt-in --dispatch-mode polling --workload low_load \
+  --e3-command-count 30 --e3-schedule steady --deadline-seconds 1200
+```
+
+**4. Kiểm định native seam hữu hạn qua selector fixture:**
+Chạy trực tiếp kiểm định seam 3 lệnh official hữu hạn trên fixture cách ly sạch:
+```sh
+python3 scripts/tests/native_compose_smoke.py --prepare "$ROOT/private" \
+  --paper-p8-e3 polling --paper-p8-e3-low-load \
+  --paper-p8-e3-command-count 3 --paper-p8-e3-schedule steady \
+  --p8-profile official --p8-official-opt-in \
+  --p8-deadline-seconds 1200
+```
 
 #### Bước 2 — Kiểm tra trạng thái và lưu session_id trên Host A (Terminal A2)
 
@@ -416,7 +493,38 @@ Toàn bộ báo cáo và dấu vết thực nghiệm được lưu trữ nguyên
 
 ## 4. Giới hạn và trạng thái gate
 
+### 4.1 Các giới hạn vận hành và ranh giới nghiệm thu
+
 - **Trạng thái cổng P8**: `full_p8_accepted=false`.
 - **Giới hạn topo mạng**: `physical_ab=NOT RUN`. Thử nghiệm được thực hiện trên cùng máy chủ cục bộ với metadata ghi nhận `generator_colocated=true` (hoặc `same-host/unverified`); chưa chứng minh được hành vi phân tán trên hai máy vật lý độc lập qua môi trường mạng vật lý tách biệt.
 - **Các kịch bản chưa thực hiện**: Các bài kiểm tra phần cứng HIL trên bo mạch AM5728, bài kiểm tra đầy đủ trên hệ thống CI từ xa (full remote CI), bài đo năng lực chịu tải và ngâm tải dài hạn (capacity/soak testing), cùng quy trình triển khai sản xuất (live rollout) đều là **NOT RUN**.
-- **Phạm vi dừng**: Bốn profile E3 đã hoàn thành đầy đủ bằng chứng kiểm thử native thông qua công cụ helper CLI. Nhiệm vụ nghiệm thu E3 dừng tại mốc bàn giao này; tuyệt đối không tự ý triển khai, chạy lại hay mở rộng sang E4, E5 hay Stage 6 nếu chưa có chỉ thị mới.
+- **Official30 native vẫn là NOT RUN**: Việc nghiệm thu luồng 30 lệnh chính thức trên môi trường native phân tán đầy đủ vẫn là **NOT RUN**. Hiện mới chỉ hoàn thành hợp đồng offline dry-run và bài kiểm tra native seam hữu hạn 3 lệnh (`official3`).
+- **Ranh giới nghiệm thu kết quả và quy trình import**: Quy trình nhập kết quả (result import) và đối soát dữ liệu (reconciliation) đã hoàn thành và đạt trạng thái `VALIDATED` trong 4 profile 4-lệnh chuẩn (§3) cũng như bài kiểm tra bounded seam 3-lệnh ghi nhận trong báo cáo P8; không tuyên bố một cách sai lệch hay lỗi thời rằng completed result import là universally NOT RUN. Chi tiết số liệu đo đạc từng lượt được tập trung tại [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe).
+- **Ranh giới giữa Offline Admission và Online Delivery**: Thao tác offline sensor chỉ chứng minh việc tiếp nhận/cam kết và replay trong CSDL (committed admission/replay gồm desired state, command request, và receipt); tuyệt đối không chứng minh việc chuyển giao (delivery) hay thực thi lệnh thành công (success). Việc chuyển giao và kết quả (delivery/result) chỉ được kết luận từ online executor thực tế sau khi nhận `READY_MARKER` và `SUBACK`.
+- **Ngân sách vòng đời và an toàn JWT**: Mọi quy trình đều tuân thủ chặt chẽ ngân sách thời gian có hạn (`--deadline-seconds` 900s hoặc 1200s), thời hạn ngắn của JWT token, dọn dẹp chính xác tài nguyên (`exact_cleanup_verified`), và phân quyền tập tin nghiêm ngặt (`0700`/`0600`).
+- **Phạm vi dừng (checkpoint lịch sử)**: Bốn profile E3 đã được ghi nhận hoàn thành ở checkpoint trước thông qua helper CLI. Kết quả bổ sung không thay đổi qualification của các lượt profile lịch sử; xem [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe).
+
+### 4.2 Hợp đồng offline Official30 và kiểm định native seam hữu hạn
+
+Kiểm tra tính hợp lệ của luồng 30 lệnh official dự kiến mà không cần khởi tạo fixture hay tiến trình mạng/workload (ngân sách phiên 20 phút được thiết lập có chủ đích):
+
+```sh
+python3 scripts/paper_p8_server.py serve --root /not-used \
+  --network-config /not-used --dry-run --experiment E3 --profile official \
+  --official-opt-in --dispatch-mode polling --workload low_load \
+  --e3-command-count 30 --e3-schedule steady --deadline-seconds 1200
+```
+
+Dry-run dùng identity chỉ dành cho schema, không dùng credential trên mạng. E3 control/session là `official`, còn telemetry nền E2 giữ profile `pilot`. Official cần opt-in; preset là 30 lệnh `steady`, hoặc 3 lệnh `low_load/steady` để kiểm tra seam hữu hạn. Tổ hợp không hỗ trợ bị từ chối trước khi tạo fixture. Không coi dry-run là nghiệm thu 30 lệnh; kết quả thực tế nằm trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe).
+
+Đối với kiểm định seam native hữu hạn, sử dụng đường dẫn native fixture hiện có với công thức 3 lệnh `low_load`/`steady` có opt-in official và một thư mục gốc cách ly mới. Preset official30 đã chọn vẫn sẵn sàng để gọi trực tiếp mà không cần sửa mã nguồn:
+
+```sh
+python3 scripts/tests/native_compose_smoke.py --prepare "$ROOT/private" \
+  --paper-p8-e3 polling --paper-p8-e3-low-load \
+  --paper-p8-e3-command-count 3 --paper-p8-e3-schedule steady \
+  --p8-profile official --p8-official-opt-in \
+  --p8-deadline-seconds 1200
+```
+
+Lệnh này dùng fixture E3 hữu hạn, cần các gate cleanup/readback thông thường và không phải nghiệm thu official 30 lệnh.

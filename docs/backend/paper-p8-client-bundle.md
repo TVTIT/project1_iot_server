@@ -1,5 +1,13 @@
 # Bundle client P8 portable (Bước 3)
 
+> **Cập nhật BS.9a (05/11/2026):** Workflow portable hiện dùng thực tế là
+> A prepare/provision/export bundle; chuyển thủ công bundle + binary phù hợp OS/
+> architecture; B bind → offline preflight bằng binary thật → kiểm tra kết nối
+> TLS/REST/WS/MQTT → đợi A `begin` và collector-ready → run → export-results;
+> chuyển projection về A để import/verify/finalize. E1–E5 native local pilots
+> đã chạy riêng, nhưng physical A/B chưa chạy. B chỉ giữ role credentials; không
+> nhận DB/admin/Docker socket/manager credential hoặc private server/CA key.
+
 ## Phạm vi
 
 `scripts/paper_p8_bundle.py` cung cấp API `export_bundle(...)` để đóng gói các

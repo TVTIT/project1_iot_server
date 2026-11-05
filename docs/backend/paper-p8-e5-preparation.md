@@ -1,5 +1,10 @@
 # P8 E5 — Ma trận bóc tách cơ chế tối ưu (source-qualified)
 
+> `--mode official --repeat 3` là repeat-plan/repeat
+> execution trên preset đã chọn, không tự biến thành capacity test; yêu cầu
+> tối thiểu ba independent repeats cho kết luận chính vẫn là kế hoạch chạy sau,
+> không phải số liệu hiện có. Kết quả từng lượt nằm trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e5--representative-một-repeat-và-timeout).
+
 Tài liệu hướng dẫn vận hành và báo cáo bằng chứng cho thử nghiệm P8 E5 (ma trận bóc tách cơ chế tối ưu đa pha trên 6 arm thực nghiệm: `optimized`, `ram_dedup_off`, `fanout_scan`, `shaper_off`, `microbatch_off`, `polling`). E5 được thực hiện trên cùng nền tảng kiến trúc backend (Go modular monolith, Mosquitto DynSec, TimescaleDB, WebSocket telemetry fanout, HTTP/REST và Mosquitto TLS).
 
 Thử nghiệm chạy tuần tự 6 arm trong từng fixture độc lập; mỗi arm được kiểm định dữ liệu và dọn dẹp tài nguyên độc lập. Đây là bài đo telemetry và control tổng hợp đa pha với 2 continuous viewers kết nối liên tục, không phải kiểm thử dung lượng/soak lặp lại $\ge 3$ lần hay chứng nhận phần cứng thực tế (HIL/AM5728).
@@ -39,10 +44,10 @@ Terminal A2: CLI điều phối (status, begin,       Terminal B2: CLI tác vụ
 
 ### 1.3 Quy trình 3 Pha tuần tự và 2 Continuous Viewers xuyên suốt
 
-Mỗi arm trong ma trận trải qua 3 pha đo lường tuần tự, trong đó 2 WebSocket continuous viewers (`e5-viewer-a`, `e5-viewer-b`) được duy trì kết nối liên tục từ trước Pha 1 cho đến cuối Pha 3:
+Mỗi arm trong ma trận trải qua 3 pha đo lường tuần tự, trong đó 2 WebSocket continuous viewers (`e5-viewer-a`, `e5-viewer-b`) được duy trì kết nối liên tục từ trước Pha 1 cho đến cuối Pha 3. Số lượng tin nhắn viễn trắc và phát lại kiểm tra trùng lặp phụ thuộc vào preset được cấu hình (`pilot` hoặc `representative`):
 
-1. **Pha 1 — `initial` (Replay Telemetry 20 tin nhắn đầu vào):** Máy khách B gửi 20 tin nhắn viễn trắc đo lường mới. Backend tiếp nhận, áp dụng shaper, gom cụm microbatch, ghi cơ sở dữ liệu và chuyển tiếp WebSocket tới 2 viewers.
-2. **Pha 2 — `warm_replay` (Replay Telemetry 10 tin nhắn kiểm tra lọc trùng):** Máy khách B phát lại 10 tin nhắn đã gửi ở Pha 1. Kiểm tra năng lực lọc trùng lặp tại bộ nhớ RAM hoặc cơ sở dữ liệu mà không ghi trùng mẫu dữ liệu raw.
+1. **Pha 1 — `initial` (Replay Telemetry tin nhắn đầu vào):** Máy khách B gửi tin nhắn viễn trắc đo lường mới (20 tin nhắn với preset `pilot`, hoặc 8 tin nhắn với preset `representative`; mỗi tin nhắn mang 100 mẫu đo lường). Backend tiếp nhận, áp dụng shaper, gom cụm microbatch, ghi cơ sở dữ liệu và chuyển tiếp WebSocket tới 2 viewers.
+2. **Pha 2 — `warm_replay` (Replay Telemetry tin nhắn kiểm tra lọc trùng):** Máy khách B phát lại một tiền tố tin nhắn đã gửi ở Pha 1 (10 tin nhắn với preset `pilot`, hoặc 2 tin nhắn với preset `representative`). Kiểm tra năng lực lọc trùng lặp tại bộ nhớ RAM hoặc cơ sở dữ liệu mà không ghi trùng mẫu dữ liệu raw.
 3. **Pha 3 — `control` (Thực thi 4 lệnh điều khiển bền vững & Dừng Viewer):** Máy khách B gửi 4 lệnh điều khiển desired-state, 2 gateway executors tiếp nhận lệnh và gửi ACK báo cáo kết quả. Sau khi chu kỳ điều khiển hoàn tất, gửi tín hiệu đóng 2 continuous viewers êm ái với 6 checkpoints hợp lệ.
 
 ### 1.4 Quy cách Context và Dataset dùng chung cho toàn ma trận
@@ -50,8 +55,27 @@ Mỗi arm trong ma trận trải qua 3 pha đo lường tuần tự, trong đó 
 Context được tạo một lần qua lệnh chuẩn bị chuyên dụng của E5 (`scripts/paper_p8_e5.py --prepare-only`; lưu ý: `paper_p8_server.py` không có subcommand `e5-context`) và chia sẻ nguyên vẹn cho toàn bộ 6 arm trong ma trận:
 - `seed` = 805 (hạt giống sinh số ngẫu nhiên xác định).
 - `anchor`: Mốc thời gian được tạo tự động lùi 1 giờ so với thời điểm chuẩn bị (`anchor = datetime.now() - 1 hour`, bỏ microseconds) để bảo đảm mốc thời gian an toàn trong quá khứ. Việc sinh lại lệnh này ở các thời điểm khác nhau sẽ tạo chuỗi băm dataset khác nhau; do đó trong một đợt đo bắt buộc phải **ghim và giữ nguyên vẹn tập tin context đó cho toàn bộ 6 arm**.
-- Chuỗi băm dataset lịch sử ghi nhận: SHA-256 `2411c01b9ea1be35ddb44ee449b311e8460f99cbdfe01fa2d41a335bd1500175`, dung lượng 35.684 bytes.
+- Chuỗi băm dataset lịch sử ghi nhận: SHA-256 `2411c01b9ea1be35ddb44ee449b311e8460f99cbdfe01fa2d41a335bd1500175`, dung lượng 35.684 bytes (đối với preset `pilot`).
 - Chuẩn bị mã nguồn sạch và nhị phân trước lượt `optimized`, tuyệt đối không sửa đổi source code, tài liệu hay fixture untracked trong suốt quá trình chạy 6 arm vì cơ chế kiểm tra reference sẽ đối chiếu cả `source_dirty_sha256`.
+
+### 1.5 Cấu hình Khối lượng Công việc (Workload Presets: `pilot` vs `representative`)
+
+Ma trận E5 hỗ trợ hai preset khối lượng công việc được định nghĩa trong `scripts/tests/paper_p8_e5_support.py`:
+
+| Thuộc tính metadata | Preset `pilot` (mặc định) | Preset `representative` | Ý nghĩa kỹ thuật |
+|---|:---:|:---:|---|
+| `profile` | `pilot` | `representative` | Định danh hồ sơ cấu hình tải |
+| `telemetry_messages` | 20 | 8 | Số gói tin viễn trắc phát trong pha `initial` |
+| `samples_per_message` | 100 | 100 | Số điểm đo mẫu (samples) trong mỗi gói tin viễn trắc |
+| `initial_replay_count` | 20 | 8 | Tổng số tin viễn trắc ghi nhận (2.000 mẫu vs 800 mẫu) |
+| `warm_replay_prefix` | 10 | 2 | Số gói tin tiền tố phát lại trong pha `warm_replay` để kiểm tra lọc trùng |
+| `command_count` | 4 | 4 | Số lệnh điều khiển desired-state trong pha `control` (2 lệnh/gateway) |
+| `viewer_count` | 2 | 2 | Số kết nối WebSocket continuous viewer duy trì liên tục |
+| `initial_replay_rate_per_second` | 1 | 1 | Tốc độ phát tin viễn trắc đầu vào (1 tin/giây) |
+
+**Cơ chế lựa chọn Preset giữa Driver tự động và Quy trình Manual A/B:**
+- **Trong Driver tự động (`scripts/paper_p8_e5.py`)**: Lựa chọn trực tiếp qua cờ `--workload-preset pilot` hoặc `--workload-preset representative` (mặc định là `pilot`), hoặc nạp lại ngữ cảnh qua `--context <path>` chứa tệp `context.json` đã sinh trước đó.
+- **Trong quy trình Manual A/B (`paper_p8_server.py` + `paper_p8_client.py`)**: Preset được quyết định tại bước chuẩn bị context trên Host A (`python3 scripts/paper_p8_e5.py --root "$INPUTS_DIR" --prepare-only --workload-preset <preset>`). Tệp `context.json` sinh ra là nguồn sự thật duy nhất mang siêu dữ liệu `workload_selection` và chuỗi băm xác thực `workload_selection_sha256`. Lệnh máy chủ `paper_p8_server.py serve` chỉ tiếp nhận `--context "$CTX_A"` và suy diễn mọi thông số tải từ context; **tuyệt đối không có và không tự tiện sáng chế cờ `--workload-preset` trên `paper_p8_server.py`**. Máy khách `paper_p8_client.py` cũng giải mã và tuân thủ các thông số tải này thông qua bundle được sinh ra từ context.
 
 ---
 
@@ -65,13 +89,15 @@ Context được tạo một lần qua lệnh chuẩn bị chuyên dụng của 
   - Tập tin cấu hình, bundle, chứng chỉ và kết quả: quyền `0600`.
   - Tập tin thực thi binary (`paperload`, `gateway`): quyền `0700`.
 - **Chống ghi đè tập tin**: Tuyệt đối không ghi đè hoặc tái sử dụng thư mục kết quả hay workspace cũ. Thư mục lá `$A` trên Host A và `$WORKSPACE` trên Host B **phải chưa tồn tại** trước khi chạy lệnh; các lệnh `serve` và `bind` yêu cầu tự tạo mới với quyền bảo vệ.
-- **Ngân sách thời gian (Deadline 900s)**: Tiến trình `serve` trên Terminal A1 và `e5-viewers` trên Terminal B1 có thời hạn hiệu lực `--deadline-seconds 900` (15 phút). Toàn bộ 3 pha phải được hoàn tất trước khi hết hạn ngân sách này.
+- **Ngân sách thời gian (Deadline 900s và Child Timeout 3900s)**:
+  - *Chế độ máy chủ thủ công (Terminal A1/B1)*: Tiến trình `serve` trên Terminal A1 và `e5-viewers` trên Terminal B1 có thời hạn hiệu lực `--deadline-seconds 900` (15 phút). Toàn bộ 3 pha phải được hoàn tất trước khi hết hạn ngân sách này.
+  - *Chế độ Native Driver (`scripts/paper_p8_e5.py`)*: Tham số `--child-timeout-seconds` có giá trị mặc định là `3900` giây (phạm vi ràng buộc hợp lệ: `1..7200` giây). Ngân sách 3900s này được tính toán hữu hạn nhằm bao phủ 3600s thời gian sống của viewer (wall time) cộng với 300s thời gian phụ trợ khởi tạo và dọn dẹp (lifecycle overhead) cho mỗi arm. Ngân sách khai báo tổng thể trong báo cáo tóm tắt là `(child_timeout_seconds + 60) * số_arm * repeat`.
 - **Tính bất biến của nhị phân và container images**: Trong cùng một ma trận, 2 file nhị phân (`paperload`, `gateway`) và 12 container images phải được tái sử dụng nguyên vẹn byte-for-byte giữa arm `optimized` và 5 arm bóc tách qua cờ `--reference`.
 - **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Step)**: Việc chuyển bundle, binary và kết quả giữa Host A và Host B là thao tác truyền file thủ công của người vận hành (qua lệnh `scp` hoặc `rsync` an toàn), không tuyên bố là tự động hóa ngầm.
 
 ---
 
-### 2.2 Quy trình vận hành chi tiết ma trận 6 Arm
+### 2.2 Quy trình vận hành chi tiết ma trận 6 Arm (Manual A/B Runbook)
 
 Thiết lập thư mục gốc làm việc trên cả hai máy:
 ```sh
@@ -86,7 +112,14 @@ mkdir -p "$ROOT_B" && chmod 0700 "$ROOT_B"
 
 #### Bước 1 — Tạo Context và Dataset dùng chung cho toàn ma trận (Host A)
 
-Chạy lệnh chuẩn bị context một lần duy nhất khi bắt đầu ma trận trên Host A. Lưu ý: lệnh `paper_p8_e5.py` yêu cầu tự tạo thư mục `--root` với quyền `0700` và từ chối nếu thư mục đã tồn tại; do đó **chỉ tạo thư mục cha `$ROOT_A`**, tuyệt đối **không `mkdir` trước thư mục lá `$INPUTS_DIR`**:
+Chạy lệnh chuẩn bị context một lần duy nhất khi bắt đầu ma trận trên Host A. Lưu ý: lệnh `paper_p8_e5.py` yêu cầu tự tạo thư mục `--root` với quyền `0700` và từ chối nếu thư mục đã tồn tại; do đó **chỉ tạo thư mục cha `$ROOT_A`**, tuyệt đối **không `mkdir` trước thư mục lá `$INPUTS_DIR`**.
+
+##### Bước 1.1 — Lựa chọn Preset khối lượng công việc
+Xác định preset cần chạy trước khi tạo context:
+- Sử dụng `--workload-preset pilot` (mặc định) cho bài đo thăm dò 20 tin viễn trắc (2.000 mẫu), 10 warm replay prefix.
+- Sử dụng `--workload-preset representative` cho bài đo gọn nhẹ 8 tin viễn trắc (800 mẫu), 2 warm replay prefix.
+
+##### Bước 1.2 — Lệnh chuẩn bị Context và Dataset dùng chung (`--prepare-only`)
 
 ```sh
 # Trên Host A (Terminal A1 hoặc Terminal điều phối):
@@ -94,11 +127,12 @@ export ROOT_A=/var/tmp/opencode/p8-e5-run
 mkdir -p "$ROOT_A" && chmod 0700 "$ROOT_A"
 export INPUTS_DIR="$ROOT_A/inputs"
 
-python3 scripts/paper_p8_e5.py --root "$INPUTS_DIR" --seed 805 --prepare-only
+# Chuẩn bị context với preset mong muốn (ví dụ representative):
+python3 scripts/paper_p8_e5.py --root "$INPUTS_DIR" --seed 805 --workload-preset representative --prepare-only
 chmod 0600 "$INPUTS_DIR/repeat-01/context.json"
 ```
 
-Tập tin context được tạo tại: `$INPUTS_DIR/repeat-01/context.json`. Tập tin này phải được giữ cố định không đổi cho toàn bộ 6 arm.
+Tập tin context được tạo tại: `$INPUTS_DIR/repeat-01/context.json`. Tập tin này mang thông số tải đã chọn và chuỗi băm xác thực `workload_selection_sha256`; nó phải được giữ cố định không đổi cho toàn bộ 6 arm. Khi chạy `paper_p8_server.py serve`, máy chủ tự động đọc cấu hình tải từ tệp context này qua cờ `--context` (máy chủ không có cờ `--workload-preset`).
 
 ---
 
@@ -518,6 +552,9 @@ Ví dụ chi tiết cho arm **`shaper_off`**:
 
 Khi xảy ra sự cố trong quá trình chạy (lỗi mạng, tiến trình con bị treo, timeout hoặc lỗi xác thực), người vận hành phải tuân thủ quy trình dừng an toàn, **tuyệt đối không chạy `docker system prune` hay `docker compose down -v` bừa bãi** làm ảnh hưởng tới các volume dữ liệu khác.
 
+**Hành vi xử lý Timeout và Ngắt tín hiệu của Driver (`scripts/paper_p8_e5.py --run`):**
+Lệnh `scripts/paper_p8_e5.py --run` khởi chạy từng native fixture trong một process group độc lập (`start_new_session=True`). Khi xảy ra quá hạn thời gian (`timeout`) hoặc nhận tín hiệu ngắt từ người dùng (`Ctrl-C` / `KeyboardInterrupt`), driver ưu tiên gửi tín hiệu `SIGINT` trước tiên tới process group để khối `finally` thông thường của fixture, quy trình đối soát biên lai (receipt reconciliation) và thao tác giải phóng tài nguyên chính xác có cơ hội thực thi. Driver chờ một khoảng thời gian ân hạn dọn dẹp hữu hạn (`cleanup_grace=10` giây); nếu nhóm tiến trình vẫn chưa giải phóng hoàn toàn, driver sẽ leo thang hữu hạn qua `SIGTERM` (chờ thêm grace), và cuối cùng là `SIGKILL` nếu bắt buộc. Tệp tóm tắt dở dang `driver-run.json` giữ nguyên nguyên nhân lỗi chính (`primary_failure`, ví dụ `child_timeout` với mã thoát 124, hoặc `interrupted` với mã thoát 130) tách biệt hoàn toàn với kết quả dọn dẹp của nhóm tiến trình con (`cleanup`: `already_exited`, `joined_after_interrupt`, `joined_after_terminate`, `joined_after_kill`, hoặc `unresolved`). Cờ `cleanup_verified` của lượt chạy chỉ được ghi nhận là `true` khi cả hai điều kiện sau đồng thời thỏa mãn: (1) kết quả đọc lại artifact của fixture xác nhận `cleanup_verified: true`, VÀ (2) nhóm tiến trình đã kết thúc êm ái (`joined_after_interrupt` hoặc `already_exited`). Việc leo thang tín hiệu (`SIGTERM`/`SIGKILL`) hoặc thiếu vắng artifact fixture được kiểm chứng tuyệt đối KHÔNG đồng nghĩa với việc tài nguyên fixture đã được dọn dẹp an toàn; người vận hành không được tự ý tuyên bố đã dọn dẹp tài nguyên sau khi leo thang nếu chưa xác minh qua artifact. Khi đó, cần kiểm tra các biên lai/artifact tài nguyên còn lưu và thực thi lệnh dọn dẹp đối soát biên lai hiện có (`scripts/paper_p8_server.py cleanup ...`) cho các tài nguyên native chưa được giải phóng; tuyệt đối không dùng các lệnh hạ Compose diện rộng (`docker compose down -v`) hay dọn dẹp hệ thống bừa bãi (`docker system prune`). Các lượt chạy lịch sử không có `driver-run.json` vẫn giữ nguyên trạng và không được tái công nhận hồi tố.
+
 ##### 1. Hủy bỏ Phiên đang Hoạt động (`abort`)
 Nếu server A1 vẫn đang chạy nhưng phiên bị lỗi ở một phase nào đó, gửi lệnh `abort` trên Terminal A2 (truyền đúng đường dẫn `$A` của arm đang chạy và `$SESSION_ID` tương ứng):
 ```sh
@@ -605,6 +642,58 @@ Lệnh sinh ra 3 tệp tin đã được lọc sạch thông tin nhạy cảm:
 
 ---
 
+### 2.3 Quy trình thực thi tự động qua Native Driver (`scripts/paper_p8_e5.py`)
+
+Bên cạnh quy trình Manual A/B 4 terminal trên hai máy độc lập, E5 cung cấp công cụ Native Driver `scripts/paper_p8_e5.py` hỗ trợ lập lịch và chạy tuần tự các arm thử nghiệm trên cùng môi trường cô lập:
+
+#### Bước 2.3.1 — Chế độ vận hành (`--mode`) và số lượt lặp (`--repeat`)
+- `--mode pilot` (mặc định): Yêu cầu bắt buộc `--repeat 1`. Nếu truyền cờ `--context`, cờ này chỉ được áp dụng cho đúng 1 lượt lặp pilot.
+- `--mode official`: Yêu cầu bắt buộc `--repeat >= 3`. Đây là quy định lặp lại bài đo trên cùng khối lượng công việc đã chọn (`workload_preset`) nhằm kiểm chứng độ tin cậy và phương sai; **tuyệt đối không phải là kiểm thử dung lượng/soak (capacity test)**. Chế độ `official` chỉ quản lý việc lập lịch các lượt lặp độc lập (mỗi lượt dùng seed `seed + repeat`), không làm thay đổi kích thước tải của từng lượt.
+
+#### Bước 2.3.2 — Lựa chọn Arm và quy tắc thứ tự / tham chiếu (`--arm`, `--arms`, `--reference`)
+- Lựa chọn arm: Sử dụng `--arm <arm>` cho kiểm thử gỡ lỗi một arm đơn lẻ, hoặc `--arms <arm1> <arm2> ...` cho một tập con các arm tuần tự (không dùng đồng thời cả hai cờ). Cờ `--run` bắt buộc phải đi kèm `--arm` hoặc `--arms` rõ ràng; driver không bao giờ ngầm định chạy toàn bộ 6 arm.
+- Quy tắc ma trận (`optimized` cùng các arm ablation): Khi danh sách arm có chứa `optimized` cùng với các arm ablation (`matrix = true`), driver luôn lập lịch thực thi `optimized` đầu tiên để tạo tệp báo cáo tham chiếu `p8-e5-optimized.json`. Các arm ablation tiếp theo trong cùng lượt lặp sẽ tự động tái sử dụng tệp tham chiếu này theo thứ tự ngẫu nhiên hóa dựa trên seed (`seed + repeat`).
+- Quy tắc chạy ablation riêng lẻ: Nếu danh sách được chọn chỉ gồm các arm ablation (không chứa `optimized`), lệnh `--run` bắt buộc phải nhận cả `--context` tái sử dụng và `--reference <path>` trỏ tới tệp báo cáo `p8-e5-optimized.json` hợp lệ đã đạt `PASS`, dọn dẹp sạch tài nguyên (`cleanup_verified: true`) và khớp fingerprint/seed/anchor/workload_selection.
+
+#### Bước 2.3.3 — Chuẩn bị trước (`--prepare-only`) so với Thực thi Native (`--run`)
+- `--prepare-only` (mặc định): Tạo cấu trúc thư mục private ngoài Git tree, sinh dataset và `context.json`, ghi `driver-run.json` với trạng thái `PREPARED`. Không khởi chạy bất kỳ container Docker hay fixture native nào.
+- `--run`: Thực thi trực tiếp các fixture Docker native tuần tự thông qua `native_compose_smoke.py`. Hai cờ `--run` và `--prepare-only` xung đột và không được dùng chung.
+
+#### Bước 2.3.4 — Ngân sách thời gian con (`--child-timeout-seconds`)
+- Tham số `--child-timeout-seconds` có giá trị mặc định là `3900` giây (phạm vi hợp lệ: `1..7200` giây).
+- Ngân sách hữu hạn 3900s bao phủ 3600s thời gian sống của viewer (wall time) cộng với 300s thời gian phụ trợ vòng đời mỗi arm. Driver giám sát tiến trình con và kích hoạt chu trình ngắt/dọn dẹp an toàn (`SIGINT` -> `SIGTERM` -> `SIGKILL`) nếu vượt quá hạn mức này.
+- Ngân sách khai báo tổng thể trong báo cáo tóm tắt là `(child_timeout_seconds + 60) * số_arm * repeat`.
+
+#### Bước 2.3.5 — Các lệnh mẫu thực thi qua Driver
+```sh
+# 1. Chuẩn bị ngữ cảnh đại diện (representative preset, seed 805) ngoài cây Git:
+python3 scripts/paper_p8_e5.py \
+  --root /var/tmp/opencode/p8-e5-prep \
+  --workload-preset representative \
+  --seed 805 \
+  --prepare-only
+
+# 2. Thực thi pilot một arm tham chiếu optimized:
+python3 scripts/paper_p8_e5.py \
+  --root /var/tmp/opencode/p8-e5-opt \
+  --workload-preset representative \
+  --seed 805 \
+  --arm optimized \
+  --run \
+  --child-timeout-seconds 3900
+
+# 3. Thực thi ma trận đầy đủ 6 arm (optimized chạy trước tạo reference, sau đó là 5 ablation arms):
+python3 scripts/paper_p8_e5.py \
+  --root /var/tmp/opencode/p8-e5-matrix \
+  --workload-preset representative \
+  --seed 805 \
+  --arms optimized shaper_off microbatch_off ram_dedup_off polling fanout_scan \
+  --run \
+  --child-timeout-seconds 3900
+```
+
+---
+
 ## 3. Bằng chứng thực nghiệm và lịch sử kiểm thử
 
 ### 3.1 Bảng kết quả thực chạy ma trận 6 Arm pilot (Seed 805)
@@ -640,28 +729,39 @@ Bảng đối chiếu 5 cặp bóc tách so với arm tham chiếu `optimized` (
 
 ### 3.3 Phân tích kích hoạt cơ chế và hiệu quả thực nghiệm
 
+Phân tích đối chứng giữa arm tham chiếu `optimized` và các arm bóc tách được phân định rạch ròi giữa việc **Kích hoạt cơ chế (Mechanism Activation)** theo thiết kế thí nghiệm và **Lợi ích đo đạc tổng hợp (Observed Benefit)**:
+
+- **Cửa sổ quan sát kỳ vọng của các pha**:
+  - *Cửa sổ import `initial`*: Tải đo lường mới đầu vào (20 tin nhắn với `pilot` / 8 tin nhắn với `representative`; mỗi tin 100 mẫu).
+  - *Cửa sổ phát lại `warm_replay`*: Kiểm tra năng lực lọc trùng lặp (10 tin nhắn với `pilot` / 2 tin nhắn với `representative`).
+  - *Cửa sổ điều phối `control`*: Thực thi 4 lệnh điều khiển desired-state, thu nhận kết quả từ 2 gateway executors và đóng êm ái 2 continuous viewers.
+
 1. **Cơ chế gom cụm vi mô tầng lưu trữ (`microbatch_off` vs `optimized`):**
    - *Kích hoạt*: Đạt trạng thái **`ELIGIBLE`**.
    - *Hiệu quả ghi nhận*: Trong pha `initial`, với cùng 2.000 dòng mẫu dữ liệu viễn trắc (`raw_samples_retained = 2000`), arm `optimized` gom nhóm thành 16 giao dịch commit cơ sở dữ liệu (`begin_attempts = 16`, `confirmed_commits = 16`, `copy_calls = 16`), trong khi `microbatch_off` phải thực hiện 20 giao dịch commit độc lập (20 vs 16).
-   - *Tỉ lệ suy giảm*: Đạt mức giảm **20.0%** số lượt mở giao dịch và thao tác COPY dữ liệu ($\Gamma_{\text{red}} = 20.0\%$).
-   - *Giới hạn diễn giải*: Mức 20% này chỉ áp dụng cụ thể cho các bộ đếm thao tác import ban đầu trong cấu hình thử nghiệm, không đại diện cho toàn bộ tài nguyên SQL, dung lượng lưu trữ, RSS hay thông lượng toàn hệ thống.
+   - *Tỉ lệ suy giảm*: Đạt mức giảm **20.0%** số lượt mở giao dịch và thao tác COPY dữ liệu ($\Gamma_{\text{red}} = 20.0\%$). (Trong bài đo representative: 4 vs 8 thao tác, đạt $\Gamma_{\text{red}} = 50.0\%$).
+   - *Lợi ích tổng hợp và giới hạn*: Trong tệp xuất `e5-summary.json`, chỉ số Gamma tổng hợp được ghi nhận là `UNAVAILABLE` (`process_instance_mismatch_or_missing`) do thiếu snapshot `phase_windows` đối chiếu định danh tiến trình backend, không phải lợi ích bằng 0. Mức giảm này áp dụng cho các bộ đếm thao tác SQL ban đầu, không đại diện cho toàn bộ tài nguyên hệ thống hay thông lượng đỉnh.
 
 2. **Cơ chế lọc trùng lặp bộ nhớ RAM (`ram_dedup_off` vs `optimized`):**
    - *Kích hoạt*: Đạt trạng thái **`ELIGIBLE`**.
-   - *Hiệu quả ghi nhận*: Trong pha `warm_replay`, 10 tin nhắn phát lại đã được arm `optimized` lọc sạch hoàn toàn tại bộ nhớ RAM (`ram_lookup_hits = 10`, `ram_db_calls_avoided = 10`), dẫn đến số giao dịch và commit cơ sở dữ liệu phát sinh bằng 0 (`warm_attempts = 0`, `warm_commits = 0`, `warm_transactions = 0`). Ngược lại, `ram_dedup_off` phát sinh toàn bộ 10 giao dịch kiểm tra cơ sở dữ liệu (`warm_attempts = 10`, `warm_commits = 10`).
+   - *Hiệu quả ghi nhận*: Trong pha `warm_replay`, 10 tin nhắn phát lại đã được arm `optimized` lọc sạch hoàn toàn tại bộ nhớ RAM (`ram_lookup_hits = 10`, `ram_db_calls_avoided = 10`), dẫn đến số giao dịch và commit cơ sở dữ liệu phát sinh bằng 0 (`warm_attempts = 0`, `warm_commits = 0`, `warm_transactions = 0`). Ngược lại, `ram_dedup_off` phát sinh toàn bộ 10 giao dịch kiểm tra cơ sở dữ liệu (`warm_attempts = 10`, `warm_commits = 10`). (Trong bài đo representative: 0 vs 2 warm transactions).
    - *Tỉ lệ suy giảm*: Đạt mức giảm **100.0%** tải giao dịch cơ sở dữ liệu trong pha warm replay ($\Gamma_{\text{red}} = 100.0\%$).
+   - *Lợi ích tổng hợp*: Ghi nhận `UNAVAILABLE` trong bảng summary do cùng lý do thiếu snapshot tiến trình như trên.
 
 3. **Cơ chế điều tiết tốc độ Ingress (`shaper_off` vs `optimized`):**
-   - *Kích hoạt*: Đạt trạng thái **`ELIGIBLE`**.
-   - *Hiệu quả ghi nhận*: Arm `optimized` kích hoạt cơ chế giới hạn tốc độ token bucket khi phát sinh lưu lượng vượt ngưỡng (`shaper_rate_limited > 0`), trong khi `shaper_off` không ghi nhận sự kiện giới hạn tốc độ.
+   - *Kích hoạt*: Đạt trạng thái **`ELIGIBLE`** khi phát sinh lưu lượng vượt ngưỡng điều tiết token bucket (tốc độ định mức 2 tin/giây, burst 4 tin).
+   - *Hiệu quả ghi nhận*: Arm `optimized` kích hoạt giới hạn tốc độ token bucket khi phát sinh lưu lượng vượt ngưỡng (`shaper_rate_limited > 0`), trong khi `shaper_off` không ghi nhận sự kiện giới hạn tốc độ.
+   - *Hiện tượng Shaper Inactivity (Không can thiệp khi tải thấp)*: Khi lưu lượng đầu vào được phát đều đặn ở mức 1 tin/giây (dưới ngưỡng tốc độ 2 tin/s), token bucket của shaper không kích hoạt điều tiết (`rate_limited = 0`); đây là trạng thái không can thiệp (inactivity) bình thường theo thiết kế khi tải nằm trong hạn mức an toàn, không phải là cơ chế bị lỗi hay không hoạt động. Ở các bài đo không có đợt phát vượt burst, cặp đối chiếu này ghi nhận `INCONCLUSIVE` về mặt lợi ích tốc độ.
 
 4. **Cơ chế đánh thức điều khiển hướng sự kiện (`polling` vs `optimized`):**
    - *Kích hoạt*: Đạt trạng thái **`ELIGIBLE`**.
    - *Hiệu quả ghi nhận*: Cả hai arm đều hoàn tất 4 lệnh điều khiển và cập nhật 2 cấu hình; tuy nhiên `polling` dựa trên chu kỳ thăm dò cơ sở dữ liệu định kỳ, trong khi `optimized` sử dụng kênh wakeup tức thời.
+   - *Lợi ích tổng hợp*: Chỉ số lợi ích tổng hợp ghi nhận `UNAVAILABLE` do thiếu snapshot tiến trình tương tự các cặp trên.
 
 5. **Cơ chế phân phát WebSocket (`fanout_scan` vs `optimized`):**
    - *Kích hoạt*: Ghi nhận **`INCONCLUSIVE`** do nguyên nhân `fanout_viewer_readiness_unverified`.
-   - *Bản chất kỹ thuật*: Arm `fanout_scan` thực hiện 40 lượt đánh giá quét (`scan_evaluations = 40`, `indexed_selections = 0`), trong khi `optimized` sử dụng 20 lượt trỏ chỉ mục trực tiếp (`indexed_selections = 20`, `scan_evaluations = 0`). Cả hai đều phân phát chính xác 20 sự kiện viễn trắc tới 2 viewers; tuy nhiên do chưa có cơ chế kiểm chứng độ sẵn sàng của viewer ở ranh giới đo lường, kết quả được đánh giá thận trọng là `INCONCLUSIVE`.
+   - *Bản chất kỹ thuật*: Arm `fanout_scan` thực hiện 40 lượt đánh giá quét (`scan_evaluations = 40`, `indexed_selections = 0`), trong khi `optimized` sử dụng 20 lượt trỏ chỉ mục trực tiếp (`indexed_selections = 20`, `scan_evaluations = 0`). Cả hai đều phân phát chính xác các sự kiện viễn trắc tới 2 viewers.
+   - *Độ sẵn sàng (Viewer Readiness)*: Mặc dù số lượt duyệt đánh giá quét phản ánh đúng sự khác biệt cơ chế, tại ranh giới bắt đầu đo lường chưa có cơ chế kiểm chứng độc lập độ sẵn sàng (`readiness`) tuyệt đối của kết nối viewer; do đó kết quả được đánh giá thận trọng là `INCONCLUSIVE` thay vì khẳng định cải thiện hiệu năng.
 
 ---
 
@@ -736,6 +836,8 @@ Các tệp tin tổng kết ma trận được lưu trữ tại `docs/backend/re
 ---
 
 ## 4. Giới hạn và trạng thái gate
+
+Các lượt representative ngày 05/11/2026, kể cả FAIL và timeout driver, được ghi tại [báo cáo P8](paper-p8-experiments-and-acceptance.md#e5--representative-một-repeat-và-timeout).
 
 - **Trạng thái cổng P8**: `full_p8_accepted=false`.
 - **Giới hạn topo mạng**: `physical_ab=NOT RUN`. Thử nghiệm chạy trên cùng máy chủ cục bộ với metadata ghi nhận chuẩn tắc là `generator_colocated=true` (hoặc co-located network); chưa chứng minh được hành vi phân tán trên 2 máy vật lý độc lập qua mạng.

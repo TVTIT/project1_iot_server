@@ -1,5 +1,9 @@
 # P8 E1 — chuẩn bị, chạy pilot và nhập kết quả (source-qualified)
 
+> E1 B nhận bundle + `paperload` binary, không nhận admin/DB/Docker credentials.
+> Các hướng dẫn 64 sockets bên dưới mô tả baseline lịch sử; kết quả mới nằm
+> trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1--tài-nguyên-fixture-và-pilot).
+
 Tài liệu hướng dẫn vận hành và báo cáo bằng chứng cho thử nghiệm P8 E1 (pilot hữu hạn giữa hai host A và B). E1 được thực hiện trên cùng nền tảng kiến trúc backend (Go modular monolith, Mosquitto DynSec, TimescaleDB, HTTP/REST và Mosquitto TLS).
 
 Trong thử nghiệm này, Host A sở hữu fixture và collector; Host B liên kết bundle, kiểm tra kết nối, thực thi hai role workload bằng Go binary (`paperload`), rồi xuất một projection kết quả đã giới hạn để Host A xác minh đối chiếu với cơ sở dữ liệu và telemetry thực tế. Thử nghiệm này là một pilot hữu hạn, không phải nghiệm thu toàn diện P8 (`full_p8_accepted=false`).
@@ -8,14 +12,26 @@ Trong thử nghiệm này, Host A sở hữu fixture và collector; Host B liên
 
 ## 1. Tổng quan và nguyên tắc vận hành
 
+Chi tiết kết quả pilot 128 viewer và qualification nằm trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1--tài-nguyên-fixture-và-pilot).
+
 ### 1.1 Phạm vi và mục tiêu thử nghiệm E1
 
 - **Mô hình phối hợp hai host**:
   - **Host A (Server / Fixture / Collector)**: Khởi chạy môi trường dịch vụ backend đầy đủ (Nginx, Go backend, TimescaleDB, Mosquitto DynSec), cấp phát tài nguyên mẫu (provisioning), tạo manifest và đóng gói bundle gửi cho client, đồng thời thực hiện đo lường tài nguyên và hậu kiểm dữ liệu.
   - **Host B (Client Runner)**: Nhận bundle và binary từ Host A, thực hiện liên kết workspace, tiền kiểm tra (preflight), kiểm tra kết nối mạng/xác thực, thực thi workload mô phỏng và xuất tập kết quả đo lường (projection).
-- **Topology thử nghiệm E1**:
-  - 2 Gateways, 4 Sensors (2 sensor/gateway), 2 Users, 2 Viewers (sử dụng định danh giả danh `viewer-NNNNN`), 64 sockets kết nối WebSocket / MQTT.
-  - Workload phát sinh 20 unique messages (mỗi tin nhắn chứa 100 samples, tương ứng 2.000 raw samples) và 530 lượt ghi WebSocket (WebSocket writes).
+- **Topology và thuật ngữ thử nghiệm E1**:
+  - **Ánh xạ mặc định chuẩn (legacy default mapping — `default64`)**:
+    - 2 Gateways (`gw-0`, `gw-1`), 4 Sensors (2 sensor/gateway, tạo thành 4 targets: `gw-0/sensor-0`, `gw-0/sensor-1`, `gw-1/sensor-0`, `gw-1/sensor-1`).
+    - 2 Users / Principals (`user-000`, `user-001`): Mỗi user sở hữu quyền truy cập gateway tương ứng theo phân quyền ACL; hệ thống không bypass quyền quản trị.
+    - 64 viewer sockets: Mỗi viewer socket tương ứng một client kết nối WebSocket độc lập được cấp định danh giả danh `viewer-00000` đến `viewer-00063`.
+    - 106 filters đăng ký: Với mật độ phân bổ mặc định `density=mixed` (kết hợp các bộ lọc sparse, dense và overlap), 64 viewer sockets đăng ký tổng cộng 106 filters.
+    - Workload phát sinh 20 unique messages (4 targets × 5 messages/target; mỗi message chứa 100 samples, tương ứng 2.000 raw samples đẩy qua MQTT TLS).
+    - **530 expected deliveries (WebSocket writes)**: Khớp chính xác với công thức phân bổ người nhận theo ánh xạ chuẩn `expected_deliveries_by_target` (tổng số lượt nhận trên 64 receiving viewers = 530). Đây là giá trị chuẩn xác của topology mặc định, **tuyệt đối không thay đổi tùy tiện**.
+  - **Mức mở rộng có chọn lọc (`selected128`)**:
+    - 128 viewer sockets (`viewer-00000` đến `viewer-00127`), 2 principals, 4 targets, 213 filters, 1.065 expected deliveries (5 messages/target). Yêu cầu chỉ định rõ profile `official` và cờ `--official-opt-in`.
+  - **Phân biệt với hợp đồng offline (`offline5000` / `offline10000`) và tải thực tế**:
+    - Các mức 5.000 và 10.000 viewers chỉ áp dụng trong hợp đồng offline schema-only (`--dry-run`); chỉ dùng để kiểm tra tính hợp lệ của manifest, bundle export, bundle inspect, bundle bind và Go `paperload --preflight`.
+    - Hợp đồng offline **không mở kết nối mạng hay container Docker**, và **tuyệt đối không phải là chứng nhận năng lực chịu tải (capacity claim) hay nghiệm thu tải cao (capacity acceptance)**.
 - **Ranh giới thử nghiệm**:
   - Thử nghiệm E1 là pilot hữu hạn trên môi trường kiểm chuẩn cục bộ (same-host smoke) sử dụng giao diện mạng riêng (advertised private interface) thực tế; **không chứng minh hai máy vật lý độc lập qua mạng** (`generator_colocated=true`, `physical_ab=NOT RUN`).
   - Các thử nghiệm E2–E5, collector phân tán và triển khai thực tế (live rollout) hoàn toàn nằm ngoài phạm vi E1.
@@ -45,8 +61,13 @@ Trong thử nghiệm này, Host A sở hữu fixture và collector; Host B liên
   - Thư mục `workspace` trên Host B **không được tạo trước** bằng lệnh `mkdir`; lệnh `bind` yêu cầu tự tạo mới thư mục này với quyền `0700`. Nếu thư mục đã tồn tại, `bind` sẽ từ chối thực hiện với lỗi `workspace_output_leaf_exists`.
 - **Ngân sách thời gian (Deadline Budget)**:
   - Thời hạn deadline của server `--deadline-seconds 900` (15 phút) phải bảo đảm đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle và binary, kiểm tra kết nối, thực thi workload pilot, truyền kết quả về, hậu kiểm dữ liệu và dọn dẹp tài nguyên.
-- **Ranh giới thẩm tra kết quả**:
-  - Trên Host A, lệnh `begin` chỉ được chấp nhận (ACK) khi status xác nhận `phase=MEASURING` và `collector_ready=true`.
+- **Ranh giới thẩm tra kết quả và ngưỡng từ chối tài nguyên (Refusal Boundaries)**:
+  - Trên Host A, trước khi khởi chạy child workload, fixture thực hiện đối chiếu các ngưỡng tài nguyên (`e1_resource_overlay`) với thông số đọc thực tế từ tiến trình (`readback`):
+    - `WS_MAX_SESSIONS` của backend phải lớn hơn hoặc bằng số lượng viewers (`session_cap >= viewers`).
+    - Nginx `worker_connections` và giới hạn `soft` file descriptor phải bao phủ đủ số kết nối mỗi worker: `(2 * viewers + 2 + 32 + worker_processes - 1) // worker_processes`.
+    - Số lượng file descriptor khả dụng của backend phải $\ge$ `viewers + 32` và của broker Mosquitto phải $\ge$ `2 + 32`.
+    - Nếu bất kỳ chỉ số thực tế nào không đáp ứng, fixture lập tức từ chối (`e1_resource_gate_denied:*`) và dừng lại trước khi bắt đầu tải.
+  - Lệnh `begin` chỉ được chấp nhận (ACK) khi status xác nhận `phase=MEASURING` và `collector_ready=true`.
   - Lệnh `finish-phase` chỉ chuyển trạng thái sang `VERIFYING` sau khi đã thực hiện đầy đủ các bước đối soát tương quan (correlation), kiểm tra projection, đối chiếu delta cơ sở dữ liệu, kiểm tra raw telemetry và các xác minh WebSocket terminal.
 
 ---
@@ -55,7 +76,7 @@ Trong thử nghiệm này, Host A sở hữu fixture và collector; Host B liên
 
 Quy trình vận hành sử dụng ba terminal độc lập được phân định rõ:
 - **Host A — Terminal A1**: Khởi chạy tiến trình `serve` và giữ fixture ở chế độ foreground.
-- **Host A — Terminal A2**: Thực hiện các lệnh điều khiển phiên (`status`, `begin`, `finish-phase`, `finalize`).
+- **Host A — Terminal A2**: Thực hiện các lệnh điều khiển phiên (`status`, `begin`, `finish-phase`, `finalize`, `abort`).
 - **Host B — Terminal B**: Thực hiện các thao tác client (`bind`, `preflight`, `check-connection`, `run`, `export-results`).
 
 Thiết lập biến môi trường thư mục gốc trên Host A (chỉ tạo thư mục cha `$ROOT`, **không tạo trước** thư mục lá `$ROOT/A` vì lệnh `serve` yêu cầu tự tạo mới):
@@ -69,29 +90,67 @@ mkdir -p "$ROOT" && chmod 0700 "$ROOT"
 
 Tạo tập tin cấu hình mạng riêng tư theo tài liệu [`paper-p8-remote-lifecycle.md`](paper-p8-remote-lifecycle.md), chỉ định địa chỉ IPv4 riêng tư của Host A, các cổng HTTPS/MQTT-TLS hợp lệ và cấu hình SAN phù hợp. Tuyệt đối không ghi deployment secrets vào tập tin cấu hình.
 
-Khởi chạy tiến trình `serve` ở foreground trên Terminal A1 (tiến trình này phải được giữ mở trong suốt quá trình chạy thử nghiệm):
+Tiến trình `serve` hỗ trợ các tham số cấu hình workload E1:
+- `--experiment E1`: Mặc định là `E1`.
+- `--profile {pilot, official}`: Mặc định là `pilot`. Khi sử dụng profile `official` hoặc số lượng viewers > 64, bắt buộc phải có cờ `--official-opt-in`.
+- `--e1-viewers`: Số lượng viewer sockets (mặc định 64; pilot mở rộng: 128; hỗ trợ từ 1 đến 10.000).
+- `--e1-principals`: Số lượng principal / user (mặc định 2; cố định 2 cho topology 2 gateways).
+- `--e1-density {mixed, sparse, dense, overlap}`: Mật độ phân bổ filter (mặc định `mixed`).
+- `--e1-messages-per-target`: Số tin nhắn phát sinh trên mỗi target (mặc định 5; với 4 targets sẽ tạo tổng cộng 20 messages).
+- `--deadline-seconds`: Ngân sách thời gian toàn phiên (mặc định 900 giây).
+
+Khởi chạy tiến trình `serve` ở foreground trên Terminal A1 theo một trong hai công thức được hỗ trợ:
+
+**Công thức 1A — Chạy pilot mặc định chuẩn 64 viewers (`default64`)**:
 
 ```sh
 python3 scripts/paper_p8_server.py serve \
   --root "$ROOT/A" \
   --network-config /path/to/private-network.json \
-  --deadline-seconds 900
+  --deadline-seconds 900 \
+  --experiment E1 \
+  --profile pilot \
+  --e1-viewers 64 \
+  --e1-principals 2 \
+  --e1-density mixed \
+  --e1-messages-per-target 5
 ```
 
-Tiến trình `serve` sẽ khởi dựng profile E1, tự động provision 2 Gateway, 2 User, 4 Sensor, khởi tạo role manifests và xuất client bundle tại thư mục `$ROOT/A/client-bundle/`. Nhật ký foreground được ghi nhận tại `$ROOT/A/server.log`.
+**Công thức 1B — Chạy pilot mở rộng có chọn lọc 128 viewers (`selected128`)**:
+
+```sh
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/A" \
+  --network-config /path/to/private-network.json \
+  --deadline-seconds 900 \
+  --experiment E1 \
+  --profile official \
+  --official-opt-in \
+  --e1-viewers 128 \
+  --e1-principals 2 \
+  --e1-density mixed \
+  --e1-messages-per-target 5
+```
+
+*Lưu ý về cơ chế Fixture-owned Resource Overlay & Readback Gate*:
+- Fixture tính toán overlay tài nguyên hữu hạn tương ứng (`e1_resource_overlay`): trần session `WS_MAX_SESSIONS = viewers`, trần bộ nhớ tham chiếu `WS_SESSION_REFERENCE_BYTES = 8.388.608` (8 MB cố định, không nhân theo viewers), số tiến trình worker Nginx $W = \min(32, \max(1, (viewers + 63) // 64))$, số kết nối mỗi worker Nginx $C = (2 \times viewers + 2 + 32 + W - 1) // W$, giới hạn file descriptor Nginx soft $\ge C$, FD backend khả dụng $\ge viewers + 32$, và FD broker Mosquitto khả dụng $\ge 2 + 32$.
+- Ranh giới từ chối: Trong pha khởi tạo, fixture đọc thực tế (`readback`) cấu hình và file descriptor khả dụng từ các tiến trình đang chạy. Nếu `WS_MAX_SESSIONS < viewers`, hoặc Nginx `worker_connections` / soft FD không đủ, hoặc FD khả dụng của backend/broker thấp hơn ngưỡng budget, fixture sẽ lập tức từ chối (`e1_resource_gate_denied:*`) và dừng lại trước khi sinh tải.
+- Tiến trình `serve` tự động provision 2 Gateways, 2 Users, 4 Sensors, khởi tạo role manifests và xuất client bundle tại thư mục `$ROOT/A/client-bundle/`. Nhật ký foreground được ghi nhận tại `$ROOT/A/server.log`.
 
 ### Bước 2 — Kiểm tra trạng thái READY và lấy Session ID trên Host A (Terminal A2)
 
 Trên Terminal A2 của Host A, kiểm tra trạng thái của server:
 
 ```sh
-python3 scripts/paper_p8_server.py status --root "$ROOT/A"
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E1
 ```
 
 Chờ cho đến khi server phản hồi trạng thái:
 - `preparation_status=E1_PREPARED`
 - `phase=READY`
-- Bundle artifact chứa đầy đủ `session_id`, `run_id`, `phase=pilot`, digest và topology chuẩn 2 Gateways / 4 Sensors / 2 Users / 2 Viewers.
+- Bundle artifact chứa đầy đủ `session_id`, `run_id`, `phase=pilot`, digest và topology xác thực:
+  - Đối với `default64`: 2 Gateways / 4 Sensors (4 targets) / 2 Users/principals / 64 viewer sockets (`viewer-00000` đến `viewer-00063`) / 106 filters / 530 expected deliveries.
+  - Đối với `selected128`: 2 Gateways / 4 Sensors (4 targets) / 2 Users/principals / 128 viewer sockets (`viewer-00000` đến `viewer-00127`) / 213 filters / 1.065 expected deliveries (5 messages/target).
 
 Lưu `session_id` nhận được vào biến môi trường trên Terminal A2 để sử dụng cho toàn bộ các lệnh điều khiển tiếp theo (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế nhận được từ lệnh status):
 
@@ -140,7 +199,10 @@ python3 scripts/paper_p8_client.py check-connection \
   --workspace "$ROOT/B/workspace"
 ```
 
-Tuyệt đối không bắt đầu workload nếu bước `preflight` hoặc kết nối TLS/Auth/WS/MQTT thất bại.
+- Lệnh `bind` kiểm tra cấu trúc bundle, tính toàn vẹn chữ ký/thời hạn token và sinh ra cấu hình thực thi `runtime/execution/run-spec.json`.
+- Lệnh `preflight` thực thi Go binary `paperload` với cờ `--preflight` để xác thực cú pháp manifest và kiểm tra quyền tập tin cục bộ; bước này **hoàn toàn không mở socket mạng hay thực hiện kết nối**.
+- Lệnh `check-connection` thăm dò thực tế kết nối HTTPS, thực hiện bắt tay WebSocket `/v1/ws` và probe kết nối MQTT TLS với các credentials không đặc quyền trong bundle.
+- Tuyệt đối không bắt đầu workload nếu bước `preflight` hoặc kết nối TLS/Auth/WS/MQTT thất bại.
 
 ### Bước 5 — Kích hoạt pha đo lường trên Host A (Terminal A2)
 
@@ -151,9 +213,10 @@ python3 scripts/paper_p8_server.py begin \
   --root "$ROOT/A" \
   --session-id "$SESSION_ID" \
   --phase READY \
-  --phase-id pilot
+  --phase-id pilot \
+  --experiment E1
 
-python3 scripts/paper_p8_server.py status --root "$ROOT/A"
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E1
 ```
 
 Lệnh `begin` chỉ phát hành yêu cầu khởi động collector. Tuyệt đối **chưa được chạy** workload trên Host B cho đến khi lệnh `status` phản hồi xác nhận:
@@ -177,7 +240,7 @@ python3 scripts/paper_p8_client.py export-results \
   --output "$ROOT/B/exported-results"
 ```
 
-- Lệnh `run` thực thi workload pilot theo đúng manifest đã liên kết; tiến trình giám sát (supervisor) phía Host B có giới hạn thời gian thực thi và bảo toàn bằng chứng kiểm thử nếu runner gặp sự cố.
+- Lệnh `run` thực thi workload pilot theo đúng manifest đã liên kết; tiến trình giám sát (supervisor) phía Host B có giới hạn thời gian thực thi và bảo toàn bằng chứng kiểm thử nếu runner gặp sự cố. Lưu ý: Lệnh `run` và `export-results` của E1 **không truyền cờ `--phase`** (cờ `--phase` là tham số riêng của E4/E5).
 - Lệnh `export-results` chỉ xuất thông tin tóm tắt runner (runner summary), nguồn gốc binary (provenance), bộ đếm workload theo vai trò (viewers sử dụng ID giả danh `viewer-NNNNN`, không lộ thông tin user) và tối đa 20 header-hash identity samples. Lệnh này tuyệt đối không xuất nhật ký thô, nội dung payload, chứng thư hay đường dẫn riêng tư của hệ thống. Không tự ý tổng hợp tập tin JSON thủ công để thay thế result bundle chuẩn tắc.
 
 ### Bước 7 — Chuyển giao kết quả đo về Host A (Manual Transfer Step)
@@ -203,15 +266,22 @@ python3 scripts/paper_p8_server.py finish-phase \
   --session-id "$SESSION_ID" \
   --phase MEASURING \
   --phase-id pilot \
-  --results "$ROOT/A/received-results"
+  --results "$ROOT/A/received-results" \
+  --experiment E1
 
-python3 scripts/paper_p8_server.py status --root "$ROOT/A"
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E1
 ```
 
 Chờ cho đến khi trạng thái chuyển sang `phase=VERIFYING`. Kiểm tra trường `imported_result` để xác nhận:
 - `validation_valid=true`
 - `validation_failures=[]`
 - `workload_outcome=VALIDATED`
+
+Hệ thống thẩm tra đối chiếu nghiêm ngặt:
+- **Cơ sở dữ liệu delta**: Khớp chính xác 20 messages, 2.000 raw samples, 20 ledgers, 20 temporal rows, 0 configuration changes.
+- **WebSocket deliveries / writes**: Khớp chính xác 530 writes (với `default64`) hoặc 1.065 writes (với `selected128`, 5 messages/target).
+- **Fanout mode**: Bắt buộc là `indexed` (`fanout_not_indexed` bị từ chối); số lượng frame drops bằng 0 (`drops=0`).
+- **Raw identity**: Mismatch bằng 0 (`raw_identity_value_mismatches=0`).
 
 Bất kỳ kết quả nào sai lệch lược đồ (schema), thiếu role, sai lệch session/run/phase/binary/manifest provenance, chứa đường dẫn lạ, symlink hoặc vượt ngưỡng giới hạn đều sẽ bị từ chối; hệ thống sẽ giữ nguyên ở `phase=MEASURING` và không cấp chứng nhận PASS. Khi đó người vận hành có thể gửi tập kết quả hợp lệ khác hoặc phát lệnh hủy bỏ (`abort`).
 
@@ -221,7 +291,8 @@ Khi trạng thái đã đạt `phase=VERIFYING` và kết quả được xác nh
 python3 scripts/paper_p8_server.py finalize \
   --root "$ROOT/A" \
   --session-id "$SESSION_ID" \
-  --phase VERIFYING
+  --phase VERIFYING \
+  --experiment E1
 ```
 
 *(Trường hợp workload hoặc bước import gặp lỗi không thể khắc phục, người vận hành phát lệnh hủy phiên từ phase hiện tại; thay thế `<phase-hiện-tại>` bằng phase ghi nhận từ status, ví dụ `READY`, `MEASURING` hoặc `VERIFYING`)*:
@@ -230,13 +301,14 @@ python3 scripts/paper_p8_server.py finalize \
 python3 scripts/paper_p8_server.py abort \
   --root "$ROOT/A" \
   --session-id "$SESSION_ID" \
-  --phase <phase-hiện-tại>
+  --phase <phase-hiện-tại> \
+  --experiment E1
 ```
 
 Chờ cho đến khi tiến trình `serve` trên Terminal A1 kết thúc với mã thoát 0. Sau đó kiểm tra trạng thái kết thúc trên Terminal A2:
 
 ```sh
-python3 scripts/paper_p8_server.py status --root "$ROOT/A"
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E1
 ```
 
 Xác nhận các trường trạng thái cuối cùng:
@@ -258,13 +330,15 @@ Kết quả thử nghiệm pilot E1 được ghi nhận chính thức trong hồ
 | **Trạng thái tổng thể (Status)** | **PASS** | `PAPER_P8_E1_VERIFIED` (source-qualified) |
 | **Logical Artifact ID** | `P8.6-E1-final-pilot` | Định danh đợt chạy pilot chính thức |
 | **Mã băm báo cáo thô (Raw Report SHA256)** | `d3c19bf2b3e2af898a169532ce9f6bd029b64f09f25d360ac1e6aba4614b8b0f` | Checksum SHA-256 của tệp JSON kết quả gốc |
-| **Cấu trúc Topology** | 2 Gateways, 4 Sensors, 2 Users, 2 Viewers | 64 sockets kết nối / 2 principals |
+| **Cấu trúc Topology** | 2 Gateways, 4 Sensors (4 targets), 2 Users/principals, 64 viewer sockets, 106 filters | 64 sockets kết nối / 2 principals |
 | **Unique Messages cam kết** | 20 messages | 20 unique messages được ghi nhận thành công |
 | **Raw Samples cơ sở dữ liệu** | 2.000 samples | Khớp chính xác 100 samples/message x 20 messages |
-| **WebSocket Writes** | 530 writes | Toàn bộ frames được gửi thành công, không ghi nhận frame drop |
+| **WebSocket Writes** | 530 writes | 530 expected deliveries theo mapping chuẩn (106 filters / 4 targets), hoàn tất 100%, không frame drop |
 | **Dọn dẹp tài nguyên (Cleanup)** | 12 containers, 1 network, 5 volumes | **VERIFIED** — dọn sạch chính xác tuyệt đối theo receipts |
 | **Tuyên bố năng lực (Capacity Claim)** | `false` | Workload ngắn hữu hạn; không phải kiểm tra năng lực chịu tải |
 | **Mã thoát của Server (Serve exit)** | 0 | Tiến trình `serve` kết thúc sạch, không lỗi |
+
+*Lưu ý về tiến độ bổ sung*: Kết quả thử nghiệm pilot mở rộng 128 viewers (`selected128`) và pilot 32 viewers (`selected32`) cùng các phân tích chi tiết về tài nguyên readback đã được chuyển và lưu trữ đầy đủ tại [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1--tài-nguyên-fixture-và-pilot).
 
 ### 3.2 Lịch sử kiểm thử và bảo toàn các kết quả thất bại
 
@@ -277,6 +351,10 @@ Kết quả thử nghiệm pilot E1 được ghi nhận chính thức trong hồ
 
 - **Trạng thái cổng P8**: `full_p8_accepted=false`. Kết quả E1 là một pilot hữu hạn xác thực cơ chế phân quyền, luồng kết nối và xác minh dữ liệu đa vai trò; đây không phải là nghiệm thu toàn diện P8.
 - **Giới hạn topo mạng**: `physical_ab=NOT RUN`. Thử nghiệm được thực hiện trên cùng máy chủ cục bộ với giao diện mạng riêng (`generator_colocated=true`); chưa chứng minh được hành vi phân tán trên 2 máy vật lý độc lập qua mạng vật lý.
+- **Phân định rõ ranh giới các mức thử nghiệm**:
+  - `default64`: Pilot hữu hạn baseline phục vụ xác thực toàn trình.
+  - `selected128`: Pilot hữu hạn mở rộng trên môi trường kiểm chuẩn cục bộ có áp dụng overlay và opt-in.
+  - `offline5000` và `offline10000`: Hợp đồng dry-run kiểm tra schema và plan, không phải kiểm tra năng lực chịu tải (capacity) và không được coi là nghiệm thu tải thực tế.
 - **Các kịch bản chưa thực hiện**:
   - Ma trận lặp lại chính thức E1–E5 (≥ 3 lượt chạy lặp).
   - Thử nghiệm tải cao, dung lượng và ngâm tải dài hạn (high-load / capacity / soak).
@@ -286,3 +364,28 @@ Kết quả thử nghiệm pilot E1 được ghi nhận chính thức trong hồ
   - Triển khai thực tế trên môi trường production (live rollout).
   Toàn bộ các hạng mục trên đều được ghi nhận là **NOT RUN**.
 - **Ranh giới dừng**: E1 là bước pilot khởi đầu; dừng lại tại mốc bàn giao E1 đã được nghiệm thu cục bộ. Không tự động mở rộng sang E2–E5, không thay đổi cấu hình triển khai mặc định, và không thực hiện commit/push/rollout nếu chưa có yêu cầu mới.
+
+---
+
+## Phụ lục — Offline contract và A resource gate
+
+Dry-run kiểm tra mapping → role manifests → bundle export → inspect → bind → Go `paperload --preflight --official-opt-in`. Không đọc `$ROOT`/network config, không mở kết nối mạng hoặc Docker, không khởi chạy workload; đối số đường dẫn vẫn bắt buộc theo giao diện CLI. Identity trong bundle là JWT unsigned `schema-only`, không dùng với dịch vụ thật. Không coi dry-run là load/capacity acceptance.
+
+Hàm `build_e1_offline_contract` trong mã nguồn hỗ trợ các mức rung `(128, 5000, 10000)` với đúng 2 principals (`e1_fixture_principal_topology_unsupported` nếu khác 2; `e1_offline_rung_unsupported` nếu ngoài danh sách trên). Khi chạy dry-run với profile `official`, bắt buộc phải có cờ `--official-opt-in`.
+
+```sh
+for n in 5000 10000; do
+  python3 scripts/paper_p8_server.py serve \
+    --root /var/tmp/opencode/p8-supplement/e1/unused \
+    --network-config /var/tmp/opencode/p8-supplement/e1/unused.json \
+    --dry-run --experiment E1 --profile official --official-opt-in \
+    --e1-viewers "$n" --e1-principals 2 --e1-density mixed \
+    --e1-messages-per-target 5
+done
+```
+
+Kết quả và kích thước của các lượt đã chạy được ghi tại [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1--tài-nguyên-fixture-và-pilot). Input users=2 là topology identities, không phải 5.000/10.000 principals. Chỉ hai principals được fixture hỗ trợ; principal khác 2 bị từ chối.
+
+Workload plan schema-only dùng ramp 100s (5k) / 120s (10k), warmup 0s, measurement 130s, drain 30s, wall 168s và readiness deadline 120s. Bundle bind ghi required token lifetime 50s cho wait+workload budget của fixture offline này; không phải đề xuất giới hạn token cho lượt chạy thực. Resource estimate hữu hạn gồm WS sessions = viewer count, Nginx connections/FD mỗi worker = 2 × viewers + 2 telemetry + 32 reserve (10.034 / 20.034), backend FDs available >= viewers + 32 và broker >= 2 telemetry + 32 reserve. Offline dry-run không đọc cấu hình Host A (`effective_a_limits = not_read_in_offline_dry_run`); effective A thresholds luôn phải được readback mới trước fixture E1 thực.
+
+Trong E1 fixture prepare, trước khi khởi child workload, code đọc `WS_MAX_SESSIONS` hiệu lực cùng Nginx `worker_connections` và nofile soft/hard, cùng FD còn lại của backend/Mosquitto. Gate từ chối nếu WS session ceiling nhỏ hơn viewer count, nếu Nginx không đủ `2 × viewers + 2 telemetry + 32 reserve` connections/FD mỗi worker, hoặc nếu FD còn lại backend/broker thấp hơn budget hữu hạn. Không thêm overlay/đổi sysctl. Ví dụ nếu readback hiện tại là `WS_MAX_SESSIONS=64`, rung 5.000 bị từ chối với available=64; nếu Nginx là 1 worker × 1.024 connections, rung đó yêu cầu 10.034 và bị từ chối trước workload. Giá trị ví dụ là cap/readback lịch sử/test, không khẳng định cấu hình hiện tại. Chỉ log readback của fixture thực mới quyết định có chạy được.

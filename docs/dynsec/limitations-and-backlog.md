@@ -521,6 +521,32 @@ Liên kết bằng chứng: [Chỉ mục Bằng chứng E2 equal_samples](../bac
 
 ## 4. Bảng Đối Chiếu Ma Trận Nghiệm Thu Có Giới Hạn T01–T12 (Bounded Acceptance Closeout Mapping)
 
+## P8 — Local tooling/checkpoint closeout và giới hạn paper (05/11/2026)
+
+BS.9b đã đồng bộ tài liệu dựa trên source-qualified reports và artifact có sẵn;
+không chạy thêm benchmark, không sửa code/deployment và không gộp các fingerprint
+khác nhau thành một source. BS.1, BS.2 và BS.6 local-tooling criteria được đóng
+theo bounded MVP evidence; official native experiments và các phần liệt kê dưới
+đây chưa hoàn tất. Xem [báo cáo P8](../backend/paper-p8-experiments-and-acceptance.md)
+và [kế hoạch chi tiết P8](../../../docs/backend_plan/paper/P8_detail_plan.md).
+
+| Giới hạn / phần chưa chạy | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+|---|---|---|---|
+| P8 local pilots phần lớn colocated; physical A/B, remote CI và HIL chưa chạy | Không chứng minh tải qua hai host, năng lực mạng/host thật, AM5728 hoặc cảm biến vật lý | Giữ `generator_colocated=true`/`physical_ab=NOT RUN` theo run; deployment flags giữ false; không tuyên bố full P8 | Khi chạy official experiments trên máy B và có thiết bị/CI được phê duyệt |
+| E1 chỉ có selected 128-viewer native pilot; 5k/10k chỉ contract/preflight | Không là capacity/fairness/soak result; content audit bị giới hạn sampling | Báo counts thực (128 viewers, 426/426 deliveries, 0 drop, 8/8 application ACK, pending 0) và exact cleanup; nêu sampling qualification | Khi chọn rung theo budget thực trên A/B |
+| E2 high rates, equal-samples clean comparison và extended soak chưa nghiệm thu | Retry, workload finite và resource windows hữu hạn giới hạn headline performance | Giữ actual offered/retry/admitted/committed/pending theo profile; không gộp estimate với đo hoặc gọi payload bytes là wire bytes | Khi chạy selected official steady/burst rates và đủ windows |
+| E3 official 30-command stream dưới tải chưa chạy | Native portable three-command low-load không chứng minh storm/burst overlap; client RTT không thay server-origin timeline | Giữ 3-command E3 PASS tách biệt; E3 timeline 30/10 lịch sử không đổi; burst overlap/official30 là NOT RUN | Khi chạy workload E2 đã chọn cùng 30-command stream |
+| E4 native official 1,000+100/import và wall-clock TTL 600s chưa chạy | Offline portable contract/preflight không phải workload execution, DB verification hay expiry thực; không đủ denominator cho Γ_red performance claim | Giữ offline plan/bind/Go-preflight evidence tách khỏi cache on/off 8+2 native evidence; TTL/native official remain NOT RUN, Γ_red formula/source/window/denominator documented but value unavailable; không đổi TTL production | Khi được yêu cầu chạy official dataset/expiry |
+| E5 Nov 5 representative matrix là một repeat; shaper activation inconclusive | Không đủ official repeat/causal performance claim; orchestration timeout là runner limitation | Sáu arm artifacts giữ PASS/cleanup; driver timeout và inactive shaper được qualified, không tuyên bố benefit | Khi chạy >=3 independent official repeats và workload kích hoạt shaper |
+| Resource snapshots thưa và bounded | Không đo peak RSS/continuous host behavior hoặc capacity | Diễn giải như quan sát cửa sổ; không suy hard memory bound từ logical bytes | Khi có mục tiêu profiling/capacity được giao |
+
+Các FAILED/PARTIAL lịch sử vẫn giữ nguyên. P8 tooling/checkpoint đã đóng ở phạm vi
+Local MVP, không phải official paper acceptance; official native E1–E5 runs, physical A/B,
+remote GitHub CI, TTL 600s, AM5728/HIL, physical sensors và rollout vẫn NOT RUN.
+Không tự mở P9/Stage 6.
+
+---
+
 ### 4.1 Bối cảnh đóng mốc Giai đoạn 2 (Stage 2 Pragmatic Closeout Context)
 - Theo yêu cầu và định hướng của người dùng nhằm khắc phục chậm trễ tiến độ đồ án, Giai đoạn 2 (Stage 2) được ghi nhận **đóng mốc có giới hạn (bounded scope closeout recorded under user intent)** với các ngoại lệ kỹ thuật và khoảng trống còn lại được ghi nhận minh bạch và khoanh vùng rõ ràng, phục vụ việc chuyển tiếp sang Giai đoạn 3.
 - **Tuyên bố ranh giới:** Việc đóng mốc có giới hạn này được thực hiện theo chỉ đạo của người dùng, tuyệt đối **không phải là nghiệm thu hoàn tất toàn diện (not full acceptance), không được phê duyệt bởi bên thứ ba (no third-party approval), và không đồng nghĩa với việc hệ thống đã sẵn sàng vận hành sản xuất (not production-ready)**.

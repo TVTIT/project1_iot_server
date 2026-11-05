@@ -1,5 +1,15 @@
 # P8 E2 — helper A/B pilot (source-qualified)
 
+> Offered rate là tổng hai producer logic A+B, không phải rate cho từng
+> producer: A 8 và B 16 unique pilot messages; tổng 24 mỗi profile.
+> S=100 và S=1 trả lời hai câu hỏi sample-cardinality tương ứng, không phải
+> `equal_samples`. Equal-samples là workload riêng (cùng sample stream/count ở
+> hai profile) và cặp performance lịch sử contaminated; không gọi thành so sánh
+> clean. Kết quả và giới hạn từng lượt nằm trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e2--hai-sample-profile-và-portable-lifecycle).
+
+Tiến độ native, portable lifecycle và các giới hạn từng checkpoint được ghi tại
+[báo cáo P8](paper-p8-experiments-and-acceptance.md#e2--hai-sample-profile-và-portable-lifecycle).
+
 Tài liệu hướng dẫn vận hành và báo cáo bằng chứng cho thử nghiệm P8 E2 (telemetry A/B giữa hai cấu hình batching: `samples_per_message=100` và `1`). E2 được thực hiện trên cùng nền tảng kiến trúc backend (Go modular monolith, Mosquitto DynSec, TimescaleDB, HTTP/REST và Mosquitto TLS).
 
 Thử nghiệm chạy tuần tự hai profile trong từng fixture độc lập; mỗi profile được kiểm định dữ liệu và dọn dẹp tài nguyên độc lập. Đây là bài đo telemetry tổng hợp, không chạy Gateway executor và không chứng minh durable restart.
@@ -62,6 +72,58 @@ Context được tạo một lần qua lệnh `e2-context` và chia sẻ nguyên
 - Microbatch được bật giống nhau ở cả hai profile: `MQTT_MICROBATCH_ENABLED=true`, `MQTT_MICROBATCH_MAX_WAIT=50ms`, `MQTT_MICROBATCH_MAX_MESSAGES=32`, `MQTT_MICROBATCH_MAX_ROWS=500`, `MQTT_MICROBATCH_MAX_PAYLOAD_BYTES=4194304`.
 - Toàn bộ cấu hình triển khai hệ thống (`docker-compose.yml`, `config/`, `.env.example`, migrations) hoàn toàn không thay đổi.
 
+### 1.7 Tham số cấu hình CLI, Quy tắc hạch toán và Ranh giới từ chối
+
+#### 1.7.1 Các tham số CLI hỗ trợ và dải giá trị hợp lệ
+- `--profile {pilot, official}`: Bộ chọn profile khối lượng tải có giới hạn, mặc định là `pilot`. Profile `official` bắt buộc phải đi kèm cờ `--official-opt-in`. Chú ý: Profile `official` chỉ hỗ trợ kịch bản tải `steady_burst`, không hỗ trợ `equal_samples`.
+- `--official-opt-in`: Cờ boolean ủy quyền tường minh cho việc chuẩn bị và chạy profile `official`.
+- `--dry-run`: Cờ boolean cho phép kiểm tra tính hợp lệ của kế hoạch thực thi, tham số workload và mô hình ước lượng kích thước mà không khởi động container, không tạo mạng và không truy cập tài nguyên thật (trả về trạng thái `VALIDATED_PLAN_ONLY`).
+- `--samples-per-message {100, 1}`: Bắt buộc chỉ định rõ ràng `100` hoặc `1` (E2 yêu cầu cấu hình batching tường minh, không chấp nhận giá trị mặc định ngầm định).
+- `--e2-offered-rate {100, 1000, 5000, 20000}`: Tốc độ đề nghị gộp toàn hệ thống, mặc định `100` tin nhắn/giây.
+- `--e2-duration-seconds`: Thời lượng phát tải đo lường (số nguyên >= 1, mặc định `10` giây; tối đa 7.200 giây trong ước lượng sizing).
+- `--e2-burst-messages`: Số lượng tin nhắn phát dồn (burst), số nguyên từ `0` đến `100000`, mặc định `0`.
+- `--deadline-seconds`: Thời hạn hiệu lực của phiên làm việc (session deadline), số nguyên từ `60` đến `86400` giây, mặc định `900` giây.
+
+#### 1.7.2 Quy tắc hạch toán tốc độ, burst và số dòng mẫu
+- **Tốc độ gộp (Aggregate Offered Rate)**: Giá trị `--e2-offered-rate` là tốc độ tổng hợp của cả hai producer logic A và B cộng lại, không phải tốc độ riêng lẻ của từng producer. Tốc độ được chia đều giữa hai nhánh:
+  - Arm A nhận tốc độ: `rates['A'] = offered_rate // 2`.
+  - Arm B nhận tốc độ: `rates['B'] = offered_rate - (offered_rate // 2)`.
+  - Ví dụ: Với tốc độ 100 msg/s, Arm A phát 50 msg/s và Arm B phát 50 msg/s. Với tốc độ 1.000 msg/s, Arm A phát 500 msg/s và Arm B phát 500 msg/s.
+- **Hạch toán burst (Burst Accounting)**: Tham số `--e2-burst-messages` chỉ áp dụng duy nhất cho Arm B (`burst_messages if arm == 'B' else 0`), Arm A không phát burst.
+- **Hạch toán tin nhắn unique**: Tổng số tin nhắn unique phát ra trong toàn bộ lượt đo:
+  $$\text{total\_messages} = \text{offered\_rate} \times \text{duration\_seconds} + \text{burst\_messages}$$
+  Trong đó:
+  - Arm A phát: `(offered_rate // 2) * duration_seconds`.
+  - Arm B phát: `(offered_rate - (offered_rate // 2)) * duration_seconds + burst_messages`.
+- **Hạch toán số dòng mẫu (Sample Rows Accounting)**:
+  $$\text{raw\_rows} = \text{total\_messages} \times \text{samples\_per\_message}$$
+  - Với Profile S=100: Mỗi tin nhắn chứa 100 mẫu dữ liệu, tạo ra $100 \times \text{total\_messages}$ dòng raw trong cơ sở dữ liệu.
+  - Với Profile S=1: Mỗi tin nhắn chứa 1 mẫu dữ liệu, tạo ra $1 \times \text{total\_messages}$ dòng raw trong cơ sở dữ liệu.
+
+#### 1.7.3 Ranh giới tổ hợp tham số được chấp nhận
+Không phải mọi tổ hợp tham số đều được hệ thống chấp nhận:
+- Profile `official` **chỉ** hỗ trợ chế độ `steady_burst` (`e2-telemetry-ab-official`), **không** hỗ trợ chế độ `equal_samples`. Nếu kết hợp `--profile official` với `--workload equal_samples`, server sẽ từ chối với lỗi `official_equal_samples_not_supported`.
+- Chế độ `steady_burst` **không** chấp nhận `--context` hoặc `--reference`. Nếu truyền các tham số này, server sẽ báo lỗi `E2 steady_burst does not accept --context or --reference`.
+- Chế độ `equal_samples` **bắt buộc** phải có `--context` (chạy dưới profile `pilot`). Profile S=1 có thể nhận thêm `--reference` trỏ tới báo cáo kết quả của S=100.
+- Chế độ `equal_samples` **không** sử dụng các cờ `--e2-offered-rate`, `--e2-duration-seconds`, `--e2-burst-messages` trên lệnh `serve`; cấu hình tải của nó được quy định chặt chẽ trong file `context.json`.
+
+#### 1.7.4 Cơ chế từ chối chu kỳ sống, JWT và tài nguyên
+- **Từ chối ngân sách chu kỳ sống (Lifecycle Budget Refusal)**:
+  Server kiểm tra ngân sách thời gian phiên `--deadline-seconds` (60..86400s).
+  - Với profile `official`: Yêu cầu `deadline_seconds >= e2_duration_seconds + 60` (nhằm bảo đảm thời gian cho phát tải, 30s drain, xuất/nhập kết quả và dọn dẹp).
+  - Với profile `equal_samples`: Yêu cầu `deadline_seconds >= duration_seconds + drain_seconds + grace_seconds`.
+  - Nếu `--deadline-seconds` không đủ (ví dụ: đặt 900s trong khi bài đo yêu cầu 961s), server sẽ từ chối khởi động ngay tại bước tiền kiểm tra với lỗi từ chối ngân sách chu kỳ sống (`P8 session deadline rejected`).
+- **Từ chối hạn hiệu lực JWT (JWT Expiry Refusal)**:
+  Token JWT cấp cho client được kiểm tra tính hợp lệ `time.time() < payload['exp'] < time.time() + 86400 * 366`. Tiền kiểm tra phía client (`preflight`) sẽ từ chối thực thi nếu token đã hết hạn hoặc không đủ hạn sống để trang trải toàn bộ thời gian chạy tải và drain.
+- **Từ chối vượt ngưỡng tài nguyên ước lượng (Resource Refusal)**:
+  Khi chuẩn bị profile `official`, hàm `e2_official_estimate` tính toán kích thước dự báo thận trọng. Server sẽ từ chối khởi động với lỗi `e2_predicted_bound_exceeded` nếu dự báo vượt quá các giới hạn sau:
+  - Dung lượng lưu trữ tăng trưởng (`total_storage_growth_bytes_estimate`) > 10 GiB (`max_disk_bytes = 10 << 30`).
+  - Bộ nhớ hàng đợi pending (`pending_memory_bytes`) > 256 MiB (`pending_memory_bytes = 256 << 20`).
+  - Bộ nhớ lưu trữ retry (`retry_memory_bytes`) > 256 MiB (`retry_memory_bytes = 256 << 20`).
+  - Băng thông ứng dụng (`application_bandwidth_bytes_per_second`) > 100 MiB/s (`100 << 20`).
+- **Thoát cạn hữu hạn (Finite Drain)**:
+  Mọi kịch bản đều áp dụng thời gian thoát cạn hữu hạn (20 giây đối với `equal_samples`, 30 giây đối với `official`) để toàn bộ các tin nhắn đang truyền trên đường truyền (in-flight) được backend tiếp nhận, commit vào cơ sở dữ liệu và phát ACK trước khi chuyển sang pha hậu kiểm.
+
 ---
 
 ## 2. Hướng dẫn vận hành A/B (Runbook)
@@ -76,9 +138,15 @@ Context được tạo một lần qua lệnh `e2-context` và chia sẻ nguyên
 - **Chống ghi đè tập tin**: Tuyệt đối không ghi đè hoặc tái sử dụng thư mục kết quả/workspace cũ. Mỗi profile phải được khởi tạo trong một thư mục gốc hoàn toàn mới.
 - **Ngân sách thời gian (Deadline & JWT budgets)**: Thời hạn deadline của server `--deadline-seconds 900` (15 phút) phải đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle, chạy workload 60s, chờ drain 20s, export/import, hậu kiểm và dọn dẹp. Thời hạn hiệu lực của JWT token được cấp phát với TTL riêng (ví dụ 3.600s trong testbed) và tiền kiểm tra client kiểm tra điều kiện `time.time() < payload['exp'] < time.time() + 86400 * 366`; thời hạn JWT không tự động đồng bộ hóa với tham số `--deadline-seconds` của server. Người vận hành phải bảo đảm token còn hạn vượt quá toàn bộ thời gian thực thi của workload.
 - **Bảo tồn phạm vi của E5**: E2 sử dụng các tham số `--context` và `--reference` trong không gian thử nghiệm E2, tuyệt đối không làm thay đổi hoặc ảnh hưởng tới ngữ nghĩa của E5.
-- **Giới hạn CLI trực tiếp vs Quy trình Held Lifecycle**:
-  - Chạy direct CLI `native_compose_smoke.py --paper-p8-e2` trực tiếp khi không có cấu hình HTTPS sẽ gặp lỗi `AttributeError` do endpoint ở dạng chuỗi ký tự (`str`) thay vì đối tượng `HTTPSEndpoint`.
-  - Quy trình vận hành chính thức và đã được kiểm chứng đầy đủ là quy trình held server lifecycle (`paper_p8_server.py serve` kết hợp các lệnh điều khiển theo pha). Không sao chép các lệnh chưa kiểm chứng từ ES7a.
+- **Phân định Direct fixture cục bộ và Quy trình Held Lifecycle**:
+  - Luồng Direct local `native_compose_smoke.py --prepare <fresh-root> --paper-p8-e2` là luồng pilot cục bộ có giới hạn được hỗ trợ: cơ chế này khởi tạo fixture P2/TLS độc lập và bọc endpoint thành đối tượng `HTTPSEndpoint`; luồng này không yêu cầu `--network-config` hay deployment credentials.
+  - Luồng `paper_p8_server.py serve` là quy trình chu kỳ sống portable được giữ (held portable lifecycle) và bắt buộc phải có tệp cấu hình mạng riêng nghiêm ngặt qua `--network-config`. Không áp đặt yêu cầu định tuyến của held route này lên luồng direct fixture cục bộ.
+- **Ranh giới an toàn và quyền hạn của Host B (Client-Side Isolation)**:
+  - Máy khách Host B tuyệt đối không có quyền truy cập cơ sở dữ liệu PostgreSQL/TimescaleDB (no DB access), không có quyền quản trị máy chủ backend/admin và không có quyền truy cập Docker daemon/socket trên Host A.
+  - Mọi thao tác trên Host B chỉ được thực thi bên trong thư mục workspace cục bộ với quyền `0700`, sử dụng bundle dữ liệu và binary `paperload` đã được sao chép sang, chỉ kết nối tới Host A thông qua các cổng dịch vụ mạng đã công khai và bảo vệ bằng TLS (HTTPS và MQTTS).
+- **Yêu cầu Fresh Leaves và Dọn dẹp tài nguyên**:
+  - Thư mục `workspace` trên Host B không được tạo sẵn trước khi gọi lệnh `bind`. Nếu thư mục đã tồn tại từ trước, `bind` sẽ từ chối thực thi với lỗi `workspace_output_leaf_exists`.
+  - Mọi pha đo lường khi kết thúc phải thực hiện đầy đủ chuỗi đối soát biên lai (`finish-phase` rồi `finalize`) để đảm bảo dọn dẹp sạch sẽ toàn bộ tài nguyên theo receipts; không để sót container hoặc volume mồ côi.
 - **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Steps)**: Việc chuyển bundle, binary và kết quả giữa Host A và Host B là thao tác truyền file thủ công của người vận hành (copy an toàn qua đường dẫn hoặc scp), không tuyên bố là tự động hóa qua SSH.
 
 ---
@@ -105,13 +173,29 @@ chmod 0600 "$ROOT/context.json"
 
 #### Bước 1 — Khởi động Profile S=100 trên Host A
 
-Khởi chạy tiến trình `serve` (tiến trình này phải được giữ chạy ngầm hoặc trên một terminal riêng biệt cho đến khi hoàn tất):
+Khởi chạy tiến trình `serve` (tiến trình này phải được giữ chạy ngầm hoặc trên một terminal riêng biệt cho đến khi hoàn tất). Người vận hành có thể tùy chọn chạy kiểm tra trước cấu hình với cờ `--dry-run`:
+
+```sh
+# (Tùy chọn) Kiểm tra tính hợp lệ của kế hoạch và tham số với --dry-run
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/s100/A" \
+  --network-config /path/to/private-network.json \
+  --dry-run \
+  --profile pilot \
+  --experiment E2 \
+  --samples-per-message 100 \
+  --workload equal_samples \
+  --context "$ROOT/context.json"
+```
+
+Khởi chạy phiên làm việc chính thức:
 
 ```sh
 python3 scripts/paper_p8_server.py serve \
   --root "$ROOT/s100/A" \
   --network-config /path/to/private-network.json \
   --deadline-seconds 900 \
+  --profile pilot \
   --experiment E2 \
   --samples-per-message 100 \
   --workload equal_samples \
@@ -231,13 +315,30 @@ Chờ tiến trình `serve` của S=100 kết thúc với mã thoát 0. Kiểm t
 
 #### Bước 8 — Khởi động Profile S=1 trên Host A (Tái sử dụng Reference S=100)
 
-Khởi động Profile S=1, truyền tham số `--reference` trỏ tới báo cáo S=100 đã hoàn tất để tái sử dụng binary và container images:
+Khởi động Profile S=1, truyền tham số `--reference` trỏ tới báo cáo S=100 đã hoàn tất để tái sử dụng binary và container images. Người vận hành có thể tùy chọn kiểm tra tính hợp lệ với `--dry-run`:
+
+```sh
+# (Tùy chọn) Kiểm tra tính hợp lệ của Profile S=1 kèm reference với --dry-run
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/s1/A" \
+  --network-config /path/to/private-network.json \
+  --dry-run \
+  --profile pilot \
+  --experiment E2 \
+  --samples-per-message 1 \
+  --workload equal_samples \
+  --context "$ROOT/context.json" \
+  --reference "$ROOT/s100/A/fixture/artifacts/p8-e2-equal-samples-100-remote-result.json"
+```
+
+Khởi chạy phiên làm việc chính thức cho Profile S=1:
 
 ```sh
 python3 scripts/paper_p8_server.py serve \
   --root "$ROOT/s1/A" \
   --network-config /path/to/private-network.json \
   --deadline-seconds 900 \
+  --profile pilot \
   --experiment E2 \
   --samples-per-message 1 \
   --workload equal_samples \
@@ -299,26 +400,115 @@ python3 scripts/paper_p8_server.py compare-e2 \
   --output "$ROOT/e2-comparison.json"
 ```
 
+*Lưu ý về tính hợp lệ của phép so sánh*: Do các lần chạy thực tế lịch sử (ví dụ Attempt 4) ghi nhận phát sinh retry trên cả hai profile (1 retry ở S=100, 21 retries ở S=1), thuộc tính `clean_comparison` ghi nhận là `false` và trạng thái tổng thể là `CONTAMINATED`. Trường `headline_speedup` là `UNAVAILABLE`; kết quả này không cấu thành bằng chứng tăng tốc sạch (no clean speedup evidence). Toàn bộ bằng chứng và phân tích tài nguyên chi tiết thuộc về [Báo cáo P8 E2](paper-p8-experiments-and-acceptance.md#e2--hai-sample-profile-và-portable-lifecycle).
+
 ---
 
-### 2.3 Quy trình vận hành chế độ Legacy `steady_burst` (Tham khảo lịch sử)
+### 2.3 Quy trình vận hành chế độ Fixed Message Count S100/S1 và Profile Official (steady_burst)
 
-Khi chạy chế độ legacy, tham số `--workload` được bỏ qua (hoặc để mặc định). Quy trình tương tự như trên nhưng sử dụng phase ID dạng `samples-$SAMPLES`:
-- Bắt đầu phase:
-  ```sh
-  python3 scripts/paper_p8_server.py begin --root "$ROOT/A" \
-    --experiment E2 --session-id "$SESSION_ID" --phase READY --phase-id "samples-$SAMPLES"
-  ```
-- Kết thúc phase:
-  ```sh
-  python3 scripts/paper_p8_server.py finish-phase --root "$ROOT/A" \
-    --experiment E2 --session-id "$SESSION_ID" --phase MEASURING \
-    --phase-id "samples-$SAMPLES" --results "$ROOT/A/received-results"
-  ```
+Chế độ `steady_burst` là chế độ đo tải với số lượng tin nhắn cố định giữa hai profile S=100 và S=1, nhằm trả lời câu hỏi về dung lượng mẫu trên mỗi tin nhắn (sample-cardinality), không phải so sánh cùng công (`equal_samples`).
+
+Quy trình này KHÔNG sử dụng tham số `--context` hoặc `--reference` (nếu truyền sẽ bị server từ chối với lỗi `E2 steady_burst does not accept --context or --reference`).
+
+#### 2.3.1 Kịch bản Fixed Message Count Pilot (24 unique messages)
+
+- **Cấu trúc tải**: Cố định 24 unique messages cho mỗi profile (Arm A phát 8 messages steady với tốc độ 1 msg/s; Arm B phát 4 messages steady kèm 12 messages burst dồn dập).
+- **Hạch toán dòng mẫu**: Profile S=100 tạo ra $24 \times 100 = 2.400$ dòng raw samples; Profile S=1 tạo ra $24 \times 1 = 24$ dòng raw samples.
+- **Quy ước Phase ID**: Sử dụng `phase-id="samples-100"` cho profile 100 và `phase-id="samples-1"` cho profile 1.
+
+**Thực thi Profile S=100:**
+1. Khởi động server trên Host A (có thể tùy chọn kiểm tra trước với `--dry-run`):
+   ```sh
+   python3 scripts/paper_p8_server.py serve \
+     --root "$ROOT/steady-s100/A" \
+     --network-config /path/to/private-network.json \
+     --deadline-seconds 900 \
+     --profile pilot \
+     --experiment E2 \
+     --samples-per-message 100 \
+     --workload steady_burst
+   ```
+2. Chuyển bundle và binary sang Host B, thiết lập workspace fresh leaf (`bind`, `preflight`, `check-connection`).
+3. Kích hoạt pha đo lường trên Host A:
+   ```sh
+   python3 scripts/paper_p8_server.py begin --root "$ROOT/steady-s100/A" \
+     --experiment E2 --session-id "$SESSION_ID" --phase READY --phase-id "samples-100"
+   ```
+4. Chạy tải và xuất kết quả trên Host B:
+   ```sh
+   python3 scripts/paper_p8_client.py run --workspace "$ROOT/steady-s100/B/workspace" --binary "$ROOT/steady-s100/B/paperload"
+   python3 scripts/paper_p8_client.py export-results --workspace "$ROOT/steady-s100/B/workspace" --output "$ROOT/steady-s100/B/exported-results"
+   ```
+5. Chuyển kết quả về Host A, kết thúc pha và dọn dẹp:
+   ```sh
+   python3 scripts/paper_p8_server.py finish-phase --root "$ROOT/steady-s100/A" \
+     --experiment E2 --session-id "$SESSION_ID" --phase MEASURING \
+     --phase-id "samples-100" --results "$ROOT/steady-s100/A/received-results"
+   python3 scripts/paper_p8_server.py finalize --root "$ROOT/steady-s100/A" \
+     --experiment E2 --session-id "$SESSION_ID" --phase VERIFYING
+   ```
+
+**Thực thi Profile S=1:**
+Thực hiện tương tự như trên trong thư mục gốc hoàn toàn mới `$ROOT/steady-s1/`, với tham số `--samples-per-message 1` và `phase-id="samples-1"`.
+
+---
+
+#### 2.3.2 Kịch bản Tải chuẩn Official (`--profile official`)
+
+Kịch bản `official` được thiết kế để kiểm định hệ thống ở các mức tải quy mô lớn có kiểm soát:
+- **Cờ bắt buộc**: `--profile official` và `--official-opt-in`.
+- **Tham số tải**:
+  - `--e2-offered-rate`: Chọn một trong các mức `100`, `1000`, `5000`, hoặc `20000` msg/s (tổng gộp hai producer A+B).
+  - `--e2-duration-seconds`: Thời lượng phát đo lường (mặc định 10s).
+  - `--e2-burst-messages`: Số lượng burst cho Arm B (mặc định 0).
+  - `--samples-per-message`: Bắt buộc chỉ định `100` hoặc `1`.
+  - `--deadline-seconds`: Phải đủ lớn, bảo đảm $\text{deadline\_seconds} \ge \text{duration\_seconds} + 60$ và đủ cho toàn bộ chu kỳ sống (khuyến nghị 1.200s; lưu ý 900s có thể bị từ chối nếu tổng thời gian yêu cầu vượt quá 900s).
+
+**1. Tiền kiểm tra kế hoạch và ước lượng tài nguyên với `--dry-run`:**
+```sh
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/official-s100/A" \
+  --network-config /path/to/private-network.json \
+  --dry-run \
+  --profile official \
+  --official-opt-in \
+  --experiment E2 \
+  --samples-per-message 100 \
+  --e2-offered-rate 1000 \
+  --e2-duration-seconds 10 \
+  --e2-burst-messages 0
+```
+Lệnh trên kiểm tra tính hợp lệ và in ra JSON chứa `e2_official_plan` với `expected_counts`, `producer_rates_per_second` (A: 500, B: 500) và `estimate` (dự báo thận trọng về lưu trữ, bộ nhớ pending/retry và băng thông).
+
+**2. Khởi chạy phiên làm việc chính thức:**
+```sh
+python3 scripts/paper_p8_server.py serve \
+  --root "$ROOT/official-s100/A" \
+  --network-config /path/to/private-network.json \
+  --deadline-seconds 1200 \
+  --profile official \
+  --official-opt-in \
+  --experiment E2 \
+  --samples-per-message 100 \
+  --e2-offered-rate 1000 \
+  --e2-duration-seconds 10 \
+  --e2-burst-messages 0
+```
+Chu kỳ đo lường tiến hành tuần tự với `phase-id="official-100"` (hoặc `"official-1"`), tuân thủ đúng các bước chuyển giao dữ liệu thủ công, kiểm tra kết nối, phát tải, thoát cạn (drain 30s), nhập kết quả và đối soát dọn dẹp sạch sẽ tài nguyên.
+
+---
+
+#### 2.3.3 Ranh giới dữ liệu và Dẫn chiếu Báo cáo
+
+- Các lần chạy thực tế theo chế độ `steady_burst` trước đây phát sinh retry tại Arm B do shaper can thiệp cắt tỉa gói tin burst (`rate_limited`), dẫn tới trạng thái `clean_comparison=false`.
+- Các so sánh bị nhiễm (contaminated comparisons) không được coi là bằng chứng tăng tốc sạch (no clean speedup evidence).
+- Tiến độ nghiệm thu, kết quả đo lường chi tiết và phân tích giới hạn của các đợt chạy đã được ghi nhận đầy đủ tại [Báo cáo P8 E2](paper-p8-experiments-and-acceptance.md#e2--hai-sample-profile-và-portable-lifecycle).
 
 ---
 
 ## 3. Bằng chứng thực nghiệm và lịch sử kiểm thử
+
+> **Lưu ý điều hướng**: Tiến độ kiểm thử native, kết quả đo lường phái sinh (Derived Audit v2) và giới hạn nghiệm thu mới nhất đã được di chuyển và tập trung hóa tại [Báo cáo P8 E2](paper-p8-experiments-and-acceptance.md#e2--hai-sample-profile-và-portable-lifecycle). Phần dưới đây lưu giữ các bảng đối soát và lịch sử khắc phục sự cố nhằm phục vụ việc kiểm tra và đối chiếu vận hành; không sao chép thêm kết quả thực nghiệm mới vào runbook.
 
 ### 3.1 Bảng kết quả thực chạy chế độ Legacy `steady_burst` — 2026-10-30
 

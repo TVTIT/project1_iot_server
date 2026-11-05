@@ -1,5 +1,24 @@
 # P8 — Sổ tay tinh gọn: Công cụ tải và quy trình thực nghiệm E1–E5
 
+> **Cập nhật BS.9a (05/11/2026):** Go baseline checkpoint-local-20261105T062820Z-1068601
+> và affected refresh 20261105T074320Z-1191327 PASS; Python 981 PASS/3 SKIP.
+> Native full HTTP + portable official E3 3-command run PASS tại checkpoint
+> `checkpoint-native-20261105T063844Z-1073531`; E1 128 PASS. Physical A/B,
+> official high-load/three-repeat experiments, E4 TTL 600s và capacity claims
+> vẫn NOT RUN. Các lệnh dưới đây là native local pilots, không phải A/B remote.
+
+## Quy trình A/B thủ công hiện hành
+
+A `serve`/`status` chuẩn bị fixture và bundle → copy bundle cùng binaries phù hợp
+host sang B → B `bind`/`preflight`/`check-connection` → A `begin` và xác nhận
+`MEASURING` + `collector_ready=true` → B `run`/`export-results` → copy kết quả
+về A → A `finish-phase` (và `next-phase` nếu còn phase) → `finalize`/verified
+`cleanup`. Xem [remote lifecycle](paper-p8-remote-lifecycle.md), [bundle
+contract](paper-p8-client-bundle.md) và [helper guides](paper-p8-helper-guides.md).
+B không có DB/admin/Docker credentials. Không có SSH orchestrator. Nếu abort,
+stop generator ở B; giữ nguyên pending/journal, ghi outcome PARTIAL/FAILED và
+cleanup riêng. Không diễn giải unavailable counter/window thành 0.
+
 Tài liệu này ưu tiên lệnh chạy E1–E5 và cách đọc kết quả. Để tra cứu thiết kế và lịch sử phát triển, xem [sổ tay chi tiết](paper-p8-load-tools.md), [báo cáo nghiệm thu P8](paper-p8-experiments-and-acceptance.md) và [kế hoạch P8](../../../docs/backend_plan/paper/P8_detail_plan.md).
 
 > **Lưu ý dữ liệu cũ:** Mọi lượt chạy kiểm thử phải luôn tạo thư mục output mới hoàn toàn và độc lập, không phụ thuộc vào bất kỳ artifact hoặc dữ liệu lịch sử nào trước đó.
@@ -211,11 +230,11 @@ Các lệnh bên dưới chạy trên **Máy A** qua native selector. Mỗi lầ
 
 | Bài | Pilot có sẵn trong CLI / Code | Kế hoạch Official đề ra (Chưa chạy - NOT RUN) |
 |---|---|---|
-| **E1** | 64 viewers, 2 namespaces, healthy subscribers | 32 → 64 → 128 → 512 → 1.000 → 2.000 → 5.000 → 10.000 viewers |
-| **E2** | 2 Gateways × 2 Sensors, 24 unique batches (100 và 1 mẫu), burst ngắn | Các nấc tải 100, 1.000, 5.000 và 20.000 offered msg/s |
-| **E3** | 4 fresh commands trên 2 Sensors (1.5 Hz và 0.5 Hz) | 30 commands/arm, mở rộng dải tần số dưới 1 Hz |
-| **E4** | 20 unique batches + 10 replay, warm hit, cold backend restart | 1.000 unique batches, 10% replay, kiểm chứng TTL thực tế 600 giây |
-| **E5** | 1 repeat đơn lẻ (seed 805) trên tập dataset pilot nhỏ | Tối thiểu 3 repeats độc lập, tính trung vị (median) và min-max range |
+| **E1** | 128 viewers native selected PASS; historical 64 run vẫn riêng | 32 → 64 → 128 → 512 → 1.000 → 2.000 → 5.000 → 10.000; 5k/10k offline contract, không capacity |
+| **E2** | 24 unique tổng A+B/profile, S=100 và S=1; retry được tách | Offered tổng 100/1.000/5.000/20.000 msg/s; chưa chạy high-rate |
+| **E3** | 3-command low-load/steady polling+wakeup subset PASS; pilot 4-command compatibility giữ riêng | Official 30 commands/arm; offline opt-in/preflight đã PASS, native 30 NOT RUN |
+| **E4** | 8 unique + 2 replay cache on/off PASS; replay không tạo DB/WS mới | Plan 1.000 unique + 100 replay; optional TTL 600 giây cùng process vẫn native NOT RUN |
+| **E5** | 6 arms, 1 representative pilot repeat (seed 805); không phải capacity | >=3 independent repeats là kế hoạch kết luận chính; chưa chạy official repeats |
 
 ### Giới hạn tài nguyên thực tế của Fixture Backend
 - **Hạn ngạch Backend:** Giới hạn Docker **2 vCPU và 4 GiB RAM** (kế thừa từ tiền lệ P0/P1). Giới hạn này **CHỈ áp dụng cho container Go backend**, không áp dụng cho toàn bộ máy chủ, cơ sở dữ liệu hay broker.

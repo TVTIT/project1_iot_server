@@ -1,5 +1,13 @@
 # Hồ sơ vòng đời mạng riêng P8 (Bước 2)
 
+> **Cập nhật BS.9a (05/11/2026):** Đây là phần A-side của quy trình A/B thủ công
+> đã có thể chuẩn bị bundle. Thứ tự đầy đủ là A `serve`/`status`/`begin` → copy
+> bundle và binary → B `bind`/`preflight`/`check-connection`/`run`/`export-results`
+> → copy projection về A → A `finish-phase`/`next-phase` (nếu đa pha) →
+> `finalize`/`cleanup`. Lệnh thực có thể xem bằng `--help` của từng script; không
+> có orchestration SSH xuyên máy. Native/local nghiệm thu và physical A/B là hai
+> việc khác nhau; physical A/B vẫn NOT RUN. B không nhận DB/admin/Docker access.
+
 Hồ sơ opt-in này khởi chạy và giữ một fixture P8 cô lập trên một giao diện
 IPv4 riêng. Đây chỉ là mức sẵn sàng mạng/vòng đời: **không** cấp phát hoặc đóng
 gói client từ xa, không chạy E1 và không xác nhận bundle/thí nghiệm đã sẵn sàng.

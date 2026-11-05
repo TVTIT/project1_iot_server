@@ -2,6 +2,15 @@
 
 **Trạng thái hiện tại: `LOCAL_TOOLING_COMPLETE_SOURCE_QUALIFIED`.** Đã hoàn tất bàn giao tài liệu P8.14 và safe results. Pilot local, kiểm tra local cuối và database restore có giới hạn đã được ghi nhận; không nội dung nào là nghiệm thu paper chính thức, chứng nhận capacity, phê duyệt production hay HIL. Raw lanes giữ trạng thái riêng và `full_p8_accepted=false`. Xem [báo cáo nghiệm thu P8](paper-p8-experiments-and-acceptance.md), [overview an toàn](results/p8/overview.json), [checkpoint](results/p8/checkpoint.json) và [summary restore](results/p8/recovery-summary.json). Các ghi chú source lịch sử bên dưới được giữ nguyên làm lịch sử, không phải hướng dẫn trạng thái hiện tại.
 
+**BS.9a source checkpoint (05/11/2026):** Full Go baseline checkpoint
+`checkpoint-local-20261105T062820Z-1068601` PASS. Affected refresh
+`/var/tmp/opencode/p8-final-20261105/checkpoint-refresh-20261105T074320Z-1191327/refresh-report-vi.md`
+ghi Go paperload race/static/build/ARMv7 PASS và Python 981 tests PASS, 3
+skipped. Native full HTTP và portable official E3 ba lệnh PASS tại
+`checkpoint-native-20261105T063844Z-1073531/handoff-vi.md`; E1 native 128 PASS.
+E2/E4/E5 evidence ở runbook tương ứng. Đây không phải physical A/B hay official
+capacity acceptance; `full_p8_accepted=false`.
+
 ## Bắt đầu từ đây
 
 1. Chỉ dùng handbook này với fixture cô lập, thuộc quyền quản lý của lượt chạy và thư mục run private mới. Không dùng deployment `.env`, DB/broker/volume dùng chung hoặc production credentials.
@@ -56,11 +65,116 @@ Các selector này đã chạy local dưới dạng pilot giới hạn, không p
 
 ## Runbook A/B (ranh giới thực tế)
 
+### Portable lifecycle A/B (manual, hiện hành)
+
+Flag/cú pháp chính xác phụ thuộc experiment; luôn kiểm tra
+`python3 scripts/paper_p8_server.py serve --help` và
+`python3 scripts/paper_p8_client.py <command> --help`. Lệnh tổng quát thực tế:
+
+```sh
+# A: new protected root; ROOT/A must not exist before serve.
+ROOT_A="${ROOT_A:?set private A root}"; ROOT_B="${ROOT_B:?set private B root}"
+python3 scripts/paper_p8_server.py serve --root "$ROOT_A/A" \
+  --network-config "$A_NETWORK_CONFIG" --experiment "$EXPERIMENT" \
+  --deadline-seconds "$SESSION_SECONDS"
+# Separate A terminal: wait for READY, record SESSION_ID, then export/provision
+# is performed by the server preparation flow; copy client-bundle and the
+# fixture-built paperload/gateway binaries to B using an approved secure channel.
+
+# B: workspace leaf must not already exist.
+python3 scripts/paper_p8_client.py bind --bundle "$ROOT_B/received-bundle" \
+  --workspace "$ROOT_B/workspace"
+python3 scripts/paper_p8_client.py preflight --workspace "$ROOT_B/workspace" \
+  --binary "$ROOT_B/bin/paperload" --gateway-binary "$ROOT_B/bin/gateway"
+python3 scripts/paper_p8_client.py check-connection --workspace "$ROOT_B/workspace"
+# A begin; wait for MEASURING and collector_ready=true before B workload.
+python3 scripts/paper_p8_client.py run --workspace "$ROOT_B/workspace" \
+  --binary "$ROOT_B/bin/paperload" --gateway-binary "$ROOT_B/bin/gateway"
+python3 scripts/paper_p8_client.py export-results --workspace "$ROOT_B/workspace" \
+  --output "$ROOT_B/results"
+# Copy results to A incoming using approved transfer; A then finish-phase,
+# next-phase where applicable, and finalize. cleanup is receipt-verified only.
+```
+
+`serve` options differ by E1–E5 (and profile/opt-in); do not use this generic
+sketch as a runnable experiment command. Full concrete recipes and real options
+are in each E runbook. `abort` stops a held session; it does not prove pending
+drained or authorize deleting pending/journal. `cleanup` is for owned resources
+with the recorded receipt, after outcome/evidence review. A-side stop cannot
+signal a remote B child: stop B locally, preserve pending state, then record
+PARTIAL/FAILED and cleanup outcome separately.
+
+### Pilot inputs and official offline selection examples
+
+These examples use the actual `serve --dry-run` selector. Supply a fresh
+placeholder root/config path as required by argparse even though dry-run does
+not create fixture/network state. `--profile official --official-opt-in` is an
+explicit plan-validation gate, not permission to start a live official run.
+
+```sh
+# E1 official mapping/manifest contract; no sockets/load are started.
+python3 scripts/paper_p8_server.py serve --root "$PRIVATE_ROOT/e1-plan" \
+  --network-config "$PRIVATE_NETWORK_CONFIG" --dry-run --experiment E1 \
+  --profile official --official-opt-in --e1-viewers 5000 \
+  --e1-principals 2 --e1-density mixed --e1-messages-per-target 5
+
+# E2: offered rate is the total rate for the run (producer split in the plan),
+# not 5,000 msg/s for each producer. S=100 and S=1 are separate plans.
+python3 scripts/paper_p8_server.py serve --root "$PRIVATE_ROOT/e2-plan" \
+  --network-config "$PRIVATE_NETWORK_CONFIG" --dry-run --experiment E2 \
+  --profile official --official-opt-in --workload steady_burst \
+  --samples-per-message 100 --e2-offered-rate 1000 \
+  --e2-duration-seconds 120 --deadline-seconds 1200
+
+# E3 official30 plan. A portable 3-command official-profile seam check has
+# passed, but official30 native execution remains NOT RUN.
+python3 scripts/paper_p8_server.py serve --root "$PRIVATE_ROOT/e3-plan" \
+  --network-config "$PRIVATE_NETWORK_CONFIG" --dry-run --experiment E3 \
+  --profile official --official-opt-in --dispatch-mode polling \
+  --workload steady_burst --e3-command-count 30 --e3-schedule steady \
+  --deadline-seconds 1200
+
+# E4 plan: optional expiry is same process/600s after confirmed commit;
+# dry-run validates but does not wait.
+python3 scripts/paper_p8_server.py serve --root "$PRIVATE_ROOT/e4-plan" \
+  --network-config "$PRIVATE_NETWORK_CONFIG" --dry-run --experiment E4 \
+  --profile official --official-opt-in --e4-unique-count 1000 \
+  --e4-replay-count 100 --expiry-replay --deadline-seconds 1200
+
+# E5 selected representative single pilot context (prepare-only is default;
+# no workload). Official mode with repeat>=3 plans repeats, not high capacity.
+python3 scripts/paper_p8_e5.py --root "$PRIVATE_ROOT/e5-representative" \
+  --mode pilot --repeat 1 --seed 805 --workload-preset representative \
+  --arms optimized shaper_off microbatch_off ram_dedup_off polling fanout_scan
+python3 scripts/paper_p8_e5.py --root "$PRIVATE_ROOT/e5-repeats-plan" \
+  --mode official --repeat 3 --seed 805 --workload-preset representative \
+  --arms optimized shaper_off microbatch_off ram_dedup_off polling fanout_scan
+```
+
+For each real execution, capture the resolved manifest/run-spec and record the
+actual offered/generated/attempted/PUBACK/admitted/committed/ACK/pending values.
+E1 counts mean viewer sockets vs two provisioned principals, with expected
+delivery derived from target mapping. E2 count/rate is aggregate across
+producers; sample rows are `messages × samples_per_message`. E3 command count is
+fresh command stream length; offline admission is not delivery. E4 unique and
+replay counts are distinct; replay should produce no new rows. E5 selected
+workload/repeat is one experimental input, not capacity. Do not claim all
+configured rates were achieved. Token expiry must cover readiness + workload +
+drain + import/cleanup; A collector must report ready before B begins. Plans
+whose finite session/token/disk/pending budgets do not fit must be refused or
+reduced before workload, not silently shortened. Record actual generator CPU/
+RAM/FD/network and scheduling lag where available; unavailable windows stay
+unavailable. Existing limits remain: WS delivery is nondurable, clocks across
+hosts/processes are not subtracted, shaper can be inactive, Gamma_red applies
+only to a named same-window counter, and payload bytes are neither wire bytes
+nor RSS. DB transaction counters are not raw rows; CPU missing/reset windows are
+not zero. Official run list and qualifications remain in the E runbooks/report.
+
 **A (fixture/server operator)** quản lý fixture TLS/Auth/Nginx/Go/Postgres/Mosquitto dùng một lần, cấp experiment identity với quyền tối thiểu, thiết lập collection và xác minh DB/REST. **B (máy sinh tải)** chỉ nhận client credential/config theo role và chạy generator Python/Go; không được nhận DB URL/credential, platform-admin JWT, service-role key, Docker socket, broker manager credential, SSH vào A hoặc quyền điều khiển fixture. Operator A có thể dùng fixture helper hiện có; repository không có control-plane từ xa tổng quát hay orchestration một lệnh xuyên host. Public prep manifest và private credential bundle được chuyển riêng qua kênh mã hóa có xác thực. Giữ private file mode 0600 trong thư mục mode 0700, dùng relative path trong private bundle được duyệt; tuyệt đối không đặt secret vào argv, shell history, URL, log hoặc Git.
 
 Các native fixture command hiện có chỉ thao tác fixture local, không cung cấp CLI provision/collect/cleanup cho A/B từ xa. Operator A phải tự provision B bằng private input và Go manifest/run-spec do helper tạo, sau đó chỉ chạy workload child có giới hạn. A thu thập/xác minh kết quả và thực hiện cleanup đúng resource đã sở hữu. Pilot A/B trên máy vật lý vẫn **NOT RUN**. Preparation/preflight không thay thế qualification TLS, DNS, routing, firewall, MTU hoặc resource khi chạy từ xa.
 
-Khi A đã chuyển an toàn **Go manifest thực, run-spec và Gateway env file theo role** sang B, bounded supervisor hiện có hỗ trợ preflight và thực thi (tối đa 16 process thuộc lượt chạy; không chuyển tiếp shell flags tùy ý cho child process). Path trong run-spec được tính tương đối với file run-spec, trừ khi là absolute. `run-spec.json` có `paperload: [{"manifest":"...","output_dir":"...","role":"viewer|telemetry|control|auto","ready_timeout_seconds":30}]`, `gateways: [{"env_file":"...","role":"executor|durable-telemetry","ready_timeout_seconds":30}]` tùy chọn, và `stop_timeout_seconds` tùy chọn (≤60). Với pilot có mọi profile value là `pilot`, run-spec cho phép tối đa hai durable Gateway process. Preflight kiểm tra từng paperload manifest; không đọc Gateway env file, không mở network connection và không khởi động child.
+Khi A đã chuyển an toàn **Go manifest thực, run-spec và Gateway env file theo role** sang B, bounded supervisor hiện có hỗ trợ preflight và thực thi (tối đa 16 process thuộc lượt chạy; không chuyển tiếp shell flags tùy ý cho child process). Path trong run-spec được tính tương đối với file run-spec, trừ khi là absolute. `run-spec.json` có `paperload: [{"manifest":"...","output_dir":"...","role":"viewer|telemetry|control|auto","ready_timeout_seconds":30}]`, `gateways: [{"env_file":"...","role":"executor|durable-telemetry","ready_timeout_seconds":30}]` tùy chọn, `stop_timeout_seconds` tùy chọn (≤60) và `disk_guard` hữu hạn. E1–E5 builders khai báo growth threshold theo `limits.disk_growth_bytes`; portable bind tái tạo scope dưới `outputs/` của B. Legacy pilot thiếu field dùng cap compatibility 64 MiB có qualification. Guard đo outputs/journal/outbox được sở hữu, tính SQLite sidecars qua thư mục cha chỉ một lần, walk và sample history đều bounded; không quét inputs hoặc host. Symlink traversal hay phép đo storage không khả dụng dừng workload fail-closed. Với pilot có mọi profile value là `pilot`, run-spec cho phép tối đa hai durable Gateway process. Preflight kiểm tra từng paperload manifest; không đọc Gateway env file, không mở network connection và không khởi động child.
 
 ```sh
 # On B, in its protected private bundle; A supplies these files separately.
@@ -76,6 +190,8 @@ python3 scripts/paper_p8.py --binary "$PRIVATE_BUNDLE/bin/paperload" \
 ```
 
 `run` bắt buộc có `--run-artifact`; official manifest yêu cầu opt-in tường minh `--official-opt-in`. Không đặt secret trong run-spec: các giá trị nhạy cảm chỉ nằm trong env/identity file được bảo vệ với permission giới hạn theo role. B gửi safe `run.json`, counter và digest manifest cho A qua kênh mã hóa đã duyệt; A xác minh DB/REST phía fixture và cleanup resource owned. P8 E1–E5 selector driver chỉ chạy trong fixture local, không thể chạy trọn topology A/B từ xa đầu-cuối và không thay thế quy trình chia vai trò thủ công này.
+
+B-side guard report giữ baseline, growth/free-space và stop reason trong runner artifact. Guard stop kết thúc bằng `PARTIAL`, join child và giữ nguyên output/outbox/journal; cleanup failures ở trường riêng. A-side fixture/DB guard vẫn chưa triển khai và là việc mở riêng; không có tín hiệu A→B hay tuyên claims rằng B do A điều khiển.
 
 Preflight network/security: public CA chain và SAN/hostname phải khớp HTTPS/WSS và MQTT-TLS endpoint đã cấu hình; không tắt TLS verification. Nếu A nằm trong mạng private, dùng SSH local-forward do operator tạo và chỉ bind loopback; giữ nguyên kiểm tra certificate SAN (hostname endpoint phải được resolve qua mapping được kiểm soát tới tunnel). Tunnel làm thay đổi network path và phải ghi vào run metadata; không tuyên bố topology giống A/B kết nối trực tiếp. Không expose public listener bằng P7 HTTP-only profile. Nginx exact `/v1/ws` mặc định trả 404; P7 overlay chỉ HTTP, không phải WSS profile hướng Internet.
 
@@ -140,9 +256,9 @@ Generator bottleneck checks: compare target and actual publish rate, scheduler l
 
 This is a future hardware checklist, not a result: (1) record board revision, OS/toolchain/Go build target and binary digest; (2) provision TLS CA/SAN and least-privilege gateway credential, prove denied invalid credential; (3) start Gateway and verify readiness; (4) send uplink and verify backend commit plus application ACK; (5) issue a fresh authorized command and verify published is distinct from succeeded; (6) collect runtime result and confirm `reported.configuration` only after verified result; (7) stop/reopen Gateway SQLite and verify receipt, sequence/watermark and pending payload survive; (8) repeat with a physical sensor only when attached and separately identify synthetic simulator values vs physical measurements; (9) preserve logs/digests and exact owned cleanup. AM5728/HIL and physical sensors are NOT RUN. This does not make Stage 5 complete; remote CI/Stage 5 rollout dependencies remain open.
 
-## Checkpoint P8.14 và bằng chứng hiện có
+## Checkpoint P8.14 và bằng chứng hiện có (snapshot 31/10; lịch sử giữ nguyên)
 
-Xem [báo cáo P8](paper-p8-experiments-and-acceptance.md), [JSON recovery an toàn](results/p8/recovery-summary.json) và [overview P8](results/p8/overview.json). E3 có pilot low-load polling PASS và hai run mixed-load polling/wakeup PASS; cả hai mixed-load report đều xác nhận overlap theo runner, bốn receipt, hai configuration, pending sau drain bằng 0 và cleanup 12/1/5. `D_dispatch`/`D_e2e` server-origin là null/unavailable, không được mô tả là đã đo. E5: sáu native driver run đóng băng PASS, mỗi run cleanup chính xác (12 containers/1 network/5 volumes), năm cặp strict-comparable; mọi raw record vẫn `full_p8_accepted=false`. Mỗi arm có 20 unique messages/2.000 raw samples, 10 warm replay; tổng 20 WS events trên hai viewer (10 mỗi viewer), bốn receipt và hai configuration đã xác minh. Fanout scan ghi indexed 20 so với scan 40 evaluation và viewer đúng, nhưng kích hoạt helper vẫn INCONCLUSIVE (`fanout_viewer_readiness_unverified`; thiếu readiness flag). Native command-window timeline vẫn INCONCLUSIVE (`counter_field_missing_events`), không phải latency bằng 0. Một pilot colocated không chứng minh capacity; resource snapshots thưa; overlap storm E3 là bằng chứng riêng, không thuộc lượt E5 này.
+Đoạn này là snapshot lịch sử 31/10, giữ nguyên kết luận đúng cho source/run khi đó; không dùng làm trạng thái mới nhất. Cập nhật 05/11: xem source-qualified checkpoint ở đầu tài liệu và runbook E1–E5. Cụ thể E3 corrected subset hiện có dispatch/E2E timeline; E5 representative repeat mới có command window available cho 4/4 mẫu từng arm, nhưng resource snapshots sparse và shaper pair inconclusive. Không thay raw historical reports hoặc backdate các kết luận mới.
 
 P8.12 local source/CI gates and P8.13 bounded DB restore are source-qualified in report. Recovery restored source/restore row counts and content hashes, reopened one committed/unACKed SQLite payload, verified application ACK/drain and access denials; exact fixture cleanup 14 containers/1 network/5 volumes, all four children joined. This was **database restore in the same fixture-owned PostgreSQL cluster**, not whole-platform/HA backup. Earlier original control runner remains PARTIAL; do not rewrite it COMPLETE.
 
