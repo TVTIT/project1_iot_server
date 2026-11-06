@@ -59,7 +59,7 @@ class E1OfflineContractTests(unittest.TestCase):
                 base = (2 * viewers + 34 + workers - 1) // workers
                 connections = max(256, 2 * base + 32)
                 self.assertEqual(overlay['proposed']['nginx_worker_connections'], connections)
-                self.assertEqual(overlay['proposed']['nginx_process_fd_soft'], max(1024, connections + 128))
+                self.assertEqual(overlay['proposed']['nginx_process_fd_soft'], max(1024, connections + 128 + 64))
                 self.assertEqual(overlay['proposed']['nginx_worker_processes'], workers)
                 self.assertEqual(overlay['proposed']['WS_SESSION_REFERENCE_BYTES'], 8 * 1024 * 1024)
                 self.assertEqual(overlay['estimated_only'], True)
@@ -171,6 +171,46 @@ class E1OfflineContractTests(unittest.TestCase):
         self.assertEqual(result['proxy_slots_per_worker_required'], 322)
         self.assertEqual(result['nginx_fd_limit_required'], 1024)
         self.assertTrue(result['native_executed'] is False)
+
+    def test_10000_viewer_overlay_covers_baseline_fds_without_relaxing_gate(self):
+        proposal = paper_p8_e1_support.e1_resource_overlay(
+            10000, official_opt_in=True)['proposed']
+        soft = proposal['nginx_process_fd_soft']
+        connections = proposal['nginx_worker_connections']
+        resources = {
+            'nginx': {'worker_processes':proposal['nginx_worker_processes'],
+                      'worker_connections':connections},
+            'process_fd_limits': {'soft':soft,'hard':soft},
+            'nginx_workers': [{'pid':i+2,'soft':soft,'hard':soft,'open':40+i%2,
+                              'available':soft-40-i%2} for i in range(32)],
+            'backend_fd_availability': {'available':10084},
+            'broker_fd_availability': {'available':90},
+        }
+        # Reproduce the observed 40/41 baseline FDs, then exercise the full
+        # proposed baseline allowance and the unchanged free-FD boundary.
+        result = paper_p8_e1_support.require_e1_resource_gate(
+            resources, viewers=10000, session_cap=10000)
+        self.assertEqual(result['status'], 'RESOURCE_GATE_PASSED')
+        self.assertEqual(connections, 1286)
+        self.assertEqual(soft, 1478)
+        self.assertEqual(result['nginx_fd_limit_required'], connections + 128)
+        for worker in resources['nginx_workers']:
+            worker.update(open=64, available=soft-64)
+        self.assertEqual(paper_p8_e1_support.require_e1_resource_gate(
+            resources, viewers=10000, session_cap=10000)['status'], 'RESOURCE_GATE_PASSED')
+        # One exhausted worker must refuse the whole lane, even though other
+        # workers have sufficient room and its configured soft limit is correct.
+        resources['nginx_workers'][-1].update(open=65, available=soft-65)
+        with self.assertRaisesRegex(ValueError, 'nginx_worker_fd_available'):
+            paper_p8_e1_support.require_e1_resource_gate(
+                resources, viewers=10000, session_cap=10000)
+        # The original 1414-FD readback must still fail, not become accepted.
+        resources['process_fd_limits'].update(soft=1414, hard=1414)
+        for worker in resources['nginx_workers']:
+            worker.update(soft=1414, hard=1414, open=41, available=1373)
+        with self.assertRaisesRegex(ValueError, 'nginx_worker_fd_available'):
+            paper_p8_e1_support.require_e1_resource_gate(
+                resources, viewers=10000, session_cap=10000)
 
     def test_resource_gate_rejects_known_nginx_fd_limit(self):
         resources = {'nginx': {'worker_processes': 1, 'worker_connections': 20100},

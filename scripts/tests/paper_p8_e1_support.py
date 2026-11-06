@@ -74,6 +74,7 @@ E1_CLEANUP_RESERVE_SECONDS = 30
 E1_VIEWER_FRAME_BOUND_BYTES = 8192
 E1_VIEWER_MAX_MESSAGES = 10_000_000
 E1_VIEWER_MAX_BYTES = 1 << 30
+E1_NGINX_WORKER_BASELINE_FDS = 64
 
 
 def remaining_collector_budget(deadline_monotonic, workload_lifecycle_seconds, *,
@@ -256,6 +257,9 @@ def e1_resource_overlay(viewers, *, official_opt_in, host_limits=None, reserve_c
     workers = min(32, max(1, (viewers + 63) // 64))
     proxy_slots = 2 * viewers + 2 + reserve_connections
     per_worker, fd_limit = _nginx_worker_budget(viewers, workers, reserve_connections)
+    # Baseline listening/log/control FDs are already open before the workload.
+    # Budget them separately from the gate's unchanged free-FD reserve.
+    fd_limit = max(fd_limit, per_worker + 128 + E1_NGINX_WORKER_BASELINE_FDS)
     # Reference/session memory is a fixed ceiling, not multiplied by viewers;
     # per-session queues and pending limits intentionally remain unchanged.
     proposed = {'WS_MAX_SESSIONS': viewers, 'WS_SESSION_REFERENCE_BYTES': 8 * 1024 * 1024,

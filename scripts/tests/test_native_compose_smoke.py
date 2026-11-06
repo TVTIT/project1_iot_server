@@ -752,6 +752,22 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn(expected, compose + fixture.env_file.read_text())
             self.assertIn(str(config), compose)
 
+    def test_10000_viewer_overlay_writes_baseline_fd_budget_to_nginx_and_compose(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e1_viewers=10000)
+            config = (fixture.private / 'nginx.conf').read_text()
+            self.assertIn('worker_processes 32;', config)
+            self.assertIn('worker_connections 1286;', config)
+            self.assertIn('worker_rlimit_nofile 1478;', config)
+            compose = fixture.override.read_text()
+            self.assertIn('soft: 1478', compose)
+            self.assertIn('hard: 1478', compose)
+            self.assertEqual(fixture.e1_resource_overlay['proposed']['nginx_process_fd_soft'], 1478)
+            self.assertEqual(fixture.values['WS_SESSION_REFERENCE_BYTES'], '8388608')
+            self.assertFalse(fixture.e1_resource_overlay['queues_scaled_with_viewers'])
+
     def test_e1_selected_overlay_requires_official_optin_before_fixture_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'fixture'
