@@ -550,6 +550,8 @@ def main(argv=None):
     serve.add_argument('--e2-offered-rate', type=int, choices=(100, 1000, 5000, 20000), default=100)
     serve.add_argument('--e2-duration-seconds', type=int, default=10)
     serve.add_argument('--e2-burst-messages', type=int, default=0)
+    serve.add_argument('--e2-pending-messages', type=int, default=64)
+    serve.add_argument('--e2-pending-bytes', type=int, default=1 << 20)
     serve.add_argument('--dispatch-mode', choices=('polling', 'wakeup'))
     serve.add_argument('--workload', choices=('low_load', 'mixed', 'steady_burst', 'equal_samples'))
     serve.add_argument('--e3-command-count', type=int, choices=range(1, 31), default=4)
@@ -713,6 +715,12 @@ def main(argv=None):
             if args.profile == 'official':
                 p8_support.lifecycle_budget(workload_seconds=args.e2_duration_seconds + 60,
                                             session_deadline_seconds=args.deadline_seconds)
+                import paper_p8_e2_support as e2_support
+                e2_support.e2_official_estimate(rate_per_second=args.e2_offered_rate,
+                    duration_seconds=args.e2_duration_seconds, samples_per_message=int(args.samples_per_message),
+                    payload_bytes=4096, official_opt_in=args.official_opt_in,
+                    burst_messages=args.e2_burst_messages, pending_messages=args.e2_pending_messages,
+                    pending_bytes=args.e2_pending_bytes)
             if workload == 'steady_burst':
                 if args.context is not None or args.reference is not None:
                     raise ValueError('E2 steady_burst does not accept --context or --reference')
@@ -741,6 +749,9 @@ def main(argv=None):
                      or args.cache_mode != 'on' or args.cold_replay or args.expiry_replay
                     or args.durable_reopen or args.conflicts):
                 raise ValueError('E2 does not accept unrelated experiment options')
+        if (args.experiment != 'E2' or args.profile != 'official') and (
+                args.e2_pending_messages != 64 or args.e2_pending_bytes != 1 << 20):
+            raise ValueError('E2 pending options require official E2')
         if args.experiment == 'E3':
             if args.dispatch_mode is None or args.workload is None:
                 raise ValueError('E3 requires explicit --dispatch-mode and --workload')
@@ -814,7 +825,8 @@ def main(argv=None):
                         gateway_identity_files={'gw-a':'gw-a.json','gw-b':'gw-b.json'},
                         telemetry_identity_files={'A':'a.json','B':'b.json'},
                         samples_per_message=int(args.samples_per_message), offered_rate=args.e2_offered_rate,
-                        duration_seconds=args.e2_duration_seconds, burst_messages=args.e2_burst_messages)
+                        duration_seconds=args.e2_duration_seconds, burst_messages=args.e2_burst_messages,
+                        pending_messages=args.e2_pending_messages, pending_bytes=args.e2_pending_bytes)
                     pair = manifests['profiles'][str(int(args.samples_per_message))]
                     paths = {}
                     for arm in ('A','B'):
@@ -827,7 +839,10 @@ def main(argv=None):
                         'estimate': e2_support.e2_official_estimate(rate_per_second=args.e2_offered_rate,
                             duration_seconds=args.e2_duration_seconds,
                             samples_per_message=int(args.samples_per_message), payload_bytes=4096,
-                            official_opt_in=True)}
+                            official_opt_in=True, burst_messages=args.e2_burst_messages,
+                            pending_messages=args.e2_pending_messages, pending_bytes=args.e2_pending_bytes),
+                        'pending_limits': {'pending_messages': args.e2_pending_messages,
+                                           'pending_bytes': args.e2_pending_bytes}}
             e4_plan = None
             e4_offline_contract = None
             e3_plan = None
@@ -927,7 +942,9 @@ def main(argv=None):
             command += ['--p8-e2-workload', workload]
             command += ['--p8-e2-offered-rate', str(args.e2_offered_rate),
                         '--p8-e2-duration-seconds', str(args.e2_duration_seconds),
-                        '--p8-e2-burst-messages', str(args.e2_burst_messages)]
+                        '--p8-e2-burst-messages', str(args.e2_burst_messages),
+                        '--p8-e2-pending-messages', str(args.e2_pending_messages),
+                        '--p8-e2-pending-bytes', str(args.e2_pending_bytes)]
             if workload == 'equal_samples':
                 command += ['--p8-e2-context', str(args.context)]
                 if args.reference is not None:

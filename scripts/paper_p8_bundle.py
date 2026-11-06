@@ -520,7 +520,7 @@ def _validate_e2_official_workload(workload):
     required = {'experiment','arm','phase','profile','workload','seed','samples_per_message',
         'producer_rates_per_second','offered_rate_per_second','measure_seconds','burst_messages',
         'expected_counts','estimate','durability_mode','generator_colocated'}
-    if (type(workload) is not dict or set(workload) != required
+    if (type(workload) is not dict or set(workload) not in (required, required | {'pending_limits'})
             or workload.get('experiment') != 'E2' or workload.get('profile') != 'official'
             or workload.get('workload') != 'e2-telemetry-ab-official'
             or not isinstance(workload.get('arm'), str) or not SAFE_ID.fullmatch(workload['arm'])
@@ -551,7 +551,16 @@ def _validate_e2_official_workload(workload):
         'total_storage_growth_bytes_estimate','pending_retry_memory_bytes_estimate',
         'application_bandwidth_bytes_per_second_estimate','payload_bytes_wire','payload_size_basis',
         'estimate_basis','not_measurements'}
+    pending = workload.get('pending_limits')
+    if 'pending_limits' in workload and (type(pending) is not dict
+            or set(pending) != {'pending_messages', 'pending_bytes'}
+            or type(pending['pending_messages']) is not int or not 1 <= pending['pending_messages'] <= 100000
+            or type(pending['pending_bytes']) is not int or not 1 <= pending['pending_bytes'] <= 1 << 30
+            or 2 * (pending['pending_bytes'] + pending['pending_messages'] * 4096) > 256 << 20):
+        _fail('bundle_workload_metadata_rejected')
     estimate_messages = workload['offered_rate_per_second'] * workload['measure_seconds']
+    if pending is not None:
+        estimate_messages += workload['burst_messages']
     estimate_rows = estimate_messages * workload['samples_per_message']
     basis = estimate.get('estimate_basis') if isinstance(estimate, dict) else None
     if (type(estimate) is not dict or set(estimate) != estimate_keys
@@ -571,10 +580,13 @@ def _validate_e2_official_workload(workload):
             or estimate.get('application_payload_bytes_estimate') != estimate_messages * 4096
             or estimate.get('raw_database_row_index_wal_bytes_estimate') != estimate_rows * 320 * 2
             or estimate.get('total_storage_growth_bytes_estimate') != estimate_messages * 4096 + estimate_rows * 320 * 2
-            or estimate.get('pending_retry_memory_bytes_estimate') != (min(estimate_messages,64)+min(estimate_messages,16))*4096
+            or estimate.get('pending_retry_memory_bytes_estimate') != (
+                2 * (pending['pending_bytes'] + pending['pending_messages'] * 4096)
+                if pending is not None else (min(estimate_messages,64)+min(estimate_messages,16))*4096)
             or estimate.get('application_bandwidth_bytes_per_second_estimate') != workload['offered_rate_per_second']*4096
             or basis != {'raw_row_bytes':256,'index_bytes_per_row':64,'wal_multiplier':2}
             or estimate.get('total_storage_growth_bytes_estimate') > 10 << 30
+            or estimate_messages > 1000000 or estimate_rows > 100000000
             ):
         _fail('bundle_workload_metadata_rejected')
 
@@ -1790,6 +1802,13 @@ def inspect_bundle(root):
         wl = metadata.get('workload')
         if isinstance(wl, dict) and wl.get('profile') == 'official':
             _validate_e2_official_workload(wl)
+            expected_limits = wl.get('pending_limits', {'pending_messages': 64, 'pending_bytes': 1 << 20})
+            for arm in ('A', 'B'):
+                manifest = _json_file(root / 'manifests' / f'{arm}.json', limit=MAX_MANIFEST_BYTES)
+                limits = manifest.get('limits') if isinstance(manifest, dict) else None
+                if not isinstance(limits, dict) or any(
+                        limits.get(key) != value for key, value in expected_limits.items()):
+                    _fail('bundle_e2_pending_limits_mismatch')
         elif isinstance(wl, dict) and (wl.get('workload_type') == 'equal_samples' or wl.get('workload') == 'equal_samples'):
             _validate_e2_equal_samples_workload(wl)
     return {'schema_version':SCHEMA_VERSION,'valid':True,'files':len(seen),'total_bytes':declared_total,

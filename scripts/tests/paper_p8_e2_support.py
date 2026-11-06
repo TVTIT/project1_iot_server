@@ -77,12 +77,16 @@ def e2_pilot_manifests(*, common, targets, gateway_identity_files, telemetry_ide
 
 
 def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_identity_files,
-                          samples_per_message, offered_rate, duration_seconds, burst_messages=0):
+                          samples_per_message, offered_rate, duration_seconds, burst_messages=0,
+                          pending_messages=64, pending_bytes=1 << 20):
     """Build two role manifests whose rates sum to the selected run-wide offer."""
     if (len(targets) != 2 or len({t.get('gateway_id') for t in targets}) != 2
             or samples_per_message not in PILOT_SAMPLES or offered_rate not in OFFICIAL_RATES
             or type(duration_seconds) is not int or duration_seconds < 1
-            or type(burst_messages) is not int or not 0 <= burst_messages <= 100000):
+            or type(burst_messages) is not int or not 0 <= burst_messages <= 100000
+            or type(pending_messages) is not int or not 1 <= pending_messages <= 100000
+            or type(pending_bytes) is not int or not 1 <= pending_bytes <= 1 << 30
+            or 2 * (pending_bytes + pending_messages * 4096) > 256 << 20):
         raise ValueError('e2_official_workload_rejected')
     rates = {'A': offered_rate // 2, 'B': offered_rate - offered_rate // 2}
     pair = {}
@@ -99,15 +103,15 @@ def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_
             'phases': {'warmup_seconds': 0, 'measure_seconds': duration_seconds,
                        'drain_seconds': 30, 'cooldown_seconds': 0},
             'limits': {'retries': 16, 'workers': 2, 'connections': 1,
-                       'pending_messages': 64, 'pending_bytes': 1 << 20,
+                       'pending_messages': pending_messages, 'pending_bytes': pending_bytes,
                        'disk_growth_bytes': 10 << 30, 'wall_seconds': duration_seconds + 60},
             'gateway_identity_files': {target['gateway_id']: gateway_identity_files[target['gateway_id']]},
             'identity_files': {'telemetry': telemetry_identity_files[arm]},
             'durability_mode': 'synthetic-load', 'retry_interval_ms': 500}
     return {'profiles': {str(samples_per_message): pair}, 'profile': 'official',
             'offered_rate_per_second': offered_rate, 'producer_rates_per_second': rates,
-            'duration_seconds': duration_seconds, 'unique_messages_per_profile': offered_rate * duration_seconds,
-            'raw_rows_per_profile': offered_rate * duration_seconds * samples_per_message,
+            'duration_seconds': duration_seconds, 'unique_messages_per_profile': offered_rate * duration_seconds + burst_messages,
+            'raw_rows_per_profile': (offered_rate * duration_seconds + burst_messages) * samples_per_message,
             'execution': 'NOT RUN'}
 
 
@@ -137,7 +141,7 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
                    reference_path=None, context=None, grace_seconds=10,
                    check_freshness=True, now_utc=None, profile='pilot',
                    official_opt_in=False, offered_rate=100, duration_seconds=10,
-                   burst_messages=0):
+                   burst_messages=0, pending_messages=64, pending_bytes=1 << 20):
     """Prepare one bounded E2 profile for the existing A/B helper lifecycle."""
     if samples_per_message not in PILOT_SAMPLES:
         raise ValueError('e2_samples_profile_rejected')
@@ -145,13 +149,16 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
         raise ValueError('e2_workload_rejected')
     if profile not in ('pilot', 'official'):
         raise ValueError('e2_profile_rejected')
+    if profile != 'official' and (pending_messages != 64 or pending_bytes != 1 << 20):
+        raise ValueError('e2_pending_requires_official')
     if profile == 'official' and not official_opt_in:
         raise ValueError('official_profile_requires_opt_in')
     if profile == 'official' and workload != 'steady_burst':
         raise ValueError('official_equal_samples_not_supported')
     estimate = (e2_official_estimate(rate_per_second=offered_rate,
         duration_seconds=duration_seconds, samples_per_message=samples_per_message,
-        payload_bytes=4096, official_opt_in=True) if profile == 'official' else None)
+        payload_bytes=4096, official_opt_in=True, burst_messages=burst_messages,
+        pending_messages=pending_messages, pending_bytes=pending_bytes) if profile == 'official' else None)
 
     validated_ctx = None
     if workload == 'equal_samples':
@@ -212,7 +219,8 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
         manifests = (e2_official_manifests(common=common, targets=targets,
             gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files,
             samples_per_message=samples_per_message, offered_rate=offered_rate,
-            duration_seconds=duration_seconds, burst_messages=burst_messages)
+            duration_seconds=duration_seconds, burst_messages=burst_messages,
+            pending_messages=pending_messages, pending_bytes=pending_bytes)
             if profile == 'official' else e2_pilot_manifests(common=common, targets=targets,
             gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files))
         pair = manifests['profiles'][str(samples_per_message)]
@@ -346,6 +354,8 @@ def export_prepared_bundle(prepared, *, wait_seconds=90, workload_seconds=None):
                                               'B': b['traffic']['rate_per_second']},
                 'offered_rate_per_second': offered, 'measure_seconds': duration,
                 'burst_messages': b['traffic']['burst_messages'],
+                'pending_limits': {'pending_messages': a['limits']['pending_messages'],
+                                   'pending_bytes': a['limits']['pending_bytes']},
                 'expected_counts': prepared['plan']['expected_counts'],
                 'estimate': prepared['official_estimate'], 'durability_mode': 'synthetic-load',
                 'generator_colocated': 'unverified'}
@@ -1966,6 +1976,9 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             'generator_colocated': True,
             'physical_ab': 'NOT RUN',
         }
+        if prepared.get('profile') == 'official':
+            limits = prepared['manifests']['A']['limits']
+            result['pending_limits'] = {key: limits[key] for key in ('pending_messages', 'pending_bytes')}
         artifact_name = f'p8-e2-samples-{prepared["samples_per_message"]}-remote-result.json'
     smoke.durable_json(fixture.artifacts / artifact_name, result)
     return result
@@ -2374,22 +2387,27 @@ def e2_official_estimate(*, rate_per_second, duration_seconds, samples_per_messa
                          max_raw_rows=100000000, max_disk_bytes=10 << 30,
                          raw_row_bytes=256, index_bytes_per_row=64, wal_multiplier=2,
                          pending_memory_bytes=256 << 20, retry_memory_bytes=256 << 20,
-                         application_bandwidth_bytes_per_second=100 << 20):
+                         application_bandwidth_bytes_per_second=100 << 20,
+                         burst_messages=0, pending_messages=64, pending_bytes=1 << 20):
     """Conservative sizing estimate, not a measurement or wire-byte estimate."""
     import math
     if not official_opt_in:
         raise ValueError('official_profile_requires_opt_in')
     if (rate_per_second not in OFFICIAL_RATES or type(duration_seconds) is not int or duration_seconds < 1
             or type(samples_per_message) is not int or samples_per_message not in PILOT_SAMPLES
-            or type(payload_bytes) is not int or payload_bytes < 1):
+            or type(payload_bytes) is not int or payload_bytes < 1
+            or type(burst_messages) is not int or not 0 <= burst_messages <= 100000
+            or type(pending_messages) is not int or not 1 <= pending_messages <= 100000
+            or type(pending_bytes) is not int or not 1 <= pending_bytes <= 1 << 30
+            or 2 * (pending_bytes + pending_messages * 4096) > 256 << 20):
         raise ValueError('e2_estimate_input_rejected')
-    messages = math.ceil(rate_per_second * duration_seconds)
+    messages = math.ceil(rate_per_second * duration_seconds) + burst_messages
     raw_rows = messages * samples_per_message
     payload_estimate = messages * payload_bytes
     database_estimate = raw_rows * (raw_row_bytes + index_bytes_per_row) * wal_multiplier
     total_storage_estimate = payload_estimate + database_estimate
-    pending_estimate = min(messages, 64) * payload_bytes
-    retry_estimate = min(messages, 16) * payload_bytes
+    pending_estimate = 2 * (pending_bytes + pending_messages * 4096)
+    retry_estimate = 0  # pending allowance includes retry bookkeeping for both producers
     bandwidth_estimate = rate_per_second * payload_bytes
     if (duration_seconds > max_duration_seconds or messages > max_messages or raw_rows > max_raw_rows
             or total_storage_estimate > max_disk_bytes or pending_estimate > pending_memory_bytes

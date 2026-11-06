@@ -6304,6 +6304,8 @@ def main():
     parser.add_argument('--p8-e2-offered-rate', type=int, choices=(100, 1000, 5000, 20000), default=100, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-duration-seconds', type=int, default=10, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-burst-messages', type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-pending-messages', type=int, default=64, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-pending-bytes', type=int, default=1 << 20, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-context', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-prepare-hold', action='store_true', help=argparse.SUPPRESS)
@@ -6723,6 +6725,8 @@ def main():
                                 offered_rate=args.p8_e2_offered_rate,
                                 duration_seconds=args.p8_e2_duration_seconds,
                                 burst_messages=args.p8_e2_burst_messages,
+                                pending_messages=args.p8_e2_pending_messages,
+                                pending_bytes=args.p8_e2_pending_bytes,
                             )
                         prepared['e2_support'] = e2
                         prepared['workload'] = e2_workload
