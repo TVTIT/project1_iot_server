@@ -310,6 +310,10 @@ func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir strin
 	result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	if runErr != nil {
 		result.PrimaryError = "telemetry_run_failed"
+		switch runErr.Error() {
+		case "pending_message_cap", "pending_byte_cap", "pending_cap":
+			result.PrimaryError = runErr.Error()
+		}
 	}
 	if writeErr := writeResult(outputDir, result); writeErr != nil && runErr == nil {
 		runErr = errors.New("result_artifact_write_failed")

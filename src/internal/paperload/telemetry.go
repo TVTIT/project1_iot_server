@@ -511,6 +511,7 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 				if err := e.generate(now, cohort); err != nil {
 					e.counts.deferred.Add(1)
 					if err.Error() == "pending_message_cap" || err.Error() == "pending_byte_cap" || err.Error() == "pending_cap" {
+						e.fatalGeneration = err
 						e.stopGeneration.Store(true)
 						break
 					}
@@ -573,6 +574,7 @@ func (e *TelemetryEngine) runOpenLoop(ctx context.Context, duration, ramp time.D
 			if err := e.generate(now, cohort); err != nil {
 				e.counts.deferred.Add(1)
 				if err.Error() == "pending_message_cap" || err.Error() == "pending_byte_cap" || err.Error() == "pending_cap" {
+					e.fatalGeneration = err
 					e.stopGeneration.Store(true)
 					break
 				}

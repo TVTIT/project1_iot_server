@@ -164,7 +164,7 @@ func TestGenerationFailureCannotCompleteWithZeroOffered(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := e.Run(context.Background())
-	if status != "FAILED" || err == nil || err.Error() != "telemetry_generation_incomplete" {
+	if status != "FAILED" || err == nil || err.Error() != "pending_byte_cap" {
 		t.Fatalf("generation failure status=%s err=%v", status, err)
 	}
 	if got := e.Counters(); got.Generated != 0 || got.OfferedUnique != 0 {
