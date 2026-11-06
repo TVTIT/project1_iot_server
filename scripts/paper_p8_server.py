@@ -224,7 +224,7 @@ def build_e4_offline_contract(*, unique_count, replay_count, deadline_seconds,
                        'cooldown_seconds': 0},
             'limits': {'retries': 4, 'workers': 2, 'connections': 2,
                 'pending_messages': 64, 'pending_bytes': 1 << 20,
-                'disk_growth_bytes': 1 << 20, 'wall_seconds': 720},
+                'disk_growth_bytes': e4.e4_journal_byte_bound(unique_count), 'wall_seconds': 720},
             'tls': {'https_endpoint': 'https://example.invalid',
                 'mqtt_tls_endpoint': 'mqtts://example.invalid:8883',
                 'https_ca_file': str(ca_files['https']), 'mqtt_tls_ca_file': str(ca_files['mqtt']),
@@ -234,6 +234,10 @@ def build_e4_offline_contract(*, unique_count, replay_count, deadline_seconds,
             'bundle_path': 'outputs/e4-offline', 'durability_mode': 'synthetic-load',
             'retry_interval_ms': 500, 'publish_timeout_ms': 3000}
         phases = ['unique', 'replay'] + (['expiry-replay'] if expiry_replay else [])
+        schedule = e4.e4_phase_durations(unique_count, replay_count, base_rate=5)
+        if schedule['workload_seconds'] > deadline_seconds:
+            raise ValueError('e4_offline_session_budget_insufficient')
+        common['limits']['wall_seconds'] = schedule['unique_seconds'] + schedule['drain_seconds'] + 30
         manifest_paths = {}
         for phase in phases:
             manifest = e4.e4_phase_manifest(common, 'outputs/e4-journal.sqlite', phase,
@@ -243,7 +247,7 @@ def build_e4_offline_contract(*, unique_count, replay_count, deadline_seconds,
             path.write_text(json.dumps(manifest, sort_keys=True, separators=(',', ':')))
             path.chmod(0o600); manifest_paths[phase] = path
 
-        workload_seconds = 720 if expiry_replay else 30
+        workload_seconds = 720 if expiry_replay else schedule['workload_seconds']
         workload = {'experiment': 'E4', 'arm': 'warm', 'run_id': 'e4-official-offline',
             'cache_mode': 'on', 'phase': 'e4-official-offline', 'profile': 'official',
             'seed': 89, 'generator_colocated': 'unverified',
@@ -331,9 +335,11 @@ def build_e4_offline_contract(*, unique_count, replay_count, deadline_seconds,
             'bound_session_id': binding['session']['session_id'], 'expected_counts': expected,
             'result_projection': {'schema_valid': True, 'status': projected['status'],
                 'native_completed_acceptance': False},
-            'preflight': preflight, 'bundle_bytes': inspected['total_bytes'],
-            'manifest_count': len(phases), 'required_token_lifetime_seconds':
-                binding['required_token_lifetime_seconds']}
+             'preflight': preflight, 'bundle_bytes': inspected['total_bytes'],
+             'manifest_count': len(phases), 'required_token_lifetime_seconds':
+                binding['required_token_lifetime_seconds'], 'schedule': schedule,
+             'disk_growth_bytes': json.loads(manifest_paths['unique'].read_text())['limits']['disk_growth_bytes'],
+             'journal_max_bytes': json.loads(manifest_paths['unique'].read_text())['e4']['max_bytes']}
 
 
 def build_e3_offline_contract(*, workload, dispatch_mode, command_count, schedule, deadline_seconds):

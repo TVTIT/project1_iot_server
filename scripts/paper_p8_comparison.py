@@ -609,7 +609,7 @@ def verify_raw_retention(raw_ref: Any, raw_opt: Any, *, content_provenance: Opti
 
 
 def aggregate_independent_repeats(runs_data: List[Dict[str, Any]],
-                                  metric_keys: List[str]) -> Dict[str, Any]:
+                                  metric_keys: List[str], *, allow_negative_metrics=()) -> Dict[str, Any]:
     """Aggregate declared independent repeats by computing per-run first, then median and range.
 
     Prohibits synthetic confidence intervals and merging individual run percentiles.
@@ -643,7 +643,7 @@ def aggregate_independent_repeats(runs_data: List[Dict[str, Any]],
         for r in runs_data:
             val = r.get(key)
             if (isinstance(val, bool) or not isinstance(val, (int, float))
-                    or not math.isfinite(val) or val < 0):
+                    or not math.isfinite(val) or (val < 0 and key not in allow_negative_metrics)):
                 return {'available': False, 'reason': f'invalid_metric_value_{key}'}
             values.append(val)
         if not values:
@@ -963,6 +963,14 @@ def build_e5_summary(
             e2e_cnt = None
 
         flags = r.get('effective_flags') or r.get('metadata', {}).get('effective_flags') or {}
+        metric_sources = {
+            'committed': (delta, 'Committed'), 'samples_new': (delta, 'SamplesNew'),
+            'microbatch_groups': (mm, 'groups'), 'microbatch_members': (mm, 'members'),
+            'ram_lookup_hits': (ram, 'lookup_hit_total'), 'ram_db_calls_avoided': (ram, 'database_calls_avoided_total'),
+            'shaper_rate_limited': (mechanisms.get('shaper') or {}, 'rate_limited'),
+            'fanout_indexed_selections': (mechanisms.get('fanout') or {}, 'indexed_selections'),
+            'fanout_scan_evaluations': (mechanisms.get('fanout') or {}, 'scan_evaluations'),
+        }
         run_rows.append({
             'arm': arm,
             'status': r['status'],
@@ -1009,6 +1017,10 @@ def build_e5_summary(
             'timeline_dispatch_count': disp_cnt,
             'timeline_e2e_count': e2e_cnt,
             'timeline_window': cmd_window,
+            'metric_unavailable_reasons': {
+                name: ('counter_missing_invalid_or_nonfinite' if _e5_num(source, key) is None else None)
+                for name, (source, key) in metric_sources.items()
+            },
         })
 
     pairs = []
@@ -1155,6 +1167,7 @@ def build_e5_summary(
             'workload_sha256': run_rows[0]['workload_sha256'],
             'seed': seed,
         },
+        'aggregation_provenance': _e5_aggregation_provenance(reports, raw_hashes),
         'actual_binary_and_images_comparable': True,
         'run_count': len(ARM_NAMES),
         'independent_repeats': 1,
@@ -1173,6 +1186,372 @@ def build_e5_summary(
     }
 
 
+def _e5_aggregation_provenance(reports, raw_hashes):
+    """Allowlisted source-qualified comparison fields for repeat aggregation."""
+    reference = reports['optimized']
+    meta = reference.get('metadata') or {}
+    b_declared = meta.get('b_declared')
+    if isinstance(b_declared, dict):
+        declared_windows = b_declared.get('declared_measurement_windows')
+        expected_phases = {'initial', 'warm_replay', 'control'}
+        if (isinstance(declared_windows, dict)
+                and set(declared_windows) == expected_phases
+                and all(type(value) in (int, float) and math.isfinite(value) and value > 0
+                        for value in declared_windows.values())):
+            phase_seconds = declared_windows
+        else:
+            # A portable E5 report must carry declared windows; never treat its
+            # observed runtime durations as configuration when that proof is absent.
+            phase_seconds = None
+    else:
+        # Preserve the legacy direct-report schema, where phase_seconds is declared.
+        phase_seconds = meta.get('phase_seconds')
+    context = reference.get('context') or {}
+    workload = reference.get('workload') or meta.get('workload') or {}
+    schedule = workload.get('schedule') or {}
+    telemetry = workload.get('telemetry') or {}
+    commands = workload.get('commands') or {}
+    replay = schedule.get('initial_replay') or {}
+    versions = commands.get('versions') or {}
+    workload_security = workload.get('security') or {}
+    def pos_int(value):
+        return value if type(value) is int and value > 0 else None
+    def nonnegative_int(value):
+        return value if type(value) is int and value >= 0 else None
+    def finite_positive(value):
+        return value if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
+    replay_config = {k: finite_positive(replay.get(k)) for k in ('rate_per_second', 'measure_seconds')}
+    replay_config['burst_messages'] = nonnegative_int(replay.get('burst_messages'))
+    schedule_config = {k: (schedule.get(k) if type(schedule.get(k)) is bool else None)
+                       for k in ('replay_after_commit_ack_baseline',)}
+    schedule_config.update({
+        'initial_imported_messages': nonnegative_int(schedule.get('initial_imported_messages')),
+        'warm_replay_prefix': nonnegative_int(schedule.get('warm_replay_prefix')),
+        'generated_unique': nonnegative_int(schedule.get('generated_unique')),
+        'initial_replay': replay_config,
+    })
+    versions_config = {k: nonnegative_int(versions.get(k)) for k in ('initial', 'after_each_sensor')}
+    workload_security_config = {
+        'tls': workload_security.get('tls') if type(workload_security.get('tls')) is bool else None,
+        'token_authentication': workload_security.get('jwt') if type(workload_security.get('jwt')) is bool else None,
+        'acl': workload_security.get('acl') if type(workload_security.get('acl')) is bool else None,
+        'application_commit_ack': workload_security.get('application_commit_ack') if type(workload_security.get('application_commit_ack')) is bool else None,
+    }
+    workload_config = {
+        'workload_type': workload.get('workload_type') if workload.get('workload_type') in ('p8_e5_prebuilt_journal', 'p8_telemetry_stream') else None,
+        'profile': workload.get('profile') if workload.get('profile') in ('pilot', 'representative') else None,
+        'selection_sha256': workload.get('workload_selection_sha256') if re.fullmatch(r'[0-9a-f]{64}', str(workload.get('workload_selection_sha256') or '')) else None,
+        'schedule': schedule_config,
+        'telemetry': {k: nonnegative_int(telemetry.get(k)) for k in ('messages', 'samples_per_message', 'sample_interval_us')},
+        'commands': {'count': nonnegative_int(commands.get('count')),
+                     'frequencies_hz': commands.get('frequencies_hz') if isinstance(commands.get('frequencies_hz'), list) and all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in commands.get('frequencies_hz')) else None,
+                     'executor': commands.get('executor') if commands.get('executor') == 'existing_e3_sqlite_executor' else None,
+                     'versions': versions_config},
+        'subscription_count': len(workload.get('subscriptions', [])) if isinstance(workload.get('subscriptions'), list) else None,
+        'telemetry_gateway_count': len(telemetry.get('gateway_ids', [])) if isinstance(telemetry.get('gateway_ids'), list) else None,
+        'telemetry_sensor_count': len(telemetry.get('sensor_ids', [])) if isinstance(telemetry.get('sensor_ids'), list) else None,
+        'command_target_count': len(commands.get('command_sensor_ids', [])) if isinstance(commands.get('command_sensor_ids'), list) else None,
+        'viewer_count': nonnegative_int(workload.get('viewer_count')),
+        'security': workload_security_config,
+    }
+    def identity_hash(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    dataset_fields = {
+        'context_sha256': context.get('sha256') if re.fullmatch(r'[0-9a-f]{64}', str(context.get('sha256') or '')) else None,
+        'seed': nonnegative_int(context.get('seed')),
+        'workload_selection_sha256': context.get('workload_selection_sha256') if re.fullmatch(r'[0-9a-f]{64}', str(context.get('workload_selection_sha256') or '')) else None,
+        'journal_sha256': workload.get('journal_sha256') if re.fullmatch(r'[0-9a-f]{64}', str(workload.get('journal_sha256') or '')) else None,
+        'journal_bytes': pos_int(workload.get('journal_bytes')),
+        'dataset_anchor_sha256': identity_hash(telemetry.get('dataset_anchor')),
+        'owned_targets_sha256': identity_hash({k: telemetry.get(k) for k in ('gateway_ids', 'sensor_ids')} | {
+            'command_gateway_id': commands.get('gateway_id'), 'command_sensor_ids': commands.get('command_sensor_ids'),
+            'idempotency_keys': commands.get('idempotency_keys'), 'subscriptions': workload.get('subscriptions')}),
+    }
+    source_fp = reference.get('source_fingerprint') or {}
+    source_security = meta.get('security_mode')
+    if isinstance(source_security, dict):
+        safe_security = {k: (source_security.get(k) if type(source_security.get(k)) is bool else None)
+                         for k in ('endpoint_tls', 'mqtt_tls')}
+        safe_security['fixture_jwt_mode'] = source_security.get('fixture_jwt_mode') if source_security.get('fixture_jwt_mode') in ('HS256', 'RS256') else None
+        safe_security['mqtt_authentication_readback'] = source_security.get('mqtt_authentication_readback') if source_security.get('mqtt_authentication_readback') in ('performed', 'not_performed') else None
+    elif isinstance(source_security, str):
+        safe_security = source_security if source_security in ('jwt_hs256_dynsec_tls', 'jwt_rs256_dynsec_tls') else None
+    else:
+        safe_security = None
+    security_source_valid = (
+        isinstance(safe_security, str) and safe_security in ('jwt_hs256_dynsec_tls', 'jwt_rs256_dynsec_tls')
+    ) or (
+        isinstance(safe_security, dict) and safe_security.get('fixture_jwt_mode') in ('HS256', 'RS256')
+        and type(safe_security.get('endpoint_tls')) is bool and type(safe_security.get('mqtt_tls')) is bool
+    )
+    raw_quota = reference.get('quota') or meta.get('quota')
+    quota = ({k: (pos_int(raw_quota[k]) if k == 'cpus' else nonnegative_int(raw_quota[k]))
+              for k in ('cpus', 'memory_bytes', 'queue_capacity') if k in raw_quota}
+             if isinstance(raw_quota, dict) else None)
+    raw_workers = meta.get('workers')
+    worker_keys = ('paperload', 'gateway_executors', 'mqtt_worker_count', 'database_max_conns',
+                   'stage5_publish_workers', 'stage5_result_workers')
+    if type(raw_workers) is int:
+        workers = pos_int(raw_workers)
+    elif isinstance(raw_workers, dict):
+        workers = {k: pos_int(raw_workers[k]) for k in worker_keys if k in raw_workers}
+    else:
+        workers = None
+    workers_source_valid = (type(workers) is int and workers > 0) or (
+        isinstance(workers, dict) and set(workers) == set(worker_keys)
+        and all(type(value) is int and value > 0 for value in workers.values()))
+    configured = {
+        'schema': meta.get('schema') if isinstance(meta.get('schema'), str) and re.fullmatch(r'[0-9]+:[A-Za-z0-9._-]+', meta['schema']) else None,
+        'security_mode_sha256': hashlib.sha256(json.dumps(safe_security, sort_keys=True).encode()).hexdigest() if safe_security else None,
+        'quota': quota, 'workers': workers,
+        'durability': meta.get('durability') if meta.get('durability') in ('durable_sqlite_postgres', 'synthetic_journal_background+sqlite_command_executors', 'synthetic-load; not durable gateway outbox') else None,
+        'topology': ({k: nonnegative_int(meta['topology'].get(k)) for k in ('gateways', 'sensors_per_gateway', 'viewers')}
+                     if isinstance(meta.get('topology'), dict) else None),
+        'phase_seconds': ({k: finite_positive(v) for k, v in phase_seconds.items() if k in ('initial', 'warm_replay', 'viewer', 'control')}
+                          if isinstance(phase_seconds, dict) else None), 'workload_config': workload_config,
+        'image_ids': _sanitize_image_ids(reference.get('image_ids') or meta.get('image_ids')),
+        'source_revision': (reference.get('source_revision') or meta.get('source_revision') or source_fp.get('revision')),
+        'source_dirty_sha256': source_fp.get('dirty_source_sha256') or meta.get('dirty_tree_hash'),
+        'paperload_binary_sha256': reference.get('paperload_binary_sha256') or meta.get('paperload_binary_sha256'),
+        'gateway_binary_sha256': reference.get('gateway_binary_sha256') or meta.get('gateway_binary_sha256'),
+        'combined_binary_sha256': meta.get('combined_binary_sha256') or meta.get('binary_sha256'),
+        'paperload_source_sha256': meta.get('paperload_source_sha256'),
+    }
+    configured['source_revision'] = configured['source_revision'] if re.fullmatch(r'[0-9a-f]{40,64}', str(configured['source_revision'] or '')) else None
+    for key in ('source_dirty_sha256', 'paperload_binary_sha256', 'gateway_binary_sha256', 'combined_binary_sha256', 'paperload_source_sha256'):
+        configured[key] = configured[key] if re.fullmatch(r'[0-9a-f]{64}', str(configured[key] or '')) else None
+    quota_valid = (isinstance(quota, dict) and type(quota.get('cpus')) is int and quota['cpus'] > 0
+                   and type(quota.get('memory_bytes')) is int and quota['memory_bytes'] > 0
+                   and ('queue_capacity' not in quota or type(quota['queue_capacity']) is int and quota['queue_capacity'] >= 0))
+    topology_valid = (isinstance(configured['topology'], dict)
+                      and set(configured['topology']) == {'gateways', 'sensors_per_gateway', 'viewers'}
+                      and all(type(v) is int and v >= 0 for v in configured['topology'].values()))
+    phase_valid = (isinstance(configured['phase_seconds'], dict) and bool(configured['phase_seconds'])
+                   and all(v is not None for v in configured['phase_seconds'].values()))
+    workload_valid = (
+        configured['workload_config']['profile'] is not None
+        and configured['workload_config']['selection_sha256'] is not None
+        and configured['workload_config']['commands']['count'] is not None
+        and configured['workload_config']['commands']['frequencies_hz'] is not None
+        and configured['workload_config']['commands']['executor'] is not None
+        and all(v is not None for v in configured['workload_config']['telemetry'].values())
+        and all(type(v) is bool for v in configured['workload_config']['security'].values())
+    )
+    required = all((configured['source_revision'], configured['source_dirty_sha256'],
+                    configured['paperload_binary_sha256'], configured['gateway_binary_sha256'],
+                    configured['combined_binary_sha256'], configured['workload_config']['selection_sha256'],
+                    configured['paperload_source_sha256'], configured['schema'], configured['security_mode_sha256'],
+                    security_source_valid, workers_source_valid, quota_valid, configured['workers'], configured['durability'], topology_valid,
+                    phase_valid, workload_valid, configured['image_ids'], dataset_fields['journal_sha256'],
+                    dataset_fields['dataset_anchor_sha256'], configured['workload_config']['profile'],
+                    configured['workload_config']['commands']['count']))
+    config_hash = hashlib.sha256(json.dumps(configured, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    dataset_hash = hashlib.sha256(json.dumps(dataset_fields, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    report_set = sorted(raw_hashes.values())
+    return {
+        'configured_fields': configured, 'dataset_fields': dataset_fields,
+        'workload_config_sha256': config_hash, 'dataset_sha256': dataset_hash,
+        'repeat_identity': hashlib.sha256((dataset_hash + ''.join(report_set)).encode()).hexdigest(),
+        'report_sha256_set': report_set,
+        'qualified': required,
+        'reason': None if required else 'required_source_or_context_provenance_missing_reexport_required',
+    }
+
+
+def _metric_unavailable_reason(summary, metric):
+    arm, name = metric.split('.', 1)
+    if name.startswith('gamma_'):
+        pair = next((p for p in summary['pairs'] if p['arm'] == arm), {})
+        entry = pair.get(name) or {}
+        return entry.get('reason') or pair.get('activation_reason') or 'benefit_metric_not_eligible'
+    row = next((r for r in summary['runs'] if r['arm'] == arm), {})
+    reasons = row.get('metric_unavailable_reasons') or {}
+    return reasons.get(name) or row.get(name + '_reason') or 'source_metric_missing_or_nonfinite'
+
+
+def _validate_aggregation_provenance(summary, provenance):
+    fields = provenance.get('configured_fields')
+    dataset = provenance.get('dataset_fields')
+    if not isinstance(fields, dict) or not isinstance(dataset, dict) or provenance.get('qualified') is not True:
+        raise ValueError('summary_missing_qualified_aggregation_provenance_reexport_required')
+    required_hashes = ('source_dirty_sha256', 'paperload_binary_sha256', 'gateway_binary_sha256', 'combined_binary_sha256', 'paperload_source_sha256', 'security_mode_sha256')
+    for key in required_hashes:
+        if not re.fullmatch(r'[0-9a-f]{64}', str(fields.get(key) or '')):
+            raise ValueError('summary_invalid_required_provenance_' + key + '_reexport_required')
+    if not re.fullmatch(r'[0-9a-f]{40}', str(fields.get('source_revision') or '')):
+        raise ValueError('summary_invalid_required_source_revision_reexport_required')
+    if (not isinstance(fields.get('schema'), str) or not fields['schema']
+            or not isinstance(fields.get('quota'), dict) or type(fields['quota'].get('cpus')) is not int
+            or fields['quota']['cpus'] <= 0 or type(fields['quota'].get('memory_bytes')) is not int
+            or fields['quota']['memory_bytes'] <= 0
+            or not isinstance(fields.get('durability'), str) or not isinstance(fields.get('topology'), dict)
+            or not isinstance(fields.get('phase_seconds'), dict)):
+        raise ValueError('summary_missing_comparison_configuration_reexport_required')
+    workers = fields.get('workers')
+    if type(workers) is int:
+        workers_valid = workers > 0  # Explicit legacy scalar schema support.
+    else:
+        worker_keys = {'paperload', 'gateway_executors', 'mqtt_worker_count', 'database_max_conns',
+                       'stage5_publish_workers', 'stage5_result_workers'}
+        workers_valid = (isinstance(workers, dict) and set(workers) == worker_keys
+                         and all(type(value) is int and value > 0 for value in workers.values()))
+    if not workers_valid:
+        raise ValueError('summary_invalid_worker_configuration_reexport_required')
+    if not isinstance(fields.get('image_ids'), dict) or not fields['image_ids'] or any(
+            not re.fullmatch(r'sha256:[0-9a-f]{64}', str(v)) for v in fields['image_ids'].values()):
+        raise ValueError('summary_invalid_image_provenance_reexport_required')
+    if not isinstance(fields.get('workload_config'), dict):
+        raise ValueError('summary_invalid_workload_configuration_reexport_required')
+    if not dataset.get('journal_sha256') or not re.fullmatch(r'[0-9a-f]{64}', str(dataset.get('journal_sha256'))):
+        raise ValueError('summary_invalid_dataset_identity_reexport_required')
+    for key in ('context_sha256', 'dataset_anchor_sha256', 'owned_targets_sha256', 'workload_selection_sha256'):
+        if not re.fullmatch(r'[0-9a-f]{64}', str(dataset.get(key) or '')):
+            raise ValueError('summary_missing_dataset_context_reexport_required')
+    if not fields.get('workload_config', {}).get('selection_sha256'):
+        raise ValueError('summary_missing_dataset_context_reexport_required')
+    config_hash = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    dataset_hash = hashlib.sha256(json.dumps(dataset, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    raw_hashes = [row.get('raw_report_sha256') for row in summary['runs']]
+    if any(not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value) for value in raw_hashes):
+        raise ValueError('summary_missing_or_invalid_raw_report_sha256_reexport_required')
+    reports = sorted(raw_hashes)
+    repeat_id = hashlib.sha256((dataset_hash + ''.join(reports)).encode()).hexdigest()
+    if (provenance.get('workload_config_sha256') != config_hash or provenance.get('dataset_sha256') != dataset_hash
+            or provenance.get('report_sha256_set') != reports or provenance.get('repeat_identity') != repeat_id):
+        raise ValueError('summary_provenance_digest_or_row_binding_mismatch_reexport_required')
+    for row in summary['runs']:
+        for key, row_key in (('source_revision', 'source_revision'), ('source_dirty_sha256', 'source_dirty_sha256'),
+                             ('paperload_binary_sha256', 'paperload_binary_sha256'), ('gateway_binary_sha256', 'gateway_binary_sha256'),
+                             ('image_ids', 'image_ids')):
+            if row.get(row_key) != fields.get(key):
+                raise ValueError('summary_run_provenance_mismatch_' + key)
+        if not re.fullmatch(r'[0-9a-f]{64}', str(row.get('raw_report_sha256') or '')):
+            raise ValueError('summary_missing_raw_report_identity_reexport_required')
+
+
+E5_DESCRIPTIVE_METRICS = ('committed', 'samples_new', 'microbatch_groups', 'microbatch_members',
+                          'ram_lookup_hits', 'ram_db_calls_avoided', 'shaper_rate_limited',
+                          'fanout_indexed_selections', 'fanout_scan_evaluations')
+E5_BENEFIT_METRICS = {
+    'microbatch_off': ('gamma_copy_calls', 'gamma_confirmed_commits', 'gamma_begin_attempts'),
+    'ram_dedup_off': ('gamma_warm_attempts', 'gamma_warm_commits'),
+}
+
+
+def aggregate_e5_summaries(summary_paths, output_dir):
+    if not 3 <= len(summary_paths) <= 10:
+        raise ValueError('repeat_summary_count_must_be_3_to_10')
+    summaries, paths = [], set()
+    for item in summary_paths:
+        path = Path(item)
+        if any(parent.is_symlink() for parent in (path, *path.parents)) or not path.is_file():
+            raise ValueError('summary_must_be_regular_non_symlink_file')
+        resolved = path.resolve()
+        if resolved in paths:
+            raise ValueError('duplicate_summary_input')
+        paths.add(resolved)
+        if path.stat().st_size > 5 * 1024 * 1024 or path.stat().st_mode & 0o077:
+            raise ValueError('summary_size_or_permissions_invalid')
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('summary_json_must_be_object_reexport_required')
+        prov = data.get('aggregation_provenance')
+        if not isinstance(prov, dict):
+            raise ValueError('summary_missing_qualified_aggregation_provenance_reexport_required')
+        report_hashes = prov.get('report_sha256_set')
+        if not isinstance(report_hashes, list) or len(report_hashes) != 6:
+            raise ValueError('summary_missing_qualified_aggregation_provenance_reexport_required')
+        if (data.get('schema') != 'p8-e5-safe-summary-v1' or data.get('full_p8_accepted') is not False
+                or data.get('run_count') != 6 or not isinstance(data.get('runs'), list) or len(data['runs']) != 6
+                or data.get('status') != 'PILOT_RUNS_COMPLETE_QUALIFIED' or prov.get('qualified') is not True
+                or not prov.get('dataset_sha256') or not prov.get('repeat_identity')
+                or not re.fullmatch(r'[0-9a-f]{64}', str(prov.get('dataset_sha256')))
+                or any(not isinstance(h, str) or not re.fullmatch(r'[0-9a-f]{64}', h) for h in report_hashes)):
+            raise ValueError('summary_missing_qualified_aggregation_provenance_reexport_required')
+        if any(not isinstance(r, dict) for r in data['runs']) or {r.get('arm') for r in data['runs']} != set(ARM_NAMES) or any(
+            r.get('status') != 'PASS' or r.get('cleanup_verified') is not True or r.get('exact_cleanup_verified') is not True for r in data['runs']):
+            raise ValueError('summary_runs_not_six_qualified_arms')
+        if len({r.get('arm') for r in data['runs']}) != 6:
+            raise ValueError('summary_duplicate_arm')
+        if len(set(prov['report_sha256_set'])) != 6:
+            raise ValueError('duplicate_raw_report_identity')
+        pairs = data.get('pairs')
+        if (not isinstance(pairs, list) or len(pairs) != 5 or any(not isinstance(p, dict) for p in pairs)
+                or {p.get('arm') for p in pairs} != set(ARM_NAMES[1:])
+                or any(p.get('comparability') != 'COMPARABLE' or p.get('activation_status') not in ('ELIGIBLE', 'INCONCLUSIVE') for p in pairs)):
+            raise ValueError('summary_pair_comparability_or_activation_invalid')
+        _validate_aggregation_provenance(data, prov)
+        summaries.append(data)
+    provs = [s['aggregation_provenance'] for s in summaries]
+    for key in ('configured_fields', 'workload_config_sha256'):
+        if any(p.get(key) != provs[0].get(key) for p in provs[1:]):
+            raise ValueError('repeat_comparability_mismatch_' + key)
+    if len({p['repeat_identity'] for p in provs}) != len(provs) or len({h for p in provs for h in p['report_sha256_set']}) != 6 * len(provs):
+        raise ValueError('duplicate_repeat_or_raw_report_identity')
+    if len({p['dataset_sha256'] for p in provs}) != len(provs):
+        raise ValueError('repeat_dataset_context_not_independent_seed_only_edits_rejected')
+    if len({p['dataset_fields']['journal_sha256'] for p in provs}) != len(provs):
+        raise ValueError('repeat_journal_content_duplicate')
+    rows = []
+    for summary in summaries:
+        run = {r['arm']: r for r in summary['runs']}
+        pairs = {p['arm']: p for p in summary.get('pairs', [])}
+        values = {}
+        for arm in ARM_NAMES:
+            r = run[arm]
+            for metric in E5_DESCRIPTIVE_METRICS:
+                key = f'{arm}.{metric}'
+                val = r.get(metric)
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or (not metric.startswith('gamma_') and val < 0):
+                    continue
+                values[key] = val
+            for metric in E5_BENEFIT_METRICS.get(arm, ()):
+                pair = pairs[arm]
+                entry = pair.get(metric)
+                if isinstance(entry, dict) and entry.get('available') is True and pair.get('activation_status') == 'ELIGIBLE':
+                    val = entry.get('gamma_red_percent')
+                    if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+                        values[f'{arm}.{metric}'] = val
+        rows.append(values)
+    metrics = {}
+    expected_metrics = [f'{arm}.{metric}' for arm in ARM_NAMES for metric in E5_DESCRIPTIVE_METRICS]
+    expected_metrics += [f'{arm}.{metric}' for arm, metrics_for_arm in E5_BENEFIT_METRICS.items() for metric in metrics_for_arm]
+    per_repeat = {}
+    for metric in expected_metrics:
+        usable = [row.get(metric) for row in rows]
+        per_repeat[metric] = [{'repeat_identity': p['repeat_identity'], 'value': row.get(metric),
+                               'eligible': metric in row,
+                               'reason': None if row.get(metric) is not None else _metric_unavailable_reason(source_summary, metric)}
+                              for p, row, source_summary in zip(provs, rows, summaries)]
+        usable = [v for v in usable if v is not None]
+        if len(usable) != len(rows):
+            metrics[metric] = {'available': False, 'provided_repeats': len(rows), 'eligible_repeats': len(usable), 'official_repeat_qualified': False, 'reason': 'metric_missing_or_ineligible_in_repeat'}
+            continue
+        records = [{'run_id': p['repeat_identity'], 'status':'PASS','cleanup_verified':True,'compatibility_key':provs[0]['workload_config_sha256'],metric:v} for p,v in zip(provs, usable)]
+        agg = aggregate_independent_repeats(records, [metric], allow_negative_metrics={metric} if '.gamma_' in metric else ())
+        metrics[metric] = {'available': agg.get('available') is True, 'provided_repeats':len(rows), 'eligible_repeats':len(usable), 'official_repeat_qualified':len(usable)>=3 and agg.get('available') is True, **(agg.get('metrics',{}).get(metric,{ 'reason':agg.get('reason')}))}
+    qualified_benefit = any(metrics.get(f'{arm}.{name}', {}).get('official_repeat_qualified')
+                            for arm, names in E5_BENEFIT_METRICS.items() for name in names)
+    qualified_descriptive = any(metrics.get(f'{arm}.{name}', {}).get('official_repeat_qualified')
+                                for arm in ARM_NAMES for name in E5_DESCRIPTIVE_METRICS)
+    status = ('AGGREGATED_WITH_QUALIFIED_BENEFITS' if qualified_benefit else
+              'AGGREGATED_DESCRIPTIVE_ONLY' if qualified_descriptive else 'INCONCLUSIVE')
+    result = {'schema':'p8-e5-independent-aggregate-v1','status':status,'full_p8_accepted':False,'independence_claim':'local structural/source-qualified identity checks; not cryptographic attestation','provided_repeats':len(rows),'metrics':metrics,'per_repeat':per_repeat}
+    out = Path(output_dir)
+    if any(parent.is_symlink() for parent in (out, *out.parents)) or out.exists(): raise ValueError('output_dir_must_be_fresh_non_symlink_path')
+    out.mkdir(parents=True, mode=0o700)
+    target = out / 'e5-aggregate.json'
+    target.write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+    target.chmod(0o600)
+    csv_path = out / 'e5-aggregate.csv'
+    with csv_path.open('w', newline='') as stream:
+        writer=csv.DictWriter(stream, fieldnames=['metric','available','count','provided_repeats','eligible_repeats','official_repeat_qualified','median','min','max','range','reason'])
+        writer.writeheader()
+        for key,val in metrics.items(): writer.writerow({'metric':key,**val})
+    csv_path.chmod(0o600)
+    return result
+
+
 def export_e5_summary(
     arm_paths: Dict[str, Union[str, Path]],
     output_dir: Union[str, Path],
@@ -1181,8 +1560,10 @@ def export_e5_summary(
 ) -> Dict[str, Any]:
     summary = build_e5_summary(arm_paths, private_context=private_context)
     out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / 'e5-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    summary_path = out / 'e5-summary.json'
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+    summary_path.chmod(0o600)
     for filename, rows in (('e5-runs.csv', summary['runs']), ('e5-pairs.csv', summary['pairs'])):
         if not rows:
             continue
@@ -1201,6 +1582,7 @@ def export_e5_summary(
                     k: json.dumps(v, sort_keys=True) if isinstance(v, (dict, list)) else ('' if v is None else v)
                     for k, v in row.items()
                 })
+        (out / filename).chmod(0o600)
     return summary
 
 
@@ -1228,6 +1610,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_e5.add_argument('--output-dir', required=True, help='Summary export directory')
     p_e5.add_argument('--private-context', default=None, help='Validated private context SHA-256')
 
+    p_agg = sub.add_parser('e5-aggregate', help='Aggregate explicit independent E5 summaries.')
+    p_agg.add_argument('--repeat-summary', action='append', required=True)
+    p_agg.add_argument('--output-dir', required=True)
+
     p_preflight = sub.add_parser('preflight-arm', help='Show expected flags for an arm.')
     p_preflight.add_argument('--arm', required=True, choices=ARM_NAMES, help='Arm name.')
 
@@ -1252,6 +1638,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(json.dumps({'status': 'REJECTED', 'error': str(exc)}), file=sys.stderr)
+            return 1
+
+    if args.command == 'e5-aggregate':
+        try:
+            result = aggregate_e5_summaries(args.repeat_summary, args.output_dir)
+            print(json.dumps({'status':result['status'],'provided_repeats':result['provided_repeats'],'output_dir':str(args.output_dir)}))
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(json.dumps({'status':'REJECTED','error':str(exc)}), file=sys.stderr)
             return 1
 
     if args.command == 'plan':

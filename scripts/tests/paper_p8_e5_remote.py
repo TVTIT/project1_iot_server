@@ -50,6 +50,48 @@ REQUIRED_CONTEXT_KEYS = (
 )
 
 
+def _selected_replay_counts(prepared):
+    context = prepared.get('context') if isinstance(prepared, dict) else None
+    selection = context.get('workload_selection') if isinstance(context, dict) else None
+    if not isinstance(selection, dict):
+        raise ValueError('e5_workload_selection_missing')
+    expected = e5.workload_preset(selection.get('profile'))
+    if selection != expected:
+        raise ValueError('e5_workload_selection_invalid')
+    return selection['telemetry_messages'], selection['initial_replay_count'], selection['warm_replay_prefix']
+
+
+def _verify_initial_raw(smoke, registry, prepared, journal_by_id):
+    """Prove all raw rows for each selected Gateway/Sensor equal the journal scope."""
+    proofs = []
+    scopes = set()
+    for spec in prepared['specs']:
+        scope = (spec.gateway_id, spec.sensor_id, spec.sensor_urn)
+        if scope in scopes:
+            raise ValueError('e5_initial_raw_scope_duplicate')
+        scopes.add(scope)
+        expected_ids = {
+            message_id for message_id, row in journal_by_id.items()
+            if row.get('gateway_id') == spec.gateway_id and row.get('sensor_id') == spec.sensor_id
+        }
+        if not expected_ids:
+            raise ValueError('e5_initial_raw_scope_empty')
+        proof = e4.verify_pilot_raw(smoke, registry, prepared['pg'], spec)
+        observed_ids = {
+            row.get('message_id') for row in proof.get('identity_ranges', [])
+            if isinstance(row, dict)
+        }
+        proof['selected_dataset_ids_match'] = observed_ids == expected_ids
+        proofs.append(proof)
+        if (proof.get('verified_exact') is not True
+                or proof.get('ledger_count') != len(expected_ids)
+                or observed_ids != expected_ids):
+            raise ValueError('e5_initial_raw_verification_failed')
+    if len(scopes) != 2 or sum(proof['ledger_count'] for proof in proofs) != len(journal_by_id):
+        raise ValueError('e5_initial_raw_scope_accounting_mismatch')
+    return proofs
+
+
 def _validate_private_file(path, code_prefix, max_bytes=16384):
     p = Path(path)
     try:
@@ -450,32 +492,33 @@ def finish_remote_initial(smoke, fixture, endpoint, registry, containers, prepar
     workload = b_projection.get('e4') or {}
     telemetry = b_projection.get('telemetry') or {}
 
-    # Initial requires replay 20 ACK and pending 0
-    if not e5.replay_accounting_matches(workload, telemetry, 20):
+    _, initial_count, _ = _selected_replay_counts(prepared)
+    # Initial accounting is bound to the repeat context, not a profile-name assumption.
+    if not e5.replay_accounting_matches(workload, telemetry, initial_count):
         raise ValueError('e5_initial_accounting_mismatch')
     if telemetry.get('pending_messages', 0) != 0:
         raise ValueError('e5_initial_pending_messages_not_zero')
     pubacks = telemetry.get('broker_pubacks')
     attempts = telemetry.get('publish_attempts')
     retries = telemetry.get('retries')
-    if (type(pubacks) is not int or pubacks < 20 or type(attempts) is not int
-            or type(retries) is not int or attempts < 20 or retries < 0
-            or attempts != 20 + retries or pubacks > attempts):
+    if (type(pubacks) is not int or pubacks < initial_count or type(attempts) is not int
+            or type(retries) is not int or attempts < initial_count or retries < 0
+            or attempts != initial_count + retries or pubacks > attempts):
         raise ValueError('e5_initial_publish_accounting_incoherent')
 
-    # 20 headers matching A immutable journal IDs and hashes
+    # Every selected initial header must match the A-owned immutable dataset.
     dataset_file = Path(prepared['dataset_path'])
     journal_lines = [json.loads(line) for line in dataset_file.read_text(encoding='utf-8').strip().splitlines() if line.strip()]
-    if len(journal_lines) != 20:
+    if len(journal_lines) != initial_count:
         raise ValueError('e5_journal_line_count_invalid')
     journal_by_id = {row['message_id']: row for row in journal_lines}
 
     headers = workload.get('safe_header_samples', [])
-    if not isinstance(headers, list) or len(headers) != 20:
+    if not isinstance(headers, list) or len(headers) != initial_count:
         raise ValueError('e5_initial_header_count_mismatch')
     header_by_id = {h.get('message_id'): h for h in headers if isinstance(h, dict)}
     header_ids = list(header_by_id)
-    if len(header_by_id) != 20:
+    if len(header_by_id) != initial_count:
         raise ValueError('e5_initial_headers_not_unique')
     if set(header_by_id) != set(journal_by_id):
         raise ValueError('e5_initial_headers_dataset_mismatch')
@@ -490,18 +533,16 @@ def finish_remote_initial(smoke, fixture, endpoint, registry, containers, prepar
     if admin_after.get('process_instance') != snapshot['admin_before'].get('process_instance'):
         raise ValueError('e5_server_process_restarted_during_initial')
 
-    # Independent A SQL readbacks: ledger 20, raw 2000, temporal 20, configuration 0
+    # Independent A SQL readbacks match the immutable selected dataset.
     db_after = [e4._counts(smoke, registry, prepared['pg'], s) for s in prepared['specs']]
     delta = e4._database_delta(snapshot['db_before'], db_after)
-    expected_delta = {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}
+    expected_delta = {'ledger': initial_count, 'raw': initial_count * 100,
+                      'temporal': initial_count, 'configuration': 0}
     if any(delta.get(k) != v for k, v in expected_delta.items()):
         raise ValueError('e5_initial_database_delta_mismatch')
 
     # Raw content exact known verification
-    raw_proof = [e4.verify_pilot_raw(smoke, registry, prepared['pg'], s, message_ids=header_ids)
-                 for s in prepared['specs']]
-    if len(raw_proof) != 2 or any(row.get('verified_exact') is not True for row in raw_proof):
-        raise ValueError('e5_initial_raw_verification_failed')
+    raw_proof = _verify_initial_raw(smoke, registry, prepared, journal_by_id)
 
     ingress_delta = e4._support.calculate_ingress_delta(snapshot['admin_before'], admin_after)
     ws_window = e4._e4_ws_window(snapshot['admin_before'], admin_after)
@@ -544,29 +585,30 @@ def finish_remote_warm_replay(smoke, fixture, endpoint, registry, containers, pr
     workload = b_projection.get('e4') or {}
     telemetry = b_projection.get('telemetry') or {}
 
-    # Warm replay requires 10 ACK and pending 0
-    if not e5.replay_accounting_matches(workload, telemetry, 10):
+    _, _, warm_count = _selected_replay_counts(prepared)
+    # Warm replay count is independently pinned by the same context.
+    if not e5.replay_accounting_matches(workload, telemetry, warm_count):
         raise ValueError('e5_warm_replay_accounting_mismatch')
     if telemetry.get('pending_messages', 0) != 0:
         raise ValueError('e5_warm_replay_pending_messages_not_zero')
     pubacks = telemetry.get('broker_pubacks')
     attempts = telemetry.get('publish_attempts')
     retries = telemetry.get('retries')
-    if (type(pubacks) is not int or pubacks < 10 or type(attempts) is not int
-            or type(retries) is not int or attempts < 10 or retries < 0
-            or attempts != 10 + retries or pubacks > attempts):
+    if (type(pubacks) is not int or pubacks < warm_count or type(attempts) is not int
+            or type(retries) is not int or attempts < warm_count or retries < 0
+            or attempts != warm_count + retries or pubacks > attempts):
         raise ValueError('e5_warm_replay_publish_accounting_incoherent')
 
-    # Same immutable journal prefix (first 10)
+    # Same immutable journal prefix selected for warm replay.
     dataset_file = Path(prepared['dataset_path'])
     journal_lines = [json.loads(line) for line in dataset_file.read_text(encoding='utf-8').strip().splitlines() if line.strip()]
-    expected_prefix = {row['message_id']: row for row in journal_lines[:10]}
+    expected_prefix = {row['message_id']: row for row in journal_lines[:warm_count]}
 
     headers = workload.get('safe_header_samples', [])
-    if not isinstance(headers, list) or len(headers) != 10:
+    if not isinstance(headers, list) or len(headers) != warm_count:
         raise ValueError('e5_warm_replay_header_count_mismatch')
     header_by_id = {h.get('message_id'): h for h in headers if isinstance(h, dict)}
-    if len(header_by_id) != 10 or set(header_by_id) != set(expected_prefix):
+    if len(header_by_id) != warm_count or set(header_by_id) != set(expected_prefix):
         raise ValueError('e5_warm_replay_prefix_mismatch')
     for message_id, row in expected_prefix.items():
         header = header_by_id[message_id]
@@ -886,6 +928,16 @@ def validate_continuous_viewer(viewer_projection, context, initial_phase_result,
                                lifecycle_proof=None, expected_correlation=None):
     """Validate two viewers continuous across initial -> warm_replay -> control."""
     failures = []
+    try:
+        selection = context.get('workload_selection') if isinstance(context, dict) else None
+        if not isinstance(selection, dict) or selection != e5.workload_preset(selection.get('profile')):
+            raise ValueError
+        initial_count = selection['initial_replay_count']
+        if initial_count % 2:
+            raise ValueError
+    except (TypeError, ValueError, KeyError):
+        failures.append('workload_selection_invalid')
+        initial_count = 20
     if not isinstance(viewer_projection, dict) or viewer_projection.get('status') != 'COMPLETE':
         failures.append('viewer_incomplete')
         viewer_projection = viewer_projection if isinstance(viewer_projection, dict) else {}
@@ -896,19 +948,19 @@ def validate_continuous_viewer(viewer_projection, context, initial_phase_result,
             or viewer_projection.get('receiving_distinct_viewers') != 2):
         failures.append('viewer_readiness')
 
-    # Event accounting: 20 unique events, 0 duplicates, 0 wrong namespace
-    if (viewer_projection.get('unique_events') != 20
+    # Event accounting is bound to the selected initial replay workload.
+    if (viewer_projection.get('unique_events') != initial_count
             or viewer_projection.get('duplicates') != 0
             or viewer_projection.get('wrong_namespace') != 0):
         failures.append('viewer_event_accounting')
 
-    # Per-identity accounting: mapped 10 events each
+    # Two identities receive an even split of the selected initial messages.
     viewers = viewer_projection.get('viewers')
     subscriptions = context.get('viewer_subscriptions') or []
     expected_ids = {row.get('viewer_id') for row in subscriptions if isinstance(row, dict)}
     counts = {row.get('id'): row.get('unique_events')
               for row in viewers if isinstance(row, dict)} if isinstance(viewers, list) else {}
-    if set(counts) != expected_ids or any(val != 10 for val in counts.values()):
+    if set(counts) != expected_ids or any(val != initial_count // 2 for val in counts.values()):
         failures.append('viewer_per_identity_accounting')
 
     # Bounded identity sampling provenance: one sample per declared viewer (matching Go paperload contract)
@@ -986,9 +1038,9 @@ def validate_continuous_viewer(viewer_projection, context, initial_phase_result,
     if sampled_viewers != expected_ids:
         failures.append('viewer_samples_incomplete_for_viewers')
 
-    # A per-phase WS windows: initial 20, warm 0
+    # A per-phase WS windows: selected initial count, then no new warm events.
     ws_checks = [
-        ('initial', initial_ws_window, 20),
+        ('initial', initial_ws_window, initial_count),
         ('warm', warm_ws_window, 0),
     ]
     for name, window, expected_count in ws_checks:
@@ -1239,6 +1291,7 @@ def finalize(smoke, fixture, prepared, phase_results, continuous_viewer_result, 
     initial_res = phase_results.get('initial', {})
     warm_res = phase_results.get('warm_replay', {})
     control_res = phase_results.get('control', {})
+    _, initial_count, _ = _selected_replay_counts(prepared)
 
     viewer_validation = continuous_viewer_result.get('validation', {}) if isinstance(continuous_viewer_result, dict) else {}
     viewer_failures = viewer_validation.get('failures', [])
@@ -1289,7 +1342,9 @@ def finalize(smoke, fixture, prepared, phase_results, continuous_viewer_result, 
         validation_failures.append('main_raw_fingerprint')
 
     init_delta = initial_res.get('database_delta', {})
-    if any(init_delta.get(k) != v for k, v in {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}.items()):
+    if any(init_delta.get(k) != v for k, v in {
+            'ledger': initial_count, 'raw': initial_count * 100,
+            'temporal': initial_count, 'configuration': 0}.items()):
         validation_failures.append('initial_database_delta')
 
     if warm_res.get('db_after') != initial_res.get('db_after'):
@@ -1416,9 +1471,9 @@ def finalize(smoke, fixture, prepared, phase_results, continuous_viewer_result, 
             'imported_input': initial_e4.get('journal_entry_count'),
             'warm_replay': warm_e4.get('journal_entry_count'),
             'main_dataset_delta': {
-                'ledger': init_delta.get('ledger', 20),
-                'raw': init_delta.get('raw', 2000),
-                'temporal': init_delta.get('temporal', 20),
+                'ledger': init_delta.get('ledger', initial_count),
+                'raw': init_delta.get('raw', initial_count * 100),
+                'temporal': init_delta.get('temporal', initial_count),
             },
             'command_receipts_verified': len(control_res.get('pg_receipts', {})),
             'command_configurations_verified': len(control_res.get('rest_configs', {})),

@@ -234,6 +234,7 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
         phase_id = f'equal-samples-{samples_per_message}'
         expected_counts = manifests['expected_counts'][str(samples_per_message)]
 
+    run_id = pair['A']['run_id']
     manifest_paths = {}
     for role_arm in ('A', 'B'):
         path = root / f'{role_arm}.manifest.json'
@@ -2998,7 +2999,11 @@ def validate_e2_result(*, workload_a, workload_b, ingress_delta, database_delta,
         for field in ('publish_attempts', 'broker_pubacks'):
             value = counters.get(field)
             if type(value) is not int or value < minimum: failures.append(f'{arm}_{field}')
-    if not isinstance(phase_events, list):
+    no_b_burst = (official and isinstance(manifest_pair, dict)
+                  and manifest_pair.get('B', {}).get('traffic', {}).get('burst_messages', 0) == 0)
+    if no_b_burst:
+        phase = {'available': None, 'reason': 'b_burst_not_configured'}
+    elif not isinstance(phase_events, list):
         phase = {'available': None, 'reason': 'phase_events_missing'}
     else:
         try:

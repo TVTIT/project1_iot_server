@@ -697,6 +697,7 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
     if len(viewer_subscriptions) == 3:
         viewer['subscriptions'] = [dict(row) for row in viewer_subscriptions]
     viewer['phases'] = {'warmup_seconds': 0, 'measure_seconds': 40, 'drain_seconds': 0, 'cooldown_seconds': 0}
+    viewer['limits']['wall_seconds'] = 70
     # Reuse E3 command contract and caller-provided UUIDv4 keys; omit all MQTT fields.
     control_targets = [{'gateway_id': GATEWAYS[0], 'sensor_id': sid} for sid in COMMAND_SENSORS]
     bundle = e3.e3_pilot_manifests(common=common,
@@ -738,7 +739,10 @@ def prepare_inputs(*, smoke, fixture, endpoint, specs, passwords, tokens, mqtt_b
     _write(root / 'viewer.manifest.json', viewer)
     _write(root / 'control.manifest.json', control)
     # Control-only runner specification. Invocation belongs to a later runtime slice.
-    from scripts.paper_p8_resources import disk_guard_config
+    try:
+        from scripts.paper_p8_resources import disk_guard_config
+    except ImportError:  # direct script execution puts scripts/ on sys.path
+        from paper_p8_resources import disk_guard_config
     run_spec = {'paperload': [{'manifest': str(root / 'control.manifest.json'),
         'output_dir': str(root / 'control-output'), 'role': 'control', 'ready_timeout_seconds': 90}],
         'gateways': [{'env_file': p, 'role': 'executor', 'ready_timeout_seconds': 30} for p in env_paths],

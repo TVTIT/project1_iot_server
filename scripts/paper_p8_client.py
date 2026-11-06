@@ -243,7 +243,7 @@ def _safe_workload(value, *, role=None):
             raise ValueError('workload status rejected')
         if key == 'experiment' and item not in ('E1', 'E2', 'E3', 'E4', 'E5'):
             raise ValueError('workload experiment rejected')
-        if key == 'profile' and item not in ('pilot', 'official'):
+        if key == 'profile' and item not in ('pilot', 'representative', 'official'):
             raise ValueError('workload profile rejected')
         if key == 'mode' and item not in ('local', 'remote'):
             raise ValueError('workload mode rejected')
@@ -720,6 +720,61 @@ def _verified_bundle_metadata(root, binding):
     if expected_inventory != binding.get('source_inventory'):
         raise ValueError('bound bundle metadata inventory mismatch')
     return metadata
+
+
+def _e5_replay_counts(root, binding):
+    """Return replay sizes only from the context and manifests pinned by the binding."""
+    metadata = _verified_bundle_metadata(root, binding)
+    if metadata.get('session', {}).get('experiment') != 'E5':
+        raise ValueError('bound e5 metadata missing')
+    e5 = binding.get('e5')
+    context_path = root / 'runtime/e5-context.json'
+    context_data = _bounded_read(context_path, 65536)
+    if hashlib.sha256(context_data).hexdigest() != (e5 or {}).get('context_sha256'):
+        raise ValueError('bound e5 context provenance mismatch')
+    context = json.loads(context_data)
+    # The bundle's canonical validator constrains the supported presets and their
+    # selection digest. Binding pins context and manifests, so runtime counters
+    # cannot choose or redefine these values.
+    selection = paper_p8_bundle._e5_context_projection(context)['workload_selection']
+    workload = metadata.get('workload', {})
+    if (workload.get('profile') != selection['profile']
+            or workload.get('workload_selection_sha256') != context.get('workload_selection_sha256')):
+        raise ValueError('bound e5 workload selection mismatch')
+    spec = _private_json(root / 'runtime/execution/run-spec.json')
+    manifest_by_phase = {}
+    for job in spec.get('paperload', []):
+        name = Path(job.get('manifest', '')).stem.replace('-', '_')
+        if name in ('initial', 'initial_replay', 'warm_replay'):
+            manifest_by_phase[name] = _private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
+    initial = manifest_by_phase.get('initial') or manifest_by_phase.get('initial_replay')
+    warm = manifest_by_phase.get('warm_replay')
+    if (not initial or not warm
+            or initial.get('e4', {}).get('mode') != 'replay'
+            or initial.get('e4', {}).get('replay_count') != selection['initial_replay_count']
+            or initial.get('e4', {}).get('max_messages') != selection['initial_replay_count']
+            or warm.get('e4', {}).get('mode') != 'replay'
+            or warm.get('e4', {}).get('replay_count') != selection['warm_replay_prefix']
+            or warm.get('e4', {}).get('max_messages') != selection['warm_replay_prefix']):
+        raise ValueError('bound e5 replay manifests mismatch')
+    return selection['initial_replay_count'], selection['warm_replay_prefix']
+
+
+def _validate_e5_header_prefix(root, headers, count):
+    if not isinstance(headers, list) or len(headers) != min(count, 20):
+        return False
+    rows = _bounded_read(root / 'inputs/datasets/dataset.jsonl', paper_p8_bundle.MAX_FILE_BYTES).splitlines()
+    if len(rows) < count:
+        return False
+    keys = ('gateway_id', 'sensor_id', 'boot_id', 'first_sequence', 'sample_count',
+            'payload_sha256', 'message_id')
+    for index, header in enumerate(headers):
+        source = json.loads(rows[index])
+        expected = {key: source[key] for key in keys}
+        expected['topic'] = f"gateways/{source['gateway_id']}/telemetry/{source['sensor_id']}"
+        if header != expected:
+            return False
+    return True
 
 
 def _validate_e4_phase_eligibility(root, binding, jobs, state, phase):
@@ -1748,32 +1803,65 @@ def _select_e4_phase_jobs(jobs, phase, *, replay_validated=False):
     return selected
 
 
-def _validate_e4_phase_result(phase, telemetry, viewer):
+def _validate_e4_phase_result(phase, telemetry, viewer, *, expected_unique, expected_replay):
     if (not isinstance(telemetry, dict) or telemetry.get('experiment') != 'E4'
             or not isinstance(telemetry.get('e4'), dict)
             or telemetry['e4'].get('mode') != phase):
         raise ValueError('E4 telemetry phase result rejected')
     counts = telemetry.get('telemetry', {})
+    if (type(expected_unique) is not int or type(expected_replay) is not int
+            or expected_unique < 2 or expected_unique > 10000 or expected_unique % 2
+            or expected_replay < 1 or expected_replay > expected_unique):
+        raise ValueError('E4 phase expected counts rejected')
+    sample_count = min(expected_unique if phase == 'unique' else expected_replay, 20)
     if phase == 'unique':
-        if (telemetry['e4'].get('journal_entry_count') != 20
-                or counts.get('generated_unique') != 20 or counts.get('application_acks') != 20
+        if (telemetry['e4'].get('journal_entry_count') != expected_unique
+                or counts.get('generated_unique') != expected_unique or counts.get('application_acks') != expected_unique
                 or counts.get('ignored_valid_acks') != 1 or counts.get('retries', 0) < 1
-                or len(telemetry['e4'].get('safe_header_samples', [])) < 10):
+                or counts.get('pending_messages') != 0
+                or len(telemetry['e4'].get('safe_header_samples', [])) != sample_count):
             raise ValueError('E4 unique phase result rejected')
         if (viewer.get('status') != 'COMPLETE' or viewer.get('subscribed_distinct_viewers') != 2
                 or viewer.get('connected_distinct_viewers') != 2
                 or viewer.get('receiving_distinct_viewers') != 2 or viewer.get('unique_events', 0) < 1):
             raise ValueError('E4 unique viewer proof rejected')
     else:
-        if (telemetry['e4'].get('journal_entry_count') != 10
-                or counts.get('replay_offered') != 10
-                or counts.get('replay_application_acks') != 10
-                or len(telemetry['e4'].get('safe_header_samples', [])) != 10):
+        if (telemetry['e4'].get('journal_entry_count') != expected_replay
+                or counts.get('replay_offered') != expected_replay
+                or counts.get('replay_application_acks') != expected_replay
+                or counts.get('pending_messages') != 0
+                or len(telemetry['e4'].get('safe_header_samples', [])) != sample_count):
             raise ValueError('E4 replay phase result rejected')
         if (viewer.get('status') != 'COMPLETE' or viewer.get('subscribed_distinct_viewers') != 2
                 or viewer.get('connected_distinct_viewers') != 2
                 or viewer.get('unique_events', 0) != 0):
             raise ValueError('E4 replay viewer proof rejected')
+
+
+def _e4_manifest_counts(manifests, phase):
+    modes = {manifest.get('e4', {}).get('mode'): manifest for manifest in manifests
+             if isinstance(manifest, dict) and isinstance(manifest.get('e4'), dict)}
+    unique_manifest, replay_manifest = modes.get('unique'), modes.get('replay')
+    unique_e4 = unique_manifest.get('e4', {}) if unique_manifest else {}
+    replay_e4 = replay_manifest.get('e4', {}) if replay_manifest else {}
+    unique, replay = unique_e4.get('max_messages'), replay_e4.get('replay_count')
+    if (not unique_manifest or not replay_manifest
+            or unique_e4.get('replay_count') != 0
+            or (phase != 'unique' and phase not in ('replay', 'cold-replay', 'expiry-replay'))
+            or type(unique) is not int or type(replay) is not int
+            or unique < 2 or unique > 10000 or unique % 2
+            or replay < 1 or replay > unique
+            or unique_e4.get('max_messages') != replay_e4.get('max_messages')):
+        raise ValueError('E4 phase manifest count mismatch')
+    return unique, replay
+
+
+def _validate_e4_header_prefix(unique_headers, replay_headers, replay_count):
+    count = min(replay_count, 20)
+    if (not isinstance(unique_headers, list) or not isinstance(replay_headers, list)
+            or len(unique_headers) < count or len(replay_headers) != count
+            or replay_headers != unique_headers[:count]):
+        raise ValueError('E4 replay journal headers changed')
 
 
 def _e4_phase_lock(root):
@@ -1997,9 +2085,12 @@ def _e5_phase_lock(root):
 def _local_source_fingerprint():
     try:
         from scripts.tests.paper_p8_support import _source_fingerprint
-        return _source_fingerprint(Path(__file__).resolve().parent.parent)
     except Exception:
-        return {'revision': 'local-b', 'dirty': False, 'valid': True}
+        tests_path = str(Path(__file__).resolve().parent / 'tests')
+        if tests_path not in sys.path:
+            sys.path.insert(0, tests_path)
+        from paper_p8_support import _source_fingerprint
+    return _source_fingerprint(Path(__file__).resolve().parent.parent)
 
 
 def _run_e5_viewers(workspace, binary, gateway_binary=None, deadline_seconds=None, poll_seconds=0.1):
@@ -2007,6 +2098,7 @@ def _run_e5_viewers(workspace, binary, gateway_binary=None, deadline_seconds=Non
     binding = _private_json(root / 'runtime/binding.json')
     if binding.get('session', {}).get('experiment') != 'E5':
         raise ValueError('e5_viewers_requires_e5_workspace')
+    expected_unique_events, _ = _e5_replay_counts(root, binding)
 
     if not binary:
         raise ValueError('paperload_binary_required')
@@ -2122,6 +2214,7 @@ def _run_e5_viewers(workspace, binary, gateway_binary=None, deadline_seconds=Non
         control_dir=control_dir,
         correlation=correlation,
         deadline_seconds=effective_deadline,
+        expected_unique_events=expected_unique_events,
         poll_seconds=poll_seconds if poll_seconds else 0.1,
     )
 
@@ -2143,7 +2236,6 @@ def _stop_e5_viewers(workspace):
     provenance = _private_json(prov_path)
     control_dir = Path(provenance['control_dir'])
     correlation = provenance['correlation']
-
     paper_p8_e5_client.request_viewer_stop(control_dir, correlation)
     return {'status': 'STOP_REQUESTED', 'correlation': correlation}
 
@@ -2360,6 +2452,7 @@ def _export_e5_results(workspace, output, phase):
     provenance = _private_json(prov_path)
     control_dir = Path(provenance['control_dir'])
     correlation = provenance['correlation']
+    initial_replay_count, _ = _e5_replay_counts(root, binding)
 
     phase_dir = root / 'outputs/e5-phases' / phase
     run_artifact = phase_dir / 'run.json'
@@ -2405,6 +2498,7 @@ def _export_e5_results(workspace, output, phase):
 
     run_spec = _private_json(root / 'runtime/execution/run-spec.json')
     declared_keys = _private_json(root / 'runtime/e5-context.json').get('command_keys', [])
+    initial_replay_count, warm_replay_prefix = _e5_replay_counts(root, binding)
 
     holder_status = paper_p8_e5_client.read_viewer_holder_status(control_dir)
     holder_ready = (holder_status.get('ready_verified') is True)
@@ -2435,12 +2529,13 @@ def _export_e5_results(workspace, output, phase):
             raise ValueError('initial_child_errors_present')
         e4_info = workload_raw.get('e4')
         if (not isinstance(e4_info, dict) or e4_info.get('mode') != 'replay'
-                or e4_info.get('journal_entry_count') != 20 or len(e4_info.get('safe_header_samples', [])) != 20):
+                or e4_info.get('journal_entry_count') != initial_replay_count
+                or not _validate_e5_header_prefix(root, e4_info.get('safe_header_samples'), initial_replay_count)):
             raise ValueError('initial_replay_contract_invalid')
         telemetry_info = workload_raw.get('telemetry')
         if (not isinstance(telemetry_info, dict) or telemetry_info.get('pending_messages') != 0
-                or telemetry_info.get('broker_pubacks', 0) < 20
-                or telemetry_info.get('replay_application_acks', 0) != 20):
+                or telemetry_info.get('broker_pubacks', 0) < initial_replay_count
+                or telemetry_info.get('replay_application_acks', 0) != initial_replay_count):
             raise ValueError('initial_telemetry_accounting_invalid')
 
         telemetry_workload = _safe_workload(workload_raw, role='telemetry')
@@ -2488,12 +2583,13 @@ def _export_e5_results(workspace, output, phase):
             raise ValueError('warm_replay_child_errors_present')
         e4_info = workload_raw.get('e4')
         if (not isinstance(e4_info, dict) or e4_info.get('mode') != 'replay'
-                or e4_info.get('journal_entry_count') != 10 or len(e4_info.get('safe_header_samples', [])) != 10):
+                or e4_info.get('journal_entry_count') != warm_replay_prefix
+                or not _validate_e5_header_prefix(root, e4_info.get('safe_header_samples'), warm_replay_prefix)):
             raise ValueError('warm_replay_contract_invalid')
         telemetry_info = workload_raw.get('telemetry')
         if (not isinstance(telemetry_info, dict) or telemetry_info.get('pending_messages') != 0
-                or telemetry_info.get('broker_pubacks', 0) < 10
-                or telemetry_info.get('replay_application_acks', 0) != 10):
+                or telemetry_info.get('broker_pubacks', 0) < warm_replay_prefix
+                or telemetry_info.get('replay_application_acks', 0) != warm_replay_prefix):
             raise ValueError('warm_replay_telemetry_accounting_invalid')
 
         telemetry_workload = _safe_workload(workload_raw, role='telemetry')
@@ -2565,19 +2661,21 @@ def _export_e5_results(workspace, output, phase):
             raise ValueError('viewer_manifest_role_invalid')
         # ViewerResult emits experiment/arm/profile/mode/run_id; the trusted
         # manifest (not a result-side roles field) declares the role.
-        if (viewer_raw.get('experiment') != viewer_manifest.get('experiment')
-                or viewer_raw.get('arm') != viewer_manifest.get('arm')
-                or viewer_raw.get('profile') != viewer_manifest.get('profile')
-                or viewer_raw.get('mode') != viewer_manifest.get('mode')
-                or viewer_raw.get('run_id') != viewer_manifest.get('run_id')
-                or viewer_raw.get('status') != 'COMPLETE' or viewer_raw.get('planned_stop') is not True
-                or viewer_raw.get('planned_stop_reason') != 'stopped_by_operator'
-                or viewer_raw.get('connection_attempts') != 2 or viewer_raw.get('connected_distinct_viewers') != 2
-                or viewer_raw.get('subscribed_distinct_viewers') != 2 or viewer_raw.get('receiving_distinct_viewers') != 2
-                or viewer_raw.get('reconnections') != 0 or viewer_raw.get('unique_events') != 20
-                or viewer_raw.get('duplicates') != 0 or viewer_raw.get('wrong_namespace') != 0
-                or viewer_raw.get('primary_error')):
-            raise ValueError('e5_viewer_planned_stop_invalid')
+        viewer_invalid = [
+            key for key, expected in (
+                ('experiment', viewer_manifest.get('experiment')), ('arm', viewer_manifest.get('arm')),
+                ('profile', viewer_manifest.get('profile')), ('mode', viewer_manifest.get('mode')),
+                ('run_id', viewer_manifest.get('run_id')), ('status', 'COMPLETE'),
+                ('planned_stop', True), ('planned_stop_reason', 'stopped_by_operator'),
+                ('connection_attempts', 2), ('connected_distinct_viewers', 2),
+                ('subscribed_distinct_viewers', 2), ('receiving_distinct_viewers', 2),
+                ('reconnections', 0), ('unique_events', initial_replay_count),
+                ('duplicates', 0), ('wrong_namespace', 0))
+            if viewer_raw.get(key) != expected]
+        if viewer_raw.get('primary_error'):
+            viewer_invalid.append('primary_error')
+        if viewer_invalid:
+            raise ValueError('e5_viewer_planned_stop_invalid:' + ','.join(viewer_invalid))
 
         viewer_workload = _safe_workload(viewer_raw, role='viewer')
         viewer_cleanups = viewer_raw.get('cleanup_errors', [])
@@ -2773,7 +2871,7 @@ def main(argv=None):
             jobs, gateways, stop_timeout, _ = paper_p8._read_spec(str(spec_path), None, None)
             if args.command == 'preflight':
                 binding = _private_json(root / 'runtime/binding.json')
-                official_opt_in = (binding.get('session', {}).get('experiment') in ('E1', 'E3')
+                official_opt_in = (binding.get('session', {}).get('experiment') in ('E1', 'E2', 'E3', 'E4')
                     and binding.get('session', {}).get('profile') == 'official')
                 for gateway in gateways:
                     paper_p8._gateway_environment(gateway['env_file'])
@@ -2820,8 +2918,11 @@ def main(argv=None):
                                 raise ValueError('E4 phase manifest provenance mismatch')
                             manifest_values.append(manifest)
                         telemetry_manifest = next(m for m in manifest_values if m.get('roles') == ['telemetry'])
-                        expected_e4_mode = 'replay' if args.phase in ('cold-replay', 'expiry-replay') else args.phase
-                        if telemetry_manifest.get('e4', {}).get('mode') != expected_e4_mode:
+                        count_manifests = [_private_json(Path(job['manifest']), paper_p8_bundle.MAX_MANIFEST_BYTES)
+                            for job in jobs if job.get('role') == 'telemetry']
+                        expected_unique, expected_replay = _e4_manifest_counts(count_manifests, args.phase)
+                        if telemetry_manifest.get('e4', {}).get('mode') != (
+                                'unique' if args.phase == 'unique' else 'replay'):
                             raise ValueError('E4 phase manifest mode mismatch')
                         journal_limit = telemetry_manifest.get('e4', {}).get('max_bytes')
                         if type(journal_limit) is not int or not 1 <= journal_limit <= (64 << 20):
@@ -2899,7 +3000,7 @@ def main(argv=None):
                         if e4 and phase_resumed:
                             status, report = 'COMPLETE', _private_json(artifact)
                         else:
-                            official_opt_in = (binding.get('session', {}).get('experiment') in ('E1', 'E3')
+                            official_opt_in = (binding.get('session', {}).get('experiment') in ('E1', 'E2', 'E3', 'E4')
                                 and binding.get('session', {}).get('profile') == 'official')
                             status, report = paper_p8.run_supervised(binary=args.binary,
                                 gateway_binary=args.gateway_binary, jobs=selected, gateways=gateways,
@@ -2925,10 +3026,11 @@ def main(argv=None):
                         telemetry = _safe_workload(json.loads(telemetry_output.read_text()), role='telemetry')
                         viewer = _safe_workload(json.loads(viewer_output.read_text()), role='viewer')
                         validation_phase = 'replay' if args.phase in ('cold-replay', 'expiry-replay') else args.phase
-                        _validate_e4_phase_result(validation_phase, telemetry, viewer)
-                        if (args.phase in ('replay', 'cold-replay', 'expiry-replay') and telemetry['e4']['safe_header_samples']
-                                != state.get('unique_header_samples')):
-                            raise ValueError('E4 replay journal headers changed')
+                        _validate_e4_phase_result(validation_phase, telemetry, viewer,
+                            expected_unique=expected_unique, expected_replay=expected_replay)
+                        if args.phase in ('replay', 'cold-replay', 'expiry-replay'):
+                            _validate_e4_header_prefix(state.get('unique_header_samples'),
+                                telemetry['e4']['safe_header_samples'], expected_replay)
                         if not journal_path.is_file() or journal_path.stat().st_size > journal_limit:
                             raise ValueError('E4 journal artifact missing or over bound')
                         journal_after = _file_sha256(journal_path)
@@ -2938,7 +3040,7 @@ def main(argv=None):
                             unique_validated=(args.phase == 'unique' or state.get('unique_validated') is True),
                             unique_journal_sha256=(journal_after if args.phase == 'unique'
                                 else state.get('unique_journal_sha256')),
-                        unique_header_samples=(telemetry['e4']['safe_header_samples'][:10]
+                        unique_header_samples=(telemetry['e4']['safe_header_samples'][:20]
                                 if args.phase == 'unique' else state.get('unique_header_samples')),
                             last_journal_sha256=journal_after,
                             last_phase_workload_sha256=hashlib.sha256(telemetry_output.read_bytes()).hexdigest(),

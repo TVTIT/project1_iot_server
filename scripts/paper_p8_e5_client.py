@@ -282,7 +282,8 @@ def _ready(path: Path) -> bool:
     return v.get('status') == 'ready' and v.get('connected') == 2 and v.get('subscribed') == 2 and v.get('principals') == 2 and v.get('mode') == 'healthy'
 
 
-def _validate_result(path: Path, m: dict[str, Any], c: dict[str, str]) -> dict[str, Any]:
+def _validate_result(path: Path, m: dict[str, Any], c: dict[str, str],
+                     expected_unique_events: int = 20) -> dict[str, Any]:
     result = _read_json(path)
     if not _identity_matches(result, m, c):
         raise HolderError('result_identity_mismatch')
@@ -291,7 +292,7 @@ def _validate_result(path: Path, m: dict[str, Any], c: dict[str, str]) -> dict[s
     if (result.get('connection_attempts') != 2 or result.get('socket_count') != 2
             or result.get('connected_distinct_viewers') != 2 or result.get('subscribed_distinct_viewers') != 2
             or result.get('receiving_distinct_viewers') != 2 or result.get('principal_count') != 2
-            or result.get('reconnections') != 0 or result.get('unique_events') != 20
+            or result.get('reconnections') != 0 or result.get('unique_events') != expected_unique_events
             or result.get('duplicates') != 0 or result.get('wrong_namespace') != 0
             or result.get('primary_error')):
         raise HolderError('result_viewer_provenance_invalid')
@@ -312,7 +313,8 @@ def _fresh_output_path(path: Path) -> Path:
 
 def run_viewer_holder(binary: str | Path, manifest_path: str | Path, output_dir: str | Path,
                       control_dir: str | Path, correlation: dict[str, str], deadline_seconds: int,
-                      *, poll_seconds: float = 0.1) -> dict[str, Any]:
+                      *, expected_unique_events: int = 20,
+                      poll_seconds: float = 0.1) -> dict[str, Any]:
     """Own one E5 B viewer foreground until a correlated planned-stop request or failure."""
     c = _correlation(correlation)
     if not isinstance(deadline_seconds, int) or isinstance(deadline_seconds, bool) or not 1 <= deadline_seconds <= MAX_DEADLINE_SECONDS:
@@ -460,7 +462,8 @@ def run_viewer_holder(binary: str | Path, manifest_path: str | Path, output_dir:
                 raise HolderError('child_join_timeout') from exc
             if rc != 0:
                 raise HolderError('child_failed')
-            result = _validate_result(output / 'workload.json', manifest, c)
+            result = _validate_result(output / 'workload.json', manifest, c,
+                                      expected_unique_events=expected_unique_events)
             stop_elapsed = max(0.0, time.monotonic() - start)
             if (ready_elapsed is None or len(checkpoints) != 6
                     or not math.isfinite(ready_elapsed) or not math.isfinite(stop_elapsed)

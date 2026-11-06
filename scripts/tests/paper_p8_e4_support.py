@@ -13,6 +13,47 @@ import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 
+E4_HEADER_SAMPLE_LIMIT = 20
+
+
+def e4_journal_byte_bound(unique_count):
+    return min(64 << 20, max(1 << 20, unique_count * (48 << 10)))
+
+
+def e4_raw_samples_verified(checks, unique_count):
+    if not isinstance(checks, list) or len(checks) != 2 or type(unique_count) is not int:
+        return False
+    target_count = unique_count // 2
+    sample_count = min(target_count, E4_HEADER_SAMPLE_LIMIT // 2)
+    for item in checks:
+        if not isinstance(item, dict) or item.get('raw_identity_value_mismatches') != 0:
+            return False
+        if item.get('verified_exact') is True:
+            if item.get('ledger_count') != target_count:
+                return False
+        elif (item.get('verified_sample') is not True or item.get('ledger_count') != sample_count
+              or not isinstance(item.get('identity_ranges'), list)
+              or len(item['identity_ranges']) != sample_count):
+            return False
+    return True
+
+
+def e4_phase_durations(unique_count, replay_count, *, base_rate=5, max_seconds=3600):
+    counts = validate_e4_dataset_counts(unique_count, replay_count, profile='official', official_opt_in=True)
+    if type(base_rate) is not int or not 1 <= base_rate <= 100 or type(max_seconds) is not int or max_seconds < 1:
+        raise ValueError('p8_e4_schedule_bounds_rejected')
+    unique_seconds = (counts['unique_count'] + base_rate - 1) // base_rate
+    replay_seconds = (counts['replay_count'] + base_rate - 1) // base_rate
+    if max(unique_seconds, replay_seconds) > max_seconds or unique_seconds + replay_seconds + 60 > 7200:
+        raise ValueError('p8_e4_schedule_budget_rejected')
+    viewer_seconds = max(unique_seconds, replay_seconds)
+    workload_seconds = unique_seconds + replay_seconds + 2 * viewer_seconds + 2 * 8 + 120
+    if 90 + workload_seconds > 7200:
+        raise ValueError('p8_e4_bundle_lifetime_budget_rejected')
+    return {'base_rate_per_second': base_rate, 'unique_seconds': unique_seconds,
+            'replay_seconds': replay_seconds, 'viewer_seconds': viewer_seconds,
+            'workload_seconds': workload_seconds, 'drain_seconds': 8}
+
 _here = Path(__file__).parent
 _spec = importlib.util.spec_from_file_location('paper_p8_support', _here / 'paper_p8_support.py')
 _support = importlib.util.module_from_spec(_spec)
@@ -68,7 +109,14 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
             counts != {'ledger': unique_count // 2, 'raw': unique_count // 2 * samples_per_message, 'temporal': unique_count // 2} for counts in scoped_delta['available'].values()):
         failures.append('sensor_scope_mismatch')
     if not isinstance(raw_checks, list) or len(raw_checks) != 2 or any(
-            not isinstance(x, dict) or x.get('verified_exact') is not True or x.get('ledger_count') != unique_count // 2
+            not isinstance(x, dict) or
+            not (x.get('verified_exact') is True and x.get('ledger_count') == unique_count // 2
+                 and x.get('raw_identity_value_mismatches') == 0 or
+                 x.get('verified_sample') is True
+                 and x.get('ledger_count') == min(unique_count // 2, E4_HEADER_SAMPLE_LIMIT // 2)
+                 and isinstance(x.get('identity_ranges'), list)
+                 and len(x['identity_ranges']) == min(unique_count // 2, E4_HEADER_SAMPLE_LIMIT // 2)
+                 and x.get('raw_identity_value_mismatches') == 0)
             for x in raw_checks):
         failures.append('raw_identity_mismatch')
     for label, window in (('unique', unique_window), ('replay', replay_window)):
@@ -116,7 +164,10 @@ def validate_e4_results(unique, replay, *, db_delta, scoped_delta, raw_checks,
     if isinstance(replay, dict):
         uh = (ue or {}).get('safe_header_samples') if isinstance(ue, dict) else None
         rh = (re4 or {}).get('safe_header_samples') if isinstance(re4, dict) else None
-        if not isinstance(uh, list) or not isinstance(rh, list) or len(uh) < replay_count or len(rh) != replay_count or uh[:replay_count] != rh:
+        sample_count = min(replay_count, E4_HEADER_SAMPLE_LIMIT)
+        if (not isinstance(uh, list) or not isinstance(rh, list)
+                or len(uh) < sample_count or len(rh) != sample_count
+                or uh[:sample_count] != rh):
             failures.append('replay_journal_content_mismatch')
     snapshots = replay_window.get('database_proof') if isinstance(replay_window, dict) else None
     def valid_snapshot(value):
@@ -173,9 +224,10 @@ def _replay_headers_match_manifest_prefix(prepared, unique_telemetry, replay_tel
     replay_e4 = replay_telemetry.get('e4') if isinstance(replay_telemetry, dict) else None
     unique_headers = unique_e4.get('safe_header_samples') if isinstance(unique_e4, dict) else None
     replay_headers = replay_e4.get('safe_header_samples') if isinstance(replay_e4, dict) else None
+    sample_count = min(replay_count, E4_HEADER_SAMPLE_LIMIT)
     return (isinstance(unique_headers, list) and isinstance(replay_headers, list) and
-            len(unique_headers) >= replay_count and len(replay_headers) == replay_count and
-            unique_headers[:replay_count] == replay_headers)
+            len(unique_headers) >= sample_count and len(replay_headers) == sample_count and
+            unique_headers[:sample_count] == replay_headers)
 
 
 def validate_representative_conflict(*, schema_valid, guard_precondition,
@@ -1406,9 +1458,12 @@ def e4_phase_manifest(common, journal, phase, *, unique_count=20, replay_count=1
     """Create a distinct immutable phase manifest over the shared E4 journal."""
     validate_e4_dataset_counts(unique_count, replay_count, profile=common.get('profile', 'pilot'),
                                official_opt_in=official_opt_in)
-    specs = {'unique': ('unique', 4, 0, 1), 'replay': ('replay', 2, replay_count, 0),
-             'cold-replay': ('replay', 2, replay_count, 0),
-             'expiry-replay': ('replay', 2, replay_count, 0)}
+    schedule = e4_phase_durations(unique_count, replay_count,
+        base_rate=int(common.get('traffic', {}).get('rate_per_second', 5)))
+    specs = {'unique': ('unique', schedule['unique_seconds'], 0, 1),
+             'replay': ('replay', schedule['replay_seconds'], replay_count, 0),
+             'cold-replay': ('replay', schedule['replay_seconds'], replay_count, 0),
+             'expiry-replay': ('replay', schedule['replay_seconds'], replay_count, 0)}
     if phase not in specs or not isinstance(common, dict):
         raise ValueError('p8_e4_manifest_phase_rejected')
     mode, seconds, replay_count, ignored = specs[phase]
@@ -1418,7 +1473,7 @@ def e4_phase_manifest(common, journal, phase, *, unique_count=20, replay_count=1
     return {**phase_common, 'run_id': common['run_id'] + '-' + phase,
         'phases': {**common['phases'], 'measure_seconds': seconds},
         'e4': {'mode': mode, 'journal_path': str(journal), 'max_messages': unique_count,
-                'max_bytes': min(64 << 20, max(1 << 20, unique_count * (48 << 10))), 'replay_count': replay_count,
+        'max_bytes': e4_journal_byte_bound(unique_count), 'replay_count': replay_count,
                 'ignore_first_valid_acks': ignored,
                 **({'expiry_ttl_seconds': 600} if phase == 'expiry-replay' else {})},
         **({'phases': {**common['phases'], 'measure_seconds': seconds}}
@@ -1440,6 +1495,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
         raise ValueError('p8_e4_cache_mode_rejected')
     counts = validate_e4_dataset_counts(unique_count, replay_count, profile=profile,
                                         official_opt_in=official_opt_in)
+    schedule = e4_phase_durations(unique_count, replay_count, base_rate=5)
     if type(include_cold_replay) is not bool or include_cold_replay and cache_mode != 'on':
         raise ValueError('p8_e4_cold_replay_requires_cache_on')
     if type(include_expiry_replay) is not bool or include_expiry_replay and cache_mode != 'on':
@@ -1454,9 +1510,9 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
         raise ValueError('p8_e4_two_gateway_specs_required')
     if include_expiry_replay:
         token_lifetime = min(_jwt_remaining_seconds(tokens[key]) for key in ('a', 'b', 'admin'))
-        journal_bound = min(64 << 20, max(1 << 20, unique_count * (48 << 10)))
+        journal_bound = e4_journal_byte_bound(unique_count)
         validate_e4_expiry_budget(session_seconds=session_seconds,
-            token_seconds=token_lifetime, workload_seconds=368, drain_seconds=16,
+            token_seconds=token_lifetime, workload_seconds=schedule['workload_seconds'], drain_seconds=16,
             import_seconds=30, cleanup_seconds=30, readiness_seconds=120,
             journal_bytes=journal_bound, output_bytes=1 << 20)
     flags = _flag_profile(effective, cache_mode)
@@ -1506,15 +1562,18 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
     viewer_identity = root / 'viewer-identities.json'
     smoke.private_write(viewer_identity, json.dumps({'user-000': tokens['a'], 'user-001': tokens['b']}))
     run_id = f'p8e4-{session_id}-warm' if session_id else fixture.project + '-e4'
+    phase_wall_seconds = schedule['unique_seconds'] + schedule['drain_seconds'] + 30
     common = {'schema_version': 1, 'experiment': 'E4', 'arm': 'warm', 'profile': profile,
         'mode': mode, 'run_id': run_id, 'seed': 89, 'roles': ['telemetry'],
         'samples_per_message': 100,
         'topology': {'gateways': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
         'targets': targets, 'subscriptions': [],
         'traffic': {'rate_per_second': 5, 'ramp_seconds': 0, 'burst_messages': 0},
-        'phases': {'warmup_seconds': 0, 'measure_seconds': 4, 'drain_seconds': 8, 'cooldown_seconds': 0},
+        'phases': {'warmup_seconds': 0, 'measure_seconds': schedule['viewer_seconds'],
+                   'drain_seconds': schedule['drain_seconds'], 'cooldown_seconds': 0},
         'limits': {'retries': 4, 'workers': 2, 'connections': 2, 'pending_messages': 64,
-                   'pending_bytes': 1 << 20, 'disk_growth_bytes': 1 << 20, 'wall_seconds': 30},
+                   'pending_bytes': 1 << 20, 'disk_growth_bytes': e4_journal_byte_bound(unique_count),
+                   'wall_seconds': phase_wall_seconds},
         'tls': {'https_endpoint': https_endpoint,
                 'mqtt_tls_endpoint': mqtt_endpoint,
                 'https_ca_file': str(endpoint.ca_file),
@@ -1555,6 +1614,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
         'phase_id': f'e4-warm-{cache_mode}', 'arm': 'warm', 'profile': profile,
         'mode': mode, 'cache_mode': cache_mode, 'run_id': run_id,
         'unique_count': unique_count, 'replay_count': replay_count,
+        'schedule': schedule,
         'include_cold_replay': include_cold_replay,
         'include_expiry_replay': include_expiry_replay,
         'pg': pg, 'quota': quota, 'effective': effective, 'effective_flags': flags,
@@ -1584,7 +1644,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
     return prepared
 
 
-def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_seconds=30):
+def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_seconds=None):
     """Package immutable E4 phase/viewer inputs; the run spec is preflight-only."""
     try:
         from scripts import paper_p8_bundle
@@ -1594,6 +1654,7 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
         paper_p8_bundle = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(paper_p8_bundle)
     root = Path(prepared['root'])
+    workload_seconds = prepared['schedule']['workload_seconds'] if workload_seconds is None else workload_seconds
     ca_root = root / 'portable-ca-inputs'
     ca_root.mkdir(mode=0o700, exist_ok=False)
     ca_files = {}
@@ -1632,7 +1693,16 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
     jobs = [{'manifest': path, 'output_dir': f'outputs/{label}', 'role':
              ('viewer' if label == 'viewer' else 'telemetry'), 'ready_timeout_seconds': 30}
             for label, path in manifests.items()]
-    from scripts.paper_p8_resources import disk_guard_config
+    try:
+        from scripts.paper_p8_resources import disk_guard_config
+    except ModuleNotFoundError as exc:
+        if exc.name != 'scripts':
+            raise
+        resources_spec = importlib.util.spec_from_file_location(
+            'paper_p8_resources', _here.parent / 'paper_p8_resources.py')
+        resources_module = importlib.util.module_from_spec(resources_spec)
+        resources_spec.loader.exec_module(resources_module)
+        disk_guard_config = resources_module.disk_guard_config
     run_spec.write_text(json.dumps({'paperload': jobs, 'gateways': [],
         'stop_timeout_seconds': 30, 'disk_guard': disk_guard_config(list(manifests.values()))},
         sort_keys=True, separators=(',', ':')), encoding='utf-8')
@@ -1642,10 +1712,10 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
         'profile': prepared['profile'], 'seed': 89, 'generator_colocated': True,
         'expiry_replay_enabled': prepared.get('include_expiry_replay') is True}
     if prepared.get('include_expiry_replay') is True:
-        workload['expiry_required_lifetime_seconds'] = 600 + 368 + 16 + 30 + 30 + 120
+        workload['expiry_required_lifetime_seconds'] = (600 + workload_seconds + 16 + 30 + 30 + 120)
     if prepared.get('include_expiry_replay') is True:
         workload['expiry_budget'] = validate_e4_expiry_budget(
-            session_seconds=86400, token_seconds=86400, workload_seconds=368,
+            session_seconds=86400, token_seconds=86400, workload_seconds=workload_seconds,
             drain_seconds=16, import_seconds=30, cleanup_seconds=30)
     return paper_p8_bundle.export_bundle(output_leaf=output_leaf,
         session_id=prepared['session_id'], experiment='E4', arm=prepared['arm'],
@@ -1739,7 +1809,9 @@ def _validate_e4_phase_samples(phase, telemetry, viewer, *, unique_count=20, rep
         identities = telemetry.get('identity_samples')
         headers = telemetry.get('e4', {}).get('safe_header_samples')
         expected = {row.get('message_id'): row for row in identities if isinstance(row, dict)} if isinstance(identities, list) else {}
-        if (not isinstance(headers, list) or not isinstance(identities, list) or len(expected) < 10
+        sample_count = min(unique_count, E4_HEADER_SAMPLE_LIMIT)
+        if (not isinstance(headers, list) or len(headers) != sample_count
+                or not isinstance(identities, list) or len(expected) < sample_count
                 or any(row.get('message_id') not in expected for row in headers)):
             failures.append('unique_sample_identity')
         samples = viewer.get('identity_samples') if isinstance(viewer, dict) else None
@@ -1820,9 +1892,13 @@ def begin_remote_phase(smoke, fixture, endpoint, registry, containers, prepared,
             raise ValueError('p8_e4_cold_baseline_readback_mismatch')
     database = [_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
     server = smoke.paper_p0_stats(registry, containers, phase + '_start')
+    phase_seconds = (prepared['schedule']['unique_seconds'] if phase == 'unique'
+                     else prepared['schedule']['replay_seconds'])
+    collector_deadline = phase_seconds + prepared['schedule']['drain_seconds'] + 30
     collector = BoundedCollector(scrape=lambda: _support._admin_metrics(
-        smoke, endpoint, prepared['tokens']['admin']), interval=.5, max_snapshots=32,
-        deadline_seconds=120, baseline_metrics=metrics, baseline_server=server)
+        smoke, endpoint, prepared['tokens']['admin']), interval=.5,
+        max_snapshots=min(20000, max(2, int(collector_deadline / .5) + 2)),
+        deadline_seconds=collector_deadline, baseline_metrics=metrics, baseline_server=server)
     collector.start(None)
     prepared.setdefault('remote_collectors', {})[phase] = collector
     baseline = {'phase_id': phase, 'admin_metrics': metrics, 'database': database,
@@ -1933,7 +2009,7 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
             ids = [row['message_id'] for row in telemetry.get('e4', {}).get('safe_header_samples', [])
                    if row.get('gateway_id') == spec.gateway_id and row.get('sensor_id') == spec.sensor_id]
             raw.append(verify_pilot_raw(smoke, registry, prepared['pg'], spec, message_ids=ids))
-        if len(raw) != 2 or any(item.get('verified_exact') is not True for item in raw):
+        if not e4_raw_samples_verified(raw, unique_count):
             phase_validation['failures'].append('raw_identity_not_verified')
     previous = prepared.get('phase_results', {}).get('unique')
     if phase in ('replay', 'cold-replay', 'expiry-replay'):
@@ -2192,6 +2268,8 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
         workload_status = 'DURABLE_REOPEN_SUBSET_VALIDATED'
     return {'schema_version': 1, 'status': 'PASS' if valid else 'PARTIAL' if phases else 'FAIL',
         'experiment': 'E4', 'arm': prepared['arm'], 'cache_mode': prepared['cache_mode'],
+        'selected_counts': {'unique_count': unique_count, 'replay_count': replay_count},
+        'schedule': prepared.get('schedule'),
         'workload_status': workload_status if valid else 'UNIQUE_ONLY' if phases == ['unique'] else 'VALIDATION_FAILED',
         'lane_marker': lane_marker, 'phase_history': phases,
         'session_id': prepared['session_id'], 'run_id': prepared['run_id'],
@@ -2232,10 +2310,14 @@ def e4_viewer_manifest(common, *, subscriptions, viewer_identity, root):
                      if key not in ('durability_mode', 'gateway_identity_files')}
     viewer_common.update(experiment='E1', roles=['viewer'], subscriptions=subscriptions,
         topology={**common.get('topology', {}), 'users': 2, 'viewers': 2},
-        phases={'warmup_seconds': 0, 'measure_seconds': 40, 'drain_seconds': 0, 'cooldown_seconds': 0},
+        phases={'warmup_seconds': 0, 'measure_seconds': common.get('phases', {}).get('measure_seconds', 4),
+                'drain_seconds': common.get('phases', {}).get('drain_seconds', 0), 'cooldown_seconds': 0},
         viewer={'mode': 'healthy'}, identity_files={'viewer': viewer_identity},
         limits={'workers': 2, 'connections': 2, 'pending_messages': 32,
-                'pending_bytes': 8388608, 'wall_seconds': 60, 'retries': 2,
+                'pending_bytes': 8388608,
+                'wall_seconds': common.get('phases', {}).get('measure_seconds', 4) +
+                    common.get('phases', {}).get('drain_seconds', 0) + 30,
+                'retries': 2,
                 'disk_growth_bytes': 1048576}, bundle_path=str(root))
     return viewer_common
 
@@ -2688,7 +2770,10 @@ def _run_cold_replay(smoke, fixture, endpoint, registry, containers, paperload_b
     cold_e4 = result.get('e4') if isinstance(result, dict) else {}
     headers = (warm_e4 or {}).get('safe_header_samples')
     cold_headers = (cold_e4 or {}).get('safe_header_samples')
-    if not isinstance(headers, list) or not isinstance(cold_headers, list) or headers[:replay_count] != cold_headers or len(cold_headers) != replay_count:
+    replay_samples = min(replay_count, E4_HEADER_SAMPLE_LIMIT)
+    if (not isinstance(headers, list) or not isinstance(cold_headers, list)
+            or len(headers) < replay_samples or len(cold_headers) != replay_samples
+            or headers[:replay_samples] != cold_headers):
         cold['reasons'].append('cold_replay_header_identity_mismatch')
         cold['status'] = 'FAIL'
     if result.get('status') != 'COMPLETE' or result.get('cleanup_errors'):

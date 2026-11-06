@@ -2279,7 +2279,9 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                         p8.update(cleanup_verified=cleanup_verified, exact_cleanup_verified=cleanup_verified,
                                   cleanup_counts=cleanup_counts)
                         p8['status'] = 'PASS' if (not failure and
-                            paper_p8_e4_warm_subset_acceptance(p8, cleanup_verified)) else 'FAIL'
+                            paper_p8_e4_warm_subset_acceptance(p8, cleanup_verified,
+                                {'unique_count': getattr(fixture, 'paper_p8_e4_unique_count', 20),
+                                 'replay_count': getattr(fixture, 'paper_p8_e4_replay_count', 10)})) else 'FAIL'
                     else:
                         p8.update(cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                             status='PASS' if (not failure and cleanup_verified and ((prepare_only and remote_outcome in ('VALIDATED', 'NOT_RUN')) or
@@ -2596,7 +2598,9 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 p8.update(cleanup_verified=cleanup_verified,
                           exact_cleanup_verified=cleanup_verified,
                           cleanup_counts=cleanup_counts)
-                accepted = paper_p8_e4_warm_subset_acceptance(p8, cleanup_verified)
+                accepted = paper_p8_e4_warm_subset_acceptance(p8, cleanup_verified,
+                    {'unique_count': getattr(fixture, 'paper_p8_e4_unique_count', 20),
+                     'replay_count': getattr(fixture, 'paper_p8_e4_replay_count', 10)})
                 p8['status'] = 'PASS' if accepted else p8.get('status', 'FAIL')
                 durable_json(fixture.artifacts / name, p8)
                 report = paper_p8_e4_startup_summary(fixture, p8, accepted,
@@ -4712,7 +4716,8 @@ def paper_p8_e1_cleanup_acceptance(fixture, evidence, cleanup_counts, cleanup_ve
                                             cleanup_counts, cleanup_verified, registry))
 
 
-def paper_p8_e2_validate_fixture_flags(effective, *, workload='steady_burst', e2_support=None):
+def paper_p8_e2_validate_fixture_flags(effective, *, workload='steady_burst', e2_support=None,
+                                      fixture=None):
     if e2_support is None:
         e2_support = paper_p8_e2_support()
     if workload == 'equal_samples':
@@ -4733,7 +4738,7 @@ def paper_p8_e2_validate_fixture_flags(effective, *, workload='steady_burst', e2
         if any(normalized.get(key) != value for key, value in expected.items()):
             raise ValueError('p8_e2_effective_fixture_flags_mismatch')
         return flags
-    return e2_support._validate_fixture_flags(effective)
+    return e2_support._validate_fixture_flags(effective, fixture)
 
 
 def paper_p8_e2_profiles_valid(evidence):
@@ -5095,7 +5100,7 @@ def paper_p8_e4_startup_summary(fixture, p8, accepted, cleanup_verified, cleanup
         'cleanup_counts': cleanup_counts, 'artifact': artifact_name}
 
 
-def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
+def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified, expected_counts=None):
     workloads = evidence.get('workloads') if isinstance(evidence, dict) else None
     unique = workloads.get('unique', {}) if isinstance(workloads, dict) else {}
     replay = workloads.get('replay', {}) if isinstance(workloads, dict) else {}
@@ -5107,6 +5112,13 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
     ws = evidence.get('new_ws_event_proof') if isinstance(evidence, dict) else None
     validation = evidence.get('validation') if isinstance(evidence, dict) else None
     cache = evidence.get('cache_window') if isinstance(evidence, dict) else None
+    selected = (expected_counts if isinstance(expected_counts, dict) else
+        evidence.get('selected_counts') if isinstance(evidence, dict) else None)
+    if selected is None:
+        selected = {'unique_count': 20, 'replay_count': 10}  # legacy pilot report contract
+    unique_count, replay_count = selected.get('unique_count'), selected.get('replay_count')
+    counts_valid = (type(unique_count) is int and unique_count >= 2 and unique_count % 2 == 0
+                    and type(replay_count) is int and 1 <= replay_count <= unique_count)
     cold_subset = (isinstance(evidence, dict) and
                    evidence.get('workload_status') == 'COLD_REPLAY_SUBSET_VALIDATED')
     expiry_subset = (isinstance(evidence, dict) and
@@ -5129,15 +5141,15 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
     dbproof = replay_window.get('database_proof') if isinstance(replay_window, dict) else None
     cache_valid = (isinstance(cache, dict) and type(cache.get('attempts')) is int
         and cache['attempts'] > 0 and type(cache.get('transaction_commits')) is int
-        and cache['transaction_commits'] > 0 and cache.get('database_duplicates') == cache['transaction_commits']
+        and cache['transaction_commits'] >= replay_count and cache.get('database_duplicates') == cache['transaction_commits']
         and type(cache.get('confirmed_new_rows')) is int and cache['confirmed_new_rows'] == 0
         and type(cache.get('copy_calls')) is int and cache['copy_calls'] == 0
         and isinstance(dbproof, dict) and dbproof.get('exact_equal') is True
         and isinstance(dbproof.get('unique_ack'), list) and len(dbproof['unique_ack']) == 2
         and dbproof['unique_ack'] == dbproof.get('replay_end')) if cache_off else (
         isinstance(cache, dict) and type(cache.get('warm_lookup_hits')) is int
-        and cache['warm_lookup_hits'] >= 10 and type(cache.get('repository_calls_avoided')) is int
-        and cache['repository_calls_avoided'] >= 10)
+        and cache['warm_lookup_hits'] >= replay_count and type(cache.get('repository_calls_avoided')) is int
+        and cache['repository_calls_avoided'] >= replay_count)
     cold_ws = (isinstance(ws, dict) and isinstance(ws.get('replay'), dict)
         and ws['replay'] == {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
             'telemetry_writes_completed': 0, 'drops': 0})
@@ -5153,7 +5165,7 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
         and isinstance(cold_deltas, dict) and type(cold_deltas.get('begin_attempts')) is int
         and cold_deltas['begin_attempts'] > 0 and type(cold_deltas.get('confirmed_commits')) is int
         and cold_deltas['confirmed_commits'] > 0 and cold_deltas.get('confirmed_new_rows') == 0
-        and cold_deltas.get('copy_calls') == 0 and cold_window.get('application_ack_count') == 10
+        and cold_deltas.get('copy_calls') == 0 and cold_window.get('application_ack_count') == replay_count
         and cold_window.get('database_unchanged') is True
         and isinstance(replacement, dict) and replacement.get('metrics_readback') is True
         and replacement.get('process_instance') == cold_window.get('process_instance'))
@@ -5220,15 +5232,23 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
         and (not (cold_subset or (durable_subset and cold_genuinely_proven))
              or evidence.get('cold_replay_journal_prefix_validated') is True)
         and evidence.get('cleanup_verified') is True and cleanup_verified is True
-        and isinstance(delta, dict) and delta == {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}
+        and counts_valid and isinstance(delta, dict) and delta == {
+            'ledger': unique_count, 'raw': unique_count * 100, 'temporal': unique_count, 'configuration': 0}
         and isinstance(validation, dict) and validation.get('valid') is True and validation.get('failures') == []
         and cache_valid
         and isinstance(raw, list) and len(raw) == 2
-        and all(isinstance(row, dict) and row.get('verified_exact') is True for row in raw)
+        and isinstance(raw, list) and len(raw) == 2
+        and all(isinstance(row, dict) and row.get('raw_identity_value_mismatches') == 0 and
+            ((row.get('verified_exact') is True and row.get('ledger_count') == unique_count // 2) or
+             (row.get('verified_sample') is True and
+              row.get('ledger_count') == min(unique_count // 2, 10) and
+              isinstance(row.get('identity_ranges'), list) and len(row['identity_ranges']) == min(unique_count // 2, 10)))
+            for row in raw)
         and isinstance(ut, dict) and isinstance(rt, dict)
-        and ut.get('generated_unique') == 20 and ut.get('application_acks') == 20
-        and ut.get('ignored_valid_acks') == 1 and ut.get('pending_messages') == 0
-        and rt.get('replay_offered') == 10 and rt.get('replay_application_acks') == 10
+        and ut.get('generated_unique') == unique_count and ut.get('application_acks') == unique_count
+        and ut.get('ignored_valid_acks') == 1 and type(ut.get('retries')) is int and ut['retries'] >= 1
+        and ut.get('pending_messages') == 0 and ut.get('pending_bytes') == 0
+        and rt.get('replay_offered') == replay_count and rt.get('replay_application_acks') == replay_count
         and isinstance(ws, dict) and ws.get('status') == 'PASS'
         and (not cache_off or cold_ws)
         and (not (cold_subset or (durable_subset and cold_genuinely_proven))
@@ -5238,13 +5258,13 @@ def paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified):
         and all(isinstance(row, dict) and row.get('validation_valid') is True for row in (unique, replay)))
 
 
-def paper_p8_e4_cold_restart_status(evidence, cleanup_verified):
+def paper_p8_e4_cold_restart_status(evidence, cleanup_verified, expected_counts=None):
     """A cold restart is PASS only when the finalized E4 cold subset validates."""
     if (not isinstance(evidence, dict)
             or evidence.get('workload_status') != 'COLD_REPLAY_SUBSET_VALIDATED'
             or evidence.get('lane_marker') != 'PAPER_P8_E4_COLD_REPLAY_SUBSET'
             or evidence.get('coldrestart') != 'PASS'
-            or not paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified)):
+            or not paper_p8_e4_warm_subset_acceptance(evidence, cleanup_verified, expected_counts)):
         return 'FAIL'
     return 'PASS'
 
@@ -6855,9 +6875,9 @@ def main():
                                      if experiment == 'E3' else {}),
                                   'effective_flags': (helper.safe_effective_flags(prepared['effective'])
                                       if experiment == 'E1' else
-                                      paper_p8_e2_validate_fixture_flags(prepared['effective'],
-                                          workload=prepared.get('workload', 'steady_burst'),
-                                          e2_support=prepared['e2_support'])
+                                       paper_p8_e2_validate_fixture_flags(prepared['effective'],
+                                           workload=prepared.get('workload', 'steady_burst'),
+                                           e2_support=prepared['e2_support'], fixture=fixture)
                                        if experiment == 'E2' else
                                        prepared['e3_support']._validate_e3_fixture_flags(
                                            prepared['effective'], prepared['arm']) if experiment == 'E3' else
@@ -7056,7 +7076,8 @@ def main():
                             'schema': prepared['schema'], 'quota': prepared['quota'],
                             'effective_flags': (helper.safe_effective_flags(prepared['effective'])
                                 if experiment == 'E1' else paper_p8_e2_validate_fixture_flags(prepared['effective'],
-                                    workload=prepared.get('workload', 'steady_burst'), e2_support=helper)),
+                                    workload=prepared.get('workload', 'steady_burst'), e2_support=helper,
+                                    fixture=fixture)),
                             'source': session['state'].get('source_metadata'),
                             'images': images, 'bundle_sha256': prepared['bundle_sha256'],
                             **({'manifest_sha256': [hashlib.sha256(path.read_bytes()).hexdigest()
@@ -7167,7 +7188,9 @@ def main():
                     if cold_enabled:
                         finalized = json.loads((fixture.artifacts / paper_p8_e4_artifact_name(fixture)).read_text())
                         cold_status = paper_p8_e4_cold_restart_status(finalized,
-                            finalized.get('cleanup_verified') is True)
+                            finalized.get('cleanup_verified') is True,
+                            {'unique_count': getattr(fixture, 'paper_p8_e4_unique_count', 20),
+                             'replay_count': getattr(fixture, 'paper_p8_e4_replay_count', 10)})
                         e3_lifecycle_ok = e3_lifecycle_ok and cold_status == 'PASS'
                     pilot_complete = conflicts_enabled and durable_enabled and cold_enabled
                     report['workload_outcome'] = (('PILOT_COMPLETE_VALIDATED' if pilot_complete else
