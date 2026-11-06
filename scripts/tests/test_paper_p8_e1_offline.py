@@ -32,6 +32,10 @@ class E1OfflineContractTests(unittest.TestCase):
         self.assertEqual(result['manifest_inventory'], ['expiry-replay', 'replay', 'unique'])
         self.assertEqual(result['bound_profile'], 'official')
         self.assertEqual(result['bound_session_id'], 'e4-offline-session')
+        self.assertEqual(result['schedule']['unique_seconds'], 200)
+        self.assertEqual(result['schedule']['replay_seconds'], 20)
+        self.assertEqual(result['journal_max_bytes'], 49_152_000)
+        self.assertEqual(result['disk_growth_bytes'], result['journal_max_bytes'])
         self.assertEqual(result['result_projection'], {
             'schema_valid': True, 'status': 'PARTIAL', 'native_completed_acceptance': False})
         self.assertEqual({row['phase']: row['exit_code'] for row in result['preflight']},

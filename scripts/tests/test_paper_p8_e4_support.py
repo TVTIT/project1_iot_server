@@ -49,6 +49,17 @@ def sample(mode='on'):
 
 
 class E4SupportTests(unittest.TestCase):
+    def test_e4_raw_header_sample_verification_accepts_bounded_sample_proof(self):
+        sample_checks = [{'verified_sample': True, 'ledger_count': 10,
+            'raw_identity_value_mismatches': 0, 'identity_ranges': [{} for _ in range(10)]} for _ in range(2)]
+        self.assertTrue(e4.e4_raw_samples_verified(sample_checks, 1000))
+        self.assertTrue(e4.e4_raw_samples_verified([{'verified_exact': True, 'ledger_count': 500,
+            'raw_identity_value_mismatches': 0} for _ in range(2)], 1000))
+        self.assertFalse(e4.e4_raw_samples_verified([{'verified_sample': True, 'ledger_count': 1,
+            'raw_identity_value_mismatches': 0, 'identity_ranges': [{}]} for _ in range(2)], 1000))
+        self.assertFalse(e4.e4_raw_samples_verified([{'verified_sample': True, 'ledger_count': 10,
+            'raw_identity_value_mismatches': 1, 'identity_ranges': [{} for _ in range(10)]} for _ in range(2)], 1000))
+
     def test_expiry_requires_confirmed_commit_age_same_process_and_same_journal_bytes(self):
         self.assertEqual(e4.e4_expiry_evidence(
             commit_time=100.0, now=701.0, ttl_seconds=600, process_before='p1',
@@ -87,16 +98,18 @@ class E4SupportTests(unittest.TestCase):
 
     def test_e4_counts_are_explicit_and_flow_into_phase_manifests(self):
         common = {'run_id': 'e4-run', 'phases': {'measure_seconds': 4},
-                  'topology': {'gateways': 2}}
+                  'topology': {'gateways': 2},
+                  'limits': {'disk_growth_bytes': e4.e4_journal_byte_bound(1000)}}
         unique = e4.e4_phase_manifest(common, 'journal', 'unique', unique_count=38, replay_count=11)
         replay = e4.e4_phase_manifest(common, 'journal', 'replay', unique_count=38, replay_count=11)
         self.assertEqual(unique['e4']['max_messages'], 38)
+        self.assertEqual(unique['e4']['replay_count'], 0)
         self.assertEqual(replay['e4']['replay_count'], 11)
         self.assertEqual(replay['e4']['max_messages'], 38)
-        self.assertEqual(unique['phases']['measure_seconds'], 4)
-        self.assertEqual(unique['traffic']['rate_per_second'] * 4, 38)
-        self.assertEqual(replay['phases']['measure_seconds'], 2)
-        self.assertEqual(replay['traffic']['rate_per_second'] * 2, 11)
+        self.assertEqual(unique['phases']['measure_seconds'], 8)
+        self.assertEqual(unique['traffic']['rate_per_second'] * 8, 38)
+        self.assertEqual(replay['phases']['measure_seconds'], 3)
+        self.assertEqual(replay['traffic']['rate_per_second'] * 3, 11)
         self.assertEqual(e4.validate_e4_dataset_counts(1000, 100, profile='official', official_opt_in=True),
                          {'unique_count': 1000, 'replay_count': 100})
         official = e4.e4_phase_manifest({**common, 'profile': 'official'},
@@ -105,6 +118,21 @@ class E4SupportTests(unittest.TestCase):
         self.assertEqual(official['e4']['max_messages'], 1000)
         self.assertEqual(official['e4']['replay_count'], 100)
         self.assertLessEqual(official['e4']['max_bytes'], 64 << 20)
+        large = e4.e4_phase_manifest({**common, 'profile': 'official', 'traffic': {'rate_per_second': 5}},
+            'outputs/e4-journal.sqlite', 'unique', unique_count=1000, replay_count=100,
+            official_opt_in=True)
+        replay_large = e4.e4_phase_manifest({**common, 'profile': 'official', 'traffic': {'rate_per_second': 5}},
+            'outputs/e4-journal.sqlite', 'replay', unique_count=1000, replay_count=100,
+            official_opt_in=True)
+        self.assertEqual((large['phases']['measure_seconds'], large['traffic']['rate_per_second']), (200, 5))
+        self.assertEqual((replay_large['phases']['measure_seconds'], replay_large['traffic']['rate_per_second']), (20, 5))
+        self.assertEqual(e4.e4_phase_durations(20, 10)['unique_seconds'], 4)
+        self.assertEqual(e4.e4_phase_durations(20, 10)['replay_seconds'], 2)
+        with self.assertRaisesRegex(ValueError, 'schedule|bundle_lifetime'):
+            e4.e4_phase_durations(10000, 10000)
+        self.assertEqual(e4.e4_journal_byte_bound(1000), 49_152_000)
+        self.assertEqual(e4.e4_journal_byte_bound(10000), 64 << 20)
+        self.assertEqual(official['limits']['disk_growth_bytes'], official['e4']['max_bytes'])
         with self.assertRaisesRegex(ValueError, 'official_profile_requires_opt_in'):
             e4.validate_e4_dataset_counts(1000, 100, profile='official', official_opt_in=False)
 
@@ -112,9 +140,29 @@ class E4SupportTests(unittest.TestCase):
         unique, replay, uw, rw = sample()
         result = e4.validate_e4_results(unique, replay, db_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
             scoped_delta={'available': {'a':{'ledger':10,'raw':1000,'temporal':10},'b':{'ledger':10,'raw':1000,'temporal':10}}},
-            raw_checks=[{'verified_exact':True,'ledger_count':10}]*2, unique_window=uw, replay_window=rw,
+            raw_checks=[{'verified_exact':True,'ledger_count':10,'raw_identity_value_mismatches':0}]*2, unique_window=uw, replay_window=rw,
             cache_mode='on', unique_count=20, replay_count=9, samples_per_message=100)
         self.assertFalse(result['valid'])
+
+    def test_official_replay100_matches_only_bounded20_header_prefix(self):
+        unique, replay, uw, rw = sample()
+        replay['e4']['journal_entry_count'] = 100
+        replay['e4']['safe_header_samples'] = unique['e4']['safe_header_samples'][:20]
+        result = e4.validate_e4_results(unique, replay, db_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
+            scoped_delta={'available': {'a':{'ledger':10,'raw':1000,'temporal':10},'b':{'ledger':10,'raw':1000,'temporal':10}}},
+            raw_checks=[{'verified_exact':True,'ledger_count':10,'raw_identity_value_mismatches':0}]*2,
+            unique_window=uw, replay_window=rw, cache_mode='on', unique_count=20,
+            replay_count=100, samples_per_message=100)
+        self.assertNotIn('replay_journal_content_mismatch', result['failures'])
+        for bad in (unique['e4']['safe_header_samples'][:19],
+                    ['foreign'] + replay['e4']['safe_header_samples'][1:]):
+            replay['e4']['safe_header_samples'] = bad
+            rejected = e4.validate_e4_results(unique, replay, db_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
+                scoped_delta={'available': {'a':{'ledger':10,'raw':1000,'temporal':10},'b':{'ledger':10,'raw':1000,'temporal':10}}},
+                raw_checks=[{'verified_exact':True,'ledger_count':10,'raw_identity_value_mismatches':0}]*2,
+                unique_window=uw, replay_window=rw, cache_mode='on', unique_count=20,
+                replay_count=100, samples_per_message=100)
+            self.assertIn('replay_journal_content_mismatch', rejected['failures'])
         self.assertIn('replay_replay_offered', result['failures'])
 
     def test_durable_a_side_sql_validators_require_committed_and_exact_raw_evidence(self):
@@ -262,7 +310,7 @@ class E4SupportTests(unittest.TestCase):
         telemetry_samples = []
         headers = []
         viewer_samples = []
-        for index in range(10):
+        for index in range(20):
             viewer_id = 'e4-viewer-a' if index % 2 == 0 else 'e4-viewer-b'
             row = {'viewer_id': '', 'gateway_id': f'gw-{index}', 'sensor_id': f'sensor-{index}',
                 'message_id': f'00000000-0000-0000-0000-{index + 1:012d}', 'boot_id': f'boot-{index}',
@@ -287,6 +335,16 @@ class E4SupportTests(unittest.TestCase):
             'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2,
             'unique_events': 20, 'identity_samples': viewer_samples}
         self.assertTrue(e4._validate_e4_phase_samples('unique', telemetry, viewer)['valid'])
+        small_telemetry = {**telemetry, 'identity_samples': telemetry_samples[:8],
+            'e4': {'mode': 'unique', 'safe_header_samples': headers[:8]},
+            'telemetry': {**telemetry['telemetry'], 'generated_unique': 8,
+                'offered_unique': 8, 'application_acks': 8}}
+        small_viewer = {**viewer, 'unique_events': 8}
+        self.assertTrue(e4._validate_e4_phase_samples('unique', small_telemetry,
+            small_viewer, unique_count=8)['valid'])
+        self.assertIn('unique_sample_identity', e4._validate_e4_phase_samples('unique',
+            {**small_telemetry, 'e4': {'mode': 'unique', 'safe_header_samples': headers[:7]}},
+            small_viewer, unique_count=8)['failures'])
         viewer['unique_events'] = 0
         self.assertIn('unique_viewer_subscribed_and_received',
             e4._validate_e4_phase_samples('unique', telemetry, viewer)['failures'])
@@ -398,7 +456,7 @@ class E4SupportTests(unittest.TestCase):
             self.assertEqual(unique['samples_per_message'], 100)
             self.assertEqual(unique['limits'], {'retries': 4, 'workers': 2, 'connections': 2,
                 'pending_messages': 64, 'pending_bytes': 1 << 20,
-                'disk_growth_bytes': 1 << 20, 'wall_seconds': 30})
+                'disk_growth_bytes': 1 << 20, 'wall_seconds': 42})
             self.assertEqual(viewer['experiment'], 'E1')
             self.assertEqual(viewer['roles'], ['viewer'])
             self.assertEqual(viewer['topology']['viewers'], 2)
@@ -565,7 +623,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'gw1/s1': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'gw2/s2': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode=mode)
 
     def test_actual_runresult_shape_and_warm_replay_accounting(self):
@@ -580,7 +638,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'gw1/s1': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'gw2/s2': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='off')
         self.assertIn('cache_off_database_path_unproven', result['failures'])
 
@@ -614,7 +672,8 @@ class E4SupportTests(unittest.TestCase):
                     'admin_after': {'ingress': unique_window['after']},
                     'ws_delta': {'submissions': 20, 'new_events': 20,
                         'deliveries_enqueued': 20, 'telemetry_writes_completed': 20, 'drops': 0},
-                    'raw': [{'verified_exact': True, 'ledger_count': 10}] * 2}},
+                     'raw': [{'verified_exact': True, 'ledger_count': 10,
+                         'raw_identity_value_mismatches': 0}] * 2}},
                 'unique_database_snapshot': unique_ack,
                 'phase_baselines': {'replay': {'database': unique_ack,
                     'admin_metrics': metrics_before}},
@@ -693,7 +752,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'a': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'b': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('cache_warm_hit_unproven', result['failures'])
 
@@ -715,7 +774,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'a': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'b': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('replay_database_fingerprint_changed', result['failures'])
 
@@ -738,7 +797,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'a': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'b': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('replay_journal_content_mismatch', result['failures'])
 
@@ -802,14 +861,14 @@ class E4SupportTests(unittest.TestCase):
     def test_declared_replay_prefix_rejects_count_order_and_foreign_headers(self):
         with tempfile.TemporaryDirectory(prefix='p8-e4-prefix-', dir='/var/tmp/opencode') as tmp:
             manifest = Path(tmp) / 'replay.json'
-            manifest.write_text(json.dumps({'e4': {'replay_count': 10}}))
+            manifest.write_text(json.dumps({'e4': {'replay_count': 100}}))
             prepared = {'manifests': [manifest, manifest]}
             full = {'e4': {'safe_header_samples': [{'id': i} for i in range(20)]}}
-            prefix = {'e4': {'safe_header_samples': [{'id': i} for i in range(10)]}}
+            prefix = {'e4': {'safe_header_samples': [{'id': i} for i in range(20)]}}
             self.assertTrue(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
             prefix['e4']['safe_header_samples'][0] = {'id': 'foreign'}
             self.assertFalse(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
-            prefix['e4']['safe_header_samples'] = [{'id': i} for i in range(9)]
+            prefix['e4']['safe_header_samples'] = [{'id': i} for i in range(19)]
             self.assertFalse(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
             manifest.write_text(json.dumps({'e4': {'replay_count': True}}))
             self.assertFalse(e4._replay_headers_match_manifest_prefix(prepared, full, prefix))
@@ -823,7 +882,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'a': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'b': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('cache_on_database_work_unexpected', result['failures'])
 
@@ -880,7 +939,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'gw1/s1': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'gw2/s2': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('unique_cleanup_failure', failed['failures'])
         unique['cleanup_errors'] = []
@@ -889,7 +948,7 @@ class E4SupportTests(unittest.TestCase):
             db_delta={'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             scoped_delta={'available': {'gw1/s1': {'ledger': 10, 'raw': 1000, 'temporal': 10},
                                         'gw2/s2': {'ledger': 10, 'raw': 1000, 'temporal': 10}}},
-            raw_checks=[{'verified_exact': True, 'ledger_count': 10}] * 2,
+            raw_checks=[{'verified_exact': True, 'ledger_count': 10, 'raw_identity_value_mismatches': 0}] * 2,
             unique_window=uw, replay_window=rw, cache_mode='on')
         self.assertIn('unique_result_incomplete', failed['failures'])
 

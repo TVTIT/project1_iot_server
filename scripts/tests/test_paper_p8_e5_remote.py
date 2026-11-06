@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import subprocess
 import tempfile
 import time
 from types import SimpleNamespace
@@ -309,7 +310,6 @@ class PaperP8E5RemoteTests(unittest.TestCase):
         self.dataset_raw = self.dataset_file.read_bytes()
         self.dataset_sha256 = self.context_dict['sha256']
         self.msg_ids = [json.loads(line)['message_id'] for line in self.dataset_raw.splitlines()]
-
         self.smoke = FakeSmoke(_HERE.parent.parent)
         self.fixture = SimpleNamespace(
             private=self.private,
@@ -332,6 +332,14 @@ class PaperP8E5RemoteTests(unittest.TestCase):
             'required_san_dns': ['fixture-a.lan', 'localhost', 'mosquitto', 'nginx'],
             'required_san_ips': ['127.0.0.1', '192.168.50.20'],
         })
+
+    def test_e5_fixture_imports_when_loaded_from_direct_script_path(self):
+        env = os.environ.copy()
+        env.pop('PYTHONPATH', None)
+        env['PYTHONPATH'] = os.pathsep.join((str(Path(remote.__file__).parents[1]),
+                                             str(Path(remote.__file__).parent)))
+        subprocess.run([sys.executable, '-c', 'import paper_p8_e5_fixture'],
+            cwd=self.root, env=env, check=True, capture_output=True, text=True)
 
     def _initial_headers(self):
         records = [json.loads(line) for line in self.dataset_raw.splitlines()]
@@ -579,7 +587,10 @@ class PaperP8E5RemoteTests(unittest.TestCase):
         orig_admin = remote.e4._support._admin_metrics
         try:
             remote.e4._counts = lambda s, r, pg, spec: counts_after[0] if spec.gateway_id == 'p8-e5-a' else counts_after[1]
-            remote.e4.verify_pilot_raw = lambda s, r, pg, spec, message_ids: {'verified_exact': True, 'count': 1000}
+            remote.e4.verify_pilot_raw = lambda s, r, pg, spec: {
+                'verified_exact': True, 'ledger_count': 10,
+                'identity_ranges': [{'message_id': row['message_id']} for row in
+                    map(json.loads, self.dataset_raw.splitlines()) if row['gateway_id'] == spec.gateway_id]}
             remote.e4._support._admin_metrics = lambda s, ep, tok: _sample_admin_metrics(writes=20, events=20)
 
             res = remote.finish_remote_initial(
@@ -593,6 +604,43 @@ class PaperP8E5RemoteTests(unittest.TestCase):
             remote.e4._counts = orig_counts
             remote.e4.verify_pilot_raw = orig_verify_raw
             remote.e4._support._admin_metrics = orig_admin
+
+    def test_representative_initial_and_warm_counts_come_from_repeat_selection(self):
+        repeat_dir, context_file = e5_driver.prepare_repeat(
+            self.repeat_root, 2, 814, preset='representative')
+        context = json.loads(context_file.read_text())
+        dataset = Path(context['dataset_path'])
+        message_ids = [json.loads(line)['message_id'] for line in dataset.read_text().splitlines()]
+        prepared = remote.prepare(self.smoke, self.fixture, self.endpoint, self.registry,
+            self.containers, self.images, self.state, arm='optimized', context_path=context_file)
+        remote.begin_remote_phase(self.smoke, self.fixture, self.endpoint, self.registry,
+            self.containers, prepared, phase='initial')
+        before = [{'ledger':0,'raw':0,'temporal':0,'configuration':0,'fingerprint':'0'*32} for _ in range(2)]
+        after = [{'ledger':4,'raw':400,'temporal':4,'configuration':0,'fingerprint':str(i)*32}
+                 for i in (1,2)]
+        prepared['phase_snapshots']['initial']['db_before'] = before
+        dataset_rows = [json.loads(line) for line in dataset.read_text().splitlines()]
+        with (patch.object(remote.e4, '_counts', side_effect=[*after, *after]),
+              patch.object(remote.e4, 'verify_pilot_raw', side_effect=lambda s,r,pg,spec: {
+                  'verified_exact': True,
+                  'ledger_count': sum(row['gateway_id'] == spec.gateway_id for row in dataset_rows),
+                  'identity_ranges': [{'message_id':row['message_id']} for row in dataset_rows
+                                      if row['gateway_id'] == spec.gateway_id]}),
+              patch.object(remote.e4._support, '_admin_metrics', return_value=_sample_admin_metrics(writes=8,events=8))):
+            initial = remote.finish_remote_initial(self.smoke,self.fixture,self.endpoint,self.registry,
+                self.containers,prepared,_make_replay_projection(8,_header_samples(dataset,message_ids)))
+        self.assertEqual(initial['database_delta'], {'ledger':8,'raw':800,'temporal':8,'configuration':0})
+        self.assertTrue(all(row['verified_exact'] and row['selected_dataset_ids_match']
+                            for row in initial['raw_proof']))
+        prepared['phase_snapshots']['warm_replay'] = {
+            'admin_before': _sample_admin_metrics(writes=8,events=8), 'db_before': after,
+            'server_stats': {}}
+        with (patch.object(remote.e4, '_counts', side_effect=[*after, *after]),
+              patch.object(remote.e4._support, '_admin_metrics', return_value=_sample_admin_metrics(writes=8,events=8,dedup_hits=2))):
+            warm = remote.finish_remote_warm_replay(self.smoke,self.fixture,self.endpoint,self.registry,
+                self.containers,prepared,_make_replay_projection(2,_header_samples(dataset,message_ids[:2])))
+        self.assertEqual(warm['database_delta'], {'ledger':0,'raw':0,'temporal':0,'configuration':0})
+        self.assertEqual(warm['b_projection']['e4']['journal_entry_count'],2)
 
     def test_finish_remote_initial_rejects_header_mismatch_or_non_unique(self):
         prepared = remote.prepare(

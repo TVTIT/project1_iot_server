@@ -609,7 +609,7 @@ class PortableBundleTests(unittest.TestCase):
             'telemetry_writes_completed':0,'drops':0}
         unique_telemetry = {'experiment': 'E4', 'telemetry': {
             'generated_unique': 20, 'application_acks': 20,
-            'ignored_valid_acks': 1, 'pending_messages': 0}}
+            'ignored_valid_acks': 1, 'retries':1,'pending_messages': 0,'pending_bytes':0}}
         replay_telemetry = {'experiment': 'E4', 'telemetry': {
             'replay_offered': 10, 'replay_application_acks': 10}}
         prepared.update(include_durable_reopen=True,include_cold_replay=False,
@@ -620,10 +620,15 @@ class PortableBundleTests(unittest.TestCase):
             phase_windows={'unique':{'database_delta':{'ledger':20,'raw':2000,'temporal':20,'configuration':0},
                 'ws_delta':{'submissions':20,'new_events':20,'deliveries_enqueued':20,
                     'telemetry_writes_completed':20,'drops':0},'journal_sha256':'a'*64,
-                'raw':[{'verified_exact':True},{'verified_exact':True}]},
+                 'raw':[{'verified_exact':True,'ledger_count':10,'raw_identity_value_mismatches':0},
+                        {'verified_exact':True,'ledger_count':10,'raw_identity_value_mismatches':0}]},
                 'replay':{'database_delta':{'ledger':0,'raw':0,'temporal':0,'configuration':0},
                     'ws_delta':zero_ws,'journal_sha256':'a'*64,
-                    'cache':{'warm_lookup_hits':10,'repository_calls_avoided':10}}})
+                     'cache':{'warm_lookup_hits':10,'repository_calls_avoided':10},
+                     'database_proof':{
+                         'unique_ack':[{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                         'replay_end':[{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                         'exact_equal':True}}})
         report=a_support.finalize_remote_report(prepared,{'phase_history':[
             'unique','replay','durable-fault','durable-reopen'],'workload_outcome':'VALIDATED'},
             cleanup_verified=True,cleanup_counts={})

@@ -149,6 +149,7 @@ class HolderTests(unittest.TestCase):
         self.assertIn('PREFLIGHT_ONLY_NOT_RUN', result.stdout)
 
     def _run_and_drive(self, phases=holder.PHASE_SEQUENCE, result_events=20, deadline=10,
+                       expected_unique_events=20,
                        premature_complete_after_initial=False):
         preflight_patch, child_popen, kill_patch, sampler_patch = self._install_child()
         if result_events != 20:
@@ -187,7 +188,9 @@ class HolderTests(unittest.TestCase):
             try:
                 with mock.patch.object(holder, 'GeneratorResourceSampler', FakeSampler):
                     output = holder.run_viewer_holder(self.binary, self.manifest, self.output, self.control,
-                                                      self.correlation, deadline, poll_seconds=.01)
+                                                      self.correlation, deadline,
+                                                      expected_unique_events=expected_unique_events,
+                                                      poll_seconds=.01)
             except BaseException:
                 driver.join(timeout=5)
                 if holder_errors: raise holder_errors[0]
@@ -218,6 +221,11 @@ class HolderTests(unittest.TestCase):
         self.assertEqual(resources['scope'], 'viewer_child_process_tree')
         self.assertTrue(resources['includes_idle_and_manual_transfer_time'])
         self.assertTrue(FakeSampler.instances[-1].stopped)
+
+    def test_representative_eight_event_viewer_result_is_validated_against_selected_count(self):
+        result = self._run_and_drive(result_events=8, expected_unique_events=8)
+        self.assertEqual(result['result']['unique_events'], 8)
+        self.assertTrue(json.loads((self.control / 'lifecycle.json').read_text())['joined'])
 
     def test_actual_twenty_event_result_after_initial_only_is_not_success(self):
         with self.assertRaisesRegex(holder.HolderError, 'child_exited_before_join'):

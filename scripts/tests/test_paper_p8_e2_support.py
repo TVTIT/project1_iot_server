@@ -175,6 +175,32 @@ class E2SupportTests(unittest.TestCase):
         self.assertEqual(result['phase_overlap']['available'], None)
         self.assertEqual(result['received']['available'], None)
 
+    def test_official_zero_burst_does_not_require_empty_burst_overlap(self):
+        a = {'status': 'COMPLETE', 'telemetry': {
+            'generated_unique': 50, 'offered_unique': 50, 'publish_attempts': 50,
+            'broker_pubacks': 50, 'application_acks': 50, 'pending_messages': 0,
+            'pending_bytes': 0, 'retries': 0, 'invalid_acks': 0}}
+        b = {'status': 'COMPLETE', 'telemetry': {
+            'generated_unique': 50, 'offered_unique': 50, 'publish_attempts': 50,
+            'broker_pubacks': 50, 'application_acks': 50, 'pending_messages': 0,
+            'pending_bytes': 0, 'retries': 0, 'invalid_acks': 0}}
+        phases = [{'child': f'paperload-telemetry:{arm}.manifest.json', 'event': event,
+                   'observed_at_runner_monotonic_ns': stamp}
+                  for arm, event, stamp in [('A', 'measure_begin', 10), ('A', 'measure_end', 100),
+                                            ('B', 'burst_begin', 101), ('B', 'burst_end', 101)]]
+        result = validate_e2_result(workload_a=a, workload_b=b, ingress_delta={},
+            database_delta={'ledger': 100, 'raw': 100, 'temporal': 100, 'configuration': 0},
+            database_by_gateway={'gw-a': {'ledger': 50, 'raw': 50, 'temporal': 50, 'configuration': 0},
+                                 'gw-b': {'ledger': 50, 'raw': 50, 'temporal': 50, 'configuration': 0}},
+            phase_events=phases,
+            raw_verification=[{'verified_exact': True, 'gateway_id': 'gw-a', 'sensor_id': 's-a', 'ledger_count': 50},
+                              {'verified_exact': True, 'gateway_id': 'gw-b', 'sensor_id': 's-b', 'ledger_count': 50}],
+            execution_context={'profile': 'official', 'samples_per_message': 1,
+                'role_to_target': {'A': self.targets[0], 'B': self.targets[1]},
+                'role_manifests': {arm: {'traffic': {'rate_per_second': 50, 'burst_messages': 0},
+                    'phases': {'measure_seconds': 1}} for arm in ('A', 'B')}})
+        self.assertNotIn('a_measure_does_not_overlap_b_burst', result['failures'])
+
     def test_official_accounting_uses_declared_nonpilot_counts_and_keeps_retries(self):
         pair = e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
             'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost','mqtt_tls_ca_file':'ca'}},
@@ -1201,6 +1227,7 @@ class E2SupportTests(unittest.TestCase):
             self.assertEqual(prepared_off['plan']['expected_counts'],
                 {'unique':1007,'raw':100700,'temporal':1007,'ack':1007})
             self.assertEqual(portable['workload']['producer_rates_per_second'], {'A':50,'B':50})
+            self.assertEqual(prepared_off['run_id'], prepared_off['manifests']['A']['run_id'])
             self.assertEqual(portable['workload']['expected_counts'], prepared_off['plan']['expected_counts'])
             with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
                 bad_workload = dict(portable['workload'], offered_rate_per_second=200)

@@ -21,6 +21,25 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_official_e2_fixture_flags_use_fixture_profile(self):
+        from types import SimpleNamespace
+        from scripts.tests import paper_p8_e2_support as e2
+
+        effective = {'services': {'backend': {'environment': {
+            'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
+            'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
+            'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
+            'MQTT_SHAPER_RATE_PER_SECOND': '50', 'MQTT_SHAPER_BURST': '50',
+            'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+            'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
+            'MQTT_MICROBATCH_MAX_WAIT': '50ms'}}}}
+        fixture = SimpleNamespace(paper_p8_profile='official',
+            paper_p8_e2_offered_rate=100, paper_p8_e2_burst_messages=0,
+            paper_p8_e2_samples_per_message=100)
+        flags = smoke.paper_p8_e2_validate_fixture_flags(effective,
+            e2_support=e2, fixture=fixture)
+        self.assertEqual(flags['MQTT_SHAPER_RATE_PER_SECOND'], '50')
+
     def test_held_e1_begin_uses_prepared_manifests_and_session_budget(self):
         from scripts.tests import paper_p8_e1_support as e1
         from scripts.tests import paper_p8_supervisor as supervisor
@@ -153,12 +172,15 @@ class PreparationTests(unittest.TestCase):
             'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
             'validation': {'valid': True, 'failures': []},
             'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
-            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'raw_verification': [{'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}, {'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}],
             'new_ws_event_proof': {'status': 'PASS'},
             'workloads': {
                 'unique': {'validation_valid': True, 'telemetry': {
                     'experiment': 'E4', 'telemetry': {'generated_unique': 20,
-                        'application_acks': 20, 'ignored_valid_acks': 1, 'pending_messages': 0}}},
+                        'application_acks': 20, 'ignored_valid_acks': 1, 'retries': 1,
+                        'pending_messages': 0, 'pending_bytes': 0}}},
                 'replay': {'validation_valid': True, 'telemetry': {
                     'experiment': 'E4', 'telemetry': {'replay_offered': 10,
                         'replay_application_acks': 10}}}}}
@@ -167,6 +189,38 @@ class PreparationTests(unittest.TestCase):
         self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
         report['workloads']['replay']['telemetry']['telemetry']['replay_application_acks'] = 10
         self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+    def test_e4_outer_acceptance_uses_selected_counts_and_strict_sample_proof(self):
+        report = {
+            'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_WARM_SUBSET',
+            'workload_status': 'WARM_SUBSET_VALIDATED', 'selected_counts': {'unique_count':100,'replay_count':10},
+            'phase_history': ['unique','replay'], 'full_p8_accepted': False,
+            'coldrestart':'NOT RUN','durable_gateway_reopen':'NOT RUN','conflicts':'NOT RUN',
+            'physical_ab':'NOT RUN','generator_colocated':True,'runner_stopped':True,
+            'cleanup_verified':True,'journal_sha256':'d'*64,'journal_continuity':True,
+            'replay_journal_prefix_validated':True,
+            'database_delta':{'ledger':100,'raw':10000,'temporal':100,'configuration':0},
+            'validation':{'valid':True,'failures':[]},
+            'cache_window':{'warm_lookup_hits':10,'repository_calls_avoided':10},
+            'raw_verification':[{'verified_sample':True,'ledger_count':10,
+                'raw_identity_value_mismatches':0,'identity_ranges':[{} for _ in range(10)]} for _ in range(2)],
+            'new_ws_event_proof':{'status':'PASS','unique':{'submissions':100,'new_events':100,
+                'deliveries_enqueued':100,'telemetry_writes_completed':100,'drops':0},
+                'replay':{'submissions':0,'new_events':0,'deliveries_enqueued':0,
+                'telemetry_writes_completed':0,'drops':0}},
+            'workloads':{'unique':{'validation_valid':True,'telemetry':{'telemetry':{
+                'generated_unique':100,'application_acks':100,'ignored_valid_acks':1,'retries':1,
+                'pending_messages':0,'pending_bytes':0}}},
+                'replay':{'validation_valid':True,'telemetry':{'telemetry':{
+                    'replay_offered':10,'replay_application_acks':10}}}}}
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report,True))
+        wrong_db=json.loads(json.dumps(report)); wrong_db['database_delta']['raw']=9999
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(wrong_db,True))
+        wrong_ack=json.loads(json.dumps(report)); wrong_ack['workloads']['unique']['telemetry']['telemetry']['application_acks']=99
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(wrong_ack,True))
+        short_sample=json.loads(json.dumps(report)); short_sample['raw_verification'][0]['identity_ranges']=[{}]
+        short_sample['raw_verification'][0]['ledger_count']=1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(short_sample,True))
 
     def test_e4_cache_off_acceptance_requires_real_database_duplicate_window(self):
         report = {
@@ -184,7 +238,9 @@ class PreparationTests(unittest.TestCase):
             'counter_windows': {'replay': {'database_proof': {'exact_equal': True,
                 'unique_ack': [{'fingerprint': 'a' * 32}, {'fingerprint': 'b' * 32}],
                 'replay_end': [{'fingerprint': 'a' * 32}, {'fingerprint': 'b' * 32}]}}},
-            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
+            'raw_verification': [{'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}, {'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}],
             'new_ws_event_proof': {'status': 'PASS', 'replay': {
                 'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
                 'telemetry_writes_completed': 0, 'drops': 0}},
@@ -193,7 +249,7 @@ class PreparationTests(unittest.TestCase):
             'workloads': {
                 'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
                     'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
-                    'pending_messages': 0}}},
+                    'retries':1,'pending_messages': 0,'pending_bytes':0}}},
                 'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
                     'replay_offered': 10, 'replay_application_acks': 10}}}}}
         self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
@@ -264,15 +320,23 @@ class PreparationTests(unittest.TestCase):
             'journal_sha256': 'a' * 64, 'journal_continuity': True,
             'replay_journal_prefix_validated': True,
             'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
-            'counter_windows': {'replay': {'database_proof': {'exact_equal': True}}},
+            'counter_windows': {'replay': {'database_proof': {
+                'unique_ack': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'replay_end': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'exact_equal': True}}},
             'validation': {'valid': True, 'failures': []},
             'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
-            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
-            'new_ws_event_proof': {'status': 'PASS'},
+            'raw_verification': [{'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}, {'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}],
+            'new_ws_event_proof': {'status': 'PASS', 'unique': {'submissions':20,'new_events':20,
+                'deliveries_enqueued':20,'telemetry_writes_completed':20,'drops':0},
+                'replay': {'submissions':0,'new_events':0,'deliveries_enqueued':0,
+                    'telemetry_writes_completed':0,'drops':0}},
             'workloads': {
                 'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
                     'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
-                    'pending_messages': 0}}},
+                     'retries':1,'pending_messages': 0,'pending_bytes':0}}},
                 'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
                     'replay_offered': 10, 'replay_application_acks': 10}}}}}
 
@@ -520,15 +584,23 @@ class PreparationTests(unittest.TestCase):
             'journal_sha256': 'a' * 64, 'journal_continuity': True,
             'replay_journal_prefix_validated': True,
             'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
-            'counter_windows': {'replay': {'database_proof': {'exact_equal': True}}},
+            'counter_windows': {'replay': {'database_proof': {
+                'unique_ack': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'replay_end': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'exact_equal': True}}},
             'validation': {'valid': True, 'failures': []},
             'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
-            'raw_verification': [{'verified_exact': True}, {'verified_exact': True}],
-            'new_ws_event_proof': {'status': 'PASS'},
+            'raw_verification': [{'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}, {'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}],
+            'new_ws_event_proof': {'status': 'PASS', 'unique': {'submissions':20,'new_events':20,
+                'deliveries_enqueued':20,'telemetry_writes_completed':20,'drops':0},
+                'replay': {'submissions':0,'new_events':0,'deliveries_enqueued':0,
+                    'telemetry_writes_completed':0,'drops':0}},
             'workloads': {
                 'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
                     'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
-                    'pending_messages': 0}}},
+                     'retries':1,'pending_messages': 0,'pending_bytes':0}}},
                 'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
                     'replay_offered': 10, 'replay_application_acks': 10}}}}}
 

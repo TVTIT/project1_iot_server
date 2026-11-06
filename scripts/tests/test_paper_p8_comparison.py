@@ -789,6 +789,220 @@ def sample_remote_e5_report(
 
 
 class CliInterfaceTests(unittest.TestCase):
+    def test_e5_export_then_aggregate_independent_component_repeats(self):
+        import tempfile
+        import subprocess, sys, hashlib
+        import paper_p8_e5_support as e5
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            summaries = []
+            source_reports = []
+            for idx in range(3):
+                seed = 930 + idx
+                selection = e5.workload_preset('pilot')
+                manifest = e5.workload_manifest(
+                    journal_sha256=hashlib.sha256(f'journal-{idx}'.encode()).hexdigest(),
+                    journal_bytes=1000 + idx, command_ids=e5.command_idempotency_keys(seed),
+                    sensor_ids=[f'sensor-{idx}-a', f'sensor-{idx}-b'],
+                    viewer_targets=[f'viewer-{idx}-a', f'viewer-{idx}-b'],
+                    anchor=f'anchor-{idx}', selection=selection)
+                paths = {}
+                for arm in p8c.ARM_NAMES:
+                    report = sample_remote_e5_report(
+                        arm, seed=seed,
+                        observed_windows={'initial': 4.137 + idx * 0.1,
+                                          'warm_replay': 2.083 + idx * 0.1,
+                                          'control': 12.72 + idx * 0.1})
+                    report['workload'] = copy.deepcopy(manifest)
+                    report['mechanisms']['microbatch']['max_members'] = 4
+                    report['metadata']['workload'] = copy.deepcopy(manifest)
+                    report['metadata']['workload_sha256'] = p8c.normalized_workload_fingerprint(report['metadata']['workload']).removeprefix('sha256:')
+                    report['metadata']['seed'] = seed
+                    report['metadata']['workload_selection_sha256'] = manifest['workload_selection_sha256']
+                    report['context'] = {'sha256': hashlib.sha256(f'context-{idx}'.encode()).hexdigest(),
+                                         'seed': seed, 'anchor': manifest['telemetry']['dataset_anchor'],
+                                         'workload_selection_sha256': manifest['workload_selection_sha256']}
+                    report['workload_sha256'] = p8c.normalized_workload_fingerprint(manifest).removeprefix('sha256:')
+                    report['metadata']['workload_sha256'] = report['workload_sha256']
+                    report['accounting']['ingress_delta']['delta']['Committed'] = idx + 1
+                    report['metadata']['workers'] = {
+                        'paperload': 2, 'gateway_executors': 2, 'mqtt_worker_count': 4,
+                        'database_max_conns': 11, 'stage5_publish_workers': 1,
+                        'stage5_result_workers': 2,
+                    }
+                    report['metadata']['security_mode'] = {
+                        'fixture_jwt_mode': 'HS256', 'endpoint_tls': True, 'mqtt_tls': True,
+                        'mqtt_authentication_readback': 'not_performed',
+                    }
+                    report['metadata']['durability'] = 'synthetic_journal_background+sqlite_command_executors'
+                    path = root / f'{idx}-{arm}.json'
+                    path.write_text(json.dumps(report))
+                    source_reports.append((path, path.read_bytes()))
+                    paths[arm] = path
+                exported = root / f'export-{idx}'
+                summary = p8c.export_e5_summary(paths, exported)
+                self.assertTrue(summary['aggregation_provenance']['qualified'])
+                self.assertEqual(summary['aggregation_provenance']['configured_fields']['workers'], {
+                    'paperload':2, 'gateway_executors':2, 'mqtt_worker_count':4,
+                    'database_max_conns':11, 'stage5_publish_workers':1, 'stage5_result_workers':2})
+                self.assertEqual(summary['aggregation_provenance']['configured_fields']['phase_seconds'],
+                                 {'initial': 1.0, 'warm_replay': 2.0, 'control': 8.0})
+                portable = json.loads(paths['optimized'].read_text())
+                for invalid_windows in (None, {'initial': 1.0, 'warm_replay': float('nan'), 'control': 8.0}):
+                    invalid_portable = copy.deepcopy(portable)
+                    if invalid_windows is None:
+                        invalid_portable['metadata']['b_declared'].pop('declared_measurement_windows')
+                    else:
+                        invalid_portable['metadata']['b_declared']['declared_measurement_windows'] = invalid_windows
+                    invalid_provenance = p8c._e5_aggregation_provenance(
+                        {'optimized': invalid_portable}, {'optimized': 'a' * 64})
+                    self.assertFalse(invalid_provenance['qualified'])
+                    self.assertIsNone(invalid_provenance['configured_fields']['phase_seconds'])
+                self.assertTrue((exported / 'e5-summary.json').stat().st_mode & 0o077 == 0)
+                summaries.append(exported / 'e5-summary.json')
+            config_fingerprints = {json.loads(p.read_text())['aggregation_provenance']['workload_config_sha256'] for p in summaries}
+            dataset_fingerprints = {json.loads(p.read_text())['aggregation_provenance']['dataset_sha256'] for p in summaries}
+            self.assertEqual(len(config_fingerprints), 1)
+            self.assertEqual(len(dataset_fingerprints), 3)
+            before_bytes = [p.read_bytes() for p in summaries]
+            changed_declared = json.loads(summaries[2].read_text())
+            changed_provenance = changed_declared['aggregation_provenance']
+            changed_provenance['configured_fields']['phase_seconds']['initial'] = 2.0
+            changed_provenance['workload_config_sha256'] = hashlib.sha256(json.dumps(
+                changed_provenance['configured_fields'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            summaries[2].write_text(json.dumps(changed_declared)); summaries[2].chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'repeat_comparability_mismatch_configured_fields'):
+                p8c.aggregate_e5_summaries(summaries, root / 'different-declared-window')
+            summaries[2].write_bytes(before_bytes[2]); summaries[2].chmod(0o600)
+            out = root / 'aggregate'
+            proc = subprocess.run([sys.executable, 'scripts/paper_p8_comparison.py', 'e5-aggregate',
+                                   *sum((['--repeat-summary', str(p)] for p in summaries), []),
+                                   '--output-dir', str(out)], capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads((out / 'e5-aggregate.json').read_text())
+            self.assertEqual(result['metrics']['optimized.committed']['median'], 2)
+            self.assertEqual(result['metrics']['optimized.committed']['range'], 2)
+            self.assertEqual(result['status'], 'AGGREGATED_WITH_QUALIFIED_BENEFITS')
+            self.assertNotIn('optimized.gamma_copy_calls', result['metrics'])
+            self.assertTrue(result['metrics']['microbatch_off.gamma_copy_calls']['available'])
+            self.assertEqual([p.read_bytes() for p in summaries], before_bytes)
+            self.assertEqual([path.read_bytes() for path, _ in source_reports],
+                             [contents for _, contents in source_reports])
+            # Different seeds/contexts are not independent when all repeats
+            # replay the same underlying journal content.
+            shared_journal = hashlib.sha256(b'shared-journal-content').hexdigest()
+            duplicate_content_summaries = []
+            for idx in range(3):
+                paths = {}
+                for arm in p8c.ARM_NAMES:
+                    original_path = root / f'{idx}-{arm}.json'
+                    report = json.loads(original_path.read_text())
+                    manifest = report['workload']
+                    manifest['journal_sha256'] = shared_journal
+                    manifest['journal_bytes'] = 1000
+                    report['workload'] = copy.deepcopy(manifest)
+                    report['metadata']['workload'] = copy.deepcopy(manifest)
+                    report['workload_sha256'] = p8c.normalized_workload_fingerprint(manifest).removeprefix('sha256:')
+                    report['metadata']['workload_sha256'] = report['workload_sha256']
+                    duplicate_path = root / f'duplicate-{idx}-{arm}.json'
+                    duplicate_path.write_text(json.dumps(report))
+                    paths[arm] = duplicate_path
+                exported = root / f'duplicate-export-{idx}'
+                p8c.export_e5_summary(paths, exported)
+                duplicate_content_summaries.append(exported / 'e5-summary.json')
+            with self.assertRaisesRegex(ValueError, 'repeat_journal_content_duplicate'):
+                p8c.aggregate_e5_summaries(duplicate_content_summaries, root / 'duplicate-content')
+            with self.assertRaisesRegex(ValueError, 'repeat_journal_content_duplicate'):
+                p8c.aggregate_e5_summaries(
+                    [*duplicate_content_summaries[:2], summaries[2]], root / 'two-duplicate-journals')
+            rejected_cli_out = root / 'duplicate-content-cli'
+            rejected = subprocess.run([sys.executable, 'scripts/paper_p8_comparison.py', 'e5-aggregate',
+                                       *sum((['--repeat-summary', str(p)] for p in duplicate_content_summaries), []),
+                                       '--output-dir', str(rejected_cli_out)], capture_output=True, text=True, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('repeat_journal_content_duplicate', rejected.stderr)
+            self.assertFalse(rejected_cli_out.exists())
+            first = json.loads(summaries[0].read_text())
+            first_pair = next(p for p in first['pairs'] if p['arm'] == 'microbatch_off')
+            first_pair['activation_status'] = 'INCONCLUSIVE'
+            first_pair['activation_reason'] = 'repeat_one_specific_activation_reason'
+            summaries[0].write_text(json.dumps(first)); summaries[0].chmod(0o600)
+            reasoned = p8c.aggregate_e5_summaries(summaries, root / 'reason-specific')
+            self.assertEqual(reasoned['per_repeat']['microbatch_off.gamma_copy_calls'][0]['reason'], 'repeat_one_specific_activation_reason')
+            # Missing/nonfinite count data stays unavailable, while inactive pairs keep their reason.
+            original = summaries[2].read_text()
+            altered = json.loads(original)
+            altered['runs'][0].pop('committed')
+            summaries[2].write_text(json.dumps(altered)); summaries[2].chmod(0o600)
+            incomplete = p8c.aggregate_e5_summaries(summaries, root / 'missing-metric')
+            self.assertFalse(incomplete['metrics']['optimized.committed']['available'])
+            self.assertEqual(incomplete['per_repeat']['optimized.committed'][2]['reason'], 'source_metric_missing_or_nonfinite')
+            altered['runs'][0]['committed'] = float('nan')
+            summaries[2].write_text(json.dumps(altered, allow_nan=True)); summaries[2].chmod(0o600)
+            nonfinite = p8c.aggregate_e5_summaries(summaries, root / 'nonfinite-metric')
+            self.assertFalse(nonfinite['metrics']['optimized.committed']['available'])
+            altered['runs'][0]['committed'] = 3
+            micro_pair = next(p for p in altered['pairs'] if p['arm'] == 'microbatch_off')
+            micro_pair['activation_status'] = 'INCONCLUSIVE'
+            micro_pair['activation_reason'] = 'mechanism_inactive_fixture'
+            summaries[2].write_text(json.dumps(altered)); summaries[2].chmod(0o600)
+            inactive = p8c.aggregate_e5_summaries(summaries, root / 'inactive-metric')
+            self.assertFalse(inactive['metrics']['microbatch_off.gamma_copy_calls']['available'])
+            self.assertEqual(inactive['per_repeat']['microbatch_off.gamma_copy_calls'][2]['reason'], 'mechanism_inactive_fixture')
+            malformed = root / 'malformed.json'
+            malformed.write_text('[]')
+            malformed.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'summary_json_must_be_object'):
+                p8c.aggregate_e5_summaries([malformed, *summaries[:2]], root / 'malformed-out')
+            malformed_pair = json.loads(summaries[0].read_text())
+            malformed_pair['pairs'][0] = None
+            pair_path = root / 'malformed-pair.json'
+            pair_path.write_text(json.dumps(malformed_pair)); pair_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'summary_pair_comparability_or_activation_invalid'):
+                p8c.aggregate_e5_summaries([pair_path, *summaries[1:]], root / 'malformed-pair-out')
+            malformed_worker = json.loads(summaries[0].read_text())
+            malformed_worker['aggregation_provenance']['configured_fields']['workers'] = None
+            worker_path = root / 'malformed-worker.json'
+            worker_path.write_text(json.dumps(malformed_worker)); worker_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'summary_invalid_worker_configuration'):
+                p8c.aggregate_e5_summaries([worker_path, *summaries[1:]], root / 'malformed-worker-out')
+            bad_hash = json.loads(summaries[2].read_text())
+            bad_hash['runs'][0].pop('raw_report_sha256')
+            summaries[2].write_text(json.dumps(bad_hash)); summaries[2].chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'raw_report_sha256'):
+                p8c.aggregate_e5_summaries(summaries, root / 'missing-raw-hash')
+            summaries[2].write_bytes(before_bytes[2])
+            summaries[2].chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'repeat_summary_count'):
+                p8c.aggregate_e5_summaries(summaries[:2], root / 'too-few')
+            with self.assertRaisesRegex(ValueError, 'duplicate_summary_input'):
+                p8c.aggregate_e5_summaries([summaries[0], summaries[0], summaries[1]], root / 'duplicate')
+            original = summaries[2].read_text()
+            altered = json.loads(original)
+            altered['aggregation_provenance']['configured_fields']['source_dirty_sha256'] = 'f' * 64
+            altered['aggregation_provenance']['workload_config_sha256'] = hashlib.sha256(json.dumps(altered['aggregation_provenance']['configured_fields'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            summaries[2].write_text(json.dumps(altered)); summaries[2].chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'summary_run_provenance_mismatch_source_dirty_sha256'):
+                p8c.aggregate_e5_summaries(summaries, root / 'mismatch')
+            altered['aggregation_provenance']['configured_fields']['source_dirty_sha256'] = 'a' * 64
+            altered['aggregation_provenance']['workload_config_sha256'] = hashlib.sha256(json.dumps(altered['aggregation_provenance']['configured_fields'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            first = json.loads(summaries[0].read_text())['aggregation_provenance']
+            altered['aggregation_provenance']['dataset_fields'] = first['dataset_fields']
+            prov = altered['aggregation_provenance']
+            prov['dataset_sha256'] = hashlib.sha256(json.dumps(prov['dataset_fields'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            prov['repeat_identity'] = hashlib.sha256((prov['dataset_sha256'] + ''.join(prov['report_sha256_set'])).encode()).hexdigest()
+            summaries[2].write_text(json.dumps(altered)); summaries[2].chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'repeat_dataset_context'):
+                p8c.aggregate_e5_summaries(summaries, root / 'seed-only')
+            altered['aggregation_provenance']['dataset_fields'] = dict(altered['aggregation_provenance']['dataset_fields'], context_sha256='f' * 64)
+            prov = altered['aggregation_provenance']
+            prov['dataset_sha256'] = hashlib.sha256(json.dumps(prov['dataset_fields'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            prov['repeat_identity'] = hashlib.sha256((prov['dataset_sha256'] + ''.join(prov['report_sha256_set'])).encode()).hexdigest()
+            altered['runs'][0]['exact_cleanup_verified'] = False
+            summaries[2].write_text(json.dumps(altered)); summaries[2].chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'summary_runs_not_six_qualified_arms'):
+                p8c.aggregate_e5_summaries(summaries, root / 'failed-cleanup')
+
     def test_cli_preflight_arm(self):
         import io
         import contextlib
@@ -938,11 +1152,19 @@ class CliInterfaceTests(unittest.TestCase):
             paths = {}
             for arm in p8c.ARM_NAMES:
                 r = sample_e5_report(arm, include_extra_secrets=True)
+                r['quota']['admin_password'] = 'quota-secret-excluded'
+                r['metadata']['workers'] = {'paperload': 2, 'secret_token': 'worker-secret-excluded'}
+                r['metadata']['security_mode'] = {'fixture_jwt_mode': 'HS256', 'secret_key': 'security-secret-excluded'}
                 p = td_path / f'p8-e5-{arm}.json'
                 p.write_text(json.dumps(r))
                 paths[arm] = p
 
             summary = p8c.build_e5_summary(paths)
+            safe_provenance = json.dumps(summary['aggregation_provenance'])
+            self.assertNotIn('leaked_secret_val', safe_provenance)
+            self.assertNotIn('injected_secret', safe_provenance)
+            for denied in ('quota-secret-excluded', 'worker-secret-excluded', 'security-secret-excluded', 'secret_token', 'secret_key'):
+                self.assertNotIn(denied, safe_provenance)
             for run_row in summary['runs']:
                 self.assertNotIn('secret_key', run_row['cleanup_counts'])
                 self.assertNotIn('admin_password', run_row['cleanup_counts'])

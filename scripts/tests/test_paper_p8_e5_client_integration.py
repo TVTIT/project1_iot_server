@@ -49,6 +49,17 @@ class FakeSmoke:
 
 
 class E5ClientIntegrationTests(unittest.TestCase):
+    def test_direct_client_source_fingerprint_matches_repository(self):
+        from paper_p8_client import _local_source_fingerprint
+        from scripts.tests.paper_p8_support import _source_fingerprint
+        root = Path(__file__).resolve().parents[2]
+        observed = _local_source_fingerprint()
+        expected = _source_fingerprint(root)
+        self.assertEqual(observed['revision'], expected['revision'])
+        self.assertEqual(observed['dirty'], expected['dirty'])
+        self.assertEqual(observed['dirty_source_sha256'], expected['dirty_source_sha256'])
+        self.assertNotEqual(observed['revision'], 'local-b')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='p8-e5-client-test-')
         self.addCleanup(self.tmp.cleanup)
@@ -59,7 +70,8 @@ class E5ClientIntegrationTests(unittest.TestCase):
         self.private_a = self.host_a / 'private'
         self.private_a.mkdir(parents=True, mode=0o700)
         self.repeats_dir = self.private_a / 'repeats'
-        self.repeat_dir, self.context_path = e5_driver.prepare_repeat(self.repeats_dir, 1, 813)
+        self.preset = getattr(self, 'preset', 'pilot')
+        self.repeat_dir, self.context_path = e5_driver.prepare_repeat(self.repeats_dir, 1, 813, preset=self.preset)
         self.context = json.loads(self.context_path.read_text())
 
         # Public CA fixtures
@@ -94,12 +106,13 @@ class E5ClientIntegrationTests(unittest.TestCase):
             mqtt_manifest_endpoint='mqtts://fixture-a.lan:18884',
             mqtt_ca_file=self.mqtt_ca,
             journal_path=Path(self.context['dataset_path']),
-            journal_context={k: self.context[k] for k in ('sha256', 'bytes', 'gateway_ids', 'sensor_ids', 'seed', 'anchor')},
+            journal_context={k: self.context[k] for k in ('sha256', 'bytes', 'gateway_ids', 'sensor_ids', 'seed', 'anchor', 'workload_selection_sha256')},
             seed=self.context['seed'],
             anchor=self.context['anchor'],
             root=self.prep_root,
             command_keys=self.context['command_keys'],
             viewer_subscriptions=self.context['viewer_subscriptions'],
+            workload_selection=self.context['workload_selection'],
         )
 
         self.prepared = {
@@ -148,7 +161,30 @@ fi
         self.gateway_bin.write_text(gateway_script)
         self.gateway_bin.chmod(0o700)
 
-    def test_e5_client_phase_execution_and_export_lifecycle(self):
+    def test_e5_replay_counts_follow_bound_selection_and_reject_tampered_provenance(self):
+        binding = json.loads((self.workspace / 'runtime/binding.json').read_text())
+        self.assertEqual(client._e5_replay_counts(self.workspace, binding), (20, 10))
+
+        context_path = self.workspace / 'runtime/e5-context.json'
+        original_context = context_path.read_bytes()
+        changed = json.loads(original_context)
+        changed['workload_selection'] = {
+            'profile': 'representative', 'telemetry_messages': 8, 'initial_replay_count': 8,
+            'samples_per_message': 100, 'command_count': 4, 'viewer_count': 2,
+            'initial_replay_rate_per_second': 1, 'warm_replay_prefix': 2,
+        }
+        changed['workload_selection_sha256'] = hashlib.sha256(
+            json.dumps(changed['workload_selection'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        context_path.write_text(json.dumps(changed))
+        context_path.chmod(0o600)
+        try:
+            with self.assertRaisesRegex(ValueError, 'bound e5 context provenance mismatch'):
+                client._e5_replay_counts(self.workspace, binding)
+        finally:
+            context_path.write_bytes(original_context)
+            context_path.chmod(0o600)
+
+    def _exercise_e5_client_phase_execution_and_export_lifecycle(self):
         # 1. Start e5-viewers (mocking run_viewer_holder)
         mock_holder_return = {'state': 'STOPPED', 'result': {'status': 'COMPLETE'}}
         with patch.object(holder, 'run_viewer_holder', return_value=mock_holder_return) as mock_holder:
@@ -190,6 +226,8 @@ fi
         # Helper to simulate realistic paperload workload.json
         raw_lines = Path(self.context['dataset_path']).read_text().splitlines()
         dataset_records = [json.loads(l) for l in raw_lines]
+        initial_replay_count = self.context['workload_selection']['initial_replay_count']
+        warm_replay_prefix = self.context['workload_selection']['warm_replay_prefix']
 
         def _bound_identity(label, keys=('experiment', 'arm', 'profile', 'mode', 'run_id')):
             manifest = json.loads((self.workspace / f'runtime/manifests/{label}.json').read_text())
@@ -229,8 +267,8 @@ fi
                     'observed_at_runner_monotonic_ns': 2000000000,
                     'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local',
                     'configured_phases': {'warmup_seconds': 0, 'measure_seconds': 1, 'drain_seconds': 12, 'cooldown_seconds': 0},
-                    'counters': {'application_acks': 20 if 'initial' in job['manifest'] else 10 if 'warm' in job['manifest'] else 4,
-                                 'publish_attempts': 20 if 'initial' in job['manifest'] else 10 if 'warm' in job['manifest'] else 4,
+                    'counters': {'application_acks': initial_replay_count if 'initial' in job['manifest'] else warm_replay_prefix if 'warm' in job['manifest'] else 4,
+                                 'publish_attempts': initial_replay_count if 'initial' in job['manifest'] else warm_replay_prefix if 'warm' in job['manifest'] else 4,
                                  'pending_messages': 0, 'pending_bytes': 0},
                 })
             is_control = any('control' in j.get('manifest', '') for j in jobs)
@@ -285,7 +323,7 @@ fi
                 workload_file = out / 'workload.json'
                 if 'initial' in job['manifest']:
                     samples = [{k: r[k] for k in ('gateway_id', 'sensor_id', 'boot_id', 'first_sequence',
-                                                  'sample_count', 'payload_sha256', 'message_id')} for r in dataset_records]
+                                                  'sample_count', 'payload_sha256', 'message_id')} for r in dataset_records[:initial_replay_count]]
                     for s in samples:
                         s['topic'] = f"gateways/{s['gateway_id']}/telemetry/{s['sensor_id']}"
                     workload_file.write_text(json.dumps({
@@ -293,16 +331,16 @@ fi
                         'status': 'COMPLETE',
                         'implementation_status': 'P8.4b telemetry synthetic-load; no durable restart assurance',
                         'durability_mode': 'synthetic-load',
-                        'e4': {'mode': 'replay', 'journal_entry_count': 20,
+                        'e4': {'mode': 'replay', 'journal_entry_count': initial_replay_count,
                                'sampling_qualification': 'synthetic_load_only; not SQLite/durable assurance',
                                'safe_header_samples': samples},
-                        'telemetry': {'broker_pubacks': 20, 'application_acks': 0, 'publish_attempts': 20,
+                        'telemetry': {'broker_pubacks': initial_replay_count, 'application_acks': 0, 'publish_attempts': initial_replay_count,
                                       'retries': 0, 'pending_messages': 0, 'pending_bytes': 0,
-                                      'replay_application_acks': 20},
+                                      'replay_application_acks': initial_replay_count},
                     }))
                 elif 'warm' in job['manifest']:
                     samples = [{k: r[k] for k in ('gateway_id', 'sensor_id', 'boot_id', 'first_sequence',
-                                                  'sample_count', 'payload_sha256', 'message_id')} for r in dataset_records[:10]]
+                                                  'sample_count', 'payload_sha256', 'message_id')} for r in dataset_records[:warm_replay_prefix]]
                     for s in samples:
                         s['topic'] = f"gateways/{s['gateway_id']}/telemetry/{s['sensor_id']}"
                     workload_file.write_text(json.dumps({
@@ -310,12 +348,12 @@ fi
                         'status': 'COMPLETE',
                         'implementation_status': 'P8.4b telemetry synthetic-load; no durable restart assurance',
                         'durability_mode': 'synthetic-load',
-                        'e4': {'mode': 'replay', 'journal_entry_count': 10,
+                        'e4': {'mode': 'replay', 'journal_entry_count': warm_replay_prefix,
                                'sampling_qualification': 'synthetic_load_only; not SQLite/durable assurance',
                                'safe_header_samples': samples},
-                        'telemetry': {'broker_pubacks': 10, 'application_acks': 0, 'publish_attempts': 10,
+                        'telemetry': {'broker_pubacks': warm_replay_prefix, 'application_acks': 0, 'publish_attempts': warm_replay_prefix,
                                       'retries': 0, 'pending_messages': 0, 'pending_bytes': 0,
-                                      'replay_application_acks': 10},
+                                      'replay_application_acks': warm_replay_prefix},
                     }))
                 elif 'control' in job['manifest']:
                     backend_cmd_ids = [
@@ -383,7 +421,7 @@ fi
             self.assertTrue((out_initial / 'results.json').is_file())
             initial_res = json.loads((out_initial / 'results.json').read_text())
             self.assertEqual(initial_res['status'], 'COMPLETE')
-            self.assertEqual(initial_res['e4']['journal_entry_count'], 20)
+            self.assertEqual(initial_res['e4']['journal_entry_count'], initial_replay_count)
 
             # Transfer to A and import into A-side supervisor
             in_root = self.private_a / 'incoming'
@@ -411,7 +449,7 @@ fi
                                 '--phase', 'warm_replay', '--output', str(out_warm)])
             self.assertEqual(code, 0)
             warm_res = json.loads((out_warm / 'results.json').read_text())
-            self.assertEqual(warm_res['e4']['journal_entry_count'], 10)
+            self.assertEqual(warm_res['e4']['journal_entry_count'], warm_replay_prefix)
 
             # Transfer to A and import into A-side supervisor
             in_warm = in_root / 'warm_replay'
@@ -521,14 +559,16 @@ fi
                 'subscribed_distinct_viewers': 2,
                 'receiving_distinct_viewers': 2,
                 'reconnections': 0,
-                'unique_events': 20,
+                'unique_events': initial_replay_count,
                 'duplicates': 0,
                 'wrong_namespace': 0,
                 'close_reasons': {'planned_stop': 2},
                 'viewers': [
-                    {'id': 'e5-viewer-a', 'close_reason': 'planned_stop', 'events': 10, 'unique_events': 10,
+                    {'id': 'e5-viewer-a', 'close_reason': 'planned_stop',
+                     'events': initial_replay_count // 2, 'unique_events': initial_replay_count // 2,
                      'duplicates': 0, 'bytes': 100, 'wrong_namespace': 0},
-                    {'id': 'e5-viewer-b', 'close_reason': 'planned_stop', 'events': 10, 'unique_events': 10,
+                    {'id': 'e5-viewer-b', 'close_reason': 'planned_stop',
+                     'events': initial_replay_count // 2, 'unique_events': initial_replay_count // 2,
                      'duplicates': 0, 'bytes': 100, 'wrong_namespace': 0},
                 ],
                 'identity_samples': [
@@ -653,7 +693,9 @@ fi
                 sqlite_summaries, m_cmds, pg_receipts, rest_configurations, command_sensors))
 
             # Verify continuous viewer validation accepts the exported B viewer result
-            init_ws = {'new_events': 20, 'telemetry_writes_completed': 20, 'deliveries_enqueued': 20, 'drops': 0}
+            init_ws = {'new_events': initial_replay_count,
+                       'telemetry_writes_completed': initial_replay_count,
+                       'deliveries_enqueued': initial_replay_count, 'drops': 0}
             warm_ws = {'new_events': 0, 'telemetry_writes_completed': 0, 'deliveries_enqueued': 0, 'drops': 0}
             control_ws = {'new_events': 4, 'telemetry_writes_completed': 0, 'deliveries_enqueued': 0, 'drops': 0}
             end_metrics = {'websocket_metrics': {'global_queued_work': 0, 'global_queued_bytes': 0}}
@@ -727,6 +769,12 @@ fi
             _expect_reject('neg-initial-ack', initial_workload,
                            lambda data: data['telemetry'].__setitem__('replay_application_acks', 19),
                            'initial', 'initial_telemetry_accounting_invalid')
+            _expect_reject('neg-initial-foreign-prefix', initial_workload,
+                           lambda data: data['e4']['safe_header_samples'][0].__setitem__('message_id', 'foreign-journal-row'),
+                           'initial', 'initial_replay_contract_invalid')
+            _expect_reject('neg-initial-header-size', initial_workload,
+                           lambda data: data['e4']['safe_header_samples'].pop(),
+                           'initial', 'initial_replay_contract_invalid')
             _expect_reject('neg-initial-puback-only', initial_workload,
                            lambda data: data['telemetry'].pop('replay_application_acks', None),
                            'initial', 'initial_telemetry_accounting_invalid')
@@ -736,6 +784,23 @@ fi
             _expect_reject('neg-viewer-cleanup', holder_result,
                            lambda data: data['workload'].__setitem__('cleanup_errors', ['child_not_joined']),
                            'control', 'e5_viewer_cleanup_errors')
+
+    def test_e5_client_phase_execution_and_export_lifecycle(self):
+        self._exercise_e5_client_phase_execution_and_export_lifecycle()
+
+    def test_representative_e5_export_import_lifecycle(self):
+        representative = self.__class__('test_representative_e5_export_import_lifecycle')
+        representative.preset = 'representative'
+        representative.setUp()
+        try:
+            binding = json.loads((representative.workspace / 'runtime/binding.json').read_text())
+            self.assertEqual(client._e5_replay_counts(representative.workspace, binding), (8, 2))
+            for label in ('initial', 'warm_replay', 'viewer', 'control'):
+                manifest = json.loads(Path(representative.prepared['manifests'][label]).read_text())
+                self.assertEqual(manifest['profile'], 'pilot')
+            representative._exercise_e5_client_phase_execution_and_export_lifecycle()
+        finally:
+            representative.doCleanups()
 
     def test_e5_client_negative_cases(self):
         # 1. e5-viewers without gateway binary fails

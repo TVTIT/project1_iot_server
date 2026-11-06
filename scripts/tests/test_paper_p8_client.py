@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import paper_p8_client as client
+from scripts.tests import paper_p8_e4_support as e4_support
 from scripts.tests.test_paper_p8_bundle import PortableBundleTests, token, write
 
 
@@ -467,8 +468,8 @@ class IdentityAndProbeTests(unittest.TestCase):
 
 
 class ResultProjectionTests(unittest.TestCase):
-    def test_e1_and_e3_profile_opt_in_reaches_preflight_and_run(self):
-        for experiment in ('E1', 'E3'):
+    def test_e1_e2_e3_profile_opt_in_reaches_preflight_and_run(self):
+        for experiment in ('E1', 'E2', 'E3'):
             for profile in ('pilot', 'official'):
                 with self.subTest(experiment=experiment, profile=profile):
                     fixture = PortableBundleTests()
@@ -500,6 +501,129 @@ class ResultProjectionTests(unittest.TestCase):
                                                       '--binary', str(binary)]), 0)
                     self.assertIs(run.call_args.kwargs['official'], expected)
                     self.assertEqual(preflight_official, [expected, expected])
+
+    def test_e4_official_profile_opt_in_reaches_phase_supervisor(self):
+        for profile, expected, unique_count, replay_count in (
+                ('official', True, 20, 10), ('pilot', False, 20, 10),
+                ('pilot', False, 8, 2), ('official', True, 1000, 100)):
+            with self.subTest(profile=profile):
+                fixture = PortableBundleTests()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                common = {**fixture.telemetry, 'experiment': 'E4', 'arm': 'warm',
+                    'profile': profile, 'run_id': 'e4-run',
+                    'phases': {'measure_seconds': 4}, 'topology': {'gateways': 2},
+                    'traffic': {'rate_per_second': 5}}
+                unique_manifest = e4_support.e4_phase_manifest(common,
+                    'outputs/e4-journal.sqlite', 'unique', unique_count=unique_count,
+                    replay_count=replay_count, official_opt_in=profile == 'official')
+                replay_manifest = e4_support.e4_phase_manifest(common,
+                    'outputs/e4-journal.sqlite', 'replay', unique_count=unique_count,
+                    replay_count=replay_count, official_opt_in=profile == 'official')
+                telemetry = {**common, **unique_manifest, 'experiment': 'E4', 'arm': 'warm',
+                    'profile': profile, 'run_id': 'e4-run'}
+                unique_path = write(fixture.src / 'e4-unique.json', telemetry)
+                replay_path = write(fixture.src / 'e4-replay.json',
+                    {**common, **replay_manifest, 'experiment': 'E4', 'arm': 'warm',
+                     'profile': profile, 'run_id': 'e4-run-replay'})
+                viewer = {**fixture.viewer, 'arm': 'warm', 'profile': profile}
+                viewer_path = write(fixture.src / 'e4-viewer.json', viewer)
+                e4_spec = write(fixture.src / 'e4-run-spec.json', {
+                    'paperload': [
+                        {'manifest': str(unique_path), 'output_dir': 'outputs/unique',
+                          'role': 'telemetry', 'ready_timeout_seconds': 30},
+                        {'manifest': str(replay_path), 'output_dir': 'outputs/replay',
+                         'role': 'telemetry', 'ready_timeout_seconds': 30},
+                        {'manifest': str(viewer_path), 'output_dir': 'outputs/viewer',
+                         'role': 'viewer', 'ready_timeout_seconds': 30}],
+                    'gateways': [{'env_file': 'gateway-env.json', 'role': 'durable-telemetry'}],
+                    'stop_timeout_seconds': 30})
+                exported = fixture.export(experiment='E4', arm='warm', phase='unique',
+                    manifests={'unique': unique_path, 'replay': replay_path, 'viewer': viewer_path},
+                    identity_files={'unique:telemetry': fixture.src / 'telemetry.json',
+                                    'replay:telemetry': fixture.src / 'telemetry.json',
+                                    'viewer': fixture.src / 'viewer.json'},
+                    role_metadata={'roles': {'unique:telemetry': {'role': 'telemetry', 'principals': []},
+                                             'replay:telemetry': {'role': 'telemetry', 'principals': []},
+                                             'viewer': {'role': 'viewer', 'principals': ['user-a', 'user-b']}},
+                                   'gateways': {'gw-1': {'role': 'gateway', 'gateway_id': 'gw-1',
+                                                         'username': 'gw-user'}}},
+                    workload={'experiment': 'E4', 'arm': 'warm', 'run_id': 'e4-run',
+                              'phase': 'unique', 'profile': profile}, run_spec=e4_spec)
+                workspace = fixture.root / 'B' / 'workspace'
+                workspace.parent.mkdir(mode=0o700)
+                client.paper_p8_bundle.bind_bundle(bundle_root=Path(exported['bundle_root']),
+                                                   workspace_leaf=workspace)
+                bound_jobs = json.loads(
+                    (workspace / 'runtime/execution/run-spec.json').read_text())['paperload']
+                selected_jobs = [job for job in bound_jobs
+                    if Path(job['manifest']).stem in ('unique', 'viewer')]
+                binary = fixture.root / 'paperload'
+                binary.write_bytes(b'test binary')
+                binary.chmod(0o700)
+                run_phase = 'unique'
+
+                with mock.patch.object(client.paper_p8, 'preflight') as preflight, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(client.main(['preflight', '--workspace', str(workspace),
+                                                  '--binary', str(binary)]), 0)
+                self.assertEqual([call.kwargs['official'] for call in preflight.call_args_list],
+                                 [expected, expected, expected])
+
+                # Keep the real bound CLI path through post-run count and journal checks;
+                # replace only the supervisor's child execution with deterministic files.
+                def completed_runner(**kwargs):
+                    for job in kwargs['jobs']:
+                        output = Path(job['output_dir'])
+                        output.mkdir(mode=0o700, parents=True)
+                        if job['role'] == 'telemetry':
+                            manifest = json.loads(Path(job['manifest']).read_text())
+                            mode = manifest['e4']['mode']
+                            total = unique_count if mode == 'unique' else replay_count
+                            headers = []
+                            for index in range(min(total, 20)):
+                                headers.append({'topic': f'gateways/gw-{index}/telemetry/s-{index}',
+                                    'gateway_id': f'gw-{index}', 'sensor_id': f's-{index}',
+                                    'message_id': f'm-{index}', 'boot_id': f'b-{index}',
+                                    'first_sequence': '0', 'sample_count': 100,
+                                    'payload_sha256': 'a' * 64})
+                            result = {'status': 'COMPLETE', 'experiment': 'E4', 'arm': 'warm',
+                                'profile': profile, 'run_id': manifest['run_id'], 'mode': 'local',
+                                'e4': {'mode': mode, 'journal_entry_count': total,
+                                    'safe_header_samples': headers},
+                                'telemetry': ({'generated_unique': unique_count,
+                                    'offered_unique': unique_count, 'application_acks': unique_count,
+                                    'ignored_valid_acks': 1, 'retries': 1, 'pending_messages': 0,
+                                    'pending_bytes': 0} if mode == 'unique' else {
+                                    'generated_unique': 0, 'offered_unique': 0, 'application_acks': 0,
+                                    'replay_offered': replay_count,
+                                    'replay_application_acks': replay_count,
+                                    'pending_messages': 0, 'pending_bytes': 0})}
+                        else:
+                            result = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'warm',
+                                'profile': profile, 'run_id': 'e4-run',
+                                'connected_distinct_viewers': 2, 'subscribed_distinct_viewers': 2,
+                                'receiving_distinct_viewers': (2 if run_phase == 'unique' else 0),
+                                'unique_events': (unique_count if run_phase == 'unique' else 0)}
+                        (output / 'workload.json').write_text(json.dumps(result))
+                    journal = workspace / 'outputs/e4-journal.sqlite'
+                    journal.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if run_phase == 'unique':
+                        journal.write_bytes(b'journal')
+                    return 'COMPLETE', {'status': 'COMPLETE'}
+                stderr = io.StringIO()
+                with mock.patch.object(client.paper_p8, 'run_supervised', side_effect=completed_runner) as run, \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(stderr):
+                    unique_status = client.main(['run', '--workspace', str(workspace), '--binary', str(binary),
+                                                 '--phase', 'unique'])
+                    run_phase = 'replay'
+                    replay_status = client.main(['run', '--workspace', str(workspace), '--binary', str(binary),
+                                                 '--phase', 'replay'])
+                self.assertEqual(unique_status, 0, stderr.getvalue())
+                self.assertEqual(replay_status, 0, stderr.getvalue())
+                self.assertEqual(run.call_count, 2)
+                self.assertIs(run.call_args.kwargs['official'], expected)
 
     def test_preflight_uses_all_bound_manifests_without_creating_workload_dirs(self):
         fixture = PortableBundleTests()
@@ -1039,16 +1163,74 @@ class ResultProjectionTests(unittest.TestCase):
 
     def test_e4_phase_result_requires_real_viewer_subscription_and_event_evidence(self):
         telemetry = {'status': 'COMPLETE', 'experiment': 'E4', 'e4': {
-            'mode': 'unique', 'journal_entry_count': 20, 'safe_header_samples': [{} for _ in range(10)]},
+            'mode': 'unique', 'journal_entry_count': 20, 'safe_header_samples': [{} for _ in range(20)]},
             'telemetry': {'generated_unique': 20, 'application_acks': 20,
                 'ignored_valid_acks': 1, 'retries': 1, 'pending_messages': 0}}
         viewer = {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
             'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2,
             'unique_events': 20}
-        client._validate_e4_phase_result('unique', telemetry, viewer)
+        client._validate_e4_phase_result('unique', telemetry, viewer, expected_unique=20, expected_replay=10)
         viewer['subscribed_distinct_viewers'] = 0
         with self.assertRaisesRegex(ValueError, 'viewer proof rejected'):
-            client._validate_e4_phase_result('unique', telemetry, viewer)
+            client._validate_e4_phase_result('unique', telemetry, viewer, expected_unique=20, expected_replay=10)
+
+    def test_e4_phase_result_uses_bound_manifest_counts_and_bounded_prefix(self):
+        viewer = {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+            'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2, 'unique_events': 1}
+        for unique_count, replay_count in ((20, 10), (8, 2), (1000, 100)):
+            common = {'run_id': 'e4-regression', 'profile': 'official',
+                'phases': {'measure_seconds': 4}, 'topology': {'gateways': 2},
+                'roles': ['telemetry']}
+            unique_manifest = e4_support.e4_phase_manifest(common, 'journal', 'unique',
+                unique_count=unique_count, replay_count=replay_count, official_opt_in=True)
+            replay_manifest = e4_support.e4_phase_manifest(common, 'journal', 'replay',
+                unique_count=unique_count, replay_count=replay_count, official_opt_in=True)
+            expected_unique, expected_replay = client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'unique')
+            self.assertEqual(client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'replay'), (unique_count, replay_count))
+            self.assertEqual(client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'cold-replay'), (unique_count, replay_count))
+            self.assertEqual(client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'expiry-replay'), (unique_count, replay_count))
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest], 'unique')
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest, {**replay_manifest,
+                    'e4': {**replay_manifest['e4'], 'replay_count': 0}}], 'unique')
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest, replay_manifest], 'unexpected')
+            headers = [{'message_id': f'm{i}'} for i in range(min(unique_count, 20))]
+            unique = {'experiment': 'E4', 'e4': {'mode': 'unique',
+                'journal_entry_count': unique_count, 'safe_header_samples': headers},
+                'telemetry': {'generated_unique': unique_count, 'application_acks': unique_count,
+                    'ignored_valid_acks': 1, 'retries': 1, 'pending_messages': 0}}
+            replay_headers = headers[:min(replay_count, 20)]
+            replay = {'experiment': 'E4', 'e4': {'mode': 'replay',
+                'journal_entry_count': replay_count, 'safe_header_samples': replay_headers},
+                'telemetry': {'replay_offered': replay_count,
+                    'replay_application_acks': replay_count, 'pending_messages': 0}}
+            client._validate_e4_phase_result('unique', unique, viewer,
+                expected_unique=expected_unique, expected_replay=expected_replay)
+            client._validate_e4_phase_result('replay', replay, {**viewer, 'unique_events': 0},
+                expected_unique=expected_unique, expected_replay=expected_replay)
+            wrong = {**unique, 'telemetry': {**unique['telemetry'], 'application_acks': unique_count - 1}}
+            with self.assertRaisesRegex(ValueError, 'unique phase result rejected'):
+                client._validate_e4_phase_result('unique', wrong, viewer,
+                    expected_unique=expected_unique, expected_replay=expected_replay)
+            wrong_pending = {**unique, 'telemetry': {**unique['telemetry'], 'pending_messages': 1}}
+            with self.assertRaisesRegex(ValueError, 'unique phase result rejected'):
+                client._validate_e4_phase_result('unique', wrong_pending,
+                    {**viewer, 'unique_events': unique_count},
+                    expected_unique=expected_unique, expected_replay=expected_replay)
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest, {**replay_manifest,
+                    'e4': {**replay_manifest['e4'], 'max_messages': unique_count + 1}}], 'unique')
+            with self.assertRaisesRegex(ValueError, 'journal headers changed'):
+                client._validate_e4_header_prefix(headers, [{'message_id': 'tampered'}] + replay_headers[1:],
+                    replay_count)
+            with self.assertRaisesRegex(ValueError, 'journal headers changed'):
+                client._validate_e4_header_prefix([], [], replay_count)
 
     def test_e4_safe_projection_keeps_named_viewers_and_phase_observations(self):
         workload = {'status': 'COMPLETE', 'experiment': 'E1',
