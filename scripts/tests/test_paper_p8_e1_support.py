@@ -416,8 +416,8 @@ class E1PilotSupportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'result_inventory_rejected'):
                 _load_result_bundle(root,prepared,phase_id='pilot',binary_sha256=binary)
 
-    def valid_inputs(self):
-        mapping = mixed_e1_mapping(self.targets, viewers=32, principals=2, messages_per_target=5)
+    def valid_inputs(self, *, viewers=32):
+        mapping = mixed_e1_mapping(self.targets, viewers=viewers, principals=2, messages_per_target=5)
         viewers = [{'id': r['viewer_id'], 'unique_events': sum(5 for ids in mapping['expected_recipients_by_target'].values()
             if r['viewer_id'] in ids), 'duplicates': 0, 'wrong_namespace': 0} for r in mapping['viewers']]
         expected_unique = sum(mapping['messages_per_target'].values())
@@ -446,6 +446,103 @@ class E1PilotSupportTests(unittest.TestCase):
                 'producer-0':{'message_id':'producer-0','gateway_id':self.targets[0]['gateway_id'],
                 'sensor_id':self.targets[0]['sensor_id'],'boot_id':'boot-0','first_sequence':'0','sample_count':100}})
         self.assertTrue(result['valid'],result['failures'])
+
+    def test_large_raw_verification_accepts_exact_or_sample_without_weakening_checks(self):
+        mapping, workload, sessions = self.valid_inputs(viewers=128)
+        headers = {'producer-0': {key: value for key, value in sessions['identity_samples'][0].items()
+                                 if key != 'viewer_id'}}
+        cases = (
+            ({'verified_exact': True, 'verified_sample': False}, True),
+            ({'verified_exact': False, 'verified_sample': True}, True),
+            ({'verified_exact': False, 'verified_sample': False}, False),
+            ({}, False),
+            ({'verified_exact': True, 'raw_identity_value_mismatches': 1}, False),
+            ({'verified_exact': True, 'ledger_count': 4}, False),
+            ({'verified_exact': True, 'ledger_count': 6}, False),
+        )
+        for changes, expected_valid in cases:
+            with self.subTest(changes=changes):
+                raw = [{'ledger_count': 5, 'raw_identity_value_mismatches': 0, **changes}
+                       for _ in self.targets]
+                result = validate_e1_result(workload, mapping,
+                    database_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
+                    raw_verification=raw, viewer_sessions=sessions,
+                    sampled_headers=sessions['identity_samples'], expected_headers=headers)
+                self.assertEqual(result['valid'], expected_valid, result['failures'])
+                self.assertEqual('raw_identity' in result['failures'], not expected_valid)
+
+    def test_remote_finish_above_64_viewers_accepts_actual_exact_raw_verification(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from scripts.tests import paper_p8_e1_support as e1
+
+        for viewer_count in (128, 5000):
+            with self.subTest(viewers=viewer_count), \
+                    tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+                mapping, telemetry, viewer = self.valid_inputs(viewers=viewer_count)
+                telemetry['identity_samples'] = [{key: value
+                    for key, value in viewer['identity_samples'][0].items() if key != 'viewer_id'}]
+                counts = {'ledger':5,'raw':500,'temporal':5,'configuration':0}
+                total = {'ledger':20,'raw':2000,'temporal':20,'configuration':0}
+                specs = [SimpleNamespace(**target,
+                    sensor_urn=f"urn:ngsi-ld:Sensor:{target['gateway_id']}:{target['sensor_id']}")
+                    for target in self.targets]
+                collector = mock.Mock(errors=[], metrics=[], resources=[])
+                prepared = {'pg':'pg','tokens':{'admin':'opaque'}, 'targets_db':specs,
+                    'mapping':mapping, 'bundle_sha256':'b'*64, 'remote_collector':collector,
+                    'remote_baseline':{'phase_id':'pilot','metrics':{},
+                        'database':dict.fromkeys(total, 0),
+                        'sensors':[dict(target, counts=dict.fromkeys(counts, 0))
+                                   for target in self.targets]}}
+                smoke = mock.Mock()
+                smoke.paper_p1_count_db.return_value = total
+                smoke.paper_p0_stats.return_value = {}
+
+                def db_psql(registry, pg, query, params):
+                    if "json_build_object('ledger'" in query:
+                        return json.dumps(counts)
+                    if 'json_agg' in query:
+                        return json.dumps([{'message_id':f'producer-{i}',
+                            'first_sequence':str(i*100), 'last_sequence':str(i*100+99),
+                            'sample_count':100} for i in range(5)])
+                    if 'SELECT count(*) FROM processed_messages p' in query:
+                        return '0'
+                    self.fail('unexpected raw-verification query')
+
+                smoke.db_psql.side_effect = db_psql
+                binary = Path(directory)/'paperload'
+                binary.write_bytes(b'paperload-binary')
+                imported = {'telemetry':telemetry, 'viewer':viewer, 'runner':{},
+                    '_result_status':dict.fromkeys(('runner','viewer','telemetry'), 'COMPLETE')}
+                # Only external result/metrics IO is mocked. Keep the actual DB
+                # verification helper and final validator wired together.
+                with mock.patch.object(e1, '_load_result_bundle', return_value=imported), \
+                     mock.patch.object(e1, '_drain_websocket_metrics', return_value={}), \
+                     mock.patch.object(e1, 'websocket_metrics_window',
+                                       return_value={'availability':'available'}):
+                    result = e1.finish_remote_collection(smoke, None, None, None, [],
+                        prepared, Path(directory)/'results', phase_id='pilot',
+                        paperload_binary=binary)
+                self.assertTrue(result['validation']['valid'], result['validation']['failures'])
+                self.assertEqual(result['workload_outcome'], 'VALIDATED')
+                self.assertEqual(len(result['raw_verification']), len(self.targets))
+                for raw in result['raw_verification']:
+                    self.assertTrue(raw['verified_exact'])
+                    self.assertFalse(raw['verified_sample'])
+                    self.assertEqual(raw['raw_identity_value_mismatches'], 0)
+                collector.stop.assert_called_once_with(None)
+
+    def test_small_pilot_still_requires_exact_raw_verification(self):
+        mapping, workload, sessions = self.valid_inputs()
+        headers = {'producer-0': {key: value for key, value in sessions['identity_samples'][0].items()
+                                 if key != 'viewer_id'}}
+        result = validate_e1_result(workload, mapping,
+            database_delta={'ledger':20,'raw':2000,'temporal':20,'configuration':0},
+            raw_verification=[{'verified_exact':False,'verified_sample':True,
+                'ledger_count':5,'raw_identity_value_mismatches':0} for _ in self.targets],
+            viewer_sessions=sessions, sampled_headers=sessions['identity_samples'],
+            expected_headers=headers)
+        self.assertEqual(result, {'valid':False,'failures':['raw_identity']})
 
     def test_result_validator_accepts_selected_128_viewer_sampled_raw_and_bounded_headers(self):
         mapping = mixed_e1_mapping(self.targets, viewers=128, principals=2,

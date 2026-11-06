@@ -396,10 +396,12 @@ def validate_e1_result(workload, mapping, *, database_delta, raw_verification,
     if database_delta != expected_db:
         failures.append('database_delta')
     pilot_exact = socket_count <= 64 and len(mapping['targets']) <= 4
+    # Exact raw evidence remains valid at larger viewer counts; only small
+    # pilots require exact evidence instead of permitting sampled verification.
     if (not raw_verification or (pilot_exact and len(raw_verification) != len(mapping['targets'])) or not all(
             x.get('ledger_count') == messages.get(x.get('target_key'), max(messages.values(), default=0)) and
             x.get('raw_identity_value_mismatches') == 0 and
-            (x.get('verified_exact') if pilot_exact else x.get('verified_sample'))
+            (x.get('verified_exact') or (not pilot_exact and x.get('verified_sample')))
             for x in raw_verification)):
         failures.append('raw_identity')
     header_ids = set(expected_headers) if not isinstance(expected_headers, dict) else set(expected_headers)
