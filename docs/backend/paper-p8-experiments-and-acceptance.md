@@ -572,3 +572,32 @@ remote/full final CI. Mọi raw artifact vẫn `full_p8_accepted=false`. Backend
 reference ceiling 8 MiB không thay đổi. Không mở P9/Stage 6.
 
 Runbook vận hành đã được cập nhật tại [P8 E1 remote gate](paper-p8-e1-remote-gate.md).
+
+---
+
+<a id="r5b-checkpoint-2026-11-06"></a>
+## Checkpoint R0–R5 — Sửa luồng portable E2/E4/E5 (2026-11-06)
+
+**Qualification:** Đây là bằng chứng portable có giới hạn, đã source-qualify sau khi review final gates; không khẳng định mọi lượt dùng cùng một dirty worktree cuối. Raw artifacts giữ fingerprint/cấu hình riêng và `full_p8_accepted=false`. Không chạy full CI, HIL, physical A/B, TTL expiry 600s, capacity/soak hay rollout.
+
+| Mốc | Kết quả / bằng chứng | Ranh giới |
+|---|---|---|
+| R0 — Baseline/contracts | Đối chiếu artifacts E2/E4/E5, hợp đồng CLI và lịch sử source/failure trước khi cập nhật tài liệu. | Không sửa generated report; giữ nguyên nhãn FAIL/PARTIAL/NOT RUN lịch sử. |
+| R1 — Official opt-in E2/E4 | E2 S=100 và S=1, 100 messages/s tổng trong 1s: cả hai PASS, serve exit 0, CLOSED, cleanup chính xác 12/1/5. S=100: 100 application ACK, 10.000 raw, 100 ledger, 100 temporal, 0 config; 154 attempts/PUBACK gồm 54 duplicate retries. S=1: 100 ACK, 100 raw, 100 ledger, 100 temporal, pending 0. E4 official opt-in 1000/100 cache-on/off cũng PASS; unique→warm-replay portable lifecycle hoàn tất, serve exit 0/CLOSED và cleanup verified. | E2 là hai profile hữu hạn, không phải equal-sample speedup/capacity/wire-rate claim. E4 tại đây chỉ là warm-subset lifecycle; cold/expiry/conflict/durable acceptance chưa được chứng minh. Artifact roots tương đối: E2 `e2-actual-s100-attempt9`, `e2-actual-s1-attempt1`; E4 `e4-official-on-1000-100-r5a-final`, `e4-official-off-1000-100-r5a-final`. |
+| R2 — E4 dynamic counts | Cập nhật client/runner để official counts được xử lý động theo manifest/context; phase import đã validated trong các lượt liên quan. | Giữ nguyên giới hạn schedule, pending cap và sampling raw; không suy rộng sang các pha E4 khác. |
+| R3 — E5 representative portable | Cặp `arm-optimized-final3` / `arm-ram-dedup-off-final`: cả hai PASS; initial 8 ACK / 8 ledger / 800 raw / 8 temporal / 0 config; warm 2 ACK, không tăng DB/WS; control 4 receipts / 2 configurations trên hai Gateway SQLite executors; viewers 8 events, 4 mỗi viewer; planned stop/join 0; serve exit 0, CLOSED/VALIDATED/VERIFIED, cleanup 12/1/5. Parent comparability: `comparable=true`, chỉ khác `MQTT_RAM_DEDUP_ENABLED`. | Cùng fingerprint `85e5c9ca…`, binary/context/dataset/images/quota; session metadata là representative nhưng role manifests giữ pilot. Chỉ là cặp hai arm, không phải sáu-arm repeat/performance claim. Artifact root tương đối: `e5-context-pilot-representative-final/`. |
+| R4 — Repeat aggregate CLI | `e5-aggregate` nhận 3–10 summary đủ sáu arm, có cấu hình/provenance hợp lệ; xuất JSON/CSV. | Không aggregate ba native repeat nào trong lượt này. CLI kiểm tra cấu trúc/digest, không phải cryptographic attestation thực thi. Cặp hai arm không phải repeat đủ sáu arm; ba component fixtures là component proof, không phải ba native experiments. |
+| R5 — Native verification, final gates và docs | Final gates xác nhận các run đã ghi nhận; E4/E5 evidence và accounting được giữ ở R1/R3. Fingerprint E4 `8afcd4…` giống on/off nhưng expiry-budget adjustment sau đó nghĩa là không tuyên bố cùng final tree. | Raw identity proof E4 lấy mẫu 10 IDs mỗi sensor, không full raw enumeration; chỉ unique→warm-replay lifecycle PASS, chưa nghiệm thu cold/expiry/conflict/durable. Không có latency-benefit claim. Xem thêm phần final-gate outcome bên dưới. |
+
+Accounting E4 ở cả hai lượt: UNIQUE có 1.000 application ACK, DB delta 1.000 ledger / 100.000 raw / 1.000 temporal / 0 configuration; REPLAY có 100 ACK, DB và WS delta bằng 0, pending messages/bytes bằng 0. Cache ON ghi nhận 100 repository calls avoided; cache OFF ghi nhận 100 duplicate DB commits. Schedule giữ 5 messages/s (200s UNIQUE, 20s REPLAY), pending cap 64; journal/disk budget dẫn xuất là 49.152.000 bytes, không vượt cap 64 MiB. Đây không phải so sánh lợi ích hiệu năng.
+
+Các artifact roots tương đối trong bảng nằm dưới protected evidence root `p8-client-blockers-r5a-20261106T044511Z-1648640`; không chuyển chúng thành bằng chứng cùng source bằng cách sửa manifest hoặc report.
+
+### Lịch sử lỗi và kết quả final gates (R5)
+
+- E5 `e5_initial_database_delta_mismatch`: baseline trước/sau DB không được lưu, nguyên nhân **chưa biết**; không quy cho lỗi fingerprint local-b về sau. Lỗi raw-scope verifier, expected viewer count cố định 20 và fallback fingerprint `local-b` là các lỗi riêng; các lượt FAIL vẫn được giữ.
+- E4 250 msg/s FAIL do pending cap 64 được giữ. Lượt 100/10 trước đó có **phase import validated**, nhưng outer report bị từ chối bởi kiểm tra cố định 20/10; server exit 1. Đây là lỗi outer report, không phải phase-import failure. Những lỗi này không bị đổi nhãn bởi lượt 1000/100 PASS.
+- Python consolidated affected suite: 742 tests, 1 failure, 3 skips. Failure `test_cleanup_failure_deadline_with_preceding_http_failure`: expected `cleanup_step=check_deadline`, observed `remove_resource`. Test riêng lẻ PASS; module `native_compose_smoke` rerun 220 PASS; supplemental remote module 6 PASS. Các lượt chồng lặp không cộng thành tổng mới; consolidated suite vẫn có failure.
+- Go format, race (`internal/paperload`, `cmd/paperload`, `internal/gatewaysim`, `cmd/gateway`), vet, golangci-lint (0 issues), build, ARMv7 Gateway build, Python AST và `git diff --check`: PASS. Không chạy full CI/native rerun trong final-gate verification.
+
+Chi tiết nằm trong protected R5a handoff; artifact roots tương đối được nêu theo từng mốc. Final-gate evidence root: `p8-client-blockers-final-gates-20261106T000000Z`. R5b chỉ cập nhật tài liệu, không sửa raw/generated reports hay deployment defaults.

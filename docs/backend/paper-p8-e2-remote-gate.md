@@ -128,6 +128,11 @@ Không phải mọi tổ hợp tham số đều được hệ thống chấp nh�
 
 ## 2. Hướng dẫn vận hành A/B (Runbook)
 
+Quy trình vận hành sử dụng ba terminal độc lập được phân định rõ:
+- **Host A — Terminal A1**: Khởi chạy tiến trình `serve` và giữ fixture ở chế độ foreground.
+- **Host A — Terminal A2**: Thực hiện các lệnh điều khiển phiên (`status`, `begin`, `finish-phase`, `finalize`, `abort`, `cleanup`, `e2-context`, `compare-e2`).
+- **Host B — Terminal B**: Thực hiện các thao tác client workspace (`bind`, `preflight`, `check-connection`, `run`, `export-results`).
+
 ### 2.1 Quy định an toàn và nguyên tắc vận hành
 
 - **Placeholders và bảo vệ dữ liệu**: Chỉ sử dụng placeholders hoặc biến môi trường mẫu (`/path/to/private-network.json`, `$ROOT`, `SESSION_ID_100`). Tuyệt đối không đưa IP máy thật, đường dẫn home cá nhân, thông tin định danh hay secrets vào tài liệu vận hành.
@@ -135,8 +140,13 @@ Không phải mọi tổ hợp tham số đều được hệ thống chấp nh�
   - Thư mục cha và thư mục làm việc: quyền `0700`.
   - Tập tin cấu hình, bundle, chứng chỉ và kết quả: quyền `0600`.
   - Tập tin thực thi binary (`paperload`): quyền `0700`.
-- **Chống ghi đè tập tin**: Tuyệt đối không ghi đè hoặc tái sử dụng thư mục kết quả/workspace cũ. Mỗi profile phải được khởi tạo trong một thư mục gốc hoàn toàn mới.
-- **Ngân sách thời gian (Deadline & JWT budgets)**: Thời hạn deadline của server `--deadline-seconds 900` (15 phút) phải đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle, chạy workload 60s, chờ drain 20s, export/import, hậu kiểm và dọn dẹp. Thời hạn hiệu lực của JWT token được cấp phát với TTL riêng (ví dụ 3.600s trong testbed) và tiền kiểm tra client kiểm tra điều kiện `time.time() < payload['exp'] < time.time() + 86400 * 366`; thời hạn JWT không tự động đồng bộ hóa với tham số `--deadline-seconds` của server. Người vận hành phải bảo đảm token còn hạn vượt quá toàn bộ thời gian thực thi của workload.
+- **Chống ghi đè tập tin và Quản lý Thư mục Lá (Fresh Leaves)**:
+  - Tuyệt đối không ghi đè hoặc tái sử dụng thư mục kết quả/workspace cũ. Mỗi profile phải được khởi tạo trong một thư mục gốc hoàn toàn mới.
+  - Trên Host A: Thư mục cha `$ROOT` được tạo trước (`mkdir -p "$ROOT" && chmod 0700 "$ROOT"`), nhưng thư mục lá của `--root` (ví dụ `$ROOT/s100/A` hoặc `$WORK_DIR`) **không được tạo trước bằng `mkdir`**; lệnh `serve` yêu cầu tự tạo mới với quyền `0700`.
+  - Trên Host B: Thư mục `workspace` **không được tạo sẵn trước** khi gọi lệnh `bind`. Nếu thư mục đã tồn tại từ trước, `bind` sẽ từ chối thực thi với lỗi `workspace_output_leaf_exists`.
+- **Ngân sách thời gian (Deadline & JWT budgets)**:
+  - Thời hạn deadline của server `--deadline-seconds` (60..86400s) phải đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle, chạy workload, thời gian thoát cạn drain (20s đối với `equal_samples`, 30s đối với `official`), truyền kết quả, hậu kiểm DB và dọn dẹp. Với `equal_samples`, yêu cầu $\text{deadline} \ge \text{duration} + \text{drain} + \text{grace}$. Với `official`, yêu cầu $\text{deadline} \ge \text{duration} + 60$ (khuyến nghị 1.200s).
+  - Thời hạn hiệu lực của JWT token được cấp phát với TTL riêng (ví dụ 3.600s trong testbed) và tiền kiểm tra client kiểm tra điều kiện `time.time() < payload['exp'] < time.time() + 86400 * 366`; thời hạn JWT không tự động đồng bộ hóa với tham số `--deadline-seconds` của server. Người vận hành phải bảo đảm token còn hạn vượt quá toàn bộ thời gian thực thi của workload.
 - **Bảo tồn phạm vi của E5**: E2 sử dụng các tham số `--context` và `--reference` trong không gian thử nghiệm E2, tuyệt đối không làm thay đổi hoặc ảnh hưởng tới ngữ nghĩa của E5.
 - **Phân định Direct fixture cục bộ và Quy trình Held Lifecycle**:
   - Luồng Direct local `native_compose_smoke.py --prepare <fresh-root> --paper-p8-e2` là luồng pilot cục bộ có giới hạn được hỗ trợ: cơ chế này khởi tạo fixture P2/TLS độc lập và bọc endpoint thành đối tượng `HTTPSEndpoint`; luồng này không yêu cầu `--network-config` hay deployment credentials.
@@ -144,16 +154,18 @@ Không phải mọi tổ hợp tham số đều được hệ thống chấp nh�
 - **Ranh giới an toàn và quyền hạn của Host B (Client-Side Isolation)**:
   - Máy khách Host B tuyệt đối không có quyền truy cập cơ sở dữ liệu PostgreSQL/TimescaleDB (no DB access), không có quyền quản trị máy chủ backend/admin và không có quyền truy cập Docker daemon/socket trên Host A.
   - Mọi thao tác trên Host B chỉ được thực thi bên trong thư mục workspace cục bộ với quyền `0700`, sử dụng bundle dữ liệu và binary `paperload` đã được sao chép sang, chỉ kết nối tới Host A thông qua các cổng dịch vụ mạng đã công khai và bảo vệ bằng TLS (HTTPS và MQTTS).
-- **Yêu cầu Fresh Leaves và Dọn dẹp tài nguyên**:
-  - Thư mục `workspace` trên Host B không được tạo sẵn trước khi gọi lệnh `bind`. Nếu thư mục đã tồn tại từ trước, `bind` sẽ từ chối thực thi với lỗi `workspace_output_leaf_exists`.
-  - Mọi pha đo lường khi kết thúc phải thực hiện đầy đủ chuỗi đối soát biên lai (`finish-phase` rồi `finalize`) để đảm bảo dọn dẹp sạch sẽ toàn bộ tài nguyên theo receipts; không để sót container hoặc volume mồ côi.
-- **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Steps)**: Việc chuyển bundle, binary và kết quả giữa Host A và Host B là thao tác truyền file thủ công của người vận hành (copy an toàn qua đường dẫn hoặc scp), không tuyên bố là tự động hóa qua SSH.
+- **Dọn dẹp tài nguyên và Tính nghiêm ngặt của Biên lai (Receipt-Verified Cleanup)**:
+  - Mọi pha đo lường khi kết thúc bình thường phải thực hiện đầy đủ chuỗi đối soát biên lai (`finish-phase` rồi `finalize`) để đảm bảo dọn dẹp sạch sẽ toàn bộ tài nguyên theo receipts; không để sót container hoặc volume mồ côi.
+  - Trường hợp xảy ra lỗi hoặc gián đoạn giữa chừng, sử dụng lệnh `abort` (nếu session còn sống) hoặc lệnh `cleanup` (với `--project "$PROJECT_ID"`) để thu hồi tài nguyên an toàn theo biên lai mà không làm ảnh hưởng tới các container khác trên hệ thống.
+- **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Steps)**: Việc chuyển bundle, binary và kết quả giữa Host A và Host B là thao tác truyền file thủ công của người vận hành qua kênh truyền an toàn độc lập; tài liệu chỉ mô tả ngắn gọn đường dẫn nguồn và đích, không giả định điều khiển tự động qua SSH hay scp/rsync.
 
 ---
 
 ### 2.2 Quy trình vận hành chế độ `equal_samples` (Khuyến nghị)
 
 Chạy tuần tự hai profile: Profile S=100 trước, sau đó Profile S=1 sử dụng `--reference` trỏ tới kết quả của S=100 để xác thực tính bất biến của binary và images.
+
+Dán khối thiết lập sau trên cả A1 và A2. Trên B dùng cùng giá trị `ROOT` tại bước nhận bundle; nếu chạy lại cặp đo, chọn một `ROOT` mới trên tất cả terminal.
 
 ```sh
 ROOT=/var/tmp/opencode/p8-e2-equal
@@ -208,11 +220,11 @@ Trên terminal điều khiển khác của Host A, kiểm tra trạng thái cho 
 python3 scripts/paper_p8_server.py status --root "$ROOT/s100/A"
 ```
 
-Đặt `session_id` nhận được vào biến `SESSION_ID_100` để dùng cho các lệnh sau (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế nhận được từ status):
+Đặt `session_id` nhận được vào biến `SESSION_ID_100` để dùng cho các lệnh sau (trích xuất tự động từ tệp `session.json` của session đang chạy, hoặc gán chuỗi hex thực tế từ lệnh `status`):
 
 ```sh
-SESSION_ID_100=<session_id>
-# Ví dụ: SESSION_ID_100=e817d576fffef0wB...
+SESSION_ID_100=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['session_id'])" "$ROOT/s100/A/fixture/private/session.json")
+# Hoặc gán thủ công từ kết quả status: SESSION_ID_100="e817d576fffef0..."
 ```
 
 #### Bước 2 — Chuyển giao gói dữ liệu sang Host B (Manual Transfer Step)
@@ -346,11 +358,11 @@ python3 scripts/paper_p8_server.py serve \
   --reference "$ROOT/s100/A/fixture/artifacts/p8-e2-equal-samples-100-remote-result.json"
 ```
 
-Kiểm tra status chờ đạt `preparation_status=E2_PREPARED` và `phase=READY`. Đặt `session_id` nhận được vào biến `SESSION_ID_1` để dùng cho các lệnh sau (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế từ status):
+Kiểm tra status chờ đạt `preparation_status=E2_PREPARED` và `phase=READY`. Đặt `session_id` nhận được vào biến `SESSION_ID_1` để dùng cho các lệnh sau (trích xuất tự động từ tệp `session.json` của session đang chạy, hoặc gán chuỗi hex thực tế từ lệnh `status`):
 
 ```sh
-SESSION_ID_1=<session_id>
-# Ví dụ: SESSION_ID_1=f928e461b2a3...
+SESSION_ID_1=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['session_id'])" "$ROOT/s1/A/fixture/private/session.json")
+# Hoặc gán thủ công từ kết quả status: SESSION_ID_1="f928e461b2a3..."
 ```
 
 #### Bước 9 — Thực hiện chu kỳ đo lường cho Profile S=1
@@ -389,7 +401,7 @@ SESSION_ID_1=<session_id>
 
 ---
 
-#### Bước 10 — So sánh đối chứng hai Profile qua `compare-e2`
+#### Bước 10 — So sánh đối chứng hai Profile qua `compare-e2` (Terminal A2)
 
 Thực hiện so sánh read-only trên hai tập tin báo cáo kết quả hoàn chỉnh:
 
@@ -402,25 +414,64 @@ python3 scripts/paper_p8_server.py compare-e2 \
 
 *Lưu ý về tính hợp lệ của phép so sánh*: Do các lần chạy thực tế lịch sử (ví dụ Attempt 4) ghi nhận phát sinh retry trên cả hai profile (1 retry ở S=100, 21 retries ở S=1), thuộc tính `clean_comparison` ghi nhận là `false` và trạng thái tổng thể là `CONTAMINATED`. Trường `headline_speedup` là `UNAVAILABLE`; kết quả này không cấu thành bằng chứng tăng tốc sạch (no clean speedup evidence). Toàn bộ bằng chứng và phân tích tài nguyên chi tiết thuộc về [Báo cáo P8 E2](paper-p8-experiments-and-acceptance.md#e2--hai-sample-profile-và-portable-lifecycle).
 
+#### Xử lý sự cố và dọn dẹp lỗi trong chế độ `equal_samples`
+
+1. **Hủy phiên đang chạy (`abort`)**:
+   Khi xảy ra sự cố không thể phục hồi trong bất kỳ pha nào (ví dụ client preflight lỗi, mạng đứt hoặc import thất bại), người vận hành phát lệnh hủy phiên trên Terminal A2 từ phase hiện tại (trích xuất tự động từ `session.json` hoặc truyền tường minh `READY`, `MEASURING`, `VERIFYING`):
+   ```sh
+   CURRENT_PHASE=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('phase', 'READY'))" "$ROOT/s100/A/fixture/private/session.json")
+   python3 scripts/paper_p8_server.py abort \
+     --root "$ROOT/s100/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_100" \
+     --phase "$CURRENT_PHASE"
+   ```
+
+2. **Dọn dẹp tài nguyên bị cô lập/mồ côi (`cleanup`)**:
+   Trường hợp tiến trình `serve` trên Terminal A1 bị dừng đột ngột (crash hoặc nhận tín hiệu SIGKILL) khiến các container Docker chưa kịp dọn dẹp, trích xuất mã dự án Compose (`project`, định dạng `ncs_[a-f0-9]{12}`) ghi nhận trong tệp `session.json` (hoặc `server.log`), sau đó thực hiện dọn dẹp an toàn theo biên lai:
+   ```sh
+   PROJECT_ID=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('project', ''))" "$ROOT/s100/A/fixture/private/session.json")
+   python3 scripts/paper_p8_server.py cleanup \
+     --root "$ROOT/s100/A" \
+     --project "$PROJECT_ID" \
+     --experiment E2
+   ```
+
 ---
 
 ### 2.3 Quy trình vận hành chế độ Fixed Message Count S100/S1 và Profile Official (steady_burst)
 
 Chế độ `steady_burst` là chế độ đo tải với số lượng tin nhắn cố định giữa hai profile S=100 và S=1, nhằm trả lời câu hỏi về dung lượng mẫu trên mỗi tin nhắn (sample-cardinality), không phải so sánh cùng công (`equal_samples`).
 
-Quy trình này KHÔNG sử dụng tham số `--context` hoặc `--reference` (nếu truyền sẽ bị server từ chối với lỗi `E2 steady_burst does not accept --context or --reference`).
+**Ranh giới cấm nghiêm ngặt**:
+- Quy trình này **tuyệt đối KHÔNG sử dụng** tham số `--context` hoặc `--reference` (nếu truyền sẽ bị server từ chối ngay tại bước phân tích cú pháp với lỗi `E2 steady_burst does not accept --context or --reference`).
+- Chế độ `equal_samples` **tuyệt đối KHÔNG hỗ trợ** dưới profile `official` (kết hợp `--profile official` với `--workload equal_samples` sẽ bị từ chối với lỗi `official_equal_samples_not_supported`).
+
+---
 
 #### 2.3.1 Kịch bản Fixed Message Count Pilot (24 unique messages)
 
 - **Cấu trúc tải**: Cố định 24 unique messages cho mỗi profile (Arm A phát 8 messages steady với tốc độ 1 msg/s; Arm B phát 4 messages steady kèm 12 messages burst dồn dập).
 - **Hạch toán dòng mẫu**: Profile S=100 tạo ra $24 \times 100 = 2.400$ dòng raw samples; Profile S=1 tạo ra $24 \times 1 = 24$ dòng raw samples.
-- **Quy ước Phase ID**: Sử dụng `phase-id="samples-100"` cho profile 100 và `phase-id="samples-1"` cho profile 1.
+- **Quy ước Phase ID**: Sử dụng tường minh `phase-id="samples-100"` cho profile 100 và `phase-id="samples-1"` cho profile 1.
 
-**Thực thi Profile S=100:**
-1. Khởi động server trên Host A (có thể tùy chọn kiểm tra trước với `--dry-run`):
+##### Phần A — Thực thi Profile S=100 (Pilot 24 messages)
+
+Trên A2, thiết lập biến trước khi dùng các lệnh điều khiển ở bước 2; các giá trị phải khớp A1:
+
+```sh
+ROOT=/var/tmp/opencode/p8-e2-pilot-steady
+RUN_LABEL=run01
+```
+
+1. **Khởi động server trên Host A (Terminal A1)**:
    ```sh
+   ROOT=/var/tmp/opencode/p8-e2-pilot-steady
+   RUN_LABEL="run01"        # Nhãn phân biệt đợt chạy (tránh xung đột thư mục lá khi chạy lặp lại)
+   mkdir -p "$ROOT" && chmod 0700 "$ROOT"
+
    python3 scripts/paper_p8_server.py serve \
-     --root "$ROOT/steady-s100/A" \
+     --root "$ROOT/steady-s100-${RUN_LABEL}/A" \
      --network-config /path/to/private-network.json \
      --deadline-seconds 900 \
      --profile pilot \
@@ -428,73 +479,569 @@ Quy trình này KHÔNG sử dụng tham số `--context` hoặc `--reference` (n
      --samples-per-message 100 \
      --workload steady_burst
    ```
-2. Chuyển bundle và binary sang Host B, thiết lập workspace fresh leaf (`bind`, `preflight`, `check-connection`).
-3. Kích hoạt pha đo lường trên Host A:
+
+2. **Kiểm tra trạng thái READY và lấy Session ID (Terminal A2)**:
    ```sh
-   python3 scripts/paper_p8_server.py begin --root "$ROOT/steady-s100/A" \
-     --experiment E2 --session-id "$SESSION_ID" --phase READY --phase-id "samples-100"
+   python3 scripts/paper_p8_server.py status --root "$ROOT/steady-s100-${RUN_LABEL}/A" --experiment E2
    ```
-4. Chạy tải và xuất kết quả trên Host B:
+   Chờ phản hồi `preparation_status=E2_PREPARED` và `phase=READY`. Ghi nhận Session ID:
    ```sh
-   python3 scripts/paper_p8_client.py run --workspace "$ROOT/steady-s100/B/workspace" --binary "$ROOT/steady-s100/B/paperload"
-   python3 scripts/paper_p8_client.py export-results --workspace "$ROOT/steady-s100/B/workspace" --output "$ROOT/steady-s100/B/exported-results"
-   ```
-5. Chuyển kết quả về Host A, kết thúc pha và dọn dẹp:
-   ```sh
-   python3 scripts/paper_p8_server.py finish-phase --root "$ROOT/steady-s100/A" \
-     --experiment E2 --session-id "$SESSION_ID" --phase MEASURING \
-     --phase-id "samples-100" --results "$ROOT/steady-s100/A/received-results"
-   python3 scripts/paper_p8_server.py finalize --root "$ROOT/steady-s100/A" \
-     --experiment E2 --session-id "$SESSION_ID" --phase VERIFYING
+   SESSION_ID_100=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['session_id'])" "$ROOT/steady-s100-${RUN_LABEL}/A/fixture/private/session.json")
+   sha256sum "$ROOT/steady-s100-${RUN_LABEL}/A/fixture/private/bin/paperload"
    ```
 
-**Thực thi Profile S=1:**
-Thực hiện tương tự như trên trong thư mục gốc hoàn toàn mới `$ROOT/steady-s1/`, với tham số `--samples-per-message 1` và `phase-id="samples-1"`.
+3. **Chuyển giao dữ liệu sang Host B (Manual Transfer Step)**:
+   - Nguồn bundle: `$ROOT/steady-s100-${RUN_LABEL}/A/client-bundle/` $\rightarrow$ Đích: `$ROOT/steady-s100-${RUN_LABEL}/B/received-bundle/`
+   - Nguồn binary: `$ROOT/steady-s100-${RUN_LABEL}/A/fixture/private/bin/paperload` $\rightarrow$ Đích: `$ROOT/steady-s100-${RUN_LABEL}/B/paperload`
+   - Thiết lập quyền trên Host B (thư mục `workspace` không tạo trước bằng `mkdir`):
+   ```sh
+   ROOT=/var/tmp/opencode/p8-e2-pilot-steady
+   RUN_LABEL="run01"
+   mkdir -p "$ROOT/steady-s100-${RUN_LABEL}/B" && chmod 0700 "$ROOT/steady-s100-${RUN_LABEL}/B"
+   chmod 0700 "$ROOT/steady-s100-${RUN_LABEL}/B/paperload"
+   find "$ROOT/steady-s100-${RUN_LABEL}/B/received-bundle" -type d -exec chmod 0700 {} +
+   find "$ROOT/steady-s100-${RUN_LABEL}/B/received-bundle" -type f -exec chmod 0600 {} +
+   ```
+
+4. **Thiết lập Workspace và kiểm tra kết nối (Terminal B)**:
+   ```sh
+   python3 scripts/paper_p8_client.py bind \
+     --bundle "$ROOT/steady-s100-${RUN_LABEL}/B/received-bundle" \
+     --workspace "$ROOT/steady-s100-${RUN_LABEL}/B/workspace"
+
+   python3 scripts/paper_p8_client.py preflight \
+     --workspace "$ROOT/steady-s100-${RUN_LABEL}/B/workspace" \
+     --binary "$ROOT/steady-s100-${RUN_LABEL}/B/paperload"
+
+   python3 scripts/paper_p8_client.py check-connection \
+     --workspace "$ROOT/steady-s100-${RUN_LABEL}/B/workspace"
+   ```
+
+5. **Kích hoạt pha đo lường trên Host A (Terminal A2)**:
+   ```sh
+   python3 scripts/paper_p8_server.py begin \
+     --root "$ROOT/steady-s100-${RUN_LABEL}/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_100" \
+     --phase READY \
+     --phase-id "samples-100"
+
+   python3 scripts/paper_p8_server.py status --root "$ROOT/steady-s100-${RUN_LABEL}/A" --experiment E2
+   ```
+   Chờ status xác nhận `phase=MEASURING`, `phase_id=samples-100`, và `collector_ready=true`.
+
+6. **Chạy tải và xuất kết quả trên Host B (Terminal B)**:
+   ```sh
+   python3 scripts/paper_p8_client.py run \
+     --workspace "$ROOT/steady-s100-${RUN_LABEL}/B/workspace" \
+     --binary "$ROOT/steady-s100-${RUN_LABEL}/B/paperload"
+
+   python3 scripts/paper_p8_client.py export-results \
+     --workspace "$ROOT/steady-s100-${RUN_LABEL}/B/workspace" \
+     --output "$ROOT/steady-s100-${RUN_LABEL}/B/exported-results"
+   ```
+
+7. **Chuyển giao kết quả về Host A (Manual Transfer Step)**:
+   - Nguồn: `$ROOT/steady-s100-${RUN_LABEL}/B/exported-results/` $\rightarrow$ Đích: `$ROOT/steady-s100-${RUN_LABEL}/A/received-results/`
+   - Quyền tại Host A: thư mục `0700`, tập tin `0600`.
+
+8. **Hậu kiểm dữ liệu và hoàn tất phiên trên Host A (Terminal A2)**:
+   ```sh
+   python3 scripts/paper_p8_server.py finish-phase \
+     --root "$ROOT/steady-s100-${RUN_LABEL}/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_100" \
+     --phase MEASURING \
+     --phase-id "samples-100" \
+     --results "$ROOT/steady-s100-${RUN_LABEL}/A/received-results"
+
+   python3 scripts/paper_p8_server.py status --root "$ROOT/steady-s100-${RUN_LABEL}/A" --experiment E2
+   ```
+   Chờ `phase=VERIFYING` và xác nhận `workload_outcome=VALIDATED`. Sau đó hoàn tất dọn dẹp:
+   ```sh
+   python3 scripts/paper_p8_server.py finalize \
+     --root "$ROOT/steady-s100-${RUN_LABEL}/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_100" \
+     --phase VERIFYING
+   ```
+   Chờ tiến trình `serve` kết thúc mã 0, `phase=CLOSED`, `cleanup_outcome=VERIFIED`. Báo cáo kết quả được lưu tại:
+   `$ROOT/steady-s100-${RUN_LABEL}/A/fixture/artifacts/p8-e2-samples-100-remote-result.json`.
+
+##### Phần B — Thực thi Profile S=1 (Pilot 24 messages)
+
+Trên A2, khai báo độc lập các giá trị khớp A1:
+
+```sh
+ROOT=/var/tmp/opencode/p8-e2-pilot-steady
+RUN_LABEL=run01
+```
+
+Thực hiện trong thư mục gốc riêng biệt `$ROOT/steady-s1-${RUN_LABEL}/` với đầy đủ các lệnh độc lập:
+
+1. **Khởi động server trên Host A (Terminal A1)**:
+   ```sh
+   ROOT=/var/tmp/opencode/p8-e2-pilot-steady
+   RUN_LABEL="run01"        # Nhãn phân biệt đợt chạy (khớp với phiên tương ứng)
+   mkdir -p "$ROOT" && chmod 0700 "$ROOT"
+
+   python3 scripts/paper_p8_server.py serve \
+     --root "$ROOT/steady-s1-${RUN_LABEL}/A" \
+     --network-config /path/to/private-network.json \
+     --deadline-seconds 900 \
+     --profile pilot \
+     --experiment E2 \
+     --samples-per-message 1 \
+     --workload steady_burst
+   ```
+
+2. **Kiểm tra trạng thái READY và lấy Session ID (Terminal A2)**:
+   ```sh
+   python3 scripts/paper_p8_server.py status --root "$ROOT/steady-s1-${RUN_LABEL}/A" --experiment E2
+   ```
+   Chờ phản hồi `preparation_status=E2_PREPARED` và `phase=READY`. Ghi nhận Session ID:
+   ```sh
+   SESSION_ID_1=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['session_id'])" "$ROOT/steady-s1-${RUN_LABEL}/A/fixture/private/session.json")
+   sha256sum "$ROOT/steady-s1-${RUN_LABEL}/A/fixture/private/bin/paperload"
+   ```
+
+3. **Chuyển giao dữ liệu sang Host B (Manual Transfer Step)**:
+   - Nguồn bundle: `$ROOT/steady-s1-${RUN_LABEL}/A/client-bundle/` $\rightarrow$ Đích: `$ROOT/steady-s1-${RUN_LABEL}/B/received-bundle/`
+   - Nguồn binary: `$ROOT/steady-s1-${RUN_LABEL}/A/fixture/private/bin/paperload` $\rightarrow$ Đích: `$ROOT/steady-s1-${RUN_LABEL}/B/paperload`
+   - Thiết lập quyền trên Host B:
+   ```sh
+   ROOT=/var/tmp/opencode/p8-e2-pilot-steady
+   RUN_LABEL="run01"
+   mkdir -p "$ROOT/steady-s1-${RUN_LABEL}/B" && chmod 0700 "$ROOT/steady-s1-${RUN_LABEL}/B"
+   chmod 0700 "$ROOT/steady-s1-${RUN_LABEL}/B/paperload"
+   find "$ROOT/steady-s1-${RUN_LABEL}/B/received-bundle" -type d -exec chmod 0700 {} +
+   find "$ROOT/steady-s1-${RUN_LABEL}/B/received-bundle" -type f -exec chmod 0600 {} +
+   ```
+
+4. **Thiết lập Workspace và kiểm tra kết nối (Terminal B)**:
+   ```sh
+   python3 scripts/paper_p8_client.py bind \
+     --bundle "$ROOT/steady-s1-${RUN_LABEL}/B/received-bundle" \
+     --workspace "$ROOT/steady-s1-${RUN_LABEL}/B/workspace"
+
+   python3 scripts/paper_p8_client.py preflight \
+     --workspace "$ROOT/steady-s1-${RUN_LABEL}/B/workspace" \
+     --binary "$ROOT/steady-s1-${RUN_LABEL}/B/paperload"
+
+   python3 scripts/paper_p8_client.py check-connection \
+     --workspace "$ROOT/steady-s1-${RUN_LABEL}/B/workspace"
+   ```
+
+5. **Kích hoạt pha đo lường trên Host A (Terminal A2)**:
+   ```sh
+   python3 scripts/paper_p8_server.py begin \
+     --root "$ROOT/steady-s1-${RUN_LABEL}/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_1" \
+     --phase READY \
+     --phase-id "samples-1"
+
+   python3 scripts/paper_p8_server.py status --root "$ROOT/steady-s1-${RUN_LABEL}/A" --experiment E2
+   ```
+   Chờ status xác nhận `phase=MEASURING`, `phase_id=samples-1`, và `collector_ready=true`.
+
+6. **Chạy tải và xuất kết quả trên Host B (Terminal B)**:
+   ```sh
+   python3 scripts/paper_p8_client.py run \
+     --workspace "$ROOT/steady-s1-${RUN_LABEL}/B/workspace" \
+     --binary "$ROOT/steady-s1-${RUN_LABEL}/B/paperload"
+
+   python3 scripts/paper_p8_client.py export-results \
+     --workspace "$ROOT/steady-s1-${RUN_LABEL}/B/workspace" \
+     --output "$ROOT/steady-s1-${RUN_LABEL}/B/exported-results"
+   ```
+
+7. **Chuyển giao kết quả về Host A (Manual Transfer Step)**:
+   - Nguồn: `$ROOT/steady-s1-${RUN_LABEL}/B/exported-results/` $\rightarrow$ Đích: `$ROOT/steady-s1-${RUN_LABEL}/A/received-results/`
+   - Quyền tại Host A: thư mục `0700`, tập tin `0600`.
+
+8. **Hậu kiểm dữ liệu và hoàn tất phiên trên Host A (Terminal A2)**:
+   ```sh
+   python3 scripts/paper_p8_server.py finish-phase \
+     --root "$ROOT/steady-s1-${RUN_LABEL}/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_1" \
+     --phase MEASURING \
+     --phase-id "samples-1" \
+     --results "$ROOT/steady-s1-${RUN_LABEL}/A/received-results"
+
+   python3 scripts/paper_p8_server.py status --root "$ROOT/steady-s1-${RUN_LABEL}/A" --experiment E2
+   ```
+   Chờ `phase=VERIFYING` và xác nhận `workload_outcome=VALIDATED`. Sau đó hoàn tất dọn dẹp:
+   ```sh
+   python3 scripts/paper_p8_server.py finalize \
+     --root "$ROOT/steady-s1-${RUN_LABEL}/A" \
+     --experiment E2 \
+     --session-id "$SESSION_ID_1" \
+     --phase VERIFYING
+   ```
+   Chờ tiến trình `serve` kết thúc mã 0, `phase=CLOSED`, `cleanup_outcome=VERIFIED`. Báo cáo kết quả được lưu tại:
+   `$ROOT/steady-s1-${RUN_LABEL}/A/fixture/artifacts/p8-e2-samples-1-remote-result.json`.
 
 ---
 
-#### 2.3.2 Kịch bản Tải chuẩn Official (`--profile official`)
+#### 2.3.2 Kịch bản Tải chuẩn Official (`--profile official` — steady_burst)
 
-Kịch bản `official` được thiết kế để kiểm định hệ thống ở các mức tải quy mô lớn có kiểm soát:
+> **Qualification hiện tại:** E2 official held-portable S=100 và S=1 đã PASS ở workload hữu hạn; xem checkpoint R1 trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#r5b-checkpoint-2026-11-06). Không diễn giải thành equal-samples speedup/capacity claim; các FAIL lịch sử vẫn được giữ.
+>
+> **Lịch sử seam (đã khắc phục, không còn là blocker hiện tại):** Các lượt trước từng bị chặn do client không forward official opt-in vào preflight/run. R1 xác nhận luồng held portable đã chạy PASS; đoạn này chỉ ghi lại nguyên nhân lịch sử, không phải hướng dẫn vận hành hiện tại.
+
+##### 1. Đặc tả Tham số, Quy tắc Hạch toán và Giới hạn Năng lực
+
 - **Cờ bắt buộc**: `--profile official` và `--official-opt-in`.
-- **Tham số tải**:
-  - `--e2-offered-rate`: Chọn một trong các mức `100`, `1000`, `5000`, hoặc `20000` msg/s (tổng gộp hai producer A+B).
-  - `--e2-duration-seconds`: Thời lượng phát đo lường (mặc định 10s).
-  - `--e2-burst-messages`: Số lượng burst cho Arm B (mặc định 0).
-  - `--samples-per-message`: Bắt buộc chỉ định `100` hoặc `1`.
-  - `--deadline-seconds`: Phải đủ lớn, bảo đảm $\text{deadline\_seconds} \ge \text{duration\_seconds} + 60$ và đủ cho toàn bộ chu kỳ sống (khuyến nghị 1.200s; lưu ý 900s có thể bị từ chối nếu tổng thời gian yêu cầu vượt quá 900s).
+- **Dải tham số đầu vào được chấp nhận**:
+  - `--e2-offered-rate`: Chọn một trong 4 mức tốc độ gộp được định nghĩa trong CLI: `100`, `1000`, `5000`, hoặc `20000` msg/s.
+  - `--samples-per-message`: Bắt buộc chỉ định tường minh `100` hoặc `1`.
+  - `--e2-duration-seconds`: Thời lượng phát tải đo lường (số nguyên từ `1` đến `7200` giây, mặc định `10` giây).
+  - `--e2-burst-messages`: Số lượng tin nhắn burst bổ sung cho Arm B (số nguyên từ `0` đến `100000`, mặc định `0`).
+  - `--deadline-seconds`: Ngân sách thời gian phiên, bắt buộc $\ge \text{duration\_seconds} + 60$ (khuyến nghị `1200` giây để bao phủ toàn bộ thời gian khởi động, phát tải, 30s drain, chuyển tệp, hậu kiểm DB và dọn dẹp).
+- **Phân bổ Tốc độ giữa hai Producer (Rate Accounting)**:
+  Tốc độ `--e2-offered-rate` là tốc độ gộp toàn hệ thống và được chia đều cho hai producer logic:
+  - Arm A nhận tốc độ: `rate_A = offered_rate // 2`.
+  - Arm B nhận tốc độ: `rate_B = offered_rate - (offered_rate // 2)`.
+  | Offered Rate | Tốc độ Arm A (`gw-0/sensor-0`) | Tốc độ Arm B (`gw-1/sensor-1`) | Ghi chú phân bổ |
+  |---:|---:|---:|---|
+  | **100** msg/s | 50 msg/s | 50 msg/s | Chia đều 1:1 |
+  | **1.000** msg/s | 500 msg/s | 500 msg/s | Chia đều 1:1 |
+  | **5.000** msg/s | 2.500 msg/s | 2.500 msg/s | Chia đều 1:1 |
+  | **20.000** msg/s | 10.000 msg/s | 10.000 msg/s | Chia đều 1:1 |
+- **Phân bổ Burst**: Tham số `--e2-burst-messages` chỉ áp dụng duy nhất cho Arm B (`burst_messages if arm == 'B' else 0`); Arm A luôn phát đều (0 burst).
+- **Hạch toán Tin nhắn Unique và Dòng Dữ liệu Cơ sở dữ liệu (Expected Counts)**:
+  - Tổng số tin nhắn unique:
+    $$\text{total\_unique} = \text{offered\_rate} \times \text{duration\_seconds} + \text{burst\_messages}$$
+    Trong đó Arm A phát `(offered_rate // 2) * duration_seconds` tin nhắn; Arm B phát `(offered_rate - (offered_rate // 2)) * duration_seconds + burst_messages` tin nhắn.
+  - Số dòng raw samples trong TimescaleDB:
+    $$\text{raw\_rows} = \text{total\_unique} \times \text{samples\_per\_message}$$
+    - Với S=100 (offered=1.000, duration=10s, burst=0): $10.000 \times 100 = 1.000.000$ dòng raw.
+    - Với S=1 (offered=1.000, duration=10s, burst=0): $10.000 \times 1 = 10.000$ dòng raw.
+  - Số dòng ledger: $\text{total\_unique}$ dòng (khớp 1:1 với số message unique đã commit).
+  - Số dòng temporal: $\text{total\_unique}$ dòng.
+  - Số dòng configuration: 0 dòng.
+- **Quy chuẩn Phase ID bắt buộc (Sửa lỗi Audit Finding)**:
+  Trong mã nguồn `scripts/tests/paper_p8_e2_support.py` (hàm `prepare_remote`, dòng 219) và callback `native_compose_smoke.py` (dòng 6668), `phase_id` được gán chính xác là:
+  $$\text{phase\_id} = \text{f'samples-\{samples\_per\_message\}'}$$
+  cho toàn bộ các kịch bản `steady_burst` (cả pilot lẫn official). Do đó, `phase_id` bắt buộc là **`samples-100`** (khi S=100) hoặc **`samples-1`** (khi S=1). Việc truyền giá trị `official-100` hay `official-1` vào lệnh `begin` hoặc `finish-phase` sẽ bị từ chối ngay với lỗi `e2_phase_id_mismatch`.
+- **Cấu hình Tự động Shaper và Microbatch trong Profile Official**:
+  Hạ tầng fixture tự động tính toán cấu hình backend tương thích với mức tải đề nghị:
+  - `shaper_rate = (offered_rate + 1) // 2` (tốc độ shaper cho mỗi gateway).
+  - `shaper_burst = max((burst_messages + 1) // 2, shaper_rate)`.
+  - `microbatch_rows = min(500, max(1, shaper_rate * samples_per_message))`.
+- **Ngân sách Dự báo và Ranh giới Từ chối Tài nguyên (`e2_official_estimate`)**:
+  Server tự động tính toán mô hình ước lượng kích thước trước khi khởi động. Server sẽ từ chối khởi động ngay tại bước `prepare` với lỗi `e2_predicted_bound_exceeded` nếu dự báo vượt quá các giới hạn an toàn:
+  - Dung lượng lưu trữ tăng trưởng (`total_storage_growth_bytes_estimate`) > 10 GiB (`10 << 30`).
+  - Bộ nhớ hàng đợi pending (`pending_memory_bytes`) > 256 MiB (`256 << 20`).
+  - Bộ nhớ lưu trữ retry (`retry_memory_bytes`) > 256 MiB (`256 << 20`).
+  - Băng thông ứng dụng (`application_bandwidth_bytes_per_second`) > 100 MiB/s (`100 << 20`).
+- **Thoát cạn Hữu hạn (Finite Drain)**:
+  Profile `official` quy định thời gian thoát cạn hữu hạn cố định là **30 giây** để toàn bộ tin nhắn đang truyền trên đường truyền (in-flight) được backend tiếp nhận, commit vào cơ sở dữ liệu và phát ACK trước khi chuyển sang pha đối soát.
+- **Ranh giới Kỹ thuật và Giới hạn Năng lực Thực tế**:
+  - Các mức 1.000, 5.000, 20.000 msg/s là các bậc thang kiểm tra tải cao có kiểm soát; **tuyệt đối không phải là cam kết năng lực chịu tải (capacity guarantee)** hay chứng nhận backend có thể đạt 20.000 msg/s trên mọi cấu hình phần cứng.
+  - Mosquitto DynSec, Nginx và Go backend có thể xuất hiện độ trễ xử lý, shaper drops (`rate_limited`) hoặc client connection/publish retries khi máy chủ bị bão hòa tài nguyên ở các mức tải cao.
+  - Metadata thử nghiệm vẫn được gắn nhãn chuẩn tắc là `physical_ab=NOT RUN` và `generator_colocated='unverified'`.
 
-**1. Tiền kiểm tra kế hoạch và ước lượng tài nguyên với `--dry-run`:**
+---
+
+##### 2. Quy trình Thực thi End-to-End cho Mọi Rung Official
+
+Người vận hành chọn các biến đầu vào mong muốn và theo dõi quy trình từng bước dưới đây; các giới hạn nghiệm thu vẫn theo qualification ở báo cáo P8:
+
+###### Bước 0 — Thiết lập Biến cấu hình Đầu vào
+
+Thiết lập biến độc lập trên các terminal tương ứng:
+
+**Trên Host A — Terminal A1 & A2**:
+```sh
+ROOT=/var/tmp/opencode/p8-e2-official
+OFFERED_RATE=1000        # Chọn 1 trong: 100, 1000, 5000, 20000 (msg/s gộp cả hai producer)
+SAMPLES=100              # Chọn 1 trong: 100 hoặc 1 (batching samples per message)
+DURATION=10              # Thời lượng phát đo lường (giây, mặc định 10, hợp lệ 1..7200)
+BURST=0                  # Tin nhắn burst bổ sung cho Arm B (mặc định 0, hợp lệ 0..100000)
+DEADLINE=1200            # Ngân sách thời gian toàn phiên (giây, >= DURATION + 60, khuyến nghị 1200)
+RUN_LABEL="run01"        # Nhãn đợt chạy cụ thể để tránh xung đột thư mục lá khi đo lặp lại
+
+WORK_DIR="$ROOT/official-s${SAMPLES}-r${OFFERED_RATE}-${RUN_LABEL}/A"
+PHASE_ID="samples-${SAMPLES}"   # Luôn dùng 'samples-100' hoặc 'samples-1' theo chuẩn prepare_remote
+
+mkdir -p "$ROOT" && chmod 0700 "$ROOT"
+# Lưu ý: Thư mục lá $WORK_DIR TUYỆT ĐỐI KHÔNG tạo trước bằng mkdir, lệnh serve yêu cầu tự tạo mới!
+```
+
+**Trên Host B — Terminal B**:
+```sh
+ROOT=/var/tmp/opencode/p8-e2-official
+OFFERED_RATE=1000        # Khớp với giá trị đã chọn trên Host A
+SAMPLES=100              # Khớp với giá trị đã chọn trên Host A
+RUN_LABEL="run01"        # Khớp với nhãn đợt chạy trên Host A
+
+WORK_DIR="$ROOT/official-s${SAMPLES}-r${OFFERED_RATE}-${RUN_LABEL}/B"
+mkdir -p "$WORK_DIR" && chmod 0700 "$WORK_DIR"
+# Lưu ý: Thư mục $WORK_DIR/workspace TUYỆT ĐỐI KHÔNG tạo trước bằng mkdir, lệnh bind yêu cầu tự tạo mới!
+```
+
+---
+
+###### Bước 1 — Tiền kiểm tra Kế hoạch và Ước lượng Tài nguyên với `--dry-run` (Terminal A1 hoặc A2)
+
+Chạy kiểm tra tính hợp lệ của tham số, kế hoạch thực thi và mô hình ước lượng tài nguyên mà không khởi động container hay tạo mạng (truyền cùng `--deadline-seconds "$DEADLINE"` để đồng nhất kiểm tra ngân sách chu kỳ sống):
+
 ```sh
 python3 scripts/paper_p8_server.py serve \
-  --root "$ROOT/official-s100/A" \
+  --root "$WORK_DIR" \
   --network-config /path/to/private-network.json \
+  --deadline-seconds "$DEADLINE" \
   --dry-run \
   --profile official \
   --official-opt-in \
   --experiment E2 \
-  --samples-per-message 100 \
-  --e2-offered-rate 1000 \
-  --e2-duration-seconds 10 \
-  --e2-burst-messages 0
+  --samples-per-message "$SAMPLES" \
+  --e2-offered-rate "$OFFERED_RATE" \
+  --e2-duration-seconds "$DURATION" \
+  --e2-burst-messages "$BURST"
 ```
-Lệnh trên kiểm tra tính hợp lệ và in ra JSON chứa `e2_official_plan` với `expected_counts`, `producer_rates_per_second` (A: 500, B: 500) và `estimate` (dự báo thận trọng về lưu trữ, bộ nhớ pending/retry và băng thông).
 
-**2. Khởi chạy phiên làm việc chính thức:**
+Lệnh trên in ra cấu trúc JSON chứa `e2_official_plan` với `expected_counts`, `producer_rates_per_second` (A và B chia đều) và `estimate` (dự báo thận trọng về lưu trữ, bộ nhớ pending/retry và băng thông). Đảm bảo không có lỗi `e2_predicted_bound_exceeded` hay `paper_p8_e2_official_schedule_rejected`.
+
+---
+
+###### Bước 2 — Khởi động Server Fixture trên Host A (Terminal A1)
+
+Khởi chạy tiến trình `serve` ở chế độ foreground và giữ terminal này trong suốt phiên làm việc:
+
 ```sh
 python3 scripts/paper_p8_server.py serve \
-  --root "$ROOT/official-s100/A" \
+  --root "$WORK_DIR" \
   --network-config /path/to/private-network.json \
-  --deadline-seconds 1200 \
+  --deadline-seconds "$DEADLINE" \
   --profile official \
   --official-opt-in \
   --experiment E2 \
-  --samples-per-message 100 \
-  --e2-offered-rate 1000 \
-  --e2-duration-seconds 10 \
-  --e2-burst-messages 0
+  --samples-per-message "$SAMPLES" \
+  --e2-offered-rate "$OFFERED_RATE" \
+  --e2-duration-seconds "$DURATION" \
+  --e2-burst-messages "$BURST"
 ```
-Chu kỳ đo lường tiến hành tuần tự với `phase-id="official-100"` (hoặc `"official-1"`), tuân thủ đúng các bước chuyển giao dữ liệu thủ công, kiểm tra kết nối, phát tải, thoát cạn (drain 30s), nhập kết quả và đối soát dọn dẹp sạch sẽ tài nguyên.
+
+Tiến trình tự động khởi động các container hạ tầng (Go backend, TimescaleDB, Mosquitto DynSec, Nginx), cấp phát 2 Gateways (`gw_p0_a_*`, `gw_p0_b_*`), sinh role manifests và xuất client bundle tại thư mục `$WORK_DIR/client-bundle/`. Nhật ký foreground được ghi nhận liên tục tại `$WORK_DIR/server.log`.
+
+---
+
+###### Bước 3 — Kiểm tra trạng thái READY và lấy Session ID trên Host A (Terminal A2)
+
+Trên Terminal A2 của Host A, kiểm tra trạng thái của server:
+
+```sh
+python3 scripts/paper_p8_server.py status --root "$WORK_DIR" --experiment E2
+```
+
+Chờ cho đến khi server phản hồi:
+- `preparation_status=E2_PREPARED`
+- `phase=READY`
+- `profile=official`
+- `workload=steady_burst` (hoặc `e2-telemetry-ab-official`)
+
+Lưu `session_id` nhận được vào biến môi trường trên Terminal A2 bằng cách trích xuất tự động từ tệp `session.json` của phiên:
+
+```sh
+SESSION_ID=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['session_id'])" "$WORK_DIR/fixture/private/session.json")
+# Hoặc gán thủ công từ lệnh status: SESSION_ID="e4a2d810f92b..."
+```
+
+Đồng thời, ghi nhận mã băm SHA-256 của tập tin thực thi `paperload` do Host A chuẩn bị:
+
+```sh
+sha256sum "$WORK_DIR/fixture/private/bin/paperload"
+```
+
+---
+
+###### Bước 4 — Chuyển giao gói bundle và binary sang Host B (Manual Transfer Step)
+
+Người vận hành tự thực hiện sao chép qua kênh an toàn giữa Host A và Host B:
+- **Gói bundle**: Sao chép thư mục `$WORK_DIR/client-bundle/` trên Host A sang `$WORK_DIR/received-bundle/` trên Host B.
+- **Tập tin binary**: Sao chép tập tin thực thi `$WORK_DIR/fixture/private/bin/paperload` trên Host A sang `$WORK_DIR/paperload` trên Host B.
+
+Sau khi sao chép, thiết lập phân quyền nghiêm ngặt trên Host B (lưu ý: thư mục `$WORK_DIR/workspace` tuyệt đối **không được tạo trước**):
+
+```sh
+chmod 0700 "$WORK_DIR/paperload"
+find "$WORK_DIR/received-bundle" -type d -exec chmod 0700 {} +
+find "$WORK_DIR/received-bundle" -type f -exec chmod 0600 {} +
+```
+
+Đối chiếu mã băm SHA-256 của `$WORK_DIR/paperload` trên Host B để đảm bảo trùng khớp 100% với mã băm đã ghi nhận tại Bước 3 trên Host A:
+
+```sh
+sha256sum "$WORK_DIR/paperload"
+```
+
+---
+
+###### Bước 5 — Thiết lập Workspace và kiểm tra kết nối trên Host B (Terminal B)
+
+Trên Terminal B của Host B, thực hiện liên kết bundle, tiền kiểm tra môi trường và kiểm tra kết nối mạng/xác thực thực tế:
+
+```sh
+python3 scripts/paper_p8_client.py bind \
+  --bundle "$WORK_DIR/received-bundle" \
+  --workspace "$WORK_DIR/workspace"
+
+python3 scripts/paper_p8_client.py preflight \
+  --workspace "$WORK_DIR/workspace" \
+  --binary "$WORK_DIR/paperload"
+
+python3 scripts/paper_p8_client.py check-connection \
+  --workspace "$WORK_DIR/workspace"
+```
+
+- Lệnh `bind` kiểm tra cấu trúc bundle, tính toàn vẹn chữ ký/thời hạn token và sinh cấu hình thực thi `runtime/execution/run-spec.json`.
+- Lệnh `preflight` thực thi Go binary `paperload --preflight` để xác thực cú pháp manifest và quyền tập tin cục bộ; hoàn toàn không mở socket mạng. *(Lưu ý: hiện tại preflight ở profile official sẽ báo lỗi do client opt-in forwarding blocker như đã cảnh báo ở trên)*.
+- Lệnh `check-connection` thăm dò thực tế kết nối HTTPS và MQTTS với credentials không đặc quyền trong bundle.
+- Tuyệt đối không tiếp tục nếu `preflight` hoặc kết nối TLS/Auth/MQTT thất bại.
+
+---
+
+###### Bước 6 — Kích hoạt pha đo lường trên Host A (Terminal A2)
+
+Trên Terminal A2 của Host A, gửi lệnh kích hoạt bắt đầu pha đo lường (sử dụng biến `$PHASE_ID`, tương ứng `samples-100` hoặc `samples-1`):
+
+```sh
+python3 scripts/paper_p8_server.py begin \
+  --root "$WORK_DIR" \
+  --experiment E2 \
+  --session-id "$SESSION_ID" \
+  --phase READY \
+  --phase-id "$PHASE_ID"
+
+python3 scripts/paper_p8_server.py status --root "$WORK_DIR" --experiment E2
+```
+
+Chờ cho đến khi lệnh `status` phản hồi xác nhận:
+- `phase=MEASURING`
+- `phase_id=$PHASE_ID` (ví dụ `samples-100` hoặc `samples-1`)
+- `collector_ready=true`
+
+Toàn bộ các số đếm cơ sở dữ liệu cơ sở (baseline DB counts) được Host A ghi nhận chính xác trước khi bộ thu thập chỉ số bắt đầu đo lường.
+
+---
+
+###### Bước 7 — Chạy tải phát tin và xuất kết quả trên Host B (Terminal B)
+
+Trên Terminal B của Host B, tiến hành chạy tải phát tin mô phỏng và xuất kết quả đo lường:
+
+```sh
+python3 scripts/paper_p8_client.py run \
+  --workspace "$WORK_DIR/workspace" \
+  --binary "$WORK_DIR/paperload"
+
+python3 scripts/paper_p8_client.py export-results \
+  --workspace "$WORK_DIR/workspace" \
+  --output "$WORK_DIR/exported-results"
+```
+
+Tiến trình `run` thực hiện phát tin theo kế hoạch `run-spec.json`:
+- Arm A phát với tốc độ `offered_rate // 2` msg/s trong suốt `DURATION` giây.
+- Arm B phát với tốc độ `offered_rate - (offered_rate // 2)` msg/s trong suốt `DURATION` giây kèm `BURST` tin nhắn dồn dập.
+- Khi thời lượng phát hoàn tất, tiến trình client duy trì thời gian thoát cạn hữu hạn (30 giây) để backend tiếp nhận đầy đủ toàn bộ tin nhắn in-flight và nhận Application ACK trước khi kết thúc.
+- Lệnh `export-results` xuất tập kết quả đo lường đã giới hạn (projection) tại thư mục `$WORK_DIR/exported-results/`.
+
+---
+
+###### Bước 8 — Chuyển giao kết quả đo về Host A (Manual Transfer Step)
+
+Người vận hành tự thực hiện sao chép qua kênh an toàn giữa Host B và Host A:
+- **Tập kết quả**: Sao chép nguyên vẹn thư mục kết quả `$WORK_DIR/exported-results/` trên Host B sang `$WORK_DIR/received-results/` trên Host A.
+- Thiết lập phân quyền nghiêm ngặt trên Host A: thư mục `0700` và tập tin `0600`:
+
+```sh
+chmod 0700 "$WORK_DIR/received-results"
+find "$WORK_DIR/received-results" -type f -exec chmod 0600 {} +
+```
+
+---
+
+###### Bước 9 — Hậu kiểm dữ liệu và Hoàn tất phiên trên Host A (Terminal A2)
+
+Trên Terminal A2 của Host A, nhập tập kết quả để hệ thống thực hiện đối chiếu tương quan với cơ sở dữ liệu và telemetry thực tế:
+
+```sh
+python3 scripts/paper_p8_server.py finish-phase \
+  --root "$WORK_DIR" \
+  --experiment E2 \
+  --session-id "$SESSION_ID" \
+  --phase MEASURING \
+  --phase-id "$PHASE_ID" \
+  --results "$WORK_DIR/received-results"
+
+python3 scripts/paper_p8_server.py status --root "$WORK_DIR" --experiment E2
+```
+
+Chờ cho đến khi trạng thái chuyển sang `phase=VERIFYING`. Kiểm tra các trường xác thực trong `status`:
+- `workload_outcome=VALIDATED`
+- `imported_result.validation_valid=true`
+- `imported_result.validation_failures=[]`
+- Delta cơ sở dữ liệu đối soát khớp chính xác:
+  - $\Delta \text{ledger} = \text{total\_unique}$
+  - $\Delta \text{temporal} = \text{total\_unique}$
+  - $\Delta \text{raw} = \text{total\_unique} \times \text{SAMPLES}$
+  - $\Delta \text{configuration} = 0$
+
+Sau khi kết quả được xác nhận hợp lệ, phát lệnh hoàn tất để dọn dẹp hạ tầng:
+
+```sh
+python3 scripts/paper_p8_server.py finalize \
+  --root "$WORK_DIR" \
+  --experiment E2 \
+  --session-id "$SESSION_ID" \
+  --phase VERIFYING
+```
+
+---
+
+###### Bước 10 — Kiểm tra trạng thái CLOSED và Xác thực Dọn dẹp (Terminal A2)
+
+Chờ cho đến khi tiến trình `serve` trên Terminal A1 kết thúc với mã thoát 0. Sau đó kiểm tra trạng thái cuối cùng trên Terminal A2:
+
+```sh
+python3 scripts/paper_p8_server.py status --root "$WORK_DIR" --experiment E2
+```
+
+Xác nhận các trường trạng thái:
+- `phase=CLOSED`
+- `cleanup_outcome=VERIFIED`
+
+Báo cáo kết quả thử nghiệm đầy đủ được lưu trữ tại:
+`$WORK_DIR/fixture/artifacts/p8-e2-samples-${SAMPLES}-remote-result.json`.
+
+---
+
+###### Bước 11 — Xử lý sự cố, Hủy phiên (`abort`) và Dọn dẹp lỗi (`cleanup`)
+
+1. **Hủy phiên đang chạy dở dang (`abort`)**:
+   Khi phát hiện lỗi ở bước client preflight, kết nối mạng hoặc lỗi xác thực import không thể cứu vãn, người vận hành phát lệnh hủy phiên trên Terminal A2 từ trạng thái hiện tại (trích xuất tự động từ `session.json` hoặc truyền tường minh `READY`, `MEASURING`, `VERIFYING`):
+   ```sh
+   CURRENT_PHASE=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('phase', 'READY'))" "$WORK_DIR/fixture/private/session.json")
+   python3 scripts/paper_p8_server.py abort \
+     --root "$WORK_DIR" \
+     --experiment E2 \
+     --session-id "$SESSION_ID" \
+     --phase "$CURRENT_PHASE"
+   ```
+
+2. **Dọn dẹp tài nguyên khi Server bị gián đoạn/crash (`cleanup`)**:
+   Trường hợp tiến trình `serve` trên Terminal A1 bị tắt đột ngột (ví dụ do mất điện, out-of-memory killer, hoặc bị gửi tín hiệu SIGKILL) khiến các container Docker còn sót lại, lấy mã dự án Compose (`project`, chuỗi định dạng `ncs_[a-f0-9]{12}`) ghi nhận trong tệp `session.json` (hoặc `server.log`), sau đó thực thi lệnh dọn dẹp thu hồi tài nguyên an toàn theo biên lai:
+   ```sh
+   PROJECT_ID=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('project', ''))" "$WORK_DIR/fixture/private/session.json")
+   python3 scripts/paper_p8_server.py cleanup \
+     --root "$WORK_DIR" \
+     --project "$PROJECT_ID" \
+     --experiment E2
+   ```
+   Lệnh trên chỉ thu hồi đúng các container, mạng và volume được xác thực bởi biên lai `resource-*.json` của đợt chạy này mà không thực hiện hành vi Docker compose down diện rộng.
 
 ---
 
@@ -671,6 +1218,7 @@ Mục lục bằng chứng kiểm thử được lưu trữ tại:
 ## 4. Giới hạn và trạng thái gate
 
 - **Trạng thái cổng P8**: `full_p8_accepted=false`.
+- **E2 Official — source-qualified native acceptance có giới hạn**: Luồng held-server/portable-client đã PASS cho profile S=100 và S=1 trong một lượt tải official hữu hạn; chi tiết accounting, source qualification và giới hạn diễn giải ở [báo cáo P8, checkpoint R1/R2](paper-p8-experiments-and-acceptance.md#checkpoint-r1r2--e2-official-portable-2026-11-06). Đây không phải equal-sample speedup/capacity claim. Các FAIL lịch sử vẫn giữ nguyên nhãn; full CI, HIL, physical A/B, soak và full P8 vẫn NOT RUN.
 - **Giới hạn topo mạng**: `physical_ab=NOT RUN`. Thử nghiệm chạy trên cùng máy chủ cục bộ với metadata ghi nhận chuẩn tắc là `generator_colocated='unverified'` (định danh kiểm chuẩn `same-host/unverified`), phân biệt với các lượt legacy cũ từng ghi `generator_colocated=true`; chưa chứng minh được hành vi phân tán trên 2 máy vật lý độc lập qua mạng.
 - **Các kịch bản chưa thực hiện**: Các bài kiểm tra lặp lại (3 cặp xen kẽ 100→1, 1→100, 100→1), bài đo năng lực chịu tải (capacity/soak), full CI, kiểm thử phần cứng HIL (AM5728) và triển khai thực tế (live rollout) đều là **NOT RUN**.
 - **Phạm vi dừng**: E3–E5 là các phạm vi thử nghiệm lịch sử riêng biệt đã được triển khai và hoàn tất trước đó; nhiệm vụ này không thực hiện thay đổi hay chạy lại bất kỳ thử nghiệm nào của E3–E5 và bảo toàn toàn bộ kết quả đã nghiệm thu của chúng. Dừng lại tại mốc bàn giao E2 `equal_samples`; không tự động mở rộng hay chuyển sang các giai đoạn tiếp theo nếu chưa có yêu cầu mới.

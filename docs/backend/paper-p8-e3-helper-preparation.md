@@ -72,159 +72,172 @@ Cần phân biệt rõ ràng hai khái niệm độc lập:
   - Thư mục cha và thư mục làm việc: quyền `0700`.
   - Tập tin cấu hình, bundle, chứng chỉ, SQLite và kết quả: quyền `0600`.
   - Tập tin thực thi binary (`paperload`, `gateway`): quyền `0700`.
-- **Chống ghi đè tập tin và cách ly môi trường**: Mỗi lượt chạy bắt buộc sử dụng một thư mục gốc hoàn toàn mới (`ROOT=/var/tmp/opencode/p8-e3-<profile>-<unique-run>`). Tuyệt đối không tái sử dụng thư mục đã có state, bundle, SQLite hay artifacts cũ.
-- **Ngân sách thời gian (Deadline budget)**: Thời hạn deadline của server `--deadline-seconds 900` (15 phút) phải đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle và 2 binary, chạy workload, chờ drain, export/import, hậu kiểm đối soát SQL/REST/SQLite và dọn dẹp.
+- **Chống ghi đè tập tin và cách ly môi trường**: Mỗi lượt chạy bắt buộc sử dụng một thư mục gốc hoàn toàn mới (ví dụ: `ROOT=/var/tmp/opencode/p8-e3-lowpoll-run01`). Tuyệt đối không tái sử dụng thư mục đã có state, bundle, SQLite hay artifacts cũ.
+- **Ngân sách thời gian (Deadline budget)**: Thời hạn deadline của server `--deadline-seconds 900` (15 phút cho pilot mặc định) hoặc `--deadline-seconds 1200` (20 phút cho official30/official3) phải đủ cho toàn bộ chu kỳ: khởi động container, biên dịch/truyền bundle và 2 binary, chạy workload, chờ drain, export/import, hậu kiểm đối soát SQL/REST/SQLite và dọn dẹp.
 - **Trình tự đồng bộ Collector nghiêm ngặt**: Bộ thu thập phía server trên Host A bắt buộc phải được kích hoạt và xác nhận sẵn sàng (`phase=MEASURING`, `collector_ready=true`) TRƯỚC KHI tiến trình client trên Host B được phép khởi chạy phát tải.
-- **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Steps)**: Việc chuyển bundle, 2 file nhị phân (`paperload`, `gateway`) và kết quả đo giữa Host A và Host B là thao tác truyền file thủ công của người vận hành (copy an toàn qua đường dẫn hoặc scp), không tuyên bố là tự động hóa qua SSH.
+- **Dán nhãn truyền dữ liệu thủ công (Manual Transfer Steps)**: Việc chuyển bundle, 2 file nhị phân (`paperload`, `gateway`) và kết quả đo giữa Host A và Host B là thao tác truyền file thủ công của người vận hành (sao chép an toàn qua đường dẫn lưu trữ hoặc công cụ mạng nội bộ), không tuyên bố là tự động hóa qua SSH.
 - **Xử lý sự cố và dọn dẹp an toàn**: Khi request hoặc kết quả bị từ chối, giữ nguyên hiện trạng các file SQLite, outbox, journal và artifacts để phục vụ chẩn đoán lỗi; không tự ý reseed hay ghi đè. Quy trình `finalize` (hoặc `abort`) vẫn là kênh đóng phiên chính thức để giải phóng an toàn 100% tài nguyên Docker.
 
 ---
 
-### 2.2 Quy trình vận hành chi tiết 8 bước
+### 2.2 Phân định Terminal và Thiết lập biến độc lập
 
-Áp dụng cho bất kỳ profile nào trong 4 profile E3 bằng cách chọn cặp cờ tương ứng:
-- `--dispatch-mode polling|wakeup`: Cơ chế điều phối lệnh (thay đổi cờ `STAGE5_WAKEUP_ENABLED`).
-- `--workload low_load|mixed`: Chế độ tải viễn trắc nền (12 messages ở low_load, 24 messages ở mixed).
+Quy trình vận hành sử dụng ba terminal độc lập được phân định rõ ràng giữa Host A và Host B:
+- **Host A — Terminal A1**: Khởi chạy tiến trình máy chủ `serve` và duy trì fixture ở chế độ foreground (hoặc theo dõi nhật ký).
+- **Host A — Terminal A2**: Thực hiện các lệnh điều khiển phiên đo (`status`, `begin`, `finish-phase`, `finalize`, `abort`, `cleanup`).
+- **Host B — Terminal B**: Thực hiện các thao tác client (`bind`, `preflight`, `check-connection`, `run`, `export-results`).
 
-**Các tùy chọn số lượng lệnh, lịch trình và hồ sơ vận hành:**
-- **Mặc định:** Tạo 4 lệnh điều khiển (`--e3-command-count 4`), lịch phát dồn `--e3-schedule smoke`, và hồ sơ `--profile pilot` với ngân sách `--deadline-seconds 900`.
-- **Stream hữu hạn (`--e3-command-count` và `--e3-schedule`):**
-  - Hỗ trợ số lượng lệnh từ 1 đến 30 (`--e3-command-count 1..30`).
-  - Lịch phát `--e3-schedule smoke|steady`: Chế độ `smoke` chỉ hợp lệ với đúng 4 lệnh; chế độ `steady` giãn đều lịch phát khai báo 1 giây/lệnh (khoảng cách 1000 ms giữa các `offset_ms`).
-- **Chế độ nghiệm thu chính thức (`--profile official` và `--official-opt-in`):**
-  - Khi chỉ định `--profile official`, bắt buộc phải có cờ chấp thuận tường minh `--official-opt-in`.
-  - Quy tắc ràng buộc nghiệm thu official của E3:
-    - *Official 30 lệnh (`official30`):* `--e3-command-count 30 --e3-schedule steady` (hỗ trợ cả `--workload low_load` lẫn `mixed`; khuyến nghị ngân sách `--deadline-seconds 1200` tương đương 20 phút).
-    - *Bounded official 3 lệnh (`official3`):* `--e3-command-count 3 --e3-schedule steady --workload low_load` (cấu hình kiểm định seam hữu hạn).
-    - Mọi tổ hợp tham số khác khi bật `--profile official` sẽ bị từ chối ngay lập tức trước khi tạo fixture với lỗi `E3_official_requires_30_or_low_load_3_steady_commands`.
-  - **Tách biệt hồ sơ:** Khi chạy official, phiên đo (session) và luồng lệnh điều khiển mang profile `official`, trong khi luồng phát tải viễn trắc nền vẫn duy trì hồ sơ `pilot` (`background_profile` theo E2).
-- **Cơ chế thứ tự pending và terminal:** Lịch khai báo offset (`offset_ms`) không cam đoan gửi lệnh đúng offset tuyệt đối nếu lệnh trước đó trên cùng Sensor chưa đạt trạng thái terminal (`succeeded`, `failed`, v.v.). Producer REST phía client thăm dò theo deadline của lệnh và chỉ phát lệnh tiếp theo khi lệnh trước đã terminal; các lệnh chưa kịp phát hoặc hoãn được ghi nhận là skipped/not-sent, tuyệt đối không ngụy tạo bước nhảy version.
-- **Đo lường timeline và đối soát:**
-  - Viễn trắc nền `low_load` / `mixed` giữ nguyên manifest E2 hiện hành và cùng tải giữa polling/wakeup; chỉ cờ wakeup thay đổi.
-  - E3 đo timeline thông qua cùng-process `ControlTimeline` snapshot tại hai mốc `workload_start` và `terminal` sau khi hoàn tất stop/drain; báo cáo sử dụng hiệu số (delta) histogram/counter, không cộng dồn snapshot tích lũy và không dùng client RTT làm server latency.
-  - Các tập kiểm tra phải đối soát số lượng dispatch/success khớp với fresh commands, missing/overflow bằng 0, và pending origins bằng 0.
+#### Bảng cấu hình 4 Profile E3 và Định danh Pha (PHASE_ID)
 
-Thiết lập thư mục gốc làm việc riêng biệt cho lượt chạy:
+Mỗi lượt chạy khảo sát một trong 4 profile độc lập. Định danh pha `PHASE_ID` bắt buộc phải có dạng `e3-<workload>-<dispatch_mode>` tương ứng:
+
+| Profile | Chế độ Dispatch (`DISPATCH_MODE`) | Tải Viễn trắc (`WORKLOAD`) | Cờ `STAGE5_WAKEUP_ENABLED` | Định danh pha (`PHASE_ID`) | Ghi chú Tải |
+|---|---|---|---|---|---|
+| **Profile 1: Low-Load Polling** (Baseline mặc định) | `polling` | `low_load` | `false` | `e3-low_load-polling` | Arm A: 8 msgs, Arm B: 4 msgs (không burst). Tổng 12 msgs. |
+| **Profile 2: Low-Load Wakeup** | `wakeup` | `low_load` | `true` | `e3-low_load-wakeup` | Arm A: 8 msgs, Arm B: 4 msgs (không burst). Tổng 12 msgs. |
+| **Profile 3: Mixed Polling** | `polling` | `mixed` | `false` | `e3-mixed-polling` | Arm A: 8 msgs, Arm B: 16 msgs (4 steady + 12 burst). Tổng 24 msgs. |
+| **Profile 4: Mixed Wakeup** | `wakeup` | `mixed` | `true` | `e3-mixed-wakeup` | Arm A: 8 msgs, Arm B: 16 msgs (4 steady + 12 burst). Tổng 24 msgs. |
+
+#### Thiết lập biến độc lập trên A1, A2 và B
+
+Dán **cùng khối Bash dưới đây vào từng terminal A1, A2 và B**; các terminal không chia sẻ biến ngầm. Chỉ chọn bốn giá trị đầu trước khi bắt đầu lượt chạy. Mỗi lần chạy lại phải đổi `RUN_LABEL`; không sửa các biến giữa chừng trong một session.
 
 ```sh
-ROOT=/var/tmp/opencode/p8-e3-<profile>-<unique-run>
+PRESET=official30         # smoke4 | official30 | official3
+DISPATCH_MODE=polling     # polling | wakeup
+WORKLOAD=low_load         # low_load | mixed; official3 chỉ nhận low_load
+RUN_LABEL=run01           # Đổi nhãn khi chạy lại cùng cấu hình
+NETWORK_CONFIG=/path/to/private-network-copy.json
+
+case "$PRESET" in
+  smoke4) COMMAND_COUNT=4; SCHEDULE=smoke; PROFILE=pilot; DEADLINE_SECONDS=900 ;;
+  official30) COMMAND_COUNT=30; SCHEDULE=steady; PROFILE=official; DEADLINE_SECONDS=1200 ;;
+  official3) COMMAND_COUNT=3; SCHEDULE=steady; PROFILE=official; DEADLINE_SECONDS=1200 ;;
+  *) printf '%s\n' 'PRESET không hợp lệ' >&2; false ;;
+esac
+test "$DISPATCH_MODE" = polling || test "$DISPATCH_MODE" = wakeup
+test "$WORKLOAD" = low_load || test "$WORKLOAD" = mixed
+test "$PRESET" != official3 || test "$WORKLOAD" = low_load
+
+ROOT="/var/tmp/opencode/p8-e3-${PRESET}-${WORKLOAD}-${DISPATCH_MODE}-${RUN_LABEL}"
+PHASE_ID="e3-${WORKLOAD}-${DISPATCH_MODE}"
+OFFICIAL_ARGS=()
+if [ "$PROFILE" = official ]; then
+  OFFICIAL_ARGS=(--official-opt-in)
+fi
 mkdir -p "$ROOT" && chmod 0700 "$ROOT"
 ```
 
-#### Bước 0 — Chuẩn bị nhị phân paperload và gateway
+Các phép kiểm tra trên phải thành công trước khi tiếp tục. Không tạo trước `$ROOT/A` hay `$ROOT/B/workspace`. Khối lệnh dùng Bash (có array); không chạy bằng `sh`.
 
-Biên dịch hai file nhị phân từ thư mục mã nguồn `src/` sạch vào thư mục scratch riêng biệt với cờ `CGO_ENABLED=0`:
+| Tham số | Ý nghĩa |
+|---|---|
+| `--root` / `--network-config` | Fixture A mới và cấu hình mạng riêng IPv4/TLS; thay đường dẫn cấu hình trước khi chạy. |
+| `--dispatch-mode` | `polling` hoặc `wakeup`; thay cơ chế dispatch, giữ nguyên workload của cặp so sánh. |
+| `--workload` | `low_load` hoặc `mixed` theo bảng trên; không phải lựa chọn rate cao E2. |
+| `--e3-command-count` / `--e3-schedule` | Preset `smoke4`: 4/smoke; `official30`: 30/steady; `official3`: 3/steady và low_load. `steady` khai báo offset 1 giây/lệnh nhưng vẫn chờ command trước trên cùng Sensor terminal. |
+| `--profile` / `--official-opt-in` | Chọn pilot/official và ủy quyền official tường minh; array tự thêm opt-in khi chọn official. Telemetry nền vẫn giữ role profile pilot. |
+| `--deadline-seconds` | Budget toàn session, không chỉ thời lượng đo; ví dụ 900/1200s, phải còn đủ cho chuyển tệp, workload, import và cleanup. |
+
+---
+
+### 2.3 Quy trình vận hành chi tiết 8 bước
+
+#### Bước 0 — Chuẩn bị và kiểm tra nguồn nhị phân
+
+Cơ chế server fixture của E3 tự động biên dịch cả hai file nhị phân `paperload` và `gateway` từ thư mục mã nguồn `src/` vào thư mục nội bộ fixture trên Host A trong Bước 1:
+- Nhị phân `paperload`: `$ROOT/A/fixture/private/bin/paperload`
+- Nhị phân `gateway`: `$ROOT/A/fixture/private/bin/gateway`
+
+Người vận hành không cần tự biên dịch vào thư mục scratch ngoại lai. Nếu muốn kiểm tra trước tính hợp lệ của mã nguồn và công cụ biên dịch Go trên Host A, có thể thực hiện kiểm tra nhanh không tạo file rác:
 
 ```sh
-BIN_DIR=/var/tmp/opencode/p8-e3-binaries
-mkdir -p "$BIN_DIR" && chmod 0700 "$BIN_DIR"
-(cd src && CGO_ENABLED=0 go build -o "$BIN_DIR/paperload" ./cmd/paperload)
-(cd src && CGO_ENABLED=0 go build -o "$BIN_DIR/gateway" ./cmd/gateway)
-chmod 0700 "$BIN_DIR/paperload" "$BIN_DIR/gateway"
+(cd src && CGO_ENABLED=0 go build -o /dev/null ./cmd/paperload ./cmd/gateway)
 ```
-
-*(Lưu ý: Chỉ sử dụng các binary đã được xác minh cùng revision mã nguồn với backend)*.
 
 #### Bước 1 — Khởi động Server Fixture E3 trên Host A (Terminal A1)
 
-Sử dụng bản sao cấu hình mạng riêng (`private-network-copy.json`), giữ nguyên interface/TLS CA/SAN/hostname và chọn host ports còn trống.
-
-**1. Khởi chạy thông thường (Pilot mặc định, 4 lệnh smoke):**
-Chạy lệnh `serve` (giữ tiến trình này chạy ngầm hoặc trên Terminal A1 riêng biệt):
+Khởi chạy tiến trình `serve` trên Terminal A1 sử dụng trực tiếp các biến môi trường đã thiết lập:
 
 ```sh
 python3 scripts/paper_p8_server.py serve \
   --root "$ROOT/A" \
-  --network-config /path/to/private-network-copy.json \
+  --network-config "$NETWORK_CONFIG" \
   --experiment E3 \
-  --dispatch-mode polling \
-  --workload low_load \
-  --deadline-seconds 900
+  --profile "$PROFILE" \
+  --dispatch-mode "$DISPATCH_MODE" \
+  --workload "$WORKLOAD" \
+  --e3-command-count "$COMMAND_COUNT" \
+  --e3-schedule "$SCHEDULE" \
+  --deadline-seconds "$DEADLINE_SECONDS" \
+  "${OFFICIAL_ARGS[@]}"
 ```
 
-*(Thay thế `--dispatch-mode wakeup` hoặc `--workload mixed` tương ứng với profile cần chạy)*.
+*(Lưu ý về các biến cấu hình: Lệnh trên tự động nạp đúng `$DISPATCH_MODE`, `$WORKLOAD`, `$COMMAND_COUNT`, `$SCHEDULE` và `$DEADLINE_SECONDS` từ môi trường đã chọn)*.
 
-**2. Khởi chạy với hồ sơ Official (`--profile official` và `--official-opt-in`):**
-- Đối với luồng `official30` (30 lệnh steady, ngân sách 20 phút):
-```sh
-python3 scripts/paper_p8_server.py serve \
-  --root "$ROOT/A" \
-  --network-config /path/to/private-network-copy.json \
-  --experiment E3 \
-  --profile official \
-  --official-opt-in \
-  --dispatch-mode polling \
-  --workload low_load \
-  --e3-command-count 30 \
-  --e3-schedule steady \
-  --deadline-seconds 1200
-```
-- Đối với bài kiểm tra seam hữu hạn `official3` (3 lệnh steady, bắt buộc `low_load`):
-```sh
-python3 scripts/paper_p8_server.py serve \
-  --root "$ROOT/A" \
-  --network-config /path/to/private-network-copy.json \
-  --experiment E3 \
-  --profile official \
-  --official-opt-in \
-  --dispatch-mode polling \
-  --workload low_load \
-  --e3-command-count 3 \
-  --e3-schedule steady \
-  --deadline-seconds 1200
-```
+**Các tùy chọn khởi chạy mở rộng (nếu chạy kịch bản official hoặc kiểm định offline)**:
 
-**3. Kiểm tra hợp đồng offline (Dry-run contract):**
-Kiểm tra tính hợp lệ của manifest và kế hoạch chạy mà không cần khởi tạo fixture, container hay tiến trình mạng (sử dụng thư mục dummy `/not-used`):
-```sh
-python3 scripts/paper_p8_server.py serve --root /not-used \
-  --network-config /not-used --dry-run --experiment E3 --profile official \
-  --official-opt-in --dispatch-mode polling --workload low_load \
-  --e3-command-count 30 --e3-schedule steady --deadline-seconds 1200
-```
+- **Official30/official3** dùng chính lệnh `serve` trên, sau khi chọn preset ở khối biến. Không chạy thêm một `serve` thứ hai trong cùng root. Telemetry nền vẫn giữ profile pilot; không có cờ tốc độ cao E2.
 
-**4. Kiểm định native seam hữu hạn qua selector fixture:**
-Chạy trực tiếp kiểm định seam 3 lệnh official hữu hạn trên fixture cách ly sạch:
-```sh
-python3 scripts/tests/native_compose_smoke.py --prepare "$ROOT/private" \
-  --paper-p8-e3 polling --paper-p8-e3-low-load \
-  --paper-p8-e3-command-count 3 --paper-p8-e3-schedule steady \
-  --p8-profile official --p8-official-opt-in \
-  --p8-deadline-seconds 1200
-```
+- **Kiểm tra hợp đồng offline Dry-Run 30 lệnh (`official30 dry-run`)**:
+  *(Kiểm tra tính hợp lệ của manifest schema và kế hoạch chạy mà không mở container hay mạng)*:
+  ```sh
+  python3 scripts/paper_p8_server.py serve --root /not-used \
+    --network-config /not-used --dry-run --experiment E3 --profile official \
+    --official-opt-in --dispatch-mode polling --workload low_load \
+    --e3-command-count 30 --e3-schedule steady --deadline-seconds 1200
+  ```
+
+- **Kiểm định native seam hữu hạn 3 lệnh qua smoke selector**:
+  *(Sử dụng thư mục độc lập riêng biệt `ROOT_SEAM` để tránh ảnh hưởng đến thư mục phiên chính)*:
+  ```sh
+  ROOT_SEAM=/var/tmp/opencode/p8-e3-native-seam
+  mkdir -p "$ROOT_SEAM" && chmod 0700 "$ROOT_SEAM"
+
+  python3 scripts/tests/native_compose_smoke.py --prepare "$ROOT_SEAM/private" \
+    --paper-p8-e3 polling --paper-p8-e3-low-load \
+    --paper-p8-e3-command-count 3 --paper-p8-e3-schedule steady \
+    --p8-profile official --p8-official-opt-in \
+    --p8-deadline-seconds 1200
+  ```
 
 #### Bước 2 — Kiểm tra trạng thái và lưu session_id trên Host A (Terminal A2)
 
-Trên terminal điều khiển A2 của Host A, kiểm tra trạng thái cho đến khi hệ thống sẵn sàng:
+Trên Terminal A2 của Host A, kiểm tra trạng thái server cho đến khi hoàn tất khởi tạo:
 
 ```sh
 python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
 ```
 
-Chờ cho đến khi status trả về `preparation_status=E3_PREPARED` và `phase=READY`. Đặt `session_id` nhận được vào biến môi trường (thay thế chuỗi placeholder `<session_id>` bằng giá trị hex thực tế từ status):
+Chờ cho đến khi status trả về `preparation_status=E3_PREPARED` và `phase=READY`.
+
+Trích xuất `session_id` an toàn từ JSON bằng Python với assertion đảm bảo trường tồn tại và không rỗng:
 
 ```sh
-SESSION_ID=<session_id>
-# Ví dụ: SESSION_ID=a1b2c3d4e5f6...
+SESSION_ID=$(python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3 | python3 -c 'import sys, json; data = json.load(sys.stdin); sid = data.get("session_id"); assert sid, "session_id missing or empty in status JSON"; print(sid)')
+echo "SESSION_ID=$SESSION_ID"
 ```
 
-Đồng thời thiết lập định danh `PHASE_ID` theo đúng cấu trúc `e3-<workload>-<dispatch_mode>` của profile đang chạy (ví dụ `e3-low_load-polling`, `e3-low_load-wakeup`, `e3-mixed-polling`, `e3-mixed-wakeup`):
+Đồng thời, ghi nhận mã băm SHA-256 của hai file nhị phân đã được fixture biên dịch sẵn tại `$ROOT/A/fixture/private/bin/`:
 
 ```sh
-# Khai báo theo profile đang chạy:
-PHASE_ID="e3-low_load-polling"
-# Hoặc nếu chạy profile khác:
-# PHASE_ID="e3-low_load-wakeup"
-# PHASE_ID="e3-mixed-polling"
-# PHASE_ID="e3-mixed-wakeup"
+sha256sum "$ROOT/A/fixture/private/bin/paperload" "$ROOT/A/fixture/private/bin/gateway"
 ```
 
 #### Bước 3 — Chuyển giao gói dữ liệu và nhị phân sang Host B (Manual Transfer Step)
 
-Sao chép bundle cấu hình và 2 file nhị phân đã biên dịch sang Host B qua kênh truyền duyệt an toàn:
-1. Sao chép thư mục `$ROOT/A/client-bundle/` sang Host B tại `$ROOT/B/received-bundle/`.
-2. Sao chép hai tập tin thực thi nhị phân `$BIN_DIR/paperload` và `$BIN_DIR/gateway` sang Host B tại `$ROOT/B/bin/paperload` và `$ROOT/B/bin/gateway`.
-3. Thiết lập phân quyền nghiêm ngặt trên Host B (lưu ý: thư mục `workspace` không được tạo trước vì lệnh `bind` yêu cầu tự tạo mới với quyền `0700`; nếu thư mục `workspace` đã tồn tại từ trước, `bind` sẽ từ chối với lỗi `workspace_output_leaf_exists`):
+Người vận hành thực hiện chuyển giao thủ công các tài nguyên cần thiết từ Host A sang Host B:
+- **Tài nguyên 1 — Client bundle**:
+  - Nguồn (Host A): `$ROOT/A/client-bundle/`
+  - Đích (Host B): `$ROOT/B/received-bundle/`
+- **Tài nguyên 2 — Nhị phân `paperload`**:
+  - Nguồn (Host A): `$ROOT/A/fixture/private/bin/paperload`
+  - Đích (Host B): `$ROOT/B/bin/paperload`
+- **Tài nguyên 3 — Nhị phân `gateway`**:
+  - Nguồn (Host A): `$ROOT/A/fixture/private/bin/gateway`
+  - Đích (Host B): `$ROOT/B/bin/gateway`
+
+Sau khi hoàn tất sao chép, thiết lập phân quyền nghiêm ngặt và đối chiếu mã băm trên Host B (Terminal B):
 
 ```sh
 mkdir -p "$ROOT/B/bin"
@@ -232,11 +245,16 @@ chmod 0700 "$ROOT/B" "$ROOT/B/bin"
 chmod 0700 "$ROOT/B/bin/paperload" "$ROOT/B/bin/gateway"
 find "$ROOT/B/received-bundle" -type d -exec chmod 0700 {} +
 find "$ROOT/B/received-bundle" -type f -exec chmod 0600 {} +
+
+# Đối chiếu mã băm SHA-256 trên Host B (bắt buộc khớp 100% với Bước 2 trên Host A):
+sha256sum "$ROOT/B/bin/paperload" "$ROOT/B/bin/gateway"
 ```
 
-#### Bước 4 — Thiết lập Workspace và kiểm tra kết nối trên Host B
+*(Lưu ý quan trọng: Thư mục `$ROOT/B/workspace` tuyệt đối **không được tạo trước** bằng lệnh `mkdir`. Lệnh `bind` tại Bước 4 yêu cầu tự tạo mới thư mục này với quyền `0700`; nếu thư mục đã tồn tại từ trước, `bind` sẽ từ chối thực hiện với lỗi `workspace_output_leaf_exists`)*.
 
-Trên Host B, thực hiện liên kết bundle, tiền kiểm tra cả hai nhị phân và kiểm tra kết nối mạng/xác thực TLS:
+#### Bước 4 — Thiết lập Workspace và kiểm tra kết nối trên Host B (Terminal B)
+
+Trên Terminal B của Host B, tiến hành liên kết bundle, tiền kiểm tra cả hai nhị phân và kiểm tra kết nối mạng/xác thực TLS:
 
 ```sh
 python3 scripts/paper_p8_client.py bind \
@@ -252,11 +270,15 @@ python3 scripts/paper_p8_client.py check-connection \
   --workspace "$ROOT/B/workspace"
 ```
 
-Xác nhận preflight và check-connection đều trả về `PASS`.
+- Lệnh `bind` kiểm tra bundle, giải nén và sinh ra cấu hình thực thi `runtime/execution/run-spec.json` (chứa 2 jobs telemetry nền, 1 job control, và 2 gateway executor jobs).
+- Lệnh `preflight` thực thi Go binary `paperload` và kiểm tra `gateway` binary với cờ `--preflight` để xác thực cú pháp manifest, môi trường executor và schema DB cục bộ; bước này **hoàn toàn không mở socket mạng**.
+- Lệnh `check-connection` thăm dò thực tế kết nối HTTPS REST API và kết nối MQTT TLS với credentials không đặc quyền trong bundle.
+
+**Cổng an toàn**: Cả `preflight` và `check-connection` đều bắt buộc phải trả về `PASS`. Tuyệt đối không kích hoạt phát tải nếu tiền kiểm tra thất bại.
 
 #### Bước 5 — Kích hoạt pha đo lường trên Host A (Terminal A2)
 
-Trên Terminal A2 của Host A, gửi lệnh bắt đầu pha đo lường bằng đúng `$SESSION_ID` và `$PHASE_ID`:
+Trên Terminal A2 của Host A, gửi lệnh bắt đầu pha đo lường với `$SESSION_ID` và `$PHASE_ID` tương ứng:
 
 ```sh
 python3 scripts/paper_p8_server.py begin \
@@ -269,11 +291,17 @@ python3 scripts/paper_p8_server.py begin \
 python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
 ```
 
-Chờ cho đến khi status trả về `phase=MEASURING`, `phase_id=$PHASE_ID`, và **`collector_ready=true`**.
+Kiểm tra xác nhận trạng thái bằng Python JSON assertion:
 
-#### Bước 6 — Chạy tải và xuất kết quả trên Host B
+```sh
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3 | python3 -c 'import sys, json; data = json.load(sys.stdin); ph = data.get("phase"); cr = data.get("collector_ready"); sid = data.get("session_id"); assert ph == "MEASURING", f"Expected phase MEASURING, got {ph}"; assert cr is True, f"Expected collector_ready True, got {cr}"; print(f"Confirmed MEASURING with collector_ready=True for session {sid}")'
+```
 
-Chỉ sau khi bước 5 xác nhận `collector_ready=true`, trên Host B tiến hành chạy tải phát tin viễn trắc kết hợp thực thi lệnh điều khiển và xuất kết quả đo lường:
+**Cổng an toàn đồng bộ (Collector Gate)**: Host B **TUYỆT ĐỐI CHƯA ĐƯỢC CHẠY** Bước 6 cho đến khi Bước 5 xác nhận `collector_ready=true`. Lệnh `begin` chỉ phát hành yêu cầu; bộ thu thập phía server cần thời gian ghi nhận snapshot đường cơ sở SQL và telemetry trước khi sẵn sàng tiếp nhận tải.
+
+#### Bước 6 — Chạy tải và xuất kết quả trên Host B (Terminal B)
+
+Chỉ sau khi Bước 5 đã xác nhận `collector_ready=true`, trên Terminal B của Host B tiến hành chạy tải kết hợp và xuất tập kết quả:
 
 ```sh
 python3 scripts/paper_p8_client.py run \
@@ -286,17 +314,27 @@ python3 scripts/paper_p8_client.py export-results \
   --output "$ROOT/B/exported-results"
 ```
 
+- Lệnh `run` khởi chạy đồng thời hai luồng telemetry nền phát tin MQTT TLS (Arm A và Arm B), một luồng điều khiển Sensor gửi các lệnh PATCH tuần tự qua HTTPS REST API, và hai tiến trình Gateway executor độc lập (`gw_a`, `gw_b`) nhận và thực thi lệnh qua MQTT TLS. *(Lưu ý: Lệnh `run` của E3 không sử dụng cờ `--phase`)*.
+- Lệnh `export-results` trích xuất hình chiếu kết quả an toàn gồm:
+  - Bản tóm tắt thực thi của các roles (`workloads/*/workload.json`).
+  - Dữ liệu biên lai từ 2 CSDL SQLite (`runner/executor-receipts.json`) gồm command ID, version, sample_interval_us, kết quả SHA-256 và outbox pending count.
+  - Thông tin nguồn gốc nhị phân (binary provenance SHA-256).
+  *(Lưu ý: Lệnh `export-results` của E3 không dùng cờ `--phase`; không xuất file nhị phân, secrets hay nội dung payload thô)*.
+
 #### Bước 7 — Chuyển giao kết quả đo về Host A (Manual Transfer Step)
 
-Sao chép nguyên vẹn thư mục kết quả `$ROOT/B/exported-results/` sang Host A tại đường dẫn `$ROOT/A/received-results/`.
-Thiết lập phân quyền an toàn trên Host A: thư mục quyền `0700` và tập tin quyền `0600`:
+Người vận hành sao chép thủ công toàn bộ thư mục kết quả đo từ Host B về Host A:
+- Nguồn (Host B): `$ROOT/B/exported-results/`
+- Đích (Host A): `$ROOT/A/received-results/`
+
+Thiết lập phân quyền an toàn trên Host A:
 
 ```sh
 chmod 0700 "$ROOT/A/received-results"
 find "$ROOT/A/received-results" -type f -exec chmod 0600 {} +
 ```
 
-*(Lưu ý: Giữ nguyên vẹn tập tin projection/inventory, không can thiệp sửa đổi nội dung)*.
+*(Lưu ý: Giữ nguyên vẹn toàn bộ tập tin kết quả, không chỉnh sửa hash, session_id hay metadata; tuyệt đối không sao chép đè vào thư mục client-bundle)*.
 
 #### Bước 8 — Hậu kiểm dữ liệu, đối soát và đóng Fixture trên Host A (Terminal A2)
 
@@ -314,7 +352,21 @@ python3 scripts/paper_p8_server.py finish-phase \
 python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
 ```
 
-Kiểm tra status chờ chuyển sang `phase=VERIFYING` và xác nhận trường `workload_outcome=VALIDATED` (kèm `validation_valid=true` và `validation_failures=[]`). Sau đó tiến hành dọn dẹp và đóng server:
+Chờ cho đến khi lệnh `status` chuyển sang `phase=VERIFYING`.
+
+**Cổng kiểm định kết quả (Validation Gate)**: Kiểm tra các trường trong status JSON bằng Python assertion:
+
+```sh
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3 | python3 -c 'import sys, json; data = json.load(sys.stdin); result = data.get("imported_result", {}); assert data.get("phase") == "VERIFYING"; assert data.get("workload_outcome") == "VALIDATED"; assert result.get("validation_valid") is True; assert result.get("validation_failures") == []; print("Confirmed workload VALIDATED")'
+```
+
+Hệ thống thực hiện quy trình thẩm tra đối chiếu tự động nghiêm ngặt:
+- Đối chiếu biên lai command receipts trong SQLite của Host B khớp 100% với PostgreSQL trên Host A (khớp command ID, desired version, sample_interval_us, result_sha256).
+- Đối chiếu cấu hình reported configuration qua REST GET API khớp với giá trị đã áp dụng trong SQLite.
+- Phân tách luồng viễn trắc nền: Telemetry messages (12 ở low_load, 24 ở mixed) không bị ô nhiễm vào dữ liệu của các cảm biến điều khiển.
+- Kiểm tra tính hợp lệ của overlap clock (ở chế độ mixed, kiểm tra khoảng giao thoa thời gian giữa A steady và B burst).
+
+Sau khi xác nhận `workload_outcome=VALIDATED`, tiến hành dọn dẹp và hoàn tất phiên:
 
 ```sh
 python3 scripts/paper_p8_server.py finalize \
@@ -326,8 +378,53 @@ python3 scripts/paper_p8_server.py finalize \
 python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
 ```
 
-Chờ tiến trình `serve` trên Terminal A1 kết thúc với mã thoát 0. Kiểm tra status xác nhận `phase=CLOSED` và `cleanup_outcome=VERIFIED`. Báo cáo kết quả được lưu trong thư mục:
+Chờ tiến trình `serve` trên Terminal A1 kết thúc với mã thoát 0. Kiểm tra status xác nhận:
+- `phase=CLOSED`
+- `cleanup_outcome=VERIFIED` (toàn bộ 12 containers, 1 network, 5 volumes được dọn dẹp sạch theo receipts).
+
+Báo cáo kết quả và artifacts được lưu trữ an toàn trong thư mục:
 `$ROOT/A/fixture/artifacts/`.
+
+---
+
+### 2.4 Quy trình hủy phiên (Abort) và thu hồi tài nguyên (Cleanup Recovery)
+
+#### 1. Hủy phiên khẩn cấp (Abort Recipe)
+
+Khi gặp lỗi không thể khắc phục trong quá trình thực thi (preflight fail, lỗi mạng/TLS, import bị từ chối, hoặc validation failures), người vận hành phát lệnh `abort` trên Terminal A2 từ phase hiện tại để dừng phiên và dọn dẹp tài nguyên Docker an toàn:
+
+```sh
+# Trích xuất phase hiện tại từ status JSON bằng Python:
+CURRENT_PHASE=$(python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3 | python3 -c 'import sys, json; data = json.load(sys.stdin); ph = data.get("phase"); assert ph in ("READY", "MEASURING", "VERIFYING"), f"Invalid phase for abort: {ph}"; print(ph)')
+
+# Phát lệnh hủy phiên:
+python3 scripts/paper_p8_server.py abort \
+  --root "$ROOT/A" \
+  --experiment E3 \
+  --session-id "$SESSION_ID" \
+  --phase "$CURRENT_PHASE"
+
+python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3
+```
+
+Chờ cho đến khi tiến trình `serve` trên Terminal A1 kết thúc với mã thoát 0. Kiểm tra status xác nhận `phase=CLOSED` và `cleanup_outcome=VERIFIED`. Toàn bộ artifacts và nhật ký lỗi được bảo toàn để phục vụ chẩn đoán nguyên nhân gốc.
+
+#### 2. Dọn dẹp tài nguyên mồ côi (Stale Fixture Cleanup Recovery)
+
+Trường hợp một phiên chạy trước đó bị gián đoạn đột ngột (tiến trình bị SIGKILL, mất điện, hoặc lỗi crash máy chủ) khiến containers, network hoặc volume Docker còn sót lại mà tiến trình `serve` không còn hoạt động, người vận hành thực hiện thu hồi tài nguyên an toàn thông qua cơ chế receipt-verified cleanup:
+
+```sh
+# Trích xuất project identifier từ status JSON bằng Python:
+PROJECT_ID=$(python3 scripts/paper_p8_server.py status --root "$ROOT/A" --experiment E3 | python3 -c 'import sys, json; data = json.load(sys.stdin); prj = data.get("project"); assert prj, "project missing or empty in status JSON"; print(prj)')
+
+# Thực hiện dọn dẹp an toàn dựa trên biên lai project:
+python3 scripts/paper_p8_server.py cleanup \
+  --root "$ROOT/A" \
+  --project "$PROJECT_ID" \
+  --experiment E3
+```
+
+Lệnh `cleanup` thu hồi chính xác các container và mạng thuộc về project đã chỉ định theo đúng danh sách biên lai, tuyệt đối không ảnh hưởng đến các container hoặc dịch vụ khác đang chạy trên hệ thống.
 
 ---
 
@@ -502,7 +599,7 @@ Toàn bộ báo cáo và dấu vết thực nghiệm được lưu trữ nguyên
 - **Ranh giới nghiệm thu kết quả và quy trình import**: Quy trình nhập kết quả (result import) và đối soát dữ liệu (reconciliation) đã hoàn thành và đạt trạng thái `VALIDATED` trong 4 profile 4-lệnh chuẩn (§3) cũng như bài kiểm tra bounded seam 3-lệnh ghi nhận trong báo cáo P8; không tuyên bố một cách sai lệch hay lỗi thời rằng completed result import là universally NOT RUN. Chi tiết số liệu đo đạc từng lượt được tập trung tại [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe).
 - **Ranh giới giữa Offline Admission và Online Delivery**: Thao tác offline sensor chỉ chứng minh việc tiếp nhận/cam kết và replay trong CSDL (committed admission/replay gồm desired state, command request, và receipt); tuyệt đối không chứng minh việc chuyển giao (delivery) hay thực thi lệnh thành công (success). Việc chuyển giao và kết quả (delivery/result) chỉ được kết luận từ online executor thực tế sau khi nhận `READY_MARKER` và `SUBACK`.
 - **Ngân sách vòng đời và an toàn JWT**: Mọi quy trình đều tuân thủ chặt chẽ ngân sách thời gian có hạn (`--deadline-seconds` 900s hoặc 1200s), thời hạn ngắn của JWT token, dọn dẹp chính xác tài nguyên (`exact_cleanup_verified`), và phân quyền tập tin nghiêm ngặt (`0700`/`0600`).
-- **Phạm vi dừng (checkpoint lịch sử)**: Bốn profile E3 đã được ghi nhận hoàn thành ở checkpoint trước thông qua helper CLI. Kết quả bổ sung không thay đổi qualification của các lượt profile lịch sử; xem [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe).
+- **Phạm vi dừng / qualification**: Bốn profile E3 đã được ghi nhận hoàn thành ở checkpoint trước thông qua helper CLI; các chỉnh sửa runbook này không chạy lại native E3 và không nâng qualification của các lượt đó. Official30 native, full CI, HIL, physical A/B, capacity/soak và live rollout vẫn NOT RUN. Xem [báo cáo P8](paper-p8-experiments-and-acceptance.md#e3--subset-ba-lệnh-và-chẩn-đoán-probe) và checkpoint R0–R5.
 
 ### 4.2 Hợp đồng offline Official30 và kiểm định native seam hữu hạn
 
@@ -528,3 +625,34 @@ python3 scripts/tests/native_compose_smoke.py --prepare "$ROOT/private" \
 ```
 
 Lệnh này dùng fixture E3 hữu hạn, cần các gate cleanup/readback thông thường và không phải nghiệm thu official 30 lệnh.
+
+### 4.3 Diễn giải đối chiếu kỳ vọng kết quả giữa Pilot 4 lệnh và Official 30 lệnh
+
+Bảng dưới đây tổng hợp sự khác biệt về tham số cấu hình, hành vi điều phối và kỳ vọng kết quả kiểm tra đối soát giữa đợt chạy Pilot 4 lệnh (đã nghiệm thu thực tế trong §3) và luồng Official 30 lệnh (kế hoạch official30):
+
+| Tiêu chí đối chiếu | Pilot 4 lệnh (`smoke4` — Baseline thực tế) | Official 30 lệnh (`official30` — Kế hoạch mở rộng) | Bounded Seam 3 lệnh (`official3` — Seam test) |
+|---|---|---|---|
+| **Hồ sơ (`--profile`)** | `pilot` | `official` (bắt buộc kèm `--official-opt-in`) | `official` (bắt buộc kèm `--official-opt-in`) |
+| **Số lượng lệnh (`--e3-command-count`)** | `4` lệnh (2 lệnh / sensor) | `30` lệnh (15 lệnh / sensor) | `3` lệnh (2 lệnh sensor 0, 1 lệnh sensor 1) |
+| **Lịch phát (`--e3-schedule`)** | `smoke` (dồn: 1s, 3.8s, 10s, 12s) | `steady` (giãn đều 1s/lệnh: 1s, 2s, ..., 30s) | `steady` (giãn đều 1s/lệnh: 1s, 2s, 3s) |
+| **Tải viễn trắc nền (`--workload`)** | Hỗ trợ cả `low_load` lẫn `mixed` | Hỗ trợ cả `low_load` lẫn `mixed` | Bắt buộc `--workload low_load` |
+| **Hồ sơ viễn trắc nền (Background)** | Profile `pilot` (1 msg/s, 100 samples/msg) | Duy trì profile `pilot` (1 msg/s, 100 samples/msg; không có cờ tốc độ cao) | Profile `pilot` (1 msg/s, 100 samples/msg) |
+| **Ngân sách thời gian (`--deadline-seconds`)** | `900` giây (15 phút) | `1200` giây (20 phút) | `1200` giây (20 phút) |
+| **Thời lượng đo lường (Control Measure/Wall)** | Measure: 14s, Drain: 30s, Wall: 60s | Measure: 32s (`max(8, 30s+2s)`), Drain: 30s, Wall: 62s | Measure: 8s, Drain: 30s, Wall: 60s |
+| **Kỳ vọng Desired Version cuối** | `ctl-a`: 2, `ctl-b`: 2 | `ctl-a`: 15, `ctl-b`: 15 | `ctl-a`: 2, `ctl-b`: 1 |
+| **Biên lai SQLite Receipts (mỗi Executor)** | 2 completed / 0 pending (tổng 4 receipts) | 15 completed / 0 pending (tổng 30 receipts) | 2 completed / 1 completed (tổng 3 receipts) |
+| **Cơ chế điều phối (Dispatch order)** | Tuần tự có kiểm tra terminal | Tuần tự nghiêm ngặt (chờ terminal trước khi gửi lệnh kế tiếp) | Tuần tự có kiểm tra terminal |
+| **Cập nhật cấu hình CSDL (Config DB)** | 2 rows (1 bản ghi/sensor) | 30 lần cập nhật cấu hình tuần tự qua REST | 3 lần cập nhật cấu hình |
+| **Trạng thái nghiệm thu (Acceptance)** | `VALIDATED` (4 profile đã chạy thành công §3) | **NOT RUN** (chỉ có hợp đồng offline dry-run) | `PASS` (trên fixture native seam cô lập) |
+
+#### Các quy tắc kiểm định then chốt của Official 30 lệnh:
+
+1. **Nguyên tắc điều phối tuần tự và bảo vệ Version (Version Monotonicity)**:
+   - Các lệnh điều khiển trong `official30` được phát tuần tự qua REST API với cơ chế kiểm tra trạng thái terminal: client chỉ phát lệnh kế tiếp cho một cảm biến khi lệnh trước đó trên cùng cảm biến đó đã đạt trạng thái terminal (`succeeded`, `failed`).
+   - Tuyệt đối không phát dồn đồng thời 15 lệnh trên một cảm biến; không tạo bước nhảy version ngụy tạo nếu có lệnh bị timeout hay hoãn.
+2. **Bảo tồn tính độc lập của Viễn trắc nền (No Background High-Rate Leakage)**:
+   - Mặc dù phiên đo E3 mang nhãn `--profile official`, luồng viễn trắc nền E2 bên dưới vẫn duy trì hồ sơ `pilot` với tốc độ chuẩn 1 msg/s (100 samples/msg).
+   - E3 không tích hợp và không chấp nhận các cờ phát tải viễn trắc tốc độ cao (như `--e2-offered-rate 1000/5000/20000`). Bất kỳ giả định nào về việc chạy viễn trắc nền tốc độ cao trong E3 đều không được công cụ helper hỗ trợ.
+3. **Phân biệt ranh giới chứng thực**:
+   - Việc vượt qua kiểm tra offline dry-run (`official30 dry-run`) chỉ xác nhận tính đúng đắn của manifest schema và run-spec; không được coi là đã kiểm định năng lực chịu tải hay nghiệm thu luồng 30 lệnh trên môi trường phân tán thực tế.
+   - Trạng thái tổng thể toàn dự án vẫn duy trì `full_p8_accepted=false` và `physical_ab=NOT RUN`.
