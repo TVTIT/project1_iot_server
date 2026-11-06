@@ -30,7 +30,7 @@ SAFE_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 MANIFEST_TOP = {'schema_version','experiment','arm','profile','mode','run_id','seed','roles',
     'samples_per_message','topology','targets','subscriptions','traffic','phases','limits','tls',
     'identity_files','gateway_identity_files','bundle_path','durability_mode','retry_interval_ms',
-    'publish_timeout_ms','viewer','commands','e4','equal_samples'}
+    'publish_timeout_ms','viewer','commands','e4','equal_samples','retry_policy'}
 RUN_SPEC_KEYS = {'paperload','gateways','stop_timeout_seconds','disk_guard'}
 
 E2_EQUAL_SAMPLES_CONTEXT_KEYS = frozenset({
@@ -347,6 +347,21 @@ def _strict_manifest(value, experiment, arm):
         if experiment != 'E2' or value.get('experiment') != 'E2':
             _fail('bundle_manifest_contract_rejected')
         _validate_equal_samples_manifest_obj(value['equal_samples'], value.get('samples_per_message'), value.get('seed'))
+    if 'retry_policy' in value:
+        if experiment != 'E2' or value.get('profile') != 'official' or value.get('arm') not in ('A', 'B'):
+            _fail('bundle_retry_policy_scope_rejected')
+        try:
+            from scripts.tests.paper_p8_e2_retry_policy import validate_retry_policy
+        except ModuleNotFoundError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('paper_p8_e2_retry_policy',
+                Path(__file__).parent / 'tests' / 'paper_p8_e2_retry_policy.py')
+            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+            validate_retry_policy = module.validate_retry_policy
+        try:
+            validate_retry_policy(value['retry_policy'], pending_messages=value['limits']['pending_messages'])
+        except ValueError:
+            _fail('bundle_retry_policy_rejected')
     return value
 
 
@@ -520,7 +535,9 @@ def _validate_e2_official_workload(workload):
     required = {'experiment','arm','phase','profile','workload','seed','samples_per_message',
         'producer_rates_per_second','offered_rate_per_second','measure_seconds','burst_messages',
         'expected_counts','estimate','durability_mode','generator_colocated'}
-    if (type(workload) is not dict or set(workload) not in (required, required | {'pending_limits'})
+    allowed = (required, required | {'pending_limits'}, required | {'retry_policy'},
+               required | {'pending_limits', 'retry_policy'})
+    if (type(workload) is not dict or set(workload) not in allowed
             or workload.get('experiment') != 'E2' or workload.get('profile') != 'official'
             or workload.get('workload') != 'e2-telemetry-ab-official'
             or not isinstance(workload.get('arm'), str) or not SAFE_ID.fullmatch(workload['arm'])
@@ -534,6 +551,20 @@ def _validate_e2_official_workload(workload):
             or workload.get('durability_mode') != 'synthetic-load'
             or workload.get('generator_colocated') not in ('unverified',True,False,'true','false')):
         _fail('bundle_workload_metadata_rejected')
+    if 'retry_policy' in workload:
+        try:
+            from scripts.tests.paper_p8_e2_retry_policy import validate_retry_policy
+        except ModuleNotFoundError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('paper_p8_e2_retry_policy',
+                Path(__file__).parent / 'tests' / 'paper_p8_e2_retry_policy.py')
+            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+            validate_retry_policy = module.validate_retry_policy
+        try:
+            validate_retry_policy(workload['retry_policy'],
+                pending_messages=(workload.get('pending_limits') or {}).get('pending_messages', 0))
+        except ValueError:
+            _fail('bundle_workload_metadata_rejected')
     rates = workload['producer_rates_per_second']
     if (type(rates) is not dict or set(rates) != {'A','B'}
             or any(type(v) is not int or v < 0 for v in rates.values())
@@ -550,7 +581,15 @@ def _validate_e2_official_workload(workload):
         'raw_rows_estimate','application_payload_bytes_estimate','raw_database_row_index_wal_bytes_estimate',
         'total_storage_growth_bytes_estimate','pending_retry_memory_bytes_estimate',
         'application_bandwidth_bytes_per_second_estimate','payload_bytes_wire','payload_size_basis',
-        'estimate_basis','not_measurements'}
+        'estimate_basis','not_measurements','retry_queue_logical_bytes_estimate','retry_queue_sizing_basis',
+        'unique_offered_rate_per_producer','retry_attempt_rate_per_producer',
+        'retry_attempt_burst_per_producer','fixture_shaper_attempt_rate_per_gateway',
+        'fixture_shaper_attempt_burst_per_gateway','retry_headroom_not_reserved'}
+    legacy_estimate_keys = estimate_keys - {'retry_queue_logical_bytes_estimate','retry_queue_sizing_basis',
+        'unique_offered_rate_per_producer','retry_attempt_rate_per_producer',
+        'retry_attempt_burst_per_producer','fixture_shaper_attempt_rate_per_gateway',
+        'fixture_shaper_attempt_burst_per_gateway','retry_headroom_not_reserved'}
+    extended_estimate = type(estimate) is dict and set(estimate) == estimate_keys
     pending = workload.get('pending_limits')
     if 'pending_limits' in workload and (type(pending) is not dict
             or set(pending) != {'pending_messages', 'pending_bytes'}
@@ -563,7 +602,8 @@ def _validate_e2_official_workload(workload):
         estimate_messages += workload['burst_messages']
     estimate_rows = estimate_messages * workload['samples_per_message']
     basis = estimate.get('estimate_basis') if isinstance(estimate, dict) else None
-    if (type(estimate) is not dict or set(estimate) != estimate_keys
+    if (type(estimate) is not dict or set(estimate) not in (estimate_keys, legacy_estimate_keys)
+            or (workload.get('retry_policy') is not None and not extended_estimate)
             or estimate.get('estimate_only') is not True or estimate.get('not_measurements') is not True
             or estimate.get('payload_bytes_wire') is not None
             or estimate.get('rate_per_second') != workload['offered_rate_per_second']
@@ -580,12 +620,25 @@ def _validate_e2_official_workload(workload):
             or estimate.get('application_payload_bytes_estimate') != estimate_messages * 4096
             or estimate.get('raw_database_row_index_wal_bytes_estimate') != estimate_rows * 320 * 2
             or estimate.get('total_storage_growth_bytes_estimate') != estimate_messages * 4096 + estimate_rows * 320 * 2
-            or estimate.get('pending_retry_memory_bytes_estimate') != (
+             or estimate.get('pending_retry_memory_bytes_estimate') != (
                 2 * (pending['pending_bytes'] + pending['pending_messages'] * 4096)
+                + (2 * pending['pending_messages'] * 16 if extended_estimate and workload.get('retry_policy') else 0)
                 if pending is not None else (min(estimate_messages,64)+min(estimate_messages,16))*4096)
+             or (extended_estimate and (
+                estimate.get('retry_queue_logical_bytes_estimate') != (
+                    2 * pending['pending_messages'] * 16 if pending is not None and workload.get('retry_policy') else 0)
+                or estimate.get('retry_queue_sizing_basis') != '2 producers * pending_messages * 16-byte UUID slots; logical estimate, not RSS'
+                or estimate.get('unique_offered_rate_per_producer') != workload['offered_rate_per_second'] / 2
+                or estimate.get('retry_attempt_rate_per_producer') != (workload['retry_policy']['rate_per_second'] if workload.get('retry_policy') else 0)
+                or estimate.get('retry_attempt_burst_per_producer') != (workload['retry_policy']['burst'] if workload.get('retry_policy') else 0)
+                or estimate.get('fixture_shaper_attempt_rate_per_gateway') != 500
+                or estimate.get('fixture_shaper_attempt_burst_per_gateway') != 500
+                or estimate.get('retry_headroom_not_reserved') is not (
+                    estimate.get('unique_offered_rate_per_producer') + estimate.get('retry_attempt_rate_per_producer') > 500)))
             or estimate.get('application_bandwidth_bytes_per_second_estimate') != workload['offered_rate_per_second']*4096
             or basis != {'raw_row_bytes':256,'index_bytes_per_row':64,'wal_multiplier':2}
-            or estimate.get('total_storage_growth_bytes_estimate') > 10 << 30
+             or estimate.get('pending_retry_memory_bytes_estimate') > 256 << 20
+             or estimate.get('total_storage_growth_bytes_estimate') > 10 << 30
             or estimate_messages > 1000000 or estimate_rows > 100000000
             ):
         _fail('bundle_workload_metadata_rejected')
@@ -994,6 +1047,10 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             manifest_refs[label]=f'manifests/{label}.json'
         if referenced_gateways != set(gateway_identity_files): _fail('bundle_gateway_identity_missing')
         if referenced_identities != set(copied_identity_refs): _fail('bundle_identity_unreferenced_input')
+        if experiment == 'E2' and (selected_profile == 'official' or 'retry_policy' in workload):
+            policies = [manifest_values[label].get('retry_policy') for label in ('A', 'B')]
+            if policies[0] != policies[1] or workload.get('retry_policy') != policies[0]:
+                _fail('bundle_retry_policy_mismatch')
 
         if set(ca_files) != {'https','mqtt'}: _fail('bundle_ca_rejected')
         rewritten={}
@@ -1800,6 +1857,14 @@ def inspect_bundle(root):
         _validate_e5_lifecycle(plan['viewer_lifecycle'])
     if session.get('experiment') == 'E2':
         wl = metadata.get('workload')
+        if isinstance(wl, dict) and ('retry_policy' in wl or any(
+                isinstance(_json_file(root / 'manifests' / f'{arm}.json', limit=MAX_MANIFEST_BYTES), dict)
+                and 'retry_policy' in _json_file(root / 'manifests' / f'{arm}.json', limit=MAX_MANIFEST_BYTES)
+                for arm in ('A', 'B'))):
+            policies = [_json_file(root / 'manifests' / f'{arm}.json', limit=MAX_MANIFEST_BYTES).get('retry_policy')
+                        for arm in ('A', 'B')]
+            if policies[0] != policies[1] or wl.get('retry_policy') != policies[0]:
+                _fail('bundle_retry_policy_mismatch')
         if isinstance(wl, dict) and wl.get('profile') == 'official':
             _validate_e2_official_workload(wl)
             expected_limits = wl.get('pending_limits', {'pending_messages': 64, 'pending_bytes': 1 << 20})

@@ -285,6 +285,17 @@ def _safe_workload(value, *, role=None):
     for key in ('telemetry', 'configured_phases', 'viewer'):
         if key in value:
             safe[key] = _safe_counter_tree(value[key])
+    if 'retry_policy' in value:
+        if role != 'telemetry' or not isinstance(value['retry_policy'], dict):
+            raise ValueError('workload retry policy rejected')
+        try:
+            from scripts.tests.paper_p8_e2_retry_policy import validate_retry_policy
+        except ModuleNotFoundError:
+            tests_path = str(Path(__file__).resolve().parent / 'tests')
+            if tests_path not in sys.path:
+                sys.path.insert(0, tests_path)
+            from paper_p8_e2_retry_policy import validate_retry_policy
+        safe['retry_policy'] = validate_retry_policy(value['retry_policy'], pending_messages=100000)
     for key in ('phase_events',):
         if key in value:
             safe[key] = _safe_phase_events(value[key])

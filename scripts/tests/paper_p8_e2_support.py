@@ -41,6 +41,25 @@ OFFICIAL_RATES = (100, 1000, 5000, 20000)
 PILOT_SEED = 84
 PILOT_MESSAGES = {'A': 8, 'B': 16}
 
+try:
+    from scripts.tests.paper_p8_e2_retry_policy import validate_retry_policy
+except ModuleNotFoundError:
+    from paper_p8_e2_retry_policy import validate_retry_policy
+
+
+def validate_applied_retry_policy(prepared, workloads):
+    manifests = prepared.get('manifests', {})
+    policies = [manifests.get(arm, {}).get('retry_policy') for arm in ('A', 'B')]
+    expected = policies[0]
+    if policies[1] != expected:
+        raise ValueError('e2_retry_policy_mismatch')
+    if expected is None:
+        return None
+    for arm in ('A', 'B'):
+        if workloads.get(arm, {}).get('retry_policy') != expected:
+            raise ValueError(f'e2_retry_policy_applied_proof_mismatch:{arm}')
+    return dict(expected)
+
 
 def e2_pilot_manifests(*, common, targets, gateway_identity_files, telemetry_identity_files):
     """Create paired same-seed A/B synthetic telemetry manifests for sample profiles."""
@@ -78,7 +97,7 @@ def e2_pilot_manifests(*, common, targets, gateway_identity_files, telemetry_ide
 
 def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_identity_files,
                           samples_per_message, offered_rate, duration_seconds, burst_messages=0,
-                          pending_messages=64, pending_bytes=1 << 20):
+                          pending_messages=64, pending_bytes=1 << 20, retry_policy=None):
     """Build two role manifests whose rates sum to the selected run-wide offer."""
     if (len(targets) != 2 or len({t.get('gateway_id') for t in targets}) != 2
             or samples_per_message not in PILOT_SAMPLES or offered_rate not in OFFICIAL_RATES
@@ -90,6 +109,8 @@ def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_
         raise ValueError('e2_official_workload_rejected')
     rates = {'A': offered_rate // 2, 'B': offered_rate - offered_rate // 2}
     pair = {}
+    if retry_policy is not None:
+        retry_policy = validate_retry_policy(retry_policy, pending_messages=pending_messages)
     for arm, target in zip(('A', 'B'), targets):
         if target['gateway_id'] not in gateway_identity_files or arm not in telemetry_identity_files:
             raise ValueError('e2_gateway_credentials_mismatch')
@@ -108,6 +129,8 @@ def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_
             'gateway_identity_files': {target['gateway_id']: gateway_identity_files[target['gateway_id']]},
             'identity_files': {'telemetry': telemetry_identity_files[arm]},
             'durability_mode': 'synthetic-load', 'retry_interval_ms': 500}
+        if retry_policy is not None:
+            pair[arm]['retry_policy'] = dict(retry_policy)
     return {'profiles': {str(samples_per_message): pair}, 'profile': 'official',
             'offered_rate_per_second': offered_rate, 'producer_rates_per_second': rates,
             'duration_seconds': duration_seconds, 'unique_messages_per_profile': offered_rate * duration_seconds + burst_messages,
@@ -141,7 +164,8 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
                    reference_path=None, context=None, grace_seconds=10,
                    check_freshness=True, now_utc=None, profile='pilot',
                    official_opt_in=False, offered_rate=100, duration_seconds=10,
-                   burst_messages=0, pending_messages=64, pending_bytes=1 << 20):
+                    burst_messages=0, pending_messages=64, pending_bytes=1 << 20,
+                    retry_policy=None):
     """Prepare one bounded E2 profile for the existing A/B helper lifecycle."""
     if samples_per_message not in PILOT_SAMPLES:
         raise ValueError('e2_samples_profile_rejected')
@@ -155,10 +179,15 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
         raise ValueError('official_profile_requires_opt_in')
     if profile == 'official' and workload != 'steady_burst':
         raise ValueError('official_equal_samples_not_supported')
+    if retry_policy is not None and (profile != 'official' or workload != 'steady_burst'):
+        raise ValueError('e2_retry_policy_scope_rejected')
+    if retry_policy is not None:
+        retry_policy = validate_retry_policy(retry_policy, pending_messages=pending_messages)
     estimate = (e2_official_estimate(rate_per_second=offered_rate,
         duration_seconds=duration_seconds, samples_per_message=samples_per_message,
         payload_bytes=4096, official_opt_in=True, burst_messages=burst_messages,
-        pending_messages=pending_messages, pending_bytes=pending_bytes) if profile == 'official' else None)
+        pending_messages=pending_messages, pending_bytes=pending_bytes,
+        retry_policy=retry_policy) if profile == 'official' else None)
 
     validated_ctx = None
     if workload == 'equal_samples':
@@ -220,7 +249,8 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
             gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files,
             samples_per_message=samples_per_message, offered_rate=offered_rate,
             duration_seconds=duration_seconds, burst_messages=burst_messages,
-            pending_messages=pending_messages, pending_bytes=pending_bytes)
+            pending_messages=pending_messages, pending_bytes=pending_bytes,
+            retry_policy=retry_policy)
             if profile == 'official' else e2_pilot_manifests(common=common, targets=targets,
             gateway_identity_files=gateway_files, telemetry_identity_files=telemetry_files))
         pair = manifests['profiles'][str(samples_per_message)]
@@ -359,6 +389,8 @@ def export_prepared_bundle(prepared, *, wait_seconds=90, workload_seconds=None):
                 'expected_counts': prepared['plan']['expected_counts'],
                 'estimate': prepared['official_estimate'], 'durability_mode': 'synthetic-load',
                 'generator_colocated': 'unverified'}
+            if 'retry_policy' in a:
+                workload['retry_policy'] = dict(a['retry_policy'])
             eff_workload_seconds = duration + 60 if workload_seconds is None else workload_seconds
         else:
             a, b = prepared['manifests']['A'], prepared['manifests']['B']
@@ -400,7 +432,7 @@ class EqualSamplesCompactSampler:
             raise ValueError('sampler_max_snapshots_out_of_bounds')
         if not (1024 <= byte_cap <= 16 * 1024 * 1024):
             raise ValueError('sampler_byte_cap_out_of_bounds')
-        if not (5.0 <= deadline_seconds <= 86400.0):
+        if not (0.1 <= deadline_seconds <= 86400.0):
             raise ValueError('sampler_deadline_out_of_bounds')
 
         self.scrape = scrape
@@ -419,7 +451,11 @@ class EqualSamplesCompactSampler:
         self.evicted_bytes = 0
         self.total_captured = 0
         self.current_ring_bytes = 0
-        self.errors = []
+        self._errors = []
+        self.max_errors = 16
+        self._lock = threading.RLock()
+        self._stop_result = None
+        self._stop_lock = threading.Lock()
 
         self.baseline_metrics = self._project_metrics(baseline_metrics) if baseline_metrics else None
         self.baseline_resources = self._project_resources(baseline_resources) if baseline_resources else None
@@ -434,9 +470,12 @@ class EqualSamplesCompactSampler:
         if not isinstance(raw, dict):
             return None
         proj = {
-            'process_instance': raw.get('process_instance'),
-            'timestamp': raw.get('timestamp'),
-            'monotonic': raw.get('monotonic'),
+            'process_instance': raw.get('process_instance')[:128]
+                if isinstance(raw.get('process_instance'), str) else None,
+            'timestamp': raw.get('timestamp')[:64]
+                if isinstance(raw.get('timestamp'), str) else None,
+            'monotonic': raw.get('monotonic')
+                if type(raw.get('monotonic')) in (int, float) else None,
         }
         ing_raw = raw.get('ingress')
         if isinstance(ing_raw, dict):
@@ -450,10 +489,17 @@ class EqualSamplesCompactSampler:
                 'ACKBuildFailures', 'Committed', 'DuplicateCommitted',
                 'SamplesNew', 'ACKPublished', 'ACKPublishFailures'
             )
-            ing = {k: ing_raw[k] for k in ing_fields if k in ing_raw and isinstance(ing_raw[k], (int, float))}
-            for hist_k in ('ack_latency', 'durations'):
-                if hist_k in ing_raw and isinstance(ing_raw[hist_k], dict):
-                    ing[hist_k] = ing_raw[hist_k]
+            ing = {k: ing_raw[k] for k in ing_fields if k in ing_raw and type(ing_raw[k]) in (int, float)}
+            durations = ing_raw.get('Durations')
+            names = ('queue_wait', 'validation', 'persistence', 'ack_publish',
+                     'batch_wait', 'group_persistence')
+            projected_durations = {}
+            for name in names:
+                hist = EqualSamplesCompactSampler._project_histogram(
+                    durations.get(name) if isinstance(durations, dict) else None)
+                projected_durations[name] = hist or {'available': False, 'reason':
+                    'missing' if not isinstance(durations, dict) or name not in durations else 'invalid'}
+            ing['durations'] = projected_durations
             proj['ingress'] = ing
         else:
             proj['ingress'] = {}
@@ -469,10 +515,12 @@ class EqualSamplesCompactSampler:
                 'fallback_calls', 'rollback_calls', 'batch_wait_timeouts',
                 'groups_flushed',
             )
-            pers = {k: pers_raw[k] for k in pers_fields if k in pers_raw and isinstance(pers_raw[k], (int, float))}
+            pers = {k: pers_raw[k] for k in pers_fields if k in pers_raw and type(pers_raw[k]) in (int, float)}
             for hist_k in ('batch_wait_latency', 'persistence_latency'):
                 if hist_k in pers_raw and isinstance(pers_raw[hist_k], dict):
-                    pers[hist_k] = pers_raw[hist_k]
+                    hist = EqualSamplesCompactSampler._project_histogram(pers_raw[hist_k])
+                    if hist:
+                        pers[hist_k] = hist
             proj['persistence'] = pers
         else:
             proj['persistence'] = {}
@@ -481,6 +529,26 @@ class EqualSamplesCompactSampler:
             proj['resources'] = EqualSamplesCompactSampler._project_resources(raw['resources'])
 
         return proj
+
+    @staticmethod
+    def _project_histogram(raw):
+        """Project the backend HistogramSnapshot DTO with bounded, finite arrays."""
+        if not isinstance(raw, dict):
+            return None
+        bounds, buckets = raw.get('upper_seconds'), raw.get('buckets')
+        count, overflow, total = raw.get('count'), raw.get('overflow'), raw.get('sum_seconds')
+        if (not isinstance(bounds, list) or not isinstance(buckets, list)
+                or len(bounds) != len(buckets) or len(bounds) > 32
+                or type(count) is not int or count < 0
+                or type(overflow) is not int or overflow < 0
+                or type(total) not in (int, float) or not math.isfinite(total)
+                or any(type(x) not in (int, float) or not math.isfinite(x) or x < 0 for x in bounds)
+                or any(type(x) is not int or x < 0 for x in buckets)
+                or any(bounds[i] >= bounds[i + 1] for i in range(len(bounds) - 1))
+                or sum(buckets) + overflow != count):
+            return None
+        return {'available': True, 'upper_seconds': bounds, 'buckets': buckets,
+                'count': count, 'overflow': overflow, 'sum_seconds': total}
 
     @staticmethod
     def _project_resources(raw):
@@ -497,17 +565,30 @@ class EqualSamplesCompactSampler:
             'nginx': 'nginx',
             'proxy': 'nginx',
         }
-        for k, v in source_svcs.items():
-            if isinstance(v, dict):
-                canon_k = canonical.get(k, k)
-                projected[canon_k] = {
-                    'cpu_cumulative_seconds': v.get('cpu_cumulative_seconds'),
-                    'memory_bytes': v.get('memory_bytes'),
-                    'available': v.get('available', True),
-                    'container_id': v.get('container_id'),
-                    'reason': v.get('reason'),
-                }
+        for index, (k, v) in enumerate(source_svcs.items()):
+            if index >= 8:
+                break
+            if isinstance(v, dict) and k in canonical:
+                canon_k = canonical[k]
+                row = {field: v[field] for field in ('cpu_cumulative_seconds', 'memory_bytes')
+                       if type(v.get(field)) in (int, float)}
+                if type(v.get('available')) is bool:
+                    row['available'] = v['available']
+                if isinstance(v.get('reason'), str):
+                    row['reason'] = v['reason'][:80]
+                projected[canon_k] = row
         return projected
+
+    def _error(self, code):
+        safe = str(code)[:96]
+        with self._lock:
+            if safe not in self._errors and len(self._errors) < self.max_errors:
+                self._errors.append(safe)
+
+    @property
+    def errors(self):
+        with self._lock:
+            return list(self._errors)
 
     def sample_step(self, phase='sample'):
         if self._started_monotonic is None:
@@ -518,8 +599,7 @@ class EqualSamplesCompactSampler:
         now_wall = self.wall_fn()
 
         if now_mono - self._started_monotonic > self.deadline_seconds:
-            if 'collector_deadline_exceeded' not in self.errors:
-                self.errors.append('collector_deadline_exceeded')
+            self._error('collector_deadline_exceeded')
             return
 
         raw_metrics = None
@@ -527,14 +607,14 @@ class EqualSamplesCompactSampler:
             try:
                 raw_metrics = self.scrape()
             except Exception as exc:
-                self.errors.append('scrape_' + type(exc).__name__)
+                self._error('scrape_' + type(exc).__name__)
 
         raw_res = None
         if self.resource_reader:
             try:
                 raw_res = self.resource_reader()
             except Exception as exc:
-                self.errors.append('resource_read_' + type(exc).__name__)
+                self._error('resource_read_' + type(exc).__name__)
 
         proj_metrics = self._project_metrics(raw_metrics) or {}
         proj_res = self._project_resources(raw_res) if raw_res else None
@@ -550,25 +630,30 @@ class EqualSamplesCompactSampler:
         if proj_res is not None:
             snapshot['resources'] = proj_res
 
-        serialized = json.dumps(snapshot, separators=(',', ':')).encode('utf-8')
-        snap_size = len(serialized)
+        snap_size = len(json.dumps(snapshot, separators=(',', ':')).encode('utf-8'))
         snapshot['_size'] = snap_size
+        snap_size = len(json.dumps(snapshot, separators=(',', ':')).encode('utf-8'))
 
-        if len(self._ring) >= self.max_snapshots:
-            oldest = self._ring.popleft()
-            self.evicted_count += 1
-            self.evicted_bytes += oldest.get('_size', 0)
-            self.current_ring_bytes -= oldest.get('_size', 0)
+        if snap_size > self.byte_cap:
+            with self._lock:
+                self.total_captured += 1
+            self._error('collector_snapshot_exceeds_byte_cap')
+            return
 
-        while self.current_ring_bytes + snap_size > self.byte_cap and len(self._ring) > 0:
-            oldest = self._ring.popleft()
-            self.evicted_count += 1
-            self.evicted_bytes += oldest.get('_size', 0)
-            self.current_ring_bytes -= oldest.get('_size', 0)
-
-        self._ring.append(snapshot)
-        self.total_captured += 1
-        self.current_ring_bytes += snap_size
+        with self._lock:
+            if len(self._ring) >= self.max_snapshots:
+                oldest = self._ring.popleft()
+                self.evicted_count += 1
+                self.evicted_bytes += oldest.get('_size', 0)
+                self.current_ring_bytes -= oldest.get('_size', 0)
+            while self.current_ring_bytes + snap_size > self.byte_cap and self._ring:
+                oldest = self._ring.popleft()
+                self.evicted_count += 1
+                self.evicted_bytes += oldest.get('_size', 0)
+                self.current_ring_bytes -= oldest.get('_size', 0)
+            self._ring.append(snapshot)
+            self.total_captured += 1
+            self.current_ring_bytes += snap_size
 
     def start_manual(self):
         self._started_monotonic = self.time_fn()
@@ -588,59 +673,70 @@ class EqualSamplesCompactSampler:
         self._thread = threading.Thread(target=loop, name='e2-compact-sampler', daemon=True)
         self._thread.start()
 
-    def stop(self, process_pid=None):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=10)
-            if self._thread.is_alive():
-                self.errors.append('collector_join_timeout')
+    def stop(self, process_pid=None, *, timeout_seconds=10.0):
+        with self._stop_lock:
+            if self._stop_result is not None:
+                return self._stop_result
+            self._stop.set()
+            if self._thread:
+                self._thread.join(timeout=max(0.0, float(timeout_seconds)))
+                if self._thread.is_alive():
+                    self._error('collector_join_timeout')
+                    return False
+            self._stop_result = True
+            return True
 
     def record_terminal(self, terminal_metrics, terminal_resources):
-        self.terminal_metrics = self._project_metrics(terminal_metrics) if terminal_metrics else None
-        self.terminal_resources = self._project_resources(terminal_resources) if terminal_resources else None
+        with self._lock:
+            self.terminal_metrics = self._project_metrics(terminal_metrics) if terminal_metrics else None
+            self.terminal_resources = self._project_resources(terminal_resources) if terminal_resources else None
 
     @property
     def retained_snapshots(self):
-        return list(self._ring)
+        with self._lock:
+            return [dict(s) for s in self._ring]
 
     @property
     def metrics(self):
-        res = []
-        if self.baseline_metrics:
-            res.append({'phase': 'workload_start', 'snapshot': self.baseline_metrics})
-        for s in self._ring:
-            res.append({'phase': s.get('phase', 'sample'), 'snapshot': s})
-        if self.terminal_metrics:
-            res.append({'phase': 'workload_terminal', 'snapshot': self.terminal_metrics})
-        return res
+        with self._lock:
+            res = []
+            if self.baseline_metrics:
+                res.append({'phase': 'workload_start', 'snapshot': dict(self.baseline_metrics)})
+            for s in self._ring:
+                res.append({'phase': s.get('phase', 'sample'), 'snapshot': dict(s)})
+            if self.terminal_metrics:
+                res.append({'phase': 'workload_terminal', 'snapshot': dict(self.terminal_metrics)})
+            return res
 
     @property
     def resources(self):
-        res = []
-        if self.baseline_resources:
-            res.append({'phase': 'workload_start', 'services': self.baseline_resources})
-        for s in self._ring:
-            if 'resources' in s:
-                res.append({'phase': s.get('phase', 'sample'), 'services': s['resources']})
-        if self.terminal_resources:
-            res.append({'phase': 'workload_terminal', 'services': self.terminal_resources})
-        return res
+        with self._lock:
+            res = []
+            if self.baseline_resources:
+                res.append({'phase': 'workload_start', 'services': self.baseline_resources})
+            for s in self._ring:
+                if 'resources' in s:
+                    res.append({'phase': s.get('phase', 'sample'), 'services': s['resources']})
+            if self.terminal_resources:
+                res.append({'phase': 'workload_terminal', 'services': self.terminal_resources})
+            return res
 
     def get_coverage(self):
-        return {
-            'sampling_interval_seconds': self.interval,
-            'deadline_seconds': self.deadline_seconds,
-            'snapshots_captured': self.total_captured,
-            'snapshots_retained': len(self._ring),
-            'snapshots_evicted': self.evicted_count,
-            'evicted_bytes': self.evicted_bytes,
-            'ring_byte_cap': self.byte_cap,
-            'ring_bytes_used': self.current_ring_bytes,
-            'collector_errors': list(self.errors),
-        }
+        with self._lock:
+            return {
+                'sampling_interval_seconds': self.interval,
+                'deadline_seconds': self.deadline_seconds,
+                'snapshots_captured': self.total_captured,
+                'snapshots_retained': len(self._ring),
+                'snapshots_evicted': self.evicted_count,
+                'evicted_bytes': self.evicted_bytes,
+                'ring_byte_cap': self.byte_cap,
+                'ring_bytes_used': self.current_ring_bytes,
+                'collector_errors': list(self._errors),
+            }
 
 
-def read_container_resources(registry, containers, *, docker_client=None, socket_path='/var/run/docker.sock'):
+def read_container_resources(registry, containers, *, docker_client=None, socket_path='/var/run/docker.sock', timeout=2.0):
     """Safe bounded Docker readback for backend/db/broker/proxy containers.
 
     Collects cumulative CPU seconds (nanoseconds / 1e9) and memory usage bytes.
@@ -745,7 +841,7 @@ def read_container_resources(registry, containers, *, docker_client=None, socket
             if not os.path.exists(socket_path):
                 raise FileNotFoundError('docker_socket_not_found')
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(2.0)
+            sock.settimeout(max(0.05, float(timeout)))
             sock.connect(socket_path)
             req = f'GET /containers/{cid}/stats?stream=false HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.encode('utf-8')
             sock.sendall(req)
@@ -1478,6 +1574,111 @@ def calculate_equal_samples_normalized_metrics(*, actual_n, total_payload_bytes,
     }
 
 
+def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=None,
+                        endpoint=None, registry=None, containers=None,
+                        persist_callback=None,
+                        time_fn=time.monotonic, wall_fn=lambda: datetime.now(timezone.utc).isoformat()):
+    """Bounded, idempotent best-effort E2 diagnostics while fixture resources are alive."""
+    if prepared.get('_failure_diagnostics_result') is not None:
+        return prepared['_failure_diagnostics_result']
+    started = time_fn()
+    deadline = started + min(15.0, max(0.0, float(stop_timeout_seconds)))
+    remaining = lambda: max(0.0, deadline - time_fn())
+    collector = prepared['collector']
+    stopped = collector.stop(None, timeout_seconds=remaining())
+    snapshots = []
+    for row in getattr(collector, 'metrics', []):
+        raw = row.get('snapshot')
+        projected = EqualSamplesCompactSampler._project_metrics(raw)
+        if projected is not None:
+            snapshots.append({'phase': str(row.get('phase', 'unknown'))[:64], 'snapshot': projected})
+    errors = [e for e in list(getattr(collector, 'errors', []))[:16]
+              if isinstance(e, str) and len(e) <= 96 and e.replace('_', '').replace('-', '').isalnum()]
+    result = {'schema_version': 1, 'experiment': 'E2',
+        'session_id': str(prepared.get('session_id', ''))[:128], 'run_id': str(prepared.get('run_id', ''))[:128],
+        'phase_id': str(prepared.get('phase_id', ''))[:128], 'workload_outcome': str(outcome)[:64],
+        'stop_cause': str(prepared.get('stop_cause', outcome))[:64], 'full_p8_accepted': False,
+        'source': prepared.get('source_provenance'), 'bundle_sha256': prepared.get('bundle_sha256'),
+        'manifest_sha256': prepared.get('manifest_sha256'), 'sample_times': {
+            'flush_started': wall_fn(), 'collector_started': getattr(collector, '_started_wall', None)},
+        'snapshot_status': ('retained' if stopped else
+            'retained_copy_after_join_timeout' if snapshots else 'collector_join_timeout'),
+        'snapshots': snapshots,
+        'resource_samples': list(getattr(collector, 'resources', []))[:64],
+        'coverage': collector.get_coverage() if hasattr(collector, 'get_coverage') else None,
+        'collector_errors': errors, 'terminal_metrics_status': {'available': False, 'reason': 'not_collected'},
+        'database_counts': {'available': False, 'reason': 'not_collected'},
+        'resources_status': {'available': False, 'reason': 'not_collected'},
+        'qualification': 'retained samples; not a workload acceptance or peak measurement'}
+    if persist_callback is not None:
+        try:
+            persist_callback(result)
+        except Exception:
+            result['snapshot_persist_status'] = {'available': False, 'reason': 'initial_persist_failed'}
+    if remaining() > 0 and smoke is not None and endpoint is not None:
+        try:
+            # HTTP helper's timeout is explicit and bounded by the shared deadline.
+            timeout = min(2.0, remaining())
+            if timeout <= 0: raise TimeoutError()
+            result['sample_times']['terminal_scrape_started'] = wall_fn()
+            terminal = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'], timeout=timeout)
+            result['sample_times']['terminal_scrape_finished'] = wall_fn()
+            projected = EqualSamplesCompactSampler._project_metrics(terminal)
+            result['terminal_metrics_status'] = {'available': projected is not None, 'reason': None if projected else 'schema_unavailable'}
+            result['terminal_metrics'] = projected
+        except Exception:
+            result['terminal_metrics_status'] = {'available': False, 'reason': 'terminal_scrape_failed'}
+        if result['terminal_metrics_status']['available'] and remaining() > 0:
+            try:
+                resources = read_container_resources(None, containers or {}, timeout=min(2.0, remaining()) / 4)
+                projected_resources = EqualSamplesCompactSampler._project_resources(resources) if resources else None
+                known_services = ('backend', 'postgres', 'mosquitto', 'nginx')
+                terminal_services = projected_resources or {}
+                for service in known_services:
+                    terminal_services.setdefault(service, {'available': False,
+                        'reason': 'service_resource_unavailable'})
+                result['resource_samples'].append({'phase':'workload_terminal','services':terminal_services})
+                complete = all(row.get('available') is True for row in terminal_services.values())
+                result['resources_status'] = {'available': complete,
+                    'reason': None if complete else 'partial_or_unavailable'}
+                if hasattr(collector, 'record_terminal'):
+                    collector.record_terminal(terminal, resources)
+            except Exception:
+                result['resources_status'] = {'available': False, 'reason': 'terminal_resource_read_failed'}
+                result['resource_samples'].append({'phase': 'workload_terminal', 'services': {
+                    service: {'available': False, 'reason': 'terminal_resource_read_failed'}
+                    for service in ('backend', 'postgres', 'mosquitto', 'nginx')}})
+        if remaining() > 0 and registry is not None and smoke is not None:
+            targets = {}
+            for spec, before in zip(prepared.get('specs', []), prepared.get('before_targets', [])):
+                if remaining() <= 0:
+                    targets[f'{spec.gateway_id}/{spec.sensor_id}'] = {'available': False, 'reason': 'diagnostics_deadline_exceeded'}
+                    continue
+                key = f'{spec.gateway_id}/{spec.sensor_id}'
+                try:
+                    after = _target_counts(smoke, registry, prepared['pg'], spec, timeout=min(2.0, remaining()))
+                    delta = {k: after[k] - before[k] for k in ('ledger', 'raw', 'temporal', 'configuration')
+                             if type(after.get(k)) is int and type(before.get(k)) is int and after[k] >= before[k]}
+                    targets[key] = {'available': len(delta) == 4, 'before': before, 'after': after,
+                                    'delta': delta, 'reason': None if len(delta) == 4 else 'count_invalid_or_reset'}
+                except Exception:
+                    targets[key] = {'available': False, 'reason': 'database_query_failed'}
+            result['database_counts'] = {'available': bool(targets) and all(v.get('available') for v in targets.values()),
+                                         'targets': targets,
+                                         'reason': None if targets and all(v.get('available') for v in targets.values()) else 'partial_or_unavailable'}
+    elif remaining() <= 0:
+        result['terminal_metrics_status'] = {'available': False, 'reason': 'diagnostics_deadline_exceeded'}
+        result['database_counts'] = {'available': False, 'reason': 'diagnostics_deadline_exceeded'}
+    result['flush_elapsed_seconds'] = max(0.0, time_fn() - started)
+    if persist_callback is not None:
+        try:
+            persist_callback(result)
+        except Exception:
+            result['snapshot_persist_status'] = {'available': False, 'reason': 'final_persist_failed'}
+    prepared['_failure_diagnostics_result'] = result
+    return result
+
+
 def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prepared, *, phase_id):
     if phase_id != prepared['phase_id']:
         raise ValueError('e2_phase_id_mismatch')
@@ -1487,15 +1688,28 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
     is_equal_samples = (prepared.get('workload') == 'equal_samples'
                         or 'context' in prepared
                         or phase_id.startswith('equal-samples-'))
-    if is_equal_samples:
+    use_compact_sampler = is_equal_samples or prepared.get('workload') == 'steady_burst'
+    if use_compact_sampler:
         baseline_res = read_container_resources(registry, containers)
+        if 'wall_seconds' in prepared:
+            declared_lifetime = prepared['wall_seconds']
+        else:
+            declared_lifetime = max(
+                int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('measure_seconds', 0))
+                + int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('drain_seconds', 60))
+                for arm in ('A', 'B'))
+        deadline_mono = prepared.get('session_deadline_monotonic')
+        remaining = (max(0.0, float(deadline_mono) - time.monotonic())
+                     if isinstance(deadline_mono, (int, float)) else
+                     prepared.get('session_remaining_seconds', declared_lifetime))
+        collector_deadline = min(float(declared_lifetime), float(remaining))
         collector = EqualSamplesCompactSampler(
             scrape=lambda: _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin']),
             resource_reader=lambda: read_container_resources(registry, containers),
             interval=1.0,
             max_snapshots=3600,
             byte_cap=2 * 1024 * 1024,
-            deadline_seconds=prepared.get('deadline_seconds', 1800.0),
+            deadline_seconds=max(0.1, min(86400.0, collector_deadline)),
             baseline_metrics=baseline,
             baseline_resources=baseline_res,
         )
@@ -1564,14 +1778,15 @@ def e2_database_counter_window(baseline, terminal):
             'deltas': deltas}
 
 
-def _target_counts(smoke, registry, pg, spec):
+def _target_counts(smoke, registry, pg, spec, *, timeout=None):
     sql = """SELECT json_build_object(
  'ledger',(SELECT count(*) FROM processed_messages WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
  'raw',(SELECT count(*) FROM telemetry WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
  'temporal',(SELECT count(*) FROM twin_temporal_values v JOIN twin_entities e ON e.id=v.entity_id WHERE e.entity_id=:'urn'),
  'configuration',(SELECT count(*) FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn' AND s.reported_state ? 'configuration'));"""
+    kwargs = {'timeout': timeout} if timeout is not None else {}
     return json.loads(smoke.db_psql(registry, pg, sql, {'gw': spec.gateway_id,
-        'sensor': spec.sensor_id, 'urn': spec.sensor_urn}).strip())
+        'sensor': spec.sensor_id, 'urn': spec.sensor_urn}, **kwargs).strip())
 
 
 def finish_remote_collection(smoke, fixture, endpoint, registry, containers, prepared,
@@ -1589,15 +1804,10 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
     is_equal_samples = (prepared.get('workload') == 'equal_samples'
                         or 'context' in prepared
                         or phase_id.startswith('equal-samples-'))
-    if is_equal_samples:
+    compact_collector = isinstance(collector, EqualSamplesCompactSampler)
+    if compact_collector:
         after_res = read_container_resources(registry, containers)
-        if hasattr(collector, 'record_terminal'):
-            collector.record_terminal(after_admin, after_res)
-        else:
-            if hasattr(collector, 'metrics') and isinstance(collector.metrics, list):
-                collector.metrics.append({'phase': 'workload_terminal', 'snapshot': after_admin})
-            if hasattr(collector, 'resources') and isinstance(collector.resources, list):
-                collector.resources.append(after_res)
+        collector.record_terminal(after_admin, after_res)
     else:
         collector.metrics.append({'phase': 'workload_terminal', 'snapshot': after_admin})
         terminal_server = smoke.paper_p0_stats(registry, containers, 'workload_terminal')
@@ -1915,6 +2125,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             'context_sha256': prepared['context']['context_sha256'],
             'seed': prepared['context'].get('seed') if isinstance(prepared.get('context'), dict) else prepared.get('seed'),
             'expected_counts': prepared['expected_counts'],
+            'applied_retry_policy': validate_applied_retry_policy(prepared, imported),
             'binary_provenance': imported.get('binary_provenance', imported.get('provenance', {})),
             'actual_counters': {
                 'A': imported['A'].get('telemetry', {}),
@@ -2128,6 +2339,10 @@ def _load_e2_result_bundle(results_root, prepared, paperload_binary):
         raise ValueError('e2_result_roles_missing')
     values['binary_provenance'] = values['provenance']
 
+    # Policy runs require output-side proof from the Go runner, not merely the
+    # child's self-reported summary or a rehashed input inventory.
+    expected_policy = validate_applied_retry_policy(prepared, values)
+
     if prepared.get('workload') == 'equal_samples':
         is_equal_samples = True
     elif prepared.get('workload') == 'steady_burst':
@@ -2316,6 +2531,10 @@ def build_e2_execution_plan(*, output_dir, manifest_a, manifest_b, seed=None,
         loaded[arm] = m
 
     a, b = loaded['A'], loaded['B']
+    if a.get('retry_policy') != b.get('retry_policy'):
+        raise ValueError('e2_retry_policy_mismatch')
+    if a.get('retry_policy') is not None:
+        validate_retry_policy(a['retry_policy'], pending_messages=a['limits']['pending_messages'])
     if ('equal_samples' in a) != ('equal_samples' in b):
         raise ValueError('e2_workload_mismatch')
     for key in ('seed', 'samples_per_message', 'tls', 'limits', 'topology', 'durability_mode'):
@@ -2388,7 +2607,8 @@ def e2_official_estimate(*, rate_per_second, duration_seconds, samples_per_messa
                          raw_row_bytes=256, index_bytes_per_row=64, wal_multiplier=2,
                          pending_memory_bytes=256 << 20, retry_memory_bytes=256 << 20,
                          application_bandwidth_bytes_per_second=100 << 20,
-                         burst_messages=0, pending_messages=64, pending_bytes=1 << 20):
+                          burst_messages=0, pending_messages=64, pending_bytes=1 << 20,
+                          retry_policy=None, shaper_rate_per_gateway=500, shaper_burst_per_gateway=500):
     """Conservative sizing estimate, not a measurement or wire-byte estimate."""
     import math
     if not official_opt_in:
@@ -2399,18 +2619,31 @@ def e2_official_estimate(*, rate_per_second, duration_seconds, samples_per_messa
             or type(burst_messages) is not int or not 0 <= burst_messages <= 100000
             or type(pending_messages) is not int or not 1 <= pending_messages <= 100000
             or type(pending_bytes) is not int or not 1 <= pending_bytes <= 1 << 30
-            or 2 * (pending_bytes + pending_messages * 4096) > 256 << 20):
+            or 2 * (pending_bytes + pending_messages * 4096) > 256 << 20
+            or type(shaper_rate_per_gateway) is not int or shaper_rate_per_gateway < 1
+            or type(shaper_burst_per_gateway) is not int or shaper_burst_per_gateway < 0):
         raise ValueError('e2_estimate_input_rejected')
+    if retry_policy is not None:
+        retry_policy = validate_retry_policy(retry_policy, pending_messages=pending_messages)
     messages = math.ceil(rate_per_second * duration_seconds) + burst_messages
     raw_rows = messages * samples_per_message
     payload_estimate = messages * payload_bytes
     database_estimate = raw_rows * (raw_row_bytes + index_bytes_per_row) * wal_multiplier
     total_storage_estimate = payload_estimate + database_estimate
     pending_estimate = 2 * (pending_bytes + pending_messages * 4096)
-    retry_estimate = 0  # pending allowance includes retry bookkeeping for both producers
+    # The policy-only Go channel is one UUID slot per pending message per producer.
+    # Add its 16-byte slots once; the existing 4096/message allowance remains a
+    # conservative structure/bookkeeping allowance, not RSS and not a second queue.
+    retry_queue_estimate = 2 * pending_messages * 16 if retry_policy is not None else 0
+    retry_estimate = retry_queue_estimate
     bandwidth_estimate = rate_per_second * payload_bytes
+    combined_memory_estimate = pending_estimate + retry_estimate
+    producer_unique_rate = rate_per_second / 2
+    retry_rate = retry_policy['rate_per_second'] if retry_policy else 0
+    retry_burst = retry_policy['burst'] if retry_policy else 0
+    retry_headroom_not_reserved = producer_unique_rate + retry_rate > shaper_rate_per_gateway
     if (duration_seconds > max_duration_seconds or messages > max_messages or raw_rows > max_raw_rows
-            or total_storage_estimate > max_disk_bytes or pending_estimate > pending_memory_bytes
+            or total_storage_estimate > max_disk_bytes or combined_memory_estimate > pending_memory_bytes
             or retry_estimate > retry_memory_bytes
             or bandwidth_estimate > application_bandwidth_bytes_per_second):
         raise ValueError('e2_predicted_bound_exceeded')
@@ -2419,7 +2652,15 @@ def e2_official_estimate(*, rate_per_second, duration_seconds, samples_per_messa
             'raw_rows_estimate': raw_rows, 'application_payload_bytes_estimate': payload_estimate,
             'raw_database_row_index_wal_bytes_estimate': database_estimate,
             'total_storage_growth_bytes_estimate': total_storage_estimate,
-            'pending_retry_memory_bytes_estimate': pending_estimate + retry_estimate,
+            'pending_retry_memory_bytes_estimate': combined_memory_estimate,
+            'retry_queue_logical_bytes_estimate': retry_queue_estimate,
+            'retry_queue_sizing_basis': '2 producers * pending_messages * 16-byte UUID slots; logical estimate, not RSS',
+            'unique_offered_rate_per_producer': producer_unique_rate,
+            'retry_attempt_rate_per_producer': retry_rate,
+            'retry_attempt_burst_per_producer': retry_burst,
+            'fixture_shaper_attempt_rate_per_gateway': shaper_rate_per_gateway,
+            'fixture_shaper_attempt_burst_per_gateway': shaper_burst_per_gateway,
+            'retry_headroom_not_reserved': retry_headroom_not_reserved,
             'application_bandwidth_bytes_per_second_estimate': bandwidth_estimate,
             'payload_bytes_wire': None, 'payload_size_basis': 'actual_builder_or_conservative_assumption',
             'estimate_basis': {'raw_row_bytes': raw_row_bytes, 'index_bytes_per_row': index_bytes_per_row,
@@ -3157,14 +3398,15 @@ def _validate_fixture_flags(effective, fixture=None):
     return flags
 
 
-def _target_counts(smoke, registry, pg, spec):
+def _target_counts(smoke, registry, pg, spec, *, timeout=None):
     sql = """SELECT json_build_object(
  'ledger',(SELECT count(*) FROM processed_messages WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
  'raw',(SELECT count(*) FROM telemetry WHERE gateway_id=:'gw' AND sensor_id=:'sensor'),
  'temporal',(SELECT count(*) FROM twin_temporal_values v JOIN twin_entities e ON e.id=v.entity_id WHERE e.entity_id=:'urn'),
  'configuration',(SELECT count(*) FROM twin_states s JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn' AND s.reported_state ? 'configuration'));"""
+    kwargs = {'timeout': timeout} if timeout is not None else {}
     value = smoke.db_psql(registry, pg, sql,
-        {'gw': spec.gateway_id, 'sensor': spec.sensor_id, 'urn': spec.sensor_urn}).strip()
+        {'gw': spec.gateway_id, 'sensor': spec.sensor_id, 'urn': spec.sensor_urn}, **kwargs).strip()
     return json.loads(value)
 
 

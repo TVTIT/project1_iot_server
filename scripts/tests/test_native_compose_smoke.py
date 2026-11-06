@@ -21,6 +21,28 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_lifecycle_hold_reads_deadline_from_initialized_supervisor_state(self):
+        from scripts.tests import dynsec_bootstrap_cli as lifecycle
+        from scripts.tests import paper_p8_supervisor as supervisor
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); root.chmod(0o700)
+            with lifecycle.cancellation_scope() as cancellation_state:
+                session = {}
+                # This is the hold callback's real input type; it is not session state.
+                self.assertIsInstance(cancellation_state, lifecycle.CancellationState)
+                session['state'] = supervisor.initialize(root, experiment='E2', arm='pilot',
+                    seed=86, deadline_seconds=900, receipts=[],
+                    preparation_status='E2_PREPARED')
+                prepared = {}
+                smoke.paper_p8_bind_initialized_session_deadline(session, prepared)
+
+                self.assertIs(prepared['session_deadline_monotonic'],
+                    session['state']['deadline_monotonic'])
+                self.assertIs(session['session_deadline_monotonic'],
+                    session['state']['deadline_monotonic'])
+                self.assertNotIn('get', vars(cancellation_state))
+
     def test_official_e2_fixture_flags_use_fixture_profile(self):
         from types import SimpleNamespace
         from scripts.tests import paper_p8_e2_support as e2
@@ -3616,11 +3638,19 @@ class AllocationTests(unittest.TestCase):
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": image_inspect, "stderr": b""})()
 
+                cleanup_events = []
+                def before_cleanup():
+                    cleanup_events.append('diagnostics')
+                    raise RuntimeError('diagnostics failure')
+
                 with patch.object(registry, "resolve", side_effect=fake_resolve), \
-                     patch.object(registry, "remove"), \
+                     patch.object(registry, "remove", side_effect=lambda item: cleanup_events.append('remove')), \
                      patch.object(registry, "command", side_effect=fake_cmd):
                     with self.assertRaisesRegex(ValueError, "phase_health_timeout"):
-                        smoke.startup_only(f, registry=registry)
+                        smoke.startup_only(f, registry=registry, pre_cleanup_callback=before_cleanup)
+
+                self.assertEqual(cleanup_events[0], 'diagnostics')
+                self.assertIn('remove', cleanup_events[1:])
 
             # supabase-envoy was started, but nginx was NEVER started because envoy failed readiness
             self.assertIn("supabase-envoy", started_services)
@@ -5046,6 +5076,7 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
                 self.assertIn('--p8-e2-workload', captured_cmd)
                 idx = captured_cmd.index('--p8-e2-workload')
                 self.assertEqual(captured_cmd[idx + 1], 'steady_burst')
+                self.assertNotIn('--p8-e2-retry-mode', captured_cmd)
 
             # steady_burst rejects --context and --reference
             with self.assertRaisesRegex(ValueError, 'E2 steady_burst does not accept --context or --reference'):
@@ -5065,6 +5096,9 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
                     '--samples-per-message','100','--e2-offered-rate','1000',
                     '--e2-duration-seconds','20','--e2-burst-messages','11',
                     '--e2-pending-messages','1024','--e2-pending-bytes','8388608',
+                    '--e2-retry-mode','bounded_backoff_v1','--e2-retry-initial-interval-ms','500',
+                    '--e2-retry-max-interval-ms','8000','--e2-retry-jitter-percent','10',
+                    '--e2-retry-rate-per-second','100','--e2-retry-burst','20',
                     '--deadline-seconds','1200'])
             self.assertIn('--p8-official-opt-in',captured)
             self.assertIn('--p8-profile',captured)
@@ -5072,6 +5106,11 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
             self.assertEqual(captured[captured.index('--p8-e2-offered-rate')+1],'1000')
             self.assertEqual(captured[captured.index('--p8-e2-pending-messages')+1],'1024')
             self.assertEqual(captured[captured.index('--p8-e2-pending-bytes')+1],'8388608')
+            for flag,value in (('--p8-e2-retry-mode','bounded_backoff_v1'),
+                ('--p8-e2-retry-initial-interval-ms','500'),('--p8-e2-retry-max-interval-ms','8000'),
+                ('--p8-e2-retry-jitter-percent','10'),('--p8-e2-retry-rate-per-second','100'),
+                ('--p8-e2-retry-burst','20')):
+                self.assertEqual(captured[captured.index(flag)+1],value)
 
     def test_serve_e2_pending_dry_run_and_bound_rejection(self):
         import io

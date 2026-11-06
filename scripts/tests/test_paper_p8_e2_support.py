@@ -4,12 +4,13 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 from scripts import paper_p8_bundle
@@ -39,6 +40,101 @@ from scripts import paper_p8_client
 
 
 class E2SupportTests(unittest.TestCase):
+    def test_backend_histogram_dto_is_projected_and_invalid_arrays_are_unavailable(self):
+        upper_seconds = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05,
+                         0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+        bucket_counts = [0] * 13 + [3]
+        dto = {'ingress': {'Received': 4, 'Durations': {
+            name: {'upper_seconds': upper_seconds, 'buckets': bucket_counts, 'count': 4,
+                   'overflow': 1, 'sum_seconds': 0.25}
+            for name in ('queue_wait', 'validation', 'persistence', 'ack_publish',
+                         'batch_wait', 'group_persistence')}}}
+        projected = e2.EqualSamplesCompactSampler._project_metrics(dto)['ingress']['durations']
+        self.assertEqual(set(projected), {'queue_wait', 'validation', 'persistence',
+            'ack_publish', 'batch_wait', 'group_persistence'})
+        self.assertEqual(projected['ack_publish'], {'available': True,
+            'upper_seconds': upper_seconds, 'buckets': bucket_counts, 'count': 4,
+            'overflow': 1, 'sum_seconds': 0.25})
+        for field, bad in (('buckets', [2, '1']), ('buckets', [2, 1] * 20),
+                           ('upper_seconds', [0.1, float('nan')]),
+                           ('sum_seconds', float('inf')), ('count', '4')):
+            invalid = copy.deepcopy(dto)
+            invalid['ingress']['Durations']['ack_publish'][field] = bad
+            hist = e2.EqualSamplesCompactSampler._project_metrics(invalid)['ingress']['durations']['ack_publish']
+            self.assertEqual(hist, {'available': False, 'reason': 'invalid'})
+        missing = e2.EqualSamplesCompactSampler._project_metrics({'ingress': {}})
+        self.assertEqual(missing['ingress']['durations']['queue_wait'],
+                         {'available': False, 'reason': 'missing'})
+        self.assertNotIn('secret', json.dumps(e2.EqualSamplesCompactSampler._project_metrics(
+            {'ingress': {'Durations': {'queue_wait': {'secret': 'TOKEN'}}}})))
+
+    def test_source_fingerprint_includes_untracked_validator_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'test@example.invalid'], check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'Test'], check=True)
+            (root / 'tracked.py').write_text('base = 1\n')
+            subprocess.run(['git', '-C', str(root), 'add', 'tracked.py'], check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], check=True)
+            validator = root / 'untracked_validator.py'
+            validator.write_text('value = 1\n')
+            first = p8._source_fingerprint(root)
+            validator.write_text('value = 2\n')
+            second = p8._source_fingerprint(root)
+            self.assertEqual(first['revision'], second['revision'])
+            self.assertTrue(first['dirty'])
+            self.assertNotEqual(first['dirty_source_sha256'], second['dirty_source_sha256'])
+
+    def test_official_retry_policy_validation_is_strict_and_optional(self):
+        policy = {'mode': 'bounded_backoff_v1', 'initial_interval_ms': 500,
+                  'max_interval_ms': 8000, 'jitter_percent': 10,
+                  'rate_per_second': 100, 'burst': 20}
+        self.assertEqual(e2.validate_retry_policy(policy, pending_messages=20), policy)
+        for bad in (None, {**policy, 'rate_per_second': True},
+                    {**policy, 'extra': 1}, {**policy, 'max_interval_ms': 499},
+                    {**policy, 'burst': 21}, {**policy, 'mode': 'fixed'}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'e2_retry_policy_rejected'):
+                e2.validate_retry_policy(bad, pending_messages=20)
+
+    def test_retry_policy_output_proof_is_strict_but_legacy_is_optional(self):
+        expected = {'mode':'bounded_backoff_v1','initial_interval_ms':500,
+                    'max_interval_ms':8000,'jitter_percent':10,'rate_per_second':100,'burst':20}
+        prepared = {'manifests': {'A': {'retry_policy': expected}, 'B': {'retry_policy': expected}}}
+        good = {'A': {'retry_policy': expected}, 'B': {'retry_policy': expected}}
+        self.assertEqual(e2.validate_applied_retry_policy(prepared, good), expected)
+        for bad in ({'A': {}, 'B': good['B']},
+                    {'A': {'retry_policy': dict(expected, burst=19)}, 'B': good['B']}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'e2_retry_policy_applied_proof_mismatch'):
+                e2.validate_applied_retry_policy(prepared, bad)
+        self.assertIsNone(e2.validate_applied_retry_policy({'manifests': {'A': {}, 'B': {}}},
+            {'A': {}, 'B': {}}))
+
+    def test_estimator_includes_policy_queue_once_and_reports_shaper_headroom(self):
+        policy = {'mode':'bounded_backoff_v1','initial_interval_ms':500,'max_interval_ms':8000,
+                  'jitter_percent':10,'rate_per_second':500,'burst':100}
+        for rate, duration, burst, expected_messages in ((1000,10,0,10000),
+                (5000,2,0,10000),(20000,1,0,20000),(20000,1,10000,30000)):
+            result = e2.e2_official_estimate(rate_per_second=rate, duration_seconds=duration,
+                samples_per_message=100, payload_bytes=4096, official_opt_in=True,
+                burst_messages=burst, pending_messages=22000, pending_bytes=32 << 20,
+                retry_policy=policy)
+            self.assertEqual(result['unique_messages_estimate'], expected_messages)
+            self.assertEqual(result['retry_queue_logical_bytes_estimate'], 2*22000*16)
+            self.assertEqual(result['pending_retry_memory_bytes_estimate'],
+                             2*((32 << 20)+22000*4096)+2*22000*16)
+            self.assertEqual(result['unique_offered_rate_per_producer'], rate/2)
+            self.assertEqual(result['retry_attempt_rate_per_producer'], 500)
+            self.assertEqual(result['retry_attempt_burst_per_producer'], 100)
+            self.assertEqual(result['fixture_shaper_attempt_rate_per_gateway'], 500)
+            self.assertEqual(result['fixture_shaper_attempt_burst_per_gateway'], 500)
+            self.assertEqual(result['retry_headroom_not_reserved'], rate/2+500 > 500)
+        with self.assertRaisesRegex(ValueError, 'e2_predicted_bound_exceeded'):
+            e2.e2_official_estimate(rate_per_second=20000, duration_seconds=20,
+                samples_per_message=100, payload_bytes=4096, official_opt_in=True,
+                burst_messages=10000, pending_messages=22000, pending_bytes=32 << 20,
+                retry_policy=policy)
+
     def setUp(self):
         self.targets = [{'gateway_id': 'gw-a', 'sensor_id': 's-a'},
                         {'gateway_id': 'gw-b', 'sensor_id': 's-b'}]
@@ -47,6 +143,200 @@ class E2SupportTests(unittest.TestCase):
             'mqtt_tls_ca_file': 'mqtt-ca.crt'}}, targets=self.targets,
             gateway_identity_files={'gw-a': 'gw-a.json', 'gw-b': 'gw-b.json'},
             telemetry_identity_files={'A': 'identity-a.json', 'B': 'identity-b.json'})
+
+    def test_failure_diagnostics_retains_sanitized_metrics(self):
+        collector = SimpleNamespace(
+            stop=Mock(return_value=True),
+            metrics=[{'phase': 'workload_sample_1', 'snapshot': {
+                'ingress': {'ShaperRateLimited': 7}, 'secret': 'must-not-leak'}}],
+            errors=[])
+        prepared = {'collector': collector, 'phase_id': 'samples-100',
+                    'session_id': 'session', 'run_id': 'run'}
+        result = e2.failure_diagnostics(prepared, 'ABORTED')
+        self.assertFalse(result['full_p8_accepted'])
+        self.assertEqual(result['snapshots'][0]['snapshot']['ingress']['ShaperRateLimited'], 7)
+        self.assertNotIn('must-not-leak', json.dumps(result))
+        self.assertEqual(collector.stop.call_count, 1)
+        self.assertAlmostEqual(collector.stop.call_args.kwargs['timeout_seconds'], 15.0, places=2)
+
+    def test_failure_diagnostics_does_not_read_live_collector(self):
+        collector = SimpleNamespace(stop=Mock(return_value=False), errors=['collector_join_timeout'])
+        result = e2.failure_diagnostics({'collector': collector, 'phase_id': 'p',
+                                         'session_id': 's', 'run_id': 'r'}, 'ABORTED')
+        self.assertEqual(result['snapshots'], [])
+        self.assertEqual(result['snapshot_status'], 'collector_join_timeout')
+
+    def test_flush_failure_diagnostics_collects_terminal_counts_and_is_idempotent(self):
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': {'Received': 3}},
+            interval=0.1, max_snapshots=8, byte_cap=1024, deadline_seconds=10,
+            baseline_metrics={'ingress': {'Received': 1}})
+        sampler.start_manual()
+        spec_a = SimpleNamespace(gateway_id='ga', sensor_id='sa', sensor_urn='urn:a')
+        spec_b = SimpleNamespace(gateway_id='gb', sensor_id='sb', sensor_urn='urn:b')
+        prepared = {'collector': sampler, 'phase_id': 'phase-safe', 'session_id': 'session-safe',
+            'run_id': 'run-safe', 'specs': [spec_a, spec_b], 'before_targets': [
+                {'ledger': 1, 'raw': 2, 'temporal': 3, 'configuration': 0},
+                {'ledger': 4, 'raw': 5, 'temporal': 6, 'configuration': 0}],
+            'before_global': {}, 'baseline': {'ingress': {'Received': 1}},
+            'tokens': {'admin': 'SECRET'}, 'pg': object(), 'bundle_sha256': 'b'*64,
+            'manifest_sha256': ['a'*64, 'c'*64], 'outcome': 'ABORTED'}
+        smoke = SimpleNamespace(http_request=Mock(return_value=(200, {}, {'ingress': {'Received': 9,
+            'api_key': 'SECRET'}, 'secret': 'SECRET'})), paper_p1_count_db=Mock(return_value={}))
+        counts = [
+            {'ledger': 2, 'raw': 4, 'temporal': 5, 'configuration': 0},
+            {'ledger': 8, 'raw': 9, 'temporal': 10, 'configuration': 0}]
+        persisted = []
+        smoke.http_request.side_effect = lambda *args, **kwargs: (
+            self.assertTrue(persisted), (200, {}, {'ingress': {'Received': 9,
+                'api_key': 'SECRET'}, 'secret': 'SECRET'}))[1]
+        with patch.object(e2, '_target_counts', side_effect=counts), \
+             patch.object(e2, 'read_container_resources', return_value={'backend': {'memory_bytes': 7}}):
+            first = e2.failure_diagnostics(prepared, 'ABORTED', smoke=smoke,
+                endpoint='https://fixture', registry=object(), containers={},
+                persist_callback=lambda result: persisted.append(copy.deepcopy(result)),
+                time_fn=lambda: 10.0, wall_fn=lambda: '2026-11-06T00:00:00Z')
+            second = e2.failure_diagnostics(prepared, 'ABORTED', smoke=smoke,
+                endpoint='https://fixture', registry=object(), containers={})
+        self.assertEqual(first, second)
+        self.assertTrue(first['database_counts']['available'])
+        self.assertEqual(first['database_counts']['targets']['ga/sa']['delta']['raw'], 2)
+        self.assertEqual(first['terminal_metrics']['ingress']['Received'], 9)
+        self.assertNotIn('SECRET', json.dumps(first))
+        self.assertEqual(smoke.http_request.call_count, 1)
+
+    def test_failure_diagnostics_caps_deadline_and_records_unavailable(self):
+        now = {'value': 0.0}
+        def stop(*args, **kwargs):
+            now['value'] = 16.0
+            return True
+        collector = SimpleNamespace(stop=Mock(side_effect=stop), metrics=[], errors=[],
+            get_coverage=lambda: {'snapshots_captured': 0})
+        prepared = {'collector': collector, 'phase_id': 'p', 'session_id': 's', 'run_id': 'r',
+                    'specs': [], 'before_targets': [], 'tokens': {'admin': 'SECRET'}}
+        result = e2.failure_diagnostics(prepared, 'IMPORT_REJECTED', smoke=Mock(),
+            endpoint='https://fixture', registry=object(), containers={}, time_fn=lambda: now['value'])
+        self.assertEqual(result['workload_outcome'], 'IMPORT_REJECTED')
+        self.assertEqual(result['terminal_metrics_status']['reason'], 'diagnostics_deadline_exceeded')
+        self.assertFalse(result['database_counts']['available'])
+
+    def test_failure_diagnostics_keeps_snapshots_when_terminal_http_and_db_fail(self):
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: None, interval=0.1,
+            max_snapshots=8, byte_cap=1024, deadline_seconds=10,
+            baseline_metrics={'ingress': {'Received': 1}})
+        sampler.start_manual()
+        spec = SimpleNamespace(gateway_id='ga', sensor_id='sa', sensor_urn='urn:a')
+        prepared = {'collector': sampler, 'phase_id': 'p', 'session_id': 's', 'run_id': 'r',
+            'specs': [spec], 'before_targets': [{'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}],
+            'pg': object(), 'tokens': {'admin': 'DO-NOT-LEAK'}}
+        smoke = SimpleNamespace(http_request=Mock(side_effect=RuntimeError('DO-NOT-LEAK')),
+                                db_psql=Mock(side_effect=RuntimeError('DO-NOT-LEAK')))
+        with patch.object(e2, '_target_counts', side_effect=RuntimeError('DO-NOT-LEAK')):
+            result = e2.failure_diagnostics(prepared, 'DEADLINE', smoke=smoke,
+                endpoint='https://fixture', registry=object(), containers={})
+        self.assertTrue(result['snapshots'])
+        self.assertEqual(result['terminal_metrics_status']['reason'], 'terminal_scrape_failed')
+        self.assertEqual(result['database_counts']['targets']['ga/sa']['reason'], 'database_query_failed')
+        self.assertNotIn('DO-NOT-LEAK', json.dumps(result))
+
+    def test_failure_diagnostics_uses_real_target_count_helper_with_timeout_and_retains_resources(self):
+        spec = SimpleNamespace(gateway_id='ga', sensor_id='sa', sensor_urn='urn:a')
+        collector = SimpleNamespace(stop=Mock(return_value=True), metrics=[], resources=[
+            {'phase':'sample','services':{'backend':{'memory_bytes':11}}}], errors=[],
+            get_coverage=lambda: {})
+        prepared = {'collector':collector,'session_id':'s','run_id':'r','phase_id':'p',
+            'specs':[spec],'before_targets':[{'ledger':1,'raw':2,'temporal':3,'configuration':0}],
+            'pg':object(),'tokens':{'admin':'secret'}}
+        smoke = SimpleNamespace(http_request=Mock(return_value=(200,{}, {'ingress':{'Received':9}})),
+            db_psql=Mock(return_value=json.dumps({'ledger':2,'raw':4,'temporal':5,'configuration':0})))
+        saved=[]
+        with patch.object(e2, 'read_container_resources', side_effect=[RuntimeError('resource unavailable')]):
+            result=e2.failure_diagnostics(prepared,'ABORTED',smoke=smoke,endpoint='https://fixture',
+                registry=object(),containers={},persist_callback=lambda value:saved.append(copy.deepcopy(value)))
+        self.assertTrue(result['database_counts']['available'])
+        self.assertTrue(result['terminal_metrics_status']['available'])
+        self.assertEqual(result['database_counts']['targets']['ga/sa']['delta']['raw'],2)
+        self.assertEqual(result['resource_samples'][0]['services']['backend']['memory_bytes'],11)
+        self.assertEqual(smoke.db_psql.call_args.kwargs['timeout'], unittest.mock.ANY)
+        self.assertTrue(any('resource_samples' in row for row in saved))
+
+    def test_bounded_collector_stop_does_not_scrape_if_join_times_out(self):
+        scrape = Mock()
+        collector = p8.BoundedCollector(scrape=scrape)
+        collector._thread = Mock()
+        collector._thread.is_alive.return_value = True
+        self.assertFalse(collector.stop(None))
+        scrape.assert_not_called()
+
+    def test_steady_burst_collector_retains_rolling_window_past_64_with_baseline_terminal(self):
+        counter = {'n': 0}
+        def scrape():
+            counter['n'] += 1
+            return {'ingress': {'Received': counter['n'], 'secret': 'discard'}}
+        sampler = e2.EqualSamplesCompactSampler(scrape=scrape, interval=0.1,
+            max_snapshots=80, byte_cap=4096, deadline_seconds=30,
+            baseline_metrics={'ingress': {'Received': 0, 'secret': 'discard'}})
+        sampler.start_manual()
+        for _ in range(70):
+            sampler.sample_step()
+        sampler.record_terminal({'ingress': {'Received': 99, 'secret': 'discard'}}, None)
+        self.assertEqual(sampler.get_coverage()['snapshots_captured'], 71)
+        self.assertGreater(sampler.get_coverage()['snapshots_evicted'], 0)
+        self.assertEqual(sampler.metrics[0]['phase'], 'workload_start')
+        self.assertEqual(sampler.metrics[-1]['phase'], 'workload_terminal')
+        self.assertLessEqual(sampler.get_coverage()['ring_bytes_used'], 4096)
+        self.assertNotIn('discard', json.dumps(sampler.metrics))
+
+    def test_collector_snapshot_and_errors_are_bounded_and_missing_counters_stay_missing(self):
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: {
+            'ingress': {'Received': 5, 'ACKPublished': None, 'secret': 'x' * 10000,
+                        'ack_latency': {'count': 2, 'sum': 3, 'buckets': {'le_1ms': 1}}}},
+            interval=0.1, max_snapshots=8, byte_cap=1024, deadline_seconds=10)
+        sampler.sample_step()
+        self.assertLessEqual(sampler.current_ring_bytes, 1024)
+        snapshot = sampler.retained_snapshots[0]
+        self.assertEqual(snapshot['ingress']['Received'], 5)
+        self.assertNotIn('ACKPublished', snapshot['ingress'])
+        self.assertNotIn('secret', json.dumps(snapshot))
+        for index in range(40):
+            sampler._error(f'bounded_error_{index}')
+        self.assertLessEqual(len(sampler.errors), sampler.max_errors)
+        self.assertLessEqual(len(json.dumps(snapshot, separators=(',', ':')).encode()), 1024)
+        sampler.record_terminal({'ingress': {'Received': 1, 'secret': 'bad'}}, None)
+        self.assertNotIn('secret', json.dumps(sampler.terminal_metrics))
+
+    def test_collector_stop_timeout_is_bounded_and_idempotent_without_second_scrape(self):
+        scrape = Mock(return_value={'ingress': {'Received': 1}})
+        sampler = e2.EqualSamplesCompactSampler(scrape=scrape, interval=0.1,
+            max_snapshots=8, byte_cap=1024, deadline_seconds=10)
+        sampler.start_manual()
+        sampler._thread = Mock()
+        sampler._thread.is_alive.return_value = True
+        self.assertFalse(sampler.stop(timeout_seconds=0.01))
+        self.assertFalse(sampler.stop(timeout_seconds=0.01))
+        sampler._thread.is_alive.return_value = False
+        self.assertTrue(sampler.stop(timeout_seconds=0.01))
+        self.assertTrue(sampler.stop(timeout_seconds=0.01))
+        self.assertEqual(scrape.call_count, 1)
+
+    def test_begin_remote_collector_covers_declared_workload_and_drain(self):
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst',
+            'profile': 'official', 'manifests': {'A': {'phases': {'measure_seconds': 7200,
+                'drain_seconds': 300}}, 'B': {'phases': {'measure_seconds': 7200,
+                'drain_seconds': 300}}}, 'session_remaining_seconds': 7200,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()],
+            'tokens': {'admin': 'not-a-real-token'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0}}), \
+             patch.object(e2, '_target_counts', return_value={} ), \
+             patch.object(e2, 'read_container_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, [],
+                                       prepared, phase_id='samples-100')
+        self.assertIsInstance(prepared['collector'], e2.EqualSamplesCompactSampler)
+        self.assertEqual(prepared['collector'].deadline_seconds, 7200)
+        prepared['collector'].stop(timeout_seconds=0.1)
 
     def test_pilot_profiles_match_sample_counts_and_concurrent_work(self):
         self.assertNotEqual(self.profiles['profiles']['100']['A']['run_id'],

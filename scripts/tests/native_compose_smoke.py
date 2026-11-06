@@ -357,9 +357,9 @@ class ResourceRegistry:
         self.fixture, self.runner = fixture, runner
         self.items = []
 
-    def command(self, args, input=None):
+    def command(self, args, input=None, *, timeout=None):
         try:
-            return self.runner(["docker", *args], input=input, capture_output=True, timeout=BUDGETS['cleanup'] if 'rm' in args else 10,
+            return self.runner(["docker", *args], input=input, capture_output=True, timeout=(timeout if timeout is not None else BUDGETS['cleanup'] if 'rm' in args else 10),
                                env=process_env(self.fixture), check=False)
         except (OSError, subprocess.TimeoutExpired):
             raise ValueError("resource_inspect_unresolved") from None
@@ -1707,7 +1707,7 @@ def _retain_e2_binary(fixture, paperload_binary):
 
 
 def startup_only(fixture, registry=None, positive_http=False, role_http=False, full_http=False,
-                 hold_callback=None, finalization_callback=None):
+                 hold_callback=None, finalization_callback=None, pre_cleanup_callback=None):
     """Phased real startup; optional hold returns through the same cleanup finally."""
     lifecycle = bootstrap_lifecycle()
     if registry is None:
@@ -2077,6 +2077,11 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                 primary_failure = failure
                 primary_phase_saved = phase if primary_failure is not None else None
                 primary_code_saved = sanitize_failure_code(primary_failure) if primary_failure is not None else None
+                if pre_cleanup_callback is not None:
+                    try:
+                        pre_cleanup_callback()
+                    except Exception:
+                        pass  # Diagnostics must not prevent owned-resource cleanup.
                 cleanup_step = None
                 cleanup_target_kind = None
                 cleanup_err_code = "unclassified"
@@ -3514,7 +3519,7 @@ def login_user_for_token(base_url: str, anon_key: str, email: str, password: str
     return token
 
 
-def db_psql(registry, postgres_cid: str, sql_commands: str, variables=None) -> str:
+def db_psql(registry, postgres_cid: str, sql_commands: str, variables=None, *, timeout=None) -> str:
     args = ["exec", "-i", postgres_cid, "psql", "-U", "postgres", "-d", "smoke", "-v", "ON_ERROR_STOP=1", "-At"]
     for key, value in (variables or {}).items():
         if (not re.fullmatch(r"[a-z_]+", key) or not isinstance(value, str)
@@ -3522,9 +3527,9 @@ def db_psql(registry, postgres_cid: str, sql_commands: str, variables=None) -> s
             raise ValueError("db_variable_invalid")
         args += ["-v", key + "=" + value]
     if variables:
-        result = registry.command(args + ["-f", "-"], input=sql_commands.encode())
+        result = registry.command(args + ["-f", "-"], input=sql_commands.encode(), **({'timeout': timeout} if timeout is not None else {}))
     else:
-        result = registry.command(args + ["-c", sql_commands])
+        result = registry.command(args + ["-c", sql_commands], **({'timeout': timeout} if timeout is not None else {}))
     if result.returncode:
         diagnostic = getattr(registry, "fixture", None)
         if diagnostic is not None:
@@ -6284,6 +6289,14 @@ def assert_response(case, status, body):
         raise ValueError("sensor_contract_failed")
 
 
+def paper_p8_bind_initialized_session_deadline(session, prepared=None):
+    """Copy the supervisor-owned deadline after initialization, never from cancellation state."""
+    deadline = session['state'].get('deadline_monotonic')
+    session['session_deadline_monotonic'] = deadline
+    if prepared is not None:
+        prepared['session_deadline_monotonic'] = deadline
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", type=Path, required=True, help="New private fixture directory, outside artifacts")
@@ -6306,6 +6319,12 @@ def main():
     parser.add_argument('--p8-e2-burst-messages', type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-pending-messages', type=int, default=64, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-pending-bytes', type=int, default=1 << 20, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-retry-mode', choices=('bounded_backoff_v1',), help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-retry-initial-interval-ms', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-retry-max-interval-ms', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-retry-jitter-percent', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-retry-rate-per-second', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-retry-burst', type=int, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-context', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e3-prepare-hold', action='store_true', help=argparse.SUPPRESS)
@@ -6655,6 +6674,7 @@ def main():
             session = {}
             def hold_ready_fixture(*, fixture, registry, containers, images, evidence, endpoint, state,
                                    paperload_binary):
+                session.update({'registry': registry, 'containers': containers, 'endpoint': endpoint})
                 receipts = [{key: item.get(key) for key in ('kind', 'name', 'image', 'labels',
                             'task', 'run', 'nonce', 'receipt', 'allocation_attempted')}
                             for item in registry.items]
@@ -6685,6 +6705,18 @@ def main():
                     elif experiment == 'E2':
                         e2 = paper_p8_e2_support()
                         e2_workload = getattr(args, 'p8_e2_workload', 'steady_burst')
+                        retry_fields = ('p8_e2_retry_mode', 'p8_e2_retry_initial_interval_ms',
+                            'p8_e2_retry_max_interval_ms', 'p8_e2_retry_jitter_percent',
+                            'p8_e2_retry_rate_per_second', 'p8_e2_retry_burst')
+                        supplied_retry = [getattr(args, field, None) for field in retry_fields]
+                        retry_policy = None
+                        if any(value is not None for value in supplied_retry):
+                            if any(value is None for value in supplied_retry):
+                                raise ValueError('e2_retry_policy_fields_rejected')
+                            retry_policy = e2.validate_retry_policy(dict(zip(
+                                ('mode', 'initial_interval_ms', 'max_interval_ms', 'jitter_percent',
+                                 'rate_per_second', 'burst'), supplied_retry)),
+                                pending_messages=args.p8_e2_pending_messages)
                         e2_phase_id = (f'equal-samples-{args.p8_e2_samples_per_message}'
                                        if e2_workload == 'equal_samples'
                                        else f'samples-{args.p8_e2_samples_per_message}')
@@ -6726,7 +6758,8 @@ def main():
                                 duration_seconds=args.p8_e2_duration_seconds,
                                 burst_messages=args.p8_e2_burst_messages,
                                 pending_messages=args.p8_e2_pending_messages,
-                                pending_bytes=args.p8_e2_pending_bytes,
+                                 pending_bytes=args.p8_e2_pending_bytes,
+                                 retry_policy=retry_policy,
                             )
                         prepared['e2_support'] = e2
                         prepared['workload'] = e2_workload
@@ -6893,9 +6926,9 @@ def main():
                         image_metadata=images, artifacts=artifacts,
                         preparation_status=f'{experiment}_PREPARED', session_id=session_id,
                         profile=args.p8_profile, official_opt_in=args.p8_official_opt_in,
-                        source_metadata={'revision': paper_p0_git(fixture, 'rev-parse', 'HEAD'),
-                            'dirty_worktree': bool(paper_p0_git(fixture, 'status', '--porcelain')),
-                            'qualification': 'local source and dirty state; not a release provenance claim'},
+                         source_metadata={**paper_p8_support()._source_fingerprint(ROOT),
+                             'dirty_worktree': bool(paper_p0_git(fixture, 'status', '--porcelain')),
+                             'qualification': 'local source and dirty state; not a release provenance claim'},
                         endpoint_metadata={'https': remote_profile['advertised_https'],
                             'mqtt_tls': remote_profile['advertised_mqtt_tls'],
                             'bind_ip': remote_profile['bind_ip']},
@@ -6918,8 +6951,11 @@ def main():
                             'mqtt_tls': remote_profile['advertised_mqtt_tls'],
                             'bind_ip': remote_profile['bind_ip']} if remote_profile else {}),
                         project=fixture.project, lock=lock)
+                paper_p8_bind_initialized_session_deadline(session)
                 if paper_p8_hold_callbacks_required(args):
                     def begin_collection(request):
+                        if experiment == 'E2':
+                            paper_p8_bind_initialized_session_deadline(session, prepared)
                         if experiment == 'E5':
                             return paper_p8_e5_begin_phase(
                                 sys.modules[__name__], fixture, endpoint, registry, containers,
@@ -7122,7 +7158,7 @@ def main():
                     return
                 collector = (session.get('prepared', {}).get('remote_collector')
                              or session.get('prepared', {}).get('collector'))
-                if collector is not None:
+                if collector is not None and not args.p8_e2_prepare_hold and not session.get('e2_diagnostics_flushed'):
                     collector.stop(None)
                 for phase_collector in session.get('prepared', {}).get('remote_collectors', {}).values():
                     phase_collector.stop(None)
@@ -7149,9 +7185,53 @@ def main():
                         sys.modules[__name__], fixture, e5_prepared,
                         supervisor.read_state(fixture.private),
                         cleanup_verified=cleanup_verified)
+            def collect_before_cleanup():
+                prepared = session.get('prepared') or {}
+                if not args.p8_e2_prepare_hold or not prepared.get('collector'):
+                    return
+                state = supervisor.read_state(fixture.private)
+                metadata = state.get('source_metadata') if isinstance(state.get('source_metadata'), dict) else {}
+                prepared['source_provenance'] = {k: metadata[k] for k in
+                    ('revision', 'branch', 'dirty_worktree', 'dirty', 'dirty_source_sha256',
+                     'qualification') if k in metadata and
+                    (type(metadata[k]) in (str, bool) and len(str(metadata[k])) <= 160)}
+                prepared['stop_cause'] = state.get('stop_reason') or state.get('workload_outcome', 'NOT_RUN')
+                prepared['manifest_sha256'] = [hashlib.sha256(Path(p).read_bytes()).hexdigest()
+                    for p in prepared.get('manifest_paths', []) if Path(p).is_file()]
+                prepared['bundle_sha256'] = prepared.get('bundle_sha256')
+                diagnostics_path = fixture.artifacts / 'p8-e2-diagnostics.json'
+                def persist_diagnostics(payload):
+                    if len(json.dumps(payload, separators=(',', ':')).encode()) > 2 * 1024 * 1024:
+                        raise ValueError('diagnostics_file_size_limit')
+                    durable_json(diagnostics_path, payload)
+                try:
+                    diagnostics = prepared['e2_support'].failure_diagnostics(
+                        prepared, state.get('workload_outcome', 'NOT_RUN'), smoke=sys.modules[__name__],
+                        endpoint=session.get('endpoint'), registry=session.get('registry'),
+                        containers=session.get('containers', {}), persist_callback=persist_diagnostics)
+                    session['e2_diagnostics_flushed'] = True
+                except Exception:
+                    diagnostics = {'schema_version': 1, 'experiment': 'E2',
+                        'full_p8_accepted': False, 'snapshot_status': 'unavailable',
+                        'error_reason': 'diagnostics_flush_failed'}
+                try:
+                    encoded = json.dumps(diagnostics, separators=(',', ':'))
+                    if len(encoded.encode()) > 2 * 1024 * 1024:
+                        diagnostics = {'schema_version': 1, 'experiment': 'E2',
+                            'full_p8_accepted': False, 'snapshot_status': 'unavailable',
+                            'error_reason': 'diagnostics_file_size_limit'}
+                    persist_diagnostics(diagnostics)
+                except Exception:
+                    try:
+                        durable_json(diagnostics_path, {
+                            'schema_version': 1, 'experiment': 'E2', 'full_p8_accepted': False,
+                            'snapshot_status': 'unavailable', 'error_reason': 'diagnostics_persist_failed'})
+                    except Exception:
+                        pass
             try:
                 report = startup_only(fixture, hold_callback=hold_ready_fixture,
-                                      finalization_callback=finalize_session)
+                                      finalization_callback=finalize_session,
+                                      pre_cleanup_callback=collect_before_cleanup)
             finally:
                 lock.close()
             e3_lifecycle_ok = True

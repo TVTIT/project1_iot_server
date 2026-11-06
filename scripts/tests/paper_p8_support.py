@@ -326,8 +326,13 @@ class BoundedCollector:
             self._thread.join(timeout=12)
             if self._thread.is_alive():
                 self.errors.append('collector_join_timeout')
+                return False
+        if getattr(self, '_terminal_sampled', False):
+            return True
         self._sample('terminal', process_pid)
         self._bound_samples(self.metrics)
+        self._terminal_sampled = True
+        return True
 
 
 def process_tree_resources(root_pid, *, proc_root=Path('/proc')):
@@ -507,9 +512,9 @@ def _unavailable(reason):
     return {'available': None, 'reason': reason}
 
 
-def _admin_metrics(smoke, endpoint, token):
+def _admin_metrics(smoke, endpoint, token, *, timeout=2):
     status, _, payload = smoke.http_request(endpoint, 'GET', '/v1/admin/metrics',
-                                             token=token, timeout=2)
+                                             token=token, timeout=timeout)
     if status != 200 or not isinstance(payload, dict):
         raise ValueError('admin_metrics_unavailable')
     # The shared HTTP helper caps responses at 64 KiB; keep the P8 cap explicit too.

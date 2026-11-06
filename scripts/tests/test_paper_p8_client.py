@@ -46,6 +46,71 @@ class FragmentedSocket:
 
 
 class IdentityAndProbeTests(unittest.TestCase):
+    def test_real_cli_exports_partial_e2_without_pythonpath(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        bundle_root = Path(fixture.export()['bundle_root'])
+        workspace = fixture.root / 'A' / 'workspace'
+        workspace.parent.mkdir(mode=0o700)
+        client.paper_p8_bundle.bind_bundle(bundle_root=bundle_root, workspace_leaf=workspace)
+
+        binding_path = workspace / 'runtime/binding.json'
+        binding = json.loads(binding_path.read_text())
+        binding['session'].update({'experiment': 'E2', 'run_id': 'e2-cli-partial'})
+        binding_path.write_text(json.dumps(binding))
+        binding_path.chmod(0o600)
+
+        spec_path = workspace / 'runtime/execution/run-spec.json'
+        spec = json.loads(spec_path.read_text())
+        for role, job in zip(('A', 'B'), spec['paperload']):
+            job['role'] = 'telemetry'
+            job['manifest'] = str(workspace / f'runtime/manifests/{role}.json')
+            output = workspace / f'outputs/{role}'
+            job['output_dir'] = str(output)
+            output.mkdir(mode=0o700)
+            policy = {'mode': 'bounded_backoff_v1', 'initial_interval_ms': 500,
+                      'max_interval_ms': 8000, 'jitter_percent': 10,
+                      'rate_per_second': 100, 'burst': 20}
+            workload = {'status': 'PARTIAL', 'experiment': 'E2', 'arm': role,
+                        'profile': 'official', 'mode': 'remote', 'run_id': 'e2-cli-partial',
+                        'retry_policy': policy}
+            write(output / 'workload.json', workload)
+        spec_path.write_text(json.dumps(spec))
+        spec_path.chmod(0o600)
+        binding['bound_run_spec_sha256'] = hashlib.sha256(spec_path.read_bytes()).hexdigest()
+        binding_path.write_text(json.dumps(binding))
+        binding_path.chmod(0o600)
+        write(workspace / 'outputs/run.json', {'status': 'PARTIAL'})
+        write(workspace / 'runtime/runner-provenance.json', {
+            'binary_sha256': 'a' * 64, 'binary_os': 'linux', 'binary_arch': 'amd64'})
+        output = fixture.root / 'exported'
+        repo = Path(__file__).resolve().parents[2]
+        env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        result = subprocess.run([sys.executable, str(repo / 'scripts/paper_p8_client.py'),
+            'export-results', '--workspace', str(workspace), '--output', str(output)],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads((output / 'results.json').read_text())
+        self.assertEqual(summary['runner_status'], 'PARTIAL')
+        self.assertEqual(summary['expected_workload_roles'], ['A', 'B'])
+        self.assertEqual(summary['present_workload_roles'], ['A', 'B'])
+        self.assertFalse(summary['full_p8_accepted'])
+        for role in ('A', 'B'):
+            exported = json.loads((output / f'results/workloads/{role}/workload.json').read_text())
+            self.assertEqual(exported['retry_policy']['mode'], 'bounded_backoff_v1')
+
+    def test_safe_workload_projects_retry_policy_and_keeps_absent_legacy_policy(self):
+        policy = {'mode':'bounded_backoff_v1','initial_interval_ms':500,'max_interval_ms':8000,
+                  'jitter_percent':10,'rate_per_second':100,'burst':20}
+        source = {'status':'COMPLETE','experiment':'E2','arm':'A','profile':'official',
+                  'mode':'remote','run_id':'e2-run','retry_policy':policy}
+        self.assertEqual(client._safe_workload(source, role='telemetry')['retry_policy'], policy)
+        self.assertNotIn('retry_policy', client._safe_workload(
+            {key:value for key,value in source.items() if key != 'retry_policy'}, role='telemetry'))
+        with self.assertRaises(ValueError):
+            client._safe_workload({**source,'retry_policy':dict(policy, burst=0)}, role='telemetry')
+
     def test_conflict_transport_has_no_legacy_external_client_path(self):
         self.assertFalse(hasattr(client, '_run_b_conflicts'))
 

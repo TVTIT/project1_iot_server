@@ -2,9 +2,11 @@ import base64
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -288,6 +290,205 @@ class PortableBundleTests(unittest.TestCase):
         self.assertEqual([Path(job['manifest']).stem for job in bound['paperload']], ['A','B'])
         self.assertEqual([job['output_dir'] for job in bound['paperload']],
                          [str(workspace/'outputs/A'), str(workspace/'outputs/B')])
+
+    def test_e2_retry_policy_tampering_fails_semantic_validation_after_rehash(self):
+        write(self.src/'gw-2.json', {'username':'gw-user-2','password':'gw-password-2'})
+        a = {**self.telemetry, 'experiment':'E2', 'arm':'A', 'mode':'remote',
+             'run_id':'e2-run-policy', 'targets':[{'gateway_id':'gw-1','sensor_id':'sensor-1'}],
+             'gateway_identity_files':{'gw-1':'/A/private/gw-1.json'}}
+        b = {**self.telemetry, 'experiment':'E2', 'arm':'B', 'mode':'remote',
+             'run_id':'e2-run-policy', 'targets':[{'gateway_id':'gw-2','sensor_id':'sensor-2'}],
+             'gateway_identity_files':{'gw-2':'/A/private/gw-2.json'}}
+        ap, bp = write(self.src/'policy-A.json', a), write(self.src/'policy-B.json', b)
+        spec = write(self.src/'policy-run-spec.json', {'paperload':[
+            {'manifest':'policy-A.json','output_dir':'/A/output/A','role':'telemetry'},
+            {'manifest':'policy-B.json','output_dir':'/A/output/B','role':'telemetry'}], 'gateways':[]})
+        result = bundle.export_bundle(output_leaf=self.parent/'e2-policy-bundle',
+            session_id='e2-policy-session', experiment='E2', arm='E2-official', phase='measure',
+            manifests={'A':ap,'B':bp},
+            identity_files={'A:telemetry':self.src/'telemetry.json','B:telemetry':self.src/'telemetry.json'},
+            gateway_identity_files={'gw-1':self.src/'gw-1.json','gw-2':self.src/'gw-2.json'},
+            gateway_env_files={}, ca_files={'https':self.src/'https-ca.pem','mqtt':self.src/'mqtt-ca.pem'},
+            role_metadata={'roles':{'A:telemetry':{'role':'telemetry','principals':[]},
+                'B:telemetry':{'role':'telemetry','principals':[]}}, 'gateways':{
+                'gw-1':{'role':'gateway','gateway_id':'gw-1','username':'gw-user'},
+                'gw-2':{'role':'gateway','gateway_id':'gw-2','username':'gw-user-2'}}},
+            wait_seconds=10, workload_seconds=30, topology={'gateways':2,'sensors':2},
+            workload={'experiment':'E2','profile':'pilot','samples_per_message':100,
+                      'unique_batches':24}, run_spec=spec)
+        root = Path(result['bundle_root'])
+        metadata_path = root/'bundle.json'
+        manifest_path = root/'manifests/A.json'
+        metadata = json.loads(metadata_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
+        policy = {'mode':'bounded_backoff_v1','initial_interval_ms':500,
+                  'max_interval_ms':8000,'jitter_percent':10,
+                  'rate_per_second':100,'burst':20}
+        manifest['retry_policy'] = dict(policy)
+        metadata['workload']['retry_policy'] = dict(policy)
+        for arm_path in (root/'manifests/A.json', root/'manifests/B.json'):
+            arm_manifest = json.loads(arm_path.read_text())
+            arm_manifest['retry_policy'] = dict(policy)
+            write(arm_path, arm_manifest)
+        row = next(row for row in metadata['inputs'] if row['path'] == 'manifests/A.json')
+        manifest_bytes = manifest_path.read_bytes()
+        row['size_bytes'] = len(manifest_bytes)
+        row['sha256'] = hashlib.sha256(manifest_bytes).hexdigest()
+        row_b = next(row for row in metadata['inputs'] if row['path'] == 'manifests/B.json')
+        manifest_b_bytes = (root/'manifests/B.json').read_bytes()
+        row_b['size_bytes'] = len(manifest_b_bytes)
+        row_b['sha256'] = hashlib.sha256(manifest_b_bytes).hexdigest()
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, separators=(',',':')))
+        metadata_path.chmod(0o600)
+        self.assertTrue(bundle.inspect_bundle(root)['valid'])
+
+        # Alter the manifest policy and rehash inventory: semantic
+        # relationship must be checked even when the new hashes are internally valid.
+        manifest['retry_policy']['rate_per_second'] = 101
+        write(manifest_path, manifest)
+        manifest_bytes = manifest_path.read_bytes()
+        row['size_bytes'] = len(manifest_bytes)
+        row['sha256'] = hashlib.sha256(manifest_bytes).hexdigest()
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, separators=(',',':')))
+        metadata_path.chmod(0o600)
+        with self.subTest(policy_location='manifest'):
+            with self.assertRaises(ValueError):
+                bundle.inspect_bundle(root)
+
+        # A metadata-only change must likewise be rejected against the bound manifests.
+        manifest['retry_policy']['rate_per_second'] = 100
+        write(manifest_path, manifest)
+        manifest_bytes = manifest_path.read_bytes()
+        row['size_bytes'] = len(manifest_bytes)
+        row['sha256'] = hashlib.sha256(manifest_bytes).hexdigest()
+        metadata['workload']['retry_policy']['burst'] = 19
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, separators=(',',':')))
+        metadata_path.chmod(0o600)
+        with self.subTest(policy_location='bundle_metadata'):
+            with self.assertRaises(ValueError):
+                bundle.inspect_bundle(root)
+
+    def test_e2_retry_policy_actual_bundle_bind_runner_projection_import_roundtrip(self):
+        from scripts.tests import paper_p8_e2_support as e2
+
+        policy = {'mode':'bounded_backoff_v1','initial_interval_ms':500,
+                  'max_interval_ms':8000,'jitter_percent':10,
+                  'rate_per_second':100,'burst':20}
+        write(self.src/'gw-2.json', {'username':'gw-user-2','password':'gw-password-2'})
+        manifests = {}
+        for arm, gateway, sensor in (('A','gw-1','sensor-1'), ('B','gw-2','sensor-2')):
+            value = {**self.telemetry, 'experiment':'E2', 'arm':arm, 'profile':'official', 'mode':'remote',
+                     'run_id':'e2-roundtrip', 'retry_policy':dict(policy),
+                     'limits':{**self.telemetry['limits'],'pending_messages':1000},
+                     'targets':[{'gateway_id':gateway,'sensor_id':sensor}],
+                     'gateway_identity_files':{gateway:f'/A/private/{gateway}.json'}}
+            manifests[arm] = write(self.src/f'roundtrip-{arm}.json', value)
+        spec = write(self.src/'roundtrip-spec.json', {'paperload':[
+            {'manifest':'roundtrip-A.json','output_dir':'/A/output/A','role':'telemetry'},
+            {'manifest':'roundtrip-B.json','output_dir':'/A/output/B','role':'telemetry'}], 'gateways':[]})
+        estimate = e2.e2_official_estimate(rate_per_second=100, duration_seconds=1,
+            samples_per_message=100, payload_bytes=4096, official_opt_in=True,
+            pending_messages=1000, pending_bytes=65536, retry_policy=policy)
+        result = bundle.export_bundle(output_leaf=self.parent/'e2-roundtrip',
+            session_id='e2-roundtrip-session', experiment='E2', arm='E2-official', phase='measure',
+            manifests=manifests,
+            identity_files={'A:telemetry':self.src/'telemetry.json','B:telemetry':self.src/'telemetry.json'},
+            gateway_identity_files={'gw-1':self.src/'gw-1.json','gw-2':self.src/'gw-2.json'},
+            gateway_env_files={}, ca_files={'https':self.src/'https-ca.pem','mqtt':self.src/'mqtt-ca.pem'},
+            role_metadata={'roles':{'A:telemetry':{'role':'telemetry','principals':[]},
+                'B:telemetry':{'role':'telemetry','principals':[]}}, 'gateways':{
+                'gw-1':{'role':'gateway','gateway_id':'gw-1','username':'gw-user'},
+                'gw-2':{'role':'gateway','gateway_id':'gw-2','username':'gw-user-2'}}},
+            wait_seconds=10, workload_seconds=30, topology={'gateways':2,'sensors':2},
+            workload={'experiment':'E2','arm':'E2-official','phase':'measure','profile':'official',
+                      'workload':'e2-telemetry-ab-official','seed':84,'samples_per_message':100,
+                      'producer_rates_per_second':{'A':50,'B':50},'offered_rate_per_second':100,
+                      'measure_seconds':1,'burst_messages':0,
+                      'expected_counts':{'unique':100,'raw':10000,'temporal':100,'ack':100},
+                      'estimate':estimate,'durability_mode':'synthetic-load','generator_colocated':'unverified',
+                      'pending_limits':{'pending_messages':1000,'pending_bytes':65536},
+                      'retry_policy':dict(policy)}, run_spec=spec)
+        root = Path(result['bundle_root'])
+        workspace = self.root/'B'/'roundtrip-bound'
+        workspace.parent.mkdir(mode=0o700, exist_ok=True)
+        bundle.bind_bundle(bundle_root=root, workspace_leaf=workspace)
+        bound = {arm:json.loads((workspace/f'runtime/manifests/{arm}.json').read_text())
+                 for arm in ('A','B')}
+        self.assertEqual([bound[arm]['retry_policy'] for arm in ('A','B')], [policy,policy])
+        # This is the same safe projection used on child workload artifacts; the
+        # verifier's expected value comes from the bound manifests, not the child.
+        child = {arm:client._safe_workload({
+            'status':'PARTIAL','mode':'remote','experiment':'E2','arm':arm,
+            'run_id':'e2-roundtrip','telemetry':{'application_acks':3},
+            'retry_policy':dict(bound[arm]['retry_policy'])}, role='telemetry') for arm in ('A','B')}
+        prepared = {'manifests':bound}
+        self.assertEqual(e2.validate_applied_retry_policy(prepared, child), policy)
+        for altered in ({**child['B'],'retry_policy':dict(policy,burst=19)},
+                        {key:value for key,value in child['B'].items() if key!='retry_policy'}):
+            with self.assertRaisesRegex(ValueError, 'e2_retry_policy_applied_proof_mismatch:B'):
+                e2.validate_applied_retry_policy(prepared, {'A':child['A'],'B':altered})
+
+        # Exercise the actual client exporter and the A-side portable importer,
+        # including its verified source-manifest inventory and runner proof.
+        binding = json.loads((workspace/'runtime/binding.json').read_text())
+        run_spec = json.loads((workspace/'runtime/execution/run-spec.json').read_text())
+        for job in run_spec['paperload']:
+            arm = Path(job['manifest']).stem
+            output_dir = Path(job['output_dir'])
+            output_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            write(output_dir/'workload.json', {
+                'status':'COMPLETE','mode':'remote','experiment':'E2','arm':arm,
+                'profile':'official','run_id':'e2-roundtrip',
+                'telemetry':{'application_acks':100},'retry_policy':dict(policy)})
+        write(workspace/'outputs/run.json', {'status':'COMPLETE'})
+        binary = self.root/'B'/'paperload'
+        binary.write_bytes(b'paperload-for-result-import')
+        binary.chmod(0o700)
+        write(workspace/'runtime/runner-provenance.json', {'binary_sha256':'a'*64,
+            'binary_os':sys.platform,'binary_arch':platform.machine()})
+        prov_path = workspace/'runtime/runner-provenance.json'
+        provenance = json.loads(prov_path.read_text())
+        provenance['binary_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        write(prov_path, provenance)
+        exported = self.root/'B'/'results'
+        client._export_results(workspace, exported)
+        bundle_meta = json.loads((root/'bundle.json').read_text())
+
+        def recalc_inventory():
+            summary_path = exported/'results.json'
+            summary = json.loads(summary_path.read_text())
+            rows = []
+            for row in summary['files']:
+                data = (exported/row['path']).read_bytes()
+                rows.append({'path':row['path'],'size_bytes':len(data),
+                             'sha256':hashlib.sha256(data).hexdigest()})
+            summary['files'] = rows
+            write(summary_path, summary)
+
+        recalc_inventory()
+        prepared = {'session_id':binding['session']['session_id'],'run_id':'e2-roundtrip',
+            'arm':'E2-official','phase_id':'measure','profile':'official','workload':'steady_burst',
+            'bundle_sha256':hashlib.sha256((root/'bundle.json').read_bytes()).hexdigest(),
+            'bundle_inventory':[{'path':row['path'],'sha256':row['sha256']} for row in bundle_meta['inputs']],
+            'bundle_root':root,'bound_manifest_sha256':binding['bound_manifest_sha256'],
+            'manifests':bound}
+        imported = e2._load_e2_result_bundle(exported, prepared, binary)
+        self.assertEqual(e2.validate_applied_retry_policy(prepared, imported), policy)
+        for defect in ('missing','mismatch'):
+            workload_path = exported/'results/workloads/B/workload.json'
+            workload = json.loads(workload_path.read_text())
+            if defect == 'missing':
+                workload.pop('retry_policy')
+            else:
+                workload['retry_policy'] = dict(policy, burst=policy['burst']-1)
+            write(workload_path, workload)
+            recalc_inventory()
+            with self.subTest(importer_policy=defect):
+                with self.assertRaisesRegex(ValueError, 'e2_retry_policy_applied_proof_mismatch:B'):
+                    e2._load_e2_result_bundle(exported, prepared, binary)
+            workload['retry_policy'] = dict(policy)
+            write(workload_path, workload)
+            recalc_inventory()
 
     def test_expiry_unknown_fields_path_traversal_symlink_and_unselected_identity_fail_closed(self):
         write(self.src/'viewer.json',{'user-a':token(int(time.time())+40), 'user-b':token(int(time.time())+40)})

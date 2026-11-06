@@ -552,6 +552,12 @@ def main(argv=None):
     serve.add_argument('--e2-burst-messages', type=int, default=0)
     serve.add_argument('--e2-pending-messages', type=int, default=64)
     serve.add_argument('--e2-pending-bytes', type=int, default=1 << 20)
+    serve.add_argument('--e2-retry-mode', choices=('bounded_backoff_v1',))
+    serve.add_argument('--e2-retry-initial-interval-ms', type=int)
+    serve.add_argument('--e2-retry-max-interval-ms', type=int)
+    serve.add_argument('--e2-retry-jitter-percent', type=int)
+    serve.add_argument('--e2-retry-rate-per-second', type=int)
+    serve.add_argument('--e2-retry-burst', type=int)
     serve.add_argument('--dispatch-mode', choices=('polling', 'wakeup'))
     serve.add_argument('--workload', choices=('low_load', 'mixed', 'steady_burst', 'equal_samples'))
     serve.add_argument('--e3-command-count', type=int, choices=range(1, 31), default=4)
@@ -704,6 +710,19 @@ def main(argv=None):
                      or args.cold_replay or args.expiry_replay or args.durable_reopen or args.conflicts):
                 raise ValueError('E1-E4 options are rejected for E5')
         e2_seed = None
+        retry_policy = None
+        retry_values = (args.e2_retry_mode, args.e2_retry_initial_interval_ms,
+            args.e2_retry_max_interval_ms, args.e2_retry_jitter_percent,
+            args.e2_retry_rate_per_second, args.e2_retry_burst)
+        if any(value is not None for value in retry_values):
+            if (args.experiment != 'E2' or args.profile != 'official'
+                    or (args.workload or 'steady_burst') != 'steady_burst'
+                    or any(value is None for value in retry_values)):
+                raise ValueError('e2_retry_policy_scope_or_fields_rejected')
+            import paper_p8_e2_support as e2_support
+            retry_policy = e2_support.validate_retry_policy(dict(zip(
+                ('mode','initial_interval_ms','max_interval_ms','jitter_percent','rate_per_second','burst'),
+                retry_values)), pending_messages=args.e2_pending_messages)
         if args.experiment == 'E2':
             if args.samples_per_message is None:
                 raise ValueError('E2 requires one explicit --samples-per-message profile')
@@ -719,8 +738,8 @@ def main(argv=None):
                 e2_support.e2_official_estimate(rate_per_second=args.e2_offered_rate,
                     duration_seconds=args.e2_duration_seconds, samples_per_message=int(args.samples_per_message),
                     payload_bytes=4096, official_opt_in=args.official_opt_in,
-                    burst_messages=args.e2_burst_messages, pending_messages=args.e2_pending_messages,
-                    pending_bytes=args.e2_pending_bytes)
+                        burst_messages=args.e2_burst_messages, pending_messages=args.e2_pending_messages,
+                        pending_bytes=args.e2_pending_bytes)
             if workload == 'steady_burst':
                 if args.context is not None or args.reference is not None:
                     raise ValueError('E2 steady_burst does not accept --context or --reference')
@@ -826,7 +845,8 @@ def main(argv=None):
                         telemetry_identity_files={'A':'a.json','B':'b.json'},
                         samples_per_message=int(args.samples_per_message), offered_rate=args.e2_offered_rate,
                         duration_seconds=args.e2_duration_seconds, burst_messages=args.e2_burst_messages,
-                        pending_messages=args.e2_pending_messages, pending_bytes=args.e2_pending_bytes)
+                         pending_messages=args.e2_pending_messages, pending_bytes=args.e2_pending_bytes,
+                         retry_policy=retry_policy)
                     pair = manifests['profiles'][str(int(args.samples_per_message))]
                     paths = {}
                     for arm in ('A','B'):
@@ -840,9 +860,10 @@ def main(argv=None):
                             duration_seconds=args.e2_duration_seconds,
                             samples_per_message=int(args.samples_per_message), payload_bytes=4096,
                             official_opt_in=True, burst_messages=args.e2_burst_messages,
-                            pending_messages=args.e2_pending_messages, pending_bytes=args.e2_pending_bytes),
-                        'pending_limits': {'pending_messages': args.e2_pending_messages,
-                                           'pending_bytes': args.e2_pending_bytes}}
+                         pending_messages=args.e2_pending_messages, pending_bytes=args.e2_pending_bytes),
+                         'pending_limits': {'pending_messages': args.e2_pending_messages,
+                                            'pending_bytes': args.e2_pending_bytes},
+                         'retry_policy': retry_policy}
             e4_plan = None
             e4_offline_contract = None
             e3_plan = None
@@ -895,7 +916,7 @@ def main(argv=None):
                  'e1_offline_contract': e1_plan_summary, 'e3_offline_contract': e3_plan,
                 'e3': ({'command_count': args.e3_command_count, 'schedule': args.e3_schedule,
                         'workload': args.workload} if args.experiment == 'E3' else None),
-                'official_opt_in': bool(args.official_opt_in)}, sort_keys=True))
+                 'official_opt_in': bool(args.official_opt_in)}, sort_keys=True))
             return 0
         if args.experiment == 'E3' and args.profile == 'official':
             if not args.official_opt_in:
@@ -945,6 +966,13 @@ def main(argv=None):
                         '--p8-e2-burst-messages', str(args.e2_burst_messages),
                         '--p8-e2-pending-messages', str(args.e2_pending_messages),
                         '--p8-e2-pending-bytes', str(args.e2_pending_bytes)]
+            if retry_policy is not None:
+                command += ['--p8-e2-retry-mode', retry_policy['mode'],
+                    '--p8-e2-retry-initial-interval-ms', str(retry_policy['initial_interval_ms']),
+                    '--p8-e2-retry-max-interval-ms', str(retry_policy['max_interval_ms']),
+                    '--p8-e2-retry-jitter-percent', str(retry_policy['jitter_percent']),
+                    '--p8-e2-retry-rate-per-second', str(retry_policy['rate_per_second']),
+                    '--p8-e2-retry-burst', str(retry_policy['burst'])]
             if workload == 'equal_samples':
                 command += ['--p8-e2-context', str(args.context)]
                 if args.reference is not None:
