@@ -601,3 +601,79 @@ Các artifact roots tương đối trong bảng nằm dưới protected evidence
 - Go format, race (`internal/paperload`, `cmd/paperload`, `internal/gatewaysim`, `cmd/gateway`), vet, golangci-lint (0 issues), build, ARMv7 Gateway build, Python AST và `git diff --check`: PASS. Không chạy full CI/native rerun trong final-gate verification.
 
 Chi tiết nằm trong protected R5a handoff; artifact roots tương đối được nêu theo từng mốc. Final-gate evidence root: `p8-client-blockers-final-gates-20261106T000000Z`. R5b chỉ cập nhật tài liệu, không sửa raw/generated reports hay deployment defaults.
+
+## E2R — Handoff dừng tại N1 (2026-11-07)
+
+### Sửa retry/diagnostics sau đối chiếu N1
+
+N1 giữ nguyên kết quả native `ncs_58056e3cbc51`: `PARTIAL` rồi `ABORTED`,
+`full_p8_accepted=false`; cleanup chính xác 12 containers / 1 network / 5
+volumes. Không chạy lại native hoặc N2/N3/N4. Artifact chẩn đoán chính là
+`p8-e2-diagnostics.json`; workload A/B, outer result và biên lai cleanup nằm
+ngoài Git tại
+`/var/tmp/opencode/p8-n1-20261107T190000-new/attempt-n1-01/fixture/artifacts/`
+(xem thêm audit đối chiếu
+`/var/tmp/opencode/p8-n1-audit-20261107/reconciliation.md`). Native dùng revision
+`a7e66ea5f395334e47cf1da626728071627403df` với dirty worktree. Sau các sửa cục
+bộ, source hiện tại khác source native N1; các sửa cuối không được chạy native.
+Fingerprint checkout tại lúc bàn giao tài liệu: branch `feat/paper-requirement`,
+cùng revision `a7e66ea5f395334e47cf1da626728071627403df`, dirty. Không gán
+fingerprint native cho source sau local fixes; dirty fingerprint mới được wire
+vào diagnostics nhưng final source chưa được chạy native.
+
+Follow-up source cục bộ đã sửa/kiểm tra lỗi standalone CLI export, ánh xạ sáu
+histogram ingress theo DTO `HistogramSnapshot` thật, và nối fingerprint dirty
+source. RED/GREEN và kiểm tra đã ghi tại
+`/var/tmp/opencode/p8-e2-retry-repair/fix-followup-20261107/handoff.md` và
+`review-follow-up.md`: exporter subprocess với `PYTHONPATH` unset hỗ trợ kết quả
+PARTIAL nhưng không nâng acceptance; regression diagnostics/schema/fingerprint
+và `python3 -m unittest scripts.tests.test_paper_p8_e2_support scripts.tests.test_paper_p8_client`
+(179 tests, 1 skip) PASS; riêng client 74 PASS, 1 skip. Các bước này chỉ xác
+nhận source/local tests. Lỗi export lịch sử N1 vẫn là FAIL trong native record;
+histogram cũng không có trong N1 diagnostic, không được bổ sung hồi tố.
+
+Parent kiểm tra lại source sau local fixes: selected Python regression gồm
+runner/client/bundle/E2/supervisor/remote/shared collector/E4/E5/native-smoke chạy
+634 tests, 2 skips, không failure/error; skips không tính PASS. Go race
+`./internal/paperload ./cmd/paperload`, `go vet ./...`, golangci-lint (0 issues),
+`go build ./...`, gofmt và `git diff --check` PASS. Đây là các kiểm tra cục bộ,
+không full CI hoặc native rerun; không cộng các suite overlap với lịch sử.
+Log parent: `/var/tmp/opencode/p8-e2-retry-repair/parent-final-WI7Mjl/`.
+Checklist E2R.0/2/3/4/6 đã đóng ở phạm vi code/local verification và bàn giao N1;
+E2R.1 còn qualification native sau sửa histogram/provenance, E2R.5 còn các lane
+người dùng tự chạy. Không coi toàn bộ kế hoạch đã hoàn tất.
+
+### Workload, counters và diễn giải
+
+N1 là E2 official `steady_burst`, S=100, tổng offered 1.000 msg/s trong 10s,
+burst 0; A/B mỗi bên 5.000 unique (10.000 tổng), không phải capacity test.
+Pending cap thực chạy: 8.192 messages / 8 MiB mỗi producer. Retry policy opt-in:
+`bounded_backoff_v1`, initial 500ms, max 8.000ms, jitter 10%, retry rate 100/s và
+burst 100 mỗi producer. Shaper fixture giữ 500 attempts/s, burst 500 mỗi Gateway;
+drain giữ 30s. Không có headroom retry được dành riêng khi đang phát đều.
+Producer ghi 17.989 attempts gồm 7.989 retries; 5.945 application ACK và 4.055
+pending, cộng đúng 10.000 offered. Backend terminal scrape nhận 17.989 = 6.206
+accepted + 10.691 queue-full + 1.092 shaper-rate-limited. PersistFailures và
+ACKPublishFailures đều 0 trong scrape này. Queue-full chiếm phần lớn admission
+rejects, nhưng shaper cũng từ chối; dữ liệu này không chứng minh DB là bottleneck
+ban đầu.
+
+Backend terminal accounting: `Committed=6.125` + `DuplicateCommitted=55` =
+`ACKPublished=6.180`; `Processed=6.200` nhiều hơn ACKPublished 20. Các metric là
+các stage/window quan sát riêng nên chênh lệch 20 không tự chứng minh mất dữ liệu.
+DB được đọc tuần tự sau scrape: 6.151 ledger và 615.100 raw (A 3.174/317.400,
+B 2.977/297.700), raw khớp 100 mẫu/ledger. Các lần đọc không atomic với metrics
+hay producer ACK; chênh 26 giữa commit counter và DB có thể gồm drain/commit sau
+scrape, không đủ căn cứ kết luận corruption hoặc mất/thừa rows.
+
+Chỉ có 5 workload snapshots trong khoảng ~40s deadline (cách nhau xấp xỉ 8–9s),
+collector ghi `collector_deadline_exceeded`; đây không phải chuỗi đo liên tục.
+Terminal metrics có sẵn, nhưng terminal resource scrape từng service timeout;
+các service vẫn có resource samples trước đó. Không có histogram persisted trong
+artifact N1 và không suy histogram bằng 0. Lịch sử setup `NOT RUN` và startup
+failure giữ nguyên như đã ghi trong run artifacts; không đổi thành PASS.
+
+**Ranh giới:** N1 cho counters hữu ích và exact cleanup, không phải workload
+completion, capacity acceptance, sustained throughput, soak hay P8 acceptance.
+N1 cũng không chứng minh nguyên nhân DB persistence. N2/N3/N4 và qualification
+native trên final source chưa chạy.

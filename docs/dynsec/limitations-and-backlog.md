@@ -4,6 +4,18 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
+## P8 E2R — retry/diagnostics, dừng tại N1 (07/11/2026)
+
+N1 `ncs_58056e3cbc51` giữ `PARTIAL` → `ABORTED`, cleanup exact 12/1/5; counters
+và giới hạn được bàn giao tại [P8 report](../backend/paper-p8-experiments-and-acceptance.md).
+N2/N3/N4 là các lane còn lại do user chạy riêng; chưa có native qualification trên
+source sau local repairs. Workload hữu hạn, colocated, chỉ 5 resource snapshots
+thưa và không có histogram trong N1 không chứng minh peak/RSS, sustained capacity,
+soak hay bottleneck DB. Giữ shaper/gates/drain/defaults hiện hành; không tối ưu DB
+hoặc nới capacity từ các counters này.
+
+---
+
 ## P3 Sensor control loop — nghiệm thu local MVP và giới hạn kỹ thuật (25/10/2026)
 
 Xem [báo cáo P3](../backend/paper-p3-sensor-control-loop.md).

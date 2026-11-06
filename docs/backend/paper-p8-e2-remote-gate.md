@@ -733,6 +733,70 @@ Thực hiện trong thư mục gốc riêng biệt `$ROOT/steady-s1-${RUN_LABEL}
   - `shaper_rate = (offered_rate + 1) // 2` (tốc độ shaper cho mỗi gateway).
   - `shaper_burst = max((burst_messages + 1) // 2, shaper_rate)`.
   - `microbatch_rows = min(500, max(1, shaper_rate * samples_per_message))`.
+
+##### Retry policy E2 official (opt-in)
+
+Các flag sau chỉ áp dụng `steady_burst` official; cần khai báo đủ cả sáu giá
+trị hoặc bỏ toàn bộ để giữ legacy fixed-retry semantics. Manifest cũ không có
+policy vẫn là legacy; không gán policy mới hồi tố cho artifact cũ.
+
+| Flag | Đơn vị / giới hạn |
+|---|---|
+| `--e2-retry-mode bounded_backoff_v1` | Chỉ mode được hỗ trợ |
+| `--e2-retry-initial-interval-ms N` | ms, 100..60.000 |
+| `--e2-retry-max-interval-ms N` | ms, 100..60.000; phải >= initial |
+| `--e2-retry-jitter-percent N` | %, 0..100 |
+| `--e2-retry-rate-per-second N` | retry attempts/s/producer, 1..10.000 |
+| `--e2-retry-burst N` | retry attempts/producer, 1..100.000 |
+
+`bounded_backoff_v1` dùng backoff/jitter và retry token budget riêng mỗi
+producer; retries không làm tăng unique offered rate, tối đa 16 retries/message
+vẫn giữ nguyên, wall/drain không kéo dài ngầm. Retry budget không dành sẵn
+shaper capacity. Dry-run có thể báo `retry_headroom_not_reserved` nếu unique
+rate + retry budget vượt shaper rate/gateway; đây là cảnh báo qualification,
+không tự dự đoán workload sẽ PASS hay FAIL. Không tắt shaper, đổi trần hoặc
+30s drain để ép kết quả.
+
+Sizing tính riêng pending và retry queue logical allowance; với policy mới
+`pending_retry_memory_bytes_estimate` gồm pending estimate cộng
+`2 * pending_messages * 16` byte retry queue estimate. Giữ gate tổng hiện hành
+`2 * (pending_bytes + pending_messages * 4096) <= 256 MiB`; policy retry cộng
+thêm `2 * pending_messages * 16` byte vào pending estimate, và combined estimate
+phải nằm trong 256 MiB pending memory budget (retry estimate cũng có gate riêng).
+Đây là estimate logic, không phải RSS. Dùng pending per
+producer theo từng rung (N1/N2 5.000, N3 10.000, N4 arm B 20.000) và tính lại
+preflight; cap thấp hơn có thể dừng workload trước khi đo được backend.
+
+Ví dụ ngắn (thay placeholder bằng path/session riêng; không dùng lại leaf):
+
+| Lane | `--e2-offered-rate` | duration | S | burst | unique / raw | pending per producer |
+|---|---:|---:|---:|---:|---:|---:|
+| N1 | 1.000 | 10s | 100 | 0 | 10.000 / 1.000.000 | 5.000 |
+| N2 | 5.000 | 2s | 100 | 0 | 10.000 / 1.000.000 | 5.000 |
+| N3 | 20.000 | 1s | 100 | 0 | 20.000 / 2.000.000 | 10.000 |
+| N4 | 20.000* | 1s* | 100 | 10.000 | 30.000* / 3.000.000* | 20.000 mỗi producer |
+
+`*` N4 chỉ sau khi N1/N2/N3 có đủ diagnostics và không có blocker; rung thấp
+hơn đã đo phải ghi lại expected counts, không gọi là 20k qualification. User
+chạy từng lane bằng held lifecycle mới: `serve --root "$ROOT/<lane>/A"
+--network-config /path/to/private-network.json --profile official
+--official-opt-in --experiment E2 --samples-per-message 100 --workload
+steady_burst --e2-offered-rate <rate> --e2-duration-seconds <seconds>
+--e2-burst-messages <burst> --e2-pending-messages <per-producer>
+--e2-pending-bytes <bytes> --deadline-seconds <>=duration+60` (và sáu retry
+flag nếu opt-in). Tiếp tục theo lifecycle hiện có: status READY → transfer
+bundle/binary → bind/preflight/check-connection → begin `samples-100` → run →
+export → finish-phase → finalize. N2/N3/N4 hiện `NOT RUN`; recipes không phải
+native verification.
+
+Held `serve` thật yêu cầu network config private có mode `0600`, interface RFC1918
+hợp lệ và ports còn trống; `--dry-run` không xác minh mode file hay readiness
+runtime. Không đưa địa chỉ thật vào tài liệu. Kiểm artifacts
+`fixture/artifacts/p8-e2-diagnostics.json` trước khi kết thúc. Khi B trả PARTIAL,
+vẫn chạy `export-results`, chuyển export và gọi `finish-phase` để lưu projection/
+diagnostics trung thực; không sửa expected counts. Nếu export/import từ chối hoặc
+flow không thể tiếp tục, giữ artifact lỗi và gọi `abort`/cleanup theo receipt;
+không gắn acceptance. Diagnostics best-effort chỉ trong lifecycle trước cleanup.
 - **Ngân sách Dự báo và Ranh giới Từ chối Tài nguyên (`e2_official_estimate`)**:
   Server tự động tính toán mô hình ước lượng kích thước trước khi khởi động. Server sẽ từ chối khởi động ngay tại bước `prepare` với lỗi `e2_predicted_bound_exceeded` nếu dự báo vượt quá các giới hạn an toàn:
   - Dung lượng lưu trữ tăng trưởng (`total_storage_growth_bytes_estimate`) > 10 GiB (`10 << 30`).
