@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func validManifest() Manifest {
@@ -75,6 +76,186 @@ func TestDecodeOfficialE2ManifestWithRunWideOfferedRate(t *testing.T) {
 	}
 	if _, err := Validate(decoded, true); err != nil {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestOfficialE2RetryPolicyRoundTripAndExplicitNullRejected(t *testing.T) {
+	m := telemetryManifest(1)
+	m.Profile = "official"
+	m.Limits.PendingMessages = 100
+	m.DurabilityMode = "synthetic-load"
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["retry_policy"] = map[string]any{
+		"mode": "bounded_backoff_v1", "initial_interval_ms": 500,
+		"max_interval_ms": 8000, "jitter_percent": 10,
+		"rate_per_second": 100, "burst": 20,
+	}
+	encoded, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(strings.NewReader(string(encoded)))
+	if err != nil {
+		t.Fatalf("Decode valid official E2 retry policy: %v", err)
+	}
+	if _, err := Validate(decoded, true); err != nil {
+		t.Fatalf("Validate valid official E2 retry policy: %v", err)
+	}
+	roundTrip, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(roundTrip, &got); err != nil {
+		t.Fatal(err)
+	}
+	wantPolicy, _ := json.Marshal(raw["retry_policy"])
+	gotPolicy, _ := json.Marshal(got["retry_policy"])
+	if string(gotPolicy) != string(wantPolicy) {
+		t.Fatalf("retry_policy roundtrip = %#v, want %#v", got["retry_policy"], raw["retry_policy"])
+	}
+
+	raw["retry_policy"] = nil
+	encoded, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(strings.NewReader(string(encoded))); err == nil {
+		t.Fatal("explicit null retry_policy accepted; expected fail-closed rejection")
+	}
+}
+
+func TestOfficialE2ExplicitNullRetryPolicyRejected(t *testing.T) {
+	m := telemetryManifest(1)
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["retry_policy"] = nil
+	encoded, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(strings.NewReader(string(encoded))); err == nil {
+		t.Fatal("explicit null retry_policy accepted; expected fail-closed rejection")
+	}
+}
+
+func TestRetryPolicyRejectsMalformedObjects(t *testing.T) {
+	m := telemetryManifest(1)
+	m.Profile = "official"
+	m.Limits.PendingMessages = 100
+	m.DurabilityMode = "synthetic-load"
+	base, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(base, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	valid := map[string]any{
+		"mode": "bounded_backoff_v1", "initial_interval_ms": 500,
+		"max_interval_ms": 8000, "jitter_percent": 10,
+		"rate_per_second": 100, "burst": 20,
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"incomplete":         func(p map[string]any) { delete(p, "burst") },
+		"missing_zero_field": func(p map[string]any) { delete(p, "jitter_percent") },
+		"null_field":         func(p map[string]any) { p["jitter_percent"] = nil },
+		"unknown_field":      func(p map[string]any) { p["extra"] = true },
+		"boolean_integer":    func(p map[string]any) { p["burst"] = true },
+		"unknown_mode":       func(p map[string]any) { p["mode"] = "fixed" },
+		"burst_over_pending": func(p map[string]any) { p["burst"] = 101 },
+		"initial_below_min":  func(p map[string]any) { p["initial_interval_ms"] = 99 },
+		"max_below_initial":  func(p map[string]any) { p["max_interval_ms"] = 499 },
+		"jitter_above_max":   func(p map[string]any) { p["jitter_percent"] = 101 },
+		"rate_above_max":     func(p map[string]any) { p["rate_per_second"] = 10001 },
+		"burst_below_min":    func(p map[string]any) { p["burst"] = 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copyPolicy := make(map[string]any, len(valid))
+			for k, v := range valid {
+				copyPolicy[k] = v
+			}
+			mutate(copyPolicy)
+			copyManifest := make(map[string]any, len(manifest)+1)
+			for k, v := range manifest {
+				copyManifest[k] = v
+			}
+			copyManifest["retry_policy"] = copyPolicy
+			data, err := json.Marshal(copyManifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := Decode(strings.NewReader(string(data)))
+			if err == nil {
+				if _, err := Validate(decoded, true); err == nil {
+					t.Fatal("malformed retry policy accepted")
+				}
+			}
+		})
+	}
+}
+
+func TestOfficialE2RetryBacklogDoesNotPrecedeFirstPublish(t *testing.T) {
+	m := telemetryManifest(1)
+	m.Profile = "official"
+	m.Limits.PendingMessages = 10
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["retry_policy"] = map[string]any{
+		"mode": "bounded_backoff_v1", "initial_interval_ms": 500,
+		"max_interval_ms": 8000, "jitter_percent": 10,
+		"rate_per_second": 100, "burst": 10,
+	}
+	encoded, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyManifest, err := Decode(strings.NewReader(string(encoded)))
+	if err != nil {
+		t.Fatalf("Decode official E2 retry policy for scheduling regression: %v", err)
+	}
+	e, err := NewTelemetryEngine(policyManifest, map[string]TelemetryTransport{"gw-a": &fakeLoadTransport{}, "gw-b": &fakeLoadTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	firstRetry := <-e.jobs
+	e.mu.Lock()
+	p := e.pending[firstRetry]
+	p.queued = false
+	p.inFlight = false
+	p.attempts = 1
+	p.nextRetry = time.Now().Add(-time.Second)
+	e.mu.Unlock()
+	e.retryDue(time.Now())
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	queuedFirst := <-e.jobs
+	if queuedFirst == firstRetry {
+		t.Fatalf("retry backlog preceded a new first-publish job: retry=%s", firstRetry)
 	}
 }
 

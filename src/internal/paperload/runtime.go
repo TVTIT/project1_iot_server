@@ -41,6 +41,7 @@ type RunResult struct {
 	Mode                string                 `json:"mode"`
 	RunID               string                 `json:"run_id"`
 	DurabilityMode      string                 `json:"durability_mode"`
+	RetryPolicy         *RetryPolicy           `json:"retry_policy,omitempty"`
 	DurableGatewayCount int                    `json:"durable_gateway_count"`
 	StartedAt           string                 `json:"started_at"`
 	FinishedAt          string                 `json:"finished_at"`
@@ -130,7 +131,7 @@ type E4RuntimeSummary struct {
 // RunTelemetry creates one Paho TLS transport for each selected real Gateway,
 // waits for its own positive ACK SUBACK, then executes a bounded synthetic run.
 func RunTelemetry(ctx context.Context, m Manifest, manifestPath, outputDir string, observers ...func(PhaseEvent) error) (result RunResult, retErr error) {
-	result = RunResult{Implementation: "P8.4b telemetry synthetic-load; no durable restart assurance", Experiment: m.Experiment, Arm: m.Arm, Profile: m.Profile, Mode: m.Mode, RunID: m.RunID, DurabilityMode: m.DurabilityMode, DurableGatewayCount: 0, ConfiguredPhases: m.Phases, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), IdentitySampling: "header_sha256_only; maximum 20 globally; not every payload; not a full-content audit"}
+	result = RunResult{Implementation: "P8.4b telemetry synthetic-load; no durable restart assurance", Experiment: m.Experiment, Arm: m.Arm, Profile: m.Profile, Mode: m.Mode, RunID: m.RunID, DurabilityMode: m.DurabilityMode, RetryPolicy: m.RetryPolicy, DurableGatewayCount: 0, ConfiguredPhases: m.Phases, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), IdentitySampling: "header_sha256_only; maximum 20 globally; not every payload; not a full-content audit"}
 	if m.EqualSamples != nil {
 		result.EqualSamples = makeEqualSamplesSummary(m, result.Counters, "INITIALIZING")
 	}

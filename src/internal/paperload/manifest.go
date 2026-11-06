@@ -64,6 +64,18 @@ type Manifest struct {
 	Commands             []ControlCommand      `json:"commands,omitempty"`
 	E4                   E4Settings            `json:"e4,omitempty"`
 	EqualSamples         *EqualSamplesSettings `json:"equal_samples,omitempty"`
+	RetryPolicy          *RetryPolicy          `json:"retry_policy,omitempty"`
+}
+
+// RetryPolicy opts an official E2 telemetry manifest into bounded retries.
+// A nil policy preserves the legacy fixed retry interval.
+type RetryPolicy struct {
+	Mode              string `json:"mode"`
+	InitialIntervalMS int    `json:"initial_interval_ms"`
+	MaxIntervalMS     int    `json:"max_interval_ms"`
+	JitterPercent     int    `json:"jitter_percent"`
+	RatePerSecond     int    `json:"rate_per_second"`
+	Burst             int    `json:"burst"`
 }
 
 // E4Settings describes a finite unique/replay experiment. It is inert until
@@ -188,6 +200,21 @@ func Decode(r io.Reader) (Manifest, error) {
 	if raw, ok := rawTop["equal_samples"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return m, errors.New("manifest_json_invalid")
 	}
+	if raw, ok := rawTop["retry_policy"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return m, errors.New("manifest_json_invalid")
+	}
+	if raw, ok := rawTop["retry_policy"]; ok {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil || len(fields) != 6 {
+			return m, errors.New("manifest_json_invalid")
+		}
+		for _, field := range []string{"mode", "initial_interval_ms", "max_interval_ms", "jitter_percent", "rate_per_second", "burst"} {
+			value, exists := fields[field]
+			if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return m, errors.New("manifest_json_invalid")
+			}
+		}
+	}
 	d := json.NewDecoder(strings.NewReader(string(data)))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&m); err != nil {
@@ -288,6 +315,15 @@ func ValidateAt(m Manifest, officialOptIn bool, now time.Time) (Estimate, error)
 		m.Experiment == "E3" && (!roleSet["control"] || roleSet["viewer"]) ||
 		m.Experiment == "E4" && (!roleSet["telemetry"] || roleSet["control"] || roleSet["viewer"]) {
 		return bad()
+	}
+	if p := m.RetryPolicy; p != nil {
+		if m.Experiment != "E2" || m.Profile != "official" || len(m.Roles) != 1 || m.Roles[0] != "telemetry" ||
+			p.Mode != "bounded_backoff_v1" || p.InitialIntervalMS < 100 || p.InitialIntervalMS > 60000 ||
+			p.MaxIntervalMS < p.InitialIntervalMS || p.MaxIntervalMS > 60000 ||
+			p.JitterPercent < 0 || p.JitterPercent > 100 || p.RatePerSecond < 1 || p.RatePerSecond > 10000 ||
+			p.Burst < 1 || p.Burst > 100000 || p.Burst > m.Limits.PendingMessages {
+			return bad()
+		}
 	}
 	if m.Experiment == "E4" {
 		if len(m.Roles) != 1 || m.Roles[0] != "telemetry" || m.DurabilityMode != "synthetic-load" || m.E4 != (E4Settings{}) && !validE4Settings(m.E4) {

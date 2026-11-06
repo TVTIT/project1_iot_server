@@ -3,6 +3,7 @@ package paperload
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,7 @@ type pendingMessage struct {
 	nextRetry        time.Time
 	queued           bool
 	inFlight         bool
+	retryJob         bool
 }
 
 // TelemetryCounters distinguishes scheduled opportunities, unique payloads,
@@ -78,36 +80,49 @@ type TelemetryCounters struct {
 	AckLatencyTotalNS           int64  `json:"ack_latency_total_ns"`
 	AckLatencyAvailable         bool   `json:"ack_latency_available"`
 	AckLatencyUnavailableReason string `json:"ack_latency_unavailable_reason,omitempty"`
+	FirstAttempts               int64  `json:"first_attempts,omitempty"`
+	RetryAttempts               int64  `json:"retry_attempts,omitempty"`
+	RetryBudgetDelayed          int64  `json:"retry_budget_delayed,omitempty"`
+	RetryExhaustedPending       int64  `json:"retry_exhausted_pending,omitempty"`
+	RetryQueueOccupancy         int64  `json:"retry_queue_occupancy,omitempty"`
+	RetryQueueHighWater         int64  `json:"retry_queue_high_water,omitempty"`
 }
 
 // TelemetryEngine is a bounded in-memory retry engine. It provides no
 // restart/durable-outbox guarantee; pending work is reported, never discarded
 // to claim a successful drain.
 type TelemetryEngine struct {
-	m               Manifest
-	transports      map[string]TelemetryTransport
-	mu              sync.Mutex
-	pending         map[uuid.UUID]*pendingMessage
-	pendingBytes    int64
-	jobs            chan uuid.UUID
-	acks            chan ackInput
-	counts          telemetryAtomic
-	boot            map[string]uuid.UUID
-	nextSequence    map[string]int64
-	targets         map[string][]Target
-	stopGeneration  atomic.Bool
-	cleanupErrors   []string
-	identitySamples []ViewerIdentitySample
-	phaseObserver   func(PhaseEvent) error
-	phaseOrigin     time.Time
-	phaseEvents     []PhaseEvent
-	phaseFailed     bool
-	journal         *E4Journal
-	replay          []E4ReplayBatch
-	replayIndex     int
-	ignoreACKBudget int
-	fatalGeneration error
-	anchorTime      time.Time
+	m                   Manifest
+	transports          map[string]TelemetryTransport
+	mu                  sync.Mutex
+	pending             map[uuid.UUID]*pendingMessage
+	pendingBytes        int64
+	jobs                chan uuid.UUID
+	retryJobs           chan uuid.UUID
+	retryTokens         float64
+	retryRefillAt       time.Time
+	retryQueueHighWater atomic.Int64
+	retryQueueOccupancy atomic.Int64
+	retryScanAt         time.Time
+	firstPublishStreak  atomic.Int64
+	acks                chan ackInput
+	counts              telemetryAtomic
+	boot                map[string]uuid.UUID
+	nextSequence        map[string]int64
+	targets             map[string][]Target
+	stopGeneration      atomic.Bool
+	cleanupErrors       []string
+	identitySamples     []ViewerIdentitySample
+	phaseObserver       func(PhaseEvent) error
+	phaseOrigin         time.Time
+	phaseEvents         []PhaseEvent
+	phaseFailed         bool
+	journal             *E4Journal
+	replay              []E4ReplayBatch
+	replayIndex         int
+	ignoreACKBudget     int
+	fatalGeneration     error
+	anchorTime          time.Time
 }
 
 // PhaseEvent is a bounded, identity-free phase snapshot. elapsed_ns is local
@@ -143,6 +158,7 @@ type telemetryAtomic struct {
 	warmupACKs, measureACKs, burstACKs                                                                                                                                              atomic.Int64
 	generatedPayloadBytes, offeredPayloadBytes, attemptedPayloadBytes                                                                                                               atomic.Int64
 	replayScheduled, replayOffered, replayACKs, ignoredACKs                                                                                                                         atomic.Int64
+	firstAttempts, retryBudgetDelayed                                                                                                                                               atomic.Int64
 }
 
 // NewTelemetryEngine validates and constructs the bounded synthetic engine.
@@ -179,7 +195,18 @@ func NewTelemetryEngine(m Manifest, transports map[string]TelemetryTransport) (*
 			return nil, err
 		}
 	}
-	return &TelemetryEngine{m: m, transports: transports, pending: map[uuid.UUID]*pendingMessage{}, jobs: make(chan uuid.UUID, m.Limits.PendingMessages), acks: make(chan ackInput, m.Limits.PendingMessages), boot: boot, nextSequence: map[string]int64{}, targets: byGateway, anchorTime: anchorTime}, nil
+	var retryJobs chan uuid.UUID
+	if m.RetryPolicy != nil {
+		retryJobs = make(chan uuid.UUID, m.Limits.PendingMessages)
+	}
+	return &TelemetryEngine{m: m, transports: transports, pending: map[uuid.UUID]*pendingMessage{}, jobs: make(chan uuid.UUID, m.Limits.PendingMessages), retryJobs: retryJobs, acks: make(chan ackInput, m.Limits.PendingMessages), boot: boot, nextSequence: map[string]int64{}, targets: byGateway, anchorTime: anchorTime, retryTokens: float64(retryBurst(m)), retryRefillAt: time.Now()}, nil
+}
+
+func retryBurst(m Manifest) int {
+	if m.RetryPolicy == nil {
+		return 0
+	}
+	return m.RetryPolicy.Burst
 }
 
 // Admit is safe for a Paho callback: bounded copy/enqueue only. Parsing occurs
@@ -204,6 +231,20 @@ func (e *TelemetryEngine) Counters() TelemetryCounters {
 	pending, bytes := len(e.pending), e.pendingBytes
 	e.mu.Unlock()
 	c := TelemetryCounters{Scheduled: e.counts.scheduled.Load(), Missed: e.counts.missed.Load(), Deferred: e.counts.deferred.Load(), Generated: e.counts.generated.Load(), OfferedUnique: e.counts.offered.Load(), GeneratedPayloadBytes: e.counts.generatedPayloadBytes.Load(), OfferedUniquePayloadBytes: e.counts.offeredPayloadBytes.Load(), AttemptedPayloadBytes: e.counts.attemptedPayloadBytes.Load(), ACKQueueDropped: e.counts.ackQueueDropped.Load(), UnmatchedACKs: e.counts.unmatchedACKs.Load(), WarmupScheduled: e.counts.warmupScheduled.Load(), WarmupGenerated: e.counts.warmupGenerated.Load(), MeasureScheduled: e.counts.measureScheduled.Load(), MeasureGenerated: e.counts.measureGenerated.Load(), BurstScheduled: e.counts.burstScheduled.Load(), BurstGenerated: e.counts.burstGenerated.Load(), PublishAttempts: e.counts.attempts.Load(), PublishFailures: e.counts.failures.Load(), BrokerPUBACKs: e.counts.pubacks.Load(), ApplicationACKs: e.counts.appacks.Load(), ReplayScheduled: e.counts.replayScheduled.Load(), ReplayOffered: e.counts.replayOffered.Load(), ReplayApplicationACKs: e.counts.replayACKs.Load(), IgnoredValidACKs: e.counts.ignoredACKs.Load(), WarmupApplicationACKs: e.counts.warmupACKs.Load(), MeasureApplicationACKs: e.counts.measureACKs.Load(), BurstApplicationACKs: e.counts.burstACKs.Load(), InvalidACKs: e.counts.invalid.Load(), RetainedACKs: e.counts.retained.Load(), Retries: e.counts.retries.Load(), PendingMessages: int64(pending), PendingBytes: bytes, SchedulingLagMaxNS: e.counts.lag.Load(), AckLatencyCount: e.counts.latencyCount.Load(), AckLatencyTotalNS: e.counts.latencyNS.Load()}
+	c.RetryQueueOccupancy = e.retryQueueOccupancy.Load()
+	c.RetryQueueHighWater = e.retryQueueHighWater.Load()
+	if e.m.RetryPolicy != nil {
+		c.FirstAttempts = e.counts.firstAttempts.Load()
+		c.RetryAttempts = e.counts.retries.Load()
+		c.RetryBudgetDelayed = e.counts.retryBudgetDelayed.Load()
+		e.mu.Lock()
+		for _, p := range e.pending {
+			if p.attempts > e.m.Limits.Retries {
+				c.RetryExhaustedPending++
+			}
+		}
+		e.mu.Unlock()
+	}
 	c.AckLatencyAvailable = c.AckLatencyCount > 0
 	if !c.AckLatencyAvailable {
 		c.AckLatencyUnavailableReason = "no_application_ack_samples"
@@ -859,6 +900,29 @@ func (e *TelemetryEngine) worker(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if e.m.RetryPolicy != nil {
+			if e.firstPublishStreak.Load() >= 8 {
+				select {
+				case id := <-e.retryJobs:
+					e.mu.Lock()
+					e.retryQueueOccupancy.Add(-1)
+					e.mu.Unlock()
+					e.processJob(ctx, id)
+					e.firstPublishStreak.Store(0)
+					continue
+				default:
+				}
+			}
+			select {
+			case id, ok := <-e.jobs:
+				if !ok {
+					return
+				}
+				e.processWorkerJob(ctx, id)
+				continue
+			default:
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -866,8 +930,27 @@ func (e *TelemetryEngine) worker(ctx context.Context) {
 			if !ok || ctx.Err() != nil {
 				return
 			}
+			e.processWorkerJob(ctx, id)
+		case id := <-e.retryJobs:
+			e.mu.Lock()
+			e.retryQueueOccupancy.Add(-1)
+			e.mu.Unlock()
+			if ctx.Err() != nil {
+				return
+			}
 			e.processJob(ctx, id)
+			e.firstPublishStreak.Store(0)
 		}
+	}
+}
+
+func (e *TelemetryEngine) processWorkerJob(ctx context.Context, id uuid.UUID) {
+	e.mu.Lock()
+	p := e.pending[id]
+	first := p != nil && p.attempts == 0
+	e.mu.Unlock()
+	if e.processJob(ctx, id) && first {
+		e.firstPublishStreak.Add(1)
 	}
 }
 
@@ -882,8 +965,18 @@ func (e *TelemetryEngine) processJob(ctx context.Context, id uuid.UUID) bool {
 		return false
 	}
 	p.queued = false
+	p.retryJob = false
 	p.inFlight = true
 	retry := p.attempts > 0
+	if retry && e.m.RetryPolicy != nil {
+		if !e.takeRetryToken(time.Now()) {
+			p.inFlight = false
+			p.nextRetry = time.Now().Add(100 * time.Millisecond)
+			e.mu.Unlock()
+			e.counts.retryBudgetDelayed.Add(1)
+			return false
+		}
+	}
 	p.attempts++
 	if p.firstPublishedAt.IsZero() {
 		p.firstPublishedAt = time.Now()
@@ -898,6 +991,8 @@ func (e *TelemetryEngine) processJob(ctx context.Context, id uuid.UUID) bool {
 	e.counts.attemptedPayloadBytes.Add(int64(len(p.batch.Payload)))
 	if retry {
 		e.counts.retries.Add(1)
+	} else if e.m.RetryPolicy != nil {
+		e.counts.firstAttempts.Add(1)
 	}
 	e.mu.Unlock()
 	err := e.transports[p.batch.Batch.GatewayID].Publish(ctx, p.batch.Topic, p.batch.Payload)
@@ -910,7 +1005,11 @@ func (e *TelemetryEngine) handlePublishResult(id uuid.UUID, publishErr error) {
 	p := e.pending[id]
 	if p != nil {
 		p.inFlight = false
-		p.nextRetry = time.Now().Add(time.Duration(e.m.RetryIntervalMS) * time.Millisecond)
+		if e.m.RetryPolicy != nil {
+			p.nextRetry = time.Now().Add(retryDelay(*e.m.RetryPolicy, p.batch.Batch.MessageID, p.attempts))
+		} else {
+			p.nextRetry = time.Now().Add(time.Duration(e.m.RetryIntervalMS) * time.Millisecond)
+		}
 	}
 	e.mu.Unlock()
 	if publishErr != nil {
@@ -922,6 +1021,42 @@ func (e *TelemetryEngine) handlePublishResult(id uuid.UUID, publishErr error) {
 func (e *TelemetryEngine) retryDue(now time.Time) {
 	e.mu.Lock()
 	deferred := int64(0)
+	if e.m.RetryPolicy != nil {
+		if !e.retryScanAt.IsZero() && now.Sub(e.retryScanAt) < 50*time.Millisecond {
+			e.mu.Unlock()
+			return
+		}
+		e.retryScanAt = now
+		// Policy scheduling scans at a bounded 50ms cadence (rather than every
+		// 1ms) and never queues more than one retry for a pending message.
+		for id, p := range e.pending {
+			if p.attempts == 0 || p.queued || p.inFlight || p.nextRetry.After(now) {
+				continue
+			}
+			if p.attempts > e.m.Limits.Retries {
+				p.nextRetry = time.Time{}
+				continue
+			}
+			p.queued, p.retryJob = true, true
+			select {
+			case e.retryJobs <- id:
+				n := e.retryQueueOccupancy.Add(1)
+				for {
+					old := e.retryQueueHighWater.Load()
+					if n <= old || e.retryQueueHighWater.CompareAndSwap(old, n) {
+						break
+					}
+				}
+			default:
+				p.queued = false
+				p.retryJob = false
+				p.nextRetry = now.Add(50 * time.Millisecond)
+			}
+		}
+		e.mu.Unlock()
+		e.counts.deferred.Add(deferred)
+		return
+	}
 	for id, p := range e.pending {
 		if p.attempts > 0 && !p.queued && !p.inFlight && !p.nextRetry.After(now) && p.attempts <= e.m.Limits.Retries {
 			p.queued = true
@@ -936,6 +1071,62 @@ func (e *TelemetryEngine) retryDue(now time.Time) {
 	}
 	e.mu.Unlock()
 	e.counts.deferred.Add(deferred)
+}
+
+func (e *TelemetryEngine) takeRetryToken(now time.Time) bool {
+	p := e.m.RetryPolicy
+	if p == nil {
+		return true
+	}
+	elapsed := now.Sub(e.retryRefillAt)
+	if elapsed > 0 {
+		e.retryTokens += elapsed.Seconds() * float64(p.RatePerSecond)
+		if e.retryTokens > float64(p.Burst) {
+			e.retryTokens = float64(p.Burst)
+		}
+		e.retryRefillAt = now
+	}
+	if e.retryTokens < 1 {
+		return false
+	}
+	e.retryTokens--
+	return true
+}
+
+func retryDelay(p RetryPolicy, id uuid.UUID, attempts int) time.Duration {
+	d := time.Duration(p.InitialIntervalMS) * time.Millisecond
+	for i := 1; i < attempts && d < time.Duration(p.MaxIntervalMS)*time.Millisecond; i++ {
+		if d > time.Duration(p.MaxIntervalMS)*time.Millisecond/2 {
+			d = time.Duration(p.MaxIntervalMS) * time.Millisecond
+			break
+		}
+		d *= 2
+	}
+	max := time.Duration(p.MaxIntervalMS) * time.Millisecond
+	if d > max {
+		d = max
+	}
+	if p.JitterPercent == 0 {
+		if d <= 0 {
+			return time.Nanosecond
+		}
+		return d
+	}
+	h := sha256.Sum256([]byte(id.String() + ":" + strconv.Itoa(attempts)))
+	span := int64(d) * int64(p.JitterPercent) / 100
+	if span == 0 {
+		return d
+	}
+	width := uint64(2*span + 1)
+	offset := int64(binary.BigEndian.Uint64(h[:8])%width) - span
+	d += time.Duration(offset)
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	if d > max {
+		return max
+	}
+	return d
 }
 func (e *TelemetryEngine) handleACK(a ackInput) {
 	if a.retained {

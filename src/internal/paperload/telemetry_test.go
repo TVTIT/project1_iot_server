@@ -151,6 +151,295 @@ func TestFiniteNoACKDrainKeepsPendingAndReturnsPartial(t *testing.T) {
 	}
 }
 
+func retryTestEngine(t *testing.T, retries int) (*TelemetryEngine, *fakeLoadTransport) {
+	t.Helper()
+	m := telemetryManifest(1)
+	m.Targets = []Target{{GatewayID: "gw-a", SensorID: "s-a"}}
+	m.Limits.Retries = retries
+	m.RetryPolicy = &RetryPolicy{Mode: "bounded_backoff_v1", InitialIntervalMS: 100, MaxIntervalMS: 400, JitterPercent: 10, RatePerSecond: 2, Burst: 1}
+	f := &fakeLoadTransport{}
+	e, err := NewTelemetryEngine(m, map[string]TelemetryTransport{"gw-a": f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e, f
+}
+
+func TestBoundedRetryDelayDeterministicExponentialCapAndPositiveJitter(t *testing.T) {
+	p := RetryPolicy{InitialIntervalMS: 100, MaxIntervalMS: 400, JitterPercent: 100}
+	id := uuid.New()
+	for n, want := range []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 400 * time.Millisecond} {
+		a, b := retryDelay(p, id, n+1), retryDelay(p, id, n+1)
+		if a != b || a <= 0 || a > 400*time.Millisecond {
+			t.Fatalf("attempt %d delay=%s second=%s", n+1, a, b)
+		}
+		if n == 3 && want != 400*time.Millisecond {
+			t.Fatal("bad cap test")
+		}
+	}
+}
+
+func TestRetryTokenEnvelopeBoundsActualDispatches(t *testing.T) {
+	e, _ := retryTestEngine(t, 4)
+	e.m.RetryPolicy.Burst = 2
+	e.retryTokens = 2
+	start := time.Now()
+	first := e.takeRetryToken(start)
+	second := e.takeRetryToken(start)
+	if !first || !second {
+		t.Fatal("configured retry burst was not available")
+	}
+	if e.takeRetryToken(start) {
+		t.Fatal("retry dispatch exceeded burst without elapsed time")
+	}
+	if !e.takeRetryToken(start.Add(500 * time.Millisecond)) {
+		t.Fatal("one token per half-second was not replenished")
+	}
+}
+
+func TestPolicyRetryTokenWaitDoesNotCountAndRetryIsByteIdentical(t *testing.T) {
+	e, f := retryTestEngine(t, 2)
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	id := <-e.jobs
+	if !e.processJob(context.Background(), id) {
+		t.Fatal("initial publish")
+	}
+	original := append([]byte(nil), f.publishes[0]...)
+	e.mu.Lock()
+	e.pending[id].nextRetry = time.Now().Add(-time.Second)
+	e.retryScanAt = time.Time{}
+	e.retryTokens = 1
+	e.mu.Unlock()
+	e.retryDue(time.Now().Add(time.Second))
+	queued := <-e.retryJobs
+	e.retryQueueOccupancy.Add(-1)
+	e.retryTokens = 0
+	if e.processJob(context.Background(), queued) {
+		t.Fatal("retry unexpectedly dispatched without token")
+	}
+	if c := e.Counters(); c.Retries != 0 || c.PublishAttempts != 1 || c.RetryBudgetDelayed != 1 {
+		t.Fatalf("token wait accounting: %+v", c)
+	}
+	e.mu.Lock()
+	e.pending[id].nextRetry = time.Now().Add(-time.Second)
+	e.retryScanAt = time.Time{}
+	e.retryTokens = 1
+	e.mu.Unlock()
+	e.retryDue(time.Now().Add(time.Second))
+	queued = <-e.retryJobs
+	e.retryQueueOccupancy.Add(-1)
+	if !e.processJob(context.Background(), queued) {
+		t.Fatal("retry not dispatched")
+	}
+	if string(original) != string(f.publishes[1]) {
+		t.Fatal("retry bytes changed")
+	}
+}
+
+func TestPolicyACKBeforeRetryDequeueAndExhaustionRetainEvidence(t *testing.T) {
+	e, f := retryTestEngine(t, 1)
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	id := <-e.jobs
+	e.processJob(context.Background(), id)
+	e.mu.Lock()
+	e.pending[id].nextRetry = time.Now().Add(-time.Second)
+	e.retryScanAt = time.Time{}
+	e.mu.Unlock()
+	e.retryDue(time.Now().Add(time.Second))
+	e.handleACK(ackInput{gatewayID: "gw-a", topic: "gateways/gw-a/acks/" + id.String(), payload: commitACKPayload(id), at: time.Now()})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { e.worker(ctx); close(done) }()
+	deadline := time.Now().Add(time.Second)
+	for e.retryQueueOccupancy.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	if e.retryQueueOccupancy.Load() != 0 || len(f.publishes) != 1 {
+		t.Fatal("ACKed retry was published")
+	}
+
+	e2, f2 := retryTestEngine(t, 0)
+	if err := e2.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	id2 := <-e2.jobs
+	e2.processJob(context.Background(), id2)
+	e2.mu.Lock()
+	e2.pending[id2].nextRetry = time.Now().Add(-time.Second)
+	e2.retryScanAt = time.Time{}
+	e2.mu.Unlock()
+	e2.retryDue(time.Now().Add(time.Second))
+	if e2.Counters().RetryExhaustedPending != 1 || e2.Counters().PendingMessages != 1 || len(f2.publishes) != 1 {
+		t.Fatalf("exhaustion discarded pending: %+v", e2.Counters())
+	}
+}
+
+func TestPolicyCancellationDoesNotEraseQueuedPending(t *testing.T) {
+	e, f := retryTestEngine(t, 2)
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	id := <-e.jobs
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if e.processJob(ctx, id) {
+		t.Fatal("canceled publish was dispatched")
+	}
+	if c := e.Counters(); c.PendingMessages != 1 || c.PublishAttempts != 0 || len(f.publishes) != 0 {
+		t.Fatalf("cancellation lost pending evidence or counted a publish: %+v", c)
+	}
+}
+
+func TestPolicyRetryQueueBoundedWithLargePendingAndFirstPublishProgress(t *testing.T) {
+	e, _ := retryTestEngine(t, 2)
+	e.m.Limits.PendingMessages = 128
+	e.jobs = make(chan uuid.UUID, 128)
+	e.retryJobs = make(chan uuid.UUID, 128)
+	for i := 0; i < 100; i++ {
+		if err := e.generate(time.Now(), "measure"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 100; i++ {
+		id := <-e.jobs
+		e.mu.Lock()
+		p := e.pending[id]
+		p.attempts = 1
+		p.nextRetry = time.Now().Add(-time.Second)
+		e.mu.Unlock()
+	}
+	e.retryScanAt = time.Time{}
+	e.retryDue(time.Now())
+	if len(e.retryJobs) > 128 || e.Counters().RetryQueueOccupancy > 128 {
+		t.Fatalf("retry queue unbounded: %+v", e.Counters())
+	}
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.jobs) != 1 {
+		t.Fatal("retry backlog prevented first publish queue progress")
+	}
+}
+
+func TestPolicyRetryOccupancyDecrementsOnceWhenTokenDenied(t *testing.T) {
+	e, _ := retryTestEngine(t, 2)
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	id := <-e.jobs
+	e.processJob(context.Background(), id)
+	e.mu.Lock()
+	e.pending[id].nextRetry = time.Now().Add(-time.Second)
+	e.retryScanAt = time.Time{}
+	e.retryTokens = 0
+	e.mu.Unlock()
+	e.retryDue(time.Now())
+	if got := e.retryQueueOccupancy.Load(); got != 1 {
+		t.Fatalf("queued occupancy=%d, want 1", got)
+	}
+	queued := <-e.retryJobs
+	e.retryQueueOccupancy.Add(-1) // worker's dequeue accounting
+	e.processJob(context.Background(), queued)
+	if got := e.retryQueueOccupancy.Load(); got != 0 {
+		t.Fatalf("occupancy after denied dispatch=%d, want 0", got)
+	}
+	if got := e.retryQueueHighWater.Load(); got > int64(cap(e.retryJobs)) {
+		t.Fatalf("high-water exceeded capacity: %d", got)
+	}
+}
+
+func TestPolicyExhaustedPendingMetricIsCurrentAndACKRemovesIt(t *testing.T) {
+	e, _ := retryTestEngine(t, 0)
+	if err := e.generate(time.Now(), "measure"); err != nil {
+		t.Fatal(err)
+	}
+	id := <-e.jobs
+	e.processJob(context.Background(), id)
+	e.mu.Lock()
+	e.pending[id].nextRetry = time.Time{}
+	e.mu.Unlock()
+	for i := 0; i < 4; i++ {
+		e.retryDue(time.Now().Add(time.Duration(i+1) * time.Second))
+	}
+	if got := e.Counters().RetryExhaustedPending; got != 1 {
+		t.Fatalf("exhausted metric inflated: %d", got)
+	}
+	e.handleACK(ackInput{gatewayID: "gw-a", topic: "gateways/gw-a/acks/" + id.String(), payload: commitACKPayload(id), at: time.Now()})
+	if got := e.Counters().RetryExhaustedPending; got != 0 {
+		t.Fatalf("exhausted metric after ACK=%d, want 0", got)
+	}
+}
+
+func TestPolicyRetryGetsFairOpportunityDuringFirstPublishBacklog(t *testing.T) {
+	e, f := retryTestEngine(t, 2)
+	const firstCount = 12
+	e.m.Limits.PendingMessages = firstCount + 1
+	e.m.Limits.PendingBytes = 1 << 20
+	e.jobs = make(chan uuid.UUID, firstCount)
+	e.retryJobs = make(chan uuid.UUID, 1)
+	e.retryTokens = 1
+	var retryID uuid.UUID
+	for i := 0; i < firstCount; i++ {
+		if err := e.generate(time.Now(), "measure"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := make([]uuid.UUID, 0, firstCount)
+	for i := 0; i < firstCount; i++ {
+		first = append(first, <-e.jobs)
+	}
+	retryID = uuid.New()
+	e.pending[retryID] = e.pending[first[0]]
+	e.pending[retryID].attempts = 1
+	e.pending[retryID].queued = true
+	e.pending[retryID].retryJob = true
+	delete(e.pending, first[0])
+	for _, id := range first[1:] {
+		e.jobs <- id
+	}
+	retryPayload := append([]byte(nil), e.pending[retryID].batch.Payload...)
+	e.retryJobs <- retryID
+	e.retryQueueOccupancy.Store(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { e.worker(ctx); close(done) }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		n := len(f.publishes)
+		f.mu.Unlock()
+		if n >= 9 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.publishes) < 9 || string(f.publishes[8]) != string(retryPayload) {
+		t.Fatalf("retry starved by first-publish backlog")
+	}
+}
+
+func TestLegacyManifestDoesNotAllocateRetryQueue(t *testing.T) {
+	m := telemetryManifest(1)
+	m.Targets = []Target{{GatewayID: "gw-a", SensorID: "s-a"}}
+	e, err := NewTelemetryEngine(m, map[string]TelemetryTransport{"gw-a": &fakeLoadTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.retryJobs != nil {
+		t.Fatal("legacy manifest allocated policy retry queue")
+	}
+}
+
 func TestGenerationFailureCannotCompleteWithZeroOffered(t *testing.T) {
 	m := telemetryManifest(100)
 	m.Targets = []Target{{GatewayID: "gw-a", SensorID: "s-a"}}
