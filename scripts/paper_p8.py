@@ -25,12 +25,25 @@ except ImportError:
     from paper_p8_resources import OwnedStorageGuard
 
 try:
-    from scripts.paper_p8_bundle import _validate_equal_samples_manifest_obj
+    from scripts.paper_p8_bundle import (
+        _validate_equal_samples_manifest_obj,
+        _is_validated_e1_viewer_file,
+        MAX_READINESS_SECONDS,
+        MAX_E1_VIEWER_READINESS_SECONDS,
+    )
 except ImportError:
     try:
-        from paper_p8_bundle import _validate_equal_samples_manifest_obj
+        from paper_p8_bundle import (
+            _validate_equal_samples_manifest_obj,
+            _is_validated_e1_viewer_file,
+            MAX_READINESS_SECONDS,
+            MAX_E1_VIEWER_READINESS_SECONDS,
+        )
     except ImportError:
         _validate_equal_samples_manifest_obj = None
+        _is_validated_e1_viewer_file = None
+        MAX_READINESS_SECONDS = 120
+        MAX_E1_VIEWER_READINESS_SECONDS = 300
 
 
 MAX_CHILD_TIMEOUT_SECONDS = 30
@@ -283,7 +296,14 @@ def _read_spec(path, manifest, output_dir):
         if len(jobs) != len(spec.get('paperload', [])):
             raise PaperloadInputError('run spec paperload entry is invalid')
         for job in jobs:
-            if job['role'] not in ('auto', 'viewer', 'telemetry', 'control') or not isinstance(job['ready_timeout_seconds'], (int,float)) or not 0 < job['ready_timeout_seconds'] <= 120:
+            if job['role'] not in ('auto', 'viewer', 'telemetry', 'control'):
+                raise PaperloadInputError('run spec paperload role/readiness is invalid')
+            timeout = job['ready_timeout_seconds']
+            if type(timeout) is bool or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise PaperloadInputError('run spec paperload role/readiness is invalid')
+            is_e1_viewer = bool(_is_validated_e1_viewer_file and _is_validated_e1_viewer_file(job['manifest'], job['role'], timeout))
+            max_timeout = MAX_E1_VIEWER_READINESS_SECONDS if is_e1_viewer else MAX_READINESS_SECONDS
+            if timeout > max_timeout:
                 raise PaperloadInputError('run spec paperload role/readiness is invalid')
         gateway_items = []
         for item in gateways:

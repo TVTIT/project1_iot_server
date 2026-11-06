@@ -13,6 +13,15 @@ except ModuleNotFoundError:
     _resources = importlib.util.module_from_spec(_resources_spec)
     _resources_spec.loader.exec_module(_resources)
     disk_guard_config = _resources.disk_guard_config
+try:
+    from scripts.paper_p8_bundle import e1_timing_budget
+except ImportError:
+    try:
+        from paper_p8_bundle import e1_timing_budget
+    except ImportError:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from paper_p8_bundle import e1_timing_budget
 import signal
 import subprocess
 import time
@@ -153,11 +162,16 @@ def build_e1_execution_plan(*, output_dir, viewer_manifest, telemetry_manifest, 
             raise ValueError('e1_worker_queue_policy_mismatch')
     if viewer.get('targets') != telemetry.get('targets'):
         raise ValueError('e1_target_topology_mismatch')
-    # The viewer must have time to establish every selected socket and receive
-    # each broker SUBACK before telemetry is allowed to start. Keep this finite
-    # and derived from the manifest's configured measurement/drain window.
-    readiness_budget = min(120, max(5, sum(viewer['phases'].get(key, 0)
-        for key in ('warmup_seconds', 'measure_seconds', 'drain_seconds'))))
+    # The viewer must have time to establish every selected socket and complete
+    # its subscription handshake before telemetry is allowed to start. Keep this finite
+    # and derived from the manifest's configured timing budget.
+    viewer_count = viewer.get('topology', {}).get('viewers', viewer.get('limits', {}).get('connections', 64))
+    timing = e1_timing_budget(
+        viewer_count,
+        phases=viewer.get('phases', {}),
+        declared_ramp=viewer.get('traffic', {}).get('ramp_seconds'),
+    )
+    readiness_budget = timing['ready_timeout_seconds']
     spec={'paperload':[{'manifest':str(path),'output_dir':str(root/(out)),'role':role,
                         'ready_timeout_seconds': readiness_budget if role == 'viewer' else 90}
                        for (role,path),out in zip(manifests,(viewer_output,telemetry_output))],

@@ -24,6 +24,8 @@ MAX_TOTAL_BYTES = 32 << 20
 MAX_FILES = 96
 MAX_WAIT_SECONDS = 7200
 MAX_E5_VIEWER_SECONDS = 3600
+MAX_READINESS_SECONDS = 120
+MAX_E1_VIEWER_READINESS_SECONDS = 300
 SAFE_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 MANIFEST_TOP = {'schema_version','experiment','arm','profile','mode','run_id','seed','roles',
     'samples_per_message','topology','targets','subscriptions','traffic','phases','limits','tls',
@@ -52,6 +54,101 @@ E2_EQUAL_SAMPLES_WORKLOAD_KEYS = frozenset({
 
 def _fail(code):
     raise ValueError(code)
+
+
+def _is_e1_viewer_manifest(manifest_data, role):
+    if role not in ('viewer', 'auto'):
+        return False
+    if not isinstance(manifest_data, dict):
+        return False
+    return manifest_data.get('experiment') == 'E1' and manifest_data.get('roles') == ['viewer']
+
+
+def _is_validated_e1_viewer_file(manifest_path, role, ready_timeout_seconds=None):
+    if role not in ('viewer', 'auto'):
+        return False
+    if not isinstance(manifest_path, (str, Path)) or not manifest_path or '\x00' in str(manifest_path) or str(manifest_path).startswith('-'):
+        return False
+    try:
+        p = Path(manifest_path)
+        if any(component.is_symlink() for component in (p, *p.parents)):
+            return False
+        if not p.is_file():
+            return False
+        st = p.stat()
+        if st.st_size <= 0 or st.st_size > MAX_MANIFEST_BYTES:
+            return False
+        data = json.loads(p.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            return False
+        if data.get('experiment') != 'E1' or data.get('roles') != ['viewer']:
+            return False
+        _strict_manifest(data, 'E1', data.get('arm', ''))
+        if ready_timeout_seconds is not None and ready_timeout_seconds > MAX_READINESS_SECONDS:
+            viewers = data.get('topology', {}).get('viewers', 0)
+            connections = data.get('limits', {}).get('connections', 0)
+            count = viewers if (type(viewers) is int and viewers > 0) else connections
+            ramp = data.get('traffic', {}).get('ramp_seconds', 0)
+            wall = data.get('limits', {}).get('wall_seconds', 0)
+            if type(count) is not int or count < 1:
+                return False
+            if type(ramp) is not int or ramp <= 0:
+                return False
+            if type(wall) is not int or wall < ready_timeout_seconds:
+                return False
+            timing = e1_timing_budget(count, phases=data.get('phases'), declared_ramp=ramp)
+            if wall < timing['wall_seconds']:
+                return False
+        return True
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return False
+
+
+def e1_timing_budget(viewers, phases=None, declared_ramp=None):
+    """Compute deterministic E1 ramp, readiness timeout, and wall seconds."""
+    if type(viewers) is not int or type(viewers) is bool or viewers < 1:
+        raise ValueError('e1_viewer_count_rejected')
+    phase_keys = ('warmup_seconds', 'measure_seconds', 'drain_seconds', 'cooldown_seconds')
+    phase_values = dict(phases or {'warmup_seconds': 0, 'measure_seconds': 14,
+                                   'drain_seconds': 8, 'cooldown_seconds': 0})
+    if not isinstance(phase_values, dict):
+        raise ValueError('e1_phase_budget_rejected')
+    for k in phase_keys:
+        v = phase_values.get(k, 0)
+        if type(v) is not int or type(v) is bool or v < 0 or v > 7200:
+            raise ValueError('e1_phase_budget_rejected')
+    phase_sum = sum(phase_values.get(k, 0) for k in phase_keys)
+    phase_workload = sum(phase_values.get(k, 0) for k in ('warmup_seconds', 'measure_seconds', 'drain_seconds'))
+    if phase_sum < 0 or phase_sum > 7200:
+        raise ValueError('e1_phase_budget_rejected')
+    if declared_ramp is not None:
+        if type(declared_ramp) is not int or type(declared_ramp) is bool or declared_ramp < 0 or declared_ramp > 7200:
+            raise ValueError('e1_ramp_budget_rejected')
+
+    if declared_ramp is not None:
+        ramp_seconds = declared_ramp
+    else:
+        ramp_seconds = min(120, max(1, viewers // 50))
+
+    if viewers >= 2000:
+        setup_grace = 60
+        ready_seconds = ramp_seconds + setup_grace
+    else:
+        pilot_grace = max(5, phase_workload)
+        ready_seconds = max(pilot_grace, ramp_seconds)
+
+    wall_seconds = ready_seconds + phase_sum + 8
+
+    if ready_seconds > MAX_E1_VIEWER_READINESS_SECONDS:
+        raise ValueError('e1_readiness_budget_rejected')
+    if wall_seconds < 1 or wall_seconds > 7200:
+        raise ValueError('e1_phase_budget_rejected')
+
+    return {
+        'ramp_seconds': ramp_seconds,
+        'ready_timeout_seconds': ready_seconds,
+        'wall_seconds': wall_seconds,
+    }
 
 
 def _source(path, *, limit=MAX_FILE_BYTES):
@@ -83,6 +180,25 @@ def _json_file(path, *, limit=MAX_FILE_BYTES):
     except (ValueError, UnicodeDecodeError):
         _fail('bundle_source_json_rejected')
     return value
+
+
+def _derive_e1_lifecycle(manifests):
+    """Conservative finite upper budget for staggered viewer/telemetry startup."""
+    if type(manifests) is not dict or set(manifests) != {'viewer', 'telemetry'}:
+        _fail('bundle_e1_lifecycle_rejected')
+    walls = {}
+    for role, source in manifests.items():
+        raw = _json_file(source, limit=MAX_MANIFEST_BYTES) if isinstance(source, (str, Path)) else source
+        if type(raw) is not dict:
+            _fail('bundle_e1_lifecycle_rejected')
+        limits = raw.get('limits')
+        wall = limits.get('wall_seconds') if type(limits) is dict else None
+        if (raw.get('roles') != [role] or type(wall) is not int or wall < 1 or wall > 7200):
+            _fail('bundle_e1_lifecycle_rejected')
+        walls[role] = wall
+    # Viewer starts first and remains alive while telemetry starts; sum is a
+    # conservative finite upper budget, not measured sequential execution.
+    return sum(walls.values())
 
 
 def _write(root, rel, data, *, private=True):
@@ -785,8 +901,20 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             rel=f'private/gateways/{gateway_id}.json'
             _copy_input(root,source,rel,inventory,'gateway_credential')
             gateway_refs[gateway_id]=rel
-        effective_workload_seconds = (max(workload_seconds, validated_e5_lifecycle['deadline_seconds'])
-                                      if experiment == 'E5' else workload_seconds)
+        if experiment == 'E1':
+            e1_lifecycle = _derive_e1_lifecycle(manifests)
+            effective_workload_seconds = max(workload_seconds, e1_lifecycle)
+        elif experiment == 'E5':
+            effective_workload_seconds = max(workload_seconds, validated_e5_lifecycle['deadline_seconds'])
+        else:
+            effective_workload_seconds = workload_seconds
+
+        if (type(effective_workload_seconds) not in (int, float)
+                or not math.isfinite(effective_workload_seconds)
+                or effective_workload_seconds < 0
+                or wait_seconds + effective_workload_seconds > MAX_WAIT_SECONDS):
+            _fail('bundle_wait_bound_rejected')
+
         expiry_required = workload.get('expiry_required_lifetime_seconds') if isinstance(workload, dict) else None
         if expiry_required is not None:
             if (experiment != 'E4' or type(expiry_required) not in (int, float)
@@ -795,9 +923,10 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
             required_lifetime = max(wait_seconds + effective_workload_seconds,
                                     expiry_required)
         else:
-            required_lifetime=wait_seconds+effective_workload_seconds
-        now=time.time()
-        if any(exp-now < required_lifetime for _,exp in jwt_expiries): _fail('bundle_identity_near_expiry')
+            required_lifetime = wait_seconds + effective_workload_seconds
+        now = time.time()
+        if any(exp - now < required_lifetime for _, exp in jwt_expiries):
+            _fail('bundle_identity_near_expiry')
 
         referenced_gateways=set(); referenced_identities=set()
         for label, source in manifests.items():
@@ -996,7 +1125,15 @@ def export_bundle(*, output_leaf, session_id, experiment, arm, phase, manifests,
                 if label is None or job.get('role',rewritten[label]['roles'][0]) != rewritten[label]['roles'][0]:
                     _fail('bundle_run_spec_reference_rejected')
                 timeout=job.get('ready_timeout_seconds',90)
-                if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0 < timeout <= 120:
+                if type(timeout) is bool or type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout <= 0:
+                    _fail('bundle_run_spec_rejected')
+                job_role = job.get('role', rewritten[label]['roles'][0])
+                is_e1_viewer = (
+                    experiment == 'E1'
+                    and _is_e1_viewer_manifest(rewritten[label], job_role)
+                )
+                max_timeout = MAX_E1_VIEWER_READINESS_SECONDS if is_e1_viewer else MAX_READINESS_SECONDS
+                if timeout > max_timeout:
                     _fail('bundle_run_spec_rejected')
                 spec['paperload'].append({'manifest':manifest_refs[label],
                     'output_dir':f'outputs/{label}', 'role':rewritten[label]['roles'][0],
@@ -1206,8 +1343,25 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
                    json.dumps(bound_durable_probe, sort_keys=True, separators=(',', ':')).encode())
 
         elapsed = max(elapsed_transfer_wait_seconds, time.time() - metadata['created_at_unix'])
+        effective_bound_workload = metadata['workload_seconds']
+        if metadata.get('session', {}).get('experiment') == 'E1':
+            manifest_inputs = {}
+            for rel, row in inventory.items():
+                if row['kind'] != 'manifest':
+                    continue
+                source = workspace / 'inputs' / rel
+                roles = _json_file(source, limit=MAX_MANIFEST_BYTES).get('roles')
+                if type(roles) is list and len(roles) == 1:
+                    if roles[0] in manifest_inputs:
+                        _fail('bundle_e1_lifecycle_rejected')
+                    manifest_inputs[roles[0]] = source
+            bound_e1_lifecycle = _derive_e1_lifecycle(manifest_inputs)
+            if effective_bound_workload < bound_e1_lifecycle:
+                _fail('bundle_workload_budget_rejected')
+            effective_bound_workload = max(effective_bound_workload, bound_e1_lifecycle)
+
         required_lifetime = (
-            max(0.0, metadata['wait_seconds'] - elapsed) + metadata['workload_seconds']
+            max(0.0, metadata['wait_seconds'] - elapsed) + effective_bound_workload
             + metadata.get('additional_token_lifetime_seconds', 0)
         )
         expiries = []
@@ -1328,7 +1482,14 @@ def bind_bundle(*, bundle_root, workspace_leaf, elapsed_transfer_wait_seconds=0)
             if role != manifest_input['roles'][0]:
                 _fail('bundle_run_spec_reference_rejected')
             timeout = job['ready_timeout_seconds']
-            if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 120:
+            if type(timeout) is bool or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                _fail('bundle_run_spec_rejected')
+            is_e1_viewer = (
+                metadata.get('session', {}).get('experiment') == 'E1'
+                and _is_e1_viewer_manifest(manifest_input, role)
+            )
+            max_timeout = MAX_E1_VIEWER_READINESS_SECONDS if is_e1_viewer else MAX_READINESS_SECONDS
+            if timeout > max_timeout:
                 _fail('bundle_run_spec_rejected')
             output_ref = _safe_ref(job['output_dir'])
             if not output_ref.startswith('outputs/'):

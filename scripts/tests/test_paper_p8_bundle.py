@@ -119,6 +119,93 @@ class PortableBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'bundle_checksum_mismatch'):
             bundle.inspect_bundle(root)
 
+    def test_e1_bundle_lifetime_covers_manifest_wall_after_copy_delay(self):
+        self.viewer['limits']['wall_seconds'] = 210
+        write(self.src/'viewer.manifest.json', self.viewer)
+        result=self.export(workload_seconds=50, wait_seconds=0)
+        metadata=json.loads((Path(result['bundle_root'])/'bundle.json').read_text())
+        self.assertGreaterEqual(metadata['workload_seconds'],210)
+        (self.root / 'B').mkdir(mode=0o700, exist_ok=True)
+        workspace = self.root / 'B' / 'delay-workspace'
+        bound = bundle.bind_bundle(bundle_root=result['bundle_root'],
+            workspace_leaf=workspace, elapsed_transfer_wait_seconds=40)
+        self.assertEqual(bound['session']['session_id'], 'session-actual-1')
+
+    def test_e1_export_rejects_insufficient_jwt_for_large_manifest_wall(self):
+        self.viewer['limits']['wall_seconds'] = 210
+        write(self.src/'viewer.manifest.json', self.viewer)
+        issued_at = int(time.time())
+        write(self.src/'viewer.json', {'user-a': token(issued_at + 150),
+                                       'user-b': token(issued_at + 150)})
+        with self.assertRaisesRegex(ValueError, 'bundle_identity_near_expiry'):
+            self.export(leaf=self.parent/'short-jwt', workload_seconds=50, wait_seconds=0)
+
+    def test_e1_bind_rejects_near_expiry_after_transfer_elapsed_for_large_manifest_wall(self):
+        self.viewer['limits']['wall_seconds'] = 210
+        write(self.src/'viewer.manifest.json', self.viewer)
+        issued_at = int(time.time())
+        write(self.src/'viewer.json', {'user-a': token(issued_at + 260),
+                                       'user-b': token(issued_at + 260)})
+        exported = self.export(leaf=self.parent/'transfer-expiry', wait_seconds=0, workload_seconds=50)
+        (self.root / 'B').mkdir(mode=0o700, exist_ok=True)
+        with patch.object(bundle.time, 'time', return_value=issued_at + 60):
+            with self.assertRaisesRegex(ValueError, 'bundle_identity_near_expiry'):
+                bundle.bind_bundle(bundle_root=exported['bundle_root'],
+                    workspace_leaf=self.root / 'B' / 'expired-workspace',
+                    elapsed_transfer_wait_seconds=60)
+
+    def test_e1_bind_rejects_tampered_workload_budget_smaller_than_manifest_wall(self):
+        self.viewer['limits']['wall_seconds'] = 210
+        write(self.src/'viewer.manifest.json', self.viewer)
+        exported = self.export(leaf=self.parent/'tampered-budget', wait_seconds=0, workload_seconds=50)
+        bundle_root = Path(exported['bundle_root'])
+        b_meta = json.loads((bundle_root / 'bundle.json').read_text())
+        b_meta['workload_seconds'] = 50
+        (bundle_root / 'bundle.json').write_text(json.dumps(b_meta))
+        (self.root / 'B').mkdir(mode=0o700, exist_ok=True)
+        with self.assertRaisesRegex(ValueError, 'bundle_workload_budget_rejected'):
+            bundle.bind_bundle(bundle_root=bundle_root,
+                workspace_leaf=self.root / 'B' / 'tampered-workspace')
+
+    def test_e1_export_rejects_workload_exceeding_max_wait(self):
+        self.viewer['limits']['wall_seconds'] = 7150
+        write(self.src/'viewer.manifest.json', self.viewer)
+        with self.assertRaisesRegex(ValueError, 'bundle_wait_bound_rejected'):
+            self.export(leaf=self.parent/'over-max-wait', wait_seconds=100, workload_seconds=50)
+
+    def test_e1_bundle_preserves_readiness_budget_above_120(self):
+        spec=json.loads((self.src/'run-spec.json').read_text())
+        spec['paperload'][0]['ready_timeout_seconds']=160
+        spec['paperload'][1]['ready_timeout_seconds']=90
+        write(self.src/'run-spec.json',spec)
+        result=self.export()
+        bound=bundle.bind_bundle(bundle_root=result['bundle_root'],workspace_leaf=self.root/'B-ready')
+        bound_spec=json.loads((Path(bound['workspace'])/'runtime/execution/run-spec.json').read_text())
+        self.assertEqual(bound_spec['paperload'][0]['ready_timeout_seconds'],160)
+        self.assertEqual(bound_spec['paperload'][1]['ready_timeout_seconds'],90)
+
+    def test_e1_bundle_readiness_boundary_negatives(self):
+        # Non-E1 viewer (telemetry) over 120 rejected at export
+        spec = json.loads((self.src / 'run-spec.json').read_text())
+        spec['paperload'][0]['ready_timeout_seconds'] = 90
+        spec['paperload'][1]['ready_timeout_seconds'] = 121
+        write(self.src / 'run-spec.json', spec)
+        with self.assertRaisesRegex(ValueError, 'bundle_run_spec_rejected'):
+            self.export(leaf=self.parent / 'b-over-non-e1')
+
+        # E1 viewer over 300 rejected at export
+        spec['paperload'][0]['ready_timeout_seconds'] = 301
+        spec['paperload'][1]['ready_timeout_seconds'] = 90
+        write(self.src / 'run-spec.json', spec)
+        with self.assertRaisesRegex(ValueError, 'bundle_run_spec_rejected'):
+            self.export(leaf=self.parent / 'b-over-300')
+
+        # Boolean readiness rejected at export
+        spec['paperload'][0]['ready_timeout_seconds'] = True
+        write(self.src / 'run-spec.json', spec)
+        with self.assertRaisesRegex(ValueError, 'bundle_run_spec_rejected'):
+            self.export(leaf=self.parent / 'b-bool')
+
     def test_bundle_rejects_profile_mismatch_between_workload_and_manifests(self):
         with self.assertRaisesRegex(ValueError, 'bundle_profile_mismatch'):
             self.export(leaf=self.parent/'profile-mismatch', workload={'profile':'official'})
@@ -228,8 +315,10 @@ class PortableBundleTests(unittest.TestCase):
 
     def test_bind_rechecks_actual_exp_after_late_transfer(self):
         issued_at = int(time.time())
-        write(self.src/'viewer.json', {'user-a':token(issued_at+30),
-            'user-b':token(issued_at+30)})
+        self.viewer['limits']['wall_seconds'] = 20
+        write(self.src/'viewer.manifest.json', self.viewer)
+        write(self.src/'viewer.json', {'user-a':token(issued_at+60),
+            'user-b':token(issued_at+60)})
         exported=self.export(leaf=self.parent/'late-bind', wait_seconds=0, workload_seconds=20)
         (self.root/'B').mkdir(mode=0o700)
         with patch.object(bundle.time, 'time', return_value=issued_at+25):
