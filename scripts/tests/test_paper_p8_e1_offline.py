@@ -1,5 +1,8 @@
 import unittest
 import json
+from pathlib import Path
+import subprocess
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 
@@ -8,6 +11,12 @@ from scripts.tests import paper_p8_e1_support
 
 
 class E1OfflineContractTests(unittest.TestCase):
+    def test_offline_e1_phases_match_prepare_default(self):
+        result=paper_p8_server.build_e1_offline_contract(
+            viewers=5000, principals=2, density='mixed', messages_per_target=5)
+        self.assertEqual(result['lifecycle']['measure_seconds'],14)
+        self.assertEqual(result['lifecycle']['drain_seconds'],8)
+
     def test_e4_official_dry_run_exports_binds_and_preflights_real_manifests(self):
         output = StringIO()
         with redirect_stdout(output):
@@ -66,34 +75,73 @@ class E1OfflineContractTests(unittest.TestCase):
                 host_limits={'memory_available_bytes': 1})
 
     def test_official_large_rungs_build_mapping_and_bundle_contract_without_workload(self):
-        for viewers in (5000, 10000):
-            with self.subTest(viewers=viewers):
-                output = StringIO()
-                with redirect_stdout(output):
-                    code = paper_p8_server.main(['serve', '--root', '/not-used',
-                        '--network-config', '/not-used', '--dry-run', '--experiment', 'E1',
-                        '--profile', 'official', '--official-opt-in', '--e1-viewers', str(viewers),
-                        '--e1-principals', '2', '--e1-density', 'mixed', '--e1-messages-per-target', '5'])
-                self.assertEqual(code, 0)
-                result = json.loads(output.getvalue())['e1_offline_contract']
-                self.assertEqual(result['native_executed'], False)
-                self.assertEqual(result['physical_ab'], 'NOT RUN')
-                self.assertEqual(result['mapping']['counts']['sockets'], viewers)
-                self.assertGreater(result['serialized_sizes']['mapping_bytes'], 1000)
-                self.assertGreater(result['serialized_sizes']['bundle_bytes'], 0)
-                self.assertEqual(result['lifecycle']['ramp_seconds'], min(120, viewers // 50))
-                self.assertEqual(result['lifecycle']['viewer_ready_timeout_seconds'], 120)
-                self.assertEqual(result['resource_requirements']['effective_a_limits'],
-                                 'not_read_in_offline_dry_run')
-                overlay = result['resource_requirements']['selected_overlay']
-                self.assertEqual(overlay['viewers'], viewers)
-                self.assertTrue(overlay['estimated_only'])
-                self.assertIsNone(overlay['readback'])
-                self.assertFalse(overlay['queues_scaled_with_viewers'])
-                self.assertTrue(result['bundle_roundtrip']['inspect'])
-                self.assertTrue(result['bundle_roundtrip']['bind'])
-                self.assertTrue(result['bundle_roundtrip']['paperload_preflight'])
-                self.assertTrue(result['result_schema_checked'])
+        scratch_base = Path('/var/tmp/opencode/p8-e1-large-viewer-repair')
+        scratch_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='e1r5-test-', dir=scratch_base) as td:
+            scratch = Path(td); scratch.chmod(0o700)
+            binary = scratch / 'paperload'
+            built = subprocess.run(['go', 'build', '-o', str(binary), './cmd/paperload'],
+                cwd=paper_p8_server.ROOT / 'src', capture_output=True, text=True,
+                timeout=180, check=False)
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            binary.chmod(0o700)
+            for viewers, ready, wall in ((2000, 100, 130), (5000, 160, 190), (10000, 180, 210)):
+                with self.subTest(viewers=viewers):
+                    result = paper_p8_server.build_e1_offline_contract(viewers=viewers,
+                        principals=2, density='mixed', messages_per_target=5,
+                        scratch_root=scratch, paperload_binary=binary)
+                    self.assertEqual(result['native_executed'], False)
+                    self.assertEqual(result['physical_ab'], 'NOT RUN')
+                    self.assertEqual(result['mapping']['counts']['sockets'], viewers)
+                    self.assertGreater(result['serialized_sizes']['mapping_bytes'], 1000)
+                    self.assertGreater(result['serialized_sizes']['bundle_bytes'], 0)
+                    self.assertEqual(result['lifecycle']['ramp_seconds'], min(120, viewers // 50))
+                    self.assertEqual(result['lifecycle']['viewer_ready_timeout_seconds'], ready)
+                    self.assertEqual(result['lifecycle']['measure_seconds'], 14)
+                    self.assertEqual(result['lifecycle']['drain_seconds'], 8)
+                    self.assertEqual(result['lifecycle']['wall_seconds'], wall)
+                    self.assertEqual(result['lifecycle']['warmup_seconds'], 0)
+                    self.assertEqual(result['lifecycle']['cooldown_seconds'], 0)
+                    self.assertGreater(result['receive_limits']['max_messages'], 0)
+                    self.assertLessEqual(result['receive_limits']['max_messages'], 10_000_000)
+                    self.assertGreaterEqual(result['receive_limits']['max_bytes'],
+                                            result['receive_limits']['max_messages'])
+                    expected_messages = sum(result['mapping']['expected_deliveries_by_target'].values())
+                    self.assertEqual(result['receive_limits']['max_messages'], expected_messages)
+                    self.assertEqual(result['receive_limits']['max_bytes'], expected_messages * 8192)
+                    self.assertLessEqual(result['receive_limits']['max_bytes'], 1 << 30)
+                    self.assertEqual(result['manifest_correlation']['viewer']['profile'], 'official')
+                    self.assertEqual(result['manifest_correlation']['telemetry']['profile'], 'official')
+                    self.assertEqual(result['manifest_correlation']['viewer']['run_id'],
+                                     result['manifest_correlation']['telemetry']['run_id'])
+                    self.assertEqual(result['manifest_correlation']['viewer']['targets'],
+                                     result['manifest_correlation']['telemetry']['targets'])
+                    self.assertEqual(result['bundle_correlation']['session_id'], 'e1-offline-session')
+                    self.assertEqual(result['bundle_correlation']['profile'], 'official')
+                    self.assertIn(result['manifest_correlation']['viewer']['run_id'],
+                                  result['bundle_correlation']['run_ids'])
+                    self.assertEqual(result['resource_requirements']['effective_a_limits'],
+                                     'not_read_in_offline_dry_run')
+                    overlay = result['resource_requirements']['selected_overlay']
+                    self.assertEqual(overlay['viewers'], viewers)
+                    self.assertTrue(overlay['estimated_only'])
+                    self.assertIsNone(overlay['readback'])
+                    self.assertFalse(overlay['queues_scaled_with_viewers'])
+                    self.assertTrue(result['bundle_roundtrip']['inspect'])
+                    self.assertTrue(result['bundle_roundtrip']['bind'])
+                    self.assertTrue(result['bundle_roundtrip']['paperload_preflight'])
+                    self.assertEqual([(row['role'], row['exit_code'], row['status'])
+                        for row in result['paperload_preflight_outcomes']],
+                        [('viewer', 0, 'PREFLIGHT_ONLY_NOT_RUN'),
+                         ('telemetry', 0, 'PREFLIGHT_ONLY_NOT_RUN')])
+                    self.assertTrue(result['result_schema_checked'])
+                    self.assertEqual(result['result_projection_status'], 'PARTIAL')
+                    self.assertFalse(result['native_completed_acceptance'])
+                    sizes = result['serialized_sizes']; limits = result['serialized_limits']
+                    self.assertLessEqual(sizes['viewer_manifest_bytes'], limits['manifest_bytes'])
+                    self.assertLessEqual(sizes['telemetry_manifest_bytes'], limits['manifest_bytes'])
+                    self.assertLessEqual(sizes['bundle_bytes'], limits['bundle_bytes'])
+                    self.assertLessEqual(sizes['result_projection_bytes'], limits['file_bytes'])
 
     def test_resource_gate_rejects_known_nginx_and_fd_caps_before_workload(self):
         resources = {

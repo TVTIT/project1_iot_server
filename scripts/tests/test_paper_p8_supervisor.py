@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import tempfile
+import time
 import unittest
 import shutil
 from pathlib import Path
@@ -34,9 +35,13 @@ class SupervisorStateTests(unittest.TestCase):
 
     def test_profile_metadata_defaults_to_pilot_and_is_portable(self):
         root = self.private_root()
+        before = time.monotonic()
         state = supervisor.initialize(root, experiment='E1', arm='baseline', seed=7,
             deadline_seconds=10, receipts=[])
+        after = time.monotonic()
         self.assertEqual(state['profile'], 'pilot')
+        self.assertGreaterEqual(state['deadline_monotonic'], before + 10)
+        self.assertLessEqual(state['deadline_monotonic'], after + 10)
         self.assertNotIn(str(root), json.dumps(state))
 
     def test_official_profile_requires_explicit_opt_in(self):

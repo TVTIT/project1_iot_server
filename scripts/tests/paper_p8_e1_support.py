@@ -4,6 +4,7 @@ import importlib.util
 import os
 import stat
 import json
+import math
 import re
 from pathlib import Path
 import subprocess
@@ -24,6 +25,15 @@ validate_mqtt_readback = _support.validate_mqtt_readback
 verify_pilot_raw = _support.verify_pilot_raw
 _admin_metrics = _support._admin_metrics
 metrics_window = _support.metrics_window
+try:
+    from scripts.paper_p8_bundle import e1_timing_budget
+except ImportError:
+    try:
+        from paper_p8_bundle import e1_timing_budget
+    except ImportError:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from paper_p8_bundle import e1_timing_budget
 
 
 _WS_DRAIN_ZERO_FIELDS = ('sessions', 'subscriptions', 'session_reference_bytes',
@@ -57,6 +67,27 @@ def _drain_websocket_metrics(scrape, *, clock=time.monotonic, sleep=time.sleep,
             break
         sleep(min(0.1, max(0, deadline - clock())))
     raise ValueError('p8_e1_websocket_drain_rejected:' + (last_error or 'deadline'))
+
+
+E1_RESULT_IMPORT_ALLOWANCE_SECONDS = 60
+E1_CLEANUP_RESERVE_SECONDS = 30
+E1_VIEWER_FRAME_BOUND_BYTES = 8192
+E1_VIEWER_MAX_MESSAGES = 10_000_000
+E1_VIEWER_MAX_BYTES = 1 << 30
+
+
+def remaining_collector_budget(deadline_monotonic, workload_lifecycle_seconds, *,
+                               clock=time.monotonic, reserve_seconds=E1_CLEANUP_RESERVE_SECONDS,
+                               import_allowance_seconds=E1_RESULT_IMPORT_ALLOWANCE_SECONDS):
+    if (type(deadline_monotonic) not in (int, float) or not math.isfinite(deadline_monotonic)
+            or type(workload_lifecycle_seconds) is not int or workload_lifecycle_seconds < 1
+            or type(reserve_seconds) is not int or reserve_seconds < 0
+            or type(import_allowance_seconds) is not int or import_allowance_seconds < 0):
+        raise ValueError('session_deadline_invalid')
+    remaining = int(deadline_monotonic - clock() - reserve_seconds)
+    if remaining < workload_lifecycle_seconds + import_allowance_seconds:
+        raise ValueError('collector_session_budget_insufficient')
+    return remaining
 
 
 def websocket_metrics_window(before, after, histogram_helper, expected_deliveries):
@@ -284,16 +315,33 @@ def e1_role_manifests(common, *, subscriptions, viewer_identity, telemetry_ident
         raise ValueError('e1_phase_budget_rejected')
     if phase_values['measure_seconds'] < 1 or phase_values['drain_seconds'] < 1:
         raise ValueError('e1_phase_budget_rejected')
+    timing = e1_timing_budget(
+        viewer_count,
+        phases=phase_values,
+    )
     workers = min(32, max(1, (viewer_count + 63) // 64))
-    wall = sum(phase_values.values()) + 8
+    wall = timing['wall_seconds']
     viewer_topology = dict(topology)
     if mapping:
         viewer_topology.update(viewers=viewer_count, users=mapping['counts']['principals'])
     viewer_traffic = dict(common.get('traffic', {}))
-    viewer_traffic['ramp_seconds'] = min(120, max(1, viewer_count // 50))
+    viewer_traffic['ramp_seconds'] = timing['ramp_seconds']
+    viewer_settings = {'mode': 'healthy'}
+    if mapping is not None:
+        deliveries = mapping.get('expected_deliveries_by_target')
+        if not isinstance(deliveries, dict) or not deliveries or any(
+                type(count) is not int or count < 1 for count in deliveries.values()):
+            raise ValueError('e1_viewer_receive_budget_rejected:expected_deliveries')
+        expected_messages = sum(deliveries.values())
+        if expected_messages > E1_VIEWER_MAX_MESSAGES:
+            raise ValueError('e1_viewer_receive_budget_rejected:max_messages')
+        if expected_messages > E1_VIEWER_MAX_BYTES // E1_VIEWER_FRAME_BOUND_BYTES:
+            raise ValueError('e1_viewer_receive_budget_rejected:max_bytes')
+        viewer_settings.update(max_messages=expected_messages,
+                               max_bytes=expected_messages * E1_VIEWER_FRAME_BOUND_BYTES)
     viewer = dict(viewer_common, experiment='E1', roles=['viewer'], subscriptions=subscriptions,
         topology=viewer_topology, traffic=viewer_traffic, phases=phase_values,
-        viewer={'mode': 'healthy'},
+        viewer=viewer_settings,
         limits={'workers': workers, 'connections': viewer_count, 'pending_messages': 64, 'pending_bytes': 1048576,
                 'wall_seconds': wall, 'retries': 2, 'disk_growth_bytes': 16777216},
         identity_files={'viewer': str(viewer_identity)}, bundle_path=str(root))
@@ -523,7 +571,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
         'schema':schema}
 
 
-def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_seconds=30):
+def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_seconds=None):
     """Export only client inputs; never include admin credentials or A state."""
     try:
         from scripts import paper_p8_bundle
@@ -553,11 +601,21 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
                                   'username': json.loads(Path(path).read_text())['username']}
                      for gateway_id, path in gateway_files.items()},
     }
-    manifests = {'viewer': prepared['plan']['run_spec'] and
-                 json.loads(Path(prepared['plan']['run_spec']).read_text())['paperload'][0]['manifest'],
-                 'telemetry': json.loads(Path(prepared['plan']['run_spec']).read_text())['paperload'][1]['manifest']}
-    # The builder's generated manifest paths are the exact source inputs in its run-spec.
     spec = json.loads(Path(prepared['plan']['run_spec']).read_text())
+    spec_parent = Path(prepared['plan']['run_spec']).parent
+    manifests = {}
+    for job in spec.get('paperload', []):
+        role = job.get('role')
+        if role not in ('viewer', 'telemetry') or role in manifests or not isinstance(job.get('manifest'), str):
+            raise ValueError('bundle_e1_lifecycle_rejected')
+        manifest = Path(job['manifest'])
+        manifests[role] = manifest if manifest.is_absolute() else spec_parent / manifest
+    if set(manifests) != {'viewer', 'telemetry'}:
+        raise ValueError('bundle_e1_lifecycle_rejected')
+    if workload_seconds is None:
+        workload_seconds = paper_p8_bundle._derive_e1_lifecycle(manifests)
+    else:
+        workload_seconds = max(workload_seconds, paper_p8_bundle._derive_e1_lifecycle(manifests))
     mapping = prepared.get('mapping') or {'seed': 86,
         'messages_per_target': {f"{t['gateway_id']}\0{t['sensor_id']}": 5 for t in prepared['targets']},
         'counts': {'sockets': prepared['common']['topology']['viewers'], 'principals': prepared['common']['topology']['users']},
@@ -710,7 +768,10 @@ def _load_result_bundle(results_root, prepared, *, phase_id, binary_sha256):
     return values
 
 
-def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prepared, *, phase_id):
+def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prepared, *, phase_id,
+                            collector_lifetime_budget_seconds=None,
+                            workload_lifecycle_seconds=None,
+                            session_deadline_monotonic=None):
     pg = prepared['pg']
     before = smoke.paper_p1_count_db(registry, pg)
     sensors = []
@@ -720,7 +781,14 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
             {'gw':sensor.gateway_id,'sensor':sensor.sensor_id,'urn':sensor.sensor_urn}).strip())
         sensors.append({'gateway_id':sensor.gateway_id,'sensor_id':sensor.sensor_id,'counts':counts})
     baseline = _admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
-    collector_budget = prepared['viewer_manifest']['limits']['wall_seconds'] + 10
+    collector_budget = collector_lifetime_budget_seconds
+    if session_deadline_monotonic is not None:
+        collector_budget = remaining_collector_budget(session_deadline_monotonic,
+            workload_lifecycle_seconds, clock=time.monotonic)
+    if (type(collector_budget) is not int or not 5 <= collector_budget <= 86400
+            or type(workload_lifecycle_seconds) is not int or workload_lifecycle_seconds < 1
+            or collector_budget < workload_lifecycle_seconds + E1_RESULT_IMPORT_ALLOWANCE_SECONDS):
+        raise ValueError('collector_session_budget_insufficient')
     collector = BoundedCollector(scrape=lambda: _admin_metrics(smoke, endpoint, prepared['tokens']['admin']),
         interval=0.5, max_snapshots=min(20000, collector_budget * 2 + 2),
         deadline_seconds=collector_budget, baseline_metrics=baseline,
@@ -739,9 +807,11 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
     if collector is None or not isinstance(baseline, dict) or baseline.get('phase_id') != phase_id:
         raise ValueError('collector_phase_not_started')
     binary_sha256 = hashlib.sha256(Path(paperload_binary).read_bytes()).hexdigest()
-    imported = _load_result_bundle(results_root, prepared, phase_id=phase_id,
-                                   binary_sha256=binary_sha256)
-    collector.stop(None)
+    try:
+        imported = _load_result_bundle(results_root, prepared, phase_id=phase_id,
+                                       binary_sha256=binary_sha256)
+    finally:
+        collector.stop(None)
     terminal_metrics = _drain_websocket_metrics(
         lambda: _admin_metrics(smoke, endpoint, prepared['tokens']['admin']))
     terminal_resources = smoke.paper_p0_stats(registry, containers, 'workload_terminal')

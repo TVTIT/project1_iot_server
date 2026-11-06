@@ -122,6 +122,161 @@ class E1PilotSupportTests(unittest.TestCase):
         self.assertEqual(viewer['phases']['measure_seconds'], 20)
         self.assertEqual(telemetry['phases']['measure_seconds'], 9)
 
+    def test_official_large_rung_default_wall_and_readiness_budgets_cover_ramp(self):
+        for viewers, wall in ((2000, 130), (5000, 190), (10000, 210)):
+            with self.subTest(viewers=viewers):
+                mapping = mixed_e1_mapping(self.targets, viewers=viewers, principals=2,
+                    density='dense', messages_per_target=5)
+                viewer, _ = e1_role_manifests({'schema_version': 1,
+                    'topology': {'viewers': viewers}}, subscriptions=[],
+                    viewer_identity='viewer.json', telemetry_identity='telemetry.json',
+                    gateway_refs={}, root='run', mapping=mapping,
+                    phases={'warmup_seconds': 0, 'measure_seconds': 14,
+                            'drain_seconds': 8, 'cooldown_seconds': 0})
+                self.assertEqual(viewer['traffic']['ramp_seconds'], min(120, viewers // 50))
+                self.assertEqual(viewer['limits']['wall_seconds'], wall)
+
+    def test_e1_timing_budget_validation_and_boundaries(self):
+        from scripts.paper_p8_bundle import e1_timing_budget
+        # Exact large pairs
+        p2000 = e1_timing_budget(2000)
+        self.assertEqual(p2000['ready_timeout_seconds'], 100)
+        self.assertEqual(p2000['wall_seconds'], 130)
+        p5000 = e1_timing_budget(5000)
+        self.assertEqual(p5000['ready_timeout_seconds'], 160)
+        self.assertEqual(p5000['wall_seconds'], 190)
+        p10000 = e1_timing_budget(10000)
+        self.assertEqual(p10000['ready_timeout_seconds'], 180)
+        self.assertEqual(p10000['wall_seconds'], 210)
+
+        # Pilot accommodates declared ramp
+        p_pilot = e1_timing_budget(64, phases={'measure_seconds': 14, 'drain_seconds': 8}, declared_ramp=25)
+        self.assertEqual(p_pilot['ramp_seconds'], 25)
+        self.assertGreaterEqual(p_pilot['ready_timeout_seconds'], 25)
+        self.assertGreaterEqual(p_pilot['wall_seconds'], 25)
+
+        # 1000 viewer case: count-based ramp=20, default phases=22, wall reserves ramp/setup before phases
+        p1000 = e1_timing_budget(1000)
+        self.assertEqual(p1000['ramp_seconds'], 20)
+        self.assertEqual(p1000['ready_timeout_seconds'], 22)
+        self.assertEqual(p1000['wall_seconds'], 52)
+        self.assertGreaterEqual(p1000['wall_seconds'], 20 + 22 + 8)
+
+        # Small count
+        p_small = e1_timing_budget(64)
+        self.assertEqual(p_small['ramp_seconds'], 1)
+        self.assertEqual(p_small['ready_timeout_seconds'], 22)
+        self.assertEqual(p_small['wall_seconds'], 52)
+
+        # Explicit ramp0
+        p_ramp0 = e1_timing_budget(1000, declared_ramp=0)
+        self.assertEqual(p_ramp0['ramp_seconds'], 0)
+        self.assertEqual(p_ramp0['ready_timeout_seconds'], 22)
+        self.assertEqual(p_ramp0['wall_seconds'], 52)
+
+        p_small_ramp0 = e1_timing_budget(64, declared_ramp=0)
+        self.assertEqual(p_small_ramp0['ramp_seconds'], 0)
+        self.assertEqual(p_small_ramp0['ready_timeout_seconds'], 22)
+        self.assertEqual(p_small_ramp0['wall_seconds'], 52)
+
+        # Differing phases
+        diff_phases = {'warmup_seconds': 5, 'measure_seconds': 20, 'drain_seconds': 10, 'cooldown_seconds': 5}
+        p_diff = e1_timing_budget(1000, phases=diff_phases)
+        self.assertEqual(p_diff['ramp_seconds'], 20)
+        self.assertEqual(p_diff['ready_timeout_seconds'], 35)
+        self.assertEqual(p_diff['wall_seconds'], 83)
+
+        # Invalid viewers
+        for bad_v in (0, -1, True, False, '2000', 1.5):
+            with self.assertRaises(ValueError):
+                e1_timing_budget(bad_v)
+
+        # Invalid phases
+        for bad_p in ({'measure_seconds': -1}, {'measure_seconds': True}, 'not-dict'):
+            with self.assertRaises(ValueError):
+                e1_timing_budget(64, phases=bad_p)
+
+        # Invalid ramp
+        for bad_r in (-1, True, 'ramp'):
+            with self.assertRaises(ValueError):
+                e1_timing_budget(64, declared_ramp=bad_r)
+
+    def test_e1_role_manifests_generate_finite_viewer_receive_budgets(self):
+        for viewer_count in (2000, 5000, 10000):
+            with self.subTest(viewers=viewer_count):
+                mapping = mixed_e1_mapping(self.targets, viewers=viewer_count, principals=2,
+                    density='mixed', messages_per_target=5)
+                viewer, _ = e1_role_manifests({'schema_version': 1,
+                    'topology': {'viewers': viewer_count}}, subscriptions=[],
+                    viewer_identity='viewer.json', telemetry_identity='telemetry.json',
+                    gateway_refs={}, root='run', mapping=mapping,
+                    phases={'warmup_seconds': 0, 'measure_seconds': 14,
+                            'drain_seconds': 8, 'cooldown_seconds': 0})
+                settings = viewer['viewer']
+                total_deliveries = sum(mapping['expected_deliveries_by_target'].values())
+                self.assertEqual(settings['max_messages'], total_deliveries)
+                self.assertEqual(settings['max_bytes'], total_deliveries * 8192)
+                self.assertLessEqual(settings['max_messages'], 10_000_000)
+                self.assertLessEqual(settings['max_bytes'], 1 << 30)
+
+    def test_e1_viewer_receive_budget_rejects_over_cap_and_invalid_counts(self):
+        mapping = mixed_e1_mapping(self.targets, viewers=2000, principals=2,
+            density='mixed', messages_per_target=5)
+        args = dict(subscriptions=[], viewer_identity='viewer.json',
+            telemetry_identity='telemetry.json', gateway_refs={}, root='run', mapping=mapping)
+        mapping['expected_deliveries_by_target'] = {'target': 10_000_001}
+        with self.assertRaisesRegex(ValueError, 'max_messages'):
+            e1_role_manifests({'schema_version': 1, 'topology': {'viewers': 2000}}, **args)
+        mapping['expected_deliveries_by_target'] = {'target': 131_073}
+        with self.assertRaisesRegex(ValueError, 'max_bytes'):
+            e1_role_manifests({'schema_version': 1, 'topology': {'viewers': 2000}}, **args)
+        mapping['expected_deliveries_by_target'] = {'target': True}
+        with self.assertRaisesRegex(ValueError, 'expected_deliveries'):
+            e1_role_manifests({'schema_version': 1, 'topology': {'viewers': 2000}}, **args)
+
+    def test_remote_collector_uses_session_lifetime_budget_not_wall_plus_ten(self):
+        from unittest import mock
+        from scripts.tests import paper_p8_e1_support as e1
+        prepared={'pg':'pg','targets_db':[],'tokens':{'admin':'opaque'}}
+        smoke=mock.Mock()
+        smoke.paper_p1_count_db.return_value={}
+        smoke.paper_p0_stats.return_value={}
+        collector=mock.Mock(); collector.resources=[{}]
+        with mock.patch.object(e1,'_admin_metrics',return_value={}), \
+             mock.patch.object(e1,'BoundedCollector',return_value=collector) as factory:
+            e1.begin_remote_collection(smoke,None,None,None,None,prepared,phase_id='test',
+                collector_lifetime_budget_seconds=900, workload_lifecycle_seconds=240)
+        self.assertEqual(factory.call_args.kwargs['deadline_seconds'],900)
+
+    def test_remaining_collector_budget_accounts_for_delayed_copy_and_reserve(self):
+        from scripts.tests.paper_p8_e1_support import remaining_collector_budget
+        # 30s cleanup reserve is separate; the 60s import/copy allowance is
+        # included in the required post-begin window.
+        self.assertEqual(remaining_collector_budget(1000, 240, clock=lambda:100),870)
+        self.assertEqual(remaining_collector_budget(1000, 240, clock=lambda:370),600)
+        with self.assertRaisesRegex(ValueError, 'collector_session_budget_insufficient'):
+            remaining_collector_budget(1000, 240, clock=lambda:701)
+        with self.assertRaisesRegex(ValueError, 'collector_session_budget_insufficient'):
+            remaining_collector_budget(100, 240, clock=lambda:70)
+
+    def test_e1_lifecycle_rejects_non_dict_role_manifest(self):
+        from scripts.paper_p8_bundle import _derive_e1_lifecycle
+        with self.assertRaisesRegex(ValueError, 'bundle_e1_lifecycle_rejected'):
+            _derive_e1_lifecycle({'viewer': [], 'telemetry': {'roles':['telemetry'],
+                'limits':{'wall_seconds':30}}})
+
+    def test_begin_remote_collection_rejects_window_shorter_than_lifecycle(self):
+        from unittest import mock
+        from scripts.tests import paper_p8_e1_support as e1
+        prepared={'pg':'pg','targets_db':[],'tokens':{'admin':'opaque'}}
+        with mock.patch.object(e1,'_admin_metrics',return_value={}), \
+             mock.patch.object(e1,'BoundedCollector') as factory:
+            with self.assertRaisesRegex(ValueError, 'collector_session_budget_insufficient'):
+                e1.begin_remote_collection(mock.Mock(),None,None,None,None,prepared,
+                    phase_id='test', collector_lifetime_budget_seconds=100,
+                    workload_lifecycle_seconds=90)
+        factory.assert_not_called()
+
     def test_remote_export_passes_exact_prepared_roles_and_session_correlation(self):
         from unittest import mock
         with tempfile.TemporaryDirectory() as directory:
@@ -130,9 +285,14 @@ class E1PilotSupportTests(unittest.TestCase):
             telemetry = root / 'telemetry.json'; telemetry.write_text('{}')
             gateway = root / 'gw.json'; gateway.write_text('{"username":"gw-a","password":"private"}')
             run_spec = root / 'run-spec.json'
+            viewer_manifest = root / 'viewer.manifest.json'
+            telemetry_manifest = root / 'telemetry.manifest.json'
+            viewer_manifest.write_text(json.dumps({'roles':['viewer'],'limits':{'wall_seconds':210}}))
+            telemetry_manifest.write_text(json.dumps({'roles':['telemetry'],'limits':{'wall_seconds':30}}))
+            viewer_manifest.chmod(0o600); telemetry_manifest.chmod(0o600)
             run_spec.write_text(json.dumps({'paperload': [
-                {'manifest': str(root/'viewer.manifest.json')},
-                {'manifest': str(root/'telemetry.manifest.json')}]}))
+                {'role':'viewer','manifest': str(viewer_manifest)},
+                {'role':'telemetry','manifest': str(telemetry_manifest)}]}))
             ca_https = root / 'https-ca.pem'; ca_https.write_text('https-ca')
             ca_mqtt = root / 'mqtt-ca.pem'; ca_mqtt.write_text('mqtt-ca')
             prepared = {'viewer_identity': viewer, 'telemetry_identity': telemetry,

@@ -21,11 +21,12 @@ import paper_p8_e5_import as e5_import
 import paper_p8_support as p8_support
 
 
-def build_e1_offline_contract(*, viewers, principals, density, messages_per_target):
+def build_e1_offline_contract(*, viewers, principals, density, messages_per_target,
+                              scratch_root=None, paperload_binary=None):
     """Build and inspect a schema-only large E1 bundle without starting a workload."""
     if type(principals) is not int or principals != 2:
         raise ValueError('e1_fixture_principal_topology_unsupported')
-    if type(viewers) is not int or viewers not in (128, 5000, 10000):
+    if type(viewers) is not int or viewers not in (128, 2000, 5000, 10000):
         raise ValueError('e1_offline_rung_unsupported')
     import paper_p8_e1_support as e1
     import paper_p8_bundle as bundle
@@ -33,11 +34,17 @@ def build_e1_offline_contract(*, viewers, principals, density, messages_per_targ
                for gateway in range(2) for sensor in range(2)]
     mapping = e1.mixed_e1_mapping(targets, seed=86, viewers=viewers, principals=principals,
                                   density=density, messages_per_target=messages_per_target)
-    scratch = Path('/var/tmp/opencode/p8-supplement/e1')
-    scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if scratch.is_symlink() or scratch.stat().st_uid != os.getuid() or scratch.stat().st_mode & 0o077:
+    if scratch_root is None:
+        scratch_base = Path('/var/tmp/opencode/p8-e1-large-viewer-repair')
+        scratch_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        scratch_parent = Path(tempfile.mkdtemp(prefix='e1r5-', dir=scratch_base))
+    else:
+        scratch_parent = Path(scratch_root)
+        scratch_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if (scratch_parent.is_symlink() or scratch_parent.stat().st_uid != os.getuid()
+            or scratch_parent.stat().st_mode & 0o077):
         raise ValueError('e1_offline_scratch_rejected')
-    with tempfile.TemporaryDirectory(prefix='contract-', dir=scratch) as td:
+    with tempfile.TemporaryDirectory(prefix='contract-', dir=scratch_parent) as td:
         root = Path(td); root.chmod(0o700)
         private = root / 'private'; private.mkdir(mode=0o700)
         payload = base64.urlsafe_b64encode(json.dumps({'exp': int(time.time()) + 86400}).encode()).decode().rstrip('=')
@@ -66,8 +73,7 @@ def build_e1_offline_contract(*, viewers, principals, density, messages_per_targ
         viewer, telemetry = e1.e1_role_manifests(common, subscriptions=subscriptions,
             viewer_identity=identities['viewer'], telemetry_identity=identities['telemetry'],
             gateway_refs=gateway_files, root=root, mapping=mapping,
-            messages_per_target=mapping['messages_per_target'],
-            phases={'warmup_seconds': 0, 'measure_seconds': 130, 'drain_seconds': 30, 'cooldown_seconds': 0})
+            messages_per_target=mapping['messages_per_target'])
         for data in (viewer, telemetry):
             data['tls']['https_ca_file'] = data['tls']['mqtt_tls_ca_file'] = 'certs/https-ca.pem'
         paths = {}
@@ -100,25 +106,38 @@ def build_e1_offline_contract(*, viewers, principals, density, messages_per_targ
         if inspected.get('session', {}).get('experiment') != 'E1' or metadata.get('workload', {}).get('viewer_count') != viewers:
             raise ValueError('e1_offline_result_projection_rejected')
         run_spec = json.loads(Path(bound['workspace'], 'runtime/execution/run-spec.json').read_text())
-        binary = root / 'paperload'
-        build = subprocess.run(['go', 'build', '-o', str(binary), './cmd/paperload'],
-            cwd=ROOT / 'src', text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=180, check=False)
-        if build.returncode:
-            raise ValueError('e1_offline_paperload_build_failed')
-        binary.chmod(0o700)
+        binary = Path(paperload_binary) if paperload_binary else root / 'paperload'
+        if paperload_binary is None:
+            build = subprocess.run(['go', 'build', '-o', str(binary), './cmd/paperload'],
+                cwd=ROOT / 'src', text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=180, check=False)
+            if build.returncode:
+                raise ValueError('e1_offline_paperload_build_failed')
+            binary.chmod(0o700)
+        elif not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError('e1_offline_paperload_binary_rejected')
+        preflight_checks = []
         for job in run_spec['paperload']:
             check = subprocess.run([str(binary), '--manifest', job['manifest'], '--output-dir', job['output_dir'],
                 '--preflight', '--official-opt-in'], capture_output=True, text=True, timeout=30, check=False)
             if check.returncode:
                 raise ValueError(f'e1_offline_paperload_preflight_failed:{job["role"]}:{check.stderr[:300]}')
+            preflight_checks.append(check)
         # Safe result projection/schema check is a projection of the actual bundle metadata,
         # not a fabricated completed workload or native acceptance record.
         projected = {'experiment': metadata['session']['experiment'],
             'profile': metadata['session']['profile'], 'viewer_count': metadata['workload']['viewer_count'],
             'principal_count': metadata['workload']['principal_count'],
-            'expected_deliveries_by_target': metadata['workload']['expected_deliveries_by_target']}
-        if (set(projected) != {'experiment', 'profile', 'viewer_count', 'principal_count', 'expected_deliveries_by_target'}
+            'expected_deliveries_by_target': metadata['workload']['expected_deliveries_by_target'],
+            'status': 'PARTIAL', 'native_completed_acceptance': False}
+        manifest_limit = bundle.MAX_MANIFEST_BYTES
+        projection_bytes = len(json.dumps(projected, sort_keys=True, separators=(',', ':')).encode())
+        if (any(path.stat().st_size > manifest_limit for path in paths.values())
+                or inspected['total_bytes'] > bundle.MAX_TOTAL_BYTES
+                or projection_bytes > bundle.MAX_FILE_BYTES):
+            raise ValueError('e1_offline_serialized_size_limit_exceeded')
+        if (set(projected) != {'experiment', 'profile', 'viewer_count', 'principal_count',
+                'expected_deliveries_by_target', 'status', 'native_completed_acceptance'}
                 or projected['viewer_count'] != viewers or projected['principal_count'] != principals):
             raise ValueError('e1_offline_result_projection_rejected')
         overlay = e1.e1_resource_overlay(viewers, official_opt_in=True)
@@ -129,10 +148,18 @@ def build_e1_offline_contract(*, viewers, principals, density, messages_per_targ
                 'warmup_seconds': viewer['phases']['warmup_seconds'],
                 'measure_seconds': viewer['phases']['measure_seconds'],
                 'drain_seconds': viewer['phases']['drain_seconds'],
+                'cooldown_seconds': viewer['phases']['cooldown_seconds'],
                 'wall_seconds': viewer['limits']['wall_seconds'],
                 'viewer_ready_timeout_seconds': run_spec['paperload'][0]['ready_timeout_seconds'],
                 'required_token_lifetime_seconds': json.loads(
                     Path(bound['workspace'], 'runtime/binding.json').read_text())['required_token_lifetime_seconds']},
+            'receive_limits': {'max_messages': viewer['viewer']['max_messages'],
+                'max_bytes': viewer['viewer']['max_bytes']},
+            'manifest_correlation': {role: {'run_id': data['run_id'],
+                'profile': data['profile'], 'targets': data['targets']}
+                for role, data in (('viewer', viewer), ('telemetry', telemetry))},
+            'bundle_correlation': {'session_id': inspected['session']['session_id'],
+                'profile': inspected['session']['profile'], 'run_ids': inspected['session']['run_ids']},
             'resource_requirements': {'selected_overlay': overlay,
                 'effective_a_limits': 'not_read_in_offline_dry_run'},
             'bundle_reader_caps': {'manifest_bytes': bundle.MAX_MANIFEST_BYTES,
@@ -141,10 +168,17 @@ def build_e1_offline_contract(*, viewers, principals, density, messages_per_targ
             'serialized_sizes': {'mapping_bytes': len(json.dumps(mapping, separators=(',', ':')).encode()),
                 'viewer_manifest_bytes': paths['viewer'].stat().st_size,
                 'telemetry_manifest_bytes': paths['telemetry'].stat().st_size,
-                'bundle_bytes': inspected['total_bytes']},
+                'bundle_bytes': inspected['total_bytes'],
+                'result_projection_bytes': projection_bytes},
+            'serialized_limits': {'manifest_bytes': bundle.MAX_MANIFEST_BYTES,
+                'file_bytes': bundle.MAX_FILE_BYTES, 'bundle_bytes': bundle.MAX_TOTAL_BYTES},
             'bundle_roundtrip': {'export': True, 'inspect': True, 'bind': bool(bound),
                 'paperload_preflight': True},
-            'result_schema_checked': True}
+            'paperload_preflight_outcomes': [{'role': job['role'], 'exit_code': check.returncode,
+                'status': json.loads(check.stdout).get('status')}
+                for job, check in zip(run_spec['paperload'], preflight_checks)],
+            'result_schema_checked': True, 'result_projection_status': projected['status'],
+            'native_completed_acceptance': projected['native_completed_acceptance']}
 
 
 def build_e4_offline_contract(*, unique_count, replay_count, deadline_seconds,

@@ -610,6 +610,37 @@ def paper_p8_support():
     return module
 
 
+def paper_p8_bundle():
+    spec = importlib.util.spec_from_file_location('paper_p8_bundle', Path(__file__).parents[1] / 'paper_p8_bundle.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paper_p8_e1_begin_collection(request, session_state, fixture, endpoint, registry,
+                                 containers, prepared):
+    if request.get('phase_id') != 'pilot':
+        raise ValueError('e1_phase_id_mismatch')
+    # Load the bundle module (not this loader function) before deriving timing
+    # from the exact manifests used to prepare/export the E1 bundle.
+    bundle = paper_p8_bundle()
+    e1_lifecycle = bundle._derive_e1_lifecycle({
+        'viewer': prepared['viewer_manifest'],
+        'telemetry': prepared['telemetry_manifest']})
+    lifecycle_deadline = session_state.get('deadline_monotonic')
+    # The budget requires lifecycle + 60s bounded result-copy/import; 30s is
+    # reserved separately for cleanup. No operator wait is assumed.
+    e1_support = paper_p8_e1_support()
+    collector_budget = e1_support.remaining_collector_budget(
+        lifecycle_deadline, e1_lifecycle, clock=time.monotonic)
+    return e1_support.begin_remote_collection(
+        sys.modules[__name__], fixture, endpoint, registry, containers,
+        prepared, phase_id=request['phase_id'],
+        collector_lifetime_budget_seconds=collector_budget,
+        workload_lifecycle_seconds=e1_lifecycle,
+        session_deadline_monotonic=lifecycle_deadline)
+
+
 def paper_p8_remote_support():
     spec = importlib.util.spec_from_file_location('paper_p8_remote', Path(__file__).with_name('paper_p8_remote.py'))
     module = importlib.util.module_from_spec(spec)
@@ -6626,8 +6657,9 @@ def main():
                             viewers=args.p8_e1_viewers, principals=args.p8_e1_principals,
                             density=args.p8_e1_density,
                             messages_per_target=args.p8_e1_messages_per_target)
+                        e1_lifecycle = prepared.get('viewer_manifest', {}).get('limits', {}).get('wall_seconds')
                         prepared_bundle = helper.export_prepared_bundle(prepared,
-                            output_leaf=bundle_root, wait_seconds=90, workload_seconds=30)
+                            output_leaf=bundle_root, wait_seconds=90, workload_seconds=e1_lifecycle)
                     elif experiment == 'E2':
                         e2 = paper_p8_e2_support()
                         e2_workload = getattr(args, 'p8_e2_workload', 'steady_burst')
@@ -6887,11 +6919,8 @@ def main():
                                 sys.modules[__name__], fixture, endpoint, registry, containers,
                                 prepared, phase_id=request['phase_id'])
                         if experiment == 'E1':
-                            if request.get('phase_id') != 'pilot':
-                                raise ValueError('e1_phase_id_mismatch')
-                            return paper_p8_e1_support().begin_remote_collection(
-                                sys.modules[__name__], fixture, endpoint, registry, containers,
-                                prepared, phase_id=request['phase_id'])
+                            return paper_p8_e1_begin_collection(request, session['state'],
+                                fixture, endpoint, registry, containers, prepared)
                         if experiment == 'E2':
                             if request.get('phase_id') != prepared['phase_id']:
                                 raise ValueError('e2_phase_id_mismatch')

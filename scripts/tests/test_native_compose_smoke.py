@@ -21,6 +21,53 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_held_e1_begin_uses_prepared_manifests_and_session_budget(self):
+        from scripts.tests import paper_p8_e1_support as e1
+        from scripts.tests import paper_p8_supervisor as supervisor
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); root.chmod(0o700)
+            state = supervisor.initialize(root, experiment='E1', arm='pilot', seed=86,
+                deadline_seconds=900, receipts=[], preparation_status='E1_PREPARED')
+            supervisor.write_request(root, {'session_id': state['session_id'],
+                'command': 'begin', 'phase': 'READY', 'phase_id': 'pilot'})
+            prepared = {
+                'viewer_manifest': {'roles': ['viewer'], 'limits': {'wall_seconds': 190}},
+                'telemetry_manifest': {'roles': ['telemetry'], 'limits': {'wall_seconds': 30}},
+            }
+            calls = []
+
+            def begin(*args, **kwargs):
+                calls.append((args, kwargs))
+                supervisor.write_request(root, {'session_id': state['session_id'],
+                    'command': 'finalize', 'phase': 'MEASURING'})
+                return {'database_counts': {}, 'target_count': 0,
+                    'metrics_baseline_captured': True}
+
+            def callback(request):
+                try:
+                    return smoke.paper_p8_e1_begin_collection(
+                        request, state, None, None, None, None, prepared)
+                except Exception:
+                    supervisor.write_request(root, {'session_id': state['session_id'],
+                        'command': 'abort', 'phase': 'READY'})
+                    raise
+            with patch.object(smoke, 'paper_p8_e1_support', return_value=e1), \
+                 patch.object(e1, 'begin_remote_collection', side_effect=begin):
+                held = supervisor.hold(root, poll_seconds=0, on_begin=callback)
+
+            self.assertEqual(held['phase'], 'FINALIZING')
+            self.assertNotIn('last_request_error', held)
+            self.assertEqual(len(calls), 1, held.get('last_request_error'))
+            args, kwargs = calls[0]
+            self.assertIs(args[5], prepared)
+            self.assertEqual(kwargs['phase_id'], 'pilot')
+            self.assertEqual(kwargs['workload_lifecycle_seconds'], 220)
+            self.assertIs(kwargs['session_deadline_monotonic'], state['deadline_monotonic'])
+            remaining = state['deadline_monotonic'] - time.monotonic()
+            self.assertLessEqual(kwargs['collector_lifetime_budget_seconds'] + 30, remaining)
+            self.assertGreaterEqual(kwargs['collector_lifetime_budget_seconds'], 220 + 60)
+
     def test_p8_owned_storage_guard_combines_tiny_owned_files_and_injected_database_size(self):
         class Registry:
             def resolve(self, item):
