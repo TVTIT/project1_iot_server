@@ -5064,11 +5064,36 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
                     '--experiment','E2','--profile','official','--official-opt-in',
                     '--samples-per-message','100','--e2-offered-rate','1000',
                     '--e2-duration-seconds','20','--e2-burst-messages','11',
+                    '--e2-pending-messages','1024','--e2-pending-bytes','8388608',
                     '--deadline-seconds','1200'])
             self.assertIn('--p8-official-opt-in',captured)
             self.assertIn('--p8-profile',captured)
             self.assertEqual(captured[captured.index('--p8-profile')+1],'official')
             self.assertEqual(captured[captured.index('--p8-e2-offered-rate')+1],'1000')
+            self.assertEqual(captured[captured.index('--p8-e2-pending-messages')+1],'1024')
+            self.assertEqual(captured[captured.index('--p8-e2-pending-bytes')+1],'8388608')
+
+    def test_serve_e2_pending_dry_run_and_bound_rejection(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+            base = ['serve', '--root', str(Path(td) / 'server'), '--network-config', str(net_config),
+                '--experiment', 'E2', '--profile', 'official', '--official-opt-in',
+                '--samples-per-message', '100', '--e2-offered-rate', '1000',
+                '--e2-duration-seconds', '20', '--e2-burst-messages', '100',
+                '--deadline-seconds', '1200']
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.server.main(base + ['--dry-run', '--e2-pending-messages', '1024',
+                                         '--e2-pending-bytes', '8388608'])
+            plan = json.loads(output.getvalue())['e2_official_plan']
+            self.assertEqual(plan['pending_limits'], {'pending_messages': 1024, 'pending_bytes': 8388608})
+            self.assertEqual(plan['estimate']['unique_messages_estimate'], 20100)
+            with patch('subprocess.Popen') as process:
+                with self.assertRaisesRegex(ValueError, 'e2_estimate_input_rejected'):
+                    self.server.main(base + ['--e2-pending-bytes', str(1 << 30)])
+                process.assert_not_called()
 
     def test_serve_e2_workload_equal_samples_requires_context(self):
         with tempfile.TemporaryDirectory() as td:

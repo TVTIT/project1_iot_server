@@ -109,8 +109,27 @@ class E2SupportTests(unittest.TestCase):
             e2_official_estimate(rate_per_second=100, duration_seconds=10,
                 samples_per_message=1, payload_bytes=100)
 
+    def test_official_pending_budget_and_burst_sizing(self):
+        args = dict(common={}, targets=self.targets,
+            gateway_identity_files={'gw-a': 'a', 'gw-b': 'b'},
+            telemetry_identity_files={'A': 'ia', 'B': 'ib'}, samples_per_message=100,
+            offered_rate=1000, duration_seconds=20, burst_messages=100,
+            pending_messages=1024, pending_bytes=8 << 20)
+        pair = e2_official_manifests(**args)['profiles']['100']
+        for arm in ('A', 'B'):
+            self.assertEqual(pair[arm]['limits']['pending_messages'], 1024)
+            self.assertEqual(pair[arm]['limits']['pending_bytes'], 8 << 20)
+        estimate = e2_official_estimate(rate_per_second=1000, duration_seconds=20,
+            samples_per_message=100, payload_bytes=4096, official_opt_in=True,
+            burst_messages=100, pending_messages=1024, pending_bytes=8 << 20)
+        self.assertEqual(estimate['unique_messages_estimate'], 20100)
+        self.assertEqual(estimate['raw_rows_estimate'], 2010000)
+        for name, value in (('pending_messages', 0), ('pending_bytes', (1 << 30) + 1)):
+            with self.assertRaises(ValueError):
+                e2_official_manifests(**{**args, name: value})
+
     def test_official_schedule_splits_total_rate_and_accounts_both_sample_sizes(self):
-        for samples, expected_raw in ((100, 100_000), (1, 1_000)):
+        for samples, expected_raw in ((100, 100_700), (1, 1_007)):
             manifests = e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
                 'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost', 'mqtt_tls_ca_file':'ca'}},
                 targets=self.targets, gateway_identity_files={'gw-a':'a','gw-b':'b'},
@@ -1220,18 +1239,48 @@ class E2SupportTests(unittest.TestCase):
                 smoke, FakeFixture, FakeEndpoint, registry, {'mosquitto': 'mosq'}, test_images, {},
                 session_id='sess-official', samples_per_message=100,
                 output_root=out_off, bundle_root=bnd_off, profile='official',
-                official_opt_in=True, offered_rate=100, duration_seconds=10, burst_messages=7)
+                official_opt_in=True, offered_rate=100, duration_seconds=10, burst_messages=7,
+                pending_messages=1024, pending_bytes=8 << 20)
             portable = json.loads((bnd_off / 'bundle.json').read_text())
             from scripts import paper_p8_bundle
             self.assertTrue(paper_p8_bundle.inspect_bundle(bnd_off)['valid'])
             self.assertEqual(prepared_off['plan']['expected_counts'],
                 {'unique':1007,'raw':100700,'temporal':1007,'ack':1007})
             self.assertEqual(portable['workload']['producer_rates_per_second'], {'A':50,'B':50})
+            self.assertEqual(portable['workload']['pending_limits'],
+                             {'pending_messages': 1024, 'pending_bytes': 8 << 20})
+            self.assertEqual(portable['workload']['estimate']['unique_messages_estimate'], 1007)
+            workspace = root / 'bound-official'
+            paper_p8_bundle.bind_bundle(bundle_root=bnd_off, workspace_leaf=workspace)
+            for arm in ('A', 'B'):
+                manifest = json.loads((workspace / 'runtime' / 'manifests' / f'{arm}.json').read_text())
+                self.assertEqual(manifest['limits']['pending_messages'], 1024)
+                self.assertEqual(manifest['limits']['pending_bytes'], 8 << 20)
+            with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+                bad_workload = json.loads(json.dumps(portable['workload']))
+                bad_workload['pending_limits']['pending_messages'] = 64
+                paper_p8_bundle._validate_e2_official_workload(bad_workload)
+            with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
+                paper_p8_bundle._validate_e2_official_workload(dict(portable['workload'], pending_limits=None))
             self.assertEqual(prepared_off['run_id'], prepared_off['manifests']['A']['run_id'])
             self.assertEqual(portable['workload']['expected_counts'], prepared_off['plan']['expected_counts'])
             with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
                 bad_workload = dict(portable['workload'], offered_rate_per_second=200)
                 paper_p8_bundle._validate_e2_official_workload(bad_workload)
+            # Even a recomputed inventory digest cannot make a changed bound budget
+            # agree with the independently declared workload provenance.
+            manifest_path = bnd_off / 'manifests' / 'B.json'
+            changed = json.loads(manifest_path.read_text())
+            changed['limits']['pending_messages'] = 512
+            data = json.dumps(changed, sort_keys=True, separators=(',', ':')).encode()
+            manifest_path.write_bytes(data)
+            for item in portable['inputs']:
+                if item['path'] == 'manifests/B.json':
+                    item['sha256'] = hashlib.sha256(data).hexdigest()
+                    item['size_bytes'] = len(data)
+            (bnd_off / 'bundle.json').write_text(json.dumps(portable))
+            with self.assertRaisesRegex(ValueError, 'bundle_e2_pending_limits_mismatch'):
+                paper_p8_bundle.inspect_bundle(bnd_off)
 
     def _create_test_equal_samples_bundle(self, root, ctx, *, binary_bytes=b'binary-123',
                                           session_id='sess-e2', run_id='p8e2-sess-100', arm='e2-test',
