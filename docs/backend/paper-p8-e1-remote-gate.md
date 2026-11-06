@@ -1,8 +1,8 @@
 # P8 E1 — chuẩn bị, chạy pilot và nhập kết quả (source-qualified)
 
 > E1 B nhận bundle + `paperload` binary, không nhận admin/DB/Docker credentials.
-> Các hướng dẫn 64 sockets bên dưới mô tả baseline lịch sử; kết quả mới nằm
-> trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1--tài-nguyên-fixture-và-pilot).
+> Các hướng dẫn 64 sockets bên dưới mô tả baseline lịch sử; tham số E1 lớn đã
+> sửa và bằng chứng mới nằm trong [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1r7--sửa-luồng-large-viewer).
 
 Tài liệu hướng dẫn vận hành và báo cáo bằng chứng cho thử nghiệm P8 E1 (pilot hữu hạn giữa hai host A và B). E1 được thực hiện trên cùng nền tảng kiến trúc backend (Go modular monolith, Mosquitto DynSec, TimescaleDB, HTTP/REST và Mosquitto TLS).
 
@@ -60,7 +60,9 @@ Chi tiết kết quả pilot 128 viewer và qualification nằm trong [báo cáo
   - Tuyệt đối không ghi đè hoặc tái sử dụng thư mục kết quả hay workspace cũ.
   - Thư mục `workspace` trên Host B **không được tạo trước** bằng lệnh `mkdir`; lệnh `bind` yêu cầu tự tạo mới thư mục này với quyền `0700`. Nếu thư mục đã tồn tại, `bind` sẽ từ chối thực hiện với lỗi `workspace_output_leaf_exists`.
 - **Ngân sách thời gian (Deadline Budget)**:
-  - Thời hạn deadline của server `--deadline-seconds 900` (15 phút) phải bảo đảm đủ cho toàn bộ chu kỳ: khởi động container, truyền bundle và binary, kiểm tra kết nối, thực thi workload pilot, truyền kết quả về, hậu kiểm dữ liệu và dọn dẹp tài nguyên.
+  - Với E1 large-viewer, dùng ramp/readiness/wall đã sinh bởi execution plan và manifest; không dùng thời lượng cũ cố định hoặc kế hoạch schema-only khác prepare thật. Mốc đo hiện hành: 2.000 viewer ramp/ready/wall = 40/100/130 giây; 5.000 = 100/160/190 giây; 10.000 = 120/180/210 giây. Mặc định workload là measure 14 giây và drain 8 giây.
+  - Bundle lifetime tính bảo thủ bằng tổng wall của các role chạy staggered (viewer và telemetry), không lấy riêng `measure_seconds` hay wall của một role. Collector A phải còn đủ lifecycle + 60 giây copy/import, đồng thời giữ 30 giây cleanup reserve; `begin` phải từ chối trước workload nếu session không còn đủ ngân sách.
+  - `--deadline-seconds` vẫn phải bao phủ toàn chu kỳ vận hành trên A và B; đây là deadline của fixture, không thay thế giới hạn role/session/token đã kiểm tra.
 - **Ranh giới thẩm tra kết quả và ngưỡng từ chối tài nguyên (Refusal Boundaries)**:
   - Trên Host A, trước khi khởi chạy child workload, fixture thực hiện đối chiếu các ngưỡng tài nguyên (`e1_resource_overlay`) với thông số đọc thực tế từ tiến trình (`readback`):
     - `WS_MAX_SESSIONS` của backend phải lớn hơn hoặc bằng số lượng viewers (`session_cap >= viewers`).
@@ -100,6 +102,10 @@ Tiến trình `serve` hỗ trợ các tham số cấu hình workload E1:
 - `--deadline-seconds`: Ngân sách thời gian toàn phiên (mặc định 900 giây).
 
 Khởi chạy tiến trình `serve` ở foreground trên Terminal A1 theo một trong hai công thức được hỗ trợ:
+
+Đối với rung official large-viewer 2.000/5.000/10.000, chỉ chọn count sau resource preflight A/B và dùng profile `official` cùng `--official-opt-in`. Plan mặc định tương ứng ramp/ready/wall 40/100/130, 100/160/190, 120/180/210 giây; measure/drain mặc định 14/8 giây. Đây là time budget hữu hạn, không phải cam kết tốc độ handshake hay capacity. Bộ đếm nhận viewer được giới hạn hữu hạn theo `expected_deliveries × 8192` bytes; đây là receive accounting bound cho dataset, không phải RSS, bộ nhớ cấp phát trước hay wire bytes.
+
+Mỗi lượt cần tạo fixture A mới và workspace/output B mới. Không sửa manifest, bundle hoặc results đã sinh và không dựa vào hot reload: artifacts được tạo từ snapshot fixture/workspace cụ thể, nên thay đổi tham số cần một lượt mới từ prepare.
 
 **Công thức 1A — Chạy pilot mặc định chuẩn 64 viewers (`default64`)**:
 
@@ -386,6 +392,6 @@ done
 
 Kết quả và kích thước của các lượt đã chạy được ghi tại [báo cáo P8](paper-p8-experiments-and-acceptance.md#e1--tài-nguyên-fixture-và-pilot). Input users=2 là topology identities, không phải 5.000/10.000 principals. Chỉ hai principals được fixture hỗ trợ; principal khác 2 bị từ chối.
 
-Workload plan schema-only dùng ramp 100s (5k) / 120s (10k), warmup 0s, measurement 130s, drain 30s, wall 168s và readiness deadline 120s. Bundle bind ghi required token lifetime 50s cho wait+workload budget của fixture offline này; không phải đề xuất giới hạn token cho lượt chạy thực. Resource estimate dùng overlay connection/FD có dự phòng như Bước 1, backend FDs available >= viewers + 32 và broker >= 2 telemetry + 32 reserve. Offline dry-run không đọc cấu hình Host A (`effective_a_limits = not_read_in_offline_dry_run`); effective A thresholds luôn phải được readback mới trước fixture E1 thực.
+Plan schema-only và prepare thật dùng chung execution plan. Với 2.000/5.000/10.000 viewer, ramp/ready/wall lần lượt là 40/100/130, 100/160/190 và 120/180/210 giây; mặc định measure/drain là 14/8 giây. Readiness 160/180 giây chỉ áp dụng cho E1 viewer manifest hợp lệ, không nới cap cho role/bài khác. Bundle lifetime là tổng bảo thủ của wall các role staggered; A collector/session guard tính lifecycle + 60 giây copy/import và giữ thêm 30 giây cleanup reserve. Receive cap tường minh dựa trên expected deliveries × 8192 bytes, với số lượng hữu hạn và trần validator; không diễn giải thành RSS/wire bound. Resource estimate dùng overlay connection/FD có dự phòng như Bước 1, backend FDs available >= viewers + 32 và broker >= 2 telemetry + 32 reserve. Offline dry-run không đọc cấu hình Host A (`effective_a_limits = not_read_in_offline_dry_run`); effective A thresholds luôn phải được readback mới trước fixture E1 thực.
 
 Trong E1 fixture prepare, trước khi khởi child workload, code đọc `WS_MAX_SESSIONS`, Nginx `worker_connections`, master nofile và giới hạn/FD đang mở của từng worker. Thiếu worker readback, thiếu connection/FD dự phòng hoặc thiếu FD backend/broker đều khiến gate từ chối. Overlay chỉ thuộc fixture, không đổi sysctl hay deployment defaults. Ví dụ session cap 64 không đủ rung 5.000; Nginx 1 worker × 1.024 connections cũng không đủ. Giá trị ví dụ không khẳng định cấu hình hiện tại; chỉ readback của fixture thực mới quyết định có được khởi workload.

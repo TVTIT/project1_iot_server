@@ -513,3 +513,62 @@ readback E2/E3/E4 có 162 tests tổng (161 PASS / 1 SKIP). Các lệnh và log 
 `/var/tmp/opencode/p8-e1-fd-fix/`. Một lần gọi native ban đầu dùng nhầm metadata
 deadline của hold lane bị argparse từ chối trước khi tạo fixture; giữ log riêng
 `native1000-hkmwvbhf/native.log`, không tính là workload FAIL hay PASS.
+
+## E1R.7 — Sửa luồng large-viewer
+
+Checkpoint: 06/11/2026.
+
+Đợt E1R.0–E1R.6 nối lại sáu defect trong execution path E1, giữ nguyên opt-in,
+resource gates, giới hạn backend và quy trình fixture. Nguồn nền là branch
+`feat/paper-requirement`, HEAD `c025dd6706ce31df86d13121d089e52277ceb771`, dirty.
+Artifact giữ source qualification riêng: technical/Go/offline gate ghi nhận branch
+`feat/paper-requirement`, HEAD `c025dd6706ce31df86d13121d089e52277ceb771` với dirty
+source inventory; native 2.000 report ghi cùng revision và `generator_colocated=true`;
+portable64 report ghi cùng revision, `dirty_worktree=true`. Không có một dirty
+fingerprint chung được xác nhận cho các lane này, vì vậy không gán chúng về cùng
+một dirty tree. Native 2.000 được chạy trước sửa riêng held-callback regression;
+portable64 sau đó bao gồm regression/fix đó. Kết quả tại đây là local evidence,
+không phải release provenance hay P8 acceptance.
+
+### Sáu defect đã sửa
+
+1. Manifest viewer tính ramp/readiness/wall nhất quán cho ba rung lớn, thay wall
+   ngắn cũ không bao phủ ramp.
+2. Readiness budget E1 được truyền qua execution plan, run-spec, bundle export/bind
+   và spec reader; chỉ E1 viewer manifest hợp lệ mới vượt cap 120 giây.
+3. Bundle lifetime suy từ actual role manifests, dùng tổng bảo thủ wall các role
+   chạy staggered; session/token guard bao gồm lifecycle và collector A yêu cầu
+   remaining session đủ lifecycle + 60 giây copy/import + 30 giây cleanup reserve.
+4. Viewer receive counters được đặt tường minh, hữu hạn, theo expected deliveries
+   và 8.192 bytes/delivery; overflow vẫn bị từ chối, không clamp. Đây là receive
+   accounting bound, không phải RSS, allocated memory hay wire-byte bound.
+5. Go viewer runtime thực thi ramp theo lịch viewer xác định được, giữ concurrency
+   bounded và cancellation/join; ready vẫn phụ thuộc subscribe barrier. Regression
+   xác nhận held callback không thoát/join giả.
+6. Offline contract và prepare thật dùng chung execution plan; role preflights
+   kiểm tra hợp đồng runtime đồng nhất thay vì phase override riêng che lỗi.
+
+### Bằng chứng đã kiểm tra
+
+| Lượt | Bằng chứng và kết quả | Qualification |
+|---|---|---|
+| E1R.6 final `e1r6-final-20261106T220000Z-1510609` | 770 Python tests: 768 PASS, 2 SKIP, 0 FAIL/ERROR; `git diff --check` PASS. | Kết quả theo `final-gate-report.txt`; không cộng với các lượt test khác. |
+| E1R.6a Go/offline `e1r6a-20261105T192230Z-1464362` | Go race `./internal/paperload ./cmd/paperload` và `./internal/telemetryws -run Frame`, gofmt, `go vet ./...`, golangci-lint (0 issues), `go build ./...` đều PASS. Offline report xác nhận ba rung 2.000/5.000/10.000 `VALIDATED_PLAN_ONLY`, mỗi rung có viewer và telemetry Go role preflight exit 0, `PREFLIGHT_ONLY_NOT_RUN` (sáu role preflights tổng). | Chỉ schema/manifest/preflight; không có workload/capacity claim. |
+| E1R.6b native2.000 `e1r6b-native2000-20261105T192848Z-1466818` | 2.000/2.000 viewer; 16.665/16.665 delivery; 20 application ACK; DB delta 20 ledger / 2.000 raw / 20 temporal / 0 configuration; cleanup verified 12 container / 1 network / 5 volume. | Colocated finite native run. Chạy trước held-callback fix; không dùng làm bằng chứng cho fix đó. `full_p8_accepted=false`, `physical_ab=NOT RUN`. |
+| E1R.6c portable64 `e1r6c-final-20261106T214200Z-2` | 530/530 delivery; collector 0 errors; observed delay 63.000082811 giây, lớn hơn bound cũ 62 giây; session finalized `CLOSED`, cleanup `VERIFIED` (12/1/5). | Roundtrip xác minh importer/collector sau fix, không phải capacity test. `full_p8_accepted=false`, `physical_ab=NOT RUN`. |
+
+Go gate và ba rung offline giữ source/dirty context theo từng artifact; native
+2.000 và portable64 cũng giữ qualification riêng theo raw reports. Không suy diễn
+rằng tất cả artifact dùng một dirty tree/fingerprint giống nhau.
+
+Các lỗi lịch sử vẫn được giữ: lượt `e1r6c-portable-20261106T193902Z-1480621`
+phát hiện portable loader bug, sau đó được xác nhận bằng regression rồi sửa;
+lỗi `FileExists` và `SameFile` xảy ra trước workload trong driver orchestration,
+không phải kết quả capacity, và không được đổi nhãn thành PASS. Những lượt FAIL
+này không bị gộp vào kết quả thành công bên trên.
+
+**NOT RUN / giới hạn:** native 5.000 và 10.000; physical A/B; capacity/soak; HIL;
+remote/full final CI. Mọi raw artifact vẫn `full_p8_accepted=false`. Backend
+reference ceiling 8 MiB không thay đổi. Không mở P9/Stage 6.
+
+Runbook vận hành đã được cập nhật tại [P8 E1 remote gate](paper-p8-e1-remote-gate.md).
