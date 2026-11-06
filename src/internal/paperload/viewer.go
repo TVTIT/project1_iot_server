@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -272,6 +273,13 @@ func runViewer(ctx context.Context, m Manifest, manifestPath, outputDir string, 
 		principals[claims.sub] = true
 		v.token = token
 	}
+	orderedViewers := make([]*viewerSession, 0, len(byID))
+	for _, v := range byID {
+		orderedViewers = append(orderedViewers, v)
+	}
+	sort.Slice(orderedViewers, func(i, j int) bool {
+		return orderedViewers[i].id < orderedViewers[j].id
+	})
 	window := m.Viewer.IdentityWindow
 	if window == 0 {
 		window = 1024
@@ -300,21 +308,52 @@ func runViewer(ctx context.Context, m Manifest, manifestPath, outputDir string, 
 	errs := make(chan error, len(byID))
 	var socketsMu sync.Mutex
 	sockets := map[string]*viewerSocket{}
-	startAll := func() error {
+	startAll := func(paced bool) error {
+		ramp := time.Duration(0)
+		if paced && m.Traffic.RampSeconds > 0 {
+			ramp = time.Duration(m.Traffic.RampSeconds) * time.Second
+		}
 		var wg sync.WaitGroup
-		for _, v := range byID {
+		startTime := time.Now()
+		total := len(orderedViewers)
+		cancelled := false
+
+		for i, v := range orderedViewers {
+			targetOffset := viewerLaunchOffset(i, total, ramp)
+			if targetOffset > 0 {
+				delay := targetOffset - time.Since(startTime)
+				if delay > 0 {
+					timer := time.NewTimer(delay)
+					select {
+					case <-timer.C:
+					case <-wall.Done():
+						timer.Stop()
+						cancelled = true
+					}
+				}
+			}
+			if cancelled || wall.Err() != nil {
+				break
+			}
+
 			wg.Add(1)
 			go func(v *viewerSession) {
 				defer wg.Done()
 				select {
 				case handshakes <- struct{}{}:
 				case <-wall.Done():
-					errs <- wall.Err()
+					select {
+					case errs <- wall.Err():
+					default:
+					}
 					return
 				}
 				sock, err := connectViewer(wall, endpoint.String(), roots, v, handshakes, shared)
 				if err != nil {
-					errs <- err
+					select {
+					case errs <- err:
+					default:
+					}
 					return
 				}
 				socketsMu.Lock()
@@ -323,11 +362,15 @@ func runViewer(ctx context.Context, m Manifest, manifestPath, outputDir string, 
 				go readViewer(sock, shared, errs, time.Duration(m.Viewer.SlowPauseMS)*time.Millisecond)
 			}(v)
 		}
+
 		wg.Wait()
 		socketsMu.Lock()
 		n := len(sockets)
 		socketsMu.Unlock()
-		if n != len(byID) {
+		if n != total || wall.Err() != nil {
+			if err := wall.Err(); err != nil {
+				return err
+			}
 			return errors.New("viewer_connection_failed")
 		}
 		return nil
@@ -354,7 +397,7 @@ func runViewer(ctx context.Context, m Manifest, manifestPath, outputDir string, 
 			shared.mu.Unlock()
 		}
 	}
-	if err := startAll(); err != nil {
+	if err := startAll(true); err != nil {
 		stopAll("setup_failed")
 		shared.mu.Lock()
 		shared.result.PrimaryError = "viewer_connection_or_subscribe_failed"
@@ -381,7 +424,7 @@ func runViewer(ctx context.Context, m Manifest, manifestPath, outputDir string, 
 	if m.Viewer.Mode == "reconnect" {
 		for i := 0; i < m.Viewer.ReconnectCount; i++ {
 			stopAll("planned_reconnect")
-			if e := startAll(); e != nil {
+			if e := startAll(false); e != nil {
 				stopAll("reconnect_failed")
 				return viewerFailure(outputDir, shared, "viewer_reconnect_failed")
 			}
@@ -762,6 +805,19 @@ func writeViewerResult(dir string, r ViewerResult) error {
 		return e
 	}
 	return os.WriteFile(filepath.Join(dir, "workload.json"), append(b, '\n'), 0600)
+}
+
+// viewerLaunchOffset returns the scheduled launch offset for viewer index i out of total viewers,
+// spread over the half-open interval [0, ramp).
+// When ramp <= 0, total <= 1, or i <= 0, it returns 0.
+func viewerLaunchOffset(i, total int, ramp time.Duration) time.Duration {
+	if ramp <= 0 || total <= 1 || i <= 0 {
+		return 0
+	}
+	if i >= total {
+		i = total - 1
+	}
+	return time.Duration(i) * ramp / time.Duration(total)
 }
 
 // publishViewerReady stages and syncs the marker, checks for an early operator
