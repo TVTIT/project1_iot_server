@@ -82,6 +82,7 @@ Context được tạo một lần qua lệnh `e2-context` và chia sẻ nguyên
 - `--e2-offered-rate {100, 1000, 5000, 20000}`: Tốc độ đề nghị gộp toàn hệ thống, mặc định `100` tin nhắn/giây.
 - `--e2-duration-seconds`: Thời lượng phát tải đo lường (số nguyên >= 1, mặc định `10` giây; tối đa 7.200 giây trong ước lượng sizing).
 - `--e2-burst-messages`: Số lượng tin nhắn phát dồn (burst), số nguyên từ `0` đến `100000`, mặc định `0`.
+- `--e2-pending-messages` và `--e2-pending-bytes`: giới hạn pending **mỗi producer** của E2 official, mặc định lần lượt `64` và `1048576`. Số message từ 1 đến 100000; bytes từ 1 đến 1073741824. Cặp giá trị còn phải thỏa `2 * (pending_bytes + pending_messages * 4096) <= 256 MiB` cho hai producer. Đây là ngân sách logic ước lượng, không phải cam kết RSS.
 - `--deadline-seconds`: Thời hạn hiệu lực của phiên làm việc (session deadline), số nguyên từ `60` đến `86400` giây, mặc định `900` giây.
 
 #### 1.7.2 Quy tắc hạch toán tốc độ, burst và số dòng mẫu
@@ -99,6 +100,8 @@ Context được tạo một lần qua lệnh `e2-context` và chia sẻ nguyên
   $$\text{raw\_rows} = \text{total\_messages} \times \text{samples\_per\_message}$$
   - Với Profile S=100: Mỗi tin nhắn chứa 100 mẫu dữ liệu, tạo ra $100 \times \text{total\_messages}$ dòng raw trong cơ sở dữ liệu.
   - Với Profile S=1: Mỗi tin nhắn chứa 1 mẫu dữ liệu, tạo ra $1 \times \text{total\_messages}$ dòng raw trong cơ sở dữ liệu.
+
+Với bundle official mới, estimate tính cả burst vào message, sample và storage; budget pending cũng nằm trong metadata và được đối chiếu với cả hai manifest khi bind. Bundle cũ giữ cách diễn giải estimate cũ. Đổi budget phải tạo session/bundle mới, không sửa manifest đã bind. Tăng budget không bảo đảm backend theo kịp, không thay đổi tốc độ open-loop hay bảo đảm bài test PASS.
 
 #### 1.7.3 Ranh giới tổ hợp tham số được chấp nhận
 Không phải mọi tổ hợp tham số đều được hệ thống chấp nhận:
@@ -118,8 +121,7 @@ Không phải mọi tổ hợp tham số đều được hệ thống chấp nh�
 - **Từ chối vượt ngưỡng tài nguyên ước lượng (Resource Refusal)**:
   Khi chuẩn bị profile `official`, hàm `e2_official_estimate` tính toán kích thước dự báo thận trọng. Server sẽ từ chối khởi động với lỗi `e2_predicted_bound_exceeded` nếu dự báo vượt quá các giới hạn sau:
   - Dung lượng lưu trữ tăng trưởng (`total_storage_growth_bytes_estimate`) > 10 GiB (`max_disk_bytes = 10 << 30`).
-  - Bộ nhớ hàng đợi pending (`pending_memory_bytes`) > 256 MiB (`pending_memory_bytes = 256 << 20`).
-  - Bộ nhớ lưu trữ retry (`retry_memory_bytes`) > 256 MiB (`retry_memory_bytes = 256 << 20`).
+  - Budget pending và retry của cả hai producer vượt 256 MiB theo công thức logic ở trên bị từ chối là `e2_estimate_input_rejected`; phần bookkeeping retry được tính trong khoản 4.096 byte/message, không là đo RSS.
   - Băng thông ứng dụng (`application_bandwidth_bytes_per_second`) > 100 MiB/s (`100 << 20`).
 - **Thoát cạn hữu hạn (Finite Drain)**:
   Mọi kịch bản đều áp dụng thời gian thoát cạn hữu hạn (20 giây đối với `equal_samples`, 30 giây đối với `official`) để toàn bộ các tin nhắn đang truyền trên đường truyền (in-flight) được backend tiếp nhận, commit vào cơ sở dữ liệu và phát ACK trước khi chuyển sang pha hậu kiểm.
@@ -761,6 +763,8 @@ OFFERED_RATE=1000        # Chọn 1 trong: 100, 1000, 5000, 20000 (msg/s gộp c
 SAMPLES=100              # Chọn 1 trong: 100 hoặc 1 (batching samples per message)
 DURATION=10              # Thời lượng phát đo lường (giây, mặc định 10, hợp lệ 1..7200)
 BURST=0                  # Tin nhắn burst bổ sung cho Arm B (mặc định 0, hợp lệ 0..100000)
+PENDING_MESSAGES=1024    # Mỗi producer; ví dụ thử nghiệm, không bảo đảm đủ
+PENDING_BYTES=8388608    # Mỗi producer; 8 MiB, cần đủ theo kích thước payload
 DEADLINE=1200            # Ngân sách thời gian toàn phiên (giây, >= DURATION + 60, khuyến nghị 1200)
 RUN_LABEL="run01"        # Nhãn đợt chạy cụ thể để tránh xung đột thư mục lá khi đo lặp lại
 
@@ -801,7 +805,9 @@ python3 scripts/paper_p8_server.py serve \
   --samples-per-message "$SAMPLES" \
   --e2-offered-rate "$OFFERED_RATE" \
   --e2-duration-seconds "$DURATION" \
-  --e2-burst-messages "$BURST"
+  --e2-burst-messages "$BURST" \
+  --e2-pending-messages "$PENDING_MESSAGES" \
+  --e2-pending-bytes "$PENDING_BYTES"
 ```
 
 Lệnh trên in ra cấu trúc JSON chứa `e2_official_plan` với `expected_counts`, `producer_rates_per_second` (A và B chia đều) và `estimate` (dự báo thận trọng về lưu trữ, bộ nhớ pending/retry và băng thông). Đảm bảo không có lỗi `e2_predicted_bound_exceeded` hay `paper_p8_e2_official_schedule_rejected`.
@@ -823,7 +829,9 @@ python3 scripts/paper_p8_server.py serve \
   --samples-per-message "$SAMPLES" \
   --e2-offered-rate "$OFFERED_RATE" \
   --e2-duration-seconds "$DURATION" \
-  --e2-burst-messages "$BURST"
+  --e2-burst-messages "$BURST" \
+  --e2-pending-messages "$PENDING_MESSAGES" \
+  --e2-pending-bytes "$PENDING_BYTES"
 ```
 
 Tiến trình tự động khởi động các container hạ tầng (Go backend, TimescaleDB, Mosquitto DynSec, Nginx), cấp phát 2 Gateways (`gw_p0_a_*`, `gw_p0_b_*`), sinh role manifests và xuất client bundle tại thư mục `$WORK_DIR/client-bundle/`. Nhật ký foreground được ghi nhận liên tục tại `$WORK_DIR/server.log`.
