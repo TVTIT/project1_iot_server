@@ -47,6 +47,37 @@ func TestValidateManifestAndDeterministicEstimate(t *testing.T) {
 	}
 }
 
+func TestDecodeOfficialE2ManifestWithRunWideOfferedRate(t *testing.T) {
+	m := validManifest()
+	m.Experiment = "E2"
+	m.Arm = "A"
+	m.Profile = "official"
+	m.Roles = []string{"telemetry"}
+	m.Topology.Users = 0
+	m.Topology.Viewers = 0
+	m.Subscriptions = nil
+	m.IdentityFiles = map[string]string{"telemetry": "identity.json"}
+	m.GatewayIdentityFiles = map[string]string{"gw-a": "a.json", "gw-b": "b.json"}
+	m.DurabilityMode = "synthetic-load"
+	m.Traffic.RatePerSecond = 50
+	m.Traffic.TotalRatePerSecond = 100
+
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(strings.NewReader(string(data)))
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if decoded.Traffic.TotalRatePerSecond != 100 {
+		t.Fatalf("total offered rate = %v, want 100", decoded.Traffic.TotalRatePerSecond)
+	}
+	if _, err := Validate(decoded, true); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
 func TestViewerManifestRejectsTelemetryOnlyDurabilityMode(t *testing.T) {
 	// Fixture-derived from validManifest: E1 is the native viewer role, while
 	// synthetic-load is accepted only by the separate E2 telemetry role.

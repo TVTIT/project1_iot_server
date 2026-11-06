@@ -124,9 +124,10 @@ type Subscription struct {
 
 // Traffic defines finite offered rate, ramp and burst inputs.
 type Traffic struct {
-	RatePerSecond float64 `json:"rate_per_second"`
-	RampSeconds   int     `json:"ramp_seconds"`
-	BurstMessages int     `json:"burst_messages"`
+	RatePerSecond      float64 `json:"rate_per_second"`
+	TotalRatePerSecond float64 `json:"total_rate_per_second,omitempty"`
+	RampSeconds        int     `json:"ramp_seconds"`
+	BurstMessages      int     `json:"burst_messages"`
 }
 
 // Phases defines bounded warmup, measurement, drain and cooldown windows.
@@ -235,6 +236,9 @@ func ValidateAt(m Manifest, officialOptIn bool, now time.Time) (Estimate, error)
 		return bad()
 	}
 	if !controlOnly && (math.IsNaN(m.Traffic.RatePerSecond) || math.IsInf(m.Traffic.RatePerSecond, 0) || m.Traffic.RatePerSecond <= 0 || m.Traffic.RatePerSecond > MaxRatePerSecond || m.Traffic.RampSeconds < 0 || m.Traffic.RampSeconds > MaxDurationSeconds || m.Traffic.BurstMessages < 0 || m.Traffic.BurstMessages > 1000000) {
+		return bad()
+	}
+	if m.Traffic.TotalRatePerSecond != 0 && (math.IsNaN(m.Traffic.TotalRatePerSecond) || math.IsInf(m.Traffic.TotalRatePerSecond, 0) || m.Traffic.TotalRatePerSecond < m.Traffic.RatePerSecond || m.Traffic.TotalRatePerSecond > MaxRatePerSecond) {
 		return bad()
 	}
 	phaseValues := []int{m.Phases.WarmupSeconds, m.Phases.MeasureSeconds, m.Phases.DrainSeconds, m.Phases.CooldownSeconds}
