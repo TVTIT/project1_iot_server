@@ -1335,6 +1335,7 @@ def _cache_counter_window(before, after):
         return None
     return {'warm_lookup_hits': _counter_delta(rb, ra, 'lookup_hit_total'),
             'lookup_misses': _counter_delta(rb, ra, 'lookup_miss_total'),
+            'lookup_expired': _counter_delta(rb, ra, 'lookup_expired_total'),
             'repository_calls_avoided': _counter_delta(rb, ra, 'database_calls_avoided_total'),
             'database_duplicates': None, 'confirmed_new_rows': _counter_delta(pb, pa, 'confirmed_new_rows'),
             'copy_calls': _counter_delta(pb, pa, 'copy_calls'),
@@ -1342,6 +1343,18 @@ def _cache_counter_window(before, after):
             'attempts': _counter_delta(pb, pa, 'begin_attempts'),
             'raw_counters': {'ram_dedup_before': rb, 'ram_dedup_after': ra,
                              'persistence_before': pb, 'persistence_after': pa}}
+
+
+def _expiry_lookup_proof(cache, replay_count):
+    """Expired entries and rotated-out keys are both valid database-path lookups."""
+    if not isinstance(cache, dict):
+        return False
+    misses, expired = cache.get('lookup_misses'), cache.get('lookup_expired')
+    return (type(misses) is int and type(expired) is int and misses >= 0 and expired >= 0
+            and misses + expired >= replay_count
+            and type(cache.get('warm_lookup_hits')) is int and cache['warm_lookup_hits'] == 0
+            and type(cache.get('repository_calls_avoided')) is int
+            and cache['repository_calls_avoided'] == 0)
 
 
 def _stop_collector_and_process(collector, proc):
@@ -1953,7 +1966,7 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
         phase_validation['failures'].append('ingress_window_unavailable')
     else:
         required = {'Committed': unique_count, 'SamplesNew': unique_count * 100} if phase == 'unique' else {'Committed': 0, 'SamplesNew': 0}
-        if phase == 'cold-replay':
+        if phase in ('cold-replay', 'expiry-replay'):
             required['DuplicateCommitted'] = replay_count
         if any(delta.get(key) != value for key, value in required.items()):
             phase_validation['failures'].append('ingress_delta_mismatch')
@@ -1965,11 +1978,16 @@ def finish_remote_phase(smoke, fixture, endpoint, registry, containers, prepared
             or cache.get('warm_lookup_hits') < replay_count or type(cache.get('repository_calls_avoided')) is not int
             or cache.get('repository_calls_avoided') < replay_count):
         phase_validation['failures'].append('replay_cache_window_unproven')
-    if phase in ('replay', 'expiry-replay') and (phase == 'expiry-replay' or prepared['cache_mode'] == 'off') and (
+    if phase == 'expiry-replay':
+        if (not isinstance(cache, dict) or type(cache.get('attempts')) is not int or cache['attempts'] <= 0
+                or type(cache.get('transaction_commits')) is not int or cache['transaction_commits'] <= 0
+                or not _expiry_lookup_proof(cache, replay_count)
+                or type(cache.get('copy_calls')) is not int or cache['copy_calls'] != 0
+                or type(cache.get('confirmed_new_rows')) is not int or cache['confirmed_new_rows'] != 0):
+            phase_validation['failures'].append('expiry_replay_database_path_unproven')
+    elif phase == 'replay' and prepared['cache_mode'] == 'off' and (
             not isinstance(cache, dict) or type(cache.get('attempts')) is not int or cache['attempts'] <= 0
             or type(cache.get('transaction_commits')) is not int or cache['transaction_commits'] <= 0
-            or phase == 'expiry-replay' and (type(cache.get('lookup_misses')) is not int
-                or cache.get('lookup_misses') < replay_count)
             or type(cache.get('copy_calls')) is not int or cache['copy_calls'] != 0
             or type(cache.get('confirmed_new_rows')) is not int or cache['confirmed_new_rows'] != 0):
         phase_validation['failures'].append('replay_cache_off_database_path_unproven')
@@ -2170,13 +2188,14 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
         workload_status = 'COLD_REPLAY_SUBSET_VALIDATED'
     elif expiry_enabled:
         expiry_window = windows.get('expiry-replay', {})
+        expiry_cache = expiry_window.get('cache')
         cache_ok = (prepared['cache_mode'] == 'on' and isinstance(expiry_evidence, dict)
             and expiry_evidence.get('status') == 'PASS'
             and expiry_evidence.get('confirmed_age_seconds', 0) >= 600
             and results.get('expiry-replay', {}).get('validation_valid') is True
-            and isinstance(expiry_window.get('cache'), dict)
-            and expiry_window['cache'].get('lookup_misses', 0) >= replay_count
-            and expiry_window['cache'].get('transaction_commits', 0) > 0
+            and _expiry_lookup_proof(expiry_cache, replay_count)
+            and type(expiry_cache.get('transaction_commits')) is int
+            and expiry_cache['transaction_commits'] > 0
             and expiry_window.get('database_proof', {}).get('exact_equal') is True)
         cold_status = 'PASS' if cache_ok else 'FAIL'
         lane_marker = 'PAPER_P8_E4_TTL_EXPIRY_SUBSET'

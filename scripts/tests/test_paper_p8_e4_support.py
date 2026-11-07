@@ -936,6 +936,148 @@ class E4SupportTests(unittest.TestCase):
                                                 result_root, phase='replay')
                 self.assertIn('replay_unique_snapshot_mismatch', answer['validation_failures'])
 
+    def test_expiry_replay_accepts_expired_or_rotated_lookups_with_database_proof(self):
+        unique, replay, _, _ = sample()
+        unique_hash = 'a' * 64
+        snapshot = [{'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0,
+                     'fingerprint': 'b' * 32}] * 2
+        ram_before = {'lookup_hit_total': 101, 'lookup_miss_total': 1000,
+                      'lookup_expired_total': 0, 'database_calls_avoided_total': 101}
+        persistence_before = {'begin_attempts': 999, 'confirmed_commits': 999,
+                              'copy_calls': 999, 'confirmed_new_rows': 100000}
+
+        def metrics(ram, persistence, process='proc'):
+            return {'process_instance': process, 'ram_dedup': dict(ram),
+                    'persistence': dict(persistence), 'ingress': {}, 'websocket_metrics': {}}
+
+        def run(*, expired=0, misses=0, hits=0, avoided=0, committed=10,
+                process='proc', drop_expired=False, duplicate=10):
+            with tempfile.TemporaryDirectory(prefix='p8-e4-expiry-',
+                                             dir='/var/tmp/opencode') as tmp:
+                root = Path(tmp); result_dir = root / 'incoming' / 'expiry-replay'
+                result_dir.mkdir(parents=True); (result_dir / 'results.json').write_text('{}')
+                ram_after = {'lookup_hit_total': 101 + hits,
+                             'lookup_miss_total': 1000 + misses,
+                             'lookup_expired_total': expired,
+                             'database_calls_avoided_total': 101 + avoided}
+                if drop_expired:
+                    ram_after.pop('lookup_expired_total')
+                persistence_after = {'begin_attempts': 999 + committed,
+                                     'confirmed_commits': 999 + committed,
+                                     'copy_calls': 999, 'confirmed_new_rows': 100000}
+                before = metrics(ram_before, persistence_before)
+                after = metrics(ram_after, persistence_after, process=process)
+                prepared = {
+                    'phase_baselines': {'expiry-replay': {'admin_metrics': before,
+                                                          'database': snapshot}},
+                    'remote_collectors': {'expiry-replay': Mock()},
+                    'phase_results': {'unique': {'telemetry': unique,
+                                                 'validation_valid': True}},
+                    'phase_windows': {'unique': {'journal_sha256': unique_hash}},
+                    'unique_database_snapshot': snapshot,
+                    'a_confirmed_commit_time': time.time() - 932.0,
+                    'expiry_commit_process_instance': 'proc',
+                    'include_expiry_replay': True, 'cache_mode': 'on',
+                    'unique_count': 20, 'replay_count': 10,
+                    'session_id': 'session',
+                    'phase_run_ids': {'expiry-replay': 'run'},
+                    'bundle_sha256': 'b' * 64, 'tokens': {'admin': 'token'},
+                    'specs': [SimpleNamespace(gateway_id='g1', sensor_id='s1'),
+                              SimpleNamespace(gateway_id='g2', sensor_id='s2')],
+                    'pg': 'pg', 'manifests': []}
+                fixture = SimpleNamespace(private=root)
+                runtime = Mock(); runtime.paper_p0_stats.return_value = {}
+                telemetry_path = ('results/phases/expiry-replay/workloads/'
+                                  'expiry-replay/workload.json')
+                viewer_path = 'results/phases/expiry-replay/workloads/viewer/workload.json'
+                with patch.object(e4, '_read_e4_result_bundle', return_value=(
+                        {'journal_sha256': unique_hash, 'source_bundle_sha256': 'b' * 64,
+                         'runner_status': 'COMPLETE'},
+                        {telemetry_path: replay, viewer_path: {}})), \
+                     patch.object(e4, '_validate_e4_phase_samples', return_value={
+                         'valid': True, 'failures': []}), \
+                     patch.object(e4._support, '_admin_metrics', return_value=after), \
+                     patch.object(e4, '_wait_e4_ws_drain', return_value=after), \
+                     patch.object(e4, '_counts', return_value=snapshot[0]), \
+                     patch.object(e4, '_database_delta', return_value={'ledger': 0, 'raw': 0,
+                         'temporal': 0, 'configuration': 0}), \
+                     patch.object(e4._support, 'calculate_ingress_delta', return_value={
+                         'available': True, 'delta': {'Committed': 0, 'SamplesNew': 0,
+                             'DuplicateCommitted': duplicate, 'ACKPublished': 10}}), \
+                     patch.object(e4, '_e4_ws_window', return_value={
+                         'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+                         'telemetry_writes_completed': 0, 'drops': 0}), \
+                     patch.object(e4, '_replay_headers_match_manifest_prefix',
+                                  return_value=True):
+                    return e4.finish_remote_phase(runtime, fixture, 'endpoint', 'registry', {},
+                        prepared, result_dir, phase='expiry-replay')
+
+        expired = run(expired=10)
+        self.assertTrue(expired['validation_valid'], expired['validation_failures'])
+        self.assertEqual(expired['cache_window']['lookup_expired'], 10)
+        self.assertEqual(expired['cache_window']['lookup_misses'], 0)
+        rotated = run(misses=10)
+        self.assertTrue(rotated['validation_valid'], rotated['validation_failures'])
+        for kwargs in ({'expired': 5}, {'hits': 10, 'avoided': 10},
+                       {'expired': 10, 'drop_expired': True},
+                       {'expired': 10, 'process': 'other'}):
+            result = run(**kwargs)
+            self.assertFalse(result['validation_valid'], kwargs)
+            self.assertIn('expiry_replay_database_path_unproven',
+                          result['validation_failures'])
+        short_duplicates = run(expired=10, duplicate=5)
+        self.assertFalse(short_duplicates['validation_valid'])
+        self.assertIn('ingress_delta_mismatch', short_duplicates['validation_failures'])
+
+    def test_expiry_report_accepts_expired_lookups_and_fails_short_windows(self):
+        unique, replay, _, replay_window = sample()
+        journal = 'a' * 64
+        zero = {'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}
+        unique_db = {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0}
+        no_ws = {'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+                 'telemetry_writes_completed': 0, 'drops': 0}
+        unique_ws = {'submissions': 20, 'new_events': 20, 'deliveries_enqueued': 20,
+                     'telemetry_writes_completed': 20, 'drops': 0}
+        expiry_cache = {'warm_lookup_hits': 0, 'lookup_misses': 0, 'lookup_expired': 10,
+                        'repository_calls_avoided': 0, 'attempts': 10,
+                        'transaction_commits': 10, 'copy_calls': 0,
+                        'confirmed_new_rows': 0}
+        prepared = {
+            'include_expiry_replay': True, 'cache_mode': 'on', 'unique_count': 20,
+            'replay_count': 10,
+            'phase_results': {'unique': {'telemetry': unique, 'validation_valid': True},
+                              'replay': {'telemetry': replay, 'validation_valid': True},
+                              'expiry-replay': {'telemetry': replay,
+                                                'validation_valid': True}},
+            'phase_windows': {
+                'unique': {'database_delta': unique_db, 'ws_delta': unique_ws,
+                           'journal_sha256': journal},
+                'replay': {'database_delta': zero, 'ws_delta': no_ws,
+                           'journal_sha256': journal,
+                           'cache': dict(replay_window['cache']),
+                           'database_proof': {'exact_equal': True}},
+                'expiry-replay': {'database_delta': zero, 'ws_delta': no_ws,
+                                  'journal_sha256': journal, 'cache': expiry_cache,
+                                  'database_proof': {'exact_equal': True}}},
+            'expiry_evidence': {'status': 'PASS', 'failures': [],
+                                'confirmed_age_seconds': 932.6},
+            'overall_validation': {'valid': True, 'failures': []},
+            'arm': 'warm', 'session_id': 'session', 'run_id': 'run',
+            'phase_run_ids': {'unique': 'u', 'replay': 'r', 'expiry-replay': 'e'},
+            'schema': 'schema', 'quota': {}, 'effective_flags': {}}
+        session = {'phase_history': ['unique', 'replay', 'expiry-replay'],
+                   'workload_outcome': 'VALIDATED'}
+        report = e4.finalize_remote_report(prepared, session, cleanup_verified=True,
+            cleanup_counts={'container': 12, 'network': 1, 'volume': 5})
+        self.assertEqual(report['status'], 'PASS', report.get('validation'))
+        self.assertEqual(report['ttl_expiry']['status'], 'PASS')
+        self.assertEqual(report['workload_status'], 'TTL_EXPIRY_SUBSET_VALIDATED')
+        prepared['phase_windows']['expiry-replay']['cache']['lookup_expired'] = 5
+        failed = e4.finalize_remote_report(prepared, session, cleanup_verified=True,
+            cleanup_counts={'container': 12, 'network': 1, 'volume': 5})
+        self.assertNotEqual(failed['status'], 'PASS')
+        self.assertEqual(failed['ttl_expiry']['status'], 'FAIL')
+
     def test_declared_replay_prefix_rejects_count_order_and_foreign_headers(self):
         with tempfile.TemporaryDirectory(prefix='p8-e4-prefix-', dir='/var/tmp/opencode') as tmp:
             manifest = Path(tmp) / 'replay.json'
@@ -977,19 +1119,22 @@ class E4SupportTests(unittest.TestCase):
 
     def test_actual_admin_toplevel_groups_and_counter_reset(self):
         before = {'process_instance': 'backend-1', 'ram_dedup': {'lookup_hit_total': 4, 'lookup_miss_total': 2,
-                                'database_calls_avoided_total': 3},
+                                'lookup_expired_total': 5, 'database_calls_avoided_total': 3},
                   'persistence': {'begin_attempts': 8, 'confirmed_commits': 5,
                                   'copy_calls': 2, 'confirmed_new_rows': 200}}
         after = {'process_instance': 'backend-1', 'ram_dedup': {'lookup_hit_total': 7, 'lookup_miss_total': 3,
-                               'database_calls_avoided_total': 6},
+                               'lookup_expired_total': 8, 'database_calls_avoided_total': 6},
                  'persistence': {'begin_attempts': 8, 'confirmed_commits': 5,
                                  'copy_calls': 2, 'confirmed_new_rows': 200}}
         window = e4._cache_counter_window(before, after)
         self.assertEqual(window['warm_lookup_hits'], 3)
+        self.assertEqual(window['lookup_expired'], 3)
         self.assertEqual(window['repository_calls_avoided'], 3)
         self.assertEqual(window['attempts'], 0)
         after['ram_dedup']['lookup_hit_total'] = 1
         self.assertIsNone(e4._cache_counter_window(before, after)['warm_lookup_hits'])
+        after['ram_dedup']['lookup_expired_total'] = 3
+        self.assertIsNone(e4._cache_counter_window(before, after)['lookup_expired'])
         after['process_instance'] = 'backend-2'
         self.assertIsNone(e4._cache_counter_window(before, after))
         self.assertIsNone(e4._cache_counter_window(before, {}) )
