@@ -1030,6 +1030,7 @@ class E4SupportTests(unittest.TestCase):
         self.assertIn('ingress_delta_mismatch', short_duplicates['validation_failures'])
 
     def test_expiry_report_accepts_expired_lookups_and_fails_short_windows(self):
+        from scripts.tests import native_compose_smoke as smoke
         unique, replay, _, replay_window = sample()
         journal = 'a' * 64
         zero = {'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}
@@ -1051,7 +1052,9 @@ class E4SupportTests(unittest.TestCase):
                                                 'validation_valid': True}},
             'phase_windows': {
                 'unique': {'database_delta': unique_db, 'ws_delta': unique_ws,
-                           'journal_sha256': journal},
+                           'journal_sha256': journal,
+                           'raw': [{'verified_exact': True, 'ledger_count': 10,
+                                    'raw_identity_value_mismatches': 0}] * 2},
                 'replay': {'database_delta': zero, 'ws_delta': no_ws,
                            'journal_sha256': journal,
                            'cache': dict(replay_window['cache']),
@@ -1072,11 +1075,15 @@ class E4SupportTests(unittest.TestCase):
         self.assertEqual(report['status'], 'PASS', report.get('validation'))
         self.assertEqual(report['ttl_expiry']['status'], 'PASS')
         self.assertEqual(report['workload_status'], 'TTL_EXPIRY_SUBSET_VALIDATED')
+        self.assertEqual(report['coldrestart'], 'NOT RUN')
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True),
+                        report.get('workload_status'))
         prepared['phase_windows']['expiry-replay']['cache']['lookup_expired'] = 5
         failed = e4.finalize_remote_report(prepared, session, cleanup_verified=True,
             cleanup_counts={'container': 12, 'network': 1, 'volume': 5})
         self.assertNotEqual(failed['status'], 'PASS')
         self.assertEqual(failed['ttl_expiry']['status'], 'FAIL')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(failed, True))
 
     def test_declared_replay_prefix_rejects_count_order_and_foreign_headers(self):
         with tempfile.TemporaryDirectory(prefix='p8-e4-prefix-', dir='/var/tmp/opencode') as tmp:

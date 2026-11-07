@@ -2197,7 +2197,9 @@ def finalize_remote_report(prepared, session_state, *, cleanup_verified, cleanup
             and type(expiry_cache.get('transaction_commits')) is int
             and expiry_cache['transaction_commits'] > 0
             and expiry_window.get('database_proof', {}).get('exact_equal') is True)
-        cold_status = 'PASS' if cache_ok else 'FAIL'
+        # TTL expiry proves itself through ttl_expiry; it never runs the cold
+        # restart lane, so coldrestart must stay NOT RUN for this profile.
+        cold_status = 'NOT RUN'
         lane_marker = 'PAPER_P8_E4_TTL_EXPIRY_SUBSET'
         workload_status = 'TTL_EXPIRY_SUBSET_VALIDATED'
     elif prepared['cache_mode'] == 'off':
