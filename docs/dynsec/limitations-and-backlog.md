@@ -14,6 +14,16 @@ thưa và không có histogram trong N1 không chứng minh peak/RSS, sustained 
 soak hay bottleneck DB. Giữ shaper/gates/drain/defaults hiện hành; không tối ưu DB
 hoặc nới capacity từ các counters này.
 
+**Bổ sung diagnostics source-local (07/11/2026):** smoke reader-only PostgreSQL
+16 đầu FAIL vì SQL thiếu ngoặc (exact cleanup đúng); sau sửa smoke PASS với 30
+I/O rows, quota cô lập 0,5 CPU, Docker one-shot, read-only receipt unchanged và
+exact cleanup. Không có telemetry, quota không phải E2 workload, và chưa chạy
+remote persistence trên source mới. N1 tiếp tục `PARTIAL`/`ABORTED`; E2R.1/5
+không được đánh dấu accepted, N2/N3/N4 còn chờ người dùng, P8 chưa hoàn tất.
+Chi tiết diagnostics, timestamp/reset/identity qualification và công thức delta
+nằm trong [runbook E2](../backend/paper-p8-e2-remote-gate.md#chẩn-đoán-persistence-e2-source-mới-chạy-riêng)
+và [P8 report](../backend/paper-p8-experiments-and-acceptance.md#bổ-sung--persistence-diagnostics-local-smoke-2026-11-07).
+
 ---
 
 ## P3 Sensor control loop — nghiệm thu local MVP và giới hạn kỹ thuật (25/10/2026)

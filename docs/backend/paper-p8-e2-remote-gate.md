@@ -797,6 +797,66 @@ vẫn chạy `export-results`, chuyển export và gọi `finish-phase` để l�
 diagnostics trung thực; không sửa expected counts. Nếu export/import từ chối hoặc
 flow không thể tiếp tục, giữ artifact lỗi và gọi `abort`/cleanup theo receipt;
 không gắn acceptance. Diagnostics best-effort chỉ trong lifecycle trước cleanup.
+
+#### Chẩn đoán persistence E2 (source mới, chạy riêng)
+
+Remote E2 official `steady_burst` tự thu thập 11 stage cố định `persistence.durations`; stage
+`begin` bao gồm cả thời gian lấy connection từ pool. `lock SQL duration` là
+thời lượng câu SQL liên quan, **không** phải thời gian chờ lock thuần. Báo cáo
+giữ lại các trường pool của `pgx` (`db`), nhưng không diễn giải chúng thành
+PostgreSQL server wait.
+
+Lượt source mới chưa có phép đo remote hoàn chỉnh. Khi được người dùng điều phối
+Host B, chạy lại cùng workload `run06` với leaf hoàn toàn mới, ví dụ
+`run07-diagnostics` (không tái dùng workspace/artifact), giữ nguyên thông số:
+
+```text
+rate=1000, S=100, duration=10, burst=0,
+pending=8192/8388608, deadline=3600,
+retry flags=500/8000/10/100/100 (cùng mode bounded_backoff_v1)
+```
+
+Giữ 4 workers, 500 rows, pool 10, shaper bật, backend quota 2 CPU/4 GiB và
+drain 30 giây. Tiếp tục đúng lifecycle từng bước ở trên: tạo bundle/binary mới
+và chuyển thủ công sang B; `begin` dùng `--phase-id samples-100` (100 samples/message,
+không phải yêu cầu 100 mẫu diagnostics); B export kết quả kể cả
+khi `PARTIAL`; A `finish-phase` hoặc `abort` theo kết quả thật, rồi xác minh
+exact cleanup. Không hứa lượt chạy sẽ PASS; việc phối hợp vận hành trên B thuộc
+người dùng.
+
+Diagnostics bổ sung chỉ đọc trên PostgreSQL 16 của fixture. `postgres_linux`
+giữ baseline, từng sample và terminal; mỗi nguồn có timestamp riêng, nên không
+ghép chúng như cùng một thời điểm. Truy vấn chẩn đoán tự làm tăng một phần DB
+counters; `pg_stat_database` là database-scoped, `pg_stat_wal` và `pg_stat_io`
+là cluster-scoped, không riêng telemetry. Trước khi lấy delta phải xác nhận
+server/database identity và `stats_reset` không đổi; nếu reset hoặc identity
+không khớp thì delta không hợp lệ. View chưa được hỗ trợ, cgroup v2 không đọc
+được hoặc rootless Docker được biểu diễn `unavailable`, không phải zero.
+
+Ring PostgreSQL/Linux dùng cap 64 mẫu và 512 KiB; metrics ring dùng
+3.600 mẫu và 2 MiB. Baseline/terminal được giữ riêng ngoài ring.
+Có thể thiếu mẫu do ring eviction; xem coverage và timestamp
+của từng mẫu. Thu thập có chi phí chẩn đoán, không phải overhead bằng không.
+`track_io_timing` và `track_wal_io_timing` nếu OFF giữ thời gian là
+`null`/unavailable; mã đo **không bật** các setting này.
+
+Chỉ khi counter/timestamp/identity hợp lệ mới tính delta theo khoảng đo
+`delta_t` giây:
+
+- CPU cores trung bình = `delta usage_usec / (1e6 * delta_t)`.
+- Tỷ lệ kỳ đo bị throttled = `delta nr_throttled / delta nr_periods` khi
+  `delta nr_periods > 0`; đây không phải phần trăm throughput bị mất.
+- Disk await trung bình (ms/op) =
+  `(delta read_time_ms + delta write_time_ms) / (delta reads_completed + delta writes_completed)`
+  khi mẫu số lớn hơn 0.
+- Average queue = `delta weighted_io_time_ms / (1000 * delta_t)`.
+
+Không dùng delta sau reset và không cộng các device phân lớp (layered devices),
+vì có thể đếm cùng I/O nhiều lần. Host `diskstats` không đo latency riêng của
+container; `sampledRAM` không phải peak. Quota 2 CPU chỉ áp cho backend, không
+giới hạn toàn stack và không pin CPU. Đây là chẩn đoán, không phải chẩn đoán
+phần cứng hay bằng chứng bottleneck/capacity.
+
 - **Ngân sách Dự báo và Ranh giới Từ chối Tài nguyên (`e2_official_estimate`)**:
   Server tự động tính toán mô hình ước lượng kích thước trước khi khởi động. Server sẽ từ chối khởi động ngay tại bước `prepare` với lỗi `e2_predicted_bound_exceeded` nếu dự báo vượt quá các giới hạn an toàn:
   - Dung lượng lưu trữ tăng trưởng (`total_storage_growth_bytes_estimate`) > 10 GiB (`10 << 30`).

@@ -677,3 +677,34 @@ failure giữ nguyên như đã ghi trong run artifacts; không đổi thành PA
 completion, capacity acceptance, sustained throughput, soak hay P8 acceptance.
 N1 cũng không chứng minh nguyên nhân DB persistence. N2/N3/N4 và qualification
 native trên final source chưa chạy.
+
+### Bổ sung — Persistence diagnostics local smoke (2026-11-07)
+
+Source mới bổ sung diagnostics có giới hạn: tự thu thập 11 stage cố định
+`persistence.durations` trong remote E2 official `steady_burst` (stage `begin` gồm pool
+acquisition; lock SQL duration không đồng nghĩa pure lock wait), giữ lại các
+trường `db` của pgx pool, và ghi baseline/samples/terminal PostgreSQL/Linux với
+timestamp độc lập. Tài liệu vận hành, công thức delta và giới hạn diễn giải nằm
+trong [runbook E2](paper-p8-e2-remote-gate.md#chẩn-đoán-persistence-e2-source-mới-chạy-riêng).
+
+Smoke reader fixture đầu tiên FAIL do thiếu dấu ngoặc đóng ngoài cùng của SQL; exact
+cleanup vẫn đúng. Regression được sửa, smoke tiếp theo PASS: PostgreSQL 16.15
+(`server_version_num=160015`),
+30 I/O rows, cgroup quota 0,5 CPU, Docker one-shot, read-only và receipt không
+đổi, exact cleanup. Artifacts giữ tại
+`/var/tmp/opencode/p8-persistence-diagnostics/native-reader-hzvnxr/summary.json`
+(FAIL) và
+`/var/tmp/opencode/p8-persistence-diagnostics/native-reader-H7g3DZ/summary.json`
+(PASS). Đây là fixture reader-only cô lập: quota 0,5 CPU không phải quota E2
+hay workload telemetry; không tạo telemetry, và `full_p8_accepted=false`.
+
+Đây **không** phải lượt E2 remote đo persistence. Chưa chạy cùng `run06` trên
+source mới; cần người dùng phối hợp Host B theo runbook, chọn leaf mới, chuyển
+bundle/binary mới, giữ S=100 samples/message và phase `samples-100`, export cả khi PARTIAL, rồi finish/abort và
+exact cleanup. Không bảo đảm PASS và không phải chẩn đoán phần cứng. Giữ nguyên
+N1 `PARTIAL`/`ABORTED`, mọi FAIL/PARTIAL/NOT RUN lịch sử, cùng trạng thái chưa
+đóng E2R.1/5 và chưa hoàn tất P8. Parent Go race telemetry/ingress/cmd-server,
+build, vet, lint và gofmt PASS; combined Python final chạy 571 tests, 1 skipped,
+không failures/errors (không phải 571 PASS). Commands/logs và final local
+verification ở `/var/tmp/opencode/p8-persistence-diagnostics/final-verification-lKOHyi/handoff.md`;
+không có claim coverage hoặc full CI.
