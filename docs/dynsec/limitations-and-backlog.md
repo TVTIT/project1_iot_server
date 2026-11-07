@@ -24,6 +24,22 @@ Chi tiết diagnostics, timestamp/reset/identity qualification và công thức 
 nằm trong [runbook E2](../backend/paper-p8-e2-remote-gate.md#chẩn-đoán-persistence-e2-source-mới-chạy-riêng)
 và [P8 report](../backend/paper-p8-experiments-and-acceptance.md#bổ-sung--persistence-diagnostics-local-smoke-2026-11-07).
 
+**Cập nhật lưu giữ chẩn đoán E2 cục bộ (07/11/2026):** Khắc phục hiện tượng mất
+chứng cứ active do vòng đệm xoay vòng 64 mẫu/512 KiB bị trôi trong lượt `run07`
+trước đó, mã nguồn đã bổ sung cơ chế bounded active side capture cho E2 official
+`steady_burst` (giữ earliest evidence sau trigger HTTP `ingress.Received` của
+cùng `process_instance`, ngân sách mẫu lưu giữ theo kích thước JSON 128 mẫu / 2 MiB
+(serialized/logical, không phải phân bổ RAM cứng), pre-trigger buffer $\le 4$ mẫu /
+64 KiB, tổng dung lượng file JSON chẩn đoán tối đa 8 MiB, phân định rõ với RSS).
+Kiểm chứng cục bộ hoàn tất với 566 selected Python unit/mock regressions PASS (1
+lệnh duy nhất, không cộng dồn), cú pháp hợp lệ, `git diff --check` PASS, 9 tệp Go
+và 4 tệp Python khớp SHA256 chính xác. Native DB/broker/E2 official trên scheduler+retention
+source tiếp tục là NOT RUN; không có chứng minh năng lực 1.000 msg/s. Không nới
+capacity hay tự ý chuyển N2/N3/N4; việc sửa retention cục bộ không phải là cải
+thiện hiệu năng remote hay kết luận phần cứng.
+Chi tiết xem tại [runbook E2](../backend/paper-p8-e2-remote-gate.md#chẩn-đoán-persistence-e2-source-mới-chạy-riêng)
+và [P8 report](../backend/paper-p8-experiments-and-acceptance.md#bổ-sung--bounded-active-diagnostics-retention-và-kiểm-chứng-cục-bộ-2026-11-07).
+
 ---
 
 ## P3 Sensor control loop — nghiệm thu local MVP và giới hạn kỹ thuật (25/10/2026)

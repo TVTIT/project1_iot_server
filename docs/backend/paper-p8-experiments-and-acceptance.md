@@ -708,3 +708,76 @@ build, vet, lint và gofmt PASS; combined Python final chạy 571 tests, 1 skipp
 không failures/errors (không phải 571 PASS). Commands/logs và final local
 verification ở `/var/tmp/opencode/p8-persistence-diagnostics/final-verification-lKOHyi/handoff.md`;
 không có claim coverage hoặc full CI.
+
+### Bổ sung — Bounded active diagnostics retention và kiểm chứng cục bộ (2026-11-07)
+
+**Bối cảnh:** Ở lượt chạy `run07` trước đó, dữ liệu chẩn đoán của đợt active burst ban
+đầu đã bị đẩy ra ngoài (evicted) khỏi vòng đệm xoay vòng cũ (rolling ring 64 mẫu và
+512 KiB) do bộ lấy mẫu tiếp tục gom các mẫu trong khoảng thời gian rảnh khi người
+vận hành chờ điều phối giữa các bước. Mã nguồn hiện hành đã hoàn tất cơ chế lưu
+giữ chủ động có giới hạn (bounded active side capture) ở phạm vi cục bộ:
+
+1. **Phạm vi và luồng lấy mẫu:**
+   - Cơ chế bounded active side capture chỉ áp dụng cho E2 official `steady_burst`.
+     Các chế độ standalone, pilot, hoặc `equal_samples` giữ nguyên hành vi trước đây.
+   - Luồng đọc chậm riêng biệt (separate slow-reader thread) cho PostgreSQL/Linux/Docker
+     hoạt động độc lập, không làm nghẽn tiến trình lấy mẫu HTTP định kỳ.
+
+2. **Trigger và cửa sổ yêu cầu:**
+   - Trigger kích hoạt active CHỈ ĐƯỢC XÁC ĐỊNH khi CÙNG một tiến trình backend
+     (`process_instance`) và số lượng `ingress.Received` (dạng số nguyên hợp lệ)
+     tăng so với baseline HTTP trên Host A (`scrape_finished_monotonic` / `scrape_finished_timestamp`).
+     Không tính thời điểm `begin`, không phụ thuộc tiến trình đọc PG hay đồng hồ Host B.
+   - Vùng đệm tiền kích hoạt (pre-trigger buffer) lưu tối đa $\le 4$ mẫu và $\le 64\text{ KiB}$,
+     được tính gộp trong tổng giới hạn 128 mẫu / 2 MiB. Hệ thống có thể chờ trước khi
+     có trigger; thời lượng thu thập không chạy sớm khi chưa có lưu lượng thực tế.
+   - Cửa sổ yêu cầu sau trigger = $\max(\text{tổng thời lượng các pha } A, B) + 10\text{s}$
+     (với kịch bản 10s đo lường + 30s drain $\to$ 50s sau trigger). Session absolute
+     deadline độc lập chặn cận trên; ngân sách thời gian được tính lại sau baseline
+     chậm và không được gia hạn.
+
+3. **Chính sách lưu trữ và bao phủ:**
+   - Sau khi trigger kích hoạt, hệ thống bảo toàn chứng cứ sớm nhất (earliest evidence),
+     tuyệt đối không eviction để lấy chỗ cho mẫu idle. Đóng băng toàn bộ khi hết cửa
+     sổ tự nhiên; các khoảng lặng tạm thời không kích hoạt freeze.
+   - Cạn 128 mẫu hoặc 2 MiB sẽ đóng băng ngay với nhãn `truncated` / `incomplete`.
+     Thiếu baseline, identity, trigger, hoặc bị reset/dừng sớm thì kết quả không
+     được coi là hoàn tất (`complete`).
+   - Tiến trình đọc đang chạy được phép hoàn tất với timestamp riêng; không khởi động
+     nguồn mới sau khi đóng; nguồn chưa chạy ghi `unavailable`. Baseline/terminal tách biệt;
+     stop/join có chặn thời gian.
+
+4. **Giới hạn dung lượng mẫu và tệp chẩn đoán:**
+   - Ngân sách mẫu lưu giữ theo kích thước JSON cho `postgres_linux` là **128 mẫu và 2 MiB**
+     (dung lượng mẫu serialized/logical được giữ lại, không phải phân bổ RAM cứng);
+     ngân sách vòng đệm HTTP rolling ring giữ **3.600 mẫu và 2 MiB**.
+   - Tổng dung lượng TỆP JSON chẩn đoán (`p8-e2-diagnostics.json`) được giới hạn cứng
+     ở mức **8 MiB**, đo bằng chuỗi mã hóa thực tế qua `json.dumps` mặc định bởi helper
+     chuẩn tắc `native_compose_smoke.paper_p8_e2_persist_diagnostics(path, payload)`
+     (dùng thống nhất cho early, final, và fallback writes). Phân định rõ từng ngân sách
+     mẫu tuần tự hóa với trần file JSON tổng thể trên đĩa (cả hai đều không phải process RSS).
+     Vượt quá 8 MiB sẽ fail-closed với trạng thái giới hạn kích thước.
+   - Thao tác xuất (`finish-phase` / `abort`) trước khi dọn dẹp bảo toàn dữ liệu active
+     sớm nhất; sự chậm trễ của người vận hành sau khi freeze không làm mất dữ liệu.
+     Trường `full_p8_accepted: false` được bảo toàn trong diagnostics; artifact xuất
+     được và cleanup exact không đồng nghĩa nghiệm thu hiệu năng.
+
+**Kết quả kiểm chứng cục bộ (Parent Final Local Verification):**
+- Bài kiểm tra đơn vị và hồi quy: **566 selected Python unit/mock regressions PASS**
+  (chạy trong một lệnh duy nhất, không cộng dồn các lượt trước), cú pháp Python phân tích
+  hợp lệ (syntax parse PASS), `git diff --check` PASS (mã thoát 0).
+- Bảo toàn mã nguồn: Toàn bộ 9 tệp mã Go khớp chính xác SHA256 theo
+  `/var/tmp/opencode/p8-retention-e708uz/preexisting-go-work.json` và 4 tệp Python khớp
+  theo `verified-python-hashes.json`. Lệnh và log chi tiết được lưu giữ tại
+  `/var/tmp/opencode/p8-retention-e708uz/final-verification-w1s2zeu2/checks.json` và
+  `python-tests.log`.
+- **Ranh giới kỹ thuật:** Native DB/broker/E2 official trên scheduler+retention source
+  là **NOT RUN**; không có chứng minh năng lực chịu tải 1.000 msg/s. Các số liệu trước
+  đây (451, 223, v.v.) là từ các phiên bản source cũ hơn, không cộng dồn hay nâng cấp
+  các lượt chưa hoàn tất. Mọi FAIL/PARTIAL lịch sử vẫn được bảo toàn.
+- **Kế hoạch tiếp theo:** Khi người vận hành điều phối chạy E2 official mới trên Host B,
+  cần tạo bundle/binary mới, workspace độc lập, giữ nguyên cấu hình `run07` (rate 1.000 msg/s,
+  S=100, duration 10s, drain 30s, 4 workers, pool 10, shaper on, retry bounded_backoff_v1
+  initial 500ms max 8000ms jitter 10%, rate 100/burst 100 mỗi producer; backend 2 CPU / 4 GiB).
+  Không tự ý tuning hay chuyển sang N2/N3/N4. Sửa đổi retention cục bộ không phải là cải
+  thiện hiệu năng đo đạc từ xa và không đưa ra kết luận nâng cấp phần cứng.

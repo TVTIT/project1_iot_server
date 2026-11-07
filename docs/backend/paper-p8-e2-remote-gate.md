@@ -807,13 +807,14 @@ giữ lại các trường pool của `pgx` (`db`), nhưng không diễn giải 
 PostgreSQL server wait.
 
 Lượt source mới chưa có phép đo remote hoàn chỉnh. Khi được người dùng điều phối
-Host B, chạy lại cùng workload `run06` với leaf hoàn toàn mới, ví dụ
-`run07-diagnostics` (không tái dùng workspace/artifact), giữ nguyên thông số:
+Host B, chạy lại cùng workload với leaf hoàn toàn mới (ví dụ `retention-check-<new-run-id>`,
+tuyệt đối không tái dùng workspace hay artifact cũ), giữ nguyên toàn bộ thông số:
 
 ```text
 rate=1000, S=100, duration=10, burst=0,
 pending=8192/8388608, deadline=3600,
-retry flags=500/8000/10/100/100 (cùng mode bounded_backoff_v1)
+retry flags=500/8000/10/100/100 (cùng mode bounded_backoff_v1: initial 500ms, max 8000ms, jitter 10%,
+rate=100 và burst=100 cho mỗi producer)
 ```
 
 Giữ 4 workers, 500 rows, pool 10, shaper bật, backend quota 2 CPU/4 GiB và
@@ -822,7 +823,9 @@ và chuyển thủ công sang B; `begin` dùng `--phase-id samples-100` (100 sam
 không phải yêu cầu 100 mẫu diagnostics); B export kết quả kể cả
 khi `PARTIAL`; A `finish-phase` hoặc `abort` theo kết quả thật, rồi xác minh
 exact cleanup. Không hứa lượt chạy sẽ PASS; việc phối hợp vận hành trên B thuộc
-người dùng.
+người dùng. Không tự ý áp dụng tinh chỉnh tải hay chuyển sang N2/N3/N4 khi chưa
+có yêu cầu riêng. Việc sửa đổi cơ chế lưu giữ chẩn đoán cục bộ không phải là
+cải thiện hiệu năng đo đạc từ xa và không đưa ra kết luận nâng cấp phần cứng.
 
 Diagnostics bổ sung chỉ đọc trên PostgreSQL 16 của fixture. `postgres_linux`
 giữ baseline, từng sample và terminal; mỗi nguồn có timestamp riêng, nên không
@@ -832,13 +835,96 @@ là cluster-scoped, không riêng telemetry. Trước khi lấy delta phải xá
 server/database identity và `stats_reset` không đổi; nếu reset hoặc identity
 không khớp thì delta không hợp lệ. View chưa được hỗ trợ, cgroup v2 không đọc
 được hoặc rootless Docker được biểu diễn `unavailable`, không phải zero.
-
-Ring PostgreSQL/Linux dùng cap 64 mẫu và 512 KiB; metrics ring dùng
-3.600 mẫu và 2 MiB. Baseline/terminal được giữ riêng ngoài ring.
-Có thể thiếu mẫu do ring eviction; xem coverage và timestamp
-của từng mẫu. Thu thập có chi phí chẩn đoán, không phải overhead bằng không.
 `track_io_timing` và `track_wal_io_timing` nếu OFF giữ thời gian là
 `null`/unavailable; mã đo **không bật** các setting này.
+
+##### Cơ chế lưu giữ chẩn đoán active (Bounded Active Side Retention)
+
+Ở các phiên bản thử nghiệm trước (như lượt `run07`), bộ lấy mẫu phụ sử dụng
+vòng đệm xoay vòng (rolling ring) 64 mẫu và 512 KiB; khi người vận hành chờ
+điều phối giữa các bước, vòng đệm tiếp tục thu thập các mẫu trong giai đoạn rảnh
+(idle), dẫn đến việc loại bỏ (eviction) và làm mất toàn bộ chứng cứ active burst
+ban đầu. Để khắc phục hiện tượng mất dữ liệu này mà không làm phình bộ nhớ,
+mã nguồn hiện hành quy định chặt chẽ:
+
+1. **Phạm vi áp dụng:**
+   Chỉ riêng profile E2 official `steady_burst` mới kích hoạt cơ chế lưu giữ
+   chủ động có giới hạn (bounded active side capture). Các chế độ standalone,
+   pilot hoặc `equal_samples` tiếp tục giữ nguyên hành vi trước đây. Tiến trình
+   đọc chậm riêng biệt (separate slow-reader thread) cho PostgreSQL/Linux/Docker
+   hoạt động độc lập, không gây nghẽn tiến trình lấy mẫu HTTP định kỳ.
+
+2. **Điều kiện kích hoạt (Trigger):**
+   Trigger kích hoạt giai đoạn active CHỈ ĐƯỢC XÁC ĐỊNH khi thỏa mãn đồng thời:
+   - CÙNG một phiên bản tiến trình Go backend (`process_instance`).
+   - Chỉ số `ingress.Received` (dạng số nguyên hợp lệ) ghi nhận sự gia tăng
+     so với baseline của HTTP scraper trên Host A, căn cứ theo tem thời gian
+     hoàn tất cào `scrape_finished_monotonic` / `scrape_finished_timestamp`.
+   - Tuyệt đối không tính thời điểm kích hoạt từ lệnh `begin`, không phụ thuộc
+     vào tiến trình đọc PostgreSQL hay đồng hồ wall-clock trên Host B.
+   - Vùng đệm tiền kích hoạt (pre-trigger buffer) lưu tối đa $\le 4$ mẫu và
+     $\le 64\text{ KiB}$, được **tính gộp** trong tổng giới hạn 128 mẫu / 2 MiB.
+     Hệ thống có thể chờ trước khi trigger xuất hiện; thời lượng thu thập không
+     chạy sớm khi chưa có lưu lượng thực tế.
+
+3. **Cửa sổ thu thập yêu cầu (Requested Capture Window):**
+   - Thời lượng cửa sổ yêu cầu sau trigger = $\max(\text{tổng thời lượng các pha của A}, \text{tổng thời lượng các pha của B}) + 10\text{s}$
+     xử lý hậu kỳ (bao gồm đầy đủ các pha: warmup + measure + drain + cooldown).
+   - Với kịch bản chuẩn của `run07` (10s đo lường + 30s drain), thời lượng
+     yêu cầu sau trigger là $10\text{s} + 30\text{s} + 10\text{s} = 50\text{ giây}$.
+   - Hạn chót tuyệt đối của phiên (session absolute deadline) độc lập giới hạn
+     thời điểm kết thúc thực tế; ngân sách thời gian được tính toán lại sau các
+     lần đo baseline chậm và không được gia hạn vượt deadline.
+
+4. **Chính sách bảo toàn chứng cứ sớm (Earliest Evidence Preservation):**
+   - Sau khi trigger kích hoạt, hệ thống **bảo toàn các mẫu sớm nhất**, TUYỆT ĐỐI
+     KHÔNG thực hiện đẩy mẫu cũ (eviction) để lấy chỗ cho các mẫu rảnh (idle).
+   - Khi hết cửa sổ yêu cầu tự nhiên (natural window end), toàn bộ mẫu được
+     đóng băng (freeze); các khoảng lặng tạm thời trong cửa sổ không đóng băng sớm.
+   - Nếu chạm trần số lượng mẫu (128 mẫu) hoặc trần dung lượng (2 MiB), bộ lấy
+     mẫu lập tức đóng băng và gắn nhãn `truncated` / `incomplete`.
+   - Trường hợp thiếu baseline, sai lệch identity, thiếu trigger, tiến trình backend
+     bị reset/thay đổi, dừng sớm hoặc bị cắt bởi deadline, kết quả KHÔNG được
+     coi là hoàn tất (`complete`). Không tuyên bố độ bao phủ đầy đủ chỉ vì thời
+     gian cửa sổ đã trôi qua; lỗi hoặc trạng thái thiếu của từng nguồn riêng
+     biệt vẫn giữ nguyên qualification.
+
+5. **Kết thúc Reader và Bao phủ Nguồn:**
+   - Tiến trình đọc (reader) đã khởi chạy trước mốc đóng băng được phép hoàn tất
+     với tem thời gian thực tế vượt qua ranh giới cửa sổ; tuyệt đối không khởi
+     chạy thêm nguồn đọc mới sau khi đã kết thúc.
+   - Các nguồn chưa kịp khởi chạy được đánh dấu `unavailable` với mã lỗi cố định;
+     độ bao phủ nguồn từng phần được ghi nhận trung thực.
+   - Baseline và terminal luôn được giữ tách biệt ngoài tập mẫu định kỳ.
+   - Thao tác dừng/chờ (stop/join) có giới hạn thời gian (bounded join), không
+     cam kết ngắt tức thời thời gian thực (hard real-time cancellation) đối với
+     tiến trình đọc ngoại vi đang bị nghẽn I/O.
+
+6. **Giới hạn dung lượng mẫu và tệp chẩn đoán (Sample & File Caps):**
+   - Ngân sách mẫu lưu giữ theo kích thước JSON cho `postgres_linux` là **128 mẫu và 2 MiB**
+     (đây là dung lượng mẫu serialized/logical được giữ lại, không phải phân bổ RAM cứng;
+     thay cho mức 64 mẫu và 512 KiB rolling cũ).
+   - Ngân sách vòng đệm HTTP metrics giữ nguyên **3.600 mẫu và 2 MiB**.
+   - Tổng dung lượng TỆP JSON chẩn đoán (`p8-e2-diagnostics.json`) được giới hạn
+     cứng ở mức **8 MiB**, được đo đạc bằng dung lượng chuỗi mã hóa thực tế qua
+     hàm `json.dumps` mặc định bởi helper chuẩn tắc
+     `native_compose_smoke.paper_p8_e2_persist_diagnostics(path, payload)`.
+     Helper này được dùng thống nhất cho mọi lượt ghi (sớm, hoàn tất, hoặc fallback).
+   - Cần phân định rạch ròi: ngân sách dung lượng mẫu tuần tự hóa (2 MiB) tách biệt với giới
+     hạn tệp JSON tổng thể trên đĩa (8 MiB), và cả hai đều không đại diện cho mức tiêu
+     thụ RSS của toàn tiến trình. Nếu tệp vượt quá 8 MiB, hệ thống fail-closed
+     với trạng thái giới hạn dung lượng nhỏ gọn, không gán độ bao phủ sạch.
+
+7. **Xuất kết quả và ranh giới nghiệm thu:**
+   - Các lệnh `finish-phase` hoặc `abort` thực thi trước khi dọn dẹp để xuất
+     toàn bộ baseline, samples, coverage, terminal của `postgres_linux` và các
+     dữ liệu active sớm nhất; sự chậm trễ của người vận hành sau khi mẫu đã
+     freeze không thể ghi đè vùng dữ liệu active đã lưu.
+   - Ranh giới nghiệm thu tách biệt: trường `full_p8_accepted: false` tiếp tục
+     được duy trì trong dữ liệu chẩn đoán, bảo toàn đầy đủ các kết quả
+     `PARTIAL`, `FAIL` và dữ liệu bị khuyết. Việc xuất thành công tệp chẩn đoán
+     và dọn dẹp sạch tài nguyên (exact cleanup) KHÔNG PHẢI là nghiệm thu hiệu
+     năng hay cam kết về năng lực chịu tải.
 
 Chỉ khi counter/timestamp/identity hợp lệ mới tính delta theo khoảng đo
 `delta_t` giây:
