@@ -712,7 +712,9 @@ func TestMicrobatchGroupErrorDoesNotTrustProvisionalResultButKeepsConfirmedParti
 	ing.setClock(clock)
 	mustStart(t, ing)
 	topic0, payload0, at0 := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 1)
-	topic1, payload1, at1 := testPayloadFor(t, "gateway_001", "sensor_002", uuid.New(), testBootID, 1)
+	// Batch result mapping is independent of Sensor identity; use one Sensor
+	// because runtime PersistBatch groups are now homogeneous per Sensor.
+	topic1, payload1, at1 := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 1)
 	if ing.Admit(topic0, payload0, at0, false) != AdmissionAccepted {
 		t.Fatal("first admission failed")
 	}

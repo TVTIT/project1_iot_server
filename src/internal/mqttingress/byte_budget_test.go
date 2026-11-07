@@ -290,6 +290,64 @@ func TestBufferedPayloadBudgetReturnsForWorkerOutcomes(t *testing.T) {
 	}
 }
 
+func TestDeadlineCrossingAfterPopStillTransfersReservation(t *testing.T) {
+	// The clock crosses the absolute deadline during the destructive Pop. Once
+	// Pop succeeds, the returned item is owned and must be validated/released.
+	start := time.Unix(100, 0)
+	clock := &deadlineCrossingClock{before: start, after: start.Add(time.Second)}
+	opts := defaultOptions()
+	opts.BufferedPayloadBytes = int64(opts.MaxPayloadBytes)
+	ing, err := New(opts, newValidator(t), &fakeRepo{}, &fakePublisher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ing.setClock(clock)
+	payload := []byte("payload")
+	if !ing.reservePayloadBytes(int64(len(payload))) {
+		t.Fatal("reservation failed")
+	}
+	queued := item{payload: payload, reservedBytes: int64(len(payload))}
+	scheduler := newSensorScheduler(2, 1)
+	if ok, _ := scheduler.Enqueue("gateway_001", "sensor_001", item{}); !ok {
+		t.Fatal("initial enqueue failed")
+	}
+	lease, err := scheduler.TryAcquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := scheduler.Enqueue("gateway_001", "sensor_001", queued); !ok {
+		t.Fatal("queued enqueue failed")
+	}
+	got, ok, reason, _ := takeSensorGroupItem(ing, lease, start.Add(time.Millisecond))
+	if !ok || reason != 0 || got.reservedBytes != int64(len(payload)) {
+		t.Fatalf("take = (%v, %v, %d), want acquired item despite deadline crossing", got.reservedBytes, ok, reason)
+	}
+	if !clock.Now().After(start.Add(time.Millisecond)) {
+		t.Fatal("controlled clock did not cross the deadline after Pop")
+	}
+	ing.releasePayloadBytes(got.reservedBytes)
+	lease.Release()
+	if got := ing.Snapshot().BufferedPayloadBytes; got != 0 {
+		t.Fatalf("buffered bytes = %d, want 0", got)
+	}
+}
+
+type deadlineCrossingClock struct {
+	before, after time.Time
+	calls         int
+}
+
+func (c *deadlineCrossingClock) Now() time.Time {
+	c.calls++
+	if c.calls == 1 {
+		return c.before
+	}
+	return c.after
+}
+func (*deadlineCrossingClock) NewTimer(time.Duration) ingressTimer {
+	return &controlledTimer{ch: make(chan time.Time, 1)}
+}
+
 type rejectAllValidator struct{ err error }
 
 func (v rejectAllValidator) Validate(string, []byte, time.Time) (*telemetry.Message, error) {

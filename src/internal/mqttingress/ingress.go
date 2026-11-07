@@ -138,7 +138,8 @@ type Ingress struct {
 	publishTimeout               time.Duration
 	logger                       *slog.Logger
 
-	queue chan item
+	queue     chan item
+	scheduler *sensorScheduler
 	// stop is closed once by StopAdmission to tell workers to drain and exit.
 	stop chan struct{}
 
@@ -231,6 +232,13 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 		logger = slog.Default()
 	}
 	runCtx, cancelRun := context.WithCancel(context.Background())
+	var queue chan item
+	var scheduler *sensorScheduler
+	if opts.Microbatch.Enabled {
+		scheduler = newSensorScheduler(opts.QueueCapacity, opts.WorkerCount)
+	} else {
+		queue = make(chan item, opts.QueueCapacity)
+	}
 	return &Ingress{
 		metricsEnabled:               opts.MetricsEnabled,
 		validator:                    validator,
@@ -243,7 +251,8 @@ func New(opts Options, validator Validator, repository Repository, publisher Pub
 		persistTimeout:               opts.PersistTimeout,
 		publishTimeout:               opts.PublishTimeout,
 		logger:                       logger,
-		queue:                        make(chan item, opts.QueueCapacity),
+		queue:                        queue,
+		scheduler:                    scheduler,
 		stop:                         make(chan struct{}),
 		runCtx:                       runCtx,
 		cancelRun:                    cancelRun,
@@ -337,6 +346,20 @@ func (i *Ingress) Admit(topic string, payload []byte, receivedAt time.Time, reta
 	if i.metricsEnabled {
 		it.enqueuedAt = time.Now()
 	}
+	if i.microbatch.Enabled {
+		accepted, depth := i.scheduler.Enqueue(parsedTopic.GatewayID, parsedTopic.SensorID, it)
+		if accepted {
+			if i.metricsEnabled {
+				i.counters.acceptedBytes.Add(int64(len(payload)))
+			}
+			i.counters.accepted.Add(1)
+			i.recordQueueHighWater(depth)
+			return AdmissionAccepted
+		}
+		i.releasePayloadBytes(reservedBytes)
+		i.counters.queueFull.Add(1)
+		return AdmissionRejectedQueueFull
+	}
 	select {
 	case i.queue <- it:
 		if i.metricsEnabled {
@@ -388,18 +411,20 @@ func (i *Ingress) recordBufferedPayloadHighWater(observed int64) {
 }
 
 // recordQueueHighWater updates the admission-observed queue high-water mark.
-// Observation point: sampled via len(queue) immediately after a successful
-// non-blocking enqueue in Admit().
+// Observation point: sampled immediately after a successful enqueue in Admit,
+// using aggregate pending depth across per-Sensor queues when microbatching.
 // Limits: bounded within [0, QueueCapacity]; monotonically non-decreasing.
 //
-// Concurrent workers may consume items between the channel send and len()
-// observation, so this represents an admission-observed high-water mark rather
-// than an exact absolute instantaneous queue peak.
+// Concurrent workers may consume between enqueue and observation, so this is
+// an admission-observed high-water mark rather than an absolute queue peak.
 func (i *Ingress) recordQueueHighWater(observed int) {
 	if observed <= 0 {
 		return
 	}
 	qCap := cap(i.queue)
+	if i.microbatch.Enabled {
+		qCap = i.scheduler.Capacity()
+	}
 	if observed > qCap {
 		observed = qCap
 	}
@@ -539,158 +564,283 @@ func (t realIngressTimer) Stop() {
 }
 
 func (i *Ingress) microbatchWorker() {
-	var timer ingressTimer
 	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-		// Cancellation owns every item still in the shared queue; no unconfirmed
-		// item is acknowledged and each reservation is released once.
-		for {
-			select {
-			case it := <-i.queue:
+		if i.runCtx.Err() != nil {
+			for _, it := range i.scheduler.DiscardPending() {
 				i.releasePayloadBytes(it.reservedBytes)
-			default:
-				return
 			}
 		}
 	}()
-	var group []*validatedDelivery
-	var rows int
-	var bytes int64
-	var deadline time.Time
-	flush := func(ctx context.Context, reason int) {
-		if len(group) == 0 {
+	for {
+		lease, err := i.scheduler.AcquireUntil(i.runCtx, i.stop)
+		if err != nil {
 			return
 		}
-		members := group
-		if i.metricsEnabled {
-			i.counters.groupCount.Add(1)
-			i.counters.groupMembers.Add(int64(len(members)))
-			i.counters.groupRows.Add(int64(rows))
-			i.counters.groupPayloadBytes.Add(bytes)
+		if lease == nil {
+			return
+		}
+		stopping := false
+		var carry *validatedDelivery
+		turnUsed := 0
+		for {
+			var it item
+			var carried *validatedDelivery
+			if carry != nil {
+				carried = carry
+				carry = nil
+			} else if turnUsed == 0 {
+				it = lease.Item
+			} else {
+				var ok bool
+				var changed <-chan struct{}
+				it, ok, changed = lease.PopOrChanged()
+				if !ok {
+					select {
+					case <-changed:
+						continue
+					case <-i.stop:
+						stopping = true
+					case <-i.runCtx.Done():
+						stopping = true
+					}
+					if stopping {
+						lease.Release()
+						break
+					}
+					continue
+				}
+			}
+			turnUsed++
+			carryTurn := carried != nil
+			group := make([]*validatedDelivery, 0, i.microbatch.MaxMessages)
+			var rows int
+			var payloadBytes int64
+			var timer ingressTimer
+			var deadline time.Time
+			flushReason := 0
+			current := carried
 			for {
-				old := i.counters.groupMaxMembers.Load()
-				if int64(len(members)) <= old || i.counters.groupMaxMembers.CompareAndSwap(old, int64(len(members))) {
+				if current == nil {
+					current = &validatedDelivery{original: it, ownsReservation: true}
+					if i.runCtx.Err() != nil {
+						i.releaseDelivery(current)
+						current = nil
+						stopping = true
+						break
+					}
+					i.startDelivery(current)
+					i.counters.processed.Add(1)
+					if !i.validateDelivery(current) {
+						i.releaseDelivery(current)
+						current = nil
+						if len(group) == 0 {
+							break
+						}
+						var available bool
+						var reason int
+						it, available, reason = i.waitSensorGroupItem(lease, timer, deadline)
+						if available {
+							continue
+						}
+						flushReason = reason
+						stopping = reason == 5
+						break
+					}
+					current.validatedAt = i.clock.Now()
+					if cached, ok := i.confirmedCacheHit(current); ok {
+						i.publishACK(current, cached)
+						i.releaseDelivery(current)
+						current = nil
+						if len(group) == 0 {
+							break
+						}
+						var available bool
+						var reason int
+						it, available, reason = i.waitSensorGroupItem(lease, timer, deadline)
+						if available {
+							continue
+						}
+						flushReason = reason
+						stopping = reason == 5
+						break
+					}
+				}
+				memberRows := current.message.SampleCount()
+				if memberRows > i.microbatch.MaxRows || int64(len(current.original.payload)) > i.microbatch.MaxPayloadBytes {
+					if len(group) > 0 {
+						flushReason = 2
+						if memberRows <= i.microbatch.MaxRows {
+							flushReason = 3
+						}
+						break
+					}
+					if i.metricsEnabled {
+						i.counters.standaloneOversized.Add(1)
+					}
+					i.persistStandaloneBatch(i.runCtx, current)
+					current = nil
 					break
 				}
+				if len(group) > 0 && (len(group) >= i.microbatch.MaxMessages || rows+memberRows > i.microbatch.MaxRows || payloadBytes+current.original.reservedBytes > i.microbatch.MaxPayloadBytes) {
+					flushReason = 3
+					if len(group) >= i.microbatch.MaxMessages {
+						flushReason = 1
+					} else if rows+memberRows > i.microbatch.MaxRows {
+						flushReason = 2
+					}
+					break // current is the sole carried, already-validated item
+				}
+				group = append(group, current)
+				rows += memberRows
+				payloadBytes += current.original.reservedBytes
+				current = nil
+				if len(group) >= i.microbatch.MaxMessages || rows >= i.microbatch.MaxRows || payloadBytes >= i.microbatch.MaxPayloadBytes {
+					flushReason = 3
+					if len(group) >= i.microbatch.MaxMessages {
+						flushReason = 1
+					} else if rows >= i.microbatch.MaxRows {
+						flushReason = 2
+					}
+					break
+				}
+				if timer == nil {
+					timer = i.clock.NewTimer(i.microbatch.MaxWait)
+					deadline = i.clock.Now().Add(i.microbatch.MaxWait)
+				}
+				if carryTurn {
+					select {
+					case <-timer.C():
+						flushReason = 4
+					case <-i.stop:
+						flushReason = 5
+						stopping = true
+					case <-i.runCtx.Done():
+						stopping = true
+					}
+					break
+				}
+				next, available, reason := i.waitSensorGroupItem(lease, timer, deadline)
+				if available {
+					it = next
+					current = nil
+					continue
+				}
+				flushReason = reason
+				stopping = reason == 5 || i.runCtx.Err() != nil
+				break
 			}
-			switch reason {
-			case 1:
-				i.counters.flushMessages.Add(1)
-			case 2:
-				i.counters.flushRows.Add(1)
-			case 3:
-				i.counters.flushBytes.Add(1)
-			case 4:
-				i.counters.flushTimer.Add(1)
-			case 5:
-				i.counters.flushStop.Add(1)
+			if timer != nil {
+				timer.Stop()
+			}
+			if current != nil && len(group) > 0 {
+				carry = current
+			}
+			if len(group) > 0 {
+				if i.metricsEnabled {
+					i.counters.groupCount.Add(1)
+					i.counters.groupMembers.Add(int64(len(group)))
+					i.counters.groupRows.Add(int64(rows))
+					i.counters.groupPayloadBytes.Add(payloadBytes)
+					for {
+						old := i.counters.groupMaxMembers.Load()
+						if int64(len(group)) <= old || i.counters.groupMaxMembers.CompareAndSwap(old, int64(len(group))) {
+							break
+						}
+					}
+					switch flushReason {
+					case 1:
+						i.counters.flushMessages.Add(1)
+					case 2:
+						i.counters.flushRows.Add(1)
+					case 3:
+						i.counters.flushBytes.Add(1)
+					case 4:
+						i.counters.flushTimer.Add(1)
+					case 5:
+						i.counters.flushStop.Add(1)
+					}
+				}
+				i.persistGroup(i.runCtx, group)
+			}
+			if i.runCtx.Err() != nil {
+				if carry != nil {
+					i.releaseDelivery(carry)
+					carry = nil
+				}
+				lease.Release()
+				stopping = true
+				break
+			}
+			if carryTurn {
+				if carry != nil {
+					i.releaseDelivery(carry)
+					carry = nil
+				}
+				lease.Release()
+				break
+			}
+			if carry != nil {
+				// At most one cap-overflow carry group belongs to this lease turn.
+				// It gets a fresh timer, but cannot dequeue a third group.
+				continue
+			} // one bounded carry group; same lease held
+			lease.Release()
+			break
+		}
+		if stopping { // graceful stop continues acquiring until scheduler is empty; cancellation exits
+			if i.runCtx.Err() != nil {
+				return
 			}
 		}
-		group = nil
-		rows = 0
-		bytes = 0
-		deadline = time.Time{}
-		if timer != nil {
-			timer.Stop()
-			timer = nil
-		}
-		i.persistGroup(ctx, members)
 	}
-	process := func(it item) {
-		d := &validatedDelivery{original: it, ownsReservation: true}
-		if i.runCtx.Err() != nil {
-			i.releaseDelivery(d)
-			return
-		}
-		i.startDelivery(d)
-		i.counters.processed.Add(1)
-		if !i.validateDelivery(d) {
-			i.releaseDelivery(d)
-			return
-		}
-		d.validatedAt = i.clock.Now()
-		if cached, ok := i.confirmedCacheHit(d); ok {
-			i.publishACK(d, cached)
-			i.releaseDelivery(d)
-			return
-		}
-		memberRows := d.message.SampleCount()
-		if memberRows > i.microbatch.MaxRows || int64(len(it.payload)) > i.microbatch.MaxPayloadBytes {
-			// Attribute a preceding group's flush to the standalone member's
-			// exceeded cap (rows before bytes if both are exceeded).
-			reason := 3
-			if memberRows > i.microbatch.MaxRows {
-				reason = 2
-			}
-			flush(i.runCtx, reason)
-			if i.metricsEnabled {
-				i.counters.standaloneOversized.Add(1)
-			}
-			i.persistStandaloneBatch(i.runCtx, d)
-			return
-		}
-		if len(group) > 0 && (len(group) >= i.microbatch.MaxMessages || rows+memberRows > i.microbatch.MaxRows || bytes+it.reservedBytes > i.microbatch.MaxPayloadBytes) {
-			// Simultaneous cap precedence: messages > rows > bytes.
-			reason := 3
-			if len(group) >= i.microbatch.MaxMessages {
-				reason = 1
-			} else if rows+memberRows > i.microbatch.MaxRows {
-				reason = 2
-			}
-			flush(i.runCtx, reason)
-		}
-		if len(group) == 0 {
-			deadline = i.clock.Now().Add(i.microbatch.MaxWait)
-			timer = i.clock.NewTimer(i.microbatch.MaxWait)
-		}
-		group = append(group, d)
-		rows += memberRows
-		bytes += it.reservedBytes
-		if len(group) >= i.microbatch.MaxMessages || rows >= i.microbatch.MaxRows || bytes >= i.microbatch.MaxPayloadBytes {
-			reason := 3
-			if len(group) >= i.microbatch.MaxMessages {
-				reason = 1
-			} else if rows >= i.microbatch.MaxRows {
-				reason = 2
-			}
-			flush(i.runCtx, reason)
-		}
-	}
+}
+
+// waitSensorGroupItem waits only until the group's original absolute deadline.
+// It rechecks the scheduler queue after every generation wake and gives ready
+// items priority without allowing a continuous stream to extend MaxWait.
+func (i *Ingress) waitSensorGroupItem(lease *sensorLease, timer ingressTimer, deadline time.Time) (item, bool, int) {
 	for {
-		var timerC <-chan time.Time
-		if timer != nil {
-			timerC = timer.C()
+		it, ok, reason, changed := takeSensorGroupItem(i, lease, deadline)
+		if ok {
+			return it, true, 0
+		}
+		if reason != 0 {
+			return item{}, false, reason
 		}
 		select {
-		case it := <-i.queue:
-			process(it)
-		case <-timerC:
-			flush(i.runCtx, 4)
+		case <-changed:
+		case <-timer.C():
+			return item{}, false, 4
 		case <-i.stop:
-			flush(i.runCtx, 5)
-			for {
-				select {
-				case it := <-i.queue:
-					process(it)
-				default:
-					flush(i.runCtx, 5)
-					return
+			if i.runCtx.Err() == nil {
+				if it, ok, reason, _ := takeSensorGroupItem(i, lease, deadline); ok {
+					return it, true, 0
+				} else if reason == 4 {
+					return item{}, false, 4
 				}
 			}
+			return item{}, false, 5
 		case <-i.runCtx.Done():
-			for n, d := range group {
-				i.releaseDelivery(d)
-				group[n] = nil
-			}
-			group = nil
-			return
-		}
-		if !deadline.IsZero() && !i.clock.Now().Before(deadline) {
-			flush(i.runCtx, 4)
+			return item{}, false, 0
 		}
 	}
+}
+
+// takeSensorGroupItem checks the absolute deadline before the destructive Pop.
+// A successful Pop transfers ownership even if the deadline passes immediately
+// afterward; callers must process or release that item exactly once.
+func takeSensorGroupItem(i *Ingress, lease *sensorLease, deadline time.Time) (item, bool, int, <-chan struct{}) {
+	if i.runCtx.Err() != nil {
+		return item{}, false, 0, nil
+	}
+	if !i.clock.Now().Before(deadline) {
+		return item{}, false, 4, nil
+	}
+	it, ok, changed := lease.PopOrChanged()
+	if ok {
+		return it, true, 0, changed
+	}
+	return item{}, false, 0, changed
 }
 
 func (i *Ingress) persistStandaloneBatch(ctx context.Context, d *validatedDelivery) {

@@ -94,26 +94,26 @@ type Snapshot struct {
 	ProcessingLatencyTotal time.Duration
 	ProcessingCount        int64
 
-	// Queue gauge: approximate number of items waiting (excluding items a
-	// worker has already taken) and the fixed capacity.
+	// Queue gauge: aggregate pending items across per-Sensor queues (excluding
+	// items already acquired by worker leases) and the global fixed capacity.
 	QueueDepth    int
 	QueueCapacity int
 
-	// QueueHighWater is the highest admission-observed queue depth, sampled via
-	// len(queue) immediately following each successful non-blocking enqueue in
-	// Admit().
-	// Observation point: sampled in Admit() immediately after case i.queue <- it succeeds.
+	// QueueHighWater is the highest admission-observed aggregate pending depth,
+	// sampled immediately after each successful enqueue across all Sensor queues.
 	// Limits: bounded within [0, QueueCapacity]; monotonically non-decreasing.
-	// Note: Concurrent workers may consume items from the channel between the
-	// channel send and the len() observation, so this represents an
-	// admission-observed high-water mark rather than an absolute instantaneous
-	// queue peak.
+	// Concurrent workers may consume between enqueue and observation, so this
+	// is an admission-observed high-water mark, not an absolute instantaneous peak.
 	QueueHighWater int
 }
 
 // Snapshot returns the current counters and queue state.
 func (i *Ingress) Snapshot() Snapshot {
 	shaperEntries, shaperCapacity := i.shaper.EntriesAndCap()
+	queueDepth, queueCapacity := len(i.queue), cap(i.queue)
+	if i.microbatch.Enabled {
+		queueDepth, queueCapacity = i.scheduler.PendingDepth(), i.scheduler.Capacity()
+	}
 	return Snapshot{
 		Received: i.counters.received.Load(), ReceivedBytes: i.counters.receivedBytes.Load(),
 		AcceptedBytes: i.counters.acceptedBytes.Load(), InFlight: i.counters.inFlight.Load(),
@@ -154,8 +154,8 @@ func (i *Ingress) Snapshot() Snapshot {
 		ProcessingLatencyTotal: time.Duration(i.counters.processingNanos.Load()),
 		ProcessingCount:        i.counters.processingCount.Load(),
 
-		QueueDepth:     len(i.queue),
-		QueueCapacity:  cap(i.queue),
+		QueueDepth:     queueDepth,
+		QueueCapacity:  queueCapacity,
 		QueueHighWater: int(i.counters.queueHighWater.Load()),
 	}
 }
