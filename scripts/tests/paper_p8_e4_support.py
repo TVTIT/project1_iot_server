@@ -1713,10 +1713,6 @@ def export_prepared_bundle(prepared, *, output_leaf, wait_seconds=90, workload_s
         'expiry_replay_enabled': prepared.get('include_expiry_replay') is True}
     if prepared.get('include_expiry_replay') is True:
         workload['expiry_required_lifetime_seconds'] = (600 + workload_seconds + 16 + 30 + 30 + 120)
-    if prepared.get('include_expiry_replay') is True:
-        workload['expiry_budget'] = validate_e4_expiry_budget(
-            session_seconds=86400, token_seconds=86400, workload_seconds=workload_seconds,
-            drain_seconds=16, import_seconds=30, cleanup_seconds=30)
     return paper_p8_bundle.export_bundle(output_leaf=output_leaf,
         session_id=prepared['session_id'], experiment='E4', arm=prepared['arm'],
         phase=prepared['phase_id'], manifests=manifests, identity_files=identities,

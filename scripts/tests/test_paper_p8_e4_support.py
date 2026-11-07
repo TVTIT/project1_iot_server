@@ -539,6 +539,84 @@ class E4SupportTests(unittest.TestCase):
             self.assertEqual(paper_p8_client.main(['run', '--workspace', str(workspace),
                 '--binary', '/bin/true']), 1)
 
+    def test_official_expiry_bundle_round_trip_keeps_scalar_expiry_contract(self):
+        scratch = Path('/var/tmp/opencode')
+        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='p8-e4-expiry-bundle-', dir=scratch) as tmp:
+            root = Path(tmp); private = root / 'private'; private.mkdir(mode=0o700)
+            (private / 'certs').mkdir(mode=0o700)
+            specs = [SimpleNamespace(gateway_id='gw-a', sensor_id='sensor-a', sensor_urn='urn:ngsi-ld:Sensor:gw-a:sensor-a'),
+                     SimpleNamespace(gateway_id='gw-b', sensor_id='sensor-b', sensor_urn='urn:ngsi-ld:Sensor:gw-b:sensor-b')]
+            env = {'WEBSOCKET_ENABLED': 'true', 'STAGE5_ENABLED': 'false', 'STAGE5_WAKEUP_ENABLED': 'false',
+                'MQTT_SHAPER_ENABLED': 'false', 'MQTT_MICROBATCH_ENABLED': 'true',
+                'MQTT_RAM_DEDUP_ENABLED': 'true', 'MQTT_MICROBATCH_MAX_MESSAGES': '32',
+                'MQTT_MICROBATCH_MAX_ROWS': '500', 'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20),
+                'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
+            class Smoke:
+                def __init__(self, remote_support): self.remote_support = remote_support
+                def prepare_paper_workload(self, *args):
+                    def jwt(sub):
+                        enc = lambda value: base64.urlsafe_b64encode(value).decode().rstrip('=')
+                        return enc(b'{"alg":"none"}') + '.' + enc(json.dumps(
+                            {'sub': sub, 'exp': time.time() + 3600}).encode()) + '.sig'
+                    return ('pg', {'quota': 1}, {'services': {'backend': {'environment': env}}}, {},
+                        'ready', {'a': jwt('a'), 'b': jwt('b'), 'admin': jwt('admin')}, specs, ['pa', 'pb'], None)
+                def db_psql(self, _r, _p, sql, _v=None):
+                    return '24:telemetry_ledger_timestamp' if 'schema_migrations' in sql else json.dumps(
+                        {'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0}) if 'SELECT json_build_object' in sql else 'a' * 32
+                @staticmethod
+                def http_request(_endpoint, method, path, *, token, body):
+                    gateway, sensor = path.split('/')[3], path.split('/')[-1]
+                    return 201, {}, {'entity_id': f'urn:ngsi-ld:Sensor:{gateway}:{sensor}'}
+                def private_write(self, path, text):
+                    Path(path).write_text(text, encoding='utf-8'); Path(path).chmod(0o600)
+                def paper_p8_remote_support(self): return self.remote_support
+            remote = Mock()
+            profile = {'advertised_https': 'https://192.168.50.10:9443',
+                       'advertised_mqtt_tls': 'mqtts://192.168.50.10:9883',
+                       'advertised_host': '192.168.50.10', 'bind_ip': '192.168.50.10',
+                       'https_port': 9443, 'mqtt_tls_port': 9883}
+            broker = {'NetworkSettings': {'Ports': {'8883/tcp': [
+                {'HostIp': '192.168.50.10', 'HostPort': '9883'}]}}}
+            nginx = {'NetworkSettings': {'Ports': {'443/tcp': [
+                {'HostIp': '192.168.50.10', 'HostPort': '9443'}]}}}
+            registry = Mock()
+            registry.resolve.side_effect = [broker, nginx]
+            fixture = SimpleNamespace(private=private, project='ncs_0123456789ab')
+            endpoint = SimpleNamespace(url='https://127.0.0.1:80', ca_file=private / 'certs/https-ca.pem')
+            context = e4.prepare(Smoke(remote), fixture, endpoint, registry, {'mosquitto': 'broker', 'nginx': 'nginx'},
+                {}, object(), 'on', remote_profile=profile, session_id='c' * 32,
+                include_expiry_replay=True, unique_count=1000, replay_count=100,
+                profile='official', official_opt_in=True, session_seconds=86400)
+            self.assertEqual(context['schedule']['workload_seconds'], 756)
+            for path in (endpoint.ca_file, private / 'certs/ca.crt'):
+                path.write_text('test-ca', encoding='utf-8'); path.chmod(0o600)
+            bundle = e4.export_prepared_bundle(context, output_leaf=private / 'portable-bundle')
+            from scripts import paper_p8_bundle
+            inspected = paper_p8_bundle.inspect_bundle(bundle['bundle_root'])
+            self.assertTrue(inspected['valid'])
+            metadata = json.loads((private / 'portable-bundle/bundle.json').read_text())
+            workload = metadata['workload']
+            self.assertNotIn('expiry_budget', workload)
+            self.assertIs(workload['expiry_replay_enabled'], True)
+            self.assertEqual(workload['expiry_required_lifetime_seconds'], 1552)
+            self.assertEqual(metadata['additional_token_lifetime_seconds'], 706)
+            exported_expiry = json.loads((private / 'portable-bundle/manifests/expiry-replay.json').read_text())
+            self.assertEqual(exported_expiry['e4']['expiry_ttl_seconds'], 600)
+            self.assertEqual(exported_expiry['e4']['replay_count'], 100)
+            workspace = private / 'bound-workspace'
+            paper_p8_bundle.bind_bundle(bundle_root=bundle['bundle_root'], workspace_leaf=workspace)
+            bound = [json.loads(path.read_text()) for path in
+                sorted((workspace / 'runtime/manifests').glob('*.json'))]
+            bound_expiry = next(manifest for manifest in bound
+                if isinstance(manifest.get('e4'), dict) and manifest['e4'].get('expiry_ttl_seconds') == 600)
+            self.assertEqual(bound_expiry['e4']['mode'], 'replay')
+            self.assertEqual(bound_expiry['e4']['replay_count'], 100)
+
+    def test_expiry_replay_requires_cache_on_before_preparation(self):
+        with self.assertRaisesRegex(ValueError, 'p8_e4_expiry_replay_requires_cache_on'):
+            e4.prepare(None, None, None, None, None, None, None, 'off', include_expiry_replay=True)
+
     def test_local_runner_consumes_prepared_context_once(self):
         import inspect
         source = inspect.getsource(e4.run)
