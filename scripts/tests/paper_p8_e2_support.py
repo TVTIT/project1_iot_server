@@ -49,7 +49,7 @@ except ModuleNotFoundError as exc:
     from scripts import paper_p8_client
 
 PILOT_SAMPLES = (100, 1)
-OFFICIAL_RATES = (100, 1000, 5000, 20000)
+OFFICIAL_RATES = (100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000)
 PILOT_SEED = 84
 PILOT_MESSAGES = {'A': 8, 'B': 16}
 

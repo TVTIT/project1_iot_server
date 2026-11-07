@@ -1540,6 +1540,39 @@ class E2SupportTests(unittest.TestCase):
             self.assertEqual(pair['B']['traffic']['burst_messages'], 7)
             self.assertEqual(pair['A']['traffic']['burst_messages'], 0)
 
+    def test_official_rates_support_and_rejections(self):
+        from scripts.tests.paper_p8_e2_support import OFFICIAL_RATES
+        expected_rates = (100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000)
+        self.assertEqual(OFFICIAL_RATES, expected_rates)
+        for rate in expected_rates:
+            duration = 5 if rate == 20000 else 10
+            manifests = e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
+                'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost', 'mqtt_tls_ca_file':'ca'}},
+                targets=self.targets, gateway_identity_files={'gw-a':'a','gw-b':'b'},
+                telemetry_identity_files={'A':'ia','B':'ib'}, samples_per_message=100,
+                offered_rate=rate, duration_seconds=duration)
+            pair = manifests['profiles']['100']
+            rate_a = pair['A']['traffic']['rate_per_second']
+            rate_b = pair['B']['traffic']['rate_per_second']
+            self.assertEqual(rate_a, rate // 2)
+            self.assertEqual(rate_b, rate - rate // 2)
+            self.assertEqual(rate_a + rate_b, rate)
+            estimate = e2_official_estimate(rate_per_second=rate, duration_seconds=duration,
+                samples_per_message=100, payload_bytes=4096, official_opt_in=True)
+            self.assertEqual(estimate['rate_per_second'], rate)
+            self.assertEqual(estimate['unique_messages_estimate'], rate * duration)
+
+        for invalid_rate in (-100, 0, 50, 150, 250, 300, 999, 12000, 25000):
+            with self.assertRaisesRegex(ValueError, 'e2_official_workload_rejected'):
+                e2_official_manifests(common={'tls': {'https_endpoint':'https://localhost',
+                    'https_ca_file':'ca','mqtt_tls_endpoint':'mqtts://localhost', 'mqtt_tls_ca_file':'ca'}},
+                    targets=self.targets, gateway_identity_files={'gw-a':'a','gw-b':'b'},
+                    telemetry_identity_files={'A':'ia','B':'ib'}, samples_per_message=100,
+                    offered_rate=invalid_rate, duration_seconds=10)
+            with self.assertRaisesRegex(ValueError, 'e2_estimate_input_rejected'):
+                e2_official_estimate(rate_per_second=invalid_rate, duration_seconds=10,
+                    samples_per_message=100, payload_bytes=4096, official_opt_in=True)
+
     def test_official_plan_requires_optin_and_rejects_oversize_schedule(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2663,7 +2696,7 @@ class E2SupportTests(unittest.TestCase):
             self.assertEqual(prepared_off['run_id'], prepared_off['manifests']['A']['run_id'])
             self.assertEqual(portable['workload']['expected_counts'], prepared_off['plan']['expected_counts'])
             with self.assertRaisesRegex(ValueError, 'bundle_workload_metadata_rejected'):
-                bad_workload = dict(portable['workload'], offered_rate_per_second=200)
+                bad_workload = dict(portable['workload'], offered_rate_per_second=250)
                 paper_p8_bundle._validate_e2_official_workload(bad_workload)
             # Even a recomputed inventory digest cannot make a changed bound budget
             # agree with the independently declared workload provenance.

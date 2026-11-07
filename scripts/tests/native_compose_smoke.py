@@ -866,7 +866,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         if paper_p8_profile not in ('pilot','official') or (paper_p8_profile == 'official' and not paper_p8_official_opt_in):
             raise ValueError('official_profile_opt_in_required')
         if (paper_p8_profile == 'official' and (paper_p8_e2_workload != 'steady_burst'
-                or paper_p8_e2_offered_rate not in (100,1000,5000,20000)
+                or paper_p8_e2_offered_rate not in (100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000)
                 or type(paper_p8_e2_duration_seconds) is not int or not 1 <= paper_p8_e2_duration_seconds <= 7200
                 or type(paper_p8_e2_burst_messages) is not int or not 0 <= paper_p8_e2_burst_messages <= 100000)):
             raise ValueError('paper_p8_e2_official_schedule_rejected')
@@ -6335,7 +6335,7 @@ def main():
     parser.add_argument('--p8-e2-bundle-root', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-samples-per-message', choices=('100', '1'), help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-workload', choices=('steady_burst', 'equal_samples'), default='steady_burst', help=argparse.SUPPRESS)
-    parser.add_argument('--p8-e2-offered-rate', type=int, choices=(100, 1000, 5000, 20000), default=100, help=argparse.SUPPRESS)
+    parser.add_argument('--p8-e2-offered-rate', type=int, choices=(100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000), default=100, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-duration-seconds', type=int, default=10, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-burst-messages', type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument('--p8-e2-pending-messages', type=int, default=64, help=argparse.SUPPRESS)

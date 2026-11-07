@@ -5161,6 +5161,36 @@ class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
                     self.server.main(base + ['--e2-pending-bytes', str(1 << 30)])
                 process.assert_not_called()
 
+    def test_serve_e2_offered_rates_choices_accepted_and_rejected(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+            expected_rates = (100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000)
+            for rate in expected_rates:
+                dur = '5' if rate == 20000 else '10'
+                base = ['serve', '--root', str(Path(td) / f'server-{rate}'), '--network-config', str(net_config),
+                    '--experiment', 'E2', '--profile', 'official', '--official-opt-in',
+                    '--samples-per-message', '100', '--e2-offered-rate', str(rate),
+                    '--e2-duration-seconds', dur, '--deadline-seconds', '1200', '--dry-run']
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = self.server.main(base)
+                self.assertEqual(code, 0)
+                plan = json.loads(output.getvalue())['e2_official_plan']
+                self.assertEqual(plan['estimate']['rate_per_second'], rate)
+                rates = plan['producer_rates_per_second']
+                self.assertEqual(rates['A'], rate // 2)
+                self.assertEqual(rates['B'], rate - (rate // 2))
+
+            for bad_rate in (0, 50, 250, 300, 999, 12000, 25000):
+                bad_base = ['serve', '--root', str(Path(td) / 'server-bad'), '--network-config', str(net_config),
+                    '--experiment', 'E2', '--profile', 'official', '--official-opt-in',
+                    '--samples-per-message', '100', '--e2-offered-rate', str(bad_rate),
+                    '--e2-duration-seconds', '10', '--deadline-seconds', '1200', '--dry-run']
+                with self.assertRaises(SystemExit):
+                    self.server.main(bad_base)
+
     def test_serve_e2_workload_equal_samples_requires_context(self):
         with tempfile.TemporaryDirectory() as td:
             net_config = self._valid_net_config(td)

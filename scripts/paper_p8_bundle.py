@@ -545,7 +545,7 @@ def _validate_e2_official_workload(workload):
             or type(workload.get('seed')) is not int or not 0 <= workload['seed'] <= (1 << 63)-1
             or type(workload.get('samples_per_message')) is not int or workload['samples_per_message'] not in (1,100)
             or type(workload.get('offered_rate_per_second')) is not int
-            or workload['offered_rate_per_second'] not in (100,1000,5000,20000)
+            or workload['offered_rate_per_second'] not in (100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000)
             or type(workload.get('measure_seconds')) is not int or not 1 <= workload['measure_seconds'] <= 7200
             or type(workload.get('burst_messages')) is not int or not 0 <= workload['burst_messages'] <= 100000
             or workload.get('durability_mode') != 'synthetic-load'

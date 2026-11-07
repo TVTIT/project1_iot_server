@@ -547,7 +547,7 @@ def main(argv=None):
     serve.add_argument('--context', type=Path)
     serve.add_argument('--reference', type=Path)
     serve.add_argument('--samples-per-message', choices=('100', '1'))
-    serve.add_argument('--e2-offered-rate', type=int, choices=(100, 1000, 5000, 20000), default=100)
+    serve.add_argument('--e2-offered-rate', type=int, choices=(100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000), default=100)
     serve.add_argument('--e2-duration-seconds', type=int, default=10)
     serve.add_argument('--e2-burst-messages', type=int, default=0)
     serve.add_argument('--e2-pending-messages', type=int, default=64)

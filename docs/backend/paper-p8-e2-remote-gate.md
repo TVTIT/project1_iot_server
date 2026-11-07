@@ -79,7 +79,7 @@ Context được tạo một lần qua lệnh `e2-context` và chia sẻ nguyên
 - `--official-opt-in`: Cờ boolean ủy quyền tường minh cho việc chuẩn bị và chạy profile `official`.
 - `--dry-run`: Cờ boolean cho phép kiểm tra tính hợp lệ của kế hoạch thực thi, tham số workload và mô hình ước lượng kích thước mà không khởi động container, không tạo mạng và không truy cập tài nguyên thật (trả về trạng thái `VALIDATED_PLAN_ONLY`).
 - `--samples-per-message {100, 1}`: Bắt buộc chỉ định rõ ràng `100` hoặc `1` (E2 yêu cầu cấu hình batching tường minh, không chấp nhận giá trị mặc định ngầm định).
-- `--e2-offered-rate {100, 1000, 5000, 20000}`: Tốc độ đề nghị gộp toàn hệ thống, mặc định `100` tin nhắn/giây.
+- `--e2-offered-rate {100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000}`: Tốc độ đề nghị gộp toàn hệ thống, mặc định `100` tin nhắn/giây.
 - `--e2-duration-seconds`: Thời lượng phát tải đo lường (số nguyên >= 1, mặc định `10` giây; tối đa 7.200 giây trong ước lượng sizing).
 - `--e2-burst-messages`: Số lượng tin nhắn phát dồn (burst), số nguyên từ `0` đến `100000`, mặc định `0`.
 - `--e2-pending-messages` và `--e2-pending-bytes`: giới hạn pending **mỗi producer** của E2 official, mặc định lần lượt `64` và `1048576`. Số message từ 1 đến 100000; bytes từ 1 đến 1073741824. Cặp giá trị còn phải thỏa `2 * (pending_bytes + pending_messages * 4096) <= 256 MiB` cho hai producer. Đây là ngân sách logic ước lượng, không phải cam kết RSS.
@@ -697,7 +697,7 @@ Thực hiện trong thư mục gốc riêng biệt `$ROOT/steady-s1-${RUN_LABEL}
 
 - **Cờ bắt buộc**: `--profile official` và `--official-opt-in`.
 - **Dải tham số đầu vào được chấp nhận**:
-  - `--e2-offered-rate`: Chọn một trong 4 mức tốc độ gộp được định nghĩa trong CLI: `100`, `1000`, `5000`, hoặc `20000` msg/s.
+  - `--e2-offered-rate`: Chọn một trong các mức tốc độ gộp được định nghĩa trong CLI: `100`, `200`, `500`, `1000`, `2000`, `5000`, `8000`, `10000`, `15000`, hoặc `20000` msg/s.
   - `--samples-per-message`: Bắt buộc chỉ định tường minh `100` hoặc `1`.
   - `--e2-duration-seconds`: Thời lượng phát tải đo lường (số nguyên từ `1` đến `7200` giây, mặc định `10` giây).
   - `--e2-burst-messages`: Số lượng tin nhắn burst bổ sung cho Arm B (số nguyên từ `0` đến `100000`, mặc định `0`).
@@ -969,7 +969,7 @@ Thiết lập biến độc lập trên các terminal tương ứng:
 **Trên Host A — Terminal A1 & A2**:
 ```sh
 ROOT=/var/tmp/opencode/p8-e2-official
-OFFERED_RATE=1000        # Chọn 1 trong: 100, 1000, 5000, 20000 (msg/s gộp cả hai producer)
+OFFERED_RATE=1000        # Chọn 1 trong: 100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000 (msg/s gộp cả hai producer)
 SAMPLES=100              # Chọn 1 trong: 100 hoặc 1 (batching samples per message)
 DURATION=10              # Thời lượng phát đo lường (giây, mặc định 10, hợp lệ 1..7200)
 BURST=0                  # Tin nhắn burst bổ sung cho Arm B (mặc định 0, hợp lệ 0..100000)
