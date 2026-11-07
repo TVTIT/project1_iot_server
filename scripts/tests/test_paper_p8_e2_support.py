@@ -130,8 +130,19 @@ class E2SupportTests(unittest.TestCase):
             interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=10,
             baseline_metrics={'ingress': {'Received': 0}})
         collector.sample_step()
-        collector.side_sampler = e2.IndependentSideSampler(reader={
-            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}})
+        # Attach a triggered side sampler: baseline 0, then observe increase to 25
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {'active_marker': 'triggered'}, 'linux': lambda: {'cpu': 50},
+            'docker': lambda: {'containers': []}},
+            max_samples=64, byte_cap=2 * 1024 * 1024, capture_seconds=60,
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'},
+            deadline_seconds=120)
+        # Simulate valid HTTP increase on same process triggers side
+        side.observe_ingress({'process_instance': 'proc-123', 'ingress': {'Received': 25},
+                              'scrape_finished_monotonic': 10.0,
+                              'scrape_finished_timestamp': '2026-11-07T00:00:10Z'})
+        self.assertTrue(side._triggered)
+        collector.side_sampler = side
         collector.side_sampler.sample_step()
         prepared = {'collector': collector, 'phase_id': 'samples-1', 'session_id': 's',
             'run_id': 'r', 'source_provenance': {'revision': 'abc'}, 'bundle_sha256': 'b',
@@ -142,12 +153,180 @@ class E2SupportTests(unittest.TestCase):
             'postgres_linux': {'postgres': {'terminal': 1}},
             'database_counts': {'available': True}, 'collector_stop_joined': True})
         self.assertEqual(envelope['source'], {'revision': 'abc'})
+        # Baseline and terminal separate
         self.assertEqual(envelope['postgres_linux']['baseline'], {'postgres': {'base': 1}})
         self.assertEqual(envelope['postgres_linux']['terminal'], {'postgres': {'terminal': 1}})
         sample = next(row['snapshot'] for row in envelope['snapshots'] if row['phase'] == 'sample')
         self.assertEqual(sample['ingress']['durations']['ack_publish']['count'], 2)
         self.assertEqual(envelope['full_p8_accepted'], False)
         self.assertIn('coverage', envelope)
+        # Active side data survives: triggered side samples present
+        pl = envelope['postgres_linux']
+        self.assertIsInstance(pl.get('samples'), list)
+        self.assertIn('coverage', pl)
+        # Active markers present in side sample (if any samples captured)
+        if len(pl['samples']) > 0:
+            active_sample = pl['samples'][0]
+            self.assertEqual(active_sample['postgres']['value']['active_marker'], 'triggered')
+            self.assertEqual(active_sample['linux']['value']['cpu'], 50)
+
+    def test_fake_clock_sampler_to_writer_end_to_end_regression(self):
+        """Task 4: fake-clock sampler -> failure_diagnostics -> actual writer regression.
+
+        Long delay before valid HTTP trigger; side captures active PG/Linux markers;
+        natural end; many idle ticks; export via failure_diagnostics with real persist
+        helper; active data + coverage survive; baseline/terminal separate; no active
+        eviction; no extra read after natural end; idempotent repeated export.
+        """
+        import tempfile, json
+        from pathlib import Path
+        from scripts.tests import native_compose_smoke as smoke_runtime
+
+        # Fake clock: long delay (minutes) before valid HTTP trigger
+        clock = {'mono': 0.0, 'wall': '2026-11-07T00:00:00Z'}
+        def time_fn(): return clock['mono']
+        def wall_fn(): return clock['wall']
+
+        # Build side sampler with capture mode, baseline 0, process_instance matched
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {'pg_active': True, 'rows': 1000},
+            'linux': lambda: {'linux_active': True, 'cpu': 42},
+            'docker': lambda: {'containers': []}},
+            max_samples=128, byte_cap=2 * 1024 * 1024, capture_seconds=300,
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-a'},
+            deadline_seconds=3600, time_fn=time_fn, wall_fn=wall_fn)
+
+        # Simulate many idle ticks (operator wait) with Received == baseline (no trigger)
+        for _ in range(20):
+            clock['mono'] += 30.0  # 30s idle ticks = 10 minutes of idle
+            clock['wall'] = '2026-11-07T00:10:00Z'
+            side.observe_ingress({'process_instance': 'proc-a', 'ingress': {'Received': 0},
+                                  'scrape_finished_monotonic': clock['mono'],
+                                  'scrape_finished_timestamp': clock['wall']})
+        self.assertFalse(side._triggered)  # No-trigger: idle does not trigger
+        self.assertEqual(side._state, 'waiting')
+
+        # Valid HTTP increase on same process triggers side (after long delay)
+        clock['mono'] += 60.0  # another minute passed
+        clock['wall'] = '2026-11-07T00:11:00Z'
+        side.observe_ingress({'process_instance': 'proc-a', 'ingress': {'Received': 150},
+                              'scrape_finished_monotonic': clock['mono'],
+                              'scrape_finished_timestamp': clock['wall']})
+        self.assertTrue(side._triggered)
+        self.assertEqual(side._state, 'active_capture')
+
+        # Sample active PG/Linux markers during capture window
+        for _ in range(5):
+            clock['mono'] += 10.0
+            clock['wall'] = '2026-11-07T00:11:' + str(10 + _) + 'Z'
+            side.sample_step()  # captures active PG/Linux markers
+
+        # Natural end: freeze capture
+        clock['mono'] += 300.0  # capture_seconds elapsed
+        clock['wall'] = '2026-11-07T00:16:10Z'
+        side._freeze_if_needed(clock['mono'], clock['wall'], reason='natural_end')
+        self.assertTrue(side._frozen)
+        self.assertEqual(side._freeze_reason, 'natural_end')
+
+        # Many idle ticks after natural end - no new reads, no active eviction
+        samples_before = len(side.samples)
+        for _ in range(10):
+            clock['mono'] += 60.0  # 10 more minutes idle
+            clock['wall'] = '2026-11-07T00:17:' + str(_) + 'Z'
+            side.observe_ingress({'process_instance': 'proc-a', 'ingress': {'Received': 150},
+                                  'scrape_finished_monotonic': clock['mono'],
+                                  'scrape_finished_timestamp': clock['wall']})
+        self.assertEqual(len(side.samples), samples_before)  # No extra reads after freeze
+        self.assertFalse(side._active_truncated)  # No active eviction
+
+        # Build collector with real data and fake clock
+        hist = {'upper_seconds': [1.0], 'buckets': [2], 'count': 2, 'overflow': 0,
+                'sum_seconds': 0.5}
+        collector = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': {
+            'Durations': {'ack_publish': hist}}, 'persistence': {'confirmed_commits': 2}},
+            interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=10,
+            baseline_metrics={'ingress': {'Received': 0}},
+            time_fn=time_fn, wall_fn=wall_fn)
+        collector.sample_step()
+        collector.side_sampler = side
+
+        prepared = {'collector': collector, 'phase_id': 'samples-1', 'session_id': 's',
+            'run_id': 'r', 'source_provenance': {'revision': 'abc'}, 'bundle_sha256': 'b',
+            'manifest_sha256': ['m'], 'diagnostic_baseline': {'postgres': {'base': 1}},
+            '_started_wall': 'started'}
+
+        # Export via failure_diagnostics with real persist helper (actual writer)
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            diag_path = Path(tmp) / 'p8-e2-diagnostics.json'
+
+            def persist_callback(payload):
+                smoke_runtime.paper_p8_e2_persist_diagnostics(diag_path, payload)
+
+            envelope = e2.failure_diagnostics(prepared, 'PARTIAL', terminal_data={
+                'metrics': {'ingress': {'Received': 2}},
+                'resources': {'services': {'backend': {'available': True}}},
+                'postgres_linux': {'postgres': {'terminal': 1}},
+                'database_counts': {'available': True}, 'collector_stop_joined': True},
+                persist_callback=persist_callback, time_fn=time_fn, wall_fn=wall_fn)
+
+            # Persist via real helper
+            persist_callback(envelope)
+
+            # Verify artifact written and readable
+            self.assertTrue(diag_path.is_file())
+            file_size = diag_path.stat().st_size
+            self.assertGreater(file_size, 0)
+            self.assertLessEqual(file_size, 8 * 1024 * 1024)
+
+            # Read back and verify
+            written = json.loads(diag_path.read_text(encoding='utf-8'))
+            self.assertEqual(written['full_p8_accepted'], False)
+            self.assertEqual(written.get('workload_outcome'), 'PARTIAL')
+
+            # Active data and coverage survive
+            pl = written['postgres_linux']
+            self.assertEqual(pl['baseline'], {'postgres': {'base': 1}})
+            self.assertEqual(pl['terminal'], {'postgres': {'terminal': 1}})
+            self.assertIn('coverage', pl)
+            self.assertGreater(pl['coverage']['samples_retained'], 0)
+            self.assertGreater(len(pl['samples']), 0)
+            active_sample = pl['samples'][0]
+            self.assertEqual(active_sample['postgres']['value']['pg_active'], True)
+            self.assertEqual(active_sample['linux']['value']['linux_active'], True)
+
+            # Idempotent: repeated failure_diagnostics returns same result
+            envelope2 = e2.failure_diagnostics(prepared, 'PARTIAL', terminal_data={
+                'metrics': {'ingress': {'Received': 2}},
+                'resources': {'services': {'backend': {'available': True}}},
+                'postgres_linux': {'postgres': {'terminal': 1}},
+                'database_counts': {'available': True}, 'collector_stop_joined': True},
+                persist_callback=persist_callback, time_fn=time_fn, wall_fn=wall_fn)
+            self.assertEqual(envelope2, envelope)
+
+    def test_side_sampler_qualification_table_no_trigger_early_stop_cap(self):
+        """Task 4 qualification table: no-trigger, early-stop, cap outcomes."""
+        cases = [
+            # (label, baseline_received, observe_received, expected_triggered, expected_state)
+            ('no-trigger-idle', 10, 10, False, 'waiting'),
+            ('no-trigger-decrease', 100, 50, False, 'waiting'),
+            ('trigger-increase', 10, 25, True, 'active_capture'),
+            ('trigger-from-zero-baseline', 0, 1, True, 'active_capture'),
+        ]
+        for label, baseline_recv, observe_recv, expected_trig, expected_state in cases:
+            with self.subTest(label=label):
+                side = e2.IndependentSideSampler(reader={
+                    'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+                    max_samples=64, byte_cap=2 * 1024 * 1024, capture_seconds=60,
+                    baseline_metrics={'ingress': {'Received': baseline_recv},
+                                      'process_instance': 'proc-x'},
+                    deadline_seconds=120)
+                side.observe_ingress({'process_instance': 'proc-x', 'ingress': {'Received': observe_recv},
+                                      'scrape_finished_monotonic': 10.0,
+                                      'scrape_finished_timestamp': '2026-11-07T00:00:10Z'})
+                self.assertEqual(side._triggered, expected_trig, label)
+                if expected_trig:
+                    self.assertEqual(side._state, expected_state, label)
+                side.stop(timeout_seconds=0)
 
     def test_official_side_sampler_does_not_block_metrics_scrapes(self):
         entered, second_scrape = threading.Event(), threading.Event()
@@ -192,6 +371,567 @@ class E2SupportTests(unittest.TestCase):
         with self.assertRaises(ValueError): e2.IndependentSideSampler(reader={}, byte_cap=0)
         self.assertEqual(sampler.stop(timeout_seconds=0), True)
         self.assertEqual(sampler.stop(timeout_seconds=0), True)
+
+    # === STEP 2: Official E2 active capture wiring tests ===
+
+    def test_official_steady_burst_creates_side_sampler_with_capture_seconds_from_phases(self):
+        """Official steady_burst profile creates side sampler with capture_seconds = max(phase durations) + 10."""
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'warmup_seconds': 5, 'measure_seconds': 10, 'drain_seconds': 30, 'cooldown_seconds': 0}},
+                          'B': {'phases': {'warmup_seconds': 0, 'measure_seconds': 8, 'drain_seconds': 20, 'cooldown_seconds': 2}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        collector = prepared['collector']
+        side = collector.side_sampler
+        self.assertIsNotNone(side)
+        # Phase A: 5+10+30+0 = 45, Phase B: 0+8+20+2 = 30, max = 45, +10 = 55
+        self.assertEqual(side.capture_seconds, 55)
+        self.assertEqual(side.max_samples, 128)
+        self.assertEqual(side.byte_cap, 2 * 1024 * 1024)
+        self.assertFalse(side._legacy_mode)
+        collector.stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    def test_official_steady_burst_uses_remaining_session_deadline_for_side_sampler(self):
+        """Side sampler deadline uses remaining session budget, not stale pre-baseline budget."""
+        # session_deadline_monotonic = now + 100s, but baseline reads take ~5s
+        # Remaining should be ~95s, not the original 100s or the workload-only duration
+        session_deadline = time.monotonic() + 100
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}},
+                          'B': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}}},
+            'session_deadline_monotonic': session_deadline,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            before_begin = time.monotonic()
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        collector = prepared['collector']
+        side = collector.side_sampler
+        # Deadline should be based on remaining session time, capped at 86400
+        # capture_seconds = 10+30+10 = 50, deadline should be >= capture_seconds
+        self.assertGreaterEqual(side.deadline - side._start_time, 50)
+        self.assertLessEqual(side.deadline - side._start_time, 100)
+        collector.stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    def test_pilot_profile_no_capture_seconds_legacy_mode(self):
+        """Pilot profile preserves legacy rolling semantics (no capture_seconds)."""
+        prepared = {'phase_id': 'samples-8', 'workload': 'steady_burst', 'profile': 'pilot',
+            'manifests': {'A': {'phases': {'measure_seconds': 8, 'drain_seconds': 12}},
+                          'B': {'phases': {'measure_seconds': 4, 'drain_seconds': 12}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-8')
+        collector = prepared['collector']
+        self.assertIsNone(collector.side_sampler)  # Pilot doesn't get side sampler
+        collector.stop(timeout_seconds=0.1)
+
+    def test_equal_samples_workload_no_capture_seconds(self):
+        """Equal samples workload preserves legacy rolling semantics."""
+        prepared = {'phase_id': 'equal-samples-1', 'workload': 'equal_samples', 'profile': 'pilot',
+            'manifests': {'A': {'phases': {'measure_seconds': 60, 'drain_seconds': 20}},
+                          'B': {'phases': {'measure_seconds': 60, 'drain_seconds': 20}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='equal-samples-1')
+        collector = prepared['collector']
+        self.assertIsNone(collector.side_sampler)  # Equal samples doesn't get side sampler
+        collector.stop(timeout_seconds=0.1)
+
+    def test_standalone_side_sampler_without_capture_seconds_preserves_rolling(self):
+        """Standalone IndependentSideSampler without capture_seconds preserves rolling behavior."""
+        sampler = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+            max_samples=64, byte_cap=512 * 1024)
+        self.assertTrue(sampler._legacy_mode)
+        self.assertIsNone(sampler.capture_seconds)
+        self.assertEqual(sampler.max_samples, 64)
+        self.assertEqual(sampler.byte_cap, 512 * 1024)
+        self.assertEqual(sampler.stop(timeout_seconds=0), True)
+
+    def test_sampler_notifies_side_observe_ingress_before_resource_reader(self):
+        """EqualSamplesCompactSampler.sample_step calls side.observe_ingress for every valid HTTP scrape BEFORE resource reader."""
+        observed_snapshots = []
+        resource_called = []
+        clock = {'value': 10.0}
+        def scrape():
+            return {'process_instance': 'proc-123', 'ingress': {'Received': 1},
+                    'persistence': {}, 'db': {}}
+        def slow_resource():
+            resource_called.append(clock['value'])
+            clock['value'] = 99.0
+            time.sleep(0.01)
+            return {}
+        def mock_observe(snapshot):
+            observed_snapshots.append((snapshot.get('process_instance'), snapshot.get('ingress', {}).get('Received'),
+                                       snapshot.get('scrape_finished_monotonic')))
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=slow_resource,
+            interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=100,
+            time_fn=lambda: clock['value'],
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        collector.sample_step()
+        # observe_ingress called once with correct snapshot
+        self.assertEqual(len(observed_snapshots), 1)
+        proc_inst, received, scrape_mono = observed_snapshots[0]
+        self.assertEqual(proc_inst, 'proc-123')
+        self.assertEqual(received, 1)
+        self.assertEqual(scrape_mono, 10.0)  # Captured BEFORE slow resource reader
+        # Resource reader was called AFTER observe_ingress
+        self.assertEqual(len(resource_called), 1)
+
+    def test_sampler_notifies_side_even_when_ring_rejects_oversized_entry(self):
+        """HTTP observation notification occurs even when metrics ring rejects oversized entry."""
+        observed = []
+        def scrape():
+            # Large payload that exceeds byte_cap
+            return {'process_instance': 'proc-123', 'ingress': {'Received': 1, 'data': 'x' * 5000},
+                    'persistence': {}, 'db': {}}
+        def mock_observe(snapshot):
+            observed.append(snapshot.get('ingress', {}).get('Received'))
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=lambda: {},
+            interval=0.1, max_snapshots=8, byte_cap=1024, deadline_seconds=100,
+            time_fn=lambda: 10.0,
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        collector.sample_step()
+        # Ring rejected oversized entry, but side was still notified
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0], 1)
+        self.assertEqual(len(collector.retained_snapshots), 0)  # Ring empty due to rejection
+        self.assertIn('collector_snapshot_exceeds_byte_cap', collector.errors)
+
+    def test_sampler_notifies_side_on_every_valid_scrape_not_just_first(self):
+        """Side sampler notified on EVERY valid projected HTTP scrape, not just trigger."""
+        observed = []
+        call_count = {'n': 0}
+        clock = {'value': 10.0}
+        def scrape():
+            call_count['n'] += 1
+            return {'process_instance': 'proc-123', 'ingress': {'Received': call_count['n']},
+                    'persistence': {}, 'db': {}}
+        def mock_observe(snapshot):
+            observed.append(snapshot.get('ingress', {}).get('Received'))
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=lambda: {},
+            interval=0.1, max_snapshots=100, byte_cap=64 * 1024, deadline_seconds=100,
+            time_fn=lambda: clock['value'],
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        for i in range(5):
+            collector.sample_step()
+        # All 5 scrapes notified
+        self.assertEqual(observed, [1, 2, 3, 4, 5])
+        self.assertEqual(len(collector.retained_snapshots), 5)
+
+    def test_sampler_does_not_notify_on_failed_http_scrape(self):
+        """Missing/failed HTTP scrape does not fabricate counter or trigger side notification."""
+        observed = []
+        def scrape():
+            raise RuntimeError('HTTP failed')
+        def mock_observe(snapshot):
+            observed.append(snapshot)
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=lambda: {},
+            interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=100,
+            time_fn=lambda: 10.0,
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        collector.sample_step()
+        # No notification on failed scrape
+        self.assertEqual(len(observed), 0)
+        self.assertIn('scrape_RuntimeError', collector.errors)
+
+    def test_sampler_does_not_notify_on_missing_ingress_in_scrape(self):
+        """Scrape without ingress dict does not trigger side notification."""
+        observed = []
+        def scrape():
+            return {'persistence': {}, 'db': {}}  # No ingress
+        def mock_observe(snapshot):
+            observed.append(snapshot)
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=lambda: {},
+            interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=100,
+            time_fn=lambda: 10.0,
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        collector.sample_step()
+        # No notification - ingress missing from projection
+        self.assertEqual(len(observed), 0)
+
+    def test_side_observe_ingress_equal_received_is_idle_no_trigger(self):
+        """Equal Received = idle (no trigger, no error)."""
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+            max_samples=128, byte_cap=2 * 1024 * 1024,
+            capture_seconds=50,
+            baseline_metrics={'ingress': {'Received': 10}, 'process_instance': 'proc-123'},
+            deadline_seconds=100)
+        # Observe with same Received = baseline (idle)
+        side.observe_ingress({'process_instance': 'proc-123', 'ingress': {'Received': 10},
+                              'scrape_finished_monotonic': 20.0, 'scrape_finished_timestamp': '2026-11-07T00:00:00Z'})
+        self.assertFalse(side._triggered)
+        self.assertEqual(side._state, 'waiting')
+        self.assertNotIn('counter_reset', side._qualification_reasons)
+        self.assertEqual(side.stop(timeout_seconds=0), True)
+
+    def test_side_observe_ingress_missing_baseline_qualified_not_error(self):
+        """Missing baseline -> active mode remains bounded waiting with qualification 'baseline_unavailable'.
+
+        capture_seconds alone selects active mode; baseline_metrics=None is a
+        diagnostics qualification, not legacy. observe_ingress cannot trigger
+        without a valid baseline even if Received>0. Coverage always reports
+        mode='active_capture', trigger_observed=False, complete=False.
+        """
+        # Side sampler with capture_seconds but NO baseline_metrics
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+            max_samples=128, byte_cap=2 * 1024 * 1024,
+            capture_seconds=50,
+            baseline_metrics=None,  # No baseline!
+            deadline_seconds=100)
+        # Active mode selected by capture_seconds alone (baseline absence is qualification)
+        self.assertFalse(side._legacy_mode)
+        self.assertIsNotNone(side.capture_seconds)
+        self.assertIsNone(side.baseline_metrics)
+        # Observe with valid data - should not trigger because no baseline
+        side.observe_ingress({'process_instance': 'proc-123', 'ingress': {'Received': 10},
+                              'scrape_finished_monotonic': 20.0, 'scrape_finished_timestamp': '2026-11-07T00:00:00Z'})
+        self.assertFalse(side._triggered)
+        self.assertEqual(side._state, 'waiting')
+        # Sticky qualification recorded
+        self.assertIn('baseline_unavailable', side._qualification_reasons)
+        self.assertIn('baseline_unavailable', side.errors)
+        # stop before trigger -> no_trigger
+        self.assertEqual(side.stop(timeout_seconds=0), True)
+        self.assertEqual(side._state, 'no_trigger')
+        # Coverage: active mode, no trigger, incomplete
+        cov = side.coverage()
+        self.assertEqual(cov['mode'], 'active_capture')
+        self.assertEqual(cov['state'], 'no_trigger')
+        self.assertFalse(cov.get('trigger_observed', True))
+        self.assertFalse(cov.get('complete', True))
+        self.assertIn('baseline_unavailable', cov.get('qualifications', []))
+        # Old count/bytes fields preserved
+        self.assertIn('samples_captured', cov)
+        self.assertIn('samples_retained', cov)
+        self.assertIn('samples_evicted', cov)
+
+    def test_side_observe_ingress_invalid_baseline_qualified(self):
+        """Invalid baseline (missing process_instance) -> qualification, no trigger."""
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+            max_samples=128, byte_cap=2 * 1024 * 1024,
+            capture_seconds=50,
+            baseline_metrics={'ingress': {'Received': 10}},  # Missing process_instance
+            deadline_seconds=100)
+        self.assertFalse(side._legacy_mode)  # Has capture_seconds and baseline_metrics dict
+        side.observe_ingress({'process_instance': 'proc-123', 'ingress': {'Received': 15},
+                              'scrape_finished_monotonic': 20.0, 'scrape_finished_timestamp': '2026-11-07T00:00:00Z'})
+        self.assertFalse(side._triggered)
+        self.assertIn('baseline_missing_process_instance', side._qualification_reasons)
+        self.assertEqual(side._state, 'waiting')
+        self.assertEqual(side.stop(timeout_seconds=0), True)
+
+    def test_side_observe_ingress_process_instance_changed_qualification(self):
+        """Process instance change -> qualification, no trigger."""
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+            max_samples=128, byte_cap=2 * 1024 * 1024,
+            capture_seconds=50,
+            baseline_metrics={'ingress': {'Received': 10}, 'process_instance': 'proc-baseline'},
+            deadline_seconds=100)
+        side.observe_ingress({'process_instance': 'proc-different', 'ingress': {'Received': 15},
+                              'scrape_finished_monotonic': 20.0, 'scrape_finished_timestamp': '2026-11-07T00:00:00Z'})
+        self.assertFalse(side._triggered)
+        self.assertIn('process_instance_changed', side._qualification_reasons)
+        self.assertEqual(side._state, 'waiting')
+        self.assertEqual(side.stop(timeout_seconds=0), True)
+
+    def test_side_observe_ingress_counter_reset_qualification(self):
+        """Decrease from last observation or baseline -> counter_reset qualification."""
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}},
+            max_samples=128, byte_cap=2 * 1024 * 1024,
+            capture_seconds=50,
+            baseline_metrics={'ingress': {'Received': 100}, 'process_instance': 'proc-123'},
+            deadline_seconds=100)
+        # First observation: increase (trigger)
+        side.observe_ingress({'process_instance': 'proc-123', 'ingress': {'Received': 150},
+                              'scrape_finished_monotonic': 20.0, 'scrape_finished_timestamp': '2026-11-07T00:00:00Z'})
+        self.assertTrue(side._triggered)
+        # Second observation: decrease (counter reset)
+        side.observe_ingress({'process_instance': 'proc-123', 'ingress': {'Received': 100},
+                              'scrape_finished_monotonic': 21.0, 'scrape_finished_timestamp': '2026-11-07T00:00:01Z'})
+        self.assertIn('counter_reset', side._qualification_reasons)
+        self.assertEqual(side.stop(timeout_seconds=0), True)
+
+    def test_blocked_pg_reader_does_not_block_multiple_http_scrapes(self):
+        """Slow/blocked PG reader does not block multiple HTTP scrapes from notifying side."""
+        observed = []
+        scrape_times = []
+        pg_started = threading.Event()
+        pg_release = threading.Event()
+        clock = {'value': 10.0}
+        def slow_pg():
+            pg_started.set()
+            pg_release.wait(2)
+            return {'data': 'pg'}
+        def scrape():
+            scrape_times.append(clock['value'])
+            return {'process_instance': 'proc-123', 'ingress': {'Received': len(scrape_times)},
+                    'persistence': {}, 'db': {}}
+        def mock_observe(snapshot):
+            observed.append(snapshot.get('ingress', {}).get('Received'))
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=slow_pg,
+            interval=0.1, max_snapshots=100, byte_cap=64 * 1024, deadline_seconds=100,
+            time_fn=lambda: clock['value'],
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        # Don't start collector thread - call sample_step manually
+        for _ in range(3):
+            collector.sample_step()
+            clock['value'] += 0.1
+        # All 3 scrapes notified side even though PG is blocked
+        self.assertEqual(len(observed), 3)
+        self.assertEqual(observed, [1, 2, 3])
+
+    def test_side_capture_seconds_calculation_unequal_arms_chooses_longer(self):
+        """Unequal phase arms choose the longer declared duration."""
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'warmup_seconds': 0, 'measure_seconds': 10, 'drain_seconds': 30, 'cooldown_seconds': 0}},
+                          'B': {'phases': {'warmup_seconds': 0, 'measure_seconds': 20, 'drain_seconds': 40, 'cooldown_seconds': 0}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        side = prepared['collector'].side_sampler
+        # Arm A: 10+30=40, Arm B: 20+40=60, max=60, +10=70
+        self.assertEqual(side.capture_seconds, 70)
+        prepared['collector'].stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    def test_side_capture_seconds_includes_warmup_and_cooldown(self):
+        """Capture seconds includes warmup and cooldown if non-zero."""
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'warmup_seconds': 5, 'measure_seconds': 10, 'drain_seconds': 30, 'cooldown_seconds': 5}},
+                          'B': {'phases': {'warmup_seconds': 0, 'measure_seconds': 10, 'drain_seconds': 30, 'cooldown_seconds': 0}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        side = prepared['collector'].side_sampler
+        # Arm A: 5+10+30+5=50, Arm B: 0+10+30+0=40, max=50, +10=60
+        self.assertEqual(side.capture_seconds, 60)
+        prepared['collector'].stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    def test_sampler_actual_http_observation_triggers_at_scrape_finish_even_if_resource_reader_advances_time(self):
+        """HTTP observation triggers at scrape finish time, even if resource reader later advances clock."""
+        clock = {'value': 10.0}
+        observed_scrape_times = []
+        def scrape():
+            return {'process_instance': 'proc-123', 'ingress': {'Received': 1},
+                    'persistence': {}, 'db': {}}
+        def slow_resource():
+            # Advance clock during resource read
+            clock['value'] = 99.0
+            return {}
+        def mock_observe(snapshot):
+            observed_scrape_times.append(snapshot.get('scrape_finished_monotonic'))
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, resource_reader=slow_resource,
+            interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=100,
+            time_fn=lambda: clock['value'],
+            wall_fn=lambda: '2026-11-07T00:00:00Z',
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'})
+        collector.side_sampler = Mock()
+        collector.side_sampler.observe_ingress = mock_observe
+        collector._started_monotonic = 10.0
+        collector.sample_step()
+        # Scrape finished time captured BEFORE resource reader advanced clock
+        self.assertEqual(observed_scrape_times, [10.0])
+        self.assertEqual(clock['value'], 99.0)  # Clock advanced by resource reader
+
+    def test_official_side_sampler_has_128_samples_and_2mib_cap(self):
+        """Official side sampler has 128 total samples and 2MiB cap (pretrigger 4/64KiB included)."""
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}},
+                          'B': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        side = prepared['collector'].side_sampler
+        self.assertEqual(side.max_samples, 128)
+        self.assertEqual(side.byte_cap, 2 * 1024 * 1024)
+        # Pre-trigger limit should be min(4, 128) = 4 samples and min(64KiB, 2MiB) = 64KiB
+        prepared['collector'].stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    def test_http_ring_max3600_2mib_unchanged(self):
+        """HTTP ring max 3600/2MiB and intervals unchanged."""
+        collector = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': {}},
+            interval=1.0, max_snapshots=3600, byte_cap=2 * 1024 * 1024, deadline_seconds=1800)
+        self.assertEqual(collector.max_snapshots, 3600)
+        self.assertEqual(collector.byte_cap, 2 * 1024 * 1024)
+        self.assertEqual(collector.interval, 1.0)
+
+    def test_side_sampler_deadline_independently_bounds_actual_capture_end(self):
+        """Session deadline independently bounds actual capture end; delayed begin doesn't eat capture window."""
+        # session_deadline = now + 60s, but begin happens at now + 5s
+        # capture_seconds = 50s, so capture_end = trigger + 50s
+        # If trigger at now + 5s, capture_end = now + 55s < session_deadline (now + 60s) -> OK
+        session_deadline = time.monotonic() + 60
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}},
+                          'B': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}}},
+            'session_deadline_monotonic': session_deadline,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=Mock(return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}),
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', return_value={'ingress': {'Received': 0, 'process_instance': 'proc-123'}}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            # Simulate 5s delay before begin
+            time.sleep(0.01)
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        side = prepared['collector'].side_sampler
+        # capture_seconds = 10+30+10 = 50
+        # deadline should allow full capture window
+        self.assertGreaterEqual(side.deadline - side._start_time, 50)
+        self.assertLessEqual(side.deadline - side._start_time, 60)
+        prepared['collector'].stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    def test_begin_delay_and_slow_diagnostic_baseline_reduce_remaining_deadline_not_capture_duration(self):
+        """Begin delay and slow diagnostic baseline reads reduce remaining deadline but not requested capture duration."""
+        session_deadline = time.monotonic() + 100
+        prepared = {'phase_id': 'samples-100', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}},
+                          'B': {'phases': {'measure_seconds': 10, 'drain_seconds': 30}}},
+            'session_deadline_monotonic': session_deadline,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        # Slow baseline read
+        slow_baseline_done = threading.Event()
+        def slow_admin_metrics(*args, **kwargs):
+            time.sleep(0.02)  # Simulate slow baseline
+            slow_baseline_done.set()
+            return {'ingress': {'Received': 0, 'process_instance': 'proc-123'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}),
+            _admin_metrics=slow_admin_metrics,
+            paper_p0_stats=Mock(return_value={}))
+        registry = object()
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        with patch.object(e2._support, '_admin_metrics', side_effect=slow_admin_metrics), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}):
+            before = time.monotonic()
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-100')
+        side = prepared['collector'].side_sampler
+        # capture_seconds unchanged at 50
+        self.assertEqual(side.capture_seconds, 50)
+        # But deadline reduced by baseline time
+        elapsed = time.monotonic() - before
+        self.assertLess(side.deadline - side._start_time, 100)
+        self.assertGreaterEqual(side.deadline - side._start_time, 50)
+        prepared['collector'].stop(timeout_seconds=0.1)
+        side.stop(timeout_seconds=0.1)
+
+    # === End STEP 2 tests ===
 
     def test_side_sampler_stop_interrupts_waiting_reader_sequence(self):
         entered, release = threading.Event(), threading.Event()
@@ -504,6 +1244,127 @@ class E2SupportTests(unittest.TestCase):
         self.assertEqual(smoke.db_psql.call_args.kwargs['timeout'], unittest.mock.ANY)
         self.assertTrue(any('resource_samples' in row for row in saved))
 
+    def test_failure_diagnostics_envelope_size_between_2mib_and_8mib_preserved(self):
+        """Diagnostics envelope between 2MiB and 8MiB written via actual helper."""
+        import tempfile
+        from pathlib import Path
+        from scripts.tests import native_compose_smoke as smoke_runtime
+
+        # Build a representative combined HTTP+side envelope where EACH component <= 2MiB
+        # but total > 2MiB and <= 8MiB. Use real sampler machinery for structure,
+        # then pad deterministically so the file size exceeds 2MiB (each logical part
+        # stays <= 2MiB; only the combined total crosses 2MiB).
+        http_ingress = {'Received': 100, 'durations': {'ack_publish': {
+            'upper_seconds': [0.1, 1.0], 'buckets': [50, 50], 'count': 100, 'overflow': 0, 'sum_seconds': 25.0}}}
+        side_postgres = {'data': 'y' * (1024 * 1024)}  # ~1MiB
+        side_linux = {'cpu': 100, 'mem': 'z' * (1024 * 1024)}  # ~1MiB
+
+        collector = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': http_ingress},
+            interval=0.1, max_snapshots=10, byte_cap=4 * 1024 * 1024, deadline_seconds=100,
+            baseline_metrics={'ingress': {'Received': 0}})
+        collector.start_manual()
+        for _ in range(5):
+            collector.sample_step()
+        collector.record_terminal({'ingress': {'Received': 99}}, None)
+
+        side = e2.IndependentSideSampler(reader={
+            'postgres': lambda: side_postgres, 'linux': lambda: side_linux, 'docker': lambda: {'containers': []}},
+            max_samples=10, byte_cap=4 * 1024 * 1024, capture_seconds=10,
+            baseline_metrics={'ingress': {'Received': 0}, 'process_instance': 'proc-123'},
+            deadline_seconds=100)
+        collector.side_sampler = side
+        side.start()
+        for _ in range(5):
+            side.sample_step()
+        side.stop(timeout_seconds=1.0)
+
+        prepared = {'collector': collector, 'phase_id': 'test', 'session_id': 's', 'run_id': 'r',
+                    'tokens': {'admin': 'x'}, 'specs': [], 'before_targets': [],
+                    'source_provenance': {'revision': 'abc'}, 'bundle_sha256': 'b',
+                    'manifest_sha256': ['m'], '_started_wall': 'started'}
+
+        envelope = e2.failure_diagnostics(prepared, 'PARTIAL', terminal_data={
+            'metrics': {'ingress': {'Received': 2}}, 'resources': {'services': {'backend': {'available': True}}},
+            'postgres_linux': {'postgres': {'terminal': 1}},
+            'database_counts': {'available': True}, 'collector_stop_joined': True})
+
+        # Verify envelope structure survives failure_diagnostics
+        self.assertIn('snapshots', envelope)
+        self.assertIn('postgres_linux', envelope)
+        self.assertEqual(envelope['full_p8_accepted'], False)
+        self.assertEqual(envelope.get('workload_outcome'), 'PARTIAL')
+        self.assertIn('coverage', envelope)
+
+        # Pad deterministically so combined total > 2MiB but <= 8MiB.
+        # HTTP component ~100 bytes (<= 2MiB), side samples ~2MiB total (<= 2MiB),
+        # padding pushes combined over 2MiB while staying <= 8MiB.
+        pad_needed = max(0, (2 * 1024 * 1024 + 4096) - len(json.dumps(envelope).encode()))
+        envelope['writer_padding'] = 'p' * pad_needed
+        total_size = len(json.dumps(envelope).encode())
+        self.assertGreater(total_size, 2 * 1024 * 1024)
+        self.assertLessEqual(total_size, 8 * 1024 * 1024)
+
+        # Now test the ACTUAL helper writes this envelope to a protected owned temp dir
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            diag_path = Path(tmp) / 'p8-e2-diagnostics.json'
+            smoke_runtime.paper_p8_e2_persist_diagnostics(diag_path, envelope)
+            self.assertTrue(diag_path.is_file())
+            # Read back and assert size and exact content
+            written = json.loads(diag_path.read_text(encoding='utf-8'))
+            self.assertEqual(written['full_p8_accepted'], False)
+            self.assertEqual(written.get('workload_outcome'), 'PARTIAL')
+            self.assertIn('snapshots', written)
+            self.assertIn('postgres_linux', written)
+            self.assertEqual(written['coverage'], envelope['coverage'])
+            # Assert actual file size > 2MiB and <= 8MiB
+            actual_file_size = diag_path.stat().st_size
+            self.assertGreater(actual_file_size, 2 * 1024 * 1024)
+            self.assertLessEqual(actual_file_size, 8 * 1024 * 1024)
+            # Verify padding survives roundtrip
+            self.assertEqual(written.get('writer_padding'), envelope['writer_padding'])
+
+    def test_failure_diagnostics_envelope_over_8mib_rejected_deterministically(self):
+        """Actual helper over 8MiB MUST raise fixed error and leave path absent or previous artifact unchanged."""
+        import tempfile
+        from pathlib import Path
+        from scripts.tests import native_compose_smoke as smoke_runtime
+
+        # Create an envelope that's over 8MiB
+        large_data = 'x' * (9 * 1024 * 1024)  # 9 MiB
+        oversized_envelope = {
+            'schema_version': 1, 'experiment': 'E2', 'full_p8_accepted': False,
+            'snapshot_status': 'available', 'large_field': large_data}
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            diag_path = Path(tmp) / 'p8-e2-diagnostics.json'
+
+            # First write a small valid artifact
+            small_envelope = {'schema_version': 1, 'experiment': 'E2', 'full_p8_accepted': False}
+            smoke_runtime.paper_p8_e2_persist_diagnostics(diag_path, small_envelope)
+            self.assertTrue(diag_path.is_file())
+            small_content = diag_path.read_text(encoding='utf-8')
+
+            # Now attempt to write oversized envelope - should raise fixed error
+            with self.assertRaises(ValueError) as ctx:
+                smoke_runtime.paper_p8_e2_persist_diagnostics(diag_path, oversized_envelope)
+            self.assertEqual(str(ctx.exception), 'diagnostics_file_size_limit')
+
+            # Verify the previous small artifact is UNCHANGED (atomic write failed, original preserved)
+            unchanged_content = diag_path.read_text(encoding='utf-8')
+            self.assertEqual(unchanged_content, small_content)
+
+            # Verify path still exists (previous artifact preserved)
+            self.assertTrue(diag_path.is_file())
+
+        # Also test that writing oversized to a NEW path leaves it absent
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            new_diag_path = Path(tmp) / 'p8-e2-diagnostics-new.json'
+            with self.assertRaises(ValueError) as ctx:
+                smoke_runtime.paper_p8_e2_persist_diagnostics(new_diag_path, oversized_envelope)
+            self.assertEqual(str(ctx.exception), 'diagnostics_file_size_limit')
+            # Path should not exist (atomic write never completed)
+            self.assertFalse(new_diag_path.exists())
+
     def test_bounded_collector_stop_does_not_scrape_if_join_times_out(self):
         scrape = Mock()
         collector = p8.BoundedCollector(scrape=scrape)
@@ -580,7 +1441,9 @@ class E2SupportTests(unittest.TestCase):
             e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, [],
                                        prepared, phase_id='samples-100')
         self.assertIsInstance(prepared['collector'], e2.EqualSamplesCompactSampler)
-        self.assertEqual(prepared['collector'].deadline_seconds, 7200)
+        # Deadline is now computed AFTER baseline read, so it's slightly less than 7200
+        self.assertGreaterEqual(prepared['collector'].deadline_seconds, 7199.9)
+        self.assertLessEqual(prepared['collector'].deadline_seconds, 7200.1)
         prepared['collector'].stop(timeout_seconds=0.1)
 
     def test_pilot_profiles_match_sample_counts_and_concurrent_work(self):

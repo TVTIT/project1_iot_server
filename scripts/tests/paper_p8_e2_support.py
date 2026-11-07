@@ -658,6 +658,30 @@ class EqualSamplesCompactSampler:
                 self._error('scrape_' + type(exc).__name__)
         scrape_finished_mono, scrape_finished_wall = self.time_fn(), self.wall_fn()
 
+        # Project metrics immediately after HTTP scrape, BEFORE resource reader
+        proj_metrics = self._project_metrics(raw_metrics) or {}
+
+        # Notify side sampler for EVERY valid projected HTTP scrape, BEFORE resource reader
+        # and BEFORE retention/ring-cap rejection
+        if (self.side_sampler is not None and raw_metrics is not None
+                and isinstance(proj_metrics.get('ingress'), dict)
+                and proj_metrics.get('ingress')
+                and proj_metrics.get('process_instance')
+                and scrape_finished_mono is not None
+                and scrape_finished_wall is not None):
+            # Build observation snapshot with required fields (using local scrape finish times)
+            obs_snapshot = {
+                'process_instance': proj_metrics['process_instance'],
+                'ingress': proj_metrics['ingress'],
+                'scrape_finished_monotonic': scrape_finished_mono,
+                'scrape_finished_timestamp': scrape_finished_wall,
+            }
+            try:
+                self.side_sampler.observe_ingress(obs_snapshot)
+            except Exception:
+                # Side sampler errors are handled internally; don't block metrics collection
+                pass
+
         raw_res = None
         if self.resource_reader:
             try:
@@ -665,7 +689,6 @@ class EqualSamplesCompactSampler:
             except Exception as exc:
                 self._error('resource_read_' + type(exc).__name__)
 
-        proj_metrics = self._project_metrics(raw_metrics) or {}
         proj_res = self._project_resources(raw_res) if raw_res else None
 
         snapshot = {
@@ -803,76 +826,566 @@ class EqualSamplesCompactSampler:
 
 
 class IndependentSideSampler:
-    """One bounded slow-reader thread, independent of the HTTP metrics sampler."""
-    def __init__(self, *, reader, interval=1.0, max_samples=64, byte_cap=512 * 1024, deadline_seconds=None):
-        if type(max_samples) is not int or max_samples <= 0 or type(byte_cap) is not int or byte_cap <= 0:
-            raise ValueError('side_sampler_caps_invalid')
-        self.reader, self.interval = reader, interval
-        self.max_samples, self.byte_cap = max_samples, byte_cap
-        self.deadline = None if deadline_seconds is None else time.monotonic() + max(0.0, float(deadline_seconds))
-        self._ring, self._bytes = collections.deque(), 0
-        self.evicted_count = self.evicted_bytes = self.total_captured = 0
+    """One bounded slow-reader thread, independent of the HTTP metrics sampler.
+
+    Supports optional active capture mode that preserves evidence during the
+    critical window after ingress trigger (via observe_ingress), while maintaining
+    backward compatibility with the existing rolling behavior when capture options are absent.
+    """
+    def __init__(self, *, reader, interval=1.0, max_samples=64, byte_cap=512 * 1024,
+                 deadline_seconds=None, capture_seconds=None, baseline_metrics=None,
+                 time_fn=None, wall_fn=None):
+        if type(max_samples) is not int or max_samples <= 0 or max_samples > 20000:
+            raise ValueError('side_sampler_max_samples_invalid')
+        if type(byte_cap) is not int or byte_cap <= 0 or byte_cap > 16 * 1024 * 1024:
+            raise ValueError('side_sampler_byte_cap_invalid')
+        if not (0.001 <= interval <= 5.0):
+            raise ValueError('side_sampler_interval_out_of_bounds')
+
+        self.reader = reader
+        self.interval = float(interval)
+        self.max_samples = int(max_samples)
+        self.byte_cap = int(byte_cap)
+        self.time_fn = time_fn if time_fn is not None else time.monotonic
+        self.wall_fn = wall_fn if wall_fn is not None else (lambda: datetime.now(timezone.utc).isoformat())
+        # Deadline uses the same clock as sample timestamps (injected or real)
+        self._start_time = self.time_fn()
+        if deadline_seconds is not None:
+            if type(deadline_seconds) not in (int, float) or isinstance(deadline_seconds, bool):
+                raise ValueError('deadline_seconds_must_be_number')
+            if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
+                raise ValueError('deadline_seconds_must_be_finite_nonnegative')
+        self._deadline_seconds = None if deadline_seconds is None else max(0.0, float(deadline_seconds))
+        self.deadline = None if self._deadline_seconds is None else self._start_time + self._deadline_seconds
+
+        # Validate capture options
+        if capture_seconds is not None:
+            if type(capture_seconds) not in (int, float) or isinstance(capture_seconds, bool):
+                raise ValueError('capture_seconds_must_be_number')
+            if not math.isfinite(capture_seconds) or capture_seconds <= 0:
+                raise ValueError('capture_seconds_must_be_finite_positive')
+            # Note: capture_seconds can exceed deadline_seconds; runtime will cap capture window
+        self.capture_seconds = capture_seconds
+
+        # Validate baseline_metrics - store only minimal scalar copy
+        if baseline_metrics is not None:
+            if not isinstance(baseline_metrics, dict):
+                raise ValueError('baseline_metrics_must_be_dict')
+            ingress = baseline_metrics.get('ingress')
+            if not isinstance(ingress, dict):
+                raise ValueError('baseline_metrics_missing_ingress')
+            received = ingress.get('Received')
+            if type(received) is not int or isinstance(received, bool) or received < 0:
+                raise ValueError('baseline_metrics_received_must_be_nonnegative_int')
+            # Store process_instance if present for trigger validation
+            proc_inst = baseline_metrics.get('process_instance')
+            if proc_inst is not None and not isinstance(proc_inst, str):
+                raise ValueError('baseline_metrics_process_instance_must_be_string')
+            # Keep only minimal scalar copy
+            self.baseline_metrics = {
+                'ingress': {'Received': received},
+                'process_instance': proc_inst
+            }
+        else:
+            self.baseline_metrics = None
+
+        # Internal state
+        self._ring = collections.deque()
+        self._bytes = 0
+        self.evicted_count = 0
+        self.evicted_bytes = 0
+        self.total_captured = 0
         self.errors = []
-        self._lock, self._stop, self._thread = threading.RLock(), threading.Event(), None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread = None
         self._stop_result = None
 
+        # Active capture state (triggered ONLY by observe_ingress)
+        self._triggered = False
+        self._trigger_monotonic = None
+        self._trigger_wall = None
+        self._capture_end_monotonic = None
+        self._capture_end_wall = None  # Derived once at trigger: trigger_wall + capture_seconds delta
+        self._active = False
+        self._frozen = False
+        self._pre_trigger_evictions = 0
+        self._active_truncated = False
+        self._active_truncated_dropped = 0
+        self._state = 'waiting'  # waiting, active_capture, capture_complete, no_trigger, early_stop, deadline
+        self._freeze_monotonic = None
+        self._freeze_wall = None
+        self._freeze_reason = None  # natural_end, deadline, active_count_cap, active_byte_cap, early_stop
+
+        # Last observed ingress state for counter reset detection
+        self._last_observed_received = None
+        self._last_observed_process_instance = None
+
+        # PARENT B: Dedicated sticky qualification flags (not just errors list)
+        self._qualification_reasons = set()  # e.g., 'process_instance_changed', 'counter_reset', 'baseline_missing_process_instance'
+
+        # PARENT A: Track if capture end was clipped by deadline vs natural
+        self._capture_end_clipped_by_deadline = False
+
+        # PARENT E: Track if we're in legacy mode (no capture options).
+        # Legacy = capture_seconds is None ONLY. baseline_metrics absence is a
+        # diagnostics qualification (baseline_unavailable), NOT a legacy/active
+        # mode switch. Active capture is selected by capture_seconds alone.
+        self._legacy_mode = (capture_seconds is None)
+
+    def observe_ingress(self, snapshot):
+        """SOLE trigger mechanism. Call from HTTP collector with projected snapshot.
+
+        Snapshot must contain:
+        - process_instance: non-empty string (must match baseline if baseline has one)
+        - ingress: dict with 'Received' (int >= 0)
+        - scrape_finished_monotonic: finite numeric (non-bool) from Host A
+        - scrape_finished_timestamp: valid bounded ISO UTC timestamp string
+
+        Only Received increase above baseline (or last observation) triggers capture.
+        Equal Received = idle (no trigger, no error). Decrease = counter_reset qualification.
+        Process instance change = process_instance_changed qualification.
+        Validation continues after trigger for counter reset/process change detection.
+        """
+        if self.capture_seconds is None:
+            return  # Legacy mode: no capture requested
+
+        with self._lock:
+            if self._frozen:
+                return  # Frozen - no more observations
+
+            # Validate snapshot structure
+            if not isinstance(snapshot, dict):
+                self._add_error('observe_ingress_snapshot_must_be_dict')
+                return
+
+            # process_instance: non-empty string
+            proc_inst = snapshot.get('process_instance')
+            if not isinstance(proc_inst, str) or not proc_inst:
+                self._add_error('observe_ingress_process_instance_missing_or_invalid')
+                return
+
+            # ingress: dict with Received (int >= 0)
+            ingress = snapshot.get('ingress')
+            if not isinstance(ingress, dict):
+                self._add_error('observe_ingress_missing_ingress')
+                return
+            received = ingress.get('Received')
+            # Must be numeric (int or float), not bool
+            if not isinstance(received, (int, float)) or isinstance(received, bool):
+                self._add_error('observe_ingress_received_must_be_nonnegative_int')
+                return
+            # Must be finite
+            if not math.isfinite(received):
+                self._add_error('observe_ingress_received_must_be_finite')
+                return
+            # Must be int (not float)
+            if type(received) is not int:
+                self._add_error('observe_ingress_received_must_be_nonnegative_int')
+                return
+            if received < 0:
+                self._add_error('observe_ingress_received_must_be_nonnegative_int')
+                return
+
+            # scrape_finished_monotonic: finite numeric non-bool
+            scrape_mono = snapshot.get('scrape_finished_monotonic')
+            if type(scrape_mono) not in (int, float) or isinstance(scrape_mono, bool):
+                self._add_error('observe_ingress_scrape_monotonic_must_be_numeric')
+                return
+            if not math.isfinite(scrape_mono):
+                self._add_error('observe_ingress_scrape_monotonic_must_be_finite')
+                return
+
+            # scrape_finished_timestamp: valid bounded ISO UTC timestamp
+            scrape_wall = snapshot.get('scrape_finished_timestamp')
+            if not isinstance(scrape_wall, str):
+                self._add_error('observe_ingress_scrape_timestamp_missing_or_invalid')
+                return
+            # PARENT C: Proper ISO UTC parsing with validation
+            try:
+                if scrape_wall.endswith('Z'):
+                    dt = datetime.fromisoformat(scrape_wall[:-1] + '+00:00')
+                elif '+' in scrape_wall[-6:] or '-' in scrape_wall[-6:]:
+                    dt = datetime.fromisoformat(scrape_wall)
+                    if dt.tzinfo is None:
+                        self._add_error('observe_ingress_scrape_timestamp_must_be_utc')
+                        return
+                    if dt.utcoffset() != timedelta(0):
+                        self._add_error('observe_ingress_scrape_timestamp_must_be_utc')
+                        return
+                else:
+                    self._add_error('observe_ingress_scrape_timestamp_must_be_utc')
+                    return
+                # Check for reasonable bounds (year 1970-2100)
+                if dt.year < 1970 or dt.year > 2100:
+                    self._add_error('observe_ingress_scrape_timestamp_must_be_utc')
+                    return
+            except Exception:
+                self._add_error('observe_ingress_scrape_timestamp_must_be_utc')
+                return
+
+            # Baseline unavailable: active capture requested but no baseline.
+            # Sticky diagnostics qualification, no trigger, state stays waiting.
+            if self.baseline_metrics is None:
+                self._add_qualification('baseline_unavailable')
+                return
+
+            # Check process_instance match with baseline
+            baseline_proc = self.baseline_metrics.get('process_instance')
+            if baseline_proc is not None:
+                if proc_inst != baseline_proc:
+                    self._add_qualification('process_instance_changed')
+                    self._last_observed_process_instance = proc_inst
+                    return  # Process instance mismatch - no trigger, no counter reset check
+            else:
+                # PARENT D: Baseline has no process_instance - cannot infer sameness
+                self._add_qualification('baseline_missing_process_instance')
+                return
+
+            baseline_received = self.baseline_metrics['ingress']['Received']
+
+            # Check for counter reset (decrease from last observation or baseline)
+            if self._last_observed_received is not None:
+                if received < self._last_observed_received:
+                    self._add_qualification('counter_reset')
+                    self._last_observed_received = received
+                    return
+            elif received < baseline_received:
+                self._add_qualification('counter_reset')
+                self._last_observed_received = received
+                return
+
+            # Update last observed
+            self._last_observed_received = received
+            self._last_observed_process_instance = proc_inst
+
+            # Equal = idle, not trigger
+            if received <= baseline_received:
+                return  # Idle, no trigger, no error
+
+            # Valid trigger: increase above baseline (only if not already triggered)
+            if not self._triggered:
+                self._triggered = True
+                self._trigger_monotonic = scrape_mono
+                self._trigger_wall = scrape_wall
+                self._capture_end_monotonic = scrape_mono + self.capture_seconds
+                # Cap by deadline
+                if self.deadline is not None and self._capture_end_monotonic > self.deadline:
+                    self._capture_end_monotonic = self.deadline
+                    self._capture_end_clipped_by_deadline = True
+                else:
+                    self._capture_end_clipped_by_deadline = False
+                # Derive capture_end_wall once from trigger_wall + effective delta (UTC)
+                delta = self._capture_end_monotonic - scrape_mono
+                self._capture_end_wall = self._add_seconds_to_utc(scrape_wall, delta)
+                self._active = True
+                self._state = 'active_capture'
+
+    def _add_qualification(self, reason):
+        """Add a qualification reason (sticky, deduplicated, bounded)."""
+        self._qualification_reasons.add(reason)
+        # Also add to errors for backward compatibility, but with bounding
+        if len(self.errors) < 16:
+            self.errors.append(reason)
+
+    def _add_error(self, error_code):
+        """Add error with bounding (max 16). Observe_ingress validation errors are not deduplicated."""
+        if len(self.errors) < 16:
+            self.errors.append(error_code)
+
     @staticmethod
-    def _timed(reader):
-        start_utc, start_mono = datetime.now(timezone.utc).isoformat(), time.monotonic()
+    def _add_seconds_to_utc(utc_timestamp, seconds):
+        """Add seconds to UTC timestamp string, return new UTC timestamp string."""
+        try:
+            # Parse ISO format with Z or offset
+            if utc_timestamp.endswith('Z'):
+                dt = datetime.fromisoformat(utc_timestamp[:-1] + '+00:00')
+            else:
+                dt = datetime.fromisoformat(utc_timestamp)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            new_dt = dt + timedelta(seconds=seconds)
+            return new_dt.isoformat().replace('+00:00', 'Z')
+        except Exception:
+            # Fallback: return original (should not happen with validated input)
+            return utc_timestamp
+
+    @staticmethod
+    def _timed(reader, time_fn, wall_fn):
+        start_utc, start_mono = wall_fn(), time_fn()
         try:
             value = reader()
             error = None
         except Exception:
             value, error = None, 'reader_failed'
-        end_mono, end_utc = time.monotonic(), datetime.now(timezone.utc).isoformat()
+        end_mono, end_utc = time_fn(), wall_fn()
         return {'start_utc': start_utc, 'end_utc': end_utc,
                 'start_monotonic_seconds': start_mono, 'end_monotonic_seconds': end_mono,
                 'value': value, 'error': error}
 
     def sample_step(self):
-        def active():
-            return not self._stop.is_set() and (self.deadline is None or time.monotonic() < self.deadline)
-        if not active():
+        # BUG 3 FIX: Check frozen at VERY BEGINNING, before ANY state mutations
+        if self._frozen:
             return
-        pg = self._timed(self.reader['postgres'])
-        if not active(): return
-        linux = self._timed(self.reader['linux'])
-        if not active(): return
-        docker = self._timed(self.reader['docker']) if self.reader.get('docker') else None
+
+        now_mono = self.time_fn()
+        now_wall = self.wall_fn()
+
+        # Check deadline (uses same clock as sample timestamps)
+        if self.deadline is not None and now_mono >= self.deadline:
+            with self._lock:
+                # BUG 3 FIX: Only mutate state if NOT already frozen (double-check under lock)
+                if self._frozen:
+                    return
+                if not self._triggered:
+                    self._state = 'deadline'
+                elif self._active and not self._frozen:
+                    self._state = 'capture_complete'
+                self._freeze_if_needed(now_mono, now_wall, reason='deadline')
+            return
+
+        # Check active capture window end
+        if self._active and self._capture_end_monotonic is not None:
+            if now_mono >= self._capture_end_monotonic:
+                with self._lock:
+                    if self._frozen:
+                        return
+                    self._active = False
+                    self._state = 'capture_complete'
+                    self._freeze_if_needed(now_mono, now_wall, reason='natural_end')
+                return
+
+        # Also check deadline during active capture
+        if self._active and self.deadline is not None and now_mono >= self.deadline:
+            with self._lock:
+                if self._frozen:
+                    return
+                self._active = False
+                self._state = 'capture_complete'
+                self._freeze_if_needed(now_mono, now_wall, reason='deadline')
+            return
+
+        # Perform the timed reads - check before EACH reader
+        def active_check():
+            return not self._stop.is_set() and not self._frozen and \
+                   (self.deadline is None or self.time_fn() < self.deadline) and \
+                   (not self._active or self._capture_end_monotonic is None or self.time_fn() < self._capture_end_monotonic)
+
+        if not active_check():
+            return
+
+        # Track whether capture end was crossed during reader execution
+        capture_end_crossed = False
+
+        # PG reader - always allowed to start if active_check passes
+        pg = self._timed(self.reader['postgres'], self.time_fn, self.wall_fn)
+
+        # Check if capture end was crossed during PG execution
+        if self._active and self._capture_end_monotonic is not None:
+            if pg['end_monotonic_seconds'] >= self._capture_end_monotonic:
+                capture_end_crossed = True
+
+        # Linux reader - only start if capture end not crossed
+        if capture_end_crossed:
+            # Create unavailable envelope for Linux
+            linux_start_mono = self.time_fn()
+            linux_start_utc = self.wall_fn()
+            linux = {
+                'start_utc': linux_start_utc,
+                'end_utc': linux_start_utc,
+                'start_monotonic_seconds': linux_start_mono,
+                'end_monotonic_seconds': linux_start_mono,
+                'value': None,
+                'error': 'capture_window_ended'
+            }
+        else:
+            if not active_check():
+                return
+            linux = self._timed(self.reader['linux'], self.time_fn, self.wall_fn)
+            # Check if capture end was crossed during Linux execution
+            if self._active and self._capture_end_monotonic is not None:
+                if linux['end_monotonic_seconds'] >= self._capture_end_monotonic:
+                    capture_end_crossed = True
+
+        # Docker reader - only start if capture end not crossed
+        docker = None
+        if self.reader.get('docker'):
+            if capture_end_crossed:
+                # Create unavailable envelope for Docker
+                docker_start_mono = self.time_fn()
+                docker_start_utc = self.wall_fn()
+                docker = {
+                    'start_utc': docker_start_utc,
+                    'end_utc': docker_start_utc,
+                    'start_monotonic_seconds': docker_start_mono,
+                    'end_monotonic_seconds': docker_start_mono,
+                    'value': None,
+                    'error': 'capture_window_ended'
+                }
+            else:
+                if not active_check():
+                    return
+                docker = self._timed(self.reader['docker'], self.time_fn, self.wall_fn)
+                # Check if capture end was crossed during Docker execution
+                if self._active and self._capture_end_monotonic is not None:
+                    if docker['end_monotonic_seconds'] >= self._capture_end_monotonic:
+                        capture_end_crossed = True
+                # BUG 2 FIX: Do NOT return early after Docker reader completes.
+                # If all started readers completed (even if clock advanced past capture end),
+                # we still append the sample. The active_check before each reader START
+                # prevents new readers from starting after capture end.
+                docker['value'] = EqualSamplesCompactSampler._project_resources(docker['value'])
+
+        # Build sample with FULL PG value preserved (no filtering)
         sample = {'postgres': pg, 'linux': linux}
         if docker is not None:
-            docker['value'] = EqualSamplesCompactSampler._project_resources(docker['value'])
             sample['docker'] = docker
+
+        # If capture end was crossed during any reader, we have a partial sample
+        # Mark qualification for incomplete source coverage
+        # BUG 2 FIX: Only add qualification if some reader was PREVENTED from starting,
+        # not if all started readers completed (even if they ended after capture end).
+        # We track which sources had unavailable envelopes.
+        if capture_end_crossed:
+            # Check if any source has 'capture_window_ended' error (was not started)
+            has_unstarted = False
+            if linux.get('error') == 'capture_window_ended':
+                has_unstarted = True
+            if docker is not None and docker.get('error') == 'capture_window_ended':
+                has_unstarted = True
+            if has_unstarted:
+                self._add_qualification('inflight_partial_sample')
+
         try:
             size = len(json.dumps(sample, separators=(',', ':'), allow_nan=False).encode())
         except (TypeError, ValueError):
             sample = {'postgres': {**{k: pg[k] for k in ('start_utc','end_utc','start_monotonic_seconds','end_monotonic_seconds')}, 'error':'reader_payload_invalid','value':None},
                       'linux': {**{k: linux[k] for k in ('start_utc','end_utc','start_monotonic_seconds','end_monotonic_seconds')}, 'error':'reader_payload_invalid','value':None}}
             size = len(json.dumps(sample, separators=(',', ':')).encode())
+
         while True:
             sample['_size'] = size
             exact_size = len(json.dumps(sample, separators=(',', ':'), allow_nan=False).encode())
             if exact_size == size:
                 break
             size = exact_size
+
         with self._lock:
-            self.total_captured += 1
-            if size > self.byte_cap:
-                self.errors = ['side_sample_exceeds_byte_cap']
+            # Recheck frozen state under lock after readers completed
+            if self._frozen:
                 return
-            while self._ring and (len(self._ring) >= self.max_samples or self._bytes + size > self.byte_cap):
-                old = self._ring.popleft(); self._bytes -= old['_size']
-                self.evicted_count += 1; self.evicted_bytes += old['_size']
-            self._ring.append(sample); self._bytes += size
+
+            self.total_captured += 1
+
+            # Single sample exceeds total byte_cap -> truncate/freeze (only in capture mode)
+            if size > self.byte_cap:
+                if self._legacy_mode:
+                    return  # Legacy mode: skip oversized sample, continue
+                if not self._active_truncated:
+                    self._active_truncated = True
+                    self._active_truncated_dropped = 0
+                self._active_truncated_dropped += 1
+                # BUG 1 FIX: Use actual current time for freeze, not stale now_mono
+                freeze_mono = self.time_fn()
+                freeze_wall = self.wall_fn()
+                self._freeze_if_needed(freeze_mono, freeze_wall, reason='active_byte_cap')
+                return
+
+            # Determine pre-trigger buffer limit
+            if self.capture_seconds is not None and not self._triggered:
+                pre_trigger_limit = min(4, self.max_samples)
+                pre_trigger_byte_limit = min(64 * 1024, self.byte_cap)
+            else:
+                pre_trigger_limit = self.max_samples
+                pre_trigger_byte_limit = self.byte_cap
+
+            # Eviction logic
+            if not self._triggered:
+                # Pre-trigger: bounded by min(4, max_samples) and min(64KiB, byte_cap)
+                # Single oversized pre-trigger sample must not be appended even if total cap permits
+                if size > pre_trigger_byte_limit:
+                    return  # Drop oversized pre-trigger sample
+                while self._ring and (len(self._ring) >= pre_trigger_limit or self._bytes + size > pre_trigger_byte_limit):
+                    old = self._ring.popleft()
+                    self._bytes -= old['_size']
+                    self.evicted_count += 1
+                    self.evicted_bytes += old['_size']
+                    self._pre_trigger_evictions += 1
+            else:
+                # Post-trigger: bounded by max_samples and byte_cap (retained evidence not evicted)
+                # But if we exceed caps, we truncate from the end (keep earliest) and FREEZE
+                if len(self._ring) >= self.max_samples or self._bytes + size > self.byte_cap:
+                    if not self._active_truncated:
+                        self._active_truncated = True
+                        self._active_truncated_dropped = 0
+                    # Count how many would be dropped
+                    self._active_truncated_dropped += 1
+                    # Freeze on truncation - determine reason
+                    freeze_reason = 'active_count_cap' if len(self._ring) >= self.max_samples else 'active_byte_cap'
+                    # BUG 1 FIX: Use actual current time for freeze
+                    freeze_mono = self.time_fn()
+                    freeze_wall = self.wall_fn()
+                    self._freeze_if_needed(freeze_mono, freeze_wall, reason=freeze_reason)
+                    return
+
+            self._ring.append(sample)
+            self._bytes += size
+
+            # If capture end was crossed during reader execution, freeze immediately with natural_end reason
+            if capture_end_crossed:
+                # BUG 1 FIX: Use actual current time for freeze (clock may have been advanced by readers)
+                freeze_mono = self.time_fn()
+                freeze_wall = self.wall_fn()
+                self._freeze_if_needed(freeze_mono, freeze_wall, reason='natural_end')
+
+    def _freeze_if_needed(self, now_mono, now_wall, reason='natural_end'):
+        """Freeze evidence collection.
+        BUG 1 FIX: Uses actual current time internally (self.time_fn(), self.wall_fn())
+        to ensure freeze timestamps reflect the real moment of freezing, not a stale
+        caller-provided time that may predate slow reader execution.
+        """
+        if not self._frozen:
+            self._frozen = True
+            # BUG 1 FIX: Use actual current time at freeze point, not stale caller args
+            self._freeze_monotonic = self.time_fn()
+            self._freeze_wall = self.wall_fn()
+            self._freeze_reason = reason
+            self._active = False  # Always deactivate on freeze
+            if self._state == 'waiting':
+                self._state = 'no_trigger'
+            elif self._state == 'active_capture':
+                self._state = 'capture_complete'
 
     def start(self):
         if self._thread is not None:
             return
         def loop():
             while not self._stop.is_set():
-                if self.deadline is not None and time.monotonic() >= self.deadline:
+                # BUG 3 FIX: Check frozen at loop start, before any state mutations
+                if self._frozen:
+                    return
+                now_mono = self.time_fn()
+                if self.deadline is not None and now_mono >= self.deadline:
+                    with self._lock:
+                        # Double-check frozen under lock
+                        if self._frozen:
+                            return
+                        if not self._triggered:
+                            self._state = 'deadline'
+                        elif self._active and not self._frozen:
+                            self._state = 'capture_complete'
+                        self._freeze_if_needed(now_mono, self.wall_fn(), reason='deadline')
+                    return
+                # Exit thread when naturally frozen (capture end or cap hit)
+                if self._frozen:
                     return
                 if self._stop.wait(self.interval):
+                    with self._lock:
+                        if self._state == 'waiting':
+                            self._state = 'no_trigger'
+                        elif self._state == 'active_capture':
+                            self._state = 'early_stop'
+                        self._freeze_if_needed(self.time_fn(), self.wall_fn(), reason='early_stop')
                     return
                 self.sample_step()
         self._thread = threading.Thread(target=loop, name='e2-side-diagnostics', daemon=True)
@@ -881,6 +1394,24 @@ class IndependentSideSampler:
     def stop(self, *, timeout_seconds=10.0):
         if self._stop_result is True:
             return True
+        with self._lock:
+            if self._state == 'waiting':
+                self._state = 'no_trigger'
+                self._freeze_if_needed(self.time_fn(), self.wall_fn(), reason='early_stop')
+            elif self._state == 'active_capture':
+                # Check if natural capture end has elapsed (current time >= capture_end_monotonic)
+                # This handles the case where stop is called after natural end but without sample_step at that time
+                now_mono = self.time_fn()
+                natural_end_reached = (self._capture_end_monotonic is not None and
+                                       now_mono >= self._capture_end_monotonic and
+                                       (self.deadline is None or self._capture_end_monotonic <= self.deadline + 1e-9))
+                if natural_end_reached:
+                    self._state = 'capture_complete'
+                    self._freeze_if_needed(now_mono, self.wall_fn(), reason='natural_end')
+                else:
+                    self._state = 'early_stop'
+                    self._freeze_if_needed(now_mono, self.wall_fn(), reason='early_stop')
+            # If already frozen (capture_complete, deadline, etc.), don't change state
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=max(0.0, float(timeout_seconds)))
@@ -896,10 +1427,58 @@ class IndependentSideSampler:
 
     def coverage(self):
         with self._lock:
-            return {'samples_captured': self.total_captured, 'samples_retained': len(self._ring),
+            cov = {'samples_captured': self.total_captured, 'samples_retained': len(self._ring),
                     'samples_evicted': self.evicted_count, 'evicted_bytes': self.evicted_bytes,
                     'ring_count_cap': self.max_samples, 'ring_byte_cap': self.byte_cap,
                     'ring_bytes_used': self._bytes, 'errors': list(self.errors)}
+
+            if self.capture_seconds is not None:
+                cov['mode'] = 'active_capture'
+                cov['state'] = self._state
+                cov['pre_trigger_evictions'] = self._pre_trigger_evictions
+                if self._triggered:
+                    cov['trigger_observed'] = True
+                    cov['trigger_monotonic'] = self._trigger_monotonic
+                    cov['trigger_wall'] = self._trigger_wall
+                    cov['capture_end_monotonic'] = self._capture_end_monotonic
+                    cov['capture_end_wall'] = self._capture_end_wall  # Stable, derived at trigger
+                    # capture_end_reached: true only if declared capture end was actually reached (not clipped by deadline)
+                    # PARENT A: If clipped by deadline, declared end was NOT reached
+                    # Also: cap freeze (active_count_cap, active_byte_cap) must not equate to declared end reached
+                    # Use freeze_reason to distinguish: only natural_end (or deadline==natural_end) means reached
+                    declared_end_reached = (self._capture_end_monotonic is not None and
+                                           not self._capture_end_clipped_by_deadline and
+                                           self._freeze_reason == 'natural_end')
+                    cov['capture_end_reached'] = declared_end_reached
+                else:
+                    cov['trigger_observed'] = False
+                if self._frozen:
+                    cov['freeze_monotonic'] = self._freeze_monotonic
+                    cov['freeze_wall'] = self._freeze_wall
+                    cov['freeze_reason'] = self._freeze_reason
+                # PARENT B: Include qualification reasons
+                if self._qualification_reasons:
+                    cov['qualifications'] = list(self._qualification_reasons)
+                if self._active_truncated:
+                    cov['truncated'] = {
+                        'reason': 'active_count_cap' if len(self._ring) >= self.max_samples else 'active_byte_cap',
+                        'dropped_count': self._active_truncated_dropped
+                    }
+                    cov['active_truncation'] = {
+                        'reason': 'active_count_cap' if len(self._ring) >= self.max_samples else 'active_byte_cap',
+                        'dropped_count': self._active_truncated_dropped
+                    }
+                    cov['complete'] = False
+                else:
+                    # Complete only if not truncated, no qualifications, not early_stop, and capture_end_reached
+                    cov['complete'] = (not self._active and self._state == 'capture_complete' and
+                                       cov.get('capture_end_reached', False) and
+                                       not self._qualification_reasons)
+            # Legacy mode: no 'mode' key for backward compatibility
+            else:
+                cov['complete'] = True
+
+            return cov
 
 
 def read_container_resources(registry, containers, *, docker_client=None, socket_path='/var/run/docker.sock', timeout=2.0, read_only=False):
@@ -1901,33 +2480,59 @@ def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=N
     return result
 
 
+def _compute_official_capture_seconds(manifests):
+    """Compute capture_seconds = max(phase duration A, phase duration B) + 10 seconds postprocessing.
+
+    Phase duration = warmup_seconds + measure_seconds + drain_seconds + cooldown_seconds.
+    """
+    durations = []
+    for arm in ('A', 'B'):
+        phases = manifests.get(arm, {}).get('phases', {})
+        warmup = int(phases.get('warmup_seconds', 0))
+        measure = int(phases.get('measure_seconds', 0))
+        drain = int(phases.get('drain_seconds', 0))
+        cooldown = int(phases.get('cooldown_seconds', 0))
+        durations.append(warmup + measure + drain + cooldown)
+    if not durations:
+        return 0
+    return max(durations) + 10
+
+
 def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prepared, *, phase_id):
     if phase_id != prepared['phase_id']:
         raise ValueError('e2_phase_id_mismatch')
     before_global = smoke.paper_p1_count_db(registry, prepared['pg'])
     before_targets = [_target_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
-    baseline = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
     is_equal_samples = (prepared.get('workload') == 'equal_samples'
                         or 'context' in prepared
                         or phase_id.startswith('equal-samples-'))
     use_compact_sampler = is_equal_samples or prepared.get('workload') == 'steady_burst'
+
+    # Compute absolute session expiry BEFORE slow baseline reads
+    if 'wall_seconds' in prepared:
+        declared_lifetime = prepared['wall_seconds']
+    else:
+        declared_lifetime = max(
+            int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('measure_seconds', 0))
+            + int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('drain_seconds', 60))
+            for arm in ('A', 'B'))
+    deadline_mono = prepared.get('session_deadline_monotonic')
+    if type(deadline_mono) in (int, float) and math.isfinite(deadline_mono):
+        absolute_expiry = float(deadline_mono)
+    else:
+        # Use a finite declared workload lifetime when supervisor deadline metadata is absent.
+        fallback = prepared.get('session_remaining_seconds', declared_lifetime)
+        absolute_expiry = time.monotonic() + max(0.1, float(fallback))
+
+    # Now read baseline (slow diagnostic)
+    baseline = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
+
+    # Compute remaining deadline AFTER baseline read
+    collector_deadline = max(0.1, absolute_expiry - time.monotonic())
+
     if use_compact_sampler:
         baseline_res = read_container_resources(registry, containers,
             read_only=prepared.get('profile') == 'official')
-        if 'wall_seconds' in prepared:
-            declared_lifetime = prepared['wall_seconds']
-        else:
-            declared_lifetime = max(
-                int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('measure_seconds', 0))
-                + int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('drain_seconds', 60))
-                for arm in ('A', 'B'))
-        deadline_mono = prepared.get('session_deadline_monotonic')
-        if type(deadline_mono) in (int, float) and math.isfinite(deadline_mono):
-            collector_deadline = max(0.1, float(deadline_mono) - time.monotonic())
-        else:
-            # Use a finite declared workload lifetime when supervisor deadline metadata is absent.
-            fallback = prepared.get('session_remaining_seconds', declared_lifetime)
-            collector_deadline = max(0.1, float(fallback))
         collector = EqualSamplesCompactSampler(
             scrape=lambda: _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin']),
             resource_reader=(None if prepared.get('profile') == 'official' and
@@ -1951,16 +2556,34 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
     if prepared.get('profile') == 'official' and prepared.get('workload') == 'steady_burst':
         pg_entry = containers.get('postgres') if isinstance(containers, dict) else None
         try:
-                pg_cid = registry.resolve(pg_entry, timeout=2.0, read_only=True).get('Id') if pg_entry else None
+            pg_cid = registry.resolve(pg_entry, timeout=2.0, read_only=True).get('Id') if pg_entry else None
         except Exception:
             pg_cid = None
         prepared['diagnostic_baseline'] = _read_diagnostic_sources(
             smoke, registry, pg_cid, containers, timeout=2.0)
+        # Compute capture_seconds from declared manifest phases
+        manifests = prepared.get('manifests', {})
+        capture_seconds = _compute_official_capture_seconds(manifests)
+        # Baseline metrics for side sampler - ensure process_instance is included
+        side_baseline = None
+        if isinstance(baseline, dict):
+            ingress = baseline.get('ingress')
+            proc_inst = baseline.get('process_instance')
+            if isinstance(ingress, dict) and type(ingress.get('Received')) is int and ingress.get('Received') >= 0:
+                side_baseline = {'ingress': {'Received': ingress['Received']}}
+                if isinstance(proc_inst, str) and proc_inst:
+                    side_baseline['process_instance'] = proc_inst
+        # Pass remaining deadline (absolute_expiry - now) to side sampler, not stale collector_deadline
+        side_deadline = max(0.0, absolute_expiry - time.monotonic())
         collector.side_sampler = IndependentSideSampler(reader={
             'postgres': lambda: read_postgres_diagnostics(smoke, registry, pg_cid, timeout=2.0),
             'linux': lambda: read_linux_resources(registry, containers, timeout=0.5),
             'docker': lambda: read_container_resources(registry, containers, timeout=0.5, read_only=True)},
-            deadline_seconds=max(0.0, collector_deadline))
+            max_samples=128,
+            byte_cap=2 * 1024 * 1024,
+            deadline_seconds=side_deadline,
+            capture_seconds=capture_seconds,
+            baseline_metrics=side_baseline)
     collector.start(None)
     if collector.side_sampler is not None:
         collector.side_sampler.start()

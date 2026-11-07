@@ -245,6 +245,22 @@ def durable_json(path, data):
         os.close(fd)
 
 
+# 8MiB cap for total diagnostics file (separate from 2MiB side/HTTP caps)
+DIAGNOSTICS_FILE_CAP = 8 * 1024 * 1024
+
+
+def paper_p8_e2_persist_diagnostics(path, payload):
+    """Persist diagnostics payload with 8MiB size enforcement.
+
+    Uses the same serialization as durable_json (json.dumps without separators).
+    Raises ValueError('diagnostics_file_size_limit') if serialized size exceeds 8MiB.
+    """
+    actual_size = len(json.dumps(payload).encode())
+    if actual_size > DIAGNOSTICS_FILE_CAP:
+        raise ValueError('diagnostics_file_size_limit')
+    durable_json(path, payload)
+
+
 def generate_fixture_tls(fixture):
     """Fresh two-day CA/server; only server key is UID-1883 readable via ACL."""
     certs = fixture.private / "certs"
@@ -7205,27 +7221,30 @@ def main():
                     for p in prepared.get('manifest_paths', []) if Path(p).is_file()]
                 prepared['bundle_sha256'] = prepared.get('bundle_sha256')
                 diagnostics_path = fixture.artifacts / 'p8-e2-diagnostics.json'
-                def persist_diagnostics(payload):
-                    if len(json.dumps(payload, separators=(',', ':')).encode()) > 2 * 1024 * 1024:
-                        raise ValueError('diagnostics_file_size_limit')
-                    durable_json(diagnostics_path, payload)
                 try:
                     diagnostics = prepared['e2_support'].failure_diagnostics(
                         prepared, state.get('workload_outcome', 'NOT_RUN'), smoke=sys.modules[__name__],
                         endpoint=session.get('endpoint'), registry=session.get('registry'),
-                        containers=session.get('containers', {}), persist_callback=persist_diagnostics)
+                        containers=session.get('containers', {}),
+                        persist_callback=lambda payload: paper_p8_e2_persist_diagnostics(diagnostics_path, payload))
                     session['e2_diagnostics_flushed'] = True
                 except Exception:
                     diagnostics = {'schema_version': 1, 'experiment': 'E2',
                         'full_p8_accepted': False, 'snapshot_status': 'unavailable',
                         'error_reason': 'diagnostics_flush_failed'}
                 try:
-                    encoded = json.dumps(diagnostics, separators=(',', ':'))
-                    if len(encoded.encode()) > 2 * 1024 * 1024:
+                    paper_p8_e2_persist_diagnostics(diagnostics_path, diagnostics)
+                except ValueError as exc:
+                    if str(exc) == 'diagnostics_file_size_limit':
                         diagnostics = {'schema_version': 1, 'experiment': 'E2',
                             'full_p8_accepted': False, 'snapshot_status': 'unavailable',
                             'error_reason': 'diagnostics_file_size_limit'}
-                    persist_diagnostics(diagnostics)
+                        try:
+                            paper_p8_e2_persist_diagnostics(diagnostics_path, diagnostics)
+                        except Exception:
+                            pass
+                    else:
+                        raise
                 except Exception:
                     try:
                         durable_json(diagnostics_path, {
