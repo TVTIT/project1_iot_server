@@ -1,5 +1,6 @@
 """Preparation and preflight regression tests; these tests never contact Docker."""
 import base64
+import copy
 from contextlib import ExitStack
 import dataclasses
 import importlib.util
@@ -1113,6 +1114,32 @@ class PreparationTests(unittest.TestCase):
             runner.return_value = Mock(returncode=1, stderr=b'daemon unavailable')
             with self.assertRaisesRegex(ValueError, 'resource_inspect_unresolved'):
                 registry.remove(item)
+
+    def test_resource_readonly_resolve_preserves_receipt_and_timeout(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            calls = []
+            obj = {'Id': 'a' * 64, 'Name': '/run-fixture', 'Image': 'sha256:expected',
+                   'Created': 'created', 'Config': {'Labels': {'test.run': fixture.project}}}
+            def runner(args, **kwargs):
+                calls.append(kwargs)
+                return Mock(returncode=0, stdout=json.dumps([obj]).encode(), stderr=b'')
+            registry = smoke.ResourceRegistry(fixture, runner)
+            item = {'kind': 'container', 'name': 'run-fixture', 'image': 'sha256:expected',
+                    'labels': {'test.run': fixture.project}, 'receipt': None,
+                    'path': fixture.private / 'receipt.json'}
+            original = copy.deepcopy(item)
+            registry.resolve(item, timeout=0.25, read_only=True)
+            self.assertEqual(item, original)
+            self.assertFalse(item['path'].exists())
+            self.assertEqual(calls[-1]['timeout'], 0.25)
+            registry.resolve(item)
+            self.assertTrue(item['path'].exists())
+            self.assertIsNotNone(item['receipt'])
+            item['receipt'] = {'id': 'b' * 64, 'created': 'replacement', 'labels': {}}
+            with self.assertRaisesRegex(ValueError, 'resource_replacement_refused'):
+                registry.resolve(item, timeout=0.25, read_only=True)
 
 
     def prepare(self, directory):

@@ -23,6 +23,18 @@ sensor_scoped_delta = _support.sensor_scoped_delta
 BoundedCollector = _support.BoundedCollector
 verify_pilot_raw = _support.verify_pilot_raw
 
+def _load_sibling_module(name):
+    path = Path(__file__).with_name(name + '.py')
+    spec = importlib.util.spec_from_file_location('paper_p8_e2_' + name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_pg_diagnostics = _load_sibling_module('paper_p8_e2_diagnostics')
+_linux_resources = _load_sibling_module('paper_p8_e2_resources')
+read_postgres_diagnostics = _pg_diagnostics.read_postgres_diagnostics
+read_linux_resources = _linux_resources.read_linux_resources
+
 try:
     from scripts import paper_p8_client
 except ModuleNotFoundError as exc:
@@ -464,6 +476,7 @@ class EqualSamplesCompactSampler:
 
         self._stop = threading.Event()
         self._thread = None
+        self.side_sampler = None
 
     @staticmethod
     def _project_metrics(raw):
@@ -477,6 +490,13 @@ class EqualSamplesCompactSampler:
             'monotonic': raw.get('monotonic')
                 if type(raw.get('monotonic')) in (int, float) else None,
         }
+        for key in ('scrape_started_timestamp', 'scrape_finished_timestamp'):
+            if isinstance(raw.get(key), str):
+                proj[key] = raw[key][:64]
+        for key in ('scrape_started_monotonic', 'scrape_finished_monotonic'):
+            value = raw.get(key)
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                proj[key] = value
         ing_raw = raw.get('ingress')
         if isinstance(ing_raw, dict):
             ing_fields = (
@@ -490,15 +510,20 @@ class EqualSamplesCompactSampler:
                 'SamplesNew', 'ACKPublished', 'ACKPublishFailures'
             )
             ing = {k: ing_raw[k] for k in ing_fields if k in ing_raw and type(ing_raw[k]) in (int, float)}
-            durations = ing_raw.get('Durations')
+            durations = ing_raw.get('Durations', ing_raw.get('durations'))
             names = ('queue_wait', 'validation', 'persistence', 'ack_publish',
                      'batch_wait', 'group_persistence')
             projected_durations = {}
             for name in names:
                 hist = EqualSamplesCompactSampler._project_histogram(
                     durations.get(name) if isinstance(durations, dict) else None)
-                projected_durations[name] = hist or {'available': False, 'reason':
-                    'missing' if not isinstance(durations, dict) or name not in durations else 'invalid'}
+                existing = durations.get(name) if isinstance(durations, dict) else None
+                projected_durations[name] = hist or (
+                    {'available': False, 'reason': existing['reason'][:32]}
+                    if isinstance(existing, dict) and existing.get('available') is False
+                    and existing.get('reason') in ('missing', 'invalid') else
+                    {'available': False, 'reason':
+                     'missing' if not isinstance(durations, dict) or name not in durations else 'invalid'})
             ing['durations'] = projected_durations
             proj['ingress'] = ing
         else:
@@ -516,6 +541,21 @@ class EqualSamplesCompactSampler:
                 'groups_flushed',
             )
             pers = {k: pers_raw[k] for k in pers_fields if k in pers_raw and type(pers_raw[k]) in (int, float)}
+            duration_names = ('begin', 'gateway_lock', 'sensor_lock', 'graph_lookup',
+                'entity_lock', 'state_lock', 'ledger', 'copy', 'reported_state', 'temporal', 'commit')
+            durations_raw = pers_raw.get('durations')
+            projected_durations = {}
+            for name in duration_names:
+                hist = EqualSamplesCompactSampler._project_histogram(
+                    durations_raw.get(name) if isinstance(durations_raw, dict) else None)
+                existing = durations_raw.get(name) if isinstance(durations_raw, dict) else None
+                projected_durations[name] = hist or (
+                    {'available': False, 'reason': existing['reason'][:32]}
+                    if isinstance(existing, dict) and existing.get('available') is False
+                    and existing.get('reason') in ('missing', 'invalid') else
+                    {'available': False, 'reason':
+                     'missing' if not isinstance(durations_raw, dict) or name not in durations_raw else 'invalid'})
+            pers['durations'] = projected_durations
             for hist_k in ('batch_wait_latency', 'persistence_latency'):
                 if hist_k in pers_raw and isinstance(pers_raw[hist_k], dict):
                     hist = EqualSamplesCompactSampler._project_histogram(pers_raw[hist_k])
@@ -524,6 +564,13 @@ class EqualSamplesCompactSampler:
             proj['persistence'] = pers
         else:
             proj['persistence'] = {}
+
+        db_raw = raw.get('db')
+        db_fields = ('acquired', 'idle', 'total', 'max', 'acquire_count',
+                     'empty_acquire_count', 'canceled_acquire_count', 'acquire_seconds')
+        proj['db'] = {k: db_raw[k] for k in db_fields if isinstance(db_raw, dict)
+                      and type(db_raw.get(k)) in (int, float)
+                      and math.isfinite(db_raw[k]) and db_raw[k] >= 0}
 
         if 'resources' in raw and isinstance(raw['resources'], dict):
             proj['resources'] = EqualSamplesCompactSampler._project_resources(raw['resources'])
@@ -603,11 +650,13 @@ class EqualSamplesCompactSampler:
             return
 
         raw_metrics = None
+        scrape_started_mono, scrape_started_wall = self.time_fn(), self.wall_fn()
         if self.scrape:
             try:
                 raw_metrics = self.scrape()
             except Exception as exc:
                 self._error('scrape_' + type(exc).__name__)
+        scrape_finished_mono, scrape_finished_wall = self.time_fn(), self.wall_fn()
 
         raw_res = None
         if self.resource_reader:
@@ -623,9 +672,14 @@ class EqualSamplesCompactSampler:
             'phase': phase,
             'timestamp': now_wall,
             'monotonic': now_mono,
+            'scrape_started_timestamp': scrape_started_wall,
+            'scrape_started_monotonic': scrape_started_mono,
+            'scrape_finished_timestamp': scrape_finished_wall,
+            'scrape_finished_monotonic': scrape_finished_mono,
             'process_instance': proj_metrics.get('process_instance'),
             'ingress': proj_metrics.get('ingress', {}),
             'persistence': proj_metrics.get('persistence', {}),
+            'db': proj_metrics.get('db', {}),
         }
         if proj_res is not None:
             snapshot['resources'] = proj_res
@@ -678,13 +732,25 @@ class EqualSamplesCompactSampler:
             if self._stop_result is not None:
                 return self._stop_result
             self._stop.set()
+            if self.side_sampler is not None:
+                self.side_sampler._stop.set()
+            deadline = time.monotonic() + max(0.0, float(timeout_seconds))
             if self._thread:
-                self._thread.join(timeout=max(0.0, float(timeout_seconds)))
-                if self._thread.is_alive():
-                    self._error('collector_join_timeout')
-                    return False
-            self._stop_result = True
-            return True
+                self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                metrics_joined = not self._thread.is_alive()
+            else:
+                metrics_joined = True
+            side_joined = True
+            if self.side_sampler is not None:
+                side_joined = self.side_sampler.stop(timeout_seconds=max(0.0, deadline - time.monotonic()))
+            if not metrics_joined:
+                self._error('collector_join_timeout')
+            if not side_joined:
+                self._error('side_sampler_join_timeout')
+            joined = metrics_joined and side_joined
+            if joined:
+                self._stop_result = True
+            return joined
 
     def record_terminal(self, terminal_metrics, terminal_resources):
         with self._lock:
@@ -736,7 +802,107 @@ class EqualSamplesCompactSampler:
             }
 
 
-def read_container_resources(registry, containers, *, docker_client=None, socket_path='/var/run/docker.sock', timeout=2.0):
+class IndependentSideSampler:
+    """One bounded slow-reader thread, independent of the HTTP metrics sampler."""
+    def __init__(self, *, reader, interval=1.0, max_samples=64, byte_cap=512 * 1024, deadline_seconds=None):
+        if type(max_samples) is not int or max_samples <= 0 or type(byte_cap) is not int or byte_cap <= 0:
+            raise ValueError('side_sampler_caps_invalid')
+        self.reader, self.interval = reader, interval
+        self.max_samples, self.byte_cap = max_samples, byte_cap
+        self.deadline = None if deadline_seconds is None else time.monotonic() + max(0.0, float(deadline_seconds))
+        self._ring, self._bytes = collections.deque(), 0
+        self.evicted_count = self.evicted_bytes = self.total_captured = 0
+        self.errors = []
+        self._lock, self._stop, self._thread = threading.RLock(), threading.Event(), None
+        self._stop_result = None
+
+    @staticmethod
+    def _timed(reader):
+        start_utc, start_mono = datetime.now(timezone.utc).isoformat(), time.monotonic()
+        try:
+            value = reader()
+            error = None
+        except Exception:
+            value, error = None, 'reader_failed'
+        end_mono, end_utc = time.monotonic(), datetime.now(timezone.utc).isoformat()
+        return {'start_utc': start_utc, 'end_utc': end_utc,
+                'start_monotonic_seconds': start_mono, 'end_monotonic_seconds': end_mono,
+                'value': value, 'error': error}
+
+    def sample_step(self):
+        def active():
+            return not self._stop.is_set() and (self.deadline is None or time.monotonic() < self.deadline)
+        if not active():
+            return
+        pg = self._timed(self.reader['postgres'])
+        if not active(): return
+        linux = self._timed(self.reader['linux'])
+        if not active(): return
+        docker = self._timed(self.reader['docker']) if self.reader.get('docker') else None
+        sample = {'postgres': pg, 'linux': linux}
+        if docker is not None:
+            docker['value'] = EqualSamplesCompactSampler._project_resources(docker['value'])
+            sample['docker'] = docker
+        try:
+            size = len(json.dumps(sample, separators=(',', ':'), allow_nan=False).encode())
+        except (TypeError, ValueError):
+            sample = {'postgres': {**{k: pg[k] for k in ('start_utc','end_utc','start_monotonic_seconds','end_monotonic_seconds')}, 'error':'reader_payload_invalid','value':None},
+                      'linux': {**{k: linux[k] for k in ('start_utc','end_utc','start_monotonic_seconds','end_monotonic_seconds')}, 'error':'reader_payload_invalid','value':None}}
+            size = len(json.dumps(sample, separators=(',', ':')).encode())
+        while True:
+            sample['_size'] = size
+            exact_size = len(json.dumps(sample, separators=(',', ':'), allow_nan=False).encode())
+            if exact_size == size:
+                break
+            size = exact_size
+        with self._lock:
+            self.total_captured += 1
+            if size > self.byte_cap:
+                self.errors = ['side_sample_exceeds_byte_cap']
+                return
+            while self._ring and (len(self._ring) >= self.max_samples or self._bytes + size > self.byte_cap):
+                old = self._ring.popleft(); self._bytes -= old['_size']
+                self.evicted_count += 1; self.evicted_bytes += old['_size']
+            self._ring.append(sample); self._bytes += size
+
+    def start(self):
+        if self._thread is not None:
+            return
+        def loop():
+            while not self._stop.is_set():
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    return
+                if self._stop.wait(self.interval):
+                    return
+                self.sample_step()
+        self._thread = threading.Thread(target=loop, name='e2-side-diagnostics', daemon=True)
+        self._thread.start()
+
+    def stop(self, *, timeout_seconds=10.0):
+        if self._stop_result is True:
+            return True
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=max(0.0, float(timeout_seconds)))
+        joined = not (self._thread and self._thread.is_alive())
+        if joined:
+            self._stop_result = True
+        return joined
+
+    @property
+    def samples(self):
+        with self._lock:
+            return [dict(row) for row in self._ring]
+
+    def coverage(self):
+        with self._lock:
+            return {'samples_captured': self.total_captured, 'samples_retained': len(self._ring),
+                    'samples_evicted': self.evicted_count, 'evicted_bytes': self.evicted_bytes,
+                    'ring_count_cap': self.max_samples, 'ring_byte_cap': self.byte_cap,
+                    'ring_bytes_used': self._bytes, 'errors': list(self.errors)}
+
+
+def read_container_resources(registry, containers, *, docker_client=None, socket_path='/var/run/docker.sock', timeout=2.0, read_only=False):
     """Safe bounded Docker readback for backend/db/broker/proxy containers.
 
     Collects cumulative CPU seconds (nanoseconds / 1e9) and memory usage bytes.
@@ -781,7 +947,8 @@ def read_container_resources(registry, containers, *, docker_client=None, socket
         cid = None
         if registry and hasattr(registry, 'resolve'):
             try:
-                resolved = registry.resolve(container_entry)
+                resolved = (registry.resolve(container_entry, timeout=min(2.0, timeout), read_only=True)
+                            if read_only else registry.resolve(container_entry))
                 if resolved and isinstance(resolved, dict):
                     cid = resolved.get('Id')
             except Exception as exc:
@@ -794,7 +961,7 @@ def read_container_resources(registry, containers, *, docker_client=None, socket
                 }
                 continue
 
-        if not cid:
+        if not cid and not read_only:
             receipt = container_entry.get('receipt') or {}
             cid = receipt.get('id') or container_entry.get('name')
 
@@ -841,17 +1008,24 @@ def read_container_resources(registry, containers, *, docker_client=None, socket
             if not os.path.exists(socket_path):
                 raise FileNotFoundError('docker_socket_not_found')
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(max(0.05, float(timeout)))
-            sock.connect(socket_path)
-            req = f'GET /containers/{cid}/stats?stream=false HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.encode('utf-8')
-            sock.sendall(req)
-            raw_data = b''
-            while len(raw_data) < 262144:
-                chunk = sock.recv(8192)
-                if not chunk:
-                    break
-                raw_data += chunk
-            sock.close()
+            read_deadline = time.monotonic() + min(2.0, max(0.001, float(timeout)))
+            try:
+                sock.settimeout(max(0.001, read_deadline - time.monotonic()))
+                sock.connect(socket_path)
+                req = f'GET /containers/{cid}/stats?stream=false&one-shot=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.encode('utf-8')
+                sock.sendall(req)
+                raw_data = b''
+                while len(raw_data) < 262144:
+                    remaining = read_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('docker_stats_deadline_exceeded')
+                    sock.settimeout(remaining)
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        break
+                    raw_data += chunk
+            finally:
+                sock.close()
 
             header_end = raw_data.find(b'\r\n\r\n')
             if header_end == -1:
@@ -1577,6 +1751,7 @@ def calculate_equal_samples_normalized_metrics(*, actual_n, total_payload_bytes,
 def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=None,
                         endpoint=None, registry=None, containers=None,
                         persist_callback=None,
+                        terminal_data=None,
                         time_fn=time.monotonic, wall_fn=lambda: datetime.now(timezone.utc).isoformat()):
     """Bounded, idempotent best-effort E2 diagnostics while fixture resources are alive."""
     if prepared.get('_failure_diagnostics_result') is not None:
@@ -1585,7 +1760,11 @@ def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=N
     deadline = started + min(15.0, max(0.0, float(stop_timeout_seconds)))
     remaining = lambda: max(0.0, deadline - time_fn())
     collector = prepared['collector']
-    stopped = collector.stop(None, timeout_seconds=remaining())
+    side = getattr(collector, 'side_sampler', None)
+    stop_budget = remaining()
+    if getattr(collector, 'side_sampler', None) is not None:
+        stop_budget = max(0.0, stop_budget - min(3.0, stop_budget * 0.3))
+    stopped = collector.stop(None, timeout_seconds=stop_budget)
     snapshots = []
     for row in getattr(collector, 'metrics', []):
         raw = row.get('snapshot')
@@ -1603,6 +1782,8 @@ def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=N
             'flush_started': wall_fn(), 'collector_started': getattr(collector, '_started_wall', None)},
         'snapshot_status': ('retained' if stopped else
             'retained_copy_after_join_timeout' if snapshots else 'collector_join_timeout'),
+        'threads_joined': {'metrics': not bool(getattr(getattr(collector, '_thread', None), 'is_alive', lambda: False)()),
+                            'side': (side is None or not bool(getattr(getattr(side, '_thread', None), 'is_alive', lambda: False)()))},
         'snapshots': snapshots,
         'resource_samples': list(getattr(collector, 'resources', []))[:64],
         'coverage': collector.get_coverage() if hasattr(collector, 'get_coverage') else None,
@@ -1610,12 +1791,17 @@ def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=N
         'database_counts': {'available': False, 'reason': 'not_collected'},
         'resources_status': {'available': False, 'reason': 'not_collected'},
         'qualification': 'retained samples; not a workload acceptance or peak measurement'}
+    if side is not None:
+        result['postgres_linux'] = {'baseline': prepared.get('diagnostic_baseline'),
+            'samples': side.samples, 'coverage': side.coverage(), 'terminal': None}
     if persist_callback is not None:
         try:
             persist_callback(result)
         except Exception:
             result['snapshot_persist_status'] = {'available': False, 'reason': 'initial_persist_failed'}
-    if remaining() > 0 and smoke is not None and endpoint is not None:
+    terminal_http_ok = False
+    terminal = None
+    if terminal_data is None and remaining() > 0 and smoke is not None and endpoint is not None:
         try:
             # HTTP helper's timeout is explicit and bounded by the shared deadline.
             timeout = min(2.0, remaining())
@@ -1626,9 +1812,10 @@ def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=N
             projected = EqualSamplesCompactSampler._project_metrics(terminal)
             result['terminal_metrics_status'] = {'available': projected is not None, 'reason': None if projected else 'schema_unavailable'}
             result['terminal_metrics'] = projected
+            terminal_http_ok = True
         except Exception:
             result['terminal_metrics_status'] = {'available': False, 'reason': 'terminal_scrape_failed'}
-        if result['terminal_metrics_status']['available'] and remaining() > 0:
+        if remaining() > 0:
             try:
                 resources = read_container_resources(None, containers or {}, timeout=min(2.0, remaining()) / 4)
                 projected_resources = EqualSamplesCompactSampler._project_resources(resources) if resources else None
@@ -1669,6 +1856,41 @@ def failure_diagnostics(prepared, outcome, *, stop_timeout_seconds=15.0, smoke=N
     elif remaining() <= 0:
         result['terminal_metrics_status'] = {'available': False, 'reason': 'diagnostics_deadline_exceeded'}
         result['database_counts'] = {'available': False, 'reason': 'diagnostics_deadline_exceeded'}
+    if side is not None:
+        # Readers are attempted independently of HTTP; terminal PG/Linux do not
+        # inherit a fresh metrics timestamp or an HTTP success condition.
+        if terminal_data is not None:
+            result['postgres_linux']['terminal'] = terminal_data.get('postgres_linux')
+        elif remaining() > 0 and registry is not None:
+            pg_entry = (containers or {}).get('postgres') if isinstance(containers, dict) else None
+            try:
+                pg_cid = registry.resolve(pg_entry, timeout=min(2.0, remaining()), read_only=True).get('Id') if pg_entry else None
+            except Exception:
+                pg_cid = None
+            budget = min(2.0, max(0.0, remaining() - 1.0))
+            result['postgres_linux']['terminal'] = _read_diagnostic_sources(
+                smoke, registry, pg_cid, containers or {}, timeout=max(0.05, budget)) if budget > 0 else {
+                    'postgres': {'available': False, 'reason': 'deadline_exceeded'},
+                    'linux': {'available': False, 'reason': 'deadline_exceeded'}}
+        result['postgres_linux']['samples'] = side.samples
+        result['postgres_linux']['coverage'] = side.coverage()
+    if terminal_data is not None:
+        terminal_metrics = terminal_data.get('metrics')
+        terminal_resources = terminal_data.get('resources')
+        projected = EqualSamplesCompactSampler._project_metrics(terminal_metrics) if terminal_metrics else None
+        result['terminal_metrics'] = projected
+        result['terminal_metrics_status'] = {'available': projected is not None,
+            'reason': None if projected is not None else 'schema_unavailable'}
+        services = EqualSamplesCompactSampler._project_resources(terminal_resources) if terminal_resources else None
+        if services is not None:
+            result['resource_samples'] = list(getattr(collector, 'resources', []))[:64]
+            complete = bool(services) and all(row.get('available') is True for row in services.values())
+            result['resources_status'] = {'available': complete,
+                'reason': None if complete else 'partial_or_unavailable'}
+        counts = terminal_data.get('database_counts')
+        if counts is not None:
+            result['database_counts'] = counts
+        result['collector_stop_joined'] = bool(terminal_data.get('collector_stop_joined'))
     result['flush_elapsed_seconds'] = max(0.0, time_fn() - started)
     if persist_callback is not None:
         try:
@@ -1690,7 +1912,8 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
                         or phase_id.startswith('equal-samples-'))
     use_compact_sampler = is_equal_samples or prepared.get('workload') == 'steady_burst'
     if use_compact_sampler:
-        baseline_res = read_container_resources(registry, containers)
+        baseline_res = read_container_resources(registry, containers,
+            read_only=prepared.get('profile') == 'official')
         if 'wall_seconds' in prepared:
             declared_lifetime = prepared['wall_seconds']
         else:
@@ -1699,17 +1922,21 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
                 + int(prepared.get('manifests', {}).get(arm, {}).get('phases', {}).get('drain_seconds', 60))
                 for arm in ('A', 'B'))
         deadline_mono = prepared.get('session_deadline_monotonic')
-        remaining = (max(0.0, float(deadline_mono) - time.monotonic())
-                     if isinstance(deadline_mono, (int, float)) else
-                     prepared.get('session_remaining_seconds', declared_lifetime))
-        collector_deadline = min(float(declared_lifetime), float(remaining))
+        if type(deadline_mono) in (int, float) and math.isfinite(deadline_mono):
+            collector_deadline = max(0.1, float(deadline_mono) - time.monotonic())
+        else:
+            # Use a finite declared workload lifetime when supervisor deadline metadata is absent.
+            fallback = prepared.get('session_remaining_seconds', declared_lifetime)
+            collector_deadline = max(0.1, float(fallback))
         collector = EqualSamplesCompactSampler(
             scrape=lambda: _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin']),
-            resource_reader=lambda: read_container_resources(registry, containers),
+            resource_reader=(None if prepared.get('profile') == 'official' and
+                prepared.get('workload') == 'steady_burst' else
+                lambda: read_container_resources(registry, containers)),
             interval=1.0,
             max_snapshots=3600,
             byte_cap=2 * 1024 * 1024,
-            deadline_seconds=max(0.1, min(86400.0, collector_deadline)),
+            deadline_seconds=min(86400.0, collector_deadline),
             baseline_metrics=baseline,
             baseline_resources=baseline_res,
         )
@@ -1719,9 +1946,42 @@ def begin_remote_collection(smoke, fixture, endpoint, registry, containers, prep
             deadline_seconds=60, baseline_metrics=baseline,
             baseline_server=smoke.paper_p0_stats(registry, containers, 'workload_start'))
     prepared.update({'before_global': before_global, 'before_targets': before_targets,
-                     'baseline': baseline, 'collector': collector})
+                     'baseline': baseline, 'collector': collector, 'containers': containers,
+                     'registry': registry, 'smoke': smoke, 'endpoint': endpoint})
+    if prepared.get('profile') == 'official' and prepared.get('workload') == 'steady_burst':
+        pg_entry = containers.get('postgres') if isinstance(containers, dict) else None
+        try:
+                pg_cid = registry.resolve(pg_entry, timeout=2.0, read_only=True).get('Id') if pg_entry else None
+        except Exception:
+            pg_cid = None
+        prepared['diagnostic_baseline'] = _read_diagnostic_sources(
+            smoke, registry, pg_cid, containers, timeout=2.0)
+        collector.side_sampler = IndependentSideSampler(reader={
+            'postgres': lambda: read_postgres_diagnostics(smoke, registry, pg_cid, timeout=2.0),
+            'linux': lambda: read_linux_resources(registry, containers, timeout=0.5),
+            'docker': lambda: read_container_resources(registry, containers, timeout=0.5, read_only=True)},
+            deadline_seconds=max(0.0, collector_deadline))
     collector.start(None)
+    if collector.side_sampler is not None:
+        collector.side_sampler.start()
     return {'collector_ready': True, 'phase_id': phase_id}
+
+
+def _read_diagnostic_sources(smoke, registry, pg_cid, containers, *, timeout=2.0):
+    timeout = min(2.0, max(0.0, float(timeout)))
+    deadline = time.monotonic() + timeout
+    result = {}
+    for key, reader in (('postgres', lambda budget: read_postgres_diagnostics(smoke, registry, pg_cid, timeout=budget)),
+                        ('linux', lambda budget: read_linux_resources(registry, containers, timeout=budget))):
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            result[key] = {'available': False, 'reason': 'deadline_exceeded'}
+            continue
+        try:
+            result[key] = reader(remaining)
+        except Exception:
+            result[key] = {'available': False, 'reason': 'reader_failed'}
+    return result
 
 
 def calculate_canonical_database_delta(before, after):
@@ -1799,19 +2059,32 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
         raise ValueError('e2_binary_file_rejected')
     bin_sha256 = hashlib.sha256(bin_path.read_bytes()).hexdigest()
     imported = _load_e2_result_bundle(results_root, prepared, bin_path)
-    collector.stop(None)
+    collector_stop_joined = collector.stop(None)
     after_admin = _support._admin_metrics(smoke, endpoint, prepared['tokens']['admin'])
     is_equal_samples = (prepared.get('workload') == 'equal_samples'
                         or 'context' in prepared
                         or phase_id.startswith('equal-samples-'))
     compact_collector = isinstance(collector, EqualSamplesCompactSampler)
+    official_side_path = prepared.get('profile') == 'official' and getattr(collector, 'side_sampler', None) is not None
     if compact_collector:
-        after_res = read_container_resources(registry, containers)
+        after_res = (read_container_resources(registry, containers, timeout=0.5, read_only=True)
+                     if official_side_path else read_container_resources(registry, containers))
         collector.record_terminal(after_admin, after_res)
     else:
         collector.metrics.append({'phase': 'workload_terminal', 'snapshot': after_admin})
         terminal_server = smoke.paper_p0_stats(registry, containers, 'workload_terminal')
         collector.resources.append(terminal_server)
+    if getattr(collector, 'side_sampler', None) is not None:
+        pg_entry = containers.get('postgres') if isinstance(containers, dict) else None
+        try:
+            pg_cid = (registry.resolve(pg_entry, timeout=2.0, read_only=True).get('Id')
+                      if pg_entry and official_side_path else
+                      registry.resolve(pg_entry).get('Id') if pg_entry else None)
+        except Exception:
+            pg_cid = None
+        terminal_diag = _read_diagnostic_sources(smoke, registry, pg_cid, containers, timeout=2.0)
+        side = collector.side_sampler
+        prepared['diagnostic_terminal'] = terminal_diag
     after_global = smoke.paper_p1_count_db(registry, prepared['pg'])
     delta = calculate_canonical_database_delta(prepared['before_global'], after_global)
     after_targets = [_target_counts(smoke, registry, prepared['pg'], spec) for spec in prepared['specs']]
@@ -2147,6 +2420,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             'collector_errors': collector.errors,
             'collector_metrics': collector.metrics if hasattr(collector, 'metrics') else [],
             'collector_resources': collector.resources if hasattr(collector, 'resources') else [],
+            'collector_stop_joined': collector_stop_joined,
             'full_p8_accepted': False,
             'generator_colocated': 'unverified',
             'physical_ab': 'NOT RUN',
@@ -2183,6 +2457,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             'collector_errors': collector.errors,
             'collector_metrics': collector.metrics,
             'collector_resources': collector.resources,
+            'collector_stop_joined': collector_stop_joined,
             'full_p8_accepted': False,
             'generator_colocated': True,
             'physical_ab': 'NOT RUN',
@@ -2191,6 +2466,14 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             limits = prepared['manifests']['A']['limits']
             result['pending_limits'] = {key: limits[key] for key in ('pending_messages', 'pending_bytes')}
         artifact_name = f'p8-e2-samples-{prepared["samples_per_message"]}-remote-result.json'
+    if getattr(collector, 'side_sampler', None) is not None and prepared.get('_failure_diagnostics_result') is None:
+        envelope = failure_diagnostics(prepared, result.get('workload_outcome', result.get('status', 'FINISHED')),
+            stop_timeout_seconds=0, terminal_data={'metrics': after_admin,
+                'resources': after_res if compact_collector else None,
+                'postgres_linux': prepared.get('diagnostic_terminal'),
+                'database_counts': {'available': True, 'delta': delta},
+                'collector_stop_joined': collector_stop_joined})
+        smoke.durable_json(fixture.artifacts / 'p8-e2-diagnostics.json', envelope)
     smoke.durable_json(fixture.artifacts / artifact_name, result)
     return result
 

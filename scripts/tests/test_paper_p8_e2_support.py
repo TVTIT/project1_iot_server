@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import threading
 import unittest
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
@@ -40,6 +42,189 @@ from scripts import paper_p8_client
 
 
 class E2SupportTests(unittest.TestCase):
+    def test_resource_source_receives_original_container_mapping(self):
+        containers = {'backend': {'kind': 'container', 'receipt': {'id': 'b'}},
+                      'postgres': {'kind': 'container', 'receipt': {'id': 'p'}}}
+        with patch.object(e2, 'read_postgres_diagnostics', return_value={'ok': True}), \
+             patch.object(e2, 'read_linux_resources', return_value={'containers': []}) as linux:
+            e2._read_diagnostic_sources(object(), object(), 'p', containers)
+        self.assertIs(linux.call_args.args[1], containers)
+
+    def test_official_begin_closes_over_receipt_mapping_for_linux_sampler(self):
+        containers = {'backend': {'kind': 'container', 'receipt': {'id': 'b'}},
+                      'postgres': {'kind': 'container', 'receipt': {'id': 'p'}}}
+        prepared = {'phase_id': 'samples-1', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 1, 'drain_seconds': 1}},
+                          'B': {'phases': {'measure_seconds': 1, 'drain_seconds': 1}}},
+            'pg': 'pg', 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}))
+        registry = SimpleNamespace(resolve=Mock(return_value={'Id': 'p'}))
+        with patch.object(e2._support, '_admin_metrics', return_value={}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={}), \
+             patch.object(e2, 'read_linux_resources', return_value={}) as linux:
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), registry, containers,
+                                       prepared, phase_id='samples-1')
+            prepared['collector'].side_sampler.sample_step()
+            self.assertIs(linux.call_args.args[1], containers)
+            prepared['collector'].stop(timeout_seconds=0.1)
+
+    def test_equal_samples_compact_finish_does_not_use_legacy_terminal_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / 'paperload'; binary.write_bytes(b'bin')
+            collector = e2.EqualSamplesCompactSampler(scrape=lambda: {}, interval=0.1,
+                max_snapshots=8, byte_cap=4096, deadline_seconds=10)
+            prepared = {'phase_id': 'equal-samples-1', 'workload': 'equal_samples',
+                'profile': 'pilot', 'collector': collector, 'samples_per_message': 1,
+                'session_id': 's', 'run_id': 'r'}
+            smoke = SimpleNamespace(durable_json=Mock(),
+                paper_p0_stats=Mock(side_effect=AssertionError('legacy path')))
+            with patch.object(e2, '_load_e2_result_bundle', return_value={} ), \
+                 patch.object(e2._support, '_admin_metrics', return_value={}), \
+                 patch.object(e2, 'read_container_resources', return_value={}):
+                with self.assertRaises((KeyError, ValueError)):
+                    e2.finish_remote_collection(smoke, SimpleNamespace(), object(), object(), {},
+                        prepared, root, phase_id='equal-samples-1', paperload_binary=str(binary))
+            smoke.paper_p0_stats.assert_not_called()
+            self.assertEqual(collector.metrics, [])
+
+    def test_scrape_finished_clock_is_captured_before_slow_resource_read(self):
+        clock = {'value': 10.0}
+        def slow_resource():
+            clock['value'] = 99.0
+            return {}
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': {}},
+            resource_reader=slow_resource, interval=0.1, max_snapshots=8,
+            byte_cap=4096, deadline_seconds=10, time_fn=lambda: clock['value'],
+            wall_fn=lambda: 'fixed')
+        sampler._started_monotonic = 10.0
+        sampler.sample_step()
+        self.assertEqual(sampler.retained_snapshots[0]['scrape_finished_monotonic'], 10.0)
+
+    def test_failure_http_error_still_reads_terminal_sources_and_resources(self):
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: {}, interval=0.1,
+            max_snapshots=8, byte_cap=4096, deadline_seconds=10)
+        sampler.side_sampler = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}})
+        containers = {'postgres': {'kind': 'container', 'receipt': {'id': 'pg'}}}
+        registry = SimpleNamespace(resolve=Mock(return_value={'Id': 'pg'}))
+        prepared = {'collector': sampler, 'phase_id': 'p', 'session_id': 's', 'run_id': 'r',
+                    'tokens': {'admin': 'x'}, 'pg': 'pg', 'specs': [], 'before_targets': []}
+        with patch.object(e2._support, '_admin_metrics', side_effect=RuntimeError()), \
+             patch.object(e2, 'read_postgres_diagnostics', return_value={'pg': 1}), \
+             patch.object(e2, 'read_linux_resources', return_value={'linux': 1}), \
+             patch.object(e2, 'read_container_resources', return_value={'services': {'backend': {'available': True}}}) as docker:
+            result = e2.failure_diagnostics(prepared, 'ABORTED', smoke=object(), endpoint='endpoint',
+                registry=registry, containers=containers)
+        self.assertEqual(result['postgres_linux']['terminal']['postgres'], {'pg': 1})
+        self.assertIn('workload_terminal', [r['phase'] for r in result['resource_samples']])
+        docker.assert_called_once()
+
+    def test_diagnostics_envelope_reuses_full_failure_contract_for_normal_finish(self):
+        hist = {'upper_seconds': [1.0], 'buckets': [2], 'count': 2, 'overflow': 0,
+                'sum_seconds': 0.5}
+        collector = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': {
+            'Durations': {'ack_publish': hist}}, 'persistence': {'confirmed_commits': 2}},
+            interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=10,
+            baseline_metrics={'ingress': {'Received': 0}})
+        collector.sample_step()
+        collector.side_sampler = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {}, 'linux': lambda: {}, 'docker': lambda: {}})
+        collector.side_sampler.sample_step()
+        prepared = {'collector': collector, 'phase_id': 'samples-1', 'session_id': 's',
+            'run_id': 'r', 'source_provenance': {'revision': 'abc'}, 'bundle_sha256': 'b',
+            'manifest_sha256': ['m'], 'diagnostic_baseline': {'postgres': {'base': 1}},
+            '_started_wall': 'started'}
+        envelope = e2.failure_diagnostics(prepared, 'VALIDATED', terminal_data={
+            'metrics': {'ingress': {'Received': 2}}, 'resources': {'services': {'backend': {'available': True}}},
+            'postgres_linux': {'postgres': {'terminal': 1}},
+            'database_counts': {'available': True}, 'collector_stop_joined': True})
+        self.assertEqual(envelope['source'], {'revision': 'abc'})
+        self.assertEqual(envelope['postgres_linux']['baseline'], {'postgres': {'base': 1}})
+        self.assertEqual(envelope['postgres_linux']['terminal'], {'postgres': {'terminal': 1}})
+        sample = next(row['snapshot'] for row in envelope['snapshots'] if row['phase'] == 'sample')
+        self.assertEqual(sample['ingress']['durations']['ack_publish']['count'], 2)
+        self.assertEqual(envelope['full_p8_accepted'], False)
+        self.assertIn('coverage', envelope)
+
+    def test_official_side_sampler_does_not_block_metrics_scrapes(self):
+        entered, second_scrape = threading.Event(), threading.Event()
+        calls = []
+        release = threading.Event()
+        def slow():
+            entered.set()
+            release.wait()
+            return {'safe': True}
+        def scrape():
+            calls.append(1)
+            if len(calls) >= 2:
+                second_scrape.set()
+            return {'ingress': {'Received': len(calls)}}
+        collector = e2.EqualSamplesCompactSampler(scrape=scrape, interval=0.1,
+            baseline_metrics={}, deadline_seconds=5)
+        collector.start_manual()
+        collector.start()
+        side = e2.IndependentSideSampler(reader={'postgres': slow, 'linux': lambda: {'ok': True}}, interval=0.01)
+        collector.side_sampler = side
+        side.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(second_scrape.wait(1))
+            self.assertGreaterEqual(len(collector.retained_snapshots), 1)
+        finally:
+            release.set()
+            self.assertTrue(collector.stop(timeout_seconds=2))
+
+    def test_side_sampler_has_independent_count_and_byte_eviction_caps(self):
+        sampler = e2.IndependentSideSampler(reader={
+            'postgres': lambda: {'data': 'x' * 80}, 'linux': lambda: {'ok': True}},
+            max_samples=2, byte_cap=1200)
+        for _ in range(5):
+            sampler.sample_step()
+        coverage = sampler.coverage()
+        self.assertEqual(coverage['samples_retained'], 2)
+        self.assertEqual(coverage['samples_evicted'], 3)
+        self.assertLessEqual(coverage['ring_bytes_used'], 1200)
+        self.assertEqual(coverage['ring_bytes_used'], sum(len(json.dumps(row, separators=(',', ':')).encode()) for row in sampler.samples))
+        with self.assertRaises(ValueError): e2.IndependentSideSampler(reader={}, max_samples=0)
+        with self.assertRaises(ValueError): e2.IndependentSideSampler(reader={}, byte_cap=0)
+        self.assertEqual(sampler.stop(timeout_seconds=0), True)
+        self.assertEqual(sampler.stop(timeout_seconds=0), True)
+
+    def test_side_sampler_stop_interrupts_waiting_reader_sequence(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def blocked():
+            calls.append('postgres'); entered.set(); release.wait(2); return {'ok': True}
+        sampler = e2.IndependentSideSampler(reader={'postgres': blocked,
+            'linux': lambda: calls.append('linux'), 'docker': lambda: calls.append('docker')},
+            interval=0.001, deadline_seconds=5)
+        sampler.start()
+        self.assertTrue(entered.wait(1))
+        stopped = threading.Thread(target=lambda: sampler.stop(timeout_seconds=0.01))
+        stopped.start(); stopped.join(0.2)
+        release.set(); sampler._thread.join(1)
+        self.assertEqual(calls, ['postgres'])
+
+    def test_docker_socket_deadline_expiry_is_not_extended_during_recv(self):
+        class FakeSocket:
+            closed = False
+            def settimeout(self, value): self.timeouts = getattr(self, 'timeouts', []) + [value]
+            def connect(self, path): pass
+            def sendall(self, request): pass
+            def recv(self, size): return b''
+            def close(self): self.closed = True
+        sock = FakeSocket()
+        with patch.object(e2.os.path, 'exists', return_value=True), \
+             patch.object(e2.socket, 'socket', return_value=sock), \
+             patch.object(e2.time, 'monotonic', side_effect=[0.0, 0.0, 1.0] + [1.0] * 20):
+            result = e2.read_container_resources(None, {'backend': {'name': 'owned-id'}},
+                socket_path='/fake/docker.sock', timeout=0.5)
+        self.assertEqual(result['services']['backend']['reason'], 'docker_stats_read_failed_TimeoutError')
+        self.assertTrue(sock.closed)
+        self.assertEqual(len(sock.timeouts), 1)
     def test_backend_histogram_dto_is_projected_and_invalid_arrays_are_unavailable(self):
         upper_seconds = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05,
                          0.1, 0.25, 0.5, 1, 2.5, 5, 10]
@@ -67,6 +252,66 @@ class E2SupportTests(unittest.TestCase):
                          {'available': False, 'reason': 'missing'})
         self.assertNotIn('secret', json.dumps(e2.EqualSamplesCompactSampler._project_metrics(
             {'ingress': {'Durations': {'queue_wait': {'secret': 'TOKEN'}}}})))
+
+    def test_sampler_projection_and_failure_export_preserve_compact_persistence_metrics(self):
+        bounds = [0.1, 1.0]
+        hist = {'upper_seconds': bounds, 'buckets': [2, 1], 'count': 3,
+                'overflow': 0, 'sum_seconds': 0.5}
+        raw = {'ingress': {'Durations': {'queue_wait': hist}},
+               'persistence': {'durations': {name: hist for name in
+                   ('begin', 'gateway_lock', 'sensor_lock', 'graph_lookup', 'entity_lock',
+                    'state_lock', 'ledger', 'copy', 'reported_state', 'temporal', 'commit')},
+                   'secret': 'discard'},
+               'db': {'acquired': 1, 'idle': 2, 'total': 3, 'max': 4,
+                      'acquire_count': 5, 'empty_acquire_count': 6,
+                      'canceled_acquire_count': 7, 'acquire_seconds': 0.25,
+                      'password': 'discard'}}
+        sampler = e2.EqualSamplesCompactSampler(scrape=lambda: raw, interval=0.1,
+            max_snapshots=8, byte_cap=4096, deadline_seconds=10,
+            time_fn=lambda: 5.0, wall_fn=lambda: '2026-11-07T00:00:00Z')
+        sampler.sample_step()
+        sample = sampler.retained_snapshots[0]
+        self.assertEqual(sample['persistence']['durations']['commit']['count'], 3)
+        self.assertEqual(sample['db']['acquired'], 1)
+        self.assertIn('scrape_started_monotonic', sample)
+        self.assertIn('scrape_finished_timestamp', sample)
+        prepared = {'collector': sampler, 'phase_id': 'p', 'session_id': 's', 'run_id': 'r'}
+        exported = e2.failure_diagnostics(prepared, 'ABORTED')['snapshots'][0]['snapshot']
+        self.assertEqual(exported['ingress']['durations']['queue_wait']['count'], 3)
+        self.assertEqual(exported['persistence']['durations']['commit']['count'], 3)
+        self.assertEqual(exported['db']['acquired'], 1)
+        self.assertNotIn('discard', json.dumps(exported))
+
+    def test_sampler_deadline_uses_supervisor_session_lifetime_not_workload_duration(self):
+        prepared = {'phase_id': 'samples-1', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 40, 'drain_seconds': 20}},
+                          'B': {'phases': {'measure_seconds': 40, 'drain_seconds': 20}}},
+            'session_deadline_monotonic': time.monotonic() + 3600,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}), paper_p0_stats=Mock(return_value={}))
+        with patch.object(e2._support, '_admin_metrics', return_value={}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), object(), [], prepared, phase_id='samples-1')
+        sampler = prepared['collector']
+        self.assertGreater(sampler.deadline_seconds, 3500)
+        time.sleep(0.01)  # Producer may start after begin; this delay must not consume workload-only budget.
+        self.assertGreater(sampler.deadline_seconds, 3500)
+        sampler.stop(timeout_seconds=0.1)
+
+    def test_sampler_deadline_respects_short_remaining_supervisor_session(self):
+        prepared = {'phase_id': 'samples-1', 'workload': 'steady_burst', 'profile': 'official',
+            'manifests': {'A': {'phases': {'measure_seconds': 40, 'drain_seconds': 20}},
+                          'B': {'phases': {'measure_seconds': 40, 'drain_seconds': 20}}},
+            'session_deadline_monotonic': time.monotonic() + 5,
+            'pg': object(), 'specs': [SimpleNamespace(), SimpleNamespace()], 'tokens': {'admin': 'x'}}
+        smoke = SimpleNamespace(paper_p1_count_db=Mock(return_value={}), paper_p0_stats=Mock(return_value={}))
+        with patch.object(e2._support, '_admin_metrics', return_value={}), \
+             patch.object(e2, '_target_counts', return_value={}), \
+             patch.object(e2, 'read_container_resources', return_value={}):
+            e2.begin_remote_collection(smoke, SimpleNamespace(), object(), object(), [], prepared, phase_id='samples-1')
+        self.assertLess(prepared['collector'].deadline_seconds, 5.1)
+        prepared['collector'].stop(timeout_seconds=0.1)
 
     def test_source_fingerprint_includes_untracked_validator_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2664,7 +2909,7 @@ class E2SupportTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            bundle_dir, binary_file, prepared = self._create_test_equal_samples_bundle(root, ctx)
+            bundle_dir, binary_file, prepared = self._create_test_equal_samples_bundle(root, ctx, profile='official')
 
             # Actual-shaped image inspect output with service role keys and capital Id
             actual_images = {
@@ -2725,8 +2970,13 @@ class E2SupportTests(unittest.TestCase):
                 def record_terminal(self, a, r):
                     pass
 
-            collector = FakeCollector()
+            collector = e2.EqualSamplesCompactSampler(scrape=lambda: {}, max_snapshots=8,
+                byte_cap=4096, deadline_seconds=10)
             prepared['collector'] = collector
+            prepared['profile'] = 'official'
+            prepared['manifests'] = {}
+            collector.side_sampler = SimpleNamespace(samples=[], coverage=lambda: {},
+                stop=lambda **kwargs: True, _thread=None, _stop=threading.Event())
 
             class FakeFixture:
                 artifacts = root / 'artifacts'
@@ -2765,9 +3015,18 @@ class E2SupportTests(unittest.TestCase):
                 return json.dumps({'ledger': 30, 'raw': 3000, 'temporal': 30, 'configuration': 0})
             smoke.db_psql.side_effect = fake_psql
 
-            result = e2.finish_remote_collection(
-                smoke, FakeFixture, Mock(url='https://127.0.0.1:443'), Mock(), {},
-                prepared, bundle_dir, phase_id=prepared['phase_id'], paperload_binary=binary_file)
+            registry = Mock()
+            registry.resolve.return_value = {'Id': 'owned-postgres'}
+            container_manifest = {'postgres': {'kind': 'container', 'name': 'owned-postgres', 'receipt': {'id': 'owned-postgres'}}}
+            with patch.object(e2, 'read_container_resources', return_value={}) as docker_read, \
+                 patch.object(e2, '_read_diagnostic_sources', return_value={}) as diag_read:
+                result = e2.finish_remote_collection(
+                    smoke, FakeFixture, Mock(url='https://127.0.0.1:443'), registry, container_manifest,
+                    prepared, bundle_dir, phase_id=prepared['phase_id'], paperload_binary=binary_file)
+            self.assertTrue(any(call.kwargs == {'timeout': 0.5, 'read_only': True}
+                                for call in docker_read.call_args_list))
+            self.assertTrue(any(call.kwargs == {'timeout': 2.0, 'read_only': True}
+                                for call in registry.resolve.call_args_list))
 
             # 1. Check extracted image IDs: must be valid strings, not None
             self.assertIsNotNone(result.get('image_ids'))
@@ -4030,6 +4289,39 @@ class E2SupportTests(unittest.TestCase):
             self.assertFalse(result['validation']['valid'])
             self.assertEqual(result['validation']['failures'], ['pilot_raw_retention_verification'])
             self.assertTrue(collector.stopped)
+
+    def test_finish_remote_collection_writes_full_official_diagnostics_envelope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle_dir, binary_file, prepared = self._create_test_legacy_bundle(root, samples_per_message=100)
+            smoke, Fixture, _ = self._setup_legacy_finish_env(root, prepared)
+            output = Fixture.artifacts
+            def durable(path, payload):
+                Path(path).write_text(json.dumps(payload))
+            smoke.durable_json.side_effect = durable
+            collector = e2.EqualSamplesCompactSampler(scrape=lambda: {'ingress': {'Received': 1}},
+                interval=0.1, max_snapshots=8, byte_cap=4096, deadline_seconds=10,
+                baseline_metrics={'ingress': {'Received': 0}}, baseline_resources={'backend': {'available': True}})
+            collector.sample_step()
+            collector.side_sampler = e2.IndependentSideSampler(reader={
+                'postgres': lambda: {'sample': 1}, 'linux': lambda: {'sample': 1},
+                'docker': lambda: {'services': {'backend': {'available': True}}}})
+            collector.side_sampler.sample_step()
+            prepared['collector'] = collector
+            prepared.update({'source_provenance': {'revision': 'test-rev'},
+                'diagnostic_baseline': {'postgres': {'baseline': True}},
+                'manifest_sha256': ['manifest']})
+            with patch.object(e2, 'read_postgres_diagnostics', return_value={'terminal': 'pg'}), \
+                 patch.object(e2, 'read_linux_resources', return_value={'terminal': 'linux'}), \
+                 patch.object(e2, 'read_container_resources', return_value={'services': {'backend': {'available': True}}}):
+                e2.finish_remote_collection(smoke, Fixture, Mock(url='https://fixture'), Mock(), {},
+                    prepared, bundle_dir, phase_id=prepared['phase_id'], paperload_binary=binary_file)
+            artifact = json.loads((output / 'p8-e2-diagnostics.json').read_text())
+            self.assertEqual(artifact['source'], {'revision': 'test-rev'})
+            self.assertEqual(artifact['full_p8_accepted'], False)
+            self.assertIn('snapshots', artifact); self.assertIn('coverage', artifact)
+            self.assertIn('resource_samples', artifact); self.assertIn('postgres_linux', artifact)
+            self.assertEqual(artifact['postgres_linux']['terminal']['postgres'], {'terminal': 'pg'})
 
     def test_finish_remote_collection_nonzero_configuration_triggers_failure(self):
         """finish_remote_collection captures actual configuration difference and triggers validation failure."""

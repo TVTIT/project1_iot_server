@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import base64
+import copy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -378,11 +379,13 @@ class ResourceRegistry:
         self.items.append(item)
         return item
 
-    def resolve(self, item):
-        result = self.command([item["kind"], "inspect", item["name"]])
+    def resolve(self, item, *, timeout=None, read_only=False):
+        target = copy.deepcopy(item) if read_only else item
+        args = [target["kind"], "inspect", target["name"]]
+        result = self.command(args) if timeout is None else self.command(args, timeout=timeout)
         if result.returncode:
-            if (("no such " + item["kind"]).encode() in result.stderr.lower()
-                    or item['kind'] == 'network' and ('network ' + item['name'] + ' not found').encode() in result.stderr.lower()):
+            if (("no such " + target["kind"]).encode() in result.stderr.lower()
+                    or target['kind'] == 'network' and ('network ' + target['name'] + ' not found').encode() in result.stderr.lower()):
                 return None
             raise ValueError("resource_inspect_unresolved")
         try:
@@ -390,32 +393,34 @@ class ResourceRegistry:
             if len(rows) != 1 or not isinstance(rows[0], dict):
                 raise ValueError()
             obj = rows[0]
-            if item["kind"] == "container":
+            if target["kind"] == "container":
                 labels = obj.get("Config", {}).get("Labels") or {}
                 identity, created = obj["Id"], obj["Created"]
-                valid = (obj["Name"] == "/" + item["name"] and obj["Image"] == item["image"]
+                valid = (obj["Name"] == "/" + target["name"] and obj["Image"] == target["image"]
                          and re.fullmatch(r"[a-f0-9]{64}", identity))
-            elif item["kind"] == "volume":
+            elif target["kind"] == "volume":
                 labels = obj.get("Labels") or {}
                 identity, created = obj["Name"], obj["CreatedAt"]
-                valid = identity == item["name"] and obj.get("Driver") == "local" and not obj.get("Options")
+                valid = identity == target["name"] and obj.get("Driver") == "local" and not obj.get("Options")
             else:
                 labels = obj.get("Labels") or {}
                 identity, created = obj["Id"], obj["Created"]
-                valid = obj["Name"] == item["name"] and obj.get("Driver") == "bridge" and not obj.get("Internal")
-            if not valid or not created or any(labels.get(k) != v for k, v in item["labels"].items()):
+                valid = obj["Name"] == target["name"] and obj.get("Driver") == "bridge" and not obj.get("Internal")
+            if not valid or not created or any(labels.get(k) != v for k, v in target["labels"].items()):
                 raise ValueError()
         except (ValueError, KeyError, TypeError):
             raise ValueError("resource_ownership_refused") from None
         rec = {"id": identity, "created": created, "labels": labels}
-        if item.get("helper_mount_receipt") is not None:
-            check_helper_mount_receipt(item["helper_mount_receipt"], obj)
-        if item["receipt"] is not None and item["receipt"] != rec:
+        if target.get("helper_mount_receipt") is not None:
+            check_helper_mount_receipt(target["helper_mount_receipt"], obj)
+        if target["receipt"] is not None and target["receipt"] != rec:
             raise ValueError("resource_replacement_refused")
-        item["receipt"] = rec
-        if item.get("expectation") is not None:
-            verify_runtime_receipt(obj, item["expectation"])
-        self.save(item)
+        target["receipt"] = rec
+        if target.get("expectation") is not None:
+            verify_runtime_receipt(obj, target["expectation"])
+        if not read_only:
+            item["receipt"] = target["receipt"]
+            self.save(item)
         return obj
 
     def remove(self, item):
