@@ -96,4 +96,59 @@ func TestRepositoryOperationMetricsConfirmedGroupAndCopyRows(t *testing.T) {
 	if s.BeginAttempts != 1 || s.BeginSucceeded != 1 || s.ConfirmedCommits != 1 || s.CopyCalls != 1 || s.CopyReturnedRows != 6 || s.ConfirmedNewRows != 6 {
 		t.Fatalf("operations: %+v", s)
 	}
+	d := s.Durations
+	if d.Begin.Count != 1 || d.GatewayLock.Count != 1 || d.SensorLock.Count != 2 || d.GraphLookup.Count != 2 || d.EntityLock.Count != 2 || d.StateLock.Count != 2 || d.Ledger.Count != 2 || d.Copy.Count != 1 || d.ReportedState.Count != 2 || d.Temporal.Count != 2 || d.Commit.Count != 1 {
+		t.Fatalf("group duration call counts: %+v", d)
+	}
+}
+
+func TestRepositoryPersistenceDurationsRecordExecutedStages(t *testing.T) {
+	message := telemetryRepositoryTestMessage(t)
+	collector := &PersistenceMetrics{}
+	tx := &telemetryFakeTx{message: message, copyCount: 3, execRows: 1}
+	repo, err := NewPostgresRepositoryWithMetrics(&telemetryFakeDatabase{tx: tx}, time.Second, collector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Persist(context.Background(), message); err != nil {
+		t.Fatal(err)
+	}
+	d := collector.Snapshot().Durations
+	for name, got := range map[string]uint64{
+		"begin": d.Begin.Count, "gateway_lock": d.GatewayLock.Count,
+		"sensor_lock": d.SensorLock.Count, "graph_lookup": d.GraphLookup.Count,
+		"entity_lock": d.EntityLock.Count, "state_lock": d.StateLock.Count,
+		"ledger": d.Ledger.Count, "copy": d.Copy.Count,
+		"reported_state": d.ReportedState.Count, "temporal": d.Temporal.Count,
+		"commit": d.Commit.Count,
+	} {
+		if got != 1 {
+			t.Errorf("%s duration count=%d, want 1", name, got)
+		}
+	}
+}
+
+func TestRepositoryPersistenceDurationsIncludeFailedBeginAndNilCollector(t *testing.T) {
+	collector := &PersistenceMetrics{}
+	repo, err := NewPostgresRepositoryWithMetrics(&telemetryFakeDatabase{beginErr: context.DeadlineExceeded}, time.Second, collector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Persist(context.Background(), telemetryRepositoryTestMessage(t)); err == nil {
+		t.Fatal("expected begin failure")
+	}
+	if got := collector.Snapshot().Durations.Begin.Count; got != 1 {
+		t.Fatalf("failed BeginTx duration count=%d, want 1", got)
+	}
+	nilMetricsRepo, err := NewPostgresRepository(&telemetryFakeDatabase{tx: &telemetryFakeTx{message: telemetryRepositoryTestMessage(t), copyCount: 3, execRows: 1}}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nilMetricsRepo.Persist(context.Background(), telemetryRepositoryTestMessage(t)); err != nil {
+		t.Fatalf("nil-metrics persistence: %v", err)
+	}
+	var emptyMetrics PersistenceMetrics
+	if emptyMetrics.Snapshot().Durations.Begin.Count != 0 {
+		t.Fatal("zero-value metrics should have no duration observations")
+	}
 }

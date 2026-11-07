@@ -100,7 +100,11 @@ func (r *postgresRepository) Persist(ctx context.Context, message *Message) (Per
 	if r.metrics != nil {
 		r.metrics.beginAttempts.Add(1)
 	}
+	beginStarted := time.Now()
 	tx, err := r.database.BeginTx(operationCtx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if r.metrics != nil {
+		observePersistenceDuration(&r.metrics.durations.begin, beginStarted)
+	}
 	if err != nil {
 		return PersistResult{}, dependencyError("begin telemetry transaction", err)
 	}
@@ -115,7 +119,12 @@ func (r *postgresRepository) Persist(ctx context.Context, message *Message) (Per
 	if err != nil {
 		return PersistResult{}, err
 	}
-	if err := tx.Commit(operationCtx); err != nil {
+	commitStarted := time.Now()
+	err = tx.Commit(operationCtx)
+	if r.metrics != nil {
+		observePersistenceDuration(&r.metrics.durations.commit, commitStarted)
+	}
+	if err != nil {
 		if r.metrics != nil {
 			r.metrics.commitUnconfirmed.Add(1)
 		}
@@ -231,7 +240,11 @@ func (r *postgresRepository) persistBatchGroup(ctx context.Context, messages []*
 		}
 		r.metrics.beginAttempts.Add(1)
 	}
+	beginStarted := time.Now()
 	tx, err := r.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if r.metrics != nil {
+		observePersistenceDuration(&r.metrics.durations.begin, beginStarted)
+	}
 	if err != nil {
 		return batchErrorResults(messages, metadata, dependencyError("begin telemetry batch transaction", err))
 	}
@@ -258,14 +271,18 @@ func (r *postgresRepository) persistBatchGroup(ctx context.Context, messages []*
 			results = batchErrorResults(messages, metadata, primaryErr)
 		}
 	}()
-	resources, err := prepareTelemetryResources(ctx, tx, messages)
+	resources, err := prepareTelemetryResourcesWithMetrics(ctx, tx, messages, r.metrics)
 	if err != nil {
 		return batchErrorResults(messages, metadata, err)
 	}
 	newMembers := make([]int, 0, len(messages))
 	for index, message := range messages {
 		entry := metadata[index]
+		ledgerStarted := time.Now()
 		disposition, insertErr := insertTelemetryLedger(ctx, tx, message)
+		if r.metrics != nil {
+			observePersistenceDuration(&r.metrics.durations.ledger, ledgerStarted)
+		}
 		if insertErr != nil {
 			return batchErrorResults(messages, metadata, insertErr)
 		}
@@ -290,9 +307,13 @@ func (r *postgresRepository) persistBatchGroup(ctx context.Context, messages []*
 		if r.metrics != nil {
 			r.metrics.copyCalls.Add(1)
 		}
+		copyStarted := time.Now()
 		count, copyErr := tx.CopyFrom(ctx, pgx.Identifier{"public", "telemetry"},
 			[]string{"measured_at", "gateway_id", "sensor_id", "sequence_num", "value", "boot_id", "message_id", "sample_index"},
 			&telemetryBatchCopySource{messages: messages, members: newMembers})
+		if r.metrics != nil {
+			observePersistenceDuration(&r.metrics.durations.copy, copyStarted)
+		}
 		if r.metrics != nil && count > 0 {
 			r.metrics.copyReturnedRows.Add(uint64(count))
 		}
@@ -305,17 +326,32 @@ func (r *postgresRepository) persistBatchGroup(ctx context.Context, messages []*
 		for _, index := range newMembers {
 			key := telemetryResourceKey{metadata[index].topic.GatewayID, metadata[index].sensorID}
 			resource := resources[key]
-			if _, err := applySensorReportedState(ctx, tx, resource, messages[index]); err != nil {
+			reportedStarted := time.Now()
+			_, err := applySensorReportedState(ctx, tx, resource, messages[index])
+			if r.metrics != nil {
+				observePersistenceDuration(&r.metrics.durations.reportedState, reportedStarted)
+			}
+			if err != nil {
 				return batchErrorResults(messages, metadata, err)
 			}
-			if err := appendSensorSampleIntervalTemporal(ctx, tx, resource, messages[index]); err != nil {
+			temporalStarted := time.Now()
+			err = appendSensorSampleIntervalTemporal(ctx, tx, resource, messages[index])
+			if r.metrics != nil {
+				observePersistenceDuration(&r.metrics.durations.temporal, temporalStarted)
+			}
+			if err != nil {
 				return batchErrorResults(messages, metadata, err)
 			}
 			results[index].Outcome = CommitOutcomeCommitted
 			results[index].SamplesSaved = int(metadata[index].sampleCount)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	commitStarted := time.Now()
+	err = tx.Commit(ctx)
+	if r.metrics != nil {
+		observePersistenceDuration(&r.metrics.durations.commit, commitStarted)
+	}
+	if err != nil {
 		if r.metrics != nil {
 			r.metrics.commitUnconfirmed.Add(1)
 		}
@@ -365,11 +401,15 @@ func batchErrorResults(messages []*Message, metadata []ledgerMessage, err error)
 // transaction, allowing a future grouped transaction to reuse the same
 // single-message write sequence without changing Persist's ownership contract.
 func persistTelemetryMessage(ctx context.Context, tx pgx.Tx, message *Message, metadata ledgerMessage, metrics *PersistenceMetrics) (PersistResult, error) {
-	resource, err := resolveTelemetryResource(ctx, tx, message)
+	resource, err := resolveTelemetryResourceWithMetrics(ctx, tx, message, metrics)
 	if err != nil {
 		return PersistResult{}, err
 	}
+	ledgerStarted := time.Now()
 	disposition, err := insertTelemetryLedger(ctx, tx, message)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.ledger, ledgerStarted)
+	}
 	if err != nil {
 		return PersistResult{}, err
 	}
@@ -391,11 +431,15 @@ func persistTelemetryMessage(ctx context.Context, tx pgx.Tx, message *Message, m
 	if metrics != nil {
 		metrics.copyCalls.Add(1)
 	}
+	copyStarted := time.Now()
 	copyCount, err := tx.CopyFrom(ctx,
 		pgx.Identifier{"public", "telemetry"},
 		[]string{"measured_at", "gateway_id", "sensor_id", "sequence_num", "value", "boot_id", "message_id", "sample_index"},
 		&telemetryCopySource{samples: message.samples},
 	)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.copy, copyStarted)
+	}
 	if metrics != nil && copyCount > 0 {
 		metrics.copyReturnedRows.Add(uint64(copyCount))
 	}
@@ -408,10 +452,20 @@ func persistTelemetryMessage(ctx context.Context, tx pgx.Tx, message *Message, m
 	// Sensor current state and its temporal observation advance in the same
 	// transaction as the ledger and raw samples. Any failure here rolls back all
 	// of them and no commit outcome is reported.
-	if _, err := applySensorReportedState(ctx, tx, resource, message); err != nil {
+	reportedStarted := time.Now()
+	_, err = applySensorReportedState(ctx, tx, resource, message)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.reportedState, reportedStarted)
+	}
+	if err != nil {
 		return PersistResult{}, err
 	}
-	if err := appendSensorSampleIntervalTemporal(ctx, tx, resource, message); err != nil {
+	temporalStarted := time.Now()
+	err = appendSensorSampleIntervalTemporal(ctx, tx, resource, message)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.temporal, temporalStarted)
+	}
+	if err != nil {
 		return PersistResult{}, err
 	}
 	return PersistResult{

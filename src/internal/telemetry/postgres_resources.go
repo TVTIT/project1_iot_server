@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -27,6 +28,10 @@ type telemetryResourceKey struct{ gatewayID, sensorID string }
 // prepareTelemetryResources acquires parent and child locks in separate stable
 // phases. Call only after the complete batch is ready to persist.
 func prepareTelemetryResources(ctx context.Context, tx pgx.Tx, messages []*Message) (map[telemetryResourceKey]resolvedTelemetryResource, error) {
+	return prepareTelemetryResourcesWithMetrics(ctx, tx, messages, nil)
+}
+
+func prepareTelemetryResourcesWithMetrics(ctx context.Context, tx pgx.Tx, messages []*Message, metrics *PersistenceMetrics) (map[telemetryResourceKey]resolvedTelemetryResource, error) {
 	gateways := make(map[string]struct{})
 	sensorSet := make(map[telemetryResourceKey]struct{})
 	for _, message := range messages {
@@ -43,7 +48,12 @@ func prepareTelemetryResources(ctx context.Context, tx pgx.Tx, messages []*Messa
 	}
 	sort.Strings(gatewayIDs)
 	for _, id := range gatewayIDs {
-		if err := lockTelemetryGatewayShare(ctx, tx, id); err != nil {
+		started := time.Now()
+		err := lockTelemetryGatewayShare(ctx, tx, id)
+		if metrics != nil {
+			observePersistenceDuration(&metrics.durations.gatewayLock, started)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -59,7 +69,11 @@ func prepareTelemetryResources(ctx context.Context, tx pgx.Tx, messages []*Messa
 	})
 	units := make(map[telemetryResourceKey]*string, len(keys))
 	for _, key := range keys {
+		started := time.Now()
 		unit, err := lockTelemetrySensor(ctx, tx, key.gatewayID, key.sensorID)
+		if metrics != nil {
+			observePersistenceDuration(&metrics.durations.sensorLock, started)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -67,28 +81,40 @@ func prepareTelemetryResources(ctx context.Context, tx pgx.Tx, messages []*Messa
 	}
 	resources := make(map[telemetryResourceKey]resolvedTelemetryResource, len(keys))
 	for _, key := range keys {
+		started := time.Now()
 		resource, err := verifyTelemetryGraph(ctx, tx, key.gatewayID, key.sensorID, units[key])
+		if metrics != nil {
+			observePersistenceDuration(&metrics.durations.graphLookup, started)
+		}
 		if err != nil {
 			return nil, err
 		}
 		resources[key] = resource
 	}
 	for _, key := range keys {
-		if err := lockTelemetrySensorEntity(ctx, tx, resources[key]); err != nil {
+		started := time.Now()
+		err := lockTelemetrySensorEntity(ctx, tx, resources[key])
+		if metrics != nil {
+			observePersistenceDuration(&metrics.durations.entityLock, started)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
 	for _, key := range keys {
-		if err := lockTelemetrySensorState(ctx, tx, resources[key]); err != nil {
+		started := time.Now()
+		err := lockTelemetrySensorState(ctx, tx, resources[key])
+		if metrics != nil {
+			observePersistenceDuration(&metrics.durations.stateLock, started)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
 	return resources, nil
 }
 
-// resolveTelemetryResource keeps the single-message path on the same
-// parent-first lock contract as the grouped path.
-func resolveTelemetryResource(ctx context.Context, tx pgx.Tx, message *Message) (resolvedTelemetryResource, error) {
+func resolveTelemetryResourceWithMetrics(ctx context.Context, tx pgx.Tx, message *Message, metrics *PersistenceMetrics) (resolvedTelemetryResource, error) {
 	if message == nil {
 		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonInvalidPayload, Field: "message"}
 	}
@@ -96,21 +122,44 @@ func resolveTelemetryResource(ctx context.Context, tx pgx.Tx, message *Message) 
 	if topic.GatewayID == "" || topic.SensorID == "" {
 		return resolvedTelemetryResource{}, &ReasonError{Code: ReasonInvalidPayload, Field: "message"}
 	}
-	if err := lockTelemetryGatewayShare(ctx, tx, topic.GatewayID); err != nil {
+	started := time.Now()
+	err := lockTelemetryGatewayShare(ctx, tx, topic.GatewayID)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.gatewayLock, started)
+	}
+	if err != nil {
 		return resolvedTelemetryResource{}, err
 	}
+	started = time.Now()
 	unit, err := lockTelemetrySensor(ctx, tx, topic.GatewayID, topic.SensorID)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.sensorLock, started)
+	}
 	if err != nil {
 		return resolvedTelemetryResource{}, err
 	}
+	started = time.Now()
 	resource, err := verifyTelemetryGraph(ctx, tx, topic.GatewayID, topic.SensorID, unit)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.graphLookup, started)
+	}
 	if err != nil {
 		return resolvedTelemetryResource{}, err
 	}
-	if err := lockTelemetrySensorEntity(ctx, tx, resource); err != nil {
+	started = time.Now()
+	err = lockTelemetrySensorEntity(ctx, tx, resource)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.entityLock, started)
+	}
+	if err != nil {
 		return resolvedTelemetryResource{}, err
 	}
-	if err := lockTelemetrySensorState(ctx, tx, resource); err != nil {
+	started = time.Now()
+	err = lockTelemetrySensorState(ctx, tx, resource)
+	if metrics != nil {
+		observePersistenceDuration(&metrics.durations.stateLock, started)
+	}
+	if err != nil {
 		return resolvedTelemetryResource{}, err
 	}
 	return resource, nil
