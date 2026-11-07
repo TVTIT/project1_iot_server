@@ -88,7 +88,7 @@ def _safe_phase_events(value):
         event = {key: item[key] for key in ('child', 'event', 'elapsed_ns', 'child_elapsed_ns', 'observed_at_runner_monotonic_ns',
                                              'command_ordinal', 'clock_qualification') if key in item}
         if 'child' in event and (not isinstance(event['child'], str) or len(event['child']) > 160
-                or not re.fullmatch(r'(?:paperload-telemetry:(?:[A-B]|telemetry|unique|replay|cold-replay|initial|warm_replay|initial-replay|warm-replay|samples-(?:1|100)|equal-samples-(?:1|100))(?:\.manifest)?\.json|paperload-viewer:viewer(?:\.manifest)?\.json|paperload-control:control(?:\.manifest)?\.json)', event['child'])):
+                or not re.fullmatch(r'(?:paperload-telemetry:(?:[A-B]|telemetry|unique|replay|cold-replay|expiry-replay|initial|warm_replay|initial-replay|warm-replay|samples-(?:1|100)|equal-samples-(?:1|100))(?:\.manifest)?\.json|paperload-viewer:viewer(?:\.manifest)?\.json|paperload-control:control(?:\.manifest)?\.json)', event['child'])):
             raise ValueError('result phase event schema rejected')
         for key in ('event', 'clock_qualification'):
             if key in event and (not isinstance(event[key], str) or len(event[key]) > 120

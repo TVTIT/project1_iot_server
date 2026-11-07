@@ -320,6 +320,8 @@ class IdentityAndProbeTests(unittest.TestCase):
             'paperload-telemetry:unique.json',
             'paperload-telemetry:replay.json',
             'paperload-telemetry:cold-replay.json',
+            'paperload-telemetry:expiry-replay.json',
+            'paperload-telemetry:expiry-replay.manifest.json',
             'paperload-telemetry:A.json',
             'paperload-telemetry:B.json',
             'paperload-viewer:viewer.json',
@@ -345,6 +347,10 @@ class IdentityAndProbeTests(unittest.TestCase):
             'paperload-control:telemetry.json',
             'paperload-telemetry:../telemetry.json',
             'paperload-telemetry:telemetry.json.extra',
+            'paperload-telemetry:../expiry-replay.json',
+            'paperload-telemetry:expiry.json',
+            'paperload-telemetry:expiry-replay.manifest.json.extra',
+            'paperload-viewer:expiry-replay.json',
             'paperload-telemetry:../initial.json',
             'paperload-telemetry:/etc/passwd',
             'paperload-telemetry:initial',
@@ -786,6 +792,123 @@ class ResultProjectionTests(unittest.TestCase):
         self.assertNotIn('private-user', (out / 'results/workloads/viewer/workload.json').read_text())
         exported_text = '\n'.join(path.read_text() for path in out.rglob('*.json'))
         self.assertNotIn('/private', exported_text)
+
+    def test_export_results_accepts_e4_expiry_replay_phase_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = root / 'workspace'
+            for path in (ws / 'inputs/certs', ws / 'runtime/execution',
+                         ws / 'runtime/manifests',
+                         ws / 'runtime/e4-phases/expiry-replay',
+                         ws / 'outputs/e4-phases/expiry-replay/expiry-replay',
+                         ws / 'outputs/e4-phases/expiry-replay/viewer'):
+                path.mkdir(mode=0o700, parents=True)
+
+            ca_file = ws / 'inputs/certs/mqtt-ca.pem'
+            ca_file.write_text('ca-content')
+            ca_file.chmod(0o600)
+
+            telemetry_manifest = ws / 'runtime/manifests/expiry-replay.json'
+            telemetry_manifest.write_text(json.dumps({'run_id': 'run-e4-expiry'}))
+            telemetry_manifest.chmod(0o600)
+            viewer_manifest = ws / 'runtime/manifests/viewer.json'
+            viewer_manifest.write_text(json.dumps({'run_id': 'run-e4-expiry-viewer'}))
+            viewer_manifest.chmod(0o600)
+
+            spec = {'paperload': [
+                {'role': 'telemetry', 'manifest': str(telemetry_manifest),
+                 'output_dir': str(ws / 'outputs/e4-phases/expiry-replay/expiry-replay')},
+                {'role': 'viewer', 'manifest': str(viewer_manifest),
+                 'output_dir': str(ws / 'outputs/e4-phases/expiry-replay/viewer')},
+            ]}
+            spec_data = json.dumps(spec)
+            spec_file = ws / 'runtime/execution/run-spec.json'
+            spec_file.write_text(spec_data)
+            spec_file.chmod(0o600)
+
+            binding = {'schema_version': 1,
+                       'session': {'experiment': 'E4', 'session_id': 'b' * 32,
+                                   'run_id': 'run-e4-expiry',
+                                   'endpoints': {'mqtt_tls': 'mqtts://127.0.0.1:18883'}},
+                       'source_bundle_sha256': 'c' * 64,
+                       'source_inventory': [{'path': 'certs/mqtt-ca.pem',
+                                             'sha256': hashlib.sha256(b'ca-content').hexdigest()}],
+                       'bound_manifest_sha256': {},
+                       'bound_gateway_environment_sha256': {},
+                       'bound_run_spec_sha256': hashlib.sha256(spec_data.encode()).hexdigest(),
+                       'elapsed_transfer_wait_seconds': 0,
+                       'required_token_lifetime_seconds': 3600}
+            binding_path = ws / 'runtime/binding.json'
+            binding_path.write_text(json.dumps(binding))
+            binding_path.chmod(0o600)
+
+            state_path = ws / 'runtime/e4-phase-state.json'
+            state_path.write_text(json.dumps({'unique_validated': True,
+                                              'last_completed_phase': 'expiry-replay',
+                                              'last_journal_sha256': 'd' * 64}))
+            state_path.chmod(0o600)
+
+            header = {'topic': 'gateways/gw-1/telemetry/sensor-1', 'gateway_id': 'gw-1',
+                      'sensor_id': 'sensor-1', 'message_id': 'm-1', 'boot_id': 'b-1',
+                      'first_sequence': '1', 'sample_count': 100, 'payload_sha256': 'e' * 64}
+            telemetry_workload = {'status': 'COMPLETE', 'experiment': 'E4', 'arm': 'warm',
+                                  'implementation_status': 'P8.4b telemetry synthetic-load; no durable restart assurance',
+                                  'telemetry': {'replay_scheduled': 100, 'replay_offered': 100,
+                                                'replay_application_acks': 100, 'publish_failures': 0,
+                                                'retries': 0, 'pending_messages': 0, 'pending_bytes': 0},
+                                  'e4': {'mode': 'replay', 'journal_entry_count': 100,
+                                         'sampling_qualification': 'synthetic_load_only; not SQLite/durable assurance',
+                                         'ignored_valid_acks': 0, 'replay_application_acks': 100,
+                                         'safe_header_samples': [header]}}
+            telemetry_path = ws / 'outputs/e4-phases/expiry-replay/expiry-replay/workload.json'
+            telemetry_path.write_text(json.dumps(telemetry_workload))
+            telemetry_path.chmod(0o600)
+            viewer_workload = {'status': 'COMPLETE', 'experiment': 'E4', 'arm': 'warm',
+                               'implementation_status': 'P8.4c viewer-only client; no control/durable/server orchestration',
+                               'connected_distinct_viewers': 2,
+                               'viewers': [{'id': 'e4-viewer-a', 'events': 100, 'unique_events': 100,
+                                            'duplicates': 0, 'bytes': 300}]}
+            viewer_path = ws / 'outputs/e4-phases/expiry-replay/viewer/workload.json'
+            viewer_path.write_text(json.dumps(viewer_workload))
+            viewer_path.chmod(0o600)
+
+            phase_dir = ws / 'outputs/e4-phases/expiry-replay'
+            events = [
+                {'child': 'paperload-telemetry:expiry-replay.json', 'event': 'warmup_begin',
+                 'elapsed_ns': 10,
+                 'clock_qualification': 'runner observed pipe receipt; observation lag unknown'},
+                {'child': 'paperload-telemetry:expiry-replay.manifest.json', 'event': 'measure_begin',
+                 'elapsed_ns': 20,
+                 'clock_qualification': 'runner observed pipe receipt; observation lag unknown'},
+            ]
+            (phase_dir / 'run.json').write_text(json.dumps({
+                'status': 'COMPLETE', 'actual_stop_confirmed': True,
+                'phase_observations': {'status': 'observed', 'events': events}}))
+            (phase_dir / 'run.json').chmod(0o600)
+            provenance = ws / 'runtime/e4-phases/expiry-replay/provenance.json'
+            provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                              'binary_os': 'linux', 'binary_arch': 'amd64'}))
+            provenance.chmod(0o600)
+
+            out = root / 'safe-results'
+            client._export_results(ws, out)
+            summary = json.loads((out / 'results.json').read_text())
+            exported_runner = json.loads(
+                (out / 'results/phases/expiry-replay/runner/run.json').read_text())
+            self.assertEqual(summary['phase'], 'expiry-replay')
+            self.assertEqual(summary['expected_workload_roles'], ['expiry-replay', 'viewer'])
+            self.assertEqual(summary['missing_workload_roles'], [])
+            self.assertEqual([event['child'] for event in
+                              exported_runner['phase_observations']['events']],
+                             ['paperload-telemetry:expiry-replay.json',
+                              'paperload-telemetry:expiry-replay.manifest.json'])
+            telemetry = json.loads(
+                (out / 'results/phases/expiry-replay/workloads/expiry-replay/workload.json').read_text())
+            self.assertEqual(telemetry['telemetry']['replay_application_acks'], 100)
+            self.assertEqual(telemetry['e4']['mode'], 'replay')
+            viewer = json.loads(
+                (out / 'results/phases/expiry-replay/workloads/viewer/workload.json').read_text())
+            self.assertEqual(viewer['viewers'][0]['id'], 'e4-viewer-a')
 
     def test_export_results_preserves_equal_samples_workload(self):
         fixture = PortableBundleTests()
