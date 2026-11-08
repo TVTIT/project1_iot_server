@@ -800,6 +800,22 @@ không gắn acceptance. Diagnostics best-effort chỉ trong lifecycle trước 
 
 #### Chẩn đoán persistence E2 (source mới, chạy riêng)
 
+Ghi chú L1 (pipeline SQL trong `persistBatchGroup`): đường batch của một group giờ
+gộp ledger, đọc reported state, ghi reported state và temporal vào **tối đa 4 lần
+`SendBatch`** mỗi group thay vì ~168 câu SQL tuần tự; thứ tự, transaction, lock order,
+mã lỗi và reason field không đổi, nhưng ledger giờ luôn gửi 3 lệnh/message nên message
+insert thành công có thêm 1 PK lookup bị bỏ qua. Về metric: chỉ `ledger`,
+`reported_state` và `temporal` của **đường group** được observe **một lần/group**
+(`reported_state` gộm cả chuyến đọc và chuyến ghi); các stage khóa/tạo tài nguyên vẫn
+đếm theo từng tài nguyên, còn đường một message (`Persist`) và fallback per-input vẫn
+observe theo message. Tên trường trong `persistence.durations`
+giữ nguyên, nhưng sau thay đổi này `count` **đếm batch chứ không đếm message**, và
+`ms_per_call` là ms/batch; ms/message quy đổi bằng
+`ms_per_message = 1000 * sum_seconds / persistence.group_members`, còn
+`ms_per_group = sum_seconds / group_attempts` vẫn so sánh trực tiếp được. Số liệu
+run10 (`official-s1-r10000-run10`) được đo **trước** thay đổi này nên không được trộn
+với lượt đo sau; **chưa có lượt native nào xác nhận throughput** sau L1.
+
 Remote E2 official `steady_burst` tự thu thập 11 stage cố định `persistence.durations`; stage
 `begin` bao gồm cả thời gian lấy connection từ pool. `lock SQL duration` là
 thời lượng câu SQL liên quan, **không** phải thời gian chờ lock thuần. Báo cáo
