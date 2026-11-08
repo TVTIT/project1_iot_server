@@ -94,6 +94,177 @@ func (candidate reportedStateCandidate) merge() map[string]any {
 	return merge
 }
 
+// reportedStateSnapshot is the locked Sensor reported state read for one batch
+// group. Only the fields the ordering decision needs are kept: the raw
+// reported_state JSON is parsed once into provenance, and objectShaped records
+// whether the stored value is a JSON object, because the advance SQL merge
+// (`reported_state || $2::jsonb`) only stays an object when the stored value
+// already is one.
+type reportedStateSnapshot struct {
+	entityID       uuid.UUID
+	version        int64
+	lastReportedAt *time.Time
+	bootID         string
+	sequence       int64
+	hasProvenance  bool
+	objectShaped   bool
+}
+
+// reportedStatePlan is one queued Sensor reported-state advance. version is the
+// reported_version the batched UPDATE must match, so a group that advances one
+// Sensor several times queues version, version+1, ... in message order.
+type reportedStatePlan struct {
+	entityID  uuid.UUID
+	version   int64
+	candidate reportedStateCandidate
+}
+
+// readSensorReportedStatesBatch locks and reads the reported state of every
+// entity in one SendBatch round trip. entities must be unique and in
+// first-appearance order. It keeps the caller's transaction ownership and the
+// same fail-closed results as the single-message read: a missing Twin state row
+// is a graph error, never a no-progress result.
+func readSensorReportedStatesBatch(ctx context.Context, tx pgx.Tx, entities []uuid.UUID) (map[uuid.UUID]reportedStateSnapshot, error) {
+	if tx == nil {
+		return nil, &ReasonError{Code: ReasonInvalidPayload, Field: "tx"}
+	}
+	for _, entity := range entities {
+		if entity == uuid.Nil {
+			return nil, &ReasonError{Code: ReasonInvalidPayload, Field: "entity_id"}
+		}
+	}
+	batch := &pgx.Batch{}
+	for _, entity := range entities {
+		batch.Queue(sensorReportedStateReadSQL, entity)
+	}
+	br := tx.SendBatch(ctx, batch)
+	snapshots := make(map[uuid.UUID]reportedStateSnapshot, len(entities))
+	for _, entity := range entities {
+		var reportedState []byte
+		var reportedVersion int64
+		var lastReportedAt *time.Time
+		err := br.QueryRow().Scan(&reportedState, &reportedVersion, &lastReportedAt)
+		if err != nil {
+			_ = br.Close()
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_state"}
+			}
+			return nil, dependencyError("lock telemetry Sensor state", err)
+		}
+		if reportedVersion < 0 {
+			_ = br.Close()
+			return nil, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "reported_version"}
+		}
+		storedBoot, storedSequence, ok := storedSensorProvenance(reportedState)
+		snapshots[entity] = reportedStateSnapshot{
+			entityID:       entity,
+			version:        reportedVersion,
+			lastReportedAt: lastReportedAt,
+			bootID:         storedBoot,
+			sequence:       storedSequence,
+			hasProvenance:  ok,
+			objectShaped:   reportedStateObjectShaped(reportedState),
+		}
+	}
+	if err := br.Close(); err != nil {
+		return nil, dependencyError("close telemetry Sensor reported-state read batch", err)
+	}
+	return snapshots, nil
+}
+
+// planReportedStateAdvances decides, in Go, which new members advance their
+// Sensor reported state. A group may carry several messages for the same Sensor,
+// so reading the state once and writing it several times would queue the same
+// reported_version repeatedly and fail the version guard on the second UPDATE.
+// The projection therefore replays the sequential loop: each emitted plan
+// advances the projection the way the SQL merge does, so the queued versions are
+// version, version+1, ... for that entity in message order.
+//
+// The projection must mirror the merge, not the candidate. The advance SQL is
+// `reported_state || $2::jsonb`, which only stays a JSON object when the stored
+// value is already an object; a legacy array or scalar stays non-object and its
+// boot/sequence provenance stays unreadable forever. The projection therefore
+// carries objectShaped across advances and derives hasProvenance from it, so an
+// equal-timestamp follow-up message holds on a non-object state exactly like the
+// sequential path, which re-reads the merged row every time.
+func planReportedStateAdvances(messages []*Message, newMembers []int, resources map[telemetryResourceKey]resolvedTelemetryResource, snapshots map[uuid.UUID]reportedStateSnapshot) ([]reportedStatePlan, error) {
+	if len(newMembers) == 0 {
+		return nil, nil
+	}
+	projections := make(map[uuid.UUID]reportedStateSnapshot, len(snapshots))
+	for entity, snapshot := range snapshots {
+		projections[entity] = snapshot
+	}
+	plans := make([]reportedStatePlan, 0, len(newMembers))
+	for _, index := range newMembers {
+		message := messages[index]
+		key := telemetryResourceKey{message.Topic().GatewayID, message.Topic().SensorID}
+		resource, ok := resources[key]
+		if !ok {
+			return nil, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_graph"}
+		}
+		if resource.EntityID == uuid.Nil {
+			return nil, &ReasonError{Code: ReasonInvalidPayload, Field: "entity_id"}
+		}
+		candidate, err := newReportedStateCandidate(resource, message)
+		if err != nil {
+			return nil, err
+		}
+		projection, ok := projections[resource.EntityID]
+		if !ok {
+			return nil, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_state"}
+		}
+		if !sensorProvenanceAdvances(projection.lastReportedAt, projection.bootID, projection.sequence, projection.hasProvenance, candidate) {
+			continue
+		}
+		plans = append(plans, reportedStatePlan{entityID: resource.EntityID, version: projection.version, candidate: candidate})
+		observedAt := candidate.observedAt
+		projection.version++
+		projection.lastReportedAt = &observedAt
+		projection.bootID = candidate.bootID.String()
+		projection.sequence = candidate.sequenceNum
+		// The merge cannot make a non-object state readable, so provenance stays
+		// unavailable for a non-object state after the advance too.
+		projection.hasProvenance = projection.objectShaped
+		projections[resource.EntityID] = projection
+	}
+	return plans, nil
+}
+
+// advanceSensorReportedStatesBatch applies every planned reported-state advance
+// in plan order with one SendBatch round trip. Each statement still carries its
+// own version guard, so a mismatch means the locked snapshot changed and the
+// caller fails closed instead of overwriting it.
+func advanceSensorReportedStatesBatch(ctx context.Context, tx pgx.Tx, plans []reportedStatePlan) error {
+	if tx == nil {
+		return &ReasonError{Code: ReasonInvalidPayload, Field: "tx"}
+	}
+	if len(plans) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, plan := range plans {
+		batch.Queue(sensorReportedStateAdvanceSQL,
+			plan.entityID, plan.candidate.merge(), plan.candidate.observedAt, plan.version)
+	}
+	br := tx.SendBatch(ctx, batch)
+	for range plans {
+		tag, err := br.Exec()
+		if err != nil {
+			_ = br.Close()
+			return dependencyError("advance telemetry Sensor reported state", err)
+		}
+		if tag.RowsAffected() != 1 {
+			_ = br.Close()
+			return &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_state"}
+		}
+	}
+	if err := br.Close(); err != nil {
+		return dependencyError("close telemetry Sensor reported-state advance batch", err)
+	}
+	return nil
+}
+
 // applySensorReportedState conditionally advances the resolved Sensor Twin's
 // reported state for one new telemetry batch inside the caller-owned
 // transaction. It uses the caller's pgx.Tx for the lock, read, and update; it
@@ -151,10 +322,19 @@ func applySensorReportedState(ctx context.Context, tx pgx.Tx, resource resolvedT
 }
 
 // sensorStateAdvances reports whether the candidate may replace the current
-// Sensor reported state using only server-authored values. Legacy states with a
-// missing or malformed boot ID or sequence number at an equal timestamp hold the
-// current state because no reliable ordering can be established.
+// Sensor reported state using only server-authored values. It parses the stored
+// provenance and delegates to the shared ordering core.
 func sensorStateAdvances(stored []byte, lastReportedAt *time.Time, candidate reportedStateCandidate) bool {
+	storedBoot, storedSequence, ok := storedSensorProvenance(stored)
+	return sensorProvenanceAdvances(lastReportedAt, storedBoot, storedSequence, ok, candidate)
+}
+
+// sensorProvenanceAdvances is the ordering core shared by the single-message
+// path and the group projection. Legacy states with a missing or malformed boot
+// ID or sequence number at an equal timestamp hold the current state because no
+// reliable ordering can be established; UUID ordering is never used to guess
+// which boot is newer.
+func sensorProvenanceAdvances(lastReportedAt *time.Time, storedBoot string, storedSequence int64, hasProvenance bool, candidate reportedStateCandidate) bool {
 	if lastReportedAt == nil {
 		return true
 	}
@@ -164,8 +344,7 @@ func sensorStateAdvances(stored []byte, lastReportedAt *time.Time, candidate rep
 	if !candidate.observedAt.Equal(*lastReportedAt) {
 		return false
 	}
-	storedBoot, storedSequence, ok := storedSensorProvenance(stored)
-	if !ok {
+	if !hasProvenance {
 		return false
 	}
 	storedBootID, err := uuid.Parse(storedBoot)
@@ -173,6 +352,19 @@ func sensorStateAdvances(stored []byte, lastReportedAt *time.Time, candidate rep
 		return false
 	}
 	return storedSequence < candidate.sequenceNum
+}
+
+// reportedStateObjectShaped reports whether the stored reported_state is a JSON
+// object. Empty bytes, null, arrays and scalars are not. The advance SQL merges
+// with `reported_state || $2::jsonb`, which leaves a non-object value
+// non-object, so a merged non-object state never gains readable boot/sequence
+// provenance and the projection must not assume it does.
+func reportedStateObjectShaped(reportedState []byte) bool {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(reportedState, &object); err != nil || object == nil {
+		return false
+	}
+	return true
 }
 
 // storedSensorProvenance extracts a valid stored boot ID string and sequence

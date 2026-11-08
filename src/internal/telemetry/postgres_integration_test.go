@@ -76,6 +76,13 @@ UPDATE twin_states SET reported_state='{"temperature":21.5}',desired_state='{"sa
 		runPostgresGroupAcceptance(ctx, t, setup, app, validator)
 		return
 	}
+	// Opt-in same-Sensor group case for the pipelined batch path. It is the only
+	// place that exercises the real reported_version guard for the second
+	// same-Sensor UPDATE inside one batch, which the lazy fake cannot model.
+	if os.Getenv("TELEMETRY_TEST_GROUP_SAME_SENSOR") == "1" {
+		runPostgresSameSensorGroupCase(ctx, t, setup, app, validator)
+		return
+	}
 	// Sensor desired state, its version, and its audit timestamps/actor must
 	// survive a reported-state advance untouched, and the Gateway Twin must stay
 	// untouched. Capture both before any persist result can influence them.
@@ -1478,6 +1485,72 @@ func runPostgresGroupAcceptance(ctx context.Context, t *testing.T, setup, app *p
 		t.Fatalf("final actual persistence metrics=%+v", finalMetrics)
 	}
 	fmt.Printf("GROUP INTEGRATION PASS: ledger=%d raw=%d temporal=%d metrics=%+v\n", count("SELECT count(*) FROM processed_messages"), count("SELECT count(*) FROM telemetry"), count("SELECT count(*) FROM twin_temporal_values"), finalMetrics)
+}
+
+// runPostgresSameSensorGroupCase persists one group of two new messages for the
+// same Sensor through the batched transaction. The projected version guards must
+// advance reported_version twice in message order and append one temporal
+// observation per message, which only the real database can prove.
+func runPostgresSameSensorGroupCase(ctx context.Context, t *testing.T, setup, app *pgxpool.Pool, validator *Validator) {
+	t.Helper()
+	const sensorEntity = "urn:ngsi-ld:Sensor:fixture_gw:fixture_sensor"
+	const boot = "80000000-0000-4000-8000-000000000001"
+	sensorVersion := func() int64 {
+		t.Helper()
+		return groupSensorVersion(ctx, t, setup, "fixture_sensor")
+	}
+	sensorTemporal := func() int {
+		t.Helper()
+		var count int
+		if err := setup.QueryRow(ctx, `SELECT count(*) FROM twin_temporal_values WHERE entity_id=(SELECT id FROM twin_entities WHERE entity_id=$1)`, sensorEntity).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	collector := &PersistenceMetrics{}
+	repo, err := NewPostgresBatchRepositoryWithMetrics(app, 5*time.Second, 4, collector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	makeMessage := func(id string, sequence int64, at time.Time) *Message {
+		t.Helper()
+		payload, marshalErr := json.Marshal(BatchDTO{ProtocolVersion: 1, MessageID: mustUUID(id), MessageType: "telemetry_batch", GatewayID: "fixture_gw", SensorID: "fixture_sensor", BootID: mustUUID(boot), FirstSequence: sequence, SampleCount: 2, MeasuredAt: at.Format(time.RFC3339Nano), SampleIntervalUS: 10000, Samples: []float64{1.5, 2.5}})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		message, validateErr := validator.Validate("gateways/fixture_gw/telemetry/fixture_sensor", payload, time.Now().UTC())
+		if validateErr != nil {
+			t.Fatal(validateErr)
+		}
+		return message
+	}
+	beforeVersion := sensorVersion()
+	beforeTemporal := sensorTemporal()
+	messages := []*Message{
+		makeMessage("90000000-0000-4000-8000-000000000001", 20001, base),
+		makeMessage("90000000-0000-4000-8000-000000000002", 20003, base.Add(time.Second)),
+	}
+	results := repo.PersistBatch(ctx, messages)
+	for i, result := range results {
+		if result.Err != nil || result.InputIndex != i || result.Outcome != CommitOutcomeCommitted || result.SamplesSaved != 2 {
+			t.Fatalf("same-Sensor group result[%d]=%+v", i, result)
+		}
+	}
+	// The batched transaction must stand on its own: any fallback would also
+	// produce these commits and versions, so the metrics must prove it never ran.
+	s := collector.Snapshot()
+	if s.GroupAttempts != 1 || s.BeginAttempts != 1 || s.ConfirmedCommits != 1 ||
+		s.FallbackAttempts != 0 || s.SingleAttempts != 0 || s.RollbackAttempts != 0 || s.ConfirmedNewRows != 4 {
+		t.Fatalf("same-Sensor group metrics = %+v; want one grouped commit with no fallback", s)
+	}
+	if got := sensorVersion(); got != beforeVersion+2 {
+		t.Fatalf("same-Sensor group reported_version=%d; want %d (both messages advanced the guarded state)", got, beforeVersion+2)
+	}
+	if got := sensorTemporal(); got != beforeTemporal+2 {
+		t.Fatalf("same-Sensor group temporal rows=%d; want %d", got, beforeTemporal+2)
+	}
+	fmt.Println("INTEGRATION CASE PASS: same-Sensor group pipelines reported-state read/update and temporal writes in one batch transaction")
 }
 
 func groupSensorVersion(ctx context.Context, t *testing.T, setup *pgxpool.Pool, sensorID string) int64 {

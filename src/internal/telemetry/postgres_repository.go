@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -275,22 +276,21 @@ func (r *postgresRepository) persistBatchGroup(ctx context.Context, messages []*
 	if err != nil {
 		return batchErrorResults(messages, metadata, err)
 	}
+	ledgerStarted := time.Now()
+	dispositions, ledgerErr := insertTelemetryLedgerBatch(ctx, tx, metadata)
+	if r.metrics != nil {
+		observePersistenceDuration(&r.metrics.durations.ledger, ledgerStarted)
+	}
+	if ledgerErr != nil {
+		return batchErrorResults(messages, metadata, ledgerErr)
+	}
 	newMembers := make([]int, 0, len(messages))
-	for index, message := range messages {
-		entry := metadata[index]
-		ledgerStarted := time.Now()
-		disposition, insertErr := insertTelemetryLedger(ctx, tx, message)
-		if r.metrics != nil {
-			observePersistenceDuration(&r.metrics.durations.ledger, ledgerStarted)
-		}
-		if insertErr != nil {
-			return batchErrorResults(messages, metadata, insertErr)
-		}
+	for index, entry := range metadata {
 		key := telemetryResourceKey{entry.topic.GatewayID, entry.sensorID}
 		if _, ok := resources[key]; !ok {
 			return batchErrorResults(messages, metadata, &ReasonError{Code: ReasonResourceGraphIncomplete, Field: "twin_graph"})
 		}
-		switch disposition {
+		switch dispositions[index] {
 		case ledgerDispositionNew:
 			newMembers = append(newMembers, index)
 		case ledgerDispositionDuplicate:
@@ -323,25 +323,45 @@ func (r *postgresRepository) persistBatchGroup(ctx context.Context, messages []*
 		if count != expected {
 			return batchErrorResults(messages, metadata, fmt.Errorf("telemetry batch sample copy count mismatch: %w", &ReasonError{Code: ReasonDependencyUnavailable}))
 		}
+		// Sensor reported state advances in three pipelined phases instead of
+		// one read/update pair per message. The read batch locks every entity
+		// once, the plan projects the sequential advances in Go, and the update
+		// batch carries each projected version guard. One observation covers the
+		// read and the update round trips.
+		reportedStarted := time.Now()
+		entities := make([]uuid.UUID, 0, len(newMembers))
+		seenEntities := make(map[uuid.UUID]struct{}, len(newMembers))
 		for _, index := range newMembers {
-			key := telemetryResourceKey{metadata[index].topic.GatewayID, metadata[index].sensorID}
-			resource := resources[key]
-			reportedStarted := time.Now()
-			_, err := applySensorReportedState(ctx, tx, resource, messages[index])
-			if r.metrics != nil {
-				observePersistenceDuration(&r.metrics.durations.reportedState, reportedStarted)
+			entity := resources[telemetryResourceKey{metadata[index].topic.GatewayID, metadata[index].sensorID}].EntityID
+			if _, ok := seenEntities[entity]; ok {
+				continue
 			}
-			if err != nil {
-				return batchErrorResults(messages, metadata, err)
+			seenEntities[entity] = struct{}{}
+			entities = append(entities, entity)
+		}
+		var reportedErr error
+		var snapshots map[uuid.UUID]reportedStateSnapshot
+		var plans []reportedStatePlan
+		if snapshots, reportedErr = readSensorReportedStatesBatch(ctx, tx, entities); reportedErr == nil {
+			if plans, reportedErr = planReportedStateAdvances(messages, newMembers, resources, snapshots); reportedErr == nil {
+				reportedErr = advanceSensorReportedStatesBatch(ctx, tx, plans)
 			}
-			temporalStarted := time.Now()
-			err = appendSensorSampleIntervalTemporal(ctx, tx, resource, messages[index])
-			if r.metrics != nil {
-				observePersistenceDuration(&r.metrics.durations.temporal, temporalStarted)
-			}
-			if err != nil {
-				return batchErrorResults(messages, metadata, err)
-			}
+		}
+		if r.metrics != nil {
+			observePersistenceDuration(&r.metrics.durations.reportedState, reportedStarted)
+		}
+		if reportedErr != nil {
+			return batchErrorResults(messages, metadata, reportedErr)
+		}
+		temporalStarted := time.Now()
+		err = appendSensorSampleIntervalTemporalBatch(ctx, tx, resources, messages, newMembers)
+		if r.metrics != nil {
+			observePersistenceDuration(&r.metrics.durations.temporal, temporalStarted)
+		}
+		if err != nil {
+			return batchErrorResults(messages, metadata, err)
+		}
+		for _, index := range newMembers {
 			results[index].Outcome = CommitOutcomeCommitted
 			results[index].SamplesSaved = int(metadata[index].sampleCount)
 		}

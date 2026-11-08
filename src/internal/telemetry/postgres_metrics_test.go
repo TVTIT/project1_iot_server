@@ -97,7 +97,11 @@ func TestRepositoryOperationMetricsConfirmedGroupAndCopyRows(t *testing.T) {
 		t.Fatalf("operations: %+v", s)
 	}
 	d := s.Durations
-	if d.Begin.Count != 1 || d.GatewayLock.Count != 1 || d.SensorLock.Count != 2 || d.GraphLookup.Count != 2 || d.EntityLock.Count != 2 || d.StateLock.Count != 2 || d.Ledger.Count != 2 || d.Copy.Count != 1 || d.ReportedState.Count != 2 || d.Temporal.Count != 2 || d.Commit.Count != 1 {
+	// L1 batch semantics: ledger, reported_state and temporal are observed once
+	// per batch group (one SendBatch round trip each), so their count counts
+	// batches rather than messages. The lock and resource stages stay per
+	// resource, so their counts are unchanged.
+	if d.Begin.Count != 1 || d.GatewayLock.Count != 1 || d.SensorLock.Count != 2 || d.GraphLookup.Count != 2 || d.EntityLock.Count != 2 || d.StateLock.Count != 2 || d.Ledger.Count != 1 || d.Copy.Count != 1 || d.ReportedState.Count != 1 || d.Temporal.Count != 1 || d.Commit.Count != 1 {
 		t.Fatalf("group duration call counts: %+v", d)
 	}
 }

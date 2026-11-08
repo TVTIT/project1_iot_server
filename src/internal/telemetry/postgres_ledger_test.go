@@ -2,9 +2,62 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// TestInsertTelemetryLedgerBatchKeepsThreeStatementsPerMessage pins the queue
+// order the pipelined ledger batch depends on: each entry queues INSERT, EXISTS,
+// SELECT-conflict interleaved in message order, so EXISTS_k runs after INSERT_k
+// and before INSERT_{k+1} exactly like the sequential loop.
+func TestInsertTelemetryLedgerBatchKeepsThreeStatementsPerMessage(t *testing.T) {
+	entries := make([]ledgerMessage, 0, 3)
+	for index := 0; index < 3; index++ {
+		entry, err := ledgerMetadata(telemetryRepositoryTestMessage(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry.payloadHash = fmt.Sprintf("payload-hash-%d", index)
+		entry.sensorID = fmt.Sprintf("sensor_%03d", index)
+		entries = append(entries, entry)
+	}
+	batch := &pgx.Batch{}
+	queueTelemetryLedgerBatch(batch, entries)
+	if batch.Len() != 9 {
+		t.Fatalf("queued statements = %d; want 9 (three per message)", batch.Len())
+	}
+	for index, entry := range entries {
+		insert := batch.QueuedQueries[index*3]
+		overlap := batch.QueuedQueries[index*3+1]
+		conflict := batch.QueuedQueries[index*3+2]
+		if !strings.Contains(insert.SQL, "INSERT INTO public.processed_messages") ||
+			!strings.Contains(insert.SQL, "ON CONFLICT (gateway_id, message_id) DO NOTHING") {
+			t.Fatalf("entry %d first statement is not the ledger insert: %s", index, insert.SQL)
+		}
+		if !strings.Contains(overlap.SQL, "SELECT EXISTS") ||
+			!strings.Contains(overlap.SQL, "AND message_id <> $6") {
+			t.Fatalf("entry %d second statement is not the overlap check: %s", index, overlap.SQL)
+		}
+		if !strings.Contains(conflict.SQL, "SELECT payload_hash, source_topic") ||
+			!strings.Contains(conflict.SQL, "FROM public.processed_messages") {
+			t.Fatalf("entry %d third statement is not the conflict read: %s", index, conflict.SQL)
+		}
+		if insert.Arguments[2] != entry.payloadHash || insert.Arguments[4] != entry.sensorID {
+			t.Fatalf("entry %d insert args = %#v; want that entry's payload hash and sensor", index, insert.Arguments)
+		}
+		if len(conflict.Arguments) != 2 ||
+			conflict.Arguments[0] != entry.topic.GatewayID || conflict.Arguments[1] != entry.messageID {
+			t.Fatalf("entry %d conflict args = %#v; want that entry's gateway and message", index, conflict.Arguments)
+		}
+		if len(overlap.Arguments) != 6 || overlap.Arguments[2] != entry.bootID {
+			t.Fatalf("entry %d overlap args = %#v; want that entry's gateway/sensor/boot", index, overlap.Arguments)
+		}
+	}
+}
 
 func TestLedgerMetadataRequiresValidatedSampleRange(t *testing.T) {
 	if _, err := ledgerMetadata(nil); reasonCode(err) != ReasonInvalidPayload {

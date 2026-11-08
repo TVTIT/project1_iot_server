@@ -84,6 +84,20 @@ type telemetryFakeTx struct {
 	batchOverlap     bool
 	batchInput       []*Message
 	batchInsertIndex int
+
+	// sendBatchCalls counts SendBatch round trips, batches records each queued
+	// batch in SQL/argument order, batchFailAt injects an error at a batch
+	// index, and openBatches tracks the single active batch per connection.
+	sendBatchCalls int
+	batches        [][]telemetryFakeQueuedQuery
+	batchFailAt    map[int]error
+	openBatches    int
+}
+
+// telemetryFakeQueuedQuery is one statement queued into a fake batch.
+type telemetryFakeQueuedQuery struct {
+	sql  string
+	args []any
 }
 
 // telemetryFakeExec records one Exec call for order assertions.
@@ -147,7 +161,6 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, args ...a
 	case strings.Contains(query, "SELECT EXISTS") && strings.Contains(query, "processed_messages"):
 		return telemetryFakeRow{values: []any{tx.batchOverlap}}
 	case strings.Contains(query, "SELECT payload_hash, source_topic"):
-		message := tx.message
 		if tx.batchLedger != nil {
 			key := fmt.Sprintf("%v/%v", args[0], args[1])
 			metadata := tx.batchLedger[key]
@@ -157,6 +170,18 @@ func (tx *telemetryFakeTx) QueryRow(ctx context.Context, query string, args ...a
 				pgtype.Int8{Int64: metadata.firstSample.SequenceNum, Valid: true}, pgtype.Int8{Int64: metadata.lastSample.SequenceNum, Valid: true},
 				pgtype.Int4{Int32: metadata.sampleCount, Valid: true},
 				pgtype.Timestamptz{Time: metadata.timestamp, Valid: true},
+			}}
+		}
+		message := tx.message
+		if message == nil {
+			// The batched ledger path also reads the comparison row for entries
+			// it has just inserted and discards it, which is what a real server
+			// returns for that lookup. Without a configured message there is no
+			// conflicting payload to return, so model the just-written row as an
+			// empty legacy row instead of an artificial failure.
+			return telemetryFakeRow{values: []any{
+				pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, pgtype.UUID{},
+				pgtype.Int8{}, pgtype.Int8{}, pgtype.Int4{}, pgtype.Timestamptz{},
 			}}
 		}
 		metadata, err := ledgerMetadata(message)
@@ -203,6 +228,92 @@ func (tx *telemetryFakeTx) messageForLedger(args []any) *Message {
 	return tx.message
 }
 
+// SendBatch models the client view of one pipelined batch on the fake
+// transaction. It copies the queued statements instead of keeping pgx aliases,
+// records the batch for assertions, and refuses a second batch while one is
+// still open because one connection has a single active batch.
+//
+// IMPORTANT: this fake models the client view only. It does not model the
+// PostgreSQL server in either of the two real behaviours: when a statement inside
+// a batch fails, the server discards the remaining queued statements until Sync
+// and runs none of them; and when the code under test stops reading at the first
+// error and calls Close, pgx drains the still-unread queued statements and
+// executes them client-side before the caller rolls back. Here a queued statement
+// runs only when the code under test reads its result, so unit tests cannot prove
+// either behaviour; that requires the opt-in integration case or a native run.
+func (tx *telemetryFakeTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	if tx.openBatches > 0 {
+		panic("SendBatch called while a previous batch is still open (missing Close)")
+	}
+	queued := make([]telemetryFakeQueuedQuery, 0, b.Len())
+	for _, query := range b.QueuedQueries {
+		queued = append(queued, telemetryFakeQueuedQuery{sql: query.SQL, args: append([]any(nil), query.Arguments...)})
+	}
+	tx.batches = append(tx.batches, queued)
+	tx.sendBatchCalls++
+	tx.openBatches++
+	return &telemetryFakeBatchResults{tx: tx, ctx: ctx, queries: queued}
+}
+
+// telemetryFakeBatchResults executes one queued statement per read, lazily, by
+// delegating to the fake's own QueryRow/Exec. Every existing knob therefore keeps
+// working and tx.execs still records the real execution order.
+type telemetryFakeBatchResults struct {
+	tx      *telemetryFakeTx
+	ctx     context.Context
+	queries []telemetryFakeQueuedQuery
+	index   int
+	closed  bool
+}
+
+func (br *telemetryFakeBatchResults) next() (telemetryFakeQueuedQuery, error) {
+	if br.closed {
+		return telemetryFakeQueuedQuery{}, errors.New("batch already closed")
+	}
+	if br.index >= len(br.queries) {
+		return telemetryFakeQueuedQuery{}, errors.New("no more results in batch")
+	}
+	query := br.queries[br.index]
+	br.index++
+	if err := br.tx.batchFailAt[br.index-1]; err != nil {
+		return telemetryFakeQueuedQuery{}, err
+	}
+	return query, nil
+}
+
+func (br *telemetryFakeBatchResults) QueryRow() pgx.Row {
+	query, err := br.next()
+	if err != nil {
+		return telemetryFakeRow{err: err}
+	}
+	return br.tx.QueryRow(br.ctx, query.sql, query.args...)
+}
+
+func (br *telemetryFakeBatchResults) Exec() (pgconn.CommandTag, error) {
+	query, err := br.next()
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	return br.tx.Exec(br.ctx, query.sql, query.args...)
+}
+
+// Query is unsupported: production code reads batch results with QueryRow or Exec
+// only, so an unsupported Query keeps that contract visible.
+func (br *telemetryFakeBatchResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("telemetry fake batch Query is not supported; use QueryRow or Exec")
+}
+
+func (br *telemetryFakeBatchResults) Close() error {
+	if br.closed {
+		return nil
+	}
+	br.closed = true
+	if br.tx.openBatches > 0 {
+		br.tx.openBatches--
+	}
+	return nil
+}
+
 func (tx *telemetryFakeTx) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
 	rows, execErr := tx.execRows, tx.execErr
 	switch {
@@ -221,7 +332,18 @@ func (tx *telemetryFakeTx) Exec(_ context.Context, query string, args ...any) (p
 	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", rows)), nil
 }
 
+// panicIfBatchOpen fails a test loudly when the code under test reaches another
+// transaction operation while a pipelined batch is still open, which would
+// desynchronize a real connection. It complements the SendBatch guard: together
+// they catch a forgotten Close on any batch.
+func (tx *telemetryFakeTx) panicIfBatchOpen(operation string) {
+	if tx.openBatches != 0 {
+		panic(fmt.Sprintf("%s called while a batch is still open (missing Close)", operation))
+	}
+}
+
 func (tx *telemetryFakeTx) CopyFrom(_ context.Context, table pgx.Identifier, columns []string, source pgx.CopyFromSource) (int64, error) {
+	tx.panicIfBatchOpen("CopyFrom")
 	if strings.Join(table, ".") != "public.telemetry" || len(columns) != 8 {
 		return 0, errors.New("unexpected CopyFrom target")
 	}
@@ -238,11 +360,13 @@ func (tx *telemetryFakeTx) CopyFrom(_ context.Context, table pgx.Identifier, col
 }
 
 func (tx *telemetryFakeTx) Commit(context.Context) error {
+	tx.panicIfBatchOpen("Commit")
 	tx.commitCalls++
 	return tx.commitErr
 }
 
 func (tx *telemetryFakeTx) Rollback(ctx context.Context) error {
+	tx.panicIfBatchOpen("Rollback")
 	tx.rollbackCalls++
 	_, tx.rollbackValid = ctx.Deadline()
 	return tx.rollbackErr
@@ -587,7 +711,7 @@ func TestPersistBatchFailuresReturnNoConfirmedOutcomes(t *testing.T) {
 		}, wantCopyRows: 6, wantExec: 1},
 		{name: "temporal", configure: func(_ *telemetryFakeDatabase, tx *telemetryFakeTx) {
 			tx.temporalExec = &telemetryFakeExecConfig{err: errors.New("temporal failed")}
-		}, wantCopyRows: 6, wantExec: 2},
+		}, wantCopyRows: 6, wantExec: 3}, // both reported-state updates now run in one batch before the first temporal statement errors
 		{name: "commit ambiguity", configure: func(_ *telemetryFakeDatabase, tx *telemetryFakeTx) { tx.commitErr = errors.New("commit response lost") }, wantCopyRows: 6, wantExec: 4},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -665,6 +789,196 @@ func TestPersistBatchPreservesSameSensorInputOrderAndTemporalPerMessage(t *testi
 	secondLast, _ := second.LastSample()
 	if !reflect.DeepEqual(reportedTimes, []time.Time{firstLast.MeasuredAt, secondLast.MeasuredAt}) {
 		t.Fatalf("reported-state application order=%v", reportedTimes)
+	}
+}
+
+// TestPersistBatchUsesAtMostFourRoundTrips pins the whole point of the batched
+// group path: one 32-message group pipelines its per-message SQL into four
+// SendBatch round trips (ledger, reported-state read, reported-state update,
+// temporal) instead of ~168 sequential statements.
+func TestPersistBatchUsesAtMostFourRoundTrips(t *testing.T) {
+	messages := make([]*Message, 0, 32)
+	for index := 0; index < 32; index++ {
+		messages = append(messages, batchTestMessage(t, "sensor_001",
+			time.Date(2026, 8, 21, 10, 15, index, 0, time.UTC).Format(time.RFC3339Nano),
+			12501+3*int64(index), uuid.NewString()))
+	}
+	tx := &telemetryFakeTx{copyCount: 96, execRows: 1, batchLedger: make(map[string]ledgerMessage), batchInput: messages}
+	database := &telemetryFakeDatabase{tx: tx}
+	repository, err := NewPostgresBatchRepository(database, time.Second, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := repository.PersistBatch(context.Background(), messages)
+	if tx.sendBatchCalls != 4 {
+		t.Fatalf("SendBatch round trips = %d; want 4 (ledger, reported-state read, reported-state update, temporal)", tx.sendBatchCalls)
+	}
+	if tx.commitCalls != 1 || tx.copyRows != 96 || tx.openBatches != 0 {
+		t.Fatalf("commit=%d copied=%d openBatches=%d; want one COMMIT, 96 streamed samples and no batch left open", tx.commitCalls, tx.copyRows, tx.openBatches)
+	}
+	for index, result := range results {
+		if result.InputIndex != index || result.Outcome != CommitOutcomeCommitted || result.SamplesSaved != 3 || result.Err != nil {
+			t.Fatalf("result[%d]=%#v; want committed with three saved samples", index, result)
+		}
+	}
+}
+
+// TestPersistBatchSameSensorMessagesAdvanceInMessageOrder pins the Go projection:
+// reading one Sensor state once and writing it several times must queue version,
+// version+1, version+2 in message order, and the reported observed_at values must
+// stay in input order.
+func TestPersistBatchSameSensorMessagesAdvanceInMessageOrder(t *testing.T) {
+	messages := []*Message{
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:00Z", 12501, uuid.NewString()),
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:01Z", 12504, uuid.NewString()),
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:02Z", 12507, uuid.NewString()),
+	}
+	tx := &telemetryFakeTx{copyCount: 9, execRows: 1, sensorVersion: 7, batchLedger: make(map[string]ledgerMessage), batchInput: messages}
+	database := &telemetryFakeDatabase{tx: tx}
+	repository, err := NewPostgresBatchRepository(database, time.Second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results := repository.PersistBatch(context.Background(), messages); len(results) != 3 || results[2].Outcome != CommitOutcomeCommitted {
+		t.Fatalf("results=%#v; want three committed inputs", results)
+	}
+	var versions []int64
+	var observedAt []time.Time
+	for _, call := range tx.execs {
+		if call.query != sensorReportedStateAdvanceSQL {
+			continue
+		}
+		version, ok := call.args[3].(int64)
+		if !ok {
+			t.Fatalf("version arg = %#v; want the projected reported_version", call.args[3])
+		}
+		measuredAt, ok := call.args[2].(time.Time)
+		if !ok {
+			t.Fatalf("observed_at arg = %#v; want a time", call.args[2])
+		}
+		versions = append(versions, version)
+		observedAt = append(observedAt, measuredAt)
+	}
+	if !reflect.DeepEqual(versions, []int64{7, 8, 9}) {
+		t.Fatalf("reported-state version guards = %v; want 7, 8, 9 in message order", versions)
+	}
+	want := make([]time.Time, 0, len(messages))
+	for _, message := range messages {
+		last, ok := message.LastSample()
+		if !ok {
+			t.Fatal("test message has no last sample")
+		}
+		want = append(want, last.MeasuredAt)
+	}
+	if !reflect.DeepEqual(observedAt, want) {
+		t.Fatalf("reported-state observed_at order = %v; want %v", observedAt, want)
+	}
+}
+
+// TestPersistBatchLedgerBatchStopsGroupOnError injects a failure on the second
+// message's first ledger statement and asserts the whole group fails before COPY,
+// reported state or temporal work, with the batch closed and one rollback.
+func TestPersistBatchLedgerBatchStopsGroupOnError(t *testing.T) {
+	messages := []*Message{
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:00Z", 12501, uuid.NewString()),
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:01Z", 12504, uuid.NewString()),
+	}
+	tx := &telemetryFakeTx{
+		copyCount:   6,
+		execRows:    1,
+		batchLedger: make(map[string]ledgerMessage),
+		batchInput:  messages,
+		batchFailAt: map[int]error{3: errors.New("ledger statement failed")},
+	}
+	database := &telemetryFakeDatabase{tx: tx}
+	repository, err := NewPostgresBatchRepository(database, time.Second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := repository.PersistBatch(context.Background(), messages)
+	for index, result := range results {
+		if result.Outcome != 0 || result.Err == nil || result.InputIndex != index {
+			t.Fatalf("result[%d]=%#v; want an unconfirmed group failure", index, result)
+		}
+	}
+	if tx.copyRows != 0 || tx.commitCalls != 0 || tx.rollbackCalls != 1 {
+		t.Fatalf("copyRows=%d commit=%d rollback=%d; want no COPY, no COMMIT and one rollback", tx.copyRows, tx.commitCalls, tx.rollbackCalls)
+	}
+	if tx.openBatches != 0 {
+		t.Fatalf("openBatches=%d; the failed ledger batch must be closed", tx.openBatches)
+	}
+	for _, call := range tx.execs {
+		if call.query == sensorReportedStateAdvanceSQL || call.query == sensorSampleIntervalTemporalInsertSQL {
+			t.Fatalf("ledger failure leaked a %q write: %#v", call.query, tx.execs)
+		}
+	}
+	if !strings.Contains(results[0].Err.Error(), "ledger statement failed") {
+		t.Fatalf("group error = %v; want the injected ledger failure", results[0].Err)
+	}
+}
+
+// TestPersistBatchReportedBatchFailureStopsBeforeTemporal asserts the reported-state
+// update batch stops at its first failed statement and never sends a temporal
+// statement or a COMMIT.
+func TestPersistBatchReportedBatchFailureStopsBeforeTemporal(t *testing.T) {
+	messages := []*Message{
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:00Z", 12501, uuid.NewString()),
+		batchTestMessage(t, "sensor_002", "2026-08-21T10:15:01Z", 12510, uuid.NewString()),
+	}
+	tx := &telemetryFakeTx{
+		copyCount:   6,
+		execRows:    1,
+		sensorExec:  &telemetryFakeExecConfig{err: errors.New("state failed")},
+		batchLedger: make(map[string]ledgerMessage),
+		batchInput:  messages,
+	}
+	database := &telemetryFakeDatabase{tx: tx}
+	repository, err := NewPostgresBatchRepository(database, time.Second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := repository.PersistBatch(context.Background(), messages)
+	if len(results) != 2 || results[0].Err == nil || results[0].Outcome != 0 {
+		t.Fatalf("results=%#v; want an unconfirmed group failure", results)
+	}
+	if reasonCode(results[0].Err) != ReasonDependencyUnavailable || !strings.Contains(results[0].Err.Error(), "state failed") {
+		t.Fatalf("group error = %v; want a dependency error carrying the reported-state cause", results[0].Err)
+	}
+	if len(tx.execs) != 1 || tx.execs[0].query != sensorReportedStateAdvanceSQL {
+		t.Fatalf("execs=%#v; want exactly the failed reported-state update", tx.execs)
+	}
+	if tx.commitCalls != 0 || tx.rollbackCalls != 1 || tx.openBatches != 0 {
+		t.Fatalf("commit=%d rollback=%d openBatches=%d; want no COMMIT, one rollback and a closed batch", tx.commitCalls, tx.rollbackCalls, tx.openBatches)
+	}
+}
+
+// TestPersistBatchTemporalBatchCountMismatchFailsGroup asserts a temporal statement
+// that does not insert exactly one row fails the group with the same reason field
+// the single-message path uses, without a COMMIT.
+func TestPersistBatchTemporalBatchCountMismatchFailsGroup(t *testing.T) {
+	messages := []*Message{
+		batchTestMessage(t, "sensor_001", "2026-08-21T10:15:00Z", 12501, uuid.NewString()),
+		batchTestMessage(t, "sensor_002", "2026-08-21T10:15:01Z", 12510, uuid.NewString()),
+	}
+	tx := &telemetryFakeTx{
+		copyCount:    6,
+		execRows:     1,
+		temporalExec: &telemetryFakeExecConfig{rows: 0},
+		batchLedger:  make(map[string]ledgerMessage),
+		batchInput:   messages,
+	}
+	database := &telemetryFakeDatabase{tx: tx}
+	repository, err := NewPostgresBatchRepository(database, time.Second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := repository.PersistBatch(context.Background(), messages)
+	var reason *ReasonError
+	if !errors.As(results[0].Err, &reason) || reason.Code != ReasonDependencyUnavailable || reason.Field != "twin_temporal_values" {
+		t.Fatalf("group error = %v; want dependency unavailable on twin_temporal_values", results[0].Err)
+	}
+	if tx.commitCalls != 0 || tx.rollbackCalls != 1 || tx.copyRows != 6 {
+		t.Fatalf("commit=%d rollback=%d copyRows=%d; want no COMMIT, one rollback and the copied samples", tx.commitCalls, tx.rollbackCalls, tx.copyRows)
 	}
 }
 
