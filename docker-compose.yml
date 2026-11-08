@@ -89,6 +89,18 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "min_wal_size=512MB"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "wal_buffers=64MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "checkpoint_timeout=15min"
     ports:
       - "127.0.0.1:5432:5432"
     networks:
