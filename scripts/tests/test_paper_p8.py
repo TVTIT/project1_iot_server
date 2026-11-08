@@ -61,6 +61,43 @@ class PaperP8EntrypointTests(unittest.TestCase):
         self.assertFalse(captured)
         self.assertTrue(errors)
 
+    def test_control_phase_events_cap_allows_93_events_for_30_commands(self):
+        """Runner must not cap control events at 32; must allow 93 for 30 commands."""
+        events = []
+        for i in range(1, 31):
+            for ev in ('request_begin', 'admission_observed', 'terminal_observed'):
+                events.append(json.dumps({
+                    'event': ev,
+                    'elapsed_ns': 1000000 * i,
+                    'command_ordinal': i,
+                    'clock_qualification': 'process-local elapsed from RunControl origin; not server latency'
+                }))
+        for ev in ('generation_stopped', 'producers_stopped', 'workers_joined'):
+            events.append(json.dumps({
+                'event': ev,
+                'elapsed_ns': 1000000 * 31,
+                'command_ordinal': 0,
+                'clock_qualification': 'process-local elapsed from RunControl origin; not server latency'
+            }))
+        input_data = '\n'.join('P8_PHASE ' + e for e in events) + '\n'
+        captured, errors = [], []
+        paper_p8._pump_lines(io.StringIO(input_data), [], __import__('threading').Event(),
+            'paperload-control:control.json', captured, errors)
+        self.assertEqual(len(captured), 93, f"Expected 93 events, got {len(captured)}. Errors: {errors}")
+        self.assertEqual(errors, [])
+        self.assertEqual(captured[-1]['event'], 'workers_joined')
+
+    def test_telemetry_phase_events_cap_remains_16(self):
+        """Telemetry events still capped at 16."""
+        valid = {'event':'measure_begin','elapsed_ns':1,'configured_phases':{},
+                 'counters':{key:0 for key in paper_p8.PHASE_COUNTERS}}
+        lines = ['P8_PHASE ' + json.dumps(valid)] * 17
+        captured, errors = [], []
+        paper_p8._pump_lines(io.StringIO('\n'.join(lines)+'\n'), [], __import__('threading').Event(),
+            'paperload-telemetry:unique.json', captured, errors)
+        self.assertEqual(len(captured), 16)
+        self.assertTrue(errors)
+
     def paths(self, directory):
         root = Path(directory)
         binary, manifest = root / 'paper load', root / 'manifest file.json'

@@ -184,7 +184,7 @@ def e3_pilot_manifests(*, common, background_targets, background_gateway_identit
                    'cooldown_seconds': 0},
         'limits': {'retries': 0, 'workers': 1, 'connections': 1,
                    'pending_messages': 4, 'pending_bytes': 65536,
-                   'disk_growth_bytes': 8 << 20, 'wall_seconds': 60}}
+                   'disk_growth_bytes': 8 << 20, 'wall_seconds': max(8, offsets[-1] // 1000 + 2) + 30 + 3}}
     return {'workload': workload, 'command_count': command_count, 'schedule': schedule,
             'background_messages': messages,
             'background_profile': background_profile, 'input_difference': ('B offered burst 0 instead of 12' if workload == 'low_load' else None),

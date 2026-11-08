@@ -454,7 +454,11 @@ def _pump_lines(pipe, lines, done, child_label=None, phase_events=None, phase_er
                                 or any(type(counters.get(key)) is not int or counters[key] < 0 for key in PHASE_COUNTERS)):
                             raise ValueError('invalid')
                     observed_count += 1
-                    if observed_count > (32 if control_role else 16):
+                    # Control child may emit 3 events per command (request_begin, admission_observed, terminal_observed)
+                    # plus 3 stop/join events. For up to 1000 bounded commands, max = 3003.
+                    # Telemetry child is bounded to 16 phase events.
+                    max_events = 3003 if control_role else 16
+                    if observed_count > max_events:
                         raise ValueError('count')
                     if phase_events is not None:
                         observed = {'child':child_label, 'event':event['event'],

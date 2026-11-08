@@ -373,5 +373,69 @@ class E3SupportTests(unittest.TestCase):
         self.assertIn('mqtt_tls_server_name', manifests['background']['A']['tls'])
         self.assertEqual(manifests['background']['A']['tls']['mqtt_tls_server_name'], 'localhost')
 
+    def test_official30_control_wall_budget_is_sufficient_for_30_commands(self):
+        """Control manifest wall_seconds must be measure + drain + guard for 30 commands steady schedule."""
+        args = _manifest_args()
+        plan = e3.e3_pilot_manifests(**args, command_count=30, schedule='steady',
+            profile='official', official_opt_in=True, workload='low_load')
+        control = plan['control']
+        # measure_seconds = max(8, 30000//1000 + 2) = 32
+        # drain_seconds = 30
+        # wall_seconds should be measure + drain + 3 (guard) = 65
+        # Previously hardcoded 60 was insufficient
+        self.assertEqual(control['phases']['measure_seconds'], 32)
+        self.assertEqual(control['phases']['drain_seconds'], 30)
+        self.assertEqual(control['limits']['wall_seconds'], 32 + 30 + 3)  # 65
+        self.assertGreater(control['limits']['wall_seconds'], 60)
+
+    def test_runner_pump_lines_allows_full_control_phase_events_for_30_commands(self):
+        """_pump_lines must accept 93 events for 30 commands (3*30 + 3 stop), not cap at 32."""
+        import paper_p8
+        import io
+        import json
+        
+        # Build 30 commands * 3 events + 3 stop events = 93 valid control events
+        events = []
+        for i in range(1, 31):
+            for ev in ('request_begin', 'admission_observed', 'terminal_observed'):
+                events.append(json.dumps({
+                    'event': ev,
+                    'elapsed_ns': 1000000 * i,
+                    'command_ordinal': i,
+                    'clock_qualification': 'process-local elapsed from RunControl origin; not server latency'
+                }))
+        for ev in ('generation_stopped', 'producers_stopped', 'workers_joined'):
+            events.append(json.dumps({
+                'event': ev,
+                'elapsed_ns': 1000000 * 31,
+                'command_ordinal': 0,
+                'clock_qualification': 'process-local elapsed from RunControl origin; not server latency'
+            }))
+        
+        input_data = '\n'.join('P8_PHASE ' + e for e in events) + '\n'
+        pipe = io.StringIO(input_data)
+        captured, errors = [], []
+        paper_p8._pump_lines(pipe, [], __import__('threading').Event(),
+            'paperload-control:control.json', captured, errors)
+        
+        # Should capture all 93 events without hitting the cap
+        self.assertEqual(len(captured), 93, f"Expected 93 events, got {len(captured)}. Errors: {errors}")
+        self.assertEqual(errors, [])
+        # Verify last event is workers_joined
+        self.assertEqual(captured[-1]['event'], 'workers_joined')
+
+    def test_official30_steady_schedule_offsets_are_1s_apart(self):
+        """official30 steady schedule has offsets 1s apart: 1000, 2000, ..., 30000 ms."""
+        args = _manifest_args()
+        plan = e3.e3_pilot_manifests(**args, command_count=30, schedule='steady',
+            profile='official', official_opt_in=True, workload='low_load')
+        commands = plan['control']['commands']
+        self.assertEqual(len(commands), 30)
+        offsets = [c['offset_ms'] for c in commands]
+        self.assertEqual(offsets[0], 1000)
+        self.assertEqual(offsets[-1], 30000)
+        for i in range(1, 30):
+            self.assertEqual(offsets[i] - offsets[i-1], 1000)
+
 
 if __name__ == '__main__': unittest.main()

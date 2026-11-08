@@ -407,7 +407,7 @@ def build_e3_offline_contract(*, workload, dispatch_mode, command_count, schedul
                             'control:control':control_id},
             gateway_identity_files=gateway_identity,
             gateway_env_files={'executor-1':gateway_envs[0], 'executor-2':gateway_envs[1]},
-            ca_files=ca, role_metadata=role_metadata, wait_seconds=0, workload_seconds=62,
+            ca_files=ca, role_metadata=role_metadata, wait_seconds=0, workload_seconds=65,
             topology={'gateways':2,'sensors':4,'sensors_per_gateway':2,'users':0,'viewers':0},
             workload={'experiment':'E3','arm':dispatch_mode,'phase':f'e3-{workload}-{dispatch_mode}',
                 'profile':'official','workload':workload,'seed':89,'dispatch_mode':dispatch_mode,
