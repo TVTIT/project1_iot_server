@@ -729,9 +729,11 @@ Thực hiện trong thư mục gốc riêng biệt `$ROOT/steady-s1-${RUN_LABEL}
   $$\text{phase\_id} = \text{f'samples-\{samples\_per\_message\}'}$$
   cho toàn bộ các kịch bản `steady_burst` (cả pilot lẫn official). Do đó, `phase_id` bắt buộc là **`samples-100`** (khi S=100) hoặc **`samples-1`** (khi S=1). Việc truyền giá trị `official-100` hay `official-1` vào lệnh `begin` hoặc `finish-phase` sẽ bị từ chối ngay với lỗi `e2_phase_id_mismatch`.
 - **Cấu hình Tự động Shaper và Microbatch trong Profile Official**:
-  Hạ tầng fixture tự động tính toán cấu hình backend tương thích với mức tải đề nghị:
-  - `shaper_rate = (offered_rate + 1) // 2` (tốc độ shaper cho mỗi gateway).
-  - `shaper_burst = max((burst_messages + 1) // 2, shaper_rate)`.
+  Hạ tầng fixture tự động tính toán cấu hình backend tương thích với mức tải đề nghị và chính sách retry (`e2_shaper_caps`):
+  - `rate_nominal = (offered_rate + 1) // 2` (tốc độ unique danh định cho mỗi gateway).
+  - `shaper_rate = math.ceil(round(rate_nominal * 1.10, 6) + retry_rate)` (bổ sung 10% dung sai lập lịch OS/TCP và dự phòng retry attempt rate).
+  - `shaper_burst = math.ceil(round(shaper_rate * tolerance_seconds, 6)) + retry_burst + workload_burst` (hấp thụ micro-burst trong cửa sổ dung sai `tolerance_seconds=1.0s`, kèm dung lượng retry burst và burst của kịch bản).
+  - Giới hạn an toàn: `shaper_rate <= 10000`, `shaper_burst <= 100000` (theo giới hạn `ShaperOptions` của Go backend).
   - `microbatch_rows = min(500, max(1, shaper_rate * samples_per_message))`.
 
 ##### Retry policy E2 official (opt-in)

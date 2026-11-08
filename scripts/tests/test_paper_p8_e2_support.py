@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts import paper_p8_bundle
 
 from scripts.tests.paper_p8_e2_support import (
-    build_e2_execution_plan, e2_fixture_profile, e2_official_estimate, e2_pilot_manifests,
+    build_e2_execution_plan, e2_fixture_profile, e2_shaper_caps, e2_official_estimate, e2_pilot_manifests,
     e2_official_manifests,
     validate_e2_result,
     validate_e2_equal_samples_result,
@@ -1475,6 +1475,37 @@ class E2SupportTests(unittest.TestCase):
         self.assertFalse(proposed['effective_fixture_flags']['WEBSOCKET_ENABLED'])
         with self.assertRaisesRegex(ValueError, 'microbatch_wait_rejected'):
             e2_fixture_profile(microbatch_wait_ms=75)
+
+    def test_e2_shaper_caps_formula_and_bounds(self):
+        # 1. Pilot profile remains fixed 2 rate, 4 burst regardless of other inputs
+        pilot = e2_shaper_caps(profile='pilot', offered_rate=2000, retry_rate=750)
+        self.assertEqual(pilot, {'rate_per_second': 2, 'burst': 4})
+
+        # 2. Official without retry: ceil(nominal * 1.10) rate, ceil(rate * tolerance) + burst
+        off1 = e2_shaper_caps(profile='official', offered_rate=1000, burst_messages=0)
+        self.assertEqual(off1, {'rate_per_second': 550, 'burst': 550})
+
+        # 3. Official with retry and burst: ceil(1000 * 1.10 + 750) = 1850; 1850 + 100 + 50 = 2000
+        off2 = e2_shaper_caps(profile='official', offered_rate=2000, burst_messages=50,
+                              retry_rate=750, retry_burst=100)
+        self.assertEqual(off2, {'rate_per_second': 1850, 'burst': 2000})
+
+        # 4. Custom tolerance window: tolerance=0.5 -> ceil(1850 * 0.5) + 100 + 50 = 925 + 150 = 1075
+        off3 = e2_shaper_caps(profile='official', offered_rate=2000, burst_messages=50,
+                              retry_rate=750, retry_burst=100, tolerance_seconds=0.5)
+        self.assertEqual(off3, {'rate_per_second': 1850, 'burst': 1075})
+
+        # 5. Upper bound limits matching Go backend ShaperOptions
+        with self.assertRaisesRegex(ValueError, 'e2_shaper_rate_exceeds_backend_limit'):
+            e2_shaper_caps(profile='official', offered_rate=20000, retry_rate=2000)
+        with self.assertRaisesRegex(ValueError, 'e2_shaper_burst_exceeds_backend_limit'):
+            e2_shaper_caps(profile='official', offered_rate=2000, burst_messages=99000, retry_burst=2000)
+
+        # 6. Verify e2_fixture_profile integrates with shaper caps
+        official_fixture = e2_fixture_profile(microbatch_wait_ms=50, profile='official',
+                                              offered_rate=2000, burst_messages=4,
+                                              retry_rate=750, retry_burst=100)
+        self.assertEqual(official_fixture['shaper'], {'rate_per_second': 1850, 'burst': 1954})
 
     def test_plan_requires_private_matching_manifests_and_official_optin(self):
         with tempfile.TemporaryDirectory() as tmp:

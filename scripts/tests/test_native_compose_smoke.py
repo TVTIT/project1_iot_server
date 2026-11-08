@@ -52,7 +52,7 @@ class PreparationTests(unittest.TestCase):
             'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
             'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
             'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
-            'MQTT_SHAPER_RATE_PER_SECOND': '50', 'MQTT_SHAPER_BURST': '50',
+            'MQTT_SHAPER_RATE_PER_SECOND': '55', 'MQTT_SHAPER_BURST': '55',
             'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
             'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
             'MQTT_MICROBATCH_MAX_WAIT': '50ms'}}}}
@@ -61,7 +61,7 @@ class PreparationTests(unittest.TestCase):
             paper_p8_e2_samples_per_message=100)
         flags = smoke.paper_p8_e2_validate_fixture_flags(effective,
             e2_support=e2, fixture=fixture)
-        self.assertEqual(flags['MQTT_SHAPER_RATE_PER_SECOND'], '50')
+        self.assertEqual(flags['MQTT_SHAPER_RATE_PER_SECOND'], '55')
 
     def test_held_e1_begin_uses_prepared_manifests_and_session_budget(self):
         from scripts.tests import paper_p8_e1_support as e1
@@ -912,9 +912,16 @@ class PreparationTests(unittest.TestCase):
                 paper_p8_profile='official', paper_p8_official_opt_in=True,
                 paper_p8_e2_offered_rate=1000, paper_p8_e2_duration_seconds=20,
                 paper_p8_e2_burst_messages=11, paper_p8_e2_samples_per_message=100)
-            self.assertEqual(fixture.values['MQTT_SHAPER_RATE_PER_SECOND'], '500')
-            self.assertEqual(fixture.values['MQTT_SHAPER_BURST'], '500')
+            self.assertEqual(fixture.values['MQTT_SHAPER_RATE_PER_SECOND'], '550')
+            self.assertEqual(fixture.values['MQTT_SHAPER_BURST'], '561')
             self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_ROWS'], '500')
+            fixture_retry = smoke.prepare(Path(directory) / 'official_retry', paper_p8_e2=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e2_offered_rate=1000, paper_p8_e2_duration_seconds=20,
+                paper_p8_e2_burst_messages=11, paper_p8_e2_samples_per_message=100,
+                paper_p8_e2_retry_rate_per_second=750, paper_p8_e2_retry_burst=100)
+            self.assertEqual(fixture_retry.values['MQTT_SHAPER_RATE_PER_SECOND'], '1300')
+            self.assertEqual(fixture_retry.values['MQTT_SHAPER_BURST'], '1411')
 
     def test_p8_e1_acceptance_requires_complete_workload_and_exact_owned_cleanup(self):
         fixture = type('Fixture', (), {'project': 'run'})()

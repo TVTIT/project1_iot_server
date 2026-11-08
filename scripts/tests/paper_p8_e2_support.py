@@ -150,15 +150,44 @@ def e2_official_manifests(*, common, targets, gateway_identity_files, telemetry_
             'execution': 'NOT RUN'}
 
 
+def e2_shaper_caps(*, profile='pilot', offered_rate=2, burst_messages=0,
+                   retry_rate=0, retry_burst=0, tolerance_seconds=1.0):
+    """Calculates shaper rate and burst capacity for E2 execution.
+
+    Rate accounts for nominal unique rate with a 10% scheduler/TCP jitter allowance
+    plus retry attempt rate:
+        shaper_rate = ceil(rate_nominal * 1.10 + retry_rate)
+    Burst accounts for rate tolerance window plus retry burst and workload burst:
+        shaper_burst = ceil(shaper_rate * tolerance_seconds) + retry_burst + workload_burst
+    """
+    if profile != 'official':
+        return {'rate_per_second': 2, 'burst': 4}
+    rate_nominal = (offered_rate + 1) // 2
+    retry_rate = max(0, int(retry_rate or 0))
+    retry_burst = max(0, int(retry_burst or 0))
+    burst_messages = max(0, int(burst_messages or 0))
+    shaper_rate = math.ceil(round(rate_nominal * 1.10, 6) + retry_rate)
+    shaper_burst = math.ceil(round(shaper_rate * tolerance_seconds, 6)) + retry_burst + burst_messages
+    if shaper_rate > 10000:
+        raise ValueError(f'e2_shaper_rate_exceeds_backend_limit: {shaper_rate} > 10000')
+    if shaper_burst > 100000:
+        raise ValueError(f'e2_shaper_burst_exceeds_backend_limit: {shaper_burst} > 100000')
+    return {'rate_per_second': shaper_rate, 'burst': shaper_burst}
+
+
 def e2_fixture_profile(*, microbatch_wait_ms, profile='pilot', offered_rate=2,
-                       burst_messages=4, samples_per_message=1):
+                       burst_messages=4, samples_per_message=1,
+                       retry_rate=0, retry_burst=0, tolerance_seconds=1.0):
     """Proposed next-fixture-only flags/caps; does not mutate deployment defaults."""
     if microbatch_wait_ms not in (50, 100):
         raise ValueError('e2_microbatch_wait_rejected')
     if profile not in ('pilot','official') or samples_per_message not in PILOT_SAMPLES:
         raise ValueError('e2_fixture_profile_rejected')
-    rate = (offered_rate + 1) // 2 if profile == 'official' else 2
-    burst = max((burst_messages + 1) // 2, rate) if profile == 'official' else 4
+    shaper = e2_shaper_caps(profile=profile, offered_rate=offered_rate,
+                            burst_messages=burst_messages, retry_rate=retry_rate,
+                            retry_burst=retry_burst, tolerance_seconds=tolerance_seconds)
+    rate = shaper['rate_per_second']
+    burst = shaper['burst']
     max_rows = min(500, max(1, rate * samples_per_message)) if profile == 'official' else 500
     return {'effective_fixture_flags': {'MQTT_SHAPER_ENABLED': True,
             'MQTT_MICROBATCH_ENABLED': True, 'MQTT_RAM_DEDUP_ENABLED': False,
@@ -4287,16 +4316,22 @@ def _safe_flags(effective):
 
 def _validate_fixture_flags(effective, fixture=None):
     flags = _safe_flags(effective)
+    shaper = e2_shaper_caps(
+        profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
+        offered_rate=getattr(fixture, 'paper_p8_e2_offered_rate', 2),
+        burst_messages=getattr(fixture, 'paper_p8_e2_burst_messages', 0),
+        retry_rate=getattr(fixture, 'paper_p8_e2_retry_rate_per_second', 0),
+        retry_burst=getattr(fixture, 'paper_p8_e2_retry_burst', 0))
+    rate = shaper['rate_per_second']
+    burst = shaper['burst']
+    max_rows = min(500, max(1, rate * getattr(fixture, 'paper_p8_e2_samples_per_message', 1))) if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 500
     expected = {'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
         'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
         'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
-            'MQTT_SHAPER_RATE_PER_SECOND': str((getattr(fixture, 'paper_p8_e2_offered_rate', 2) + 1)//2
-            if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 2),
-        'MQTT_SHAPER_BURST': str(max((getattr(fixture, 'paper_p8_e2_burst_messages', 0) + 1)//2,
-            (getattr(fixture, 'paper_p8_e2_offered_rate', 2) + 1)//2) if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 4),
+        'MQTT_SHAPER_RATE_PER_SECOND': str(rate),
+        'MQTT_SHAPER_BURST': str(burst),
         'MQTT_MICROBATCH_MAX_MESSAGES': '32',
-        'MQTT_MICROBATCH_MAX_ROWS': str(min(500, max(1, ((getattr(fixture, 'paper_p8_e2_offered_rate', 2) + 1)//2)
-            * getattr(fixture, 'paper_p8_e2_samples_per_message', 1))) if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 500),
+        'MQTT_MICROBATCH_MAX_ROWS': str(max_rows),
         'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20), 'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
     normalized = {key: str(value).lower() for key, value in flags.items()}
     if any(normalized.get(key) != value for key, value in expected.items()):
@@ -4520,7 +4555,9 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
             profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
             offered_rate=getattr(fixture, 'paper_p8_e2_offered_rate', 2),
             burst_messages=getattr(fixture, 'paper_p8_e2_burst_messages', 4),
-            samples_per_message=getattr(fixture, 'paper_p8_e2_samples_per_message', 1)),
+            samples_per_message=getattr(fixture, 'paper_p8_e2_samples_per_message', 1),
+            retry_rate=getattr(fixture, 'paper_p8_e2_retry_rate_per_second', 0),
+            retry_burst=getattr(fixture, 'paper_p8_e2_retry_burst', 0)),
         'storage_status': storage_status,
         'source_revision': smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'),
         'source_fingerprint': _support._source_fingerprint(smoke.ROOT),

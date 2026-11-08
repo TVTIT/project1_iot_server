@@ -838,6 +838,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
               paper_p8_e2_offered_rate=100, paper_p8_e2_duration_seconds=10,
               paper_p8_e2_burst_messages=0,
               paper_p8_e2_samples_per_message=1,
+              paper_p8_e2_retry_rate_per_second=0,
+              paper_p8_e2_retry_burst=0,
               paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e3_command_count=4,
               paper_p8_e3_schedule='smoke', paper_p8_e4=None,
                paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
@@ -1088,8 +1090,16 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                           MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
                           STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')
         else:
-            shaper_rate = (paper_p8_e2_offered_rate + 1) // 2 if paper_p8_profile == 'official' else 2
-            shaper_burst = max((paper_p8_e2_burst_messages + 1)//2, shaper_rate) if paper_p8_profile == 'official' else 4
+            e2 = paper_p8_e2_support()
+            shaper_caps = e2.e2_shaper_caps(
+                profile=paper_p8_profile,
+                offered_rate=paper_p8_e2_offered_rate,
+                burst_messages=paper_p8_e2_burst_messages,
+                retry_rate=paper_p8_e2_retry_rate_per_second,
+                retry_burst=paper_p8_e2_retry_burst,
+            )
+            shaper_rate = shaper_caps['rate_per_second']
+            shaper_burst = shaper_caps['burst']
             microbatch_rows = min(500, max(1, shaper_rate * paper_p8_e2_samples_per_message)) if paper_p8_profile == 'official' else 500
             values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND=str(shaper_rate), MQTT_SHAPER_BURST=str(shaper_burst),
                           MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
@@ -1226,6 +1236,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     object.__setattr__(fixture, 'paper_p8_e2_duration_seconds', paper_p8_e2_duration_seconds)
     object.__setattr__(fixture, 'paper_p8_e2_burst_messages', paper_p8_e2_burst_messages)
     object.__setattr__(fixture, 'paper_p8_e2_samples_per_message', paper_p8_e2_samples_per_message)
+    object.__setattr__(fixture, 'paper_p8_e2_retry_rate_per_second', paper_p8_e2_retry_rate_per_second)
+    object.__setattr__(fixture, 'paper_p8_e2_retry_burst', paper_p8_e2_retry_burst)
     object.__setattr__(fixture, 'paper_p8_e3', paper_p8_e3)
     object.__setattr__(fixture, 'paper_p8_e3_workload', paper_p8_e3_workload)
     object.__setattr__(fixture, 'paper_p8_e3_command_count', paper_p8_e3_command_count)
@@ -6640,6 +6652,8 @@ def main():
                                   paper_p8_e2_duration_seconds=args.p8_e2_duration_seconds,
                                   paper_p8_e2_burst_messages=args.p8_e2_burst_messages,
                                   paper_p8_e2_samples_per_message=int(args.p8_e2_samples_per_message or 1),
+                                  paper_p8_e2_retry_rate_per_second=getattr(args, 'p8_e2_retry_rate_per_second', 0) or 0,
+                                  paper_p8_e2_retry_burst=getattr(args, 'p8_e2_retry_burst', 0) or 0,
                                    paper_p8_e3=paper_p8_e3_selector(args),
                                    paper_p8_e3_workload=(args.p8_e3_workload if args.p8_e3_prepare_hold else
                                        'low_load' if args.paper_p8_e3_low_load else 'mixed'),
