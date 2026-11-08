@@ -41,10 +41,16 @@ const telemetryLedgerInsertSQL = `INSERT INTO public.processed_messages (
 	RETURNING gateway_id`
 
 const telemetryLedgerOverlapSQL = `SELECT EXISTS (
-			SELECT 1 FROM public.processed_messages
-			WHERE gateway_id = $1 AND sensor_id = $2 AND boot_id = $3
-				AND first_sequence <= $4 AND last_sequence >= $5
-				AND message_id <> $6
+			SELECT 1 FROM (
+				SELECT last_sequence
+				FROM public.processed_messages
+				WHERE gateway_id = $1 AND sensor_id = $2 AND boot_id = $3
+					AND message_id <> $6
+					AND first_sequence <= $4
+				ORDER BY first_sequence DESC
+				LIMIT 1
+			) prev
+			WHERE prev.last_sequence >= $5
 		)`
 
 const telemetryLedgerConflictSQL = `SELECT payload_hash, source_topic, sensor_id, boot_id,
@@ -100,44 +106,25 @@ func insertTelemetryLedger(ctx context.Context, tx pgx.Tx, message *Message) (le
 
 	// Use a later statement so READ COMMITTED sees a concurrent conflicting row
 	// after the INSERT waited for that transaction to finish.
-	var payloadHash pgtype.Text
-	var sourceTopic pgtype.Text
-	var sensorID pgtype.Text
-	var bootID pgtype.UUID
-	var firstSequence pgtype.Int8
-	var lastSequence pgtype.Int8
-	var sampleCount pgtype.Int4
-	var timestamp pgtype.Timestamptz
-	err = tx.QueryRow(ctx, telemetryLedgerConflictSQL,
-		entry.topic.GatewayID, entry.messageID,
-	).Scan(&payloadHash, &sourceTopic, &sensorID, &bootID, &firstSequence, &lastSequence, &sampleCount, &timestamp)
-	if err != nil {
-		return ledgerDispositionUnconfirmed, dependencyError("read conflicting telemetry message ledger", err)
+	row, conflictErr := queryLedgerConflictRow(ctx, tx, entry)
+	if conflictErr != nil {
+		return ledgerDispositionUnconfirmed, dependencyError("read conflicting telemetry message ledger", conflictErr)
 	}
-	return classifyLedgerConflict(entry, ledgerConflictRow{
-		payloadHash:   payloadHash,
-		sourceTopic:   sourceTopic,
-		sensorID:      sensorID,
-		bootID:        bootID,
-		firstSequence: firstSequence,
-		lastSequence:  lastSequence,
-		sampleCount:   sampleCount,
-		timestamp:     timestamp,
-	})
+	return classifyLedgerConflict(entry, row)
 }
 
 // insertTelemetryLedgerBatch pipelines the per-message ledger work of one batch
-// group into a single SendBatch round trip. Each entry queues exactly three
-// statements interleaved in message order (INSERT_k, EXISTS_k, SELECT-conflict_k)
-// so EXISTS_k still runs after INSERT_k and before INSERT_{k+1}, exactly like the
+// group into a single SendBatch round trip. Each entry queues exactly two
+// statements interleaved in message order (INSERT_k, EXISTS_k) so EXISTS_k
+// still runs after INSERT_k and before INSERT_{k+1}, exactly like the
 // sequential loop; grouping all INSERTs before all EXISTS queries would let
 // EXISTS_k observe a later message's row and change the overlap decision.
 //
-// The conflict SELECT is also queued for entries whose INSERT succeeded so the
-// batch keeps exactly one round trip instead of reopening a second one when a
-// group contains a duplicate. Its row is read and discarded: for a successful
-// INSERT the row is the one just written, so the scan cannot fail on a real
-// server. Every result is consumed in queue order because skipping one would
+// The conflict SELECT is omitted from the batch on the normal non-conflicting
+// path, reducing the batch statements from 3N to 2N (64 statements for 32
+// messages). When an INSERT reports a conflict (pgx.ErrNoRows), the conflict
+// row is read via queryLedgerConflictRow after the batch completes.
+// Every result is consumed in queue order because skipping one would
 // desynchronize the batch. The first error stops the loop and closes the batch:
 // after a statement error pgx does not advance the batch query index, so reading
 // further results would repeat the same failure.
@@ -152,21 +139,39 @@ func insertTelemetryLedgerBatch(ctx context.Context, tx pgx.Tx, entries []ledger
 	queueTelemetryLedgerBatch(batch, entries)
 	br := tx.SendBatch(ctx, batch)
 	dispositions := make([]ledgerDisposition, len(entries))
-	for index, entry := range entries {
-		disposition, err := readTelemetryLedgerBatchEntry(br, entry)
+	var conflictIndices []int
+	for index := range entries {
+		disposition, isConflict, err := readTelemetryLedgerBatchEntry(br)
 		if err != nil {
 			_ = br.Close()
 			return nil, err
 		}
-		dispositions[index] = disposition
+		if isConflict {
+			conflictIndices = append(conflictIndices, index)
+		} else {
+			dispositions[index] = disposition
+		}
 	}
 	if err := br.Close(); err != nil {
 		return nil, dependencyError("close telemetry message ledger batch", err)
 	}
+
+	for _, index := range conflictIndices {
+		entry := entries[index]
+		row, err := queryLedgerConflictRow(ctx, tx, entry)
+		if err != nil {
+			return nil, dependencyError("read conflicting telemetry message ledger", err)
+		}
+		disposition, err := classifyLedgerConflict(entry, row)
+		if err != nil {
+			return nil, err
+		}
+		dispositions[index] = disposition
+	}
 	return dispositions, nil
 }
 
-// queueTelemetryLedgerBatch queues the three ledger statements of every entry in
+// queueTelemetryLedgerBatch queues the two ledger statements of every entry in
 // interleaved message order. A unit test can assert the statement count and the
 // per-entry order without a database.
 func queueTelemetryLedgerBatch(b *pgx.Batch, entries []ledgerMessage) {
@@ -178,46 +183,42 @@ func queueTelemetryLedgerBatch(b *pgx.Batch, entries []ledgerMessage) {
 		)
 		b.Queue(telemetryLedgerOverlapSQL, entry.topic.GatewayID, entry.sensorID, entry.bootID,
 			entry.lastSample.SequenceNum, entry.firstSample.SequenceNum, entry.messageID)
-		b.Queue(telemetryLedgerConflictSQL, entry.topic.GatewayID, entry.messageID)
 	}
 }
 
-// readTelemetryLedgerBatchEntry consumes the three queued results of one entry and
-// returns the same disposition and error the sequential path returns for it.
-func readTelemetryLedgerBatchEntry(br pgx.BatchResults, entry ledgerMessage) (ledgerDisposition, error) {
+// readTelemetryLedgerBatchEntry consumes the two queued results of one entry and
+// returns the disposition, whether the entry conflicted and needs resolution,
+// and any dependency or validation error encountered.
+func readTelemetryLedgerBatchEntry(br pgx.BatchResults) (ledgerDisposition, bool, error) {
 	var insertedGatewayID string
 	err := br.QueryRow().Scan(&insertedGatewayID)
 	if err == nil {
 		var overlap bool
 		if overlapErr := br.QueryRow().Scan(&overlap); overlapErr != nil {
-			return ledgerDispositionUnconfirmed, dependencyError("check telemetry sequence overlap", overlapErr)
-		}
-		// The row was inserted by this entry, so the conflict comparison is
-		// skipped; the result is only consumed to stay in sync with the queue.
-		if _, conflictErr := scanLedgerConflictRow(br.QueryRow()); conflictErr != nil {
-			return ledgerDispositionUnconfirmed, dependencyError("read conflicting telemetry message ledger", conflictErr)
+			return ledgerDispositionUnconfirmed, false, dependencyError("check telemetry sequence overlap", overlapErr)
 		}
 		if overlap {
-			return ledgerDispositionUnconfirmed, &ReasonError{Code: ReasonSequenceOverlap, Field: "sequence_range"}
+			return ledgerDispositionUnconfirmed, false, &ReasonError{Code: ReasonSequenceOverlap, Field: "sequence_range"}
 		}
-		return ledgerDispositionNew, nil
+		return ledgerDispositionNew, false, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return ledgerDispositionUnconfirmed, dependencyError("insert telemetry message ledger", err)
+		return ledgerDispositionUnconfirmed, false, dependencyError("insert telemetry message ledger", err)
 	}
 
-	// Use a later statement so READ COMMITTED sees a concurrent conflicting row
-	// after the INSERT waited for that transaction to finish. The overlap value
-	// is irrelevant here: the INSERT already reported a conflicting key.
+	// The INSERT reported a conflicting (gateway_id, message_id). Consume the
+	// queued overlap check to stay in sync with the batch results. Its boolean
+	// outcome is ignored because a conflicting key is resolved by the conflict
+	// classifier rather than being treated as a sequence overlap.
 	var overlap bool
 	if overlapErr := br.QueryRow().Scan(&overlap); overlapErr != nil {
-		return ledgerDispositionUnconfirmed, dependencyError("check telemetry sequence overlap", overlapErr)
+		return ledgerDispositionUnconfirmed, false, dependencyError("check telemetry sequence overlap", overlapErr)
 	}
-	row, conflictErr := scanLedgerConflictRow(br.QueryRow())
-	if conflictErr != nil {
-		return ledgerDispositionUnconfirmed, dependencyError("read conflicting telemetry message ledger", conflictErr)
-	}
-	return classifyLedgerConflict(entry, row)
+	return ledgerDispositionUnconfirmed, true, nil
+}
+
+func queryLedgerConflictRow(ctx context.Context, tx pgx.Tx, entry ledgerMessage) (ledgerConflictRow, error) {
+	return scanLedgerConflictRow(tx.QueryRow(ctx, telemetryLedgerConflictSQL, entry.topic.GatewayID, entry.messageID))
 }
 
 func scanLedgerConflictRow(row pgx.Row) (ledgerConflictRow, error) {

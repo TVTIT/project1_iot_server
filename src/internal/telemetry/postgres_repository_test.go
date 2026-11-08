@@ -813,6 +813,9 @@ func TestPersistBatchUsesAtMostFourRoundTrips(t *testing.T) {
 	if tx.sendBatchCalls != 4 {
 		t.Fatalf("SendBatch round trips = %d; want 4 (ledger, reported-state read, reported-state update, temporal)", tx.sendBatchCalls)
 	}
+	if len(tx.batches[0]) != 64 {
+		t.Fatalf("ledger batch statements = %d; want 64 (2 statements per message in L4)", len(tx.batches[0]))
+	}
 	if tx.commitCalls != 1 || tx.copyRows != 96 || tx.openBatches != 0 {
 		t.Fatalf("commit=%d copied=%d openBatches=%d; want one COMMIT, 96 streamed samples and no batch left open", tx.commitCalls, tx.copyRows, tx.openBatches)
 	}
@@ -888,7 +891,7 @@ func TestPersistBatchLedgerBatchStopsGroupOnError(t *testing.T) {
 		execRows:    1,
 		batchLedger: make(map[string]ledgerMessage),
 		batchInput:  messages,
-		batchFailAt: map[int]error{3: errors.New("ledger statement failed")},
+		batchFailAt: map[int]error{2: errors.New("ledger statement failed")},
 	}
 	database := &telemetryFakeDatabase{tx: tx}
 	repository, err := NewPostgresBatchRepository(database, time.Second, 4)

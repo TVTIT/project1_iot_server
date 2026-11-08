@@ -800,11 +800,13 @@ không gắn acceptance. Diagnostics best-effort chỉ trong lifecycle trước 
 
 #### Chẩn đoán persistence E2 (source mới, chạy riêng)
 
-Ghi chú L1 (pipeline SQL trong `persistBatchGroup`): đường batch của một group giờ
-gộp ledger, đọc reported state, ghi reported state và temporal vào **tối đa 4 lần
-`SendBatch`** mỗi group thay vì ~168 câu SQL tuần tự; thứ tự, transaction, lock order,
-mã lỗi và reason field không đổi, nhưng ledger giờ luôn gửi 3 lệnh/message nên message
-insert thành công có thêm 1 PK lookup bị bỏ qua. Về metric: chỉ `ledger`,
+Ghi chú L1/L4 (pipeline SQL và tối ưu ledger trong `persistBatchGroup`): đường batch
+của một group giờ gộp ledger, đọc reported state, ghi reported state và temporal vào
+**tối đa 4 lần `SendBatch`** mỗi group thay vì ~168 câu SQL tuần tự. Ở L4, kiểm tra sequence
+overlap được tối ưu từ O(N) quét index sang O(log N) bằng `ORDER BY first_sequence DESC LIMIT 1`
+trên index B-Tree hiện có (`processed_stream_range`), triệt tiêu chi phí duyệt index theo độ dài stream.
+Đồng thời batch ledger chuyển từ 3N sang 2N lệnh (chỉ INSERT và EXISTS); câu lệnh đọc PK conflict chỉ
+thực hiện riêng sau khi đóng batch nếu có message bị trùng khóa. Về metric: chỉ `ledger`,
 `reported_state` và `temporal` của **đường group** được observe **một lần/group**
 (`reported_state` gộm cả chuyến đọc và chuyến ghi); các stage khóa/tạo tài nguyên vẫn
 đếm theo từng tài nguyên, còn đường một message (`Persist`) và fallback per-input vẫn
