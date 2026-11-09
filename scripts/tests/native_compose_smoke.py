@@ -115,8 +115,8 @@ DEFAULTS = dict(
     MQTT_SHAPER_IDLE_RETENTION="10m", MQTT_INGRESS_BUFFERED_BYTES="16777216",
     # P5a microbatch values are explicit fixture inputs matching the root
     # Compose defaults; the isolated fixture remains opt-in/default-off.
-    MQTT_MICROBATCH_ENABLED="false", MQTT_MICROBATCH_MAX_MESSAGES="32",
-    MQTT_MICROBATCH_MAX_ROWS="500", MQTT_MICROBATCH_MAX_PAYLOAD_BYTES="4194304",
+    MQTT_MICROBATCH_ENABLED="false", MQTT_MICROBATCH_MAX_MESSAGES="64",
+    MQTT_MICROBATCH_MAX_ROWS="6400", MQTT_MICROBATCH_MAX_PAYLOAD_BYTES="4194304",
     MQTT_MICROBATCH_MAX_WAIT="1s",
     # P5b RAM metadata cache is independently opt-in with explicit local caps.
     MQTT_RAM_DEDUP_ENABLED="false", MQTT_RAM_DEDUP_MAX_ENTRIES="100000",
@@ -1100,9 +1100,10 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
             )
             shaper_rate = shaper_caps['rate_per_second']
             shaper_burst = shaper_caps['burst']
-            microbatch_rows = min(500, max(1, shaper_rate * paper_p8_e2_samples_per_message)) if paper_p8_profile == 'official' else 500
+            microbatch_messages = 64 if paper_p8_profile == 'official' else 32
+            microbatch_rows = 6400 if paper_p8_profile == 'official' else 500
             values.update(MQTT_SHAPER_ENABLED='true', MQTT_SHAPER_RATE_PER_SECOND=str(shaper_rate), MQTT_SHAPER_BURST=str(shaper_burst),
-                          MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES='32',
+                          MQTT_MICROBATCH_ENABLED='true', MQTT_MICROBATCH_MAX_MESSAGES=str(microbatch_messages),
                           MQTT_MICROBATCH_MAX_ROWS=str(microbatch_rows), MQTT_MICROBATCH_MAX_PAYLOAD_BYTES='4194304',
                           MQTT_MICROBATCH_MAX_WAIT='50ms', MQTT_RAM_DEDUP_ENABLED='false',
                           STAGE5_ENABLED='false', STAGE5_WAKEUP_ENABLED='false', WEBSOCKET_ENABLED='false')

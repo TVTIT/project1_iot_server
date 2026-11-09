@@ -412,7 +412,7 @@ func TestIngressMicrobatchConfiguration(t *testing.T) {
 			t.Fatalf("Load() error = %v", err)
 		}
 		got := cfg.Ingress
-		if got.MicrobatchEnabled || got.MicrobatchMaxMessages != 32 || got.MicrobatchMaxRows != 500 ||
+		if got.MicrobatchEnabled || got.MicrobatchMaxMessages != 64 || got.MicrobatchMaxRows != 6400 ||
 			got.MicrobatchMaxPayloadBytes != 4<<20 || got.MicrobatchMaxWait != time.Second {
 			t.Fatalf("microbatch defaults: enabled=%v messages=%d rows=%d bytes=%d wait=%s",
 				got.MicrobatchEnabled, got.MicrobatchMaxMessages, got.MicrobatchMaxRows,

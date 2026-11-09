@@ -20,7 +20,7 @@ type postgresRepository struct {
 	metrics          *PersistenceMetrics
 }
 
-const defaultTelemetryBatchMessages = 32
+const defaultTelemetryBatchMessages = 64
 
 // NewPostgresRepository builds the transaction owner for telemetry persistence.
 // timeout bounds connection acquisition, row locks, SQL, and commit.

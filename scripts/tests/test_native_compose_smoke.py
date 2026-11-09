@@ -53,7 +53,7 @@ class PreparationTests(unittest.TestCase):
             'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
             'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
             'MQTT_SHAPER_RATE_PER_SECOND': '55', 'MQTT_SHAPER_BURST': '55',
-            'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+            'MQTT_MICROBATCH_MAX_MESSAGES': '64', 'MQTT_MICROBATCH_MAX_ROWS': '6400',
             'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
             'MQTT_MICROBATCH_MAX_WAIT': '50ms'}}}}
         fixture = SimpleNamespace(paper_p8_profile='official',
@@ -914,7 +914,8 @@ class PreparationTests(unittest.TestCase):
                 paper_p8_e2_burst_messages=11, paper_p8_e2_samples_per_message=100)
             self.assertEqual(fixture.values['MQTT_SHAPER_RATE_PER_SECOND'], '550')
             self.assertEqual(fixture.values['MQTT_SHAPER_BURST'], '561')
-            self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_ROWS'], '500')
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_MESSAGES'], '64')
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_ROWS'], '6400')
             fixture_retry = smoke.prepare(Path(directory) / 'official_retry', paper_p8_e2=True,
                 paper_p8_profile='official', paper_p8_official_opt_in=True,
                 paper_p8_e2_offered_rate=1000, paper_p8_e2_duration_seconds=20,
@@ -1261,8 +1262,8 @@ class PreparationTests(unittest.TestCase):
     def test_p5a_microbatch_defaults_are_explicit_and_default_off(self):
         expected = {
             "MQTT_MICROBATCH_ENABLED": "false",
-            "MQTT_MICROBATCH_MAX_MESSAGES": "32",
-            "MQTT_MICROBATCH_MAX_ROWS": "500",
+            "MQTT_MICROBATCH_MAX_MESSAGES": "64",
+            "MQTT_MICROBATCH_MAX_ROWS": "6400",
             "MQTT_MICROBATCH_MAX_PAYLOAD_BYTES": "4194304",
             "MQTT_MICROBATCH_MAX_WAIT": "1s",
         }

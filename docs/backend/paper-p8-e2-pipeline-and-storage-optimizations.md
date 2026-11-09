@@ -1,10 +1,10 @@
 # Tổng hợp Tối ưu Pipeline, Ingress Shaper và Hạ tầng Lưu trữ E2 (P8 Official)
 
-Tài liệu này tổng hợp ngắn gọn chuỗi 5 giải pháp tối ưu hóa hiệu năng được triển khai nhằm giúp hệ thống đạt chuẩn kiểm thử tải khắc nghiệt **P8 E2 Official** (mục tiêu $100.000\text{ messages}$ ở $2.000\text{ msg/s}$ trên môi trường 2 máy chủ độc lập).
+Tài liệu này tổng hợp ngắn gọn chuỗi 6 giải pháp tối ưu hóa hiệu năng được triển khai nhằm giúp hệ thống đạt chuẩn kiểm thử tải khắc nghiệt **P8 E2 Official** (mục tiêu $100.000\text{ messages}$ ở $2.000\text{ msg/s}$ trên môi trường 2 máy chủ độc lập).
 
 ---
 
-## 1. Danh mục 5 Giải pháp Tối ưu Kỹ thuật
+## 1. Danh mục 6 Giải pháp Tối ưu Kỹ thuật
 
 ### 1.1 Tối ưu 1 — L1: Pipeline SQL một group thành 4 SendBatch (`bbc9019`, `1ec3cb8`)
 - **Vấn đề trước tối ưu:** Hàm `persistBatchGroup` chạy tuần tự từng message: 3 câu kiểm tra/chèn ledger, 1 câu đọc reported state, 1 câu ghi reported state và 1 câu chèn temporal. Với group 32 messages, hệ thống phải chịu chi phí khoảng 168 vòng đi-về mạng (round-trips) giữa Go backend và PostgreSQL.
@@ -50,6 +50,14 @@ Tài liệu này tổng hợp ngắn gọn chuỗi 5 giải pháp tối ưu hóa
   - Đảm bảo tính toàn vẹn chiều ghi bằng lệnh khóa `lockTelemetrySensor (... FOR SHARE)` ở đầu transaction của Go backend.
   - Bảo toàn ngữ nghĩa `ON DELETE/UPDATE RESTRICT` ở tầng CSDL bằng trigger đảo chiều `trg_sensors_restrict_telemetry` trên bảng `sensors`: nếu xóa sensor hoặc sửa `sensor_id` khi đã có telemetry, PostgreSQL sẽ chặn đứng và báo lỗi `foreign_key_violation` (`23503`).
 - **Kết quả:** Thời gian chèn 500 dòng dữ liệu thô giảm từ **$25,52\text{ ms}$ xuống $\approx 3,82\text{ ms}$ (nhanh gấp 4,6 lần, giảm 78%)**, nâng trần năng lực nuốt của $S=100$ từ $258\text{ msg/s}$ lên xấp xỉ **$\approx 595\text{ msg/s}$ ($59.500\text{ samples/s}$)**.
+
+### 1.6 Tối ưu 6 — L3: Định cỡ Lô Microbatch & Mở trần Flow Control (maxBatchRows & maxBatchMessages)
+- **Vấn đề trước tối ưu:** Trần `maxBatchRows = 500` khiến các bản tin mang 100 mẫu ($S=100$) bị ngắt batch non chỉ sau 5 messages ($5 \times 100 = 500$ dòng), làm số lần `COMMIT` vọt lên 2.000 lần trong 10s (200 lần/giây), ép đĩa liên tục và kéo tụt trần thông lượng của 2 sensor leases xuống mức $\approx 300\text{ msg/s}$. Đồng thời trần `maxBatchMessages = 32` giới hạn số lượng tin gom được trong mỗi chu kỳ giao dịch.
+- **Giải pháp:**
+  - Nâng `maxBatchMessages` từ 32 lên **64** trong Go Ingress Configuration, Repository Batch Guard và E2 Official Test Runner.
+  - Nâng `maxBatchRows` từ 500 lên **6.400** theo công thức chuẩn hóa $\text{maxBatchRows} = \text{maxBatchMessages} \times 100$, đảm bảo group có thể gom trọn vẹn 64 messages ở kịch bản $S=100$ mà không bị ngắt non.
+  - Ngân sách bộ nhớ RAM của 4 workers với kích thước lô mới là $\approx 24,5\text{ MiB}$, hoàn toàn nằm sâu bên dưới trần an toàn `MaxIngressQueueMemoryBytes` (256 MiB).
+- **Kết quả:** Số lần gọi `COMMIT` ở kịch bản $S=100$ giảm tới **12,8 lần** (từ 2.000 lần xuống ~156 lần trong 10s), triệt tiêu hoàn toàn áp lực ép đĩa `WALSync`, nâng mạnh năng lực nuốt của 2 Sensor leases.
 
 ---
 

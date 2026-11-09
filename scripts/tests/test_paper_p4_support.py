@@ -82,8 +82,8 @@ class PaperP4SupportTests(unittest.TestCase):
         compose = (root / 'docker-compose.yml').read_text()
         expected = {
             'MQTT_MICROBATCH_ENABLED': 'false',
-            'MQTT_MICROBATCH_MAX_MESSAGES': '32',
-            'MQTT_MICROBATCH_MAX_ROWS': '500',
+            'MQTT_MICROBATCH_MAX_MESSAGES': '64',
+            'MQTT_MICROBATCH_MAX_ROWS': '6400',
             'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
             'MQTT_MICROBATCH_MAX_WAIT': '1s',
         }

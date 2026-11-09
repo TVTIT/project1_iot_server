@@ -1501,11 +1501,13 @@ class E2SupportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'e2_shaper_burst_exceeds_backend_limit'):
             e2_shaper_caps(profile='official', offered_rate=2000, burst_messages=99000, retry_burst=2000)
 
-        # 6. Verify e2_fixture_profile integrates with shaper caps
+        # 6. Verify e2_fixture_profile integrates with shaper caps and L3 microbatch caps
         official_fixture = e2_fixture_profile(microbatch_wait_ms=50, profile='official',
                                               offered_rate=2000, burst_messages=4,
                                               retry_rate=750, retry_burst=100)
         self.assertEqual(official_fixture['shaper'], {'rate_per_second': 1850, 'burst': 1954})
+        self.assertEqual(official_fixture['microbatch'], {'max_messages': 64, 'max_rows': 6400,
+                                                          'max_bytes': 4 << 20, 'wait_ms': 50})
 
     def test_plan_requires_private_matching_manifests_and_official_optin(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1822,6 +1824,16 @@ class E2SupportTests(unittest.TestCase):
             'MQTT_MICROBATCH_MAX_MESSAGES':'32', 'MQTT_MICROBATCH_MAX_ROWS':'500',
             'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES':str(4 << 20), 'MQTT_MICROBATCH_MAX_WAIT':'50ms'}
         self.assertEqual(e2._validate_fixture_flags({'services':{'backend':{'environment':env}}}), env)
+        class _DummyOfficialFixture:
+            paper_p8_profile = 'official'
+            paper_p8_e2_offered_rate = 2000
+            paper_p8_e2_burst_messages = 4
+            paper_p8_e2_retry_rate_per_second = 0
+            paper_p8_e2_retry_burst = 0
+            paper_p8_e2_samples_per_message = 100
+        env_official = dict(env, MQTT_SHAPER_RATE_PER_SECOND='1100', MQTT_SHAPER_BURST='1104',
+                            MQTT_MICROBATCH_MAX_MESSAGES='64', MQTT_MICROBATCH_MAX_ROWS='6400')
+        self.assertEqual(e2._validate_fixture_flags({'services':{'backend':{'environment':env_official}}}, _DummyOfficialFixture()), env_official)
         env['MQTT_MICROBATCH_MAX_WAIT'] = '100'
         with self.assertRaisesRegex(ValueError, 'effective_fixture_flags_mismatch'):
             e2._validate_fixture_flags({'services':{'backend':{'environment':env}}})

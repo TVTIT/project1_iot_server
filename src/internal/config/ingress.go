@@ -23,9 +23,9 @@ const (
 	defaultMQTTWorkerCount   = 4
 	maxMQTTWorkerCount       = 10_000
 
-	defaultMicrobatchMessages = 32
+	defaultMicrobatchMessages = 64
 	maxMicrobatchMessages     = 1024
-	defaultMicrobatchRows     = 500
+	defaultMicrobatchRows     = 6400
 	maxMicrobatchRows         = 100_000
 	defaultMicrobatchBytes    = 4 << 20
 	maxMicrobatchBytes        = 256 << 20

@@ -188,13 +188,14 @@ def e2_fixture_profile(*, microbatch_wait_ms, profile='pilot', offered_rate=2,
                             retry_burst=retry_burst, tolerance_seconds=tolerance_seconds)
     rate = shaper['rate_per_second']
     burst = shaper['burst']
-    max_rows = min(500, max(1, rate * samples_per_message)) if profile == 'official' else 500
+    max_messages = 64 if profile == 'official' else 32
+    max_rows = 6400 if profile == 'official' else 500
     return {'effective_fixture_flags': {'MQTT_SHAPER_ENABLED': True,
             'MQTT_MICROBATCH_ENABLED': True, 'MQTT_RAM_DEDUP_ENABLED': False,
             'STAGE5_ENABLED': False, 'STAGE5_WAKEUP_ENABLED': False,
             'WEBSOCKET_ENABLED': False},
             'shaper': {'rate_per_second': rate, 'burst': burst},
-            'microbatch': {'max_messages': 32, 'max_rows': max_rows,
+            'microbatch': {'max_messages': max_messages, 'max_rows': max_rows,
                            'max_bytes': 4 << 20, 'wait_ms': microbatch_wait_ms},
             'scope': 'proposed disposable E2 fixture only; deployment defaults unchanged'}
 
@@ -4316,21 +4317,23 @@ def _safe_flags(effective):
 
 def _validate_fixture_flags(effective, fixture=None):
     flags = _safe_flags(effective)
+    profile = getattr(fixture, 'paper_p8_profile', 'pilot')
     shaper = e2_shaper_caps(
-        profile=getattr(fixture, 'paper_p8_profile', 'pilot'),
+        profile=profile,
         offered_rate=getattr(fixture, 'paper_p8_e2_offered_rate', 2),
         burst_messages=getattr(fixture, 'paper_p8_e2_burst_messages', 0),
         retry_rate=getattr(fixture, 'paper_p8_e2_retry_rate_per_second', 0),
         retry_burst=getattr(fixture, 'paper_p8_e2_retry_burst', 0))
     rate = shaper['rate_per_second']
     burst = shaper['burst']
-    max_rows = min(500, max(1, rate * getattr(fixture, 'paper_p8_e2_samples_per_message', 1))) if getattr(fixture, 'paper_p8_profile', 'pilot') == 'official' else 500
+    max_messages = 64 if profile == 'official' else 32
+    max_rows = 6400 if profile == 'official' else 500
     expected = {'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
         'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
         'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
         'MQTT_SHAPER_RATE_PER_SECOND': str(rate),
         'MQTT_SHAPER_BURST': str(burst),
-        'MQTT_MICROBATCH_MAX_MESSAGES': '32',
+        'MQTT_MICROBATCH_MAX_MESSAGES': str(max_messages),
         'MQTT_MICROBATCH_MAX_ROWS': str(max_rows),
         'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': str(4 << 20), 'MQTT_MICROBATCH_MAX_WAIT': '50ms'}
     normalized = {key: str(value).lower() for key, value in flags.items()}
