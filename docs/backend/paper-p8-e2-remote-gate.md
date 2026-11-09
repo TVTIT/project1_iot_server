@@ -736,6 +736,13 @@ Thực hiện trong thư mục gốc riêng biệt `$ROOT/steady-s1-${RUN_LABEL}
   - Giới hạn an toàn: `shaper_rate <= 10000`, `shaper_burst <= 100000` (theo giới hạn `ShaperOptions` của Go backend).
   - `microbatch_rows = min(500, max(1, shaper_rate * samples_per_message))`.
 
+- **Cấu hình Tối ưu Tầng PostgreSQL và Migration 25 (Hạ tầng Database)**:
+  Để hỗ trợ các bài kiểm thử tải nặng và dài hạn ($\ge 50\text{s}$, $100.000\text{ messages}$), hạ tầng database được cấu hình tối ưu trực tiếp trong `docker-compose.yml`:
+  - `min_wal_size=512MB`, `max_wal_size=2GB`: Duy trì sẵn 32–128 file WAL để PostgreSQL thực hiện cơ chế tái chế (recycle/rename) file cũ trong bộ nhớ ($< 0,01\text{ ms}$), triệt tiêu hoàn toàn điểm nghẽn cấp phát file WAL mới trên đĩa (`IO: WALInitSync` kéo dài 30–80 ms).
+  - `wal_buffers=64MB`: Mở rộng vùng đệm WAL trong RAM (từ 4MB lên 64MB) làm vùng đệm cách ly (shock absorber) cho Go backend, giải phóng worker khỏi việc phải trực tiếp ghi đĩa khi phát sinh micro-burst.
+  - `checkpoint_completion_target=0.9`, `checkpoint_timeout=15min`: Trải đều 90% lượng I/O xả trang dữ liệu bẩn ra suốt 15 phút, san phẳng băng thông ghi đĩa ở mức trung bình $\approx 7,66\text{ MiB/s}$, ngăn chặn bão I/O làm nghẽn các lệnh `COMMIT fsync`.
+  - **Migration 25 (`000025_drop_telemetry_sensor_fk`)**: Gỡ bỏ ràng buộc khóa ngoại `fk_telemetry_sensor` trên hypertable `telemetry`. Thao tác này triệt tiêu hoàn toàn System Trigger `RI_FKey_check_ins` chạy kiểm tra từng dòng khi `CopyFrom` (vốn tiêu tốn tới $\approx 25\text{ ms}$ cho mỗi 500 mẫu ở kịch bản $S=100$, nay giảm xuống còn $\approx 3,8\text{ ms}$). Tính toàn vẹn dữ liệu được đảm bảo bởi transaction lock `FOR SHARE` ở đầu giao dịch và một trigger đảo chiều `trg_sensors_restrict_telemetry` trên bảng `sensors`.
+
 ##### Retry policy E2 official (opt-in)
 
 Các flag sau chỉ áp dụng `steady_burst` official; cần khai báo đủ cả sáu giá
