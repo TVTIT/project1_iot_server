@@ -934,7 +934,7 @@ def run_e2_telemetry100(smoke, fixture, endpoint, registry, containers, images, 
         smoke.prepare_paper_workload(fixture, registry, endpoint, containers, images, state))
     schema = smoke.db_psql(registry, pg,
         "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
-    if schema != '24:telemetry_ledger_timestamp':
+    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
     broker = registry.resolve(containers['mosquitto'])
     mappings = broker.get('NetworkSettings', {}).get('Ports', {}).get('8883/tcp') or []
@@ -1263,7 +1263,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, lifecycle_state)
         raise ValueError('p8_effective_session_cap_rejected')
     schema = smoke.db_psql(registry, pg,
         "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
-    if schema != '24:telemetry_ledger_timestamp':
+    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
     targets = [{'group': role.upper(), 'target': {'gateway_id': spec.gateway_id, 'sensor_id': spec.sensor_id}}
                for role, spec in zip(('a', 'b'), specs)]

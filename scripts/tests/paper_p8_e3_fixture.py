@@ -978,7 +978,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state,
 
     schema = smoke.db_psql(registry, pg,
         "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
-    if schema != '24:telemetry_ledger_timestamp':
+    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
 
     broker = registry.resolve(containers['mosquitto'])

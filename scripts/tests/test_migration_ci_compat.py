@@ -129,15 +129,19 @@ class CompatFixture(unittest.TestCase):
         self.assertIn("conflicting telemetry provenance", source)
         self.assertIn("telemetry_ledger_timestamp", source)
         self.assertIn("000024_telemetry_ledger_timestamp.up.sql", compose)
+        self.assertIn("000025_drop_telemetry_sensor_fk.up.sql", compose)
         self.assertLess(compose.index('000023_sensor_control_intent.up.sql'),
                         compose.index('000024_telemetry_ledger_timestamp.up.sql'))
+        self.assertLess(compose.index('000024_telemetry_ledger_timestamp.up.sql'),
+                        compose.index('000025_drop_telemetry_sensor_fk.up.sql'))
 
     def test_stage3_writer_fixtures_apply_post_auth_schema24_before_writer(self):
         source = (ROOT / 'scripts/tests/stage3_persistence_runner.py').read_text()
         helper = source[source.index('def apply_post_auth_compatibility'):source.index('def run_normal_fixture')]
         self.assertIn("fixture.sql(b\"CREATE SCHEMA IF NOT EXISTS auth", helper)
         for version, name in ((21, 'admin_user_management'), (22, 'gateway_membership_revocation'),
-                              (23, 'sensor_control_intent'), (24, 'telemetry_ledger_timestamp')):
+                              (23, 'sensor_control_intent'), (24, 'telemetry_ledger_timestamp'),
+                              (25, 'drop_telemetry_sensor_fk')):
             self.assertIn(f"({version}, '{name}')", helper)
         self.assertIn("expected = (b'21:admin_user_management'", helper)
         for fixture in ('run_normal_fixture', 'run_group_fixture'):
@@ -152,7 +156,7 @@ class CompatFixture(unittest.TestCase):
     def test_stage4_live_telemetry_writer_fixture_uses_schema24(self):
         runner = (ROOT / 'scripts/tests/stage4_api_runner.py').read_text()
         scenario = (ROOT / 'scripts/tests/stage4_vertical_scenario.py').read_text()
-        self.assertIn('TERMINAL_SCHEMA_VERSION = 24', runner)
+        self.assertIn('TERMINAL_SCHEMA_VERSION = 25', runner)
         self.assertIn('run_existing_migration_runner(fixture, TERMINAL_SCHEMA_VERSION)', runner)
         self.assertIn("producer.publish_qos1(cap_topic, cap_payload)", scenario)
 

@@ -492,7 +492,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, *,
     resource_gate = require_e1_resource_gate(fixture_resources, viewers=viewers, session_cap=session_cap)
     schema = smoke.db_psql(registry, pg,
         'SELECT version::text || \':\' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;').strip()
-    if schema != '24:telemetry_ledger_timestamp': raise ValueError('p8_schema_terminal_rejected')
+    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'): raise ValueError('p8_schema_terminal_rejected')
     # Add one separately provisioned sensor under each already-provisioned gateway.
     for index, spec in enumerate(specs):
         status, _, _ = smoke.http_request(endpoint, 'PUT', f"/v1/gateways/{spec.gateway_id}/sensors/p8_e1_second",

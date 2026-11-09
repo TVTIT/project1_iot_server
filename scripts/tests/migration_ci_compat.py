@@ -165,6 +165,14 @@ class Fixture:
         self.expect("SELECT count(*) FROM pg_class WHERE oid='processed_stream_range'::regclass;", '1')
         print('Migration 24 native sample-zero backfill, legacy NULL, unique index, retained guards and reapply passed.', flush=True)
 
+        migration25 = (ROOT / 'migrations/000025_drop_telemetry_sensor_fk.up.sql').read_text()
+        self.sql(migration25)
+        self.sql(migration25)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=25 AND name='drop_telemetry_sensor_fk';", '1')
+        self.expect("SELECT count(*) FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='fk_telemetry_sensor';", '0')
+        self.expect("SELECT count(*) FROM pg_trigger WHERE tgrelid='public.sensors'::regclass AND tgname='trg_sensors_restrict_telemetry';", '1')
+        print('Migration 25 native telemetry FK removal and sensors reverse restrict trigger passed.', flush=True)
+
     def cleanup(self):
         if self.id is None:
             return

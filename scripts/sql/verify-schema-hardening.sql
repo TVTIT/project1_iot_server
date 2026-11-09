@@ -14,9 +14,11 @@ DECLARE
     test_gateway_id TEXT;
     test_command UUID;
     actor_scoped_receipts BOOLEAN := false;
+    telemetry_sensor_fk_dropped BOOLEAN := false;
 BEGIN
     IF to_regclass('public.schema_migrations') IS NOT NULL THEN
         SELECT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=23 AND name='sensor_control_intent') INTO actor_scoped_receipts;
+        SELECT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=25 AND name='drop_telemetry_sensor_fk') INTO telemetry_sensor_fk_dropped;
     END IF;
     IF NOT EXISTS (
         SELECT 1
@@ -42,28 +44,53 @@ BEGIN
         RAISE EXCEPTION 'Verification failed: twin_states.last_desired_by is not nullable UUID';
     END IF;
 
-    SELECT count(*)
-    INTO constraint_count
-    -- Timescale copies some parent constraints onto chunks after real writes.
-    -- Count the nine required parent/name pairs, not every same-name constraint
-    -- in the database. A copy or a constraint on another table cannot replace
-    -- a missing parent constraint.
-    FROM (VALUES
-        ('public.twin_entities', 'fk_twin_entities_gateway'),
-        ('public.twin_states', 'fk_twin_states_last_desired_by'),
-        ('public.processed_messages', 'fk_processed_messages_gateway'),
-        ('public.telemetry', 'fk_telemetry_sensor'),
-        ('public.user_gateways', 'chk_user_gateways_role'),
-        ('public.twin_commands', 'chk_twin_commands_status'),
-        ('public.twin_outbox', 'chk_twin_outbox_status'),
-        ('public.twin_temporal_values', 'chk_twin_temporal_exactly_one_value'),
-        ('public.twin_outbox', 'uq_twin_outbox_command_id')
-    ) AS required(parent_table, constraint_name)
-    JOIN pg_constraint c ON c.conrelid = to_regclass(required.parent_table)
-                        AND c.conname = required.constraint_name;
+    IF telemetry_sensor_fk_dropped THEN
+        SELECT count(*)
+        INTO constraint_count
+        FROM (VALUES
+            ('public.twin_entities', 'fk_twin_entities_gateway'),
+            ('public.twin_states', 'fk_twin_states_last_desired_by'),
+            ('public.processed_messages', 'fk_processed_messages_gateway'),
+            ('public.user_gateways', 'chk_user_gateways_role'),
+            ('public.twin_commands', 'chk_twin_commands_status'),
+            ('public.twin_outbox', 'chk_twin_outbox_status'),
+            ('public.twin_temporal_values', 'chk_twin_temporal_exactly_one_value'),
+            ('public.twin_outbox', 'uq_twin_outbox_command_id')
+        ) AS required(parent_table, constraint_name)
+        JOIN pg_constraint c ON c.conrelid = to_regclass(required.parent_table)
+                            AND c.conname = required.constraint_name;
 
-    IF constraint_count <> 9 THEN
-        RAISE EXCEPTION 'Verification failed: expected 9 hardening constraints, found %', constraint_count;
+        IF constraint_count <> 8 THEN
+            RAISE EXCEPTION 'Verification failed: expected 8 hardening constraints with migration 25, found %', constraint_count;
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgrelid = 'public.sensors'::regclass
+              AND tgname = 'trg_sensors_restrict_telemetry'
+        ) THEN
+            RAISE EXCEPTION 'Verification failed: trg_sensors_restrict_telemetry trigger is missing on sensors';
+        END IF;
+    ELSE
+        SELECT count(*)
+        INTO constraint_count
+        FROM (VALUES
+            ('public.twin_entities', 'fk_twin_entities_gateway'),
+            ('public.twin_states', 'fk_twin_states_last_desired_by'),
+            ('public.processed_messages', 'fk_processed_messages_gateway'),
+            ('public.telemetry', 'fk_telemetry_sensor'),
+            ('public.user_gateways', 'chk_user_gateways_role'),
+            ('public.twin_commands', 'chk_twin_commands_status'),
+            ('public.twin_outbox', 'chk_twin_outbox_status'),
+            ('public.twin_temporal_values', 'chk_twin_temporal_exactly_one_value'),
+            ('public.twin_outbox', 'uq_twin_outbox_command_id')
+        ) AS required(parent_table, constraint_name)
+        JOIN pg_constraint c ON c.conrelid = to_regclass(required.parent_table)
+                            AND c.conname = required.constraint_name;
+
+        IF constraint_count <> 9 THEN
+            RAISE EXCEPTION 'Verification failed: expected 9 hardening constraints, found %', constraint_count;
+        END IF;
     END IF;
 
     SELECT indexdef
@@ -161,7 +188,33 @@ BEGIN
         WHEN foreign_key_violation THEN NULL;
     END;
 
-    BEGIN
+    IF NOT telemetry_sensor_fk_dropped THEN
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'telemetry'
+                  AND column_name = 'sample_index'
+            ) THEN
+                EXECUTE 'INSERT INTO telemetry
+                    (measured_at, gateway_id, sensor_id, sequence_num, value, boot_id, message_id, sample_index)
+                    VALUES (now(), $1, ''__missing_sensor'', 1, 1, gen_random_uuid(), gen_random_uuid(), 0)'
+                    USING test_gateway_id;
+            ELSE
+                EXECUTE 'INSERT INTO telemetry
+                    (measured_at, gateway_id, sensor_id, sequence_num, value)
+                    VALUES (now(), $1, ''__missing_sensor'', 1, 1)'
+                    USING test_gateway_id;
+            END IF;
+            RAISE EXCEPTION 'Verification failed: telemetry for an unknown Sensor was accepted';
+        EXCEPTION
+            WHEN foreign_key_violation THEN NULL;
+        END;
+    ELSE
+        -- Verification of reverse RESTRICT trigger on sensors under migration 25:
+        -- Deleting a sensor that has telemetry must raise foreign_key_violation
+        INSERT INTO sensors (gateway_id, sensor_id, name)
+        VALUES (test_gateway_id, '__test_restrict_sensor', 'Restrict Test Sensor');
+
         IF EXISTS (
             SELECT 1 FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'telemetry'
@@ -169,18 +222,25 @@ BEGIN
         ) THEN
             EXECUTE 'INSERT INTO telemetry
                 (measured_at, gateway_id, sensor_id, sequence_num, value, boot_id, message_id, sample_index)
-                VALUES (now(), $1, ''__missing_sensor'', 1, 1, gen_random_uuid(), gen_random_uuid(), 0)'
+                VALUES (now(), $1, ''__test_restrict_sensor'', 1, 1, gen_random_uuid(), gen_random_uuid(), 0)'
                 USING test_gateway_id;
         ELSE
             EXECUTE 'INSERT INTO telemetry
                 (measured_at, gateway_id, sensor_id, sequence_num, value)
-                VALUES (now(), $1, ''__missing_sensor'', 1, 1)'
+                VALUES (now(), $1, ''__test_restrict_sensor'', 1, 1)'
                 USING test_gateway_id;
         END IF;
-        RAISE EXCEPTION 'Verification failed: telemetry for an unknown Sensor was accepted';
-    EXCEPTION
-        WHEN foreign_key_violation THEN NULL;
-    END;
+
+        BEGIN
+            DELETE FROM sensors WHERE gateway_id = test_gateway_id AND sensor_id = '__test_restrict_sensor';
+            RAISE EXCEPTION 'Verification failed: deletion of sensor with telemetry was accepted';
+        EXCEPTION
+            WHEN foreign_key_violation THEN NULL;
+        END;
+
+        DELETE FROM telemetry WHERE gateway_id = test_gateway_id AND sensor_id = '__test_restrict_sensor';
+        DELETE FROM sensors WHERE gateway_id = test_gateway_id AND sensor_id = '__test_restrict_sensor';
+    END IF;
 
     BEGIN
         INSERT INTO user_gateways (user_id, gateway_id, role)

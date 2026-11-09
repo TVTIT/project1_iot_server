@@ -250,7 +250,7 @@ def prepare_remote(smoke, fixture, endpoint, registry, containers, images, state
         smoke.prepare_paper_workload(fixture, registry, endpoint, containers, images, state))
     schema = smoke.db_psql(registry, pg,
         "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
-    if schema != '24:telemetry_ledger_timestamp':
+    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
     broker = registry.resolve(containers['mosquitto'])
     ports = broker.get('NetworkSettings', {}).get('Ports', {}).get('8883/tcp') or []
@@ -3077,7 +3077,7 @@ def finish_remote_collection(smoke, fixture, endpoint, registry, containers, pre
             'generator_colocated': 'unverified',
             'physical_ab': 'NOT RUN',
             'source_fingerprint': source_fp,
-            'schema': prepared.get('schema', '24:telemetry_ledger_timestamp'),
+            'schema': prepared.get('schema', '25:drop_telemetry_sensor_fk'),
             'logical_topology': {'gateways': 2, 'sensors': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
             'workers': {'workers': 2, 'connections': 1, 'pending_messages': 64},
             'effective_flags': eff_flags,
@@ -4368,7 +4368,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, state, paperload
         smoke.prepare_paper_workload(fixture, registry, endpoint, containers, images, state))
     schema = smoke.db_psql(registry, pg,
         "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
-    if schema != '24:telemetry_ledger_timestamp':
+    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
     broker = registry.resolve(containers['mosquitto'])
     ports = broker.get('NetworkSettings', {}).get('Ports', {}).get('8883/tcp') or []
@@ -5111,14 +5111,14 @@ def prevalidate_e2_reference(report: dict, current_context: dict) -> bool:
         raise ValueError('server_reference_rejected')
 
     schema = report.get('schema')
-    if schema and schema != '24:telemetry_ledger_timestamp':
+    if schema and schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('server_reference_rejected')
 
     return True
 
 
 def validate_e2_reference(path, current_context: dict, *, current_source_fp=None,
-                          current_schema='24:telemetry_ledger_timestamp') -> dict:
+                          current_schema='25:drop_telemetry_sensor_fk') -> dict:
     """Validate bounded private reference report file and its immutable binaries/images."""
     if not path:
         raise ValueError('e2_reference_required')
@@ -5175,7 +5175,10 @@ def validate_e2_reference(path, current_context: dict, *, current_source_fp=None
             raise ValueError('e2_reference_source_mismatch')
 
     ref_schema = report.get('schema')
-    if ref_schema and ref_schema != current_schema:
+    if ref_schema and ref_schema != current_schema and not (
+        ref_schema in ('24:telemetry_ledger_timestamp', '25:drop_telemetry_sensor_fk') and
+        current_schema in ('24:telemetry_ledger_timestamp', '25:drop_telemetry_sensor_fk')
+    ):
         raise ValueError('e2_reference_schema_mismatch')
 
     raw_ids = report.get('image_ids') or report.get('images')
@@ -5513,7 +5516,7 @@ def compare_e2_reports(report_a: dict, report_b: dict) -> dict:
         mismatch_reasons.append('missing_required_field:schema')
     elif sch_1 != sch_100:
         mismatch_reasons.append(f'schema_mismatch: profile_1={sch_1} profile_100={sch_100}')
-    elif sch_1 != '24:telemetry_ledger_timestamp':
+    elif sch_1 not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         mismatch_reasons.append(f'schema_invalid:{sch_1}')
 
     # logical_topology

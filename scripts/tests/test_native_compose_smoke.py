@@ -2675,13 +2675,13 @@ class PaperP0Tests(unittest.TestCase):
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 24);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 25);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("24:telemetry_ledger_timestamp", expected)
+        self.assertIn("25:drop_telemetry_sensor_fk", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
 
@@ -2692,27 +2692,36 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertTrue(history23.endswith("23:sensor_control_intent"))
         self.assertTrue(smoke.schema_history_verified(
             0, history23, history23, terminal="23:sensor_control_intent"))
-        # The default verifier remains pinned to current terminal 24.
+        # The default verifier remains pinned to current terminal 25.
         self.assertFalse(smoke.schema_history_verified(0, history23, history23))
+
+    def test_historical_schema24_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history24 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 24)
+        self.assertTrue(history24.endswith("24:telemetry_ledger_timestamp"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history24, history24, terminal="24:telemetry_ledger_timestamp"))
+        self.assertFalse(smoke.schema_history_verified(0, history24, history24))
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",24:telemetry_ledger_timestamp")
+        stale = expected.removesuffix(",25:drop_telemetry_sensor_fk")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "24:telemetry_ledger_timestamp")
+        missing = ",".join(p for p in expected.split(",") if p != "25:drop_telemetry_sensor_fk")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("24:telemetry_ledger_timestamp", "24:unexpected_name")
+        wrong = expected.replace("25:drop_telemetry_sensor_fk", "25:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
         expected = smoke.expected_schema_history()
-        self.assertFalse(smoke.schema_history_verified(0, expected + ",24:future_migration", expected))
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",25:future_migration", expected))
 
     def test_failed_migration_returncode_rejected(self):
         expected = smoke.expected_schema_history()
@@ -2723,7 +2732,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("24:telemetry_ledger_timestamp", "25:future_migration")
+        future = expected.replace("25:drop_telemetry_sensor_fk", "26:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 

@@ -293,7 +293,7 @@ def restore_database(registry, fixture, source_item, archive_path, run_id, *, ti
                    'SELECT max(version)::text FROM public.schema_migrations;')
     extension = _psql(registry, container_id, target,
                       "SELECT extversion FROM pg_extension WHERE extname='timescaledb';")
-    if schema != '24' or not extension:
+    if schema not in ('24', '25') or not extension:
         raise ValueError('recovery_schema_or_extension_invalid')
     return {'status': 'restored', 'target_database': target,
             'schema_version': int(schema), 'timescaledb_ready': True}
