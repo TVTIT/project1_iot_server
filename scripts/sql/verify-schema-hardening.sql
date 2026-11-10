@@ -15,10 +15,12 @@ DECLARE
     test_command UUID;
     actor_scoped_receipts BOOLEAN := false;
     telemetry_sensor_fk_dropped BOOLEAN := false;
+    telemetry_indexes_pruned BOOLEAN := false;
 BEGIN
     IF to_regclass('public.schema_migrations') IS NOT NULL THEN
         SELECT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=23 AND name='sensor_control_intent') INTO actor_scoped_receipts;
         SELECT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=25 AND name='drop_telemetry_sensor_fk') INTO telemetry_sensor_fk_dropped;
+        SELECT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=26 AND name='drop_telemetry_redundant_indexes') INTO telemetry_indexes_pruned;
     END IF;
     IF NOT EXISTS (
         SELECT 1
@@ -113,6 +115,30 @@ BEGIN
           AND indexname = 'idx_twin_entities_gateway_type'
     ) THEN
         RAISE EXCEPTION 'Verification failed: twin ownership lookup index is missing';
+    END IF;
+
+    IF telemetry_indexes_pruned THEN
+        IF EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public' AND indexname = 'telemetry_message_sample'
+        ) THEN
+            RAISE EXCEPTION 'Verification failed: telemetry_message_sample index still exists after migration 26';
+        END IF;
+
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'public.telemetry'::regclass AND conname = 'telemetry_pkey'
+        ) THEN
+            RAISE EXCEPTION 'Verification failed: telemetry_pkey constraint still exists after migration 26';
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'telemetry'
+              AND indexname = 'idx_telemetry_gateway_sensor_time'
+        ) THEN
+            RAISE EXCEPTION 'Verification failed: idx_telemetry_gateway_sensor_time is missing on telemetry';
+        END IF;
     END IF;
 
     IF EXISTS (SELECT 1 FROM twin_entities WHERE gateway_id IS NULL) THEN

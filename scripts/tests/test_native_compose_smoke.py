@@ -2682,9 +2682,19 @@ class SchemaHistoryTests(unittest.TestCase):
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("25:drop_telemetry_sensor_fk", expected)
+        self.assertIn("26:drop_telemetry_redundant_indexes", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
+
+    def test_historical_schema25_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history25 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 25)
+        self.assertTrue(history25.endswith("25:drop_telemetry_sensor_fk"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history25, history25, terminal="25:drop_telemetry_sensor_fk"))
+        # The default verifier remains pinned to current terminal 26.
+        self.assertFalse(smoke.schema_history_verified(0, history25, history25))
 
     def test_historical_schema23_context_remains_explicitly_supported(self):
         expected = smoke.expected_schema_history()
@@ -2707,22 +2717,22 @@ class SchemaHistoryTests(unittest.TestCase):
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",25:drop_telemetry_sensor_fk")
+        stale = expected.removesuffix(",26:drop_telemetry_redundant_indexes")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "25:drop_telemetry_sensor_fk")
+        missing = ",".join(p for p in expected.split(",") if p != "26:drop_telemetry_redundant_indexes")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("25:drop_telemetry_sensor_fk", "25:unexpected_name")
+        wrong = expected.replace("26:drop_telemetry_redundant_indexes", "26:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
         expected = smoke.expected_schema_history()
-        self.assertFalse(smoke.schema_history_verified(0, expected + ",25:future_migration", expected))
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",26:future_migration", expected))
 
     def test_failed_migration_returncode_rejected(self):
         expected = smoke.expected_schema_history()
@@ -2733,7 +2743,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("25:drop_telemetry_sensor_fk", "26:future_migration")
+        future = expected.replace("26:drop_telemetry_redundant_indexes", "27:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 

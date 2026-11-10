@@ -187,7 +187,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state, arm,
     # Terminal schema migration check
     schema = smoke.db_psql(registry, pg,
         "SELECT version::text || ':' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;").strip()
-    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
+    if schema not in ('26:drop_telemetry_redundant_indexes', '25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
 
     # Mosquitto and Nginx remote readback (do not force loopback)

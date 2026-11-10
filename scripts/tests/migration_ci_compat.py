@@ -173,6 +173,15 @@ class Fixture:
         self.expect("SELECT count(*) FROM pg_trigger WHERE tgrelid='public.sensors'::regclass AND tgname='trg_sensors_restrict_telemetry';", '1')
         print('Migration 25 native telemetry FK removal and sensors reverse restrict trigger passed.', flush=True)
 
+        migration26 = (ROOT / 'migrations/000026_drop_telemetry_redundant_indexes.up.sql').read_text()
+        self.sql(migration26)
+        self.sql(migration26)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=26 AND name='drop_telemetry_redundant_indexes';", '1')
+        self.expect("SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='telemetry_message_sample';", '0')
+        self.expect("SELECT count(*) FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='telemetry_pkey';", '0')
+        self.expect("SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='idx_telemetry_gateway_sensor_time';", '1')
+        print('Migration 26 native redundant index removal on telemetry passed.', flush=True)
+
     def cleanup(self):
         if self.id is None:
             return

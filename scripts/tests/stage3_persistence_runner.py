@@ -212,7 +212,7 @@ def common_graph_seed(fixture):
 
 
 def apply_post_auth_compatibility(fixture):
-    """Apply the compatible 21-25 tail required by current telemetry writers."""
+    """Apply the compatible 21-26 tail required by current telemetry writers."""
     fixture.sql(b"CREATE SCHEMA IF NOT EXISTS auth; CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}');")
     fixture.sql((MIGRATIONS / '000004_supabase_compat.up.sql').read_bytes())
     for version, name in (
@@ -220,12 +220,13 @@ def apply_post_auth_compatibility(fixture):
             (22, 'gateway_membership_revocation'),
             (23, 'sensor_control_intent'),
             (24, 'telemetry_ledger_timestamp'),
-            (25, 'drop_telemetry_sensor_fk')):
+            (25, 'drop_telemetry_sensor_fk'),
+            (26, 'drop_telemetry_redundant_indexes')):
         fixture.sql((MIGRATIONS / f'{version:06d}_{name}.up.sql').read_bytes())
-    _, history = fixture.sql(b"SELECT version || ':' || name FROM schema_migrations WHERE version BETWEEN 21 AND 25 ORDER BY version;")
+    _, history = fixture.sql(b"SELECT version || ':' || name FROM schema_migrations WHERE version BETWEEN 21 AND 26 ORDER BY version;")
     expected = (b'21:admin_user_management', b'22:gateway_membership_revocation',
                 b'23:sensor_control_intent', b'24:telemetry_ledger_timestamp',
-                b'25:drop_telemetry_sensor_fk')
+                b'25:drop_telemetry_sensor_fk', b'26:drop_telemetry_redundant_indexes')
     if not all(row in history for row in expected):
         raise RuntimeError(f'post-Auth compatibility history mismatch: {history!r}')
 

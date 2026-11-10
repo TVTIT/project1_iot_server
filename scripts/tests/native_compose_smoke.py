@@ -45,7 +45,7 @@ SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
 # of accepting any suffix keeps a missing, extra, renamed, or wrong-version
 # history failing closed; a newly supported migration must update this pin
 # explicitly rather than being silently accepted.
-EXPECTED_SCHEMA_TERMINAL = "25:drop_telemetry_sensor_fk"
+EXPECTED_SCHEMA_TERMINAL = "26:drop_telemetry_redundant_indexes"
 
 
 def expected_schema_history(directory=None):
@@ -1378,6 +1378,7 @@ def validate_effective_model(fixture, model):
             str(ROOT / "migrations/000023_sensor_control_intent.up.sql"): "/migrations/000023_sensor_control_intent.up.sql",
             str(ROOT / "migrations/000024_telemetry_ledger_timestamp.up.sql"): "/migrations/000024_telemetry_ledger_timestamp.up.sql",
             str(ROOT / "migrations/000025_drop_telemetry_sensor_fk.up.sql"): "/migrations/000025_drop_telemetry_sensor_fk.up.sql",
+            str(ROOT / "migrations/000026_drop_telemetry_redundant_indexes.up.sql"): "/migrations/000026_drop_telemetry_redundant_indexes.up.sql",
         },
         "supabase-envoy": {str(ROOT / "config/envoy" / name): target for name, target in (
             ("envoy.yaml", "/etc/envoy/envoy.yaml"), ("cds.yaml", "/etc/envoy/cds.yaml"),
@@ -1520,7 +1521,7 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_rootfs_rejected")
     commands = {"application-migrations": ["/bin/sh", "/run-migrations.sh"],
                 "supabase-role-provisioner": ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"],
-                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql']}
+                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000026_drop_telemetry_redundant_indexes.up.sql']}
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})

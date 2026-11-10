@@ -1531,7 +1531,7 @@ def prepare(smoke, fixture, endpoint, registry, containers, images, state,
     flags = _flag_profile(effective, cache_mode)
     schema = smoke.db_psql(registry, pg,
         'SELECT version::text || \':\' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;').strip()
-    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
+    if schema not in ('26:drop_telemetry_redundant_indexes', '25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         raise ValueError('p8_schema_terminal_rejected')
     broker = registry.resolve(containers['mosquitto'])
     mappings = broker.get('NetworkSettings', {}).get('Ports', {}).get('8883/tcp') or []
@@ -2772,7 +2772,7 @@ def _run_cold_replay(smoke, fixture, endpoint, registry, containers, paperload_b
             stop_error = _stop_collector_and_process(collector, process)
             if stop_error:
                 report.setdefault('cleanup_errors', []).append('cold_collector_stop_' + type(stop_error).__name__)
-    if process is None or process.returncode != 0 or collector.errors or schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
+    if process is None or process.returncode != 0 or collector.errors or schema not in ('26:drop_telemetry_redundant_indexes', '25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp'):
         return {'status': 'FAIL', 'reason': 'runner_or_schema_failure', 'schema': schema}
     result = json.loads((out / 'workload.json').read_text(encoding='utf-8'))
     after_metrics = _support._admin_metrics(smoke, endpoint, tokens['admin'])

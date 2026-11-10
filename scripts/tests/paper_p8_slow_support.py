@@ -81,7 +81,7 @@ def run(smoke, fixture, endpoint, registry, containers, images, lifecycle_state)
         raise ValueError('p8_slow_effective_profile_rejected')
     schema = smoke.db_psql(registry, pg,
         'SELECT version::text || \':\' || name FROM schema_migrations ORDER BY version DESC LIMIT 1;').strip()
-    if schema not in ('25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp') or len(specs) < 2:
+    if schema not in ('26:drop_telemetry_redundant_indexes', '25:drop_telemetry_sensor_fk', '24:telemetry_ledger_timestamp') or len(specs) < 2:
         raise ValueError('p8_slow_schema_or_targets_rejected')
 
     target_a, target_b = specs[0], specs[1]

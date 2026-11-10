@@ -54,7 +54,7 @@ from task26_harness_helpers import RESPONSE  # noqa: E402
 
 # --- Pinned Constants and Timeouts -------------------------------------------
 
-TERMINAL_SCHEMA_VERSION = 25
+TERMINAL_SCHEMA_VERSION = 26
 
 
 def expected_stage4_schema_history() -> list[str]:
