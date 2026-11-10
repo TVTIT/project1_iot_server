@@ -59,6 +59,22 @@ Tài liệu này tổng hợp ngắn gọn chuỗi 6 giải pháp tối ưu hóa
   - Ngân sách bộ nhớ RAM của 4 workers với kích thước lô mới là $\approx 24,5\text{ MiB}$, hoàn toàn nằm sâu bên dưới trần an toàn `MaxIngressQueueMemoryBytes` (256 MiB).
 - **Kết quả:** Số lần gọi `COMMIT` ở kịch bản $S=100$ giảm tới **12,8 lần** (từ 2.000 lần xuống ~156 lần trong 10s), triệt tiêu hoàn toàn áp lực ép đĩa `WALSync`, nâng mạnh năng lực nuốt của 2 Sensor leases.
 
+### 1.7 Tối ưu 7 — Migration 26: Gỡ bỏ Chỉ mục B-Tree Trùng lặp trên Bảng Telemetry
+- **Vấn đề trước tối ưu:** Bảng `telemetry` duy trì đồng thời 3 B-Tree indexes: `telemetry_pkey (measured_at, sample_id)`, `telemetry_message_sample (measured_at, gateway_id, message_id, sample_index)`, và `idx_telemetry_gateway_sensor_time (gateway_id, sensor_id, measured_at DESC)`.
+  - Khảo sát mã nguồn thực tế chứng minh:
+    1. `telemetry_message_sample` dư thừa 100%: việc chống trùng bản tin được giải quyết triệt để tại bảng sổ cái `processed_messages (gateway_id, message_id)`. Mã nguồn Go backend không bao giờ nạp các bản tin trùng vào bảng `telemetry`.
+    2. `telemetry_pkey` không bao giờ được bất kỳ câu truy vấn đọc API nào sử dụng (các câu query đọc luôn lọc theo `(gateway_id, sensor_id)` nên sử dụng `idx_telemetry_gateway_sensor_time`). Đồng thời, TimescaleDB Hypertable không bắt buộc phải có Primary Key (tương tự như hypertable `twin_temporal_values`).
+  - Việc duy trì 3 cây B-Tree cho hàng triệu bản ghi tạo ra áp lực ghi đĩa WAL khổng lồ (49,34 MiB/s trong Run22), làm nghẽn cổ chai ổ đĩa và chiếm tới 75% CPU trong lệnh `COPY`.
+- **Giải pháp (Migration 26 - `000026_drop_telemetry_redundant_indexes`):**
+  - Gỡ bỏ partial unique index `telemetry_message_sample`.
+  - Gỡ bỏ ràng buộc Primary Key không cần thiết `telemetry_pkey`.
+  - Giữ lại duy nhất 1 index phục vụ đọc: `idx_telemetry_gateway_sensor_time`.
+  - Cung cấp script rollback an toàn: `scripts/sql/rollback-migration-000026.sql`.
+- **Kết quả định lượng (Đo đạc trên 6.400 dòng/group):**
+  - Thời gian chèn `COPY` 6.400 dòng giảm từ **$91,20\text{ ms}$ xuống $69,32\text{ ms}$ (nhanh hơn 24% CPU)**.
+  - Dung lượng WAL sinh ra giảm từ **$3,16\text{ MiB}$ xuống $2,29\text{ MiB}$/group (tiết kiệm 27,5% WAL)**.
+  - Lưu lượng ghi đĩa giảm từ $49,34\text{ MiB/s}$ về $\approx 32 - 35\text{ MiB/s}$, đưa thời gian chờ I/O đĩa `await` từ $10,09\text{ ms}$ về mức an toàn $\approx 4 - 5\text{ ms/op}$.
+
 ---
 
 ## 2. Ghi chú Kỹ thuật về Đề xuất L2 (Set-based SQL / Multi-row)
