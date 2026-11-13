@@ -1,0 +1,29 @@
+{
+  "schema": "p8-checkpoint-safe-v1",
+  "status": "SOURCE_QUALIFIED_LOCAL_CHECKPOINT",
+  "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+  "source_dirty_sha256": "b73d86246e44e5d0c4afa6c46fc4c74459170b769cbe1e0bdbc95318aa168800",
+  "go_format_vet_lint_build_full_race": "PASS",
+  "required_guards_passed": 35,
+  "coverage_percent": 77.7,
+  "coverage_gate": false,
+  "native_optin_skip_events": 106,
+  "selected_python_guards_harnesses": "PASS",
+  "full_python_discovery": "NOT_RUN",
+  "remote_github_ci": "NOT_RUN",
+  "artifact_digests": [
+    {"logical_artifact_id": "p812-final-source-20261029", "raw_report_sha256": "975c59cc714ca5ac1cf97570f25b851b9bee0789b288758674eb686f4395b4b9"},
+    {"logical_artifact_id": "p812-db-auth-retry-20261029", "raw_report_sha256": "f6012de59f79e3d44a9b07a297ec0a6f0d26e38d19c4fc574c3fcc054d1ddcfe"},
+    {"logical_artifact_id": "p812-native-mqtt-20261028", "raw_report_sha256": "906d173c90d92b294ccb241f9e014b34df344e1f6cf2d594703bcb8886b32683"},
+    {"logical_artifact_id": "p812-stage3-persistence", "evidence_index_file": "persistence.index", "evidence_index_sha256": "bc61de56a29823f2c1f3214e10e9dcef95cd4a1e2d20879057d57454f33287cb"},
+    {"logical_artifact_id": "p812-stage3-uplink", "evidence_index_file": "uplink.index", "evidence_index_sha256": "5133813b98bca143f5aece0babf38d86b66dbf4903f0452374d4c03fc62b26e7"},
+    {"logical_artifact_id": "p812-stage4-api", "raw_report_sha256": "76f7962d64d921e906832d1930173694d82350b9cc7a304c2664c2f268c6e1d8"},
+    {"logical_artifact_id": "p812-final-compose-docker", "evidence_index_file": "command-index.txt", "evidence_index_sha256": "bcd38defbb87763825230bdf53f12a4a80fdf4262a56092132993b24c0918549"}
+  ],
+  "compose_http_rbac_jwt": {"status": "PASS", "role_denials": 14, "jwt_denials": 9, "cleanup": {"containers": 10, "networks": 1, "volumes": 3}},
+  "stage3": {"persistence_fresh_upgrade_rollback": "PASS", "uplink_scenarios": 9},
+  "stage4": {"status": "PASS", "raw_rows": 60000, "temporal_rows": 580, "compressed_chunks": 2},
+  "migration_readiness_first_failure": "FAIL_RETAINED_CAUSE_UNKNOWN",
+  "deferred_legacy_supervisor_reloader_jobs": "DEFERRED",
+  "full_p8_accepted": false
+}

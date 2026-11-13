@@ -12,7 +12,7 @@ import stage2_ci as ci
 
 class Functional(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir='/tmp/opencode')
+        self.tmp = tempfile.TemporaryDirectory(dir='/var/tmp/opencode')
         self.base = Path(self.tmp.name)
         self.run_id = '12345678' + 'a' * 24
         self.owner = {'run_id': self.run_id, 'directory': str(self.base / 'fixture'),

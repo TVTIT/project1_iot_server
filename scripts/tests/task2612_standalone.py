@@ -24,6 +24,53 @@ from task26_harness_helpers import require
 
 CONFIG_ID = 'sha256:d25945831d6b8935b016caacc6f612ad4876ba124601b240e64953886cf264b4'
 PLATFORM = 'linux/amd64'
+BACKEND_OWNER_LABEL = 'io.iot.standalone-backend'
+
+
+def backend_volume_masks():
+    """The Go executable does not use the Mosquitto image's declared volumes."""
+    return [part for path in ('/mosquitto/data', '/mosquitto/log')
+            for part in ('--tmpfs', path + ':rw,nosuid,noexec,size=1048576,uid=1883,gid=1883')]
+
+
+def capture_backend_receipt(name, reference=None):
+    objects = json.loads(run(['docker', 'container', 'inspect', reference or name], capture=True, timeout=10))
+    require(len(objects) == 1, 'backend ownership inspection failed')
+    obj = objects[0]
+    require(obj.get('Name') == '/' + name and
+            (obj.get('Config', {}).get('Labels') or {}).get(BACKEND_OWNER_LABEL) == name,
+            'backend ownership mismatch')
+    identifier = obj.get('Id', '')
+    require(re.fullmatch('[a-f0-9]{64}', identifier) is not None, 'backend identity invalid')
+    # /security and /control are explicit named mounts owned by the broker
+    # fixture. Never remove them as anonymous backend volumes.
+    volumes = sorted(m['Name'] for m in obj.get('Mounts', [])
+                     if m['Type'] == 'volume' and m['Destination'] not in ('/security', '/control'))
+    return {'name': name, 'container_id': identifier, 'anonymous_volumes': volumes}
+
+
+def remove_owned_backend(receipt):
+    current = capture_backend_receipt(receipt['name'], receipt['container_id'])
+    require(current == receipt, 'backend identity or mounts changed')
+    run(['docker', 'rm', '-f', '-v', receipt['container_id']], capture=True, timeout=30)
+    remaining = run(['docker', 'container', 'ls', '-aq', '--no-trunc', '--filter',
+                     'id=' + receipt['container_id']], capture=True, timeout=10)
+    require(not remaining.strip(), 'owned backend cleanup failed')
+    for volume in receipt['anonymous_volumes']:
+        remaining = run(['docker', 'volume', 'ls', '-q', '--filter', 'name=^' + volume + '$'],
+                        capture=True, timeout=10).decode().splitlines()
+        require(volume not in remaining, 'owned backend volume cleanup failed')
+    print('Owned backend cleanup verified: ' + receipt['container_id'] +
+          ' anonymous_volumes=' + str(len(receipt['anonymous_volumes'])), flush=True)
+
+
+def cleanup_backend_if_present(name):
+    # A failed daemon query is not evidence of absence; run raises on error.
+    ids = run(['docker', 'container', 'ls', '-aq', '--no-trunc', '--filter',
+               'name=^/' + name + '$'], capture=True, timeout=10).decode().splitlines()
+    if ids:
+        require(len(ids) == 1, 'backend ownership ambiguous')
+        remove_owned_backend(capture_backend_receipt(name, ids[0]))
 
 
 def build_standalone_environment(payload, jwt_secret, spike, enabled=True, current=False):
@@ -89,13 +136,14 @@ def startup_diagnosis(backend, proxy, network, last, secrets_to_redact):
     # credential env, volume, or response body. Docker execution itself is bounded.
     direct = collect(['run', '--rm', '--name', backend + '-readiness', '--network', network,
                       '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true',
+                      *backend_volume_masks(),
                       '--entrypoint', 'wget', IMAGE, '-S', '-O', '/dev/null', '-T', '2',
                       'http://' + backend + ':8080/readyz'])
     statuses = re.findall(rb'HTTP/\S+\s+(\d{3})', direct.stdout)
     direct_status = 'http:' + statuses[-1].decode() if statuses else 'network-or-tool-error'
     # Even a timed-out docker CLI can leave its container behind. Cleanup must
     # succeed; the outer fixture also owns this name in its final cleanup.
-    cleanup = collect(['rm', '-f', backend + '-readiness'])
+    cleanup = collect(['rm', '-f', '-v', backend + '-readiness'])
     require(cleanup.returncode == 0, 'direct readiness probe cleanup failed')
     sections = [f'standalone startup timeout: proxy={last}; direct={direct_status}']
     for name in (backend, proxy):
@@ -179,22 +227,31 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
     env_file = directory / 'server.env'
 
     def start(enabled=True, bad_auth=False):
-        run(['docker', 'rm', '-f', backend], capture=True) if exists() else None
+        cleanup_backend_if_present(backend)
         values = build_standalone_environment(payload, jwt_secret, spike, enabled=enabled, current=current)
         if bad_auth:
             require(current and enabled, 'bad auth is current isolated startup control only')
             values['MQTT_DYNSEC_MANAGER_PASSWORD'] = spike.passwords['new']
         env_file.write_text(''.join(k + '=' + v + '\n' for k, v in values.items()))
         env_file.chmod(0o600)
-        args = ['docker', 'run', '-d', '--name', backend, '--network', network,
+        args = ['docker', 'create', '--name', backend, '--network', network,
+                '--label', BACKEND_OWNER_LABEL + '=' + backend,
                 '--user', '1883:1883', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true',
-                '--env-file', str(env_file), '--mount', f'type=bind,src={directory}/server,dst=/server,readonly']
+                '--env-file', str(env_file), *backend_volume_masks(),
+                '--mount', f'type=bind,src={directory}/server,dst=/server,readonly']
         if enabled:
             args += ['--mount', f'type=bind,src={directory}/ca.crt,dst=/ca.crt,readonly',
                      '--mount', 'type=volume,src=' + mounts['/security'] + ',dst=/security,readonly']
             if not current:
                 args += ['--mount', 'type=volume,src=' + mounts['/control'] + ',dst=/control']
         run(args + ['--entrypoint', '/server', IMAGE], capture=True)
+        receipt = capture_backend_receipt(backend)
+        receipts_file = directory / 'backend-receipts.json'
+        receipts = json.loads(receipts_file.read_text()) if receipts_file.exists() else []
+        receipts.append(receipt)
+        receipts_file.write_text(json.dumps(receipts))
+        receipts_file.chmod(0o600)
+        run(['docker', 'start', receipt['container_id']], capture=True, timeout=30)
         ready, last = wait_ready(lambda timeout: readiness_status(port, tls, timeout),
                                  expected_status=503 if bad_auth else 200)
         if ready:
@@ -207,10 +264,6 @@ def acceptance(directory, spike, database, backend, proxy, network, mounts, payl
                                 *spike.passwords.values(), *observed_secrets,
                                 *[v for k, v in values.items() if 'PASSWORD' in k]]), flush=True)
         raise RuntimeError('standalone startup failed')
-
-    def exists():
-        return subprocess.run(['docker', 'inspect', backend], env=ENV, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL).returncode == 0
 
     port = int(run(['docker', 'port', proxy, '8443/tcp'], capture=True).decode().strip().rsplit(':', 1)[1])
     tls = ssl.create_default_context(cafile=str(directory / 'ca.crt'))

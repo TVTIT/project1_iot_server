@@ -111,6 +111,28 @@ type fakePublisher struct {
 	onPublish func(context.Context, Delivery) error
 }
 
+type recordingBatchSink struct {
+	mu      sync.Mutex
+	batches []telemetry.BatchDTO
+	times   []time.Time
+	reject  bool
+}
+
+func (s *recordingBatchSink) TrySubmitBatch(batch telemetry.BatchDTO, observedAt time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batch.Samples = append([]float64(nil), batch.Samples...)
+	s.batches = append(s.batches, batch)
+	s.times = append(s.times, observedAt)
+	return !s.reject
+}
+
+func (s *recordingBatchSink) snapshot() []telemetry.BatchDTO {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]telemetry.BatchDTO(nil), s.batches...)
+}
+
 func (p *fakePublisher) Publish(ctx context.Context, d Delivery) error {
 	p.mu.Lock()
 	p.calls++
@@ -348,6 +370,59 @@ func TestACKOnlyAfterConfirmedCommit(t *testing.T) {
 	}
 }
 
+func TestPostCommitSinkOnlyForConfirmedNewCommitIndependentOfACK(t *testing.T) {
+	sink := &recordingBatchSink{}
+	repo := &fakeRepo{enter: make(chan *telemetry.Message, 2), release: make(chan struct{})}
+	pub := &fakePublisher{onPublish: func(context.Context, Delivery) error { return errors.New("ack unavailable") }}
+	opts := defaultOptions()
+	opts.PostCommitSink = sink
+	ing := newIngress(t, opts, newValidator(t), repo, pub)
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 2)
+	if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+		t.Fatalf("Admit = %v", got)
+	}
+	waitMessage(t, repo.enter)
+	if got := len(sink.snapshot()); got != 0 {
+		t.Fatalf("sink called before Persist returned: %d", got)
+	}
+	close(repo.release)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	batches := sink.snapshot()
+	if len(batches) != 1 || batches[0].MessageID != testMessageID || batches[0].SampleCount != 2 || len(batches[0].Samples) != 2 {
+		t.Fatalf("post-commit batches = %+v, want one persisted batch", batches)
+	}
+	if got := ing.Snapshot(); got.Committed != 1 || got.ACKPublishFailures != 1 {
+		t.Fatalf("sink changed commit/ACK outcome: %+v", got)
+	}
+}
+
+func TestPostCommitSinkRejectAndDuplicateAreIndependent(t *testing.T) {
+	sink := &recordingBatchSink{reject: true}
+	repo := &fakeRepo{onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
+		return duplicateResult(m), nil
+	}}
+	opts := defaultOptions()
+	opts.PostCommitSink = sink
+	ing := newIngress(t, opts, newValidator(t), repo, &fakePublisher{})
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 1)
+	if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+		t.Fatalf("Admit = %v", got)
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sink.snapshot()); got != 0 {
+		t.Fatalf("duplicate submitted %d events", got)
+	}
+	if got := ing.Snapshot(); got.DuplicateCommitted != 1 || got.ACKPublished != 1 {
+		t.Fatalf("sink changed duplicate ACK outcome: %+v", got)
+	}
+}
+
 func TestDuplicateCommittedReACKs(t *testing.T) {
 	repo := &fakeRepo{onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
 		return duplicateResult(m), nil
@@ -413,6 +488,19 @@ func TestNoACKOnErrorUnconfirmedOrMismatch(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "mismatched boot identity suppresses the ACK",
+			onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
+				r := committedResult(m)
+				r.Identity.BootID = uuid.New()
+				return r, nil
+			},
+			assertSnap: func(t *testing.T, s Snapshot) {
+				if s.IdentityMismatch != 1 || s.ACKPublished != 0 {
+					t.Fatalf("snapshot = %+v", s)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -434,6 +522,230 @@ func TestNoACKOnErrorUnconfirmedOrMismatch(t *testing.T) {
 			}
 			tt.assertSnap(t, ing.Snapshot())
 		})
+	}
+}
+
+func TestConfirmedCountersAreIndependentOfACKPublish(t *testing.T) {
+	pub := &fakePublisher{onPublish: func(context.Context, Delivery) error {
+		return errors.New("broker unavailable")
+	}}
+	ing := newIngress(t, defaultOptions(), newValidator(t), &fakeRepo{}, pub)
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 2)
+	if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+		t.Fatalf("Admit = %v, want accepted", got)
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain = %v", err)
+	}
+	snap := ing.Snapshot()
+	if snap.Committed != 1 || snap.SamplesNew != 2 || snap.ACKPublished != 0 || snap.ACKPublishFailures != 1 {
+		t.Fatalf("confirmed result counters must survive ACK failure: %+v", snap)
+	}
+}
+
+func TestSingleCommittedDeliveryWarmsSharedCacheAndRetrySkipsRepository(t *testing.T) {
+	repo := &fakeRepo{}
+	pub := &fakePublisher{}
+	opts := defaultOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 8, MaxBytes: 4096}
+	ing := newIngress(t, opts, newValidator(t), repo, pub)
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 2)
+	for n := 0; n < 2; n++ {
+		if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+			t.Fatalf("Admit = %v", got)
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls := repo.count(); calls != 1 {
+		t.Fatalf("Persist calls = %d, want 1", calls)
+	}
+	snap := ing.Snapshot()
+	if snap.Committed != 1 || snap.DuplicateCommitted != 1 || snap.SamplesNew != 2 || snap.ACKPublished != 2 {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+}
+
+func TestSingleCommitProofSurvivesACKFailure(t *testing.T) {
+	repo := &fakeRepo{}
+	pub := &fakePublisher{onPublish: func(context.Context, Delivery) error { return errors.New("ack unavailable") }}
+	opts := defaultOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 8, MaxBytes: 4096}
+	ing := newIngress(t, opts, newValidator(t), repo, pub)
+	mustStart(t, ing)
+	topic, payload, receivedAt := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 1)
+	for n := 0; n < 2; n++ {
+		if got := ing.Admit(topic, payload, receivedAt, false); got != AdmissionAccepted {
+			t.Fatalf("Admit = %v", got)
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap := ing.Snapshot()
+	if repo.count() != 1 || snap.Committed != 1 || snap.DuplicateCommitted != 1 || snap.ACKPublishFailures != 2 {
+		t.Fatalf("repo calls=%d snapshot=%+v", repo.count(), snap)
+	}
+}
+
+func TestDatabaseDuplicateDoesNotWarmCache(t *testing.T) {
+	repo := &fakeRepo{onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
+		return duplicateResult(m), nil
+	}}
+	opts := defaultOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 8, MaxBytes: 4096}
+	ing := newIngress(t, opts, newValidator(t), repo, &fakePublisher{})
+	mustStart(t, ing)
+	topic, payload, at := testPayloadFor(t, "gateway_001", "sensor_001", testMessageID, testBootID, 1)
+	for n := 0; n < 2; n++ {
+		if got := ing.Admit(topic, payload, at, false); got != AdmissionAccepted {
+			t.Fatalf("Admit = %v", got)
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repo.count() != 2 || ing.dedupCache.Snapshot().Entries != 0 {
+		t.Fatalf("Persist calls=%d cache=%+v", repo.count(), ing.dedupCache.Snapshot())
+	}
+}
+
+func TestPendingSameKeyDeliveriesBothRemainDatabaseResponsibilities(t *testing.T) {
+	entered := make(chan *telemetry.Message, 2)
+	release := make(chan struct{})
+	repo := &fakeRepo{enter: entered, release: release}
+	pub := &fakePublisher{}
+	opts := defaultOptions()
+	opts.WorkerCount = 2
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	ing, err := New(opts, newValidator(t), repo, pub, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStart(t, ing)
+	topic, payload, received := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 1)
+	for range 2 {
+		if got := ing.Admit(topic, payload, received, false); got != AdmissionAccepted {
+			t.Fatal(got)
+		}
+	}
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("both deliveries did not reach blocked persistence")
+		}
+	}
+	if got := repo.count(); got != 2 {
+		t.Fatalf("Persist calls before commit=%d, want 2", got)
+	}
+	if pub.count() != 0 || ing.dedupCache.Snapshot().Entries != 0 {
+		t.Fatalf("pending result exposed ACK/proof early: ACKs=%d cache=%+v", pub.count(), ing.dedupCache.Snapshot())
+	}
+	close(release)
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pub.count() != 2 {
+		t.Fatalf("ACKs=%d, want both DB-confirmed deliveries", pub.count())
+	}
+	if got := ing.dedupCache.Snapshot().Entries; got != 1 {
+		t.Fatalf("confirmed cache entries=%d, want canonical single proof", got)
+	}
+}
+
+func TestExpiredProofUsesDatabaseAndDuplicateDoesNotRenewTTL(t *testing.T) {
+	clock := &dedupTestClock{now: time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)}
+	calls := 0
+	repo := &fakeRepo{onPersist: func(_ context.Context, m *telemetry.Message) (telemetry.PersistResult, error) {
+		calls++
+		if calls == 1 {
+			return committedResult(m), nil
+		}
+		return duplicateResult(m), nil
+	}}
+	pub := &fakePublisher{}
+	pub.onPublish = func(context.Context, Delivery) error {
+		if calls == 1 {
+			clock.Add(DedupTTL)
+		}
+		return nil
+	}
+	opts := defaultOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 4, MaxBytes: 4096}
+	ing, err := New(opts, newValidator(t), repo, pub, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ing.setClock(clock)
+	mustStart(t, ing)
+	topic, payload, received := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 1)
+	for n := 0; n < 2; n++ {
+		if ing.Admit(topic, payload, received, false) != AdmissionAccepted {
+			t.Fatal("admit failed")
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repo.count() != 2 || pub.count() != 2 {
+		t.Fatalf("expired replay did not fall back: db=%d ACK=%d", repo.count(), pub.count())
+	}
+	if got := ing.dedupCache.Snapshot().Entries; got != 1 {
+		t.Fatalf("DB duplicate replaced/renewed proof: entries=%d", got)
+	}
+	message, err := newValidator(t).Validate(topic, payload, received)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, metadata, ok := buildDedupMetadata(message, clock.Now())
+	if !ok || ing.dedupCache.Lookup(key, metadata) != dedupLookupExpired {
+		t.Fatal("DB duplicate renewed the ten-minute proof")
+	}
+	snapshot := ing.Snapshot()
+	if snapshot.Committed != 1 || snapshot.DuplicateCommitted != 1 || snapshot.SamplesNew != 1 {
+		t.Fatalf("expired replay changed new/raw accounting: %+v", snapshot)
+	}
+}
+
+func TestFullCacheDoesNotBlockCommittedPersistenceAndMissFallsBackToDatabase(t *testing.T) {
+	opts := defaultOptions()
+	opts.RAMDedup = DedupCacheOptions{Enabled: true, MaxEntries: 1, MaxBytes: 4096}
+	repo := &fakeRepo{}
+	pub := &fakePublisher{}
+	ing := newIngress(t, opts, newValidator(t), repo, pub)
+	// Fill the sole slot with a canonical confirmed proof.
+	topic, payload, received := testPayloadFor(t, "gateway_001", "sensor_001", uuid.New(), testBootID, 1)
+	message, err := newValidator(t).Validate(topic, payload, received)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, proof, ok := buildDedupMetadata(message, time.Now().UTC())
+	if !ok || ing.dedupCache.Publish(key, proof) != dedupPublishStored {
+		t.Fatal("failed to seed full cache")
+	}
+	mustStart(t, ing)
+	freshTopic, freshPayload, freshAt := testPayloadFor(t, "gateway_001", "sensor_002", uuid.New(), testBootID, 1)
+	if ing.Admit(topic, payload, received, false) != AdmissionAccepted {
+		t.Fatal("canonical hit admit failed")
+	}
+	for n := 0; n < 2; n++ {
+		if ing.Admit(freshTopic, freshPayload, freshAt, false) != AdmissionAccepted {
+			t.Fatal("admit failed")
+		}
+	}
+	if err := ing.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := ing.dedupCache.Snapshot()
+	if snapshot.Entries != 1 || snapshot.LogicalBytes > opts.RAMDedup.MaxBytes {
+		t.Fatalf("cache exceeded combined caps: %+v", snapshot)
+	}
+	if repo.count() != 2 || pub.count() != 3 {
+		t.Fatalf("full-cache new/fallback/canonical hit: db=%d ACK=%d", repo.count(), pub.count())
 	}
 }
 

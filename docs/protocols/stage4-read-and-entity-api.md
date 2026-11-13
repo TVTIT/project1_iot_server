@@ -331,7 +331,7 @@ Nguồn: migration 1; provenance/PK mới ở migration 20.
   WHERE message_id IS NOT NULL`.
 - Index range `idx_telemetry_gateway_sensor_time (gateway_id, sensor_id, measured_at DESC)`
   (migration 1).
-- FK `fk_telemetry_sensor (gateway_id, sensor_id) → sensors ON DELETE RESTRICT` (migration 8).
+- FK `fk_telemetry_sensor (gateway_id, sensor_id) → sensors ON DELETE RESTRICT` (migration 8, được gỡ bỏ tại migration 25 để triệt tiêu per-row trigger overhead khi COPY và chuyển thành trigger đảo chiều `trg_sensors_restrict_telemetry` trên bảng `sensors`).
 - Hypertable `measured_at`, chunk 1 ngày; compression 7 ngày segment `gateway_id, sensor_id`,
   order `measured_at DESC, sequence_num DESC`. Retention TẮT.
 

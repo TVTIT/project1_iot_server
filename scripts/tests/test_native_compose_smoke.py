@@ -1,5 +1,6 @@
 """Preparation and preflight regression tests; these tests never contact Docker."""
 import base64
+import copy
 from contextlib import ExitStack
 import dataclasses
 import importlib.util
@@ -21,6 +22,1052 @@ spec.loader.exec_module(smoke)
 
 
 class PreparationTests(unittest.TestCase):
+    def test_lifecycle_hold_reads_deadline_from_initialized_supervisor_state(self):
+        from scripts.tests import dynsec_bootstrap_cli as lifecycle
+        from scripts.tests import paper_p8_supervisor as supervisor
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); root.chmod(0o700)
+            with lifecycle.cancellation_scope() as cancellation_state:
+                session = {}
+                # This is the hold callback's real input type; it is not session state.
+                self.assertIsInstance(cancellation_state, lifecycle.CancellationState)
+                session['state'] = supervisor.initialize(root, experiment='E2', arm='pilot',
+                    seed=86, deadline_seconds=900, receipts=[],
+                    preparation_status='E2_PREPARED')
+                prepared = {}
+                smoke.paper_p8_bind_initialized_session_deadline(session, prepared)
+
+                self.assertIs(prepared['session_deadline_monotonic'],
+                    session['state']['deadline_monotonic'])
+                self.assertIs(session['session_deadline_monotonic'],
+                    session['state']['deadline_monotonic'])
+                self.assertNotIn('get', vars(cancellation_state))
+
+    def test_official_e2_fixture_flags_use_fixture_profile(self):
+        from types import SimpleNamespace
+        from scripts.tests import paper_p8_e2_support as e2
+
+        effective = {'services': {'backend': {'environment': {
+            'WEBSOCKET_ENABLED': 'false', 'STAGE5_ENABLED': 'false',
+            'STAGE5_WAKEUP_ENABLED': 'false', 'MQTT_SHAPER_ENABLED': 'true',
+            'MQTT_MICROBATCH_ENABLED': 'true', 'MQTT_RAM_DEDUP_ENABLED': 'false',
+            'MQTT_SHAPER_RATE_PER_SECOND': '55', 'MQTT_SHAPER_BURST': '55',
+            'MQTT_MICROBATCH_MAX_MESSAGES': '64', 'MQTT_MICROBATCH_MAX_ROWS': '6400',
+            'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
+            'MQTT_MICROBATCH_MAX_WAIT': '50ms'}}}}
+        fixture = SimpleNamespace(paper_p8_profile='official',
+            paper_p8_e2_offered_rate=100, paper_p8_e2_burst_messages=0,
+            paper_p8_e2_samples_per_message=100)
+        flags = smoke.paper_p8_e2_validate_fixture_flags(effective,
+            e2_support=e2, fixture=fixture)
+        self.assertEqual(flags['MQTT_SHAPER_RATE_PER_SECOND'], '55')
+
+    def test_held_e1_begin_uses_prepared_manifests_and_session_budget(self):
+        from scripts.tests import paper_p8_e1_support as e1
+        from scripts.tests import paper_p8_supervisor as supervisor
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); root.chmod(0o700)
+            state = supervisor.initialize(root, experiment='E1', arm='pilot', seed=86,
+                deadline_seconds=900, receipts=[], preparation_status='E1_PREPARED')
+            supervisor.write_request(root, {'session_id': state['session_id'],
+                'command': 'begin', 'phase': 'READY', 'phase_id': 'pilot'})
+            prepared = {
+                'viewer_manifest': {'roles': ['viewer'], 'limits': {'wall_seconds': 190}},
+                'telemetry_manifest': {'roles': ['telemetry'], 'limits': {'wall_seconds': 30}},
+            }
+            calls = []
+
+            def begin(*args, **kwargs):
+                calls.append((args, kwargs))
+                supervisor.write_request(root, {'session_id': state['session_id'],
+                    'command': 'finalize', 'phase': 'MEASURING'})
+                return {'database_counts': {}, 'target_count': 0,
+                    'metrics_baseline_captured': True}
+
+            def callback(request):
+                try:
+                    return smoke.paper_p8_e1_begin_collection(
+                        request, state, None, None, None, None, prepared)
+                except Exception:
+                    supervisor.write_request(root, {'session_id': state['session_id'],
+                        'command': 'abort', 'phase': 'READY'})
+                    raise
+            with patch.object(smoke, 'paper_p8_e1_support', return_value=e1), \
+                 patch.object(e1, 'begin_remote_collection', side_effect=begin):
+                held = supervisor.hold(root, poll_seconds=0, on_begin=callback)
+
+            self.assertEqual(held['phase'], 'FINALIZING')
+            self.assertNotIn('last_request_error', held)
+            self.assertEqual(len(calls), 1, held.get('last_request_error'))
+            args, kwargs = calls[0]
+            self.assertIs(args[5], prepared)
+            self.assertEqual(kwargs['phase_id'], 'pilot')
+            self.assertEqual(kwargs['workload_lifecycle_seconds'], 220)
+            self.assertIs(kwargs['session_deadline_monotonic'], state['deadline_monotonic'])
+            remaining = state['deadline_monotonic'] - time.monotonic()
+            self.assertLessEqual(kwargs['collector_lifetime_budget_seconds'] + 30, remaining)
+            self.assertGreaterEqual(kwargs['collector_lifetime_budget_seconds'], 220 + 60)
+
+    def test_p8_owned_storage_guard_combines_tiny_owned_files_and_injected_database_size(self):
+        class Registry:
+            def resolve(self, item):
+                return {'Id': item['receipt']['id']}
+
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            base = Path(tmp); private = base / 'private'; artifacts = base / 'artifacts'
+            private.mkdir(mode=0o700); artifacts.mkdir(mode=0o700)
+            fixture = dataclasses.make_dataclass('FixtureStub', ('base','private','artifacts'))(
+                base, private, artifacts)
+            pg_item = {'receipt': {'id': 'a' * 64}}
+            db_size = {'value': 1000}
+            check = smoke.p8_owned_storage_guard(fixture, Registry(), pg_item,
+                growth_limit_bytes=1, minimum_free_bytes=0,
+                interval_seconds=0.001,
+                db_size_reader=lambda _registry, _cid: db_size['value'])
+            self.assertTrue(check()['ok'])
+            db_size['value'] += 1
+            time.sleep(0.003)
+            result = check()
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['reason'], 'owned_storage_growth_threshold')
+            self.assertEqual(result['report']['baseline']['database_bytes'], 1000)
+            self.assertEqual(result['report']['terminal']['database_growth_bytes'], 1)
+            self.assertTrue((private / 'owned-storage-guard.json').is_file())
+
+    def test_e2_helper_import_without_pythonpath_from_outside_repository(self):
+        import subprocess
+        import textwrap
+
+        code = textwrap.dedent('''
+            import importlib.util
+            import json
+            from pathlib import Path
+            import sys
+            from unittest.mock import patch
+
+            native_path = Path(sys.argv[1])
+            sys.path.insert(0, str(native_path.parent))
+            name = 'native_compose_smoke' if sys.argv[2] == 'native' else 'paper_p8_e2_support'
+            path = native_path if sys.argv[2] == 'native' else native_path.with_name('paper_p8_e2_support.py')
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            with patch('subprocess.run', side_effect=AssertionError('unexpected external command')), \
+                 patch('subprocess.Popen', side_effect=AssertionError('unexpected child process')):
+                spec.loader.exec_module(module)
+                helper = module.paper_p8_e2_support() if sys.argv[2] == 'native' else module
+                context = helper.build_e2_equal_samples_context()
+                helper.validate_e2_equal_samples_context(context)
+                print(json.dumps({
+                    'messages_1': helper.calculate_e2_equal_samples_expected_counts(context, 1)['total_messages'],
+                    'messages_100': helper.calculate_e2_equal_samples_expected_counts(context, 100)['total_messages'],
+                    'legacy_messages': sum(helper.PILOT_MESSAGES.values()),
+                    'client_loaded': callable(helper.paper_p8_client._safe_equal_samples),
+                    'bundle_loaded': callable(helper.paper_p8_client.paper_p8_bundle.bind_bundle),
+                }))
+        ''')
+        env = dict(os.environ)
+        env.pop('PYTHONPATH', None)
+        with tempfile.TemporaryDirectory(prefix='p8-import-', dir='/var/tmp/opencode') as directory:
+            for entrypoint in ('native', 'helper'):
+                with self.subTest(entrypoint=entrypoint):
+                    result = subprocess.run(
+                        [sys.executable, '-I', '-c', code, str(MODULE.resolve()), entrypoint],
+                        cwd=directory, env=env, capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {
+                        'messages_1': 6000, 'messages_100': 60, 'legacy_messages': 24,
+                        'client_loaded': True, 'bundle_loaded': True,
+                    })
+
+    def test_e4_warm_acceptance_reads_nested_phase_workload_counters(self):
+        report = {
+            'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_WARM_SUBSET',
+            'workload_status': 'WARM_SUBSET_VALIDATED',
+            'phase_history': ['unique', 'replay'], 'full_p8_accepted': False,
+            'coldrestart': 'NOT RUN', 'durable_gateway_reopen': 'NOT RUN',
+            'conflicts': 'NOT RUN', 'physical_ab': 'NOT RUN',
+            'journal_sha256': 'c' * 64,
+            'journal_continuity': True, 'replay_journal_prefix_validated': True,
+            'generator_colocated': True, 'runner_stopped': True, 'cleanup_verified': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+            'raw_verification': [{'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}, {'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}],
+            'new_ws_event_proof': {'status': 'PASS'},
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {
+                    'experiment': 'E4', 'telemetry': {'generated_unique': 20,
+                        'application_acks': 20, 'ignored_valid_acks': 1, 'retries': 1,
+                        'pending_messages': 0, 'pending_bytes': 0}}},
+                'replay': {'validation_valid': True, 'telemetry': {
+                    'experiment': 'E4', 'telemetry': {'replay_offered': 10,
+                        'replay_application_acks': 10}}}}}
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+        report['workloads']['replay']['telemetry']['telemetry']['replay_application_acks'] = 9
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+        report['workloads']['replay']['telemetry']['telemetry']['replay_application_acks'] = 10
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+    def test_e4_outer_acceptance_uses_selected_counts_and_strict_sample_proof(self):
+        report = {
+            'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_WARM_SUBSET',
+            'workload_status': 'WARM_SUBSET_VALIDATED', 'selected_counts': {'unique_count':100,'replay_count':10},
+            'phase_history': ['unique','replay'], 'full_p8_accepted': False,
+            'coldrestart':'NOT RUN','durable_gateway_reopen':'NOT RUN','conflicts':'NOT RUN',
+            'physical_ab':'NOT RUN','generator_colocated':True,'runner_stopped':True,
+            'cleanup_verified':True,'journal_sha256':'d'*64,'journal_continuity':True,
+            'replay_journal_prefix_validated':True,
+            'database_delta':{'ledger':100,'raw':10000,'temporal':100,'configuration':0},
+            'validation':{'valid':True,'failures':[]},
+            'cache_window':{'warm_lookup_hits':10,'repository_calls_avoided':10},
+            'raw_verification':[{'verified_sample':True,'ledger_count':10,
+                'raw_identity_value_mismatches':0,'identity_ranges':[{} for _ in range(10)]} for _ in range(2)],
+            'new_ws_event_proof':{'status':'PASS','unique':{'submissions':100,'new_events':100,
+                'deliveries_enqueued':100,'telemetry_writes_completed':100,'drops':0},
+                'replay':{'submissions':0,'new_events':0,'deliveries_enqueued':0,
+                'telemetry_writes_completed':0,'drops':0}},
+            'workloads':{'unique':{'validation_valid':True,'telemetry':{'telemetry':{
+                'generated_unique':100,'application_acks':100,'ignored_valid_acks':1,'retries':1,
+                'pending_messages':0,'pending_bytes':0}}},
+                'replay':{'validation_valid':True,'telemetry':{'telemetry':{
+                    'replay_offered':10,'replay_application_acks':10}}}}}
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report,True))
+        wrong_db=json.loads(json.dumps(report)); wrong_db['database_delta']['raw']=9999
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(wrong_db,True))
+        wrong_ack=json.loads(json.dumps(report)); wrong_ack['workloads']['unique']['telemetry']['telemetry']['application_acks']=99
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(wrong_ack,True))
+        short_sample=json.loads(json.dumps(report)); short_sample['raw_verification'][0]['identity_ranges']=[{}]
+        short_sample['raw_verification'][0]['ledger_count']=1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(short_sample,True))
+
+    def test_e4_cache_off_acceptance_requires_real_database_duplicate_window(self):
+        report = {
+            'status': 'PASS', 'lane_marker': 'PAPER_P8_E4_CACHE_OFF_SUBSET',
+            'cache_mode': 'off', 'workload_status': 'CACHE_OFF_SUBSET_VALIDATED',
+            'phase_history': ['unique', 'replay'], 'full_p8_accepted': False,
+            'coldrestart': 'NOT APPLICABLE', 'durable_gateway_reopen': 'NOT RUN',
+            'conflicts': 'NOT RUN', 'physical_ab': 'NOT RUN', 'generator_colocated': True,
+            'runner_stopped': True, 'cleanup_verified': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'attempts': 10, 'transaction_commits': 10,
+                'database_duplicates': 10, 'confirmed_new_rows': 0, 'copy_calls': 0,
+                'database_fingerprint_unchanged': True},
+            'counter_windows': {'replay': {'database_proof': {'exact_equal': True,
+                'unique_ack': [{'fingerprint': 'a' * 32}, {'fingerprint': 'b' * 32}],
+                'replay_end': [{'fingerprint': 'a' * 32}, {'fingerprint': 'b' * 32}]}}},
+            'raw_verification': [{'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}, {'verified_exact': True, 'ledger_count': 10,
+                'raw_identity_value_mismatches': 0}],
+            'new_ws_event_proof': {'status': 'PASS', 'replay': {
+                'submissions': 0, 'new_events': 0, 'deliveries_enqueued': 0,
+                'telemetry_writes_completed': 0, 'drops': 0}},
+            'journal_sha256': 'a' * 64,
+            'journal_continuity': True, 'replay_journal_prefix_validated': True,
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
+                    'retries':1,'pending_messages': 0,'pending_bytes':0}}},
+                'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'replay_offered': 10, 'replay_application_acks': 10}}}}}
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+        for key, value in (('database_duplicates', 0), ('transaction_commits', None),
+                           ('copy_calls', 1), ('confirmed_new_rows', 1)):
+            bad = json.loads(json.dumps(report))
+            bad['cache_window'][key] = value
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), key)
+        bad = json.loads(json.dumps(report)); bad['cache_window'].pop('attempts')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+        bad = json.loads(json.dumps(report))
+        bad['counter_windows']['replay']['database_proof']['replay_end'][0]['fingerprint'] = 'd' * 32
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+    def _make_durable_report_fixture(self):
+        msg_id = '38267d8c-e556-4722-99d8-8951fc8ef607'
+        payload_sha = '42181cd469ab3c5226a27ce4c17cfd929b3c558e965a17fd0e46ae5658202a46'
+        binding_sha = '459c393fc4ec651b6e4d3b106f16420f3a1bd09b7b89a18c418550293ea59a6d'
+        pending = {
+            'boot_id': '07511757-0f33-4db7-ac7a-1035be018577', 'gateway_id': 'gw_p0_a_49007a3f',
+            'sensor_id': 'p8-e4-durable', 'sequence': 0, 'sample_count': 100, 'interval_us': 10000,
+            'message_id': msg_id, 'payload_bytes': 925, 'payload_sha256': payload_sha,
+            'header': {
+                'boot_id': '07511757-0f33-4db7-ac7a-1035be018577', 'first_sequence': 0,
+                'gateway_id': 'gw_p0_a_49007a3f', 'sensor_id': 'p8-e4-durable',
+                'measured_at': '2026-10-30T10:53:45.315242Z', 'sample_count': 100,
+                'sample_interval_us': 10000
+            }
+        }
+        fault_record = {
+            'status': 'PASS', 'phase': 'durable-fault', 'pending': json.loads(json.dumps(pending)),
+            'sql': {
+                'status': 'PASS', 'message_id': msg_id, 'payload_sha256': payload_sha,
+                'ledger_fingerprint': '33230e6bbe497b567bb24f745720edb7', 'raw_count': 100
+            },
+            'database_before': {'ledger': 0, 'raw': 0, 'temporal': 0, 'configuration': 0, 'fingerprint': '8' * 32},
+            'database_after': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0, 'fingerprint': 'c' * 32},
+            'database_delta': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0},
+            'main_dataset_unchanged': True, 'binding_sha256': binding_sha
+        }
+        reopen_record = {
+            'status': 'PASS', 'phase': 'durable-reopen', 'pending_before': json.loads(json.dumps(pending)),
+            'sql': {
+                'status': 'PASS', 'raw_count': 100, 'main_dataset_unchanged': True,
+                'first_sequence': 0, 'last_sequence': 99,
+                'first_timestamp': '2026-10-30T10:53:45.315242+00:00',
+                'last_timestamp': '2026-10-30T10:53:46.305242+00:00',
+                'interval_us': 10000,
+                'auxiliary_delta': {'ledger': 2, 'raw': 200, 'temporal': 2}
+            },
+            'database_before': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0, 'fingerprint': 'c' * 32},
+            'database_after': {'ledger': 2, 'raw': 200, 'temporal': 2, 'configuration': 0, 'fingerprint': '9' * 32},
+            'database_delta': {'ledger': 1, 'raw': 100, 'temporal': 1, 'configuration': 0},
+            'application_acks': 2, 'pending_rows': 0, 'quarantined_rows': 0, 'joined': True,
+            'main_dataset_unchanged': True, 'binding_sha256': binding_sha
+        }
+        return {
+            'schema_version': 1, 'status': 'PASS', 'experiment': 'E4', 'arm': 'warm', 'cache_mode': 'on',
+            'workload_status': 'DURABLE_REOPEN_SUBSET_VALIDATED',
+            'lane_marker': 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET',
+            'phase_history': ['unique', 'replay', 'durable-fault', 'durable-reopen'],
+            'full_p8_accepted': False, 'coldrestart': 'NOT RUN',
+            'durable_gateway_reopen': {
+                'status': 'PASS', 'fault': fault_record, 'reopen': reopen_record
+            },
+            'conflicts': 'NOT RUN', 'physical_ab': 'NOT RUN', 'generator_colocated': True,
+            'runner_stopped': True, 'cleanup_verified': True,
+            'journal_sha256': 'a' * 64, 'journal_continuity': True,
+            'replay_journal_prefix_validated': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'counter_windows': {'replay': {'database_proof': {
+                'unique_ack': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'replay_end': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'exact_equal': True}}},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+            'raw_verification': [{'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}, {'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}],
+            'new_ws_event_proof': {'status': 'PASS', 'unique': {'submissions':20,'new_events':20,
+                'deliveries_enqueued':20,'telemetry_writes_completed':20,'drops':0},
+                'replay': {'submissions':0,'new_events':0,'deliveries_enqueued':0,
+                    'telemetry_writes_completed':0,'drops':0}},
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
+                     'retries':1,'pending_messages': 0,'pending_bytes':0}}},
+                'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'replay_offered': 10, 'replay_application_acks': 10}}}}}
+
+    def test_e4_durable_reopen_acceptance_and_rejections(self):
+        report = self._make_durable_report_fixture()
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+
+        # 1. Bad cleanup
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+        # 2. Wrong stage delta vs total:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['database_delta']['raw'] = 99
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_delta']['raw'] = 101
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['sql']['auxiliary_delta']['raw'] = 300
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 3. Hash changed / mismatch:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['binding_sha256'] = 'f' * 64
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['payload_sha256'] = 'e' * 64
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_before']['message_id'] = 'different-id'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 4. Pending > 0 or quarantined > 0:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_rows'] = 1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['quarantined_rows'] = 1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 5. Missing SQL:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen'].pop('sql')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault'].pop('sql')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 6. Wrong phase history:
+        bad = json.loads(json.dumps(report))
+        bad['phase_history'] = ['unique', 'replay', 'durable-fault']
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 7. Missing base proof:
+        bad = json.loads(json.dumps(report))
+        bad['cache_window']['warm_lookup_hits'] = 9
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['raw_verification'][0]['verified_exact'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['database_delta']['raw'] = 1900
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['workloads']['unique']['telemetry']['telemetry']['application_acks'] = 19
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 8. Missing / invalid ledger_fingerprint:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql'].pop('ledger_fingerprint')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['ledger_fingerprint'] = ''
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['ledger_fingerprint'] = 'not-a-valid-hex-fingerprint!'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['sql']['ledger_fingerprint'] = 'a' * 31
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 9. Missing / invalid / mismatched header:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['pending'].pop('header')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_before'].pop('header')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['pending_before']['header']['gateway_id'] = 'gw-different'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        for key, bad_val in (
+            ('gateway_id', 'different_gw'),
+            ('sensor_id', 'different_sensor'),
+            ('boot_id', 'different_boot'),
+            ('first_sequence', 999),
+            ('sample_count', 50),
+            ('sample_interval_us', 5000),
+            ('measured_at', 'not-a-timestamp'),
+        ):
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen']['fault']['pending']['header'][key] = bad_val
+            bad['durable_gateway_reopen']['reopen']['pending_before']['header'][key] = bad_val
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), key)
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['pending']['header'].pop('measured_at')
+        bad['durable_gateway_reopen']['reopen']['pending_before']['header'].pop('measured_at')
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 10. Missing / invalid / mismatched database snapshots:
+        for phase, snap_key in (('fault', 'database_before'), ('fault', 'database_after'),
+                                ('reopen', 'database_before'), ('reopen', 'database_after')):
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase].pop(snap_key)
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'missing {phase}.{snap_key}')
+
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase][snap_key]['raw'] = 'not-an-int'
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'non-int count {phase}.{snap_key}')
+
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase][snap_key]['fingerprint'] = 'bad-fp'
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'bad fp {phase}.{snap_key}')
+
+            bad = json.loads(json.dumps(report))
+            bad['durable_gateway_reopen'][phase][snap_key].pop('fingerprint')
+            self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True), f'missing fp {phase}.{snap_key}')
+
+        # 11. Continuity mismatch (fault.database_after != reopen.database_before):
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_before']['raw'] = 105
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_before']['fingerprint'] = 'e' * 32
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 12. Snapshot stage deltas must be 1/100/1/0:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['fault']['database_before']['raw'] = 10
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_after']['raw'] = 250
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 13. Cumulative reopen.after minus fault.before must be 2/200/2/0:
+        bad = json.loads(json.dumps(report))
+        bad['durable_gateway_reopen']['reopen']['database_after']['temporal'] = 3
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+    def test_e4_startup_summary_branch(self):
+        fixture = type('Fixture', (), {
+            'paper_p8_e4': 'on', 'paper_p8_e4_cache_mode': 'on', 'project': 'test-project'})()
+        report = self._make_durable_report_fixture()
+
+        # Valid durable subset:
+        summary = smoke.paper_p8_e4_startup_summary(
+            fixture, report, accepted=True, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-on.json')
+        self.assertEqual(summary['status'], 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET_VALIDATED')
+        self.assertEqual(summary['lane'], 'PAPER_P8_E4_DURABLE_REOPEN_SUBSET')
+        self.assertEqual(summary['workload_outcome'], 'DURABLE_REOPEN_SUBSET_VALIDATED')
+        self.assertEqual(summary['durable_gateway_reopen'], 'PASS')
+        self.assertFalse(summary['full_p8_accepted'])
+
+        # Failed durable subset remains failed even with cleanup_verified=True:
+        summary_fail = smoke.paper_p8_e4_startup_summary(
+            fixture, report, accepted=False, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-on.json')
+        self.assertEqual(summary_fail['status'], 'FAIL')
+        self.assertEqual(summary_fail['workload_outcome'], 'DURABLE_REOPEN_SUBSET_VALIDATED')
+
+        # Warm subset behavior unchanged:
+        warm_rep = {'workload_status': 'WARM_SUBSET_VALIDATED', 'coldrestart': 'NOT RUN',
+                    'durable_gateway_reopen': 'NOT RUN'}
+        warm_summary = smoke.paper_p8_e4_startup_summary(
+            fixture, warm_rep, accepted=True, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-on.json')
+        self.assertEqual(warm_summary['status'], 'PAPER_P8_E4_WARM_SUBSET_VALIDATED')
+        self.assertEqual(warm_summary['lane'], 'PAPER_P8_E4_WARM_SUBSET')
+        self.assertEqual(warm_summary['durable_gateway_reopen'], 'NOT RUN')
+
+        # Cache-off subset behavior unchanged:
+        off_fix = type('Fixture', (), {
+            'paper_p8_e4': 'off', 'paper_p8_e4_cache_mode': 'off', 'project': 'test-project'})()
+        off_rep = {'workload_status': 'CACHE_OFF_SUBSET_VALIDATED', 'coldrestart': 'NOT APPLICABLE',
+                   'durable_gateway_reopen': 'NOT RUN'}
+        off_summary = smoke.paper_p8_e4_startup_summary(
+            off_fix, off_rep, accepted=True, cleanup_verified=True, cleanup_counts={},
+            artifact_name='p8-e4-off.json')
+        self.assertEqual(off_summary['status'], 'PAPER_P8_E4_CACHE_OFF_SUBSET_VALIDATED')
+        self.assertEqual(off_summary['lane'], 'PAPER_P8_E4_CACHE_OFF_SUBSET')
+        self.assertEqual(off_summary['durable_gateway_reopen'], 'NOT RUN')
+
+    def _make_conflicts_report_fixture(self):
+        cases = {
+            'same_id_changed_payload': {
+                'status': 'PASS',
+                'schema_valid': True,
+                'positive_control_ack_count': 1,
+                'conflict_ack_count': 0,
+                'database_unchanged': True,
+                'expected_rejection_reason': 'message_conflict',
+                'observed_rejection_reason': 'message_conflict',
+                'guard_precondition': {'matched': True}
+            },
+            'different_first_sequence_overlap': {
+                'status': 'PASS',
+                'schema_valid': True,
+                'positive_control_ack_count': 1,
+                'conflict_ack_count': 0,
+                'database_unchanged': True,
+                'expected_rejection_reason': 'sequence_overlap',
+                'observed_rejection_reason': 'sequence_overlap',
+                'guard_precondition': {'matched': True}
+            }
+        }
+        return {
+            'schema_version': 1, 'status': 'PASS', 'experiment': 'E4', 'arm': 'warm', 'cache_mode': 'on',
+            'workload_status': 'CONFLICTS_SUBSET_VALIDATED',
+            'lane_marker': 'PAPER_P8_E4_CONFLICTS_SUBSET',
+            'phase_history': ['unique', 'replay', 'conflicts'],
+            'full_p8_accepted': False, 'coldrestart': 'NOT RUN',
+            'durable_gateway_reopen': 'NOT RUN',
+            'conflicts': {'status': 'PASS', 'cases': cases},
+            'physical_ab': 'NOT RUN', 'generator_colocated': True,
+            'runner_stopped': True, 'cleanup_verified': True,
+            'journal_sha256': 'a' * 64, 'journal_continuity': True,
+            'replay_journal_prefix_validated': True,
+            'database_delta': {'ledger': 20, 'raw': 2000, 'temporal': 20, 'configuration': 0},
+            'counter_windows': {'replay': {'database_proof': {
+                'unique_ack': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'replay_end': [{'ledger':20,'raw':2000,'temporal':20,'configuration':0,'fingerprint':'1'*32}]*2,
+                'exact_equal': True}}},
+            'validation': {'valid': True, 'failures': []},
+            'cache_window': {'warm_lookup_hits': 10, 'repository_calls_avoided': 10},
+            'raw_verification': [{'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}, {'verified_exact': True, 'ledger_count':10,
+                'raw_identity_value_mismatches':0}],
+            'new_ws_event_proof': {'status': 'PASS', 'unique': {'submissions':20,'new_events':20,
+                'deliveries_enqueued':20,'telemetry_writes_completed':20,'drops':0},
+                'replay': {'submissions':0,'new_events':0,'deliveries_enqueued':0,
+                    'telemetry_writes_completed':0,'drops':0}},
+            'workloads': {
+                'unique': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'generated_unique': 20, 'application_acks': 20, 'ignored_valid_acks': 1,
+                     'retries':1,'pending_messages': 0,'pending_bytes':0}}},
+                'replay': {'validation_valid': True, 'telemetry': {'telemetry': {
+                    'replay_offered': 10, 'replay_application_acks': 10}}}}}
+
+    def test_e4_conflicts_acceptance_and_rejections(self):
+        report = self._make_conflicts_report_fixture()
+        self.assertTrue(smoke.paper_p8_e4_warm_subset_acceptance(report, True))
+
+        # 1. Cleanup not verified
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(report, False))
+
+        # 2. Conflict ACK observed
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['conflict_ack_count'] = 1
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 3. Missing positive control ACK
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['positive_control_ack_count'] = 0
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 4. Schema invalid
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['different_first_sequence_overlap']['schema_valid'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 5. Observed rejection reason mismatch
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['observed_rejection_reason'] = 'wrong_reason'
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 6. Database changed
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['different_first_sequence_overlap']['database_unchanged'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 7. Missing required case
+        bad = json.loads(json.dumps(report))
+        del bad['conflicts']['cases']['different_first_sequence_overlap']
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 8. Guard precondition not matched
+        bad = json.loads(json.dumps(report))
+        bad['conflicts']['cases']['same_id_changed_payload']['guard_precondition']['matched'] = False
+        self.assertFalse(smoke.paper_p8_e4_warm_subset_acceptance(bad, True))
+
+        # 9. Startup summary
+        fixture = type('Fixture', (), {'paper_p8_e4': 'on', 'paper_p8_e4_cache_mode': 'on', 'project': 'test-project'})()
+        summary = smoke.paper_p8_e4_startup_summary(fixture, report, accepted=True, cleanup_verified=True, cleanup_counts={}, artifact_name='p8-e4-on.json')
+        self.assertEqual(summary['status'], 'PAPER_P8_E4_CONFLICTS_SUBSET_VALIDATED')
+        self.assertEqual(summary['lane'], 'PAPER_P8_E4_CONFLICTS_SUBSET')
+        self.assertEqual(summary['conflicts'], 'PASS')
+        self.assertFalse(summary['full_p8_accepted'])
+
+    def test_e3_hold_uses_requested_arm_for_runtime_flags(self):
+        for arm in ('polling', 'wakeup'):
+            self.assertEqual(smoke.paper_p8_e3_selector(type('Args', (), {
+                'p8_e3_prepare_hold': True, 'p8_arm': arm, 'paper_p8_e3': None})()), arm)
+        self.assertEqual(smoke.paper_p8_e3_selector(type('Args', (), {
+            'p8_e3_prepare_hold': False, 'p8_arm': None, 'paper_p8_e3': 'wakeup'})()), 'wakeup')
+    def test_e3_lifecycle_exit_accepts_only_unstarted_preparation_or_validated_workload(self):
+        self.assertTrue(smoke.paper_p8_e3_lifecycle_outcome_accepted({
+            'phase': 'CLOSED', 'workload_outcome': 'NOT_RUN'}))
+        self.assertTrue(smoke.paper_p8_e3_lifecycle_outcome_accepted({
+            'phase': 'CLOSED', 'workload_outcome': 'VALIDATED',
+            'imported_result': {'validation_valid': True}}))
+        for state in (
+                {'phase': 'CLOSED', 'workload_outcome': 'ABORTED', 'collector_ready': True},
+                {'phase': 'CLOSED', 'workload_outcome': 'VALIDATION_FAILED',
+                 'imported_result': {'validation_valid': False}},
+                {'phase': 'CLOSED', 'workload_outcome': 'NOT_RUN', 'collector_ready': True},
+                {'phase': 'CLOSED', 'workload_outcome': 'VALIDATED',
+                 'imported_result': {'validation_valid': False}}):
+            self.assertFalse(smoke.paper_p8_e3_lifecycle_outcome_accepted(state))
+
+    def test_e2_prepare_only_report_uses_e2_artifacts_and_does_not_require_workload_when_not_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e2':False, 'paper_p8_e1':False,
+                'project':'e2-test', 'private':root/'private', 'artifacts':root/'artifacts'})()
+            fixture.private.mkdir()
+            fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E2','phase_id':'samples-100'}))
+            (fixture.artifacts/'p8-e2-pilot.json').write_text(json.dumps({'status':'PREPARATION_ONLY'}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={'container':12,'network':1,'volume':5})
+            self.assertEqual(report['status'], 'PAPER_P8_E2_PREPARATION_ONLY')
+            self.assertEqual(report['artifact'], 'p8-e2-pilot.json')
+            self.assertFalse(report['p8_e2_workload_verified'])
+            self.assertFalse((fixture.artifacts/'p8-e1-pilot.json').exists())
+
+    def test_e2_prepare_only_report_selects_validated_sample_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e2':False, 'project':'e2-test',
+                'private':root/'private', 'artifacts':root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E2','phase_id':'samples-1'}))
+            (fixture.artifacts/'p8-e2-samples-1-remote-result.json').write_text(json.dumps(
+                {'status':'PASS','validation':{'valid':True}}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='VALIDATED',
+                cleanup_verified=True, cleanup_counts={})
+            self.assertEqual(report['status'], 'PAPER_P8_E2_WORKLOAD_VERIFIED')
+            self.assertEqual(report['artifact'], 'p8-e2-samples-1-remote-result.json')
+            self.assertTrue(report['p8_e2_workload_verified'])
+
+    def test_e1_prepare_only_report_keeps_e1_artifact_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e1':True, 'paper_p8_e2':False,
+                'project':'e1-test', 'private':root/'private', 'artifacts':root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.artifacts/'p8-e1-pilot.json').write_text(json.dumps({'status':'PREPARATION_ONLY'}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={})
+            self.assertEqual(report['status'], 'PAPER_P8_E1_PREPARATION_ONLY')
+            self.assertEqual(report['artifact'], 'p8-e1-remote-result.json')
+
+    def test_prepare_only_run_status_uses_session_experiment_and_separates_failure_states(self):
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=True, remote_outcome='VALIDATED'), 'E2_WORKLOAD_VERIFICATION_PASS')
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=True, remote_outcome='NOT_RUN'), 'E2_PREPARATION_ONLY_CLEANUP')
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=False, remote_outcome='VALIDATED'), 'FAIL')
+        self.assertEqual(smoke.paper_p8_prepare_only_run_status('E2', failed=False,
+            cleanup_verified=True, remote_outcome='VALIDATION_FAILED'), 'E2_WORKLOAD_VALIDATION_FAILED')
+
+    def test_e3_prepare_report_selects_low_load_artifact_and_keeps_workload_not_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e3': 'polling',
+                'paper_p8_e3_workload': 'low_load', 'project': 'e3-test',
+                'private': root/'private', 'artifacts': root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E3',
+                'phase_id':'e3-low_load-polling', 'workload_outcome':'NOT_RUN'}))
+            (fixture.artifacts/'p8-e3-polling-low-load.json').write_text(json.dumps({
+                'status':'PREPARATION_ONLY', 'workload_status':'NOT_RUN',
+                'experiment':'E3', 'phase_id':'e3-low_load-polling', 'full_p8_accepted':False}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='NOT_RUN',
+                cleanup_verified=True, cleanup_counts={'container':12,'network':1,'volume':5})
+            self.assertEqual(report['status'], 'PAPER_P8_E3_PREPARATION_ONLY')
+            self.assertEqual(report['artifact'], 'p8-e3-polling-low-load.json')
+            self.assertFalse(report['p8_e3_workload_verified'])
+            self.assertEqual(smoke.paper_p8_prepare_only_run_status('E3', failed=False,
+                cleanup_verified=True, remote_outcome='NOT_RUN'), 'E3_PREPARATION_ONLY_CLEANUP')
+
+    def test_e3_prepare_report_uses_imported_result_for_validated_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = type('Fixture', (), {'paper_p8_e3': 'polling',
+                'paper_p8_e3_workload': 'low_load', 'project': 'e3-test',
+                'private': root/'private', 'artifacts': root/'artifacts'})()
+            fixture.private.mkdir(); fixture.artifacts.mkdir()
+            (fixture.private/'session.json').write_text(json.dumps({'experiment':'E3',
+                'phase_id':'e3-low_load-polling', 'workload_outcome':'VALIDATED'}))
+            (fixture.artifacts/'p8-e3-polling-low-load.json').write_text(json.dumps(
+                {'status':'PREPARATION_ONLY'}))
+            result_path = fixture.artifacts/'p8-e3-polling-low-load-remote-result.json'
+            result_path.write_text(json.dumps({'status':'PASS','validation':{'valid':True}}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='VALIDATED',
+                cleanup_verified=True, cleanup_counts={'container':12,'network':1,'volume':5})
+            self.assertEqual(report['status'], 'PAPER_P8_E3_WORKLOAD_VERIFIED')
+            self.assertEqual(report['artifact'], result_path.name)
+            self.assertTrue(report['p8_e3_workload_verified'])
+
+    def test_private_csv_writer_creates_mode_0600_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'metrics.csv'
+            smoke.paper_p8_write_private_csv(path, ('phase', 'value'),
+                                             [('workload_start', '{"count":1}')])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.read_text(), 'phase,value\nworkload_start,"{""count"":1}"\n')
+            with self.assertRaises(FileExistsError):
+                smoke.paper_p8_write_private_csv(path, ('phase',), [])
+
+    def test_p8_lifecycle_rejects_unrelated_low_load_selector_before_prepare(self):
+        with patch.object(sys, 'argv', ['native_compose_smoke.py', '--prepare', '/tmp/not-created',
+                                      '--p8-lifecycle-hold', '--paper-p8-e3-low-load']):
+            with self.assertRaises(SystemExit) as raised:
+                smoke.main()
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_p8_e1_selector_builds_opt_in_websocket_profile_and_reuses_load_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True)
+            self.assertTrue(fixture.paper_p8_load)
+            self.assertTrue(fixture.paper_p8_e1)
+            self.assertEqual(fixture.values['WEBSOCKET_ENABLED'], 'true')
+            self.assertEqual(fixture.values['WS_MAX_SESSIONS'], '64')
+            for key, expected in {'WS_HEARTBEAT_INTERVAL': '2s', 'WS_PONG_TIMEOUT': '4s',
+                                  'WS_WRITE_TIMEOUT': '1s', 'WS_RECHECK_INTERVAL': '5s',
+                                  'WS_RECHECK_SWEEP_BUDGET': '2s', 'WS_RECHECK_CONCURRENCY': '2',
+                                  'WS_FANOUT_MODE': 'indexed'}.items():
+                self.assertEqual(fixture.values[key], expected)
+            self.assertIn('target: 8883', fixture.override.read_text())
+            self.assertEqual(fixture.private.joinpath('bin').exists(), False)
+            self.assertTrue(fixture.paper_p2)
+            self.assertFalse(any(fixture.values[k] == 'true' for k in
+                ('STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED', 'MQTT_SHAPER_ENABLED',
+                 'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED')))
+
+    def test_selected_e1_overlay_is_written_only_to_owned_fixture_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e1_viewers=128, paper_p8_e1_messages_per_target=2)
+            self.assertEqual(fixture.values['WS_MAX_SESSIONS'], '128')
+            self.assertEqual(fixture.e1_resource_overlay['proposed']['nginx_worker_connections'], 322)
+            config = fixture.private / 'nginx.conf'
+            self.assertTrue(config.is_file())
+            self.assertIn('worker_processes 2;', config.read_text())
+            self.assertIn('worker_connections 322;', config.read_text())
+            self.assertIn('worker_rlimit_nofile 1024;', config.read_text())
+            compose = fixture.override.read_text()
+            for service in ('nginx', 'backend', 'mosquitto'):
+                self.assertIn(f'  {service}:', compose)
+                self.assertIn('nofile:', compose)
+            for expected in ('soft: 1024', 'hard: 1024', 'soft: 224', 'soft: 98',
+                             'WS_MAX_SESSIONS=128', 'WS_SESSION_REFERENCE_BYTES=8388608'):
+                self.assertIn(expected, compose + fixture.env_file.read_text())
+            self.assertIn(str(config), compose)
+
+    def test_10000_viewer_overlay_writes_baseline_fd_budget_to_nginx_and_compose(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory, \
+             patch.object(smoke.resource, 'getrlimit', return_value=(65536, 65536)):
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e1_viewers=10000)
+            config = (fixture.private / 'nginx.conf').read_text()
+            self.assertIn('worker_processes 32;', config)
+            self.assertIn('worker_connections 1286;', config)
+            self.assertIn('worker_rlimit_nofile 1478;', config)
+            compose = fixture.override.read_text()
+            self.assertIn('soft: 1478', compose)
+            self.assertIn('hard: 1478', compose)
+            self.assertEqual(fixture.e1_resource_overlay['proposed']['nginx_process_fd_soft'], 1478)
+            self.assertEqual(fixture.values['WS_SESSION_REFERENCE_BYTES'], '8388608')
+            self.assertFalse(fixture.e1_resource_overlay['queues_scaled_with_viewers'])
+
+    def test_e1_selected_overlay_requires_official_optin_before_fixture_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'fixture'
+            with self.assertRaisesRegex(ValueError, 'official_opt_in_required'):
+                smoke.prepare(root, paper_p8_e1=True, paper_p8_e1_viewers=128)
+            self.assertFalse(root.exists())
+
+    def test_p8_e1_rejects_mixed_probe_and_e2_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'mixed', paper_p8_e1=True, paper_p8_sessions=True)
+
+    def test_p8_e2_selector_uses_isolated_shaper_microbatch_profile_with_ws_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'e2', paper_p8_e2=True)
+            self.assertTrue(fixture.paper_p8_load)
+            self.assertTrue(fixture.paper_p8_e2)
+            self.assertFalse(fixture.paper_p8_e1)
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['WEBSOCKET_ENABLED'], 'false')
+            for key, value in {'MQTT_SHAPER_ENABLED': 'true', 'MQTT_SHAPER_RATE_PER_SECOND': '2',
+                               'MQTT_SHAPER_BURST': '4', 'MQTT_MICROBATCH_ENABLED': 'true',
+                               'MQTT_MICROBATCH_MAX_MESSAGES': '32', 'MQTT_MICROBATCH_MAX_ROWS': '500',
+                               'MQTT_MICROBATCH_MAX_PAYLOAD_BYTES': '4194304',
+                               'MQTT_MICROBATCH_MAX_WAIT': '50ms', 'MQTT_RAM_DEDUP_ENABLED': 'false',
+                               'STAGE5_ENABLED': 'false', 'STAGE5_WAKEUP_ENABLED': 'false'}.items():
+                self.assertEqual(fixture.values[key], value)
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'mixed', paper_p8_e2=True, paper_p8_load=True)
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'sessions', paper_p8_e2=True, paper_p8_sessions=True)
+
+    def test_p8_e2_cli_rejects_other_p8_lanes(self):
+        for extra in ('--paper-p8-e1', '--paper-p8-sessions', '--paper-p8-slow-viewer', '--paper-p8-load'):
+            with self.subTest(extra=extra), patch.object(sys, 'argv',
+                    ['native_compose_smoke.py', '--prepare', '/tmp/not-created', '--paper-p8-e2', extra]):
+                with self.assertRaises(SystemExit) as raised:
+                    smoke.main()
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_official_e2_fixture_is_optin_and_shaper_tracks_selected_offer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'official_profile_opt_in_required'):
+                smoke.prepare(Path(directory) / 'denied', paper_p8_e2=True,
+                              paper_p8_profile='official')
+            fixture = smoke.prepare(Path(directory) / 'official', paper_p8_e2=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e2_offered_rate=1000, paper_p8_e2_duration_seconds=20,
+                paper_p8_e2_burst_messages=11, paper_p8_e2_samples_per_message=100)
+            self.assertEqual(fixture.values['MQTT_SHAPER_RATE_PER_SECOND'], '550')
+            self.assertEqual(fixture.values['MQTT_SHAPER_BURST'], '561')
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_MESSAGES'], '64')
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_MAX_ROWS'], '6400')
+            fixture_retry = smoke.prepare(Path(directory) / 'official_retry', paper_p8_e2=True,
+                paper_p8_profile='official', paper_p8_official_opt_in=True,
+                paper_p8_e2_offered_rate=1000, paper_p8_e2_duration_seconds=20,
+                paper_p8_e2_burst_messages=11, paper_p8_e2_samples_per_message=100,
+                paper_p8_e2_retry_rate_per_second=750, paper_p8_e2_retry_burst=100)
+            self.assertEqual(fixture_retry.values['MQTT_SHAPER_RATE_PER_SECOND'], '1300')
+            self.assertEqual(fixture_retry.values['MQTT_SHAPER_BURST'], '1411')
+
+    def test_p8_e1_acceptance_requires_complete_workload_and_exact_owned_cleanup(self):
+        fixture = type('Fixture', (), {'project': 'run'})()
+        item = {'kind': 'container', 'run': 'run', 'task': 'native-compose-allocation',
+                'allocation_attempted': True, 'removed': True,
+                'receipt': {'id': 'a' * 64, 'created': 'created', 'labels': {}}}
+        registry = type('Registry', (), {'items': [item]})()
+        counts = {'container': 1, 'network': 0, 'volume': 0}
+        complete = {'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP', 'sockets': 64,
+                    'mapping': {'counts': {'sockets': 64}, 'messages_per_target': {'target-a': 10, 'target-b': 10}},
+                    'workload': {'telemetry': {'generated_unique': 20}},
+                    'validation': {'valid': True, 'failures': []}, 'full_p8_accepted': False}
+        self.assertTrue(smoke.paper_p8_e1_cleanup_acceptance(fixture, complete, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e1_cleanup_acceptance(fixture, {}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e1_cleanup_acceptance(fixture,
+            {**complete, 'validation': {'valid': False}}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e1_cleanup_acceptance(fixture, complete, counts, False, registry))
+
+    def test_p8_load_dispatch_selects_e1_helper_without_changing_e2_route(self):
+        sentinel = object()
+        helper = Mock(run=Mock(return_value=sentinel))
+        e2 = Mock(run_e2_telemetry100=Mock(return_value=sentinel))
+        with patch.object(smoke, 'paper_p8_e1_support', return_value=helper), \
+             patch.object(smoke, 'paper_p8_support', return_value=e2):
+            e1_fixture = type('Fixture', (), {'paper_p8_e1': True})()
+            e2_fixture = type('Fixture', (), {'paper_p8_e1': False})()
+            args = (smoke, e1_fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            result = smoke.dispatch_paper_p8_load(e1_fixture, smoke, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            self.assertIs(result, sentinel)
+            helper.run.assert_called_once_with(*args, viewers=64, principals=2,
+                                               density='mixed', messages_per_target=5)
+            e2.run_e2_telemetry100.assert_not_called()
+            smoke.dispatch_paper_p8_load(e2_fixture, smoke, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            e2.run_e2_telemetry100.assert_called_once_with(smoke, e2_fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+
+    def test_p8_e2_dispatch_uses_e2_helper(self):
+        sentinel = object()
+        helper = Mock(run=Mock(return_value=sentinel))
+        with patch.object(smoke, 'paper_p8_e2_support', return_value=helper):
+            fixture = type('Fixture', (), {'paper_p8_e2': True, 'paper_p8_e1': False})()
+            args = (smoke, fixture, 'endpoint', 'registry', {}, {}, 'state', 'binary')
+            self.assertIs(smoke.dispatch_paper_p8_load(fixture, args[0], *args[2:]), sentinel)
+            helper.run.assert_called_once_with(*args)
+
+    def test_p8_e2_acceptance_requires_both_valid_profiles_and_exact_cleanup(self):
+        fixture = type('Fixture', (), {'project': 'run'})()
+        item = {'kind': 'container', 'run': 'run', 'task': 'native-compose-allocation',
+                'allocation_attempted': True, 'removed': True,
+                'receipt': {'id': 'a' * 64, 'created': 'created', 'labels': {}}}
+        registry = type('Registry', (), {'items': [item]})()
+        counts = {'container': 1, 'network': 0, 'volume': 0}
+        def profile(samples):
+            return {'samples_per_message': samples, 'status': 'PASS',
+                    'validation': {'valid': True, 'failures': []},
+                    'workloads': {arm: {'telemetry': {'generated_unique': n,
+                        'application_acks': n, 'pending_messages': 0}} for arm, n in (('A', 8), ('B', 16))}}
+        evidence = {'status': 'WORKLOAD_COMPLETE_PENDING_CLEANUP', 'full_p8_accepted': False,
+                    'profiles': [profile(100), profile(1)]}
+        self.assertTrue(smoke.paper_p8_e2_cleanup_acceptance(fixture, evidence, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, {**evidence, 'profiles': [profile(100)]}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, {**evidence, 'profiles': [profile(100), {**profile(1), 'status': 'FAIL'}]}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, {**evidence, 'profiles': [profile(100), {**profile(1), 'validation': {}}]}, counts, True, registry))
+        self.assertFalse(smoke.paper_p8_e2_cleanup_acceptance(fixture, evidence, counts, False, registry))
+        self.assertTrue(smoke.paper_p8_e2_report_acceptance({**evidence, 'status': 'PASS',
+            'workload_status': evidence['status'], 'cleanup_verified': True}, True))
+        self.assertFalse(smoke.paper_p8_e2_report_acceptance({**evidence, 'status': 'PASS',
+            'workload_status': evidence['status'], 'cleanup_verified': False}, True))
+
+    def test_p8_load_selector_isolated_and_adds_only_loopback_mqtt_tls_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_load=True)
+            self.assertTrue(fixture.paper_p2)
+            self.assertTrue(fixture.paper_p8_load)
+            for key in ('STAGE5_ENABLED', 'STAGE5_WAKEUP_ENABLED', 'MQTT_SHAPER_ENABLED',
+                        'MQTT_MICROBATCH_ENABLED', 'MQTT_RAM_DEDUP_ENABLED'):
+                self.assertEqual(fixture.values[key], 'false')
+            override = fixture.override.read_text()
+            self.assertIn('published: "0"', override)
+            self.assertIn('host_ip: "127.0.0.1"', override)
+            self.assertIn('target: 8883', override)
+            with self.assertRaisesRegex(ValueError, 'paper_p8_mode_rejected'):
+                smoke.prepare(Path(directory) / 'second', paper_p8_load=True, paper_p8_sessions=True)
+
+    def test_gateway_cli_captures_owned_diagnostics_before_callback_error(self):
+        writes = []
+        class Registry:
+            def __init__(self):
+                self.item = {'name': 'run-gateway-p6-a-steady', 'receipt': {'id': 'owned-id'}}
+                self.obj = {'Id': 'owned-id', 'State': {'Running': True, 'Status': 'running'}}
+                self.created = False
+                self.commands = []
+            def intent(self, *args): return self.item
+            def resolve(self, item): return self.obj if self.created else None
+            def save(self, item): pass
+            def allocating(self, item): pass
+            def command(self, args):
+                self.commands.append(args)
+                if args[0] == 'create':
+                    self.created = True
+                    return Mock(returncode=0, stdout=b'owned-id')
+                if args[0] == 'start': return Mock(returncode=0)
+                if args[0] == 'logs':
+                    return Mock(returncode=0, stdout=b'bounded log', stderr=b'')
+                raise AssertionError(args)
+        fixture = type('Fixture', (), {'project': 'run', 'private': Path('/private')})()
+        registry = Registry()
+        error = RuntimeError('original callback error')
+        with patch.object(smoke, 'private_write', side_effect=lambda path, data: writes.append((path, data))):
+            with self.assertRaises(RuntimeError) as raised:
+                smoke.paper_p0_gateway_cli(fixture, registry, 'image', {'name': 'vol'},
+                    Path('/secret/env'), Path('/private/ca'), 'p6-a-steady', ['run'],
+                    type('State', (), {'checkpoint': lambda self: None})(),
+                    during=lambda: (_ for _ in ()).throw(error))
+        self.assertIs(raised.exception, error)
+        self.assertTrue(any('diagnostic.log' in str(path) and data == 'bounded log'
+                            for path, data in writes))
+        self.assertTrue(any('diagnostic.json' in str(path) and 'callback_exception' in data
+                            for path, data in writes))
+        self.assertIn(['logs', '--tail', '1000', 'owned-id'], registry.commands)
+
+    def test_gateway_cli_diagnostic_failure_does_not_mask_timeout(self):
+        class Registry:
+            def __init__(self):
+                self.item = {'name': 'run-gateway-p6-a-steady', 'receipt': {'id': 'owned-id'}}
+                self.obj = {'Id': 'owned-id', 'State': {'Running': True, 'Status': 'running'}}
+                self.created = False
+            def intent(self, *args): return self.item
+            def resolve(self, item): return self.obj if self.created else None
+            def save(self, item): pass
+            def allocating(self, item): pass
+            def command(self, args):
+                if args[0] == 'create':
+                    self.created = True
+                    return Mock(returncode=0, stdout=b'owned-id')
+                if args[0] == 'start': return Mock(returncode=0)
+                raise AssertionError(args)
+        fixture = type('Fixture', (), {'project': 'run', 'private': Path('/private')})()
+        with patch.object(smoke, 'private_write', side_effect=OSError('disk failure')), \
+             patch.object(smoke.time, 'monotonic', side_effect=[0.0, 2.0, 2.0, 2.0]):
+            with self.assertRaisesRegex(ValueError, 'paper_p0_gateway_failed'):
+                smoke.paper_p0_gateway_cli(fixture, Registry(), 'image', {'name': 'vol'},
+                    Path('/secret/env'), Path('/private/ca'), 'p6-a-steady', ['run'],
+                    type('State', (), {'checkpoint': lambda self: None})(), timeout=1)
+
     def test_startup_migration_failure_blocks_next_phase(self):
         with self.assertRaisesRegex(ValueError, 'migration_nonzero'):
             smoke.startup_state('application-migrations', {'Running': False, 'ExitCode': 1})
@@ -77,6 +1124,32 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'resource_inspect_unresolved'):
                 registry.remove(item)
 
+    def test_resource_readonly_resolve_preserves_receipt_and_timeout(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            calls = []
+            obj = {'Id': 'a' * 64, 'Name': '/run-fixture', 'Image': 'sha256:expected',
+                   'Created': 'created', 'Config': {'Labels': {'test.run': fixture.project}}}
+            def runner(args, **kwargs):
+                calls.append(kwargs)
+                return Mock(returncode=0, stdout=json.dumps([obj]).encode(), stderr=b'')
+            registry = smoke.ResourceRegistry(fixture, runner)
+            item = {'kind': 'container', 'name': 'run-fixture', 'image': 'sha256:expected',
+                    'labels': {'test.run': fixture.project}, 'receipt': None,
+                    'path': fixture.private / 'receipt.json'}
+            original = copy.deepcopy(item)
+            registry.resolve(item, timeout=0.25, read_only=True)
+            self.assertEqual(item, original)
+            self.assertFalse(item['path'].exists())
+            self.assertEqual(calls[-1]['timeout'], 0.25)
+            registry.resolve(item)
+            self.assertTrue(item['path'].exists())
+            self.assertIsNotNone(item['receipt'])
+            item['receipt'] = {'id': 'b' * 64, 'created': 'replacement', 'labels': {}}
+            with self.assertRaisesRegex(ValueError, 'resource_replacement_refused'):
+                registry.resolve(item, timeout=0.25, read_only=True)
+
 
     def prepare(self, directory):
         return smoke.prepare(Path(directory) / "fixture")
@@ -113,6 +1186,35 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(env["COMPOSE_DISABLE_ENV_FILE"], "1")
             self.assertNotEqual(env["HOME"], "/deployment")
 
+    def test_e5_go_builds_use_trimpath_only_for_e5_and_keep_owned_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for is_e5 in (False, True):
+                private = Path(directory) / ('e5' if is_e5 else 'default')
+                private.mkdir()
+                (private / 'bin').mkdir()
+                fixture = type('Fixture', (), {'private': private, 'paper_p8_e5': is_e5})()
+                calls = []
+
+                def build(command, **kwargs):
+                    calls.append((command, kwargs))
+                    Path(command[command.index('-o') + 1]).write_bytes(b'binary')
+                    return type('Result', (), {'returncode': 0})()
+
+                with patch.object(smoke.subprocess, 'run', side_effect=build):
+                    paperload = smoke.build_paperload(fixture, '/tool/go')
+                    gateway = smoke.build_paper_p8_e3_gateway(fixture, '/tool/go')
+
+                expected_flags = ['-trimpath'] if is_e5 else []
+                self.assertEqual([('-trimpath' in call[0]) for call in calls], [is_e5, is_e5])
+                self.assertEqual(calls[0][0], ['/tool/go', 'build', *expected_flags, '-o', str(paperload), './cmd/paperload'])
+                self.assertEqual(calls[1][0], ['/tool/go', 'build', *expected_flags, '-o', str(gateway), './cmd/gateway'])
+                for _, kwargs in calls:
+                    self.assertEqual(kwargs['cwd'], smoke.ROOT / 'src')
+                    self.assertEqual(kwargs['env'], smoke.process_env(fixture))
+                    self.assertEqual(kwargs['check'], False)
+                self.assertTrue((private / 'paperload-build.log').is_file())
+                self.assertTrue((private / 'gateway-build.log').is_file())
+
     def test_all_root_interpolation_inputs_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.prepare(directory)
@@ -139,6 +1241,84 @@ class PreparationTests(unittest.TestCase):
             for key, value in expected.items():
                 self.assertEqual(fixture.values[key], value)
                 self.assertIn(f"{key}={value}\n", fixture.env_file.read_text())
+
+    def test_p4_shaper_interpolations_are_private_synthetic_defaults(self):
+        expected = {
+            "MQTT_SHAPER_ENABLED": "false",
+            "MQTT_SHAPER_RATE_PER_SECOND": "2",
+            "MQTT_SHAPER_BURST": "4",
+            "MQTT_SHAPER_MAX_GATEWAYS": "4096",
+            "MQTT_SHAPER_IDLE_RETENTION": "10m",
+            "MQTT_INGRESS_BUFFERED_BYTES": "16777216",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
+    def test_p5a_microbatch_defaults_are_explicit_and_default_off(self):
+        expected = {
+            "MQTT_MICROBATCH_ENABLED": "false",
+            "MQTT_MICROBATCH_MAX_MESSAGES": "64",
+            "MQTT_MICROBATCH_MAX_ROWS": "6400",
+            "MQTT_MICROBATCH_MAX_PAYLOAD_BYTES": "4194304",
+            "MQTT_MICROBATCH_MAX_WAIT": "1s",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
+    def test_p5b_ram_dedup_defaults_are_explicit_and_default_off(self):
+        expected = {
+            "MQTT_RAM_DEDUP_ENABLED": "false",
+            "MQTT_RAM_DEDUP_MAX_ENTRIES": "100000",
+            "MQTT_RAM_DEDUP_MAX_BYTES": "67108864",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
+    def test_p4_broker_configs_keep_packet_overhead_and_control_bounds(self):
+        root_config = smoke.ROOT / "config/mosquitto/mosquitto.conf"
+        text = root_config.read_text()
+        settings = {name: int(value) for name, value in re.findall(
+            r"(?m)^(max_packet_size|message_size_limit|max_inflight_messages|"
+            r"max_inflight_bytes|max_queued_messages|max_queued_bytes) (\d+)\s*$", text)}
+        self.assertEqual(settings, {
+            "max_packet_size": 2097152,
+            "message_size_limit": 1048576,
+            "max_inflight_messages": 20,
+            "max_inflight_bytes": 1048576,
+            "max_queued_messages": 256,
+            "max_queued_bytes": 16777216,
+        })
+        # Leave at least 1 KiB for topic, fixed/variable headers and properties
+        # above the supported 1 MiB publish payload ceiling.
+        self.assertGreaterEqual(settings["max_packet_size"], settings["message_size_limit"] + 1024)
+        self.assertEqual(smoke.DEFAULTS["STAGE5_PAYLOAD_BYTES"], "8192")
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            generated = (fixture.private / "mosquitto.conf").read_text()
+            self.assertEqual(generated, text)
+            self.assertIn("require_certificate false", generated)
+            self.assertIn("plugin /usr/lib/mosquitto_dynamic_security.so", generated)
+            self.assertIn("allow_anonymous false", generated)
 
     def test_user_management_and_auth_admin_defaults_explicit(self):
         expected = {
@@ -340,37 +1520,1239 @@ class PreparationTests(unittest.TestCase):
                 smoke.validate_summary(dict(report, status="PASS"))
 
 
+class PaperP1Tests(unittest.TestCase):
+    def test_p1_subscribers_use_existing_literal_filters_and_separate_principals(self):
+        spec = Mock(gateway_id='gateway_a')
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
+            username, password, topic = smoke.paper_p1_subscription_target(fixture, spec, 'gateway-password', 'telemetry')
+            self.assertEqual((username, password, topic), (fixture.values['MQTT_USERNAME'], fixture.values['MQTT_PASSWORD'], 'gateways/+/telemetry/#'))
+            self.assertNotEqual(username, fixture.values['MQTT_DYNSEC_MANAGER_USERNAME'])
+            self.assertEqual(smoke.paper_p1_subscription_target(fixture, spec, 'gateway-password', 'ack'),
+                             ('gateway_a', 'gateway-password', 'gateways/gateway_a/acks/#'))
+            with self.assertRaises(ValueError):
+                smoke.paper_p1_subscription_target(fixture, spec, 'gateway-password', 'control')
+
+    def test_p1_suback_denied_is_never_readiness(self):
+        self.assertFalse(smoke.paper_p1_suback_ready(b'Client received CONNACK (0)'))
+        self.assertTrue(smoke.paper_p1_suback_ready(b'Client received SUBACK\nSubscribed (mid: 1): 1\n'))
+        for code in (0, 128):
+            with self.assertRaisesRegex(ValueError, '^paper_p1_subscription_failed$'):
+                smoke.paper_p1_suback_ready(f'Client received SUBACK\nSubscribed (mid: 1): {code}\n'.encode())
+
+    def test_p1_subscription_parser_correlates_topics_and_payloads(self):
+        log = (b"Client received PUBLISH (d0, q1, r0, m1, 'gateways/a/telemetry/s', ... (len 7))\n"
+               b'{"message_id":"one"}\n'
+               b"Client received PUBLISH (d0, q1, r0, m2, 'gateways/b/telemetry/s', ... (len 7))\n"
+               b'{"message_id":"two"}\n')
+        self.assertEqual(smoke.paper_p1_subscription_messages(log), [
+            ('gateways/a/telemetry/s', b'{"message_id":"one"}'),
+            ('gateways/b/telemetry/s', b'{"message_id":"two"}')])
+
+    def test_p1_subscriber_credentials_are_sent_on_stdin_not_host_argv(self):
+        class FakeProcess:
+            def __init__(self, stdout):
+                import io
+                self.stdin = io.BytesIO()
+                self.stdout = stdout
+                self.returncode = None
+                self.stopped = False
+            def poll(self):
+                return self.returncode
+            def terminate(self):
+                self.stopped = True
+                self.returncode = 0
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
+            calls = []
+            def popen(args, **kwargs):
+                calls.append(args)
+                kwargs['stdout'].write(b'OBSERVER_READY\nClient received SUBACK\nSubscribed (mid: 1): 1\n')
+                kwargs['stdout'].flush()
+                return FakeProcess(kwargs['stdout'])
+            with patch.object(smoke.subprocess, 'Popen', side_effect=popen):
+                subscription = smoke.paper_p1_subscriber(fixture, Mock(), 'broker-id',
+                    Mock(gateway_id='gw_a'), 'sensitive-password', 'ack')
+                smoke.paper_p1_stop_subscription(subscription)
+            rendered = repr(calls[0])
+            self.assertNotIn('sensitive-password', rendered)
+            self.assertNotIn(fixture.values['MQTT_PASSWORD'], rendered)
+            self.assertIn('gateways/gw_a/acks/#', rendered)
+
+    def test_p1_subscriber_uses_echo_disabled_tty_and_distinct_client_id(self):
+        command = smoke.paper_p1_subscription_command(
+            'broker-id', 'telemetry', 'gateways/+/telemetry/#',
+            message_count=2, message_timeout=30)
+        self.assertEqual(command[:4], ['docker', 'exec', '-it', 'broker-id'])
+        self.assertIn('stty -echo', command[6])
+        self.assertLess(command[6].index('stty -echo'), command[6].index('OBSERVER_READY'))
+        self.assertLess(command[6].index('OBSERVER_READY'), command[6].index('read -r password'))
+        self.assertIn('-i p1-observer-telemetry-', command[6])
+        self.assertIn('"$user"', command[6])
+        self.assertIn('"$password"', command[6])
+        self.assertNotIn('backend_service', command[6])
+        self.assertNotIn('smoke_backend', command[6])
+        self.assertIn('gateways/+/telemetry/#', command[6])
+
+    def test_p1_pty_handshake_sends_secrets_only_after_ready_without_echo(self):
+        import subprocess
+        import termios
+        script = (
+            "import os,select,sys,termios,time\n"
+            "a=termios.tcgetattr(0); a[3] &= ~termios.ECHO; termios.tcsetattr(0,termios.TCSANOW,a)\n"
+            "time.sleep(0.15)\n"
+            "if select.select([0],[],[],0)[0]: print('PREMATURE_INPUT',flush=True)\n"
+            "print('OBSERVER_READY',flush=True)\n"
+            "u=sys.stdin.readline().rstrip('\\n'); p=sys.stdin.readline().rstrip('\\n')\n"
+            "print('CREDENTIALS_RECEIVED',flush=True)\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observer.log'
+            path.touch(mode=0o600)
+            with path.open('wb') as stream:
+                master_fd, slave_fd = smoke.paper_p1_open_echo_disabled_pty()
+                proc = None
+                try:
+                    self.assertFalse(termios.tcgetattr(slave_fd)[3] & termios.ECHO)
+                    proc = subprocess.Popen([sys.executable, '-c', script], stdin=slave_fd,
+                                             stdout=stream, stderr=subprocess.STDOUT)
+                    os.close(slave_fd)
+                    slave_fd = -1
+                    smoke.paper_p1_send_credentials_after_ready(
+                        proc, path, master_fd, 'observer-user', 'observer-password', timeout=3)
+                    self.assertEqual(proc.wait(timeout=3), 0)
+                    stream.flush()
+                    output = path.read_bytes()
+                    self.assertIn(b'OBSERVER_READY', output)
+                    self.assertIn(b'CREDENTIALS_RECEIVED', output)
+                    self.assertNotIn(b'PREMATURE_INPUT', output)
+                    self.assertNotIn(b'observer-user', output)
+                    self.assertNotIn(b'observer-password', output)
+                finally:
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    if slave_fd >= 0:
+                        os.close(slave_fd)
+                    os.close(master_fd)
+
+    def test_p1_resource_export_marks_unknown_gateway_limits_unavailable(self):
+        import csv
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'resources.csv'
+            smoke.paper_p1_resources_csv(target, [{'phase': 'burst', 'started_at': 't0', 'finished_at': 't1',
+                'services': {'backend': {'CPUPerc': '1.0%', 'MemUsage': '2MiB / 4GiB', 'MemPerc': '1%'},
+                             'gateway-p4-b': {'CPUPerc': '2.0%', 'MemUsage': '3MiB / 4GiB', 'MemPerc': '2%'}}}],
+                {'backend': {'NanoCpus': 2000000000, 'Memory': 4294967296}, 'gateway-p4-b': {}})
+            with target.open() as stream:
+                rows = {row['service']: row for row in csv.DictReader(stream)}
+            self.assertEqual(rows['backend']['cpu_limit_nanocpus'], '2000000000')
+            self.assertEqual(rows['gateway-p4-b']['cpu_limit_nanocpus'], '')
+            self.assertEqual(rows['gateway-p4-b']['memory_limit_bytes'], '')
+
+    def test_p1_failed_cleanup_cannot_leave_success_run_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p1='baseline')
+            smoke.durable_json(fixture.artifacts / 'run.json', {'schema_version': 1, 'status': 'PASS'})
+            smoke.record_failure_report(fixture, 'cleanup', ValueError('startup_cleanup_unresolved_evidence_retained'),
+                                        cleanup_verified=False, primary_phase='paper_p1',
+                                        primary_error_code='paper_p1_gateway_failed')
+            report = json.loads((fixture.artifacts / 'run.json').read_text())
+            self.assertEqual(report['status'], 'FAIL')
+            self.assertFalse(report['cleanup_verified'])
+            self.assertEqual(report['error'], 'startup_cleanup_unresolved_evidence_retained')
+
+    def test_p1_metrics_off_preserves_p0_profile_and_equivalent_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'off', paper_p1='baseline', metrics_enabled=False)
+            self.assertEqual(fixture.values['METRICS_ENABLED'], 'false')
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(model['services']['backend']['environment']['METRICS_ENABLED'], 'false')
+
+    def test_p1_multiple_batches_keep_shared_last_batch_assertions(self):
+        with patch.object(sys, 'path', [str(MODULE.parent), *sys.path]):
+            from stage3_uplink_runner import build_gateway_assert_sql, default_specs, simulator_envelope
+            base_envelope = simulator_envelope()
+        from dataclasses import replace
+        env = replace(base_envelope, message_id='00000000-0000-4000-8000-000000000001',
+                      first_sequence=1900, expected_reported_version=20)
+        sql = build_gateway_assert_sql(default_specs()[0], env, 'p1_last_batch', expected_messages=20)
+        self.assertIn('IF ledger <> 20', sql)
+        self.assertIn("AND message_id='00000000-0000-4000-8000-000000000001'::uuid", sql)
+        self.assertIn('telemetry rows inconsistent', sql)
+
+    def test_p1_rates_require_same_process_and_no_counter_reset(self):
+        a = {'process_instance': 'a', 'elapsed_seconds': 1, 'ingress': {'Received': 2, 'Committed': 1, 'SamplesNew': 100}}
+        b = {'process_instance': 'a', 'elapsed_seconds': 3, 'ingress': {'Received': 6, 'Committed': 2, 'SamplesNew': 200}}
+        self.assertEqual(smoke.paper_p1_rates(a, b), {'received_delivery_msg_per_s': 2, 'new_committed_msg_per_s': 0.5, 'new_committed_samples_per_s': 50})
+        for bad in (dict(b, process_instance='b'), dict(b, elapsed_seconds=1), dict(b, ingress={'Received': 0, 'Committed': 0, 'SamplesNew': 0})):
+            self.assertTrue(all(v is None for v in smoke.paper_p1_rates(a, bad).values()))
+        self.assertTrue(all(v is None for v in smoke.paper_p1_rates(None, b).values()))
+
+    def test_p4_metrics_csv_exports_fixed_ingress_budget_and_shaper_fields(self):
+        import csv
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'ingress': {'BufferedPayloadBytes': 12, 'BufferedPayloadCapacityBytes': 100,
+                              'BufferedPayloadHighWaterBytes': 80, 'ByteBudgetFull': 2,
+                              'ShaperEnabled': True, 'ShaperEntries': 3, 'ShaperCapacity': 10,
+                              'ShaperPassed': 7, 'ShaperRateLimited': 4, 'ShaperStateCapacity': 1,
+                              'GatewayID': 'PRIVATE_SENTINEL', 'payload': 'PRIVATE_SENTINEL'}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'shaped', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            actual = {(r['metric'], r['value'], r['availability']) for r in rows if r['group'] == 'ingress'}
+            expected = {('BufferedPayloadBytes', '12', 'available'),
+                        ('BufferedPayloadCapacityBytes', '100', 'available'),
+                        ('BufferedPayloadHighWaterBytes', '80', 'available'),
+                        ('ByteBudgetFull', '2', 'available'),
+                        ('ShaperEnabled', 'True', 'available'),
+                        ('ShaperEntries', '3', 'available'), ('ShaperCapacity', '10', 'available'),
+                        ('ShaperPassed', '7', 'available'), ('ShaperRateLimited', '4', 'available'),
+                        ('ShaperStateCapacity', '1', 'available')}
+            self.assertTrue(expected.issubset(actual))
+            self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
+
+    def test_p4_metrics_csv_marks_missing_or_null_fixed_fields_unavailable(self):
+        import csv
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'ingress': {'BufferedPayloadBytes': None, 'ShaperPassed': 0}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'old', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            fields = {r['metric']: r for r in rows if r['group'] == 'ingress'}
+            for name in ('BufferedPayloadBytes', 'BufferedPayloadCapacityBytes', 'ShaperEnabled'):
+                self.assertEqual(fields[name]['availability'], 'unavailable')
+                self.assertEqual(fields[name]['value'], '')
+            self.assertEqual(fields['ShaperPassed']['availability'], 'available')
+            self.assertEqual(fields['ShaperPassed']['value'], '0')
+
+    def test_p7_websocket_metrics_csv_uses_fixed_rows_and_units(self):
+        import csv
+        histogram = {'count': 1, 'sum_seconds': 0.25, 'overflow': 0,
+                     'upper_seconds': [0.1], 'buckets': [0]}
+        ws = {'availability': 'available', 'sessions': 2, 'subscriptions': 3,
+              'global_queued_work': 1, 'global_queued_bytes': 2048,
+              'session_queued_in_flight_bytes': 512, 'submissions': 1,
+              'new_events': 1, 'build_failures': 0, 'deliveries_enqueued': 2,
+              'telemetry_writes_completed': 2, 'control_writes_completed': 1,
+              'drops': 0, 'slow_closes': 0, 'auth_denials': 0, 'origin_denials': 0,
+              'expiries': 0, 'revocations': 0, 'origin_missing': 0,
+              'confirmed_to_write_seconds': histogram, 'identity': 'PRIVATE_SENTINEL'}
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'availability': {'websocket': 'available'}, 'websocket_metrics': ws}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'ws', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        fields = {(r['metric'], r['unit']): r for r in rows if r['group'] == 'websocket'}
+        self.assertEqual(fields[('global_queued_bytes', 'bytes')]['value'], '2048')
+        self.assertEqual(fields[('telemetry_writes_completed', 'count')]['value'], '2')
+        self.assertEqual(fields[('confirmed_to_write_seconds.sum', 'seconds')]['value'], '0.25')
+        self.assertNotIn('PRIVATE_SENTINEL', str(rows))
+
+    def test_p7_websocket_metrics_csv_preserves_disabled_availability(self):
+        import csv
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-25T10:00:00Z',
+                  'availability': {'websocket': 'disabled'}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'disabled', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        self.assertTrue(all(r['availability'] == 'disabled' and r['value'] == ''
+                            for r in rows if r['group'] == 'websocket'))
+
+    def test_p5a_metrics_csv_exports_actual_persistence_and_microbatch_operations(self):
+        import csv
+        h = {'count': 2, 'sum_seconds': 0.03, 'overflow': 0,
+             'upper_seconds': [0.01, 0.1], 'buckets': [1, 2]}
+        sample = {'process_instance': 'instance-a', 'elapsed_seconds': 10,
+                  'observed_at': '2026-10-25T10:00:00Z',
+                  'availability': {'persistence': 'available', 'group_persistence': 'available',
+                                   'batch_wait': 'available'},
+                  'persistence': {'single_attempts': 5, 'group_attempts': 3, 'group_members': 8,
+                                  'group_rows': 800, 'fallback_attempts': 1, 'begin_attempts': 9,
+                                  'confirmed_commits': 8, 'confirmed_rollbacks': 1,
+                                  'copy_calls': 4, 'copy_returned_rows': 700, 'confirmed_new_rows': 650},
+                  'ingress': {'Received': 8, 'SamplesNew': 650,
+                              'microbatch': {'enabled': True, 'max_messages': 32, 'max_rows': 500,
+                                  'max_payload_bytes': 4194304, 'max_wait_ns': 1000000000,
+                                  'groups': 3, 'members': 8, 'rows': 800, 'payload_bytes': 4200,
+                                  'flush_messages': 2, 'flush_rows': 1, 'flush_bytes': 0,
+                                  'flush_timer': 0, 'flush_stop': 0,
+                                  'standalone_oversized_members': 0},
+                              'Durations': {'batch_wait': h, 'group_persistence': h}}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'after', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        values = {(r['group'], r['metric']): (r['value'], r['availability']) for r in rows}
+        self.assertEqual(values[('persistence', 'copy_calls')], ('4', 'available'))
+        self.assertEqual(values[('persistence', 'copy_returned_rows')], ('700', 'available'))
+        self.assertEqual(values[('persistence', 'group_members')], ('8', 'available'))
+        self.assertEqual(values[('ingress_microbatch', 'flush_messages')], ('2', 'available'))
+        self.assertEqual(values[('ingress_microbatch', 'max_rows')], ('500', 'available'))
+        self.assertEqual(values[('ingress_durations', 'batch_wait.count')], ('2', 'available'))
+        self.assertEqual(values[('ingress_durations', 'group_persistence.sum')], ('0.03', 'available'))
+        # Operation counts are not inferred from group rows or target row limits.
+        self.assertEqual(values[('persistence', 'copy_calls')][0], '4')
+
+    def test_p5a_metrics_missing_sources_are_unavailable_and_keep_instance_delta_rules(self):
+        import csv
+        a = {'process_instance': 'same', 'elapsed_seconds': 1, 'observed_at': 't1',
+             'persistence': {'copy_calls': 2}, 'ingress': {'microbatch': {'groups': 1}}}
+        b = {'process_instance': 'same', 'elapsed_seconds': 3, 'observed_at': 't2',
+             'persistence': {'copy_calls': 5}, 'ingress': {'microbatch': {'groups': 3}}}
+        missing = {'process_instance': 'same', 'elapsed_seconds': 4, 'observed_at': 't3', 'ingress': {}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'a', 'snapshot': a},
+                                                {'phase': 'b', 'snapshot': b},
+                                                {'phase': 'missing', 'snapshot': missing}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        copy_rows = [r for r in rows if r['group'] == 'persistence' and r['metric'] == 'copy_calls']
+        self.assertEqual([(r['value'], r['delta']) for r in copy_rows[:2]], [('2', ''), ('5', '3')])
+        missing_fields = {(r['group'], r['metric']): r for r in rows if r['availability'] == 'unavailable'}
+        for key in (('persistence', 'copy_calls'), ('ingress_microbatch', 'groups'),
+                    ('ingress_microbatch', 'enabled'), ('ingress_durations', 'batch_wait.count')):
+            self.assertEqual(missing_fields[key]['value'], '')
+
+    def test_p1_metrics_csv_exports_fixed_ram_dedup_fields_with_truthful_availability(self):
+        import csv
+        snapshot = {'process_instance': 'cache-instance', 'elapsed_seconds': 12,
+                    'observed_at': '2026-10-26T10:00:00Z',
+                    'availability': {'ram_dedup': 'available'},
+                    'ram_dedup': {
+                        'lookup_hit_total': 4, 'lookup_miss_total': 8,
+                        'lookup_expired_total': 1, 'lookup_metadata_mismatch_total': 2,
+                        'lookup_disabled_bypass_total': 0, 'publication_stored_total': 7,
+                        'publication_existing_total': 2, 'publication_metadata_mismatch_total': 1,
+                        'publication_full_total': 3, 'publication_invalid_skip_total': 4,
+                        'publication_disabled_bypass_total': 5, 'capacity_bypass_total': 6,
+                        'rotations_total': 2, 'database_calls_avoided_total': 4,
+                        'entries': 7, 'logical_bytes': 896, 'current_generation_entries': 5,
+                        'previous_generation_entries': 2, 'enabled': True, 'ttl_seconds': 600,
+                        'max_entries': 1000, 'max_bytes': 65536,
+                        'unexpected_private_label': 'must_not_export'},
+                    'ingress': {}}
+        disabled = {'process_instance': 'cache-instance', 'elapsed_seconds': 13,
+                    'observed_at': '2026-10-26T10:00:01Z',
+                    'availability': {'ram_dedup': 'disabled'},
+                    'ram_dedup': {'enabled': False}, 'ingress': {}}
+        unavailable = {'process_instance': 'cache-instance', 'elapsed_seconds': 14,
+                      'observed_at': '2026-10-26T10:00:02Z',
+                      'availability': {'ram_dedup': 'unavailable'}, 'ingress': {}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [
+                {'phase': 'warm', 'snapshot': snapshot},
+                {'phase': 'disabled', 'snapshot': disabled},
+                {'phase': 'missing', 'snapshot': unavailable}])
+            with target.open() as stream:
+                reader = csv.DictReader(stream)
+                header = reader.fieldnames
+                rows = list(reader)
+        values = {(r['phase'], r['metric']): r for r in rows if r['group'] == 'ram_dedup'}
+        self.assertEqual(values[('warm', 'lookup_hit_total')]['value'], '4')
+        self.assertEqual(values[('warm', 'lookup_hit_total')]['unit'], 'operations')
+        self.assertEqual(values[('warm', 'logical_bytes')]['unit'], 'bytes')
+        self.assertEqual(values[('warm', 'ttl_seconds')]['unit'], 'seconds')
+        self.assertEqual(values[('warm', 'database_calls_avoided_total')]['value'], '4')
+        self.assertEqual(values[('warm', 'database_calls_avoided_total')]['delta'], '')
+        self.assertEqual(values[('disabled', 'lookup_hit_total')]['availability'], 'disabled')
+        self.assertEqual(values[('disabled', 'max_bytes')]['availability'], 'unavailable')
+        self.assertEqual(values[('missing', 'lookup_hit_total')]['availability'], 'unavailable')
+        self.assertEqual(values[('missing', 'lookup_hit_total')]['value'], '')
+        self.assertNotIn('unexpected_private_label', {r['metric'] for r in rows})
+        self.assertEqual(header, ['schema_version', 'timestamp_utc', 'elapsed_seconds', 'process_instance',
+                                  'phase', 'group', 'metric', 'kind', 'unit', 'value', 'delta',
+                                  'rate_per_s', 'availability', 'error'])
+
+    def test_p1_cache_export_preserves_explicit_unavailable_with_present_snapshot(self):
+        import csv
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                snapshot = {
+                    'process_instance': 'same', 'elapsed_seconds': 1,
+                    'observed_at': '2026-10-26T10:00:00Z',
+                    'availability': {'ram_dedup': 'unavailable'},
+                    'ram_dedup': {'enabled': enabled, 'lookup_hit_total': 0},
+                    'ingress': {},
+                }
+                target = Path(directory) / 'metrics.csv'
+                smoke.paper_p1_metrics_csv(target, [{'phase': 'unavailable', 'snapshot': snapshot}])
+                with target.open() as stream:
+                    rows = [row for row in csv.DictReader(stream) if row['group'] == 'ram_dedup']
+                hit = next(row for row in rows if row['metric'] == 'lookup_hit_total')
+                self.assertEqual(hit['availability'], 'unavailable')
+                self.assertEqual(hit['value'], '')
+
+    def test_p5a_metadata_has_explicit_cache_off_and_schema24_defaults(self):
+        support = smoke.paper_p5a_support()
+        metadata = support.run_metadata('off', '100')
+        self.assertEqual(metadata['database_schema_version'], 24)
+        self.assertEqual(metadata['ram_cache'], {
+            'enabled': False, 'ttl_seconds': 600, 'max_entries': 100000,
+            'max_bytes': 67108864, 'status': 'configured_not_run'})
+
+    def test_p5a_profiles_only_change_microbatch_and_keep_cache_disabled(self):
+        support = smoke.paper_p5a_support()
+        for dataset, samples in (('100', 100), ('1', 1)):
+            off = support.profile('off', dataset)
+            on = support.profile('on', dataset)
+            self.assertEqual(off['MQTT_MICROBATCH_ENABLED'], 'false')
+            self.assertEqual(on['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual({k: v for k, v in off.items() if k != 'MQTT_MICROBATCH_ENABLED'},
+                             {k: v for k, v in on.items() if k != 'MQTT_MICROBATCH_ENABLED'})
+            for mode in ('off', 'on'):
+                meta = support.run_metadata(mode, dataset,
+                    backend_quota={'cpus': 2, 'memory_bytes': 4294967296},
+                    effective_environment=support.profile(mode, dataset))
+                self.assertEqual(meta['dataset']['samples_per_message'], samples)
+                self.assertEqual(meta['effective_profile'], support.profile(mode, dataset))
+                self.assertEqual(meta['backend_quota'], {'cpus': 2, 'memory_bytes': 4294967296})
+                self.assertEqual(meta['offered_pattern']['status'], 'configured_not_run')
+                self.assertEqual(meta['auth_tls_acl'], {
+                    'auth_mode': 'rs256', 'https': True, 'mqtt_tls': True, 'acl_enforced': True})
+                self.assertEqual(meta['ram_cache'], {
+                    'enabled': False, 'ttl_seconds': 600, 'max_entries': 100000,
+                    'max_bytes': 67108864, 'status': 'configured_not_run'})
+                self.assertEqual(meta['mode'], mode)
+                self.assertEqual(meta['effective_profile_source'], 'validated_compose_environment')
+                self.assertEqual(meta['effective_profile']['MQTT_MICROBATCH_ENABLED'],
+                                 'true' if mode == 'on' else 'false')
+        with self.assertRaises(ValueError):
+            support.profile('invalid', '100')
+        with self.assertRaises(ValueError):
+            support.profile('off', '10')
+
+    def test_p4_rate_delta_is_same_process_positive_interval_and_not_shaper_accepted(self):
+        a = {'process_instance': 'a', 'elapsed_seconds': 2,
+             'ingress': {'Received': 4, 'Committed': 1, 'SamplesNew': 10, 'ShaperPassed': 8}}
+        b = {'process_instance': 'a', 'elapsed_seconds': 4,
+             'ingress': {'Received': 8, 'Committed': 3, 'SamplesNew': 30, 'ShaperPassed': 20}}
+        self.assertEqual(smoke.paper_p1_rates(a, b), {
+            'received_delivery_msg_per_s': 2, 'new_committed_msg_per_s': 1, 'new_committed_samples_per_s': 10})
+        for bad in (dict(b, process_instance='b'), dict(b, elapsed_seconds=2)):
+            self.assertTrue(all(value is None for value in smoke.paper_p1_rates(a, bad).values()))
+
+    def test_p1_artifacts_allowlist_and_missing_is_not_zero(self):
+        import csv
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            sample = {'process_instance': 'a', 'elapsed_seconds': 1, 'observed_at': '2026-10-24T10:00:00Z',
+                      'ingress': {'Received': 3, 'SamplesNew': 100, 'token': 'PRIVATE_SENTINEL'},
+                      'availability': {'command': 'disabled', 'result': 'not_implemented'}, 'password': 'PRIVATE_SENTINEL'}
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'before', 'snapshot': sample}, {'phase': 'running', 'snapshot': None, 'error': 'scrape_failed'}])
+            self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            missing = [r for r in rows if r['error'] == 'scrape_failed']
+            self.assertTrue(missing)
+            self.assertTrue(all(r['value'] == '' for r in missing))
+            unavailable = [r for r in rows if r['availability'] == 'not_implemented']
+            self.assertTrue(unavailable)
+            self.assertTrue(all(r['value'] == '' for r in unavailable))
+
+    def test_p3_control_csv_reuses_fixed_groups_without_identity_labels(self):
+        import csv
+        hist = {'count': 3, 'sum_seconds': 0.04, 'overflow': 0,
+                'upper_seconds': [0.1], 'buckets': [3]}
+        sample = {'process_instance': 'a', 'elapsed_seconds': 1,
+                  'observed_at': '2026-10-25T10:00:00Z',
+                  'command_result': {'accepted': 3, 'db_error': 1, 'processing': hist,
+                                     'command_id': 'PRIVATE_SENTINEL'},
+                  'command_timeline': {'d_dispatch': hist, 'd_e2e_succeeded': hist,
+                                       'missing_result': 1, 'capacity': 1024,
+                                       'command_id': 'PRIVATE_SENTINEL'}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'control', 'snapshot': sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertTrue(any(r['group'] == 'command_timeline' and
+                                r['metric'] == 'd_dispatch.count' and r['value'] == '3'
+                                for r in rows))
+            self.assertTrue(any(r['group'] == 'command_result' and
+                                r['metric'] == 'db_error' and r['value'] == '1'
+                                for r in rows))
+            self.assertNotIn('PRIVATE_SENTINEL', target.read_text())
+
+    def test_p6_control_csv_exports_fixed_dispatch_and_result_decomposition(self):
+        import csv
+        hist = {'count': 3, 'sum_seconds': 0.06, 'overflow': 0,
+                'upper_seconds': [0.01, 0.1], 'buckets': [1, 2]}
+        sample = {'process_instance': 'p', 'elapsed_seconds': 4, 'observed_at': 'now',
+                  'availability': {'command': 'available', 'dispatch_e2e': 'available', 'result': 'available'},
+                  'command_admission': {'accepted': 2, 'admission': hist},
+                  'command_dispatch': {'live_publish_workers': 2, 'published_mark_successful_calls': 5,
+                                       'queue_depth': 3, 'queue_capacity': 32, 'in_flight': 4,
+                                       'notification_signals_accepted': 7,
+                                       'notification_signals_coalesced': 2, 'prepare_db_recheck': hist,
+                                       'published_mark': hist},
+                  'command_result': {'queue_wait': hist, 'received_to_confirmed_commit': hist,
+                                     'accepted': 1},
+                  'command_timeline': {'commit_to_first_discovery': hist,
+                                       'commit_to_first_enqueue': hist,
+                                       'missing_commit_to_discovery': 2,
+                                       'missing_commit_to_enqueue': 3}}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'metrics.csv'
+            next_sample = dict(sample, elapsed_seconds=5, observed_at='later',
+                               command_dispatch=dict(sample['command_dispatch'],
+                                                     prepare_db_recheck={
+                                                         'count': 5, 'sum_seconds': 0.1, 'overflow': 1,
+                                                         'upper_seconds': [0.01, 0.1], 'buckets': [2, 2]}))
+            smoke.paper_p1_metrics_csv(target, [{'phase': 'control', 'snapshot': sample},
+                                                {'phase': 'control', 'snapshot': next_sample}])
+            with target.open() as stream:
+                rows = list(csv.DictReader(stream))
+        indexed = {(r['group'], r['metric']): r for r in rows}
+        for group, metric, unit in (
+                ('command_dispatch', 'live_publish_workers', 'count'),
+                ('command_dispatch', 'published_mark_successful_calls', 'count'),
+                ('command_dispatch', 'queue_depth', 'count'),
+                ('command_dispatch', 'queue_capacity', 'count'),
+                ('command_dispatch', 'in_flight', 'count'),
+                ('command_dispatch', 'notification_signals_coalesced', 'count'),
+                ('command_dispatch', 'prepare_db_recheck.count', 'count'),
+                ('command_dispatch', 'published_mark.count', 'count'),
+                ('command_result', 'queue_wait.count', 'count'),
+                ('command_result', 'received_to_confirmed_commit.count', 'count'),
+                ('command_timeline', 'commit_to_first_discovery.count', 'count'),
+                ('command_timeline', 'commit_to_first_enqueue.count', 'count'),
+                ('command_timeline', 'missing_commit_to_discovery', 'count')):
+            self.assertEqual(indexed[(group, metric)]['unit'], unit)
+            self.assertEqual(indexed[(group, metric)]['availability'], 'available')
+        self.assertEqual(indexed[('command_result', 'received_to_confirmed_commit.sum')]['unit'], 'seconds')
+        self.assertEqual(indexed[('command_dispatch', 'prepare_db_recheck.window.p95_seconds')]['value'], 'infinity')
+        self.assertEqual(indexed[('command_dispatch', 'prepare_db_recheck.window.percentile_method')]['value'],
+                         'upper_bucket_approximation')
+
+    def test_p6_histogram_window_delta_and_percentiles_are_process_local_and_bucket_bounded(self):
+        hist1 = {'count': 4, 'sum_seconds': 0.2, 'overflow': 0,
+                 'upper_seconds': [0.01, 0.1, 1.0], 'buckets': [1, 2, 1]}
+        hist2 = {'count': 7, 'sum_seconds': 0.8, 'overflow': 1,
+                 'upper_seconds': [0.01, 0.1, 1.0], 'buckets': [2, 3, 1]}
+        before = {'process_instance': 'same', 'availability': {'dispatch_e2e': 'available'},
+                  'command_dispatch': {'prepare_db_recheck': hist1}}
+        after = {'process_instance': 'same', 'availability': {'dispatch_e2e': 'available'},
+                 'command_dispatch': {'prepare_db_recheck': hist2}}
+        window = smoke.paper_p1_histogram_window(before, after, 'command_dispatch', 'prepare_db_recheck')
+        self.assertEqual(window['availability'], 'available')
+        self.assertEqual(window['count'], 3)
+        self.assertEqual(window['overflow'], 1)
+        self.assertEqual(window['buckets'], [1, 1, 0])
+        self.assertEqual(window['p50_seconds'], 0.1)
+        self.assertEqual(window['p95_seconds'], 'infinity')
+        self.assertEqual(window['percentile_method'], 'upper_bucket_approximation')
+        for bad_before, bad_after in (
+                (before, dict(after, process_instance='restarted')),
+                (None, after),
+                (before, {'process_instance': 'same', 'availability': {'dispatch_e2e': 'available'},
+                          'command_dispatch': {'prepare_db_recheck': dict(hist2, count=3)}}),
+                (before, {'process_instance': 'same', 'availability': {'dispatch_e2e': 'unavailable'},
+                          'command_dispatch': {'prepare_db_recheck': hist2}})):
+            self.assertNotEqual(smoke.paper_p1_histogram_window(
+                bad_before, bad_after, 'command_dispatch', 'prepare_db_recheck')['availability'], 'available')
+
+    def test_p6_histogram_window_marks_disabled_missing_and_non_cumulative_bucket_data(self):
+        hist = {'count': 2, 'sum_seconds': 0.3, 'overflow': 0,
+                'upper_seconds': [0.01, 0.1, 1.0], 'buckets': [1, 0, 1]}
+        disabled = {'process_instance': 'p', 'availability': {'dispatch_e2e': 'disabled'}}
+        available = {'process_instance': 'p', 'availability': {'dispatch_e2e': 'available'},
+                     'command_dispatch': {'prepare_db_recheck': hist}}
+        self.assertEqual(smoke.paper_p1_histogram_window(
+            disabled, available, 'command_dispatch', 'prepare_db_recheck')['availability'], 'disabled')
+        invalid = dict(hist, buckets=[2, 1, 0])
+        corrupt = {'process_instance': 'p', 'availability': {'dispatch_e2e': 'available'},
+                   'command_dispatch': {'prepare_db_recheck': invalid}}
+        self.assertEqual(smoke.paper_p1_histogram_window(
+            available, corrupt, 'command_dispatch', 'prepare_db_recheck')['availability'], 'unavailable')
+
+    def test_p3_profile_reuses_p2_but_enables_only_isolated_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p3', paper_p3=True)
+            self.assertTrue(fixture.paper_p3)
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['STAGE5_ENABLED'], 'true')
+            self.assertEqual(fixture.values['STAGE5_RESULT_WORKERS'], '2')
+            self.assertEqual(fixture.values['STAGE5_WAKEUP_ENABLED'], 'false')
+            self.assertEqual(fixture.values['STAGE5_PUBLISH_QUEUE_CAPACITY'], '32')
+            self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '12')
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_ENABLED'], 'true')
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_WAKEUP_ENABLED'], 'false')
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_PUBLISH_QUEUE_CAPACITY'], '32')
+            self.assertEqual(model['services']['backend']['environment']['SUPABASE_JWT_MODE'], 'rs256')
+            ordinary = smoke.prepare(Path(directory) / 'p2', paper_p2=True)
+            self.assertEqual(ordinary.values['STAGE5_ENABLED'], 'false')
+
+    def test_p3_microbatch_variant_is_explicit_opt_in_and_keeps_default_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ordinary = smoke.prepare(Path(directory) / 'ordinary', paper_p3=True)
+            variant = smoke.prepare(Path(directory) / 'microbatch', paper_p3=True,
+                                    paper_p3_microbatch=True)
+            self.assertFalse(ordinary.paper_p3_microbatch)
+            self.assertEqual(ordinary.values['MQTT_MICROBATCH_ENABLED'], 'false')
+            self.assertTrue(variant.paper_p3_microbatch)
+            self.assertTrue(variant.paper_p3)
+            self.assertTrue(variant.paper_p2)
+            self.assertEqual(variant.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(variant.values['STAGE5_ENABLED'], 'true')
+            model = smoke.dry_effective_config(variant)
+            env = model['services']['backend']['environment']
+            self.assertEqual(env['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(env['METRICS_ENABLED'], 'true')
+
+    def test_p3_microbatch_variant_rejects_other_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, '^paper_p3_microbatch_mode_rejected$'):
+                smoke.prepare(Path(directory) / 'bad', paper_p3_microbatch=True)
+
+    def test_p5b_control_variant_requires_p5a_control_and_keeps_schema24_cache_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, '^paper_p5b_control_requires_p5a_control$'):
+                smoke.prepare(Path(directory) / 'bad', paper_p3=True, paper_p5b_control_regression=True)
+            fixture = smoke.prepare(Path(directory) / 'good', paper_p3=True, paper_p3_microbatch=True,
+                                    paper_p5b_control_regression=True)
+            self.assertTrue(fixture.paper_p5b_control_regression)
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            model = smoke.dry_effective_config(fixture)
+            env = model['services']['backend']['environment']
+            self.assertEqual(env['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(env['MQTT_RAM_DEDUP_MAX_ENTRIES'], '100000')
+            self.assertEqual(env['MQTT_RAM_DEDUP_MAX_BYTES'], '67108864')
+            self.assertIn('000024_telemetry_ledger_timestamp.up.sql',
+                          model['services']['supabase-compat-migration']['command'][-1])
+
+    def test_p5b_control_cli_requires_both_explicit_regression_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P3_FIXTURE_ONLY'}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'cli'),
+                    '--paper-p3', '--p5a-control-regression', '--p5b-control-regression']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            self.assertTrue(captured['fixture'].paper_p5b_control_regression)
+            self.assertIn('--p5b-control-regression', smoke.cli_arguments())
+
+    def test_p3_microbatch_cli_routes_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P3_FIXTURE_ONLY'}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'cli'),
+                    '--paper-p3', '--p5a-control-regression']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            fixture = captured['fixture']
+            self.assertTrue(fixture.paper_p3_microbatch)
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertIn('--p5a-control-regression', smoke.cli_arguments())
+
+    def test_p3_microbatch_acceptance_label_requires_regression_and_exact_cleanup(self):
+        evidence = {'full_p3_accepted': True, 'microbatch_control_regression_accepted': True}
+        good = smoke.paper_p3_acceptance_report('fixture', evidence, True, True,
+                                                {'container': 1, 'network': 1, 'volume': 1})
+        self.assertEqual(good['status'], 'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED')
+        self.assertEqual(good['effective_optimizations'], ['mqtt_microbatch'])
+        self.assertTrue(good['exact_cleanup_verified'])
+        for cleanup, candidate in ((False, evidence), (True, {'full_p3_accepted': True,
+                                                               'microbatch_control_regression_accepted': False})):
+            report = smoke.paper_p3_acceptance_report('fixture', candidate, cleanup, True)
+            self.assertEqual(report['status'], 'FAIL')
+            if not cleanup:
+                self.assertFalse(report['exact_cleanup_verified'])
+
+    def test_p5b_control_report_is_narrow_and_requires_exact_cleanup(self):
+        evidence = {'full_p3_accepted': True, 'microbatch_control_regression_accepted': True}
+        report = smoke.paper_p3_acceptance_report('fixture', evidence, True, True, {}, True)
+        self.assertEqual(report['status'], 'PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED')
+        self.assertTrue(report['ram_dedup_enabled'])
+        self.assertFalse(report.get('full_p5b_accepted', False))
+        self.assertEqual(smoke.paper_p3_acceptance_report('fixture', evidence, False, True, {}, True)['status'], 'FAIL')
+
+    def test_p4_profiles_are_comparable_and_use_real_shaper_switch(self):
+        expected = {
+            'MQTT_SHAPER_RATE_PER_SECOND': '2', 'MQTT_SHAPER_BURST': '4',
+            'MQTT_SHAPER_MAX_GATEWAYS': '4096', 'MQTT_SHAPER_IDLE_RETENTION': '10m',
+            'MQTT_INGRESS_BUFFERED_BYTES': '16777216', 'MQTT_QUEUE_CAPACITY': '256',
+            'MQTT_MAX_PAYLOAD_BYTES': '65536', 'MQTT_WORKER_COUNT': '4',
+            'DATABASE_MAX_CONNS': '10', 'STAGE5_ENABLED': 'false', 'METRICS_ENABLED': 'true',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = smoke.prepare(Path(directory) / 'baseline', paper_p4='baseline')
+            optimized = smoke.prepare(Path(directory) / 'optimized', paper_p4='optimized')
+            for fixture, enabled in ((baseline, 'false'), (optimized, 'true')):
+                self.assertTrue(fixture.paper_p4)
+                self.assertEqual(fixture.paper_p4_mode, 'baseline' if enabled == 'false' else 'optimized')
+                self.assertTrue(fixture.paper_p2)
+                self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], enabled)
+                self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'false')
+                for key, value in expected.items():
+                    self.assertEqual(fixture.values[key], value, key)
+                self.assertIn('auth_socket:', (fixture.private / 'compose.p2.yml').read_text())
+                self.assertIn(str(smoke.PAPER_P0_TEMPLATE), smoke.compose_command(fixture, 'config'))
+                self.assertIn(str(fixture.private / 'compose.p2.yml'), smoke.compose_command(fixture, 'config'))
+                effective = {'services': {'backend': {'environment': dict(fixture.values)}}}
+                self.assertTrue(smoke.paper_p4_support().validate_effective_profile(fixture, effective))
+                for key in smoke.paper_p4_support().profile(fixture.paper_p4_mode):
+                    tampered = {'services': {'backend': {'environment': dict(fixture.values)}}}
+                    tampered['services']['backend']['environment'][key] = 'tampered'
+                    with self.assertRaisesRegex(ValueError, '^paper_p4_profile_rejected$'):
+                        smoke.paper_p4_support().validate_effective_profile(fixture, tampered)
+            self.assertNotEqual(baseline.values['MQTT_SHAPER_ENABLED'], optimized.values['MQTT_SHAPER_ENABLED'])
+
+    def test_p4_override_does_not_replace_root_metrics_environment_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p4', paper_p4='baseline')
+            backend = re.search(r'(?ms)^  backend:\n(.*?)(?=^  [a-z0-9_-]+:|^volumes:)',
+                                fixture.override.read_text())
+            self.assertIsNotNone(backend)
+            self.assertNotIn('METRICS_ENABLED', backend.group(1))
+            self.assertIn('METRICS_ENABLED: ${METRICS_ENABLED:-false}', smoke.ROOT_COMPOSE.read_text())
+
+    def test_p4_rejects_incompatible_or_metrics_off_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for kwargs in (
+                {'paper_p4': 'optimized', 'metrics_enabled': False},
+                {'paper_p4': 'invalid'},
+                {'paper_p4': 'baseline', 'paper_p3': True},
+                {'paper_p4': 'baseline', 'paper_p1': 'baseline'},
+            ):
+                with self.assertRaises(ValueError):
+                    smoke.prepare(Path(directory) / ('mode-' + str(len(kwargs)) + str(kwargs)), **kwargs)
+
+    def test_p4_lifecycle_requires_fixture_and_cleanup_veto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p4', paper_p4='baseline')
+            with self.assertRaisesRegex(ValueError, '^paper_p4_fixture_required$'):
+                smoke.paper_p4_support().run(smoke, fixture, None, None, None, None, None)
+            labels = {'io.iot.native-smoke.run': fixture.project}
+            def owned_item(kind, identity):
+                return {'kind': kind, 'name': identity, 'run': fixture.project,
+                        'task': 'native-compose-allocation', 'allocation_attempted': True,
+                        'removed': True, 'labels': labels,
+                        'receipt': {'id': identity if kind == 'volume' else 'a' * 64,
+                                    'created': '2026-10-25T08:00:00Z', 'labels': dict(labels)}}
+            registry = Mock(items=[owned_item('container', 'backend'),
+                                   owned_item('network', 'network'),
+                                   owned_item('volume', fixture.project + '_store')])
+            counts = {'container': 1, 'network': 1, 'volume': 1}
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                                               {'container': 0, 'network': 0, 'volume': 0}, True,
+                                                               Mock(items=[])))
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True,
+                                                               Mock(items=[owned_item('container', 'backend')])))
+            missing_receipt = owned_item('container', 'backend')
+            missing_receipt['receipt'] = None
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True},
+                                                               counts, True, Mock(items=[missing_receipt])))
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, False, registry))
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': False}, counts, True, registry))
+            self.assertTrue(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
+            registry.items[-1]['removed'] = False
+            self.assertFalse(smoke.paper_p4_cleanup_acceptance(fixture, {'full_p4_accepted': True}, counts, True, registry))
+
+    def test_p7_slow_viewer_mode_is_profiled_dispatched_and_proof_gated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'slow', paper_p7=True, paper_p7_mode='slow_viewer')
+            self.assertTrue(fixture.paper_p2)
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(smoke.paper_p7_support().pilot_mode(fixture), 'slow_viewer')
+            labels = {'io.iot.native-smoke.run': fixture.project}
+            item = {'kind': 'volume', 'name': fixture.project + '_store', 'run': fixture.project,
+                    'task': 'native-compose-allocation', 'allocation_attempted': True, 'removed': True,
+                    'labels': labels, 'receipt': {'id': fixture.project + '_store',
+                    'created': '2026-10-27T08:00:00Z', 'labels': dict(labels)}}
+            registry = Mock(items=[item])
+            proof_path = fixture.artifacts / 'p7-slow-viewer-proof.json'
+            ids = [f'id-{i}' for i in range(1000)]
+            proof_path.write_text(json.dumps({'functional_status': 'PASS',
+                'capture_finalization_status': 'finished', 'resource_cleanup_status': 'pending',
+                'workload': {'messages_offered': 1000, 'application_acks_expected': 1000,
+                    'application_acks_actual': 1000, 'unique_application_acks': 1000, 'message_ids': ids},
+                'database': {'actual_counts': {'ledger': 1000, 'raw': 1000000, 'temporal': 1000},
+                    'expected_counts': {'ledger': 1000, 'raw': 1000000, 'temporal': 1000},
+                    'ledger_ids': ids, 'temporal_ids': ids, 'ledger_provenance_match': True,
+                    'ledger_ids_match': True, 'ledger_time_provenance_match': True,
+                    'raw_content_match': True, 'raw_value_sequence_time_match': True,
+                    'temporal_ids_match': True, 'temporal_value_time_match': True,
+                    'temporal_provenance_match': True, 'temporal_values': [
+                        {'message_id': item, 'observed_at': '2026-10-27T00:00:00Z', 'value_number': 10000}
+                        for item in ids], 'ledger_time_values': [
+                        {'message_id': item, 'measured_at': '2026-10-27T00:00:00Z'} for item in ids],
+                    'raw_chunk_statistics': {'total_rows_expected': 1000000, 'rows_checked': 1000000,
+                        'chunks_checked': 10, 'failing_chunk': None}},
+                'policy': {'close_causes': ['queue_overflow'], 'close_cause_observed': True,
+                    'slow_close_delta_verified': True, 'queue_drained': True},
+                'capture_finalization': {'expected_a_count': 1000,
+                    'a': {'status': 'PASS', 'count': 1000, 'event_header_count': 1000,
+                        'headers_match_count': True, 'namespace_match': True},
+                    'b': {'status': 'ready', 'count': 0, 'event_header_count': 0,
+                        'headers_match_count': True, 'namespace_match': True}}}))
+            good = {'status': 'PASS', 'mode': 'paper_p7_slow_viewer', 'full_p7_accepted': False,
+                    'exact_cleanup_verified': False, 'evidence': {key: True for key in
+                    smoke.paper_p7_support().SLOW_VIEWER_REQUIRED_PROOFS},
+                    'capture_finalization_status': 'finished',
+                    'precleanup_proof_artifact': 'p7-slow-viewer-proof.json',
+                    'precleanup_proof_path': str(proof_path)}
+            self.assertTrue(smoke.paper_p7_cleanup_acceptance(fixture, {'paper_p7': good},
+                {'container': 0, 'network': 0, 'volume': 1}, True, registry))
+            bad = dict(good, evidence=dict(good['evidence'], database_counts=False))
+            self.assertFalse(smoke.paper_p7_cleanup_acceptance(fixture, {'paper_p7': bad},
+                {'container': 0, 'network': 0, 'volume': 1}, True, registry))
+
+    def test_p5a_workload_acceptance_is_separate_and_exact_cleanup_gated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p5a', paper_p5a=('on', '1'))
+            labels = {'io.iot.native-smoke.run': fixture.project}
+            item = {'kind': 'volume', 'name': fixture.project + '_outbox', 'run': fixture.project,
+                    'task': 'native-compose-allocation', 'allocation_attempted': True, 'removed': True,
+                    'labels': labels, 'receipt': {'id': fixture.project + '_outbox',
+                    'created': '2026-10-25T08:00:00Z', 'labels': dict(labels)}}
+            registry = Mock(items=[item])
+            counts = {'container': 0, 'network': 0, 'volume': 1}
+            self.assertFalse(smoke.paper_p5a_cleanup_acceptance(fixture,
+                {'full_p5a_workload_accepted': False}, counts, True, registry))
+            self.assertFalse(smoke.paper_p5a_cleanup_acceptance(fixture,
+                {'full_p5a_workload_accepted': True}, counts, False, registry))
+            self.assertTrue(smoke.paper_p5a_cleanup_acceptance(fixture,
+                {'full_p5a_workload_accepted': True}, counts, True, registry))
+
+    def test_p4_cli_dispatch_and_wrapper_are_explicit(self):
+        self.assertIn('--paper-p4', smoke.cli_arguments())
+        wrapper = (smoke.ROOT / 'scripts/test-paper-p4.sh').read_text()
+        self.assertIn('native_compose_smoke.py', wrapper)
+        self.assertIn('--paper-p4', wrapper)
+
+    def test_p4_cli_passes_mode_only_to_p4_and_never_runs_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P4_FIXTURE_ONLY'}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'p4'),
+                    '--paper-p4', '--mode', 'optimized']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            fixture = captured['fixture']
+            self.assertTrue(fixture.paper_p4)
+            self.assertIsNone(fixture.paper_p1)
+            self.assertEqual(fixture.paper_p4_mode, 'optimized')
+            self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'true')
+
+    def test_p5a_prepares_off_on_profiles_for_both_datasets_without_execution_claim(self):
+        support = smoke.paper_p5a_support()
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in ('off', 'on'):
+                for dataset in ('100', '1'):
+                    fixture = smoke.prepare(Path(directory) / f'{mode}-{dataset}',
+                                            paper_p5a=(mode, dataset))
+                    self.assertTrue(fixture.paper_p5a)
+                    self.assertEqual((fixture.paper_p5a_mode, fixture.paper_p5a_dataset), (mode, dataset))
+                    self.assertTrue(fixture.paper_p2)
+                    self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true' if mode == 'on' else 'false')
+                    self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'false')
+                    self.assertEqual(fixture.values['STAGE5_ENABLED'], 'false')
+                    self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '10')
+                    self.assertEqual(fixture.values['MQTT_WORKER_COUNT'], '4')
+                    self.assertEqual(fixture.values['MQTT_QUEUE_CAPACITY'], '256')
+                    self.assertEqual(fixture.values['SUPABASE_JWT_MODE'], 'rs256')
+                    support.validate_effective_profile(fixture.values, mode, dataset)
+                    env = dict(fixture.values)
+                    env['MQTT_MICROBATCH_ENABLED'] = 'false' if mode == 'on' else 'true'
+                    with self.assertRaisesRegex(ValueError, '^paper_p5a_profile_rejected$'):
+                        support.validate_effective_profile(env, mode, dataset)
+                    metadata = support.run_metadata(mode, dataset,
+                        effective_environment=fixture.values)
+                    self.assertEqual(metadata['offered_pattern']['status'], 'configured_not_run')
+                    self.assertEqual(metadata['backend_quota'], {'cpus': 2, 'memory_bytes': 4294967296})
+                    self.assertNotIn('password', json.dumps(metadata).lower())
+                    self.assertNotIn('secret', json.dumps(metadata).lower())
+                    artifact = json.loads((fixture.artifacts / 'run.json').read_text())
+                    self.assertEqual(artifact['status'], 'PREPARED_NOT_EXECUTED')
+                    self.assertIs(artifact['native_executed'], False)
+                    self.assertNotIn('full_p5a_accepted', artifact)
+
+    def test_p5a_rejects_conflicting_or_invalid_fixture_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for kwargs in (
+                {'paper_p5a': ('off', '100'), 'paper_p3': True},
+                {'paper_p5a': ('on', '1'), 'paper_p4': 'baseline'},
+                {'paper_p5a': ('on', '10')},
+                {'paper_p5a': ('invalid', '100')},
+                {'paper_p5a': ('off', '100'), 'metrics_enabled': False},
+            ):
+                with self.assertRaises(ValueError):
+                    smoke.prepare(Path(directory) / (str(len(kwargs)) + str(kwargs)), **kwargs)
+
+    def test_p5a_dispatch_is_explicitly_pending_and_cli_routes_only_p5a(self):
+        support = smoke.paper_p5a_support()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p5a', paper_p5a=('on', '1'))
+            with self.assertRaisesRegex(ValueError, '^paper_p5a_fixture_required$'):
+                support.run(smoke, fixture, None, None, None, None, None)
+            captured = {}
+            def startup(value):
+                captured['fixture'] = value
+                return {'status': 'P5A_FIXTURE_ONLY', 'native_executed': False}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'cli'),
+                    '--paper-p5a', '--mode', 'off', '--dataset', '100']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            self.assertTrue(captured['fixture'].paper_p5a)
+            self.assertEqual(captured['fixture'].paper_p5a_dataset, '100')
+            self.assertIn('--paper-p5a', smoke.cli_arguments())
+            wrapper = (smoke.ROOT / 'scripts/test-paper-p5a.sh').read_text()
+            self.assertIn('--paper-p5a', wrapper)
+
+    def test_p5b_cli_selects_cache_mode_without_running_native_workload(self):
+        support = smoke.paper_p5a_support()
+        with tempfile.TemporaryDirectory() as directory:
+            captured = {}
+            def startup(fixture):
+                captured['fixture'] = fixture
+                return {'status': 'P5B_PROFILE_FIXTURE_ONLY', 'native_executed': False}
+            argv = ['native_compose_smoke.py', '--prepare', str(Path(directory) / 'p5b'),
+                    '--paper-p5b', '--cache-mode', 'off', '--dataset', '100']
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'startup_only', side_effect=startup), \
+                    patch.object(smoke, 'is_fixture_verified', return_value=True), patch.object(smoke.shutil, 'rmtree'):
+                self.assertEqual(smoke.main(), 0)
+            fixture = captured['fixture']
+            self.assertTrue(fixture.paper_p5b)
+            self.assertEqual((fixture.paper_p5b_cache_mode, fixture.paper_p5a_dataset), ('off', '100'))
+            self.assertEqual(fixture.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'false')
+            artifact = json.loads((fixture.artifacts / 'run.json').read_text())
+            self.assertEqual(artifact['comparison']['cache_mode'], 'off')
+            self.assertEqual(artifact['phases']['duplicate_replay']['status'], 'configured_not_run')
+            self.assertFalse(artifact['native_executed'])
+            self.assertIn('--paper-p5b', smoke.cli_arguments())
+
+    def test_p5b_prepared_arms_use_same_schema24_profile_except_ram_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for dataset in ('100', '1'):
+                prepared = {}
+                for mode in ('off', 'on'):
+                    fixture = smoke.prepare(Path(directory) / f'{mode}-{dataset}',
+                                            paper_p5b=(mode, dataset))
+                    prepared[mode] = fixture
+                    artifact = json.loads((fixture.artifacts / 'run.json').read_text())
+                    self.assertEqual(artifact['database_schema_version'], 24)
+                    self.assertEqual(artifact['comparison']['microbatch_mode'], 'on')
+                    self.assertEqual(artifact['effective_profile']['MQTT_MICROBATCH_ENABLED'], 'true')
+                    self.assertEqual(artifact['effective_profile']['MQTT_RAM_DEDUP_ENABLED'],
+                                     'true' if mode == 'on' else 'false')
+                    self.assertEqual(fixture.values['MQTT_SHAPER_ENABLED'], 'false')
+                    self.assertEqual(fixture.values['DATABASE_MAX_CONNS'], '10')
+                    self.assertEqual(fixture.values['MQTT_WORKER_COUNT'], '4')
+                    self.assertEqual(artifact['phases']['new_messages']['status'], 'configured_not_run')
+                    self.assertEqual(artifact['phases']['duplicate_replay']['offered_attempts'], 24)
+                    self.assertIsInstance(artifact['source']['source_revision'], str)
+                    self.assertIsInstance(artifact['source']['dirty_worktree'], bool)
+                    self.assertEqual(artifact['source']['image_manifest']['status'], 'captured_after_image_build')
+                off_profile = smoke.paper_p5a_support().p5b_profile('off', dataset)
+                on_profile = smoke.paper_p5a_support().p5b_profile('on', dataset)
+                self.assertEqual({k: v for k, v in off_profile.items() if k != 'MQTT_RAM_DEDUP_ENABLED'},
+                                 {k: v for k, v in on_profile.items() if k != 'MQTT_RAM_DEDUP_ENABLED'})
+
+    def test_p5b_cli_rejects_missing_or_conflicting_cache_selector(self):
+        cases = (
+            ['--paper-p5b', '--dataset', '1'],
+            ['--cache-mode', 'on', '--dataset', '1'],
+            ['--paper-p5b', '--cache-mode', 'on', '--dataset', '1', '--paper-p5a', '--mode', 'on'],
+        )
+        for extra in cases:
+            with self.subTest(extra=extra), patch.object(sys, 'argv', ['native_compose_smoke.py',
+                    '--prepare', '/tmp/unused-p5b', *extra]), \
+                    self.assertRaises(SystemExit):
+                smoke.main()
+
+    def test_p5b_cache_flag_selects_only_the_schema24_p5a_on_one_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'p5b', paper_p5a=('on', '1'),
+                                    paper_p5b_cache_smoke=True)
+            self.assertTrue(fixture.paper_p5b_cache_smoke)
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_ENABLED'], 'true')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_MAX_ENTRIES'], '100000')
+            self.assertEqual(fixture.values['MQTT_RAM_DEDUP_MAX_BYTES'], '67108864')
+            metadata = smoke.paper_p5a_support().run_metadata('on', '1', cache_smoke=True,
+                                                               effective_environment=fixture.values)
+            self.assertEqual(metadata['database_schema_version'], 24)
+            self.assertEqual(metadata['cache_smoke_contract']['status'],
+                             'configured_not_run')
+            self.assertEqual(metadata['cache_smoke_contract']['phases'],
+                             ['warm_from_new_commit', 'exact_replay', 'representative_conflicts',
+                              'cold_exact_replay_after_controlled_backend_restart'])
+            for profile in (('off', '1'), ('on', '100')):
+                with self.assertRaisesRegex(ValueError, '^paper_p5b_cache_profile_rejected$'):
+                    smoke.prepare(Path(directory) / ('bad' + profile[0] + profile[1]),
+                                  paper_p5a=profile, paper_p5b_cache_smoke=True)
+
+    def test_p1_profile_reuses_p0_resources_but_keeps_its_own_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in ('baseline', 'optimized'):
+                fixture = smoke.prepare(Path(directory) / mode, paper_p1=mode)
+                self.assertEqual(fixture.paper_p1, mode)
+                self.assertFalse(fixture.paper_p0)
+                self.assertIn('supabase-storage', smoke.fixture_services(fixture))
+                self.assertIn(str(smoke.PAPER_P0_TEMPLATE), smoke.compose_command(fixture, 'config'))
+                self.assertEqual(fixture.values['METRICS_ENABLED'], 'true')
+                self.assertEqual(fixture.values['STAGE5_ENABLED'], 'false')
+                smoke.dry_effective_config(fixture)
+            for mode in ('invalid', 'BASELINE'):
+                with self.assertRaises(ValueError):
+                    smoke.prepare(Path(directory) / mode, paper_p1=mode)
+            with self.assertRaises(ValueError):
+                smoke.prepare(Path(directory) / 'both', paper_p0=True, paper_p1='baseline')
+
+
+class PaperP0Tests(unittest.TestCase):
+    def test_p0_git_trust_is_per_command_read_only_and_keeps_private_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            runner = Mock(return_value=Mock(returncode=0, stdout=b'a' * 40 + b'\n', stderr=b''))
+            self.assertEqual(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD', runner=runner), 'a' * 40)
+            self.assertEqual(runner.call_args.args[0], [
+                'git', '--no-optional-locks', '-c', 'safe.directory=' + str(smoke.ROOT),
+                '-C', str(smoke.ROOT), 'rev-parse', 'HEAD'])
+            self.assertEqual(runner.call_args.kwargs['env'], smoke.process_env(fixture))
+            self.assertTrue(runner.call_args.kwargs['capture_output'])
+            self.assertEqual(runner.call_args.kwargs['timeout'], 10)
+            for args in (('config', '--global', '--add', 'safe.directory', '*'), ('reset', '--hard')):
+                with self.assertRaisesRegex(ValueError, 'paper_p0_metadata_failed'):
+                    smoke.paper_p0_git(fixture, *args, runner=runner)
+            self.assertEqual(runner.call_count, 1)
+
+    def test_p0_git_failure_does_not_echo_raw_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            runner = Mock(return_value=Mock(returncode=128, stdout=b'', stderr=b'private diagnostic sentinel'))
+            with self.assertRaisesRegex(ValueError, '^paper_p0_metadata_failed$'):
+                smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD', runner=runner)
+
+    def test_p0_git_real_metadata_works_with_private_home(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            source = Path(directory) / 'source'
+            source.mkdir(mode=0o700)
+
+            def git(*args):
+                return subprocess.run(['git', '-C', str(source), *args],
+                    env=smoke.process_env(fixture), capture_output=True,
+                    timeout=10, check=True).stdout.decode().strip()
+
+            git('init', '--quiet', '--object-format=sha1', '--initial-branch=fixture')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                'commit', '--quiet', '--allow-empty', '-m', 'fixture')
+            head = git('rev-parse', 'HEAD')
+            with patch.object(smoke, 'ROOT', source):
+                self.assertEqual(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'), head)
+                self.assertEqual(smoke.paper_p0_git(fixture, 'branch', '--show-current'), 'fixture')
+                self.assertEqual(smoke.paper_p0_git(fixture, 'status', '--porcelain'), '')
+                git('checkout', '--quiet', '--detach', 'HEAD')
+                self.assertEqual(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'), head)
+                self.assertEqual(smoke.paper_p0_git(fixture, 'branch', '--show-current'), '')
+                self.assertEqual(smoke.paper_p0_git(fixture, 'status', '--porcelain'), '')
+
+    def test_p0_temporal_query_uses_backend_utc_z_contract(self):
+        from urllib.parse import parse_qs
+        query = parse_qs(smoke.paper_p0_temporal_query(
+            '2026-10-24T10:00:00.123456+00:00',
+            '2026-10-24T10:00:01.113456+00:00'))
+        self.assertEqual(query, {
+            'attrs': ['measurement'], 'timerel': ['between'],
+            'timeAt': ['2026-10-24T09:59:59.123456Z'],
+            'endTimeAt': ['2026-10-24T10:00:02.113456Z']})
+        # Same instant, different input offset: still send canonical UTC Z.
+        other = parse_qs(smoke.paper_p0_temporal_query(
+            '2026-10-24T17:00:00.123456+07:00',
+            '2026-10-24T17:00:01.113456+07:00'))
+        self.assertEqual(other, query)
+
+    def test_p0_temporal_query_rejects_ambiguous_naive_time(self):
+        with self.assertRaisesRegex(ValueError, 'paper_p0_read_failed'):
+            smoke.paper_p0_temporal_query('2026-10-24T10:00:00', '2026-10-24T10:00:01')
+
+    def test_effective_p0_model_rejects_flag_quota_mount_and_port_drift(self):
+        import copy
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(len(model['services']), 10)
+            self.assertEqual(str(model['services']['backend']['mem_limit']), '4294967296')
+            self.assertEqual(model['services']['supabase-storage']['volumes'][0]['source'], 'storage_data')
+            for key, value in [('MQTT_INGRESS_ENABLED', 'false'), ('STAGE5_ENABLED', 'true'),
+                               ('DATABASE_MAX_CONNS', '5'), ('MQTT_MAX_PAYLOAD_BYTES', '1048576'),
+                               ('MQTT_CREDENTIAL_RUNTIME_ENABLED', 'true')]:
+                bad = copy.deepcopy(model)
+                bad['services']['backend']['environment'][key] = value
+                with self.assertRaisesRegex(ValueError, 'paper_p0_profile_rejected'):
+                    smoke.validate_effective_model(fixture, bad)
+            for key, value in [('cpus', 0), ('mem_limit', 4000000000)]:
+                bad = copy.deepcopy(model)
+                bad['services']['backend'][key] = value
+                with self.assertRaisesRegex(ValueError, 'paper_p0_profile_rejected'):
+                    smoke.validate_effective_model(fixture, bad)
+            bad = copy.deepcopy(model)
+            bad['services']['supabase-storage']['volumes'][0]['source'] = 'postgres_data'
+            with self.assertRaisesRegex(ValueError, 'effective_mounts_rejected'):
+                smoke.validate_effective_model(fixture, bad)
+            bad = copy.deepcopy(model)
+            bad['services']['mosquitto']['ports'] = [{'target': 8883, 'published': '8883'}]
+            with self.assertRaisesRegex(ValueError, 'effective_ports_rejected'):
+                smoke.validate_effective_model(fixture, bad)
+            bad = copy.deepcopy(model)
+            bad['volumes']['storage_data']['name'] = 'deployment_storage_data'
+            with self.assertRaisesRegex(ValueError, 'effective_names_rejected'):
+                smoke.validate_effective_model(fixture, bad)
+
+    def test_effective_e3_polling_profile_accepts_required_stage5_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p8_e3='polling')
+            model = smoke.dry_effective_config(fixture)
+            self.assertEqual(model['services']['backend']['environment']['STAGE5_ENABLED'], 'true')
+            self.assertEqual(model['services']['backend']['environment']['DATABASE_MAX_CONNS'], '12')
+            smoke.validate_effective_model(fixture, model)
+
+    def test_effective_p6_profile_accepts_stage5_pool_and_metrics_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = smoke.prepare(Path(directory) / 'paper', paper_p6=('polling', '100'))
+            model = smoke.dry_effective_config(fixture)
+            environment = model['services']['backend']['environment']
+            self.assertEqual(environment['STAGE5_ENABLED'], 'true')
+            self.assertEqual(environment['DATABASE_MAX_CONNS'], '12')
+            self.assertEqual(environment['METRICS_ENABLED'], 'true')
+
+    def test_p0_partial_evidence_cannot_be_accepted(self):
+        with self.assertRaisesRegex(ValueError, 'paper_p0_acceptance_incomplete'):
+            smoke.validate_paper_p0_evidence({'checks': {'raw_samples': 200}})
+
+    def test_p0_profile_is_opt_in_and_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = smoke.prepare(Path(directory) / 'old')
+            p0 = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
+            self.assertEqual(old.values['MQTT_INGRESS_ENABLED'], 'false')
+            self.assertEqual(old.values['DATABASE_MAX_CONNS'], '5')
+            self.assertNotIn('supabase-storage', smoke.fixture_services(old))
+            self.assertIn('supabase-storage', smoke.fixture_services(p0))
+            for key, value in {'MQTT_INGRESS_ENABLED': 'true', 'STAGE5_ENABLED': 'false',
+                               'DATABASE_MAX_CONNS': '10', 'MQTT_QUEUE_CAPACITY': '256',
+                               'MQTT_WORKER_COUNT': '4', 'MQTT_MAX_PAYLOAD_BYTES': '65536'}.items():
+                self.assertEqual(p0.values[key], value)
+            self.assertNotEqual(old.project, p0.project)
+            self.assertNotEqual(old.values['JWT_SECRET'], p0.values['JWT_SECRET'])
+            text = p0.override.read_text()
+            self.assertNotIn('supabase-storage: !reset', text)
+            self.assertEqual(text.count('container_name: !reset null'), 10)
+            command = smoke.compose_command(p0, 'up')
+            self.assertIn(str(smoke.PAPER_P0_TEMPLATE), command)
+            self.assertEqual(command[-10:], list(smoke.fixture_services(p0)))
+            self.assertNotIn('rathole', command)
+            self.assertNotIn('cloudflared', command)
+
+    def test_p0_quota_requires_effective_runtime_limit(self):
+        for host in ({'NanoCpus': 2000000000, 'Memory': 4294967296},
+                     {'NanoCpus': 0, 'CpuQuota': 200000, 'CpuPeriod': 100000,
+                      'Memory': 4294967296}):
+            self.assertEqual(smoke.paper_p0_quota(host), {'cpus': 2, 'memory_bytes': 4294967296})
+        for host in ({'NanoCpus': 0, 'Memory': 4294967296},
+                     {'NanoCpus': 2000000000, 'Memory': 4000000000}):
+            with self.assertRaisesRegex(ValueError, 'paper_p0_quota_rejected'):
+                smoke.paper_p0_quota(host)
+
+    def test_p0_mode_exposed_and_fragment_has_no_public_ports_or_secrets(self):
+        self.assertIn('--paper-p0', smoke.cli_arguments())
+        text = smoke.PAPER_P0_TEMPLATE.read_text()
+        self.assertIn('cpus: 2', text)
+        self.assertIn('mem_limit: 4294967296', text)
+        self.assertIn('storage_data:', text)
+        self.assertNotIn('ports:', text)
+        self.assertNotIn('password', text.lower())
+
+
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 23);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 25);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("23:sensor_control_intent", expected)
+        self.assertIn("26:drop_telemetry_redundant_indexes", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
 
+    def test_historical_schema25_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history25 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 25)
+        self.assertTrue(history25.endswith("25:drop_telemetry_sensor_fk"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history25, history25, terminal="25:drop_telemetry_sensor_fk"))
+        # The default verifier remains pinned to current terminal 26.
+        self.assertFalse(smoke.schema_history_verified(0, history25, history25))
+
+    def test_historical_schema23_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history23 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 23)
+        self.assertTrue(history23.endswith("23:sensor_control_intent"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history23, history23, terminal="23:sensor_control_intent"))
+        # The default verifier remains pinned to current terminal 25.
+        self.assertFalse(smoke.schema_history_verified(0, history23, history23))
+
+    def test_historical_schema24_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history24 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 24)
+        self.assertTrue(history24.endswith("24:telemetry_ledger_timestamp"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history24, history24, terminal="24:telemetry_ledger_timestamp"))
+        self.assertFalse(smoke.schema_history_verified(0, history24, history24))
+
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",23:sensor_control_intent")
+        stale = expected.removesuffix(",26:drop_telemetry_redundant_indexes")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "23:sensor_control_intent")
+        missing = ",".join(p for p in expected.split(",") if p != "26:drop_telemetry_redundant_indexes")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("23:sensor_control_intent", "23:unexpected_name")
+        wrong = expected.replace("26:drop_telemetry_redundant_indexes", "26:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
         expected = smoke.expected_schema_history()
-        self.assertFalse(smoke.schema_history_verified(0, expected + ",23:future_migration", expected))
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",26:future_migration", expected))
 
     def test_failed_migration_returncode_rejected(self):
         expected = smoke.expected_schema_history()
@@ -381,7 +2763,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("23:sensor_control_intent", "24:future_migration")
+        future = expected.replace("26:drop_telemetry_redundant_indexes", "27:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 
@@ -1330,11 +3712,19 @@ class AllocationTests(unittest.TestCase):
                             return type("Res", (), {"returncode": 0, "stdout": b"1\n", "stderr": b""})()
                     return type("Res", (), {"returncode": 0, "stdout": image_inspect, "stderr": b""})()
 
+                cleanup_events = []
+                def before_cleanup():
+                    cleanup_events.append('diagnostics')
+                    raise RuntimeError('diagnostics failure')
+
                 with patch.object(registry, "resolve", side_effect=fake_resolve), \
-                     patch.object(registry, "remove"), \
+                     patch.object(registry, "remove", side_effect=lambda item: cleanup_events.append('remove')), \
                      patch.object(registry, "command", side_effect=fake_cmd):
                     with self.assertRaisesRegex(ValueError, "phase_health_timeout"):
-                        smoke.startup_only(f, registry=registry)
+                        smoke.startup_only(f, registry=registry, pre_cleanup_callback=before_cleanup)
+
+                self.assertEqual(cleanup_events[0], 'diagnostics')
+                self.assertIn('remove', cleanup_events[1:])
 
             # supabase-envoy was started, but nginx was NEVER started because envoy failed readiness
             self.assertIn("supabase-envoy", started_services)
@@ -1490,6 +3880,15 @@ class AllocationTests(unittest.TestCase):
     def test_safe_failure_report_schema_and_allowlists(self):
         with tempfile.TemporaryDirectory() as directory:
             f = smoke.prepare(Path(directory) / "fixture")
+            for code in ("paper_p5b_cold_replay_reconciliation_failed",
+                         "paper_p5b_functional_smoke_failed",
+                         "p8_prepare_report_artifact_missing",
+                         "p8_prepare_report_validation_missing"):
+                self.assertIn(code, smoke.ALLOWED_FAILURE_ERROR_CODES)
+                self.assertEqual(smoke.sanitize_failure_code(ValueError(code)), code)
+                report = smoke.record_failure_report(f, phase="paper_p5a",
+                    exc=ValueError(code), cleanup_verified=True)
+                self.assertEqual(report["error_code"], code)
             valid_report = {
                 "schema_version": 1,
                 "status": "STARTUP_FAILED",
@@ -2665,6 +5064,312 @@ class AllocationTests(unittest.TestCase):
             self.assertEqual(rep["phase"], "cleanup")
             self.assertEqual(rep["error_code"], "startup_cleanup_unresolved_evidence_retained")
             self.assertFalse(rep["cleanup_verified"])
+
+
+class P8ServerAndSmokeE2EqualSamplesTests(unittest.TestCase):
+    def setUp(self):
+        from scripts import paper_p8_server
+        self.server = paper_p8_server
+        from scripts.tests.paper_p8_e2_support import (
+            build_e2_equal_samples_context,
+            validate_e2_equal_samples_context,
+        )
+        self.build_ctx = build_e2_equal_samples_context
+        self.validate_ctx = validate_e2_equal_samples_context
+
+    def test_e2_context_command_creates_private_valid_context_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / 'e2-context.json'
+            ret = self.server.main(['e2-context', '--output', str(output)])
+            self.assertEqual(ret, 0)
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            ctx = json.loads(output.read_text())
+            validated = self.validate_ctx(ctx, check_freshness=False)
+            self.assertEqual(validated['total_samples'], 6000)
+            self.assertEqual(validated['sample_rate'], 100)
+            self.assertEqual(validated['seed'], 84)
+            self.assertEqual(validated['duration_seconds'], 60)
+            self.assertEqual(validated['workload_type'], 'equal_samples')
+
+    def test_e2_context_command_custom_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / 'e2-custom-context.json'
+            ret = self.server.main([
+                'e2-context', '--output', str(output),
+                '--total-samples', '12000',
+                '--sample-rate', '200',
+                '--seed', '42'
+            ])
+            self.assertEqual(ret, 0)
+            ctx = json.loads(output.read_text())
+            validated = self.validate_ctx(ctx, check_freshness=False)
+            self.assertEqual(validated['total_samples'], 12000)
+            self.assertEqual(validated['sample_rate'], 200)
+            self.assertEqual(validated['seed'], 42)
+            self.assertEqual(validated['duration_seconds'], 60)
+
+    def test_e2_context_command_rejects_existing_output_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / 'exists.json'
+            output.write_text('{}')
+            with self.assertRaises(ValueError):
+                self.server.main(['e2-context', '--output', str(output)])
+
+            sym_dir = Path(td) / 'symdir'
+            sym_dir.symlink_to(Path(td))
+            with self.assertRaises(ValueError):
+                self.server.main(['e2-context', '--output', str(sym_dir / 'out.json')])
+
+    def _valid_net_config(self, td):
+        net_config = Path(td) / 'net.json'
+        net_config.write_text(json.dumps({
+            'schema_version': 1, 'bind_ip': '10.0.0.1', 'advertised_host': '10.0.0.1',
+            'https_port': 8443, 'mqtt_tls_port': 8883,
+            'required_san_dns': ['localhost', 'nginx', 'mosquitto'],
+            'required_san_ips': ['127.0.0.1', '10.0.0.1'],
+        }))
+        net_config.chmod(0o600)
+        return net_config
+
+    def test_serve_e2_workload_omitted_is_steady_burst(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / 'server'
+            net_config = self._valid_net_config(td)
+            captured_cmd = []
+            with patch.object(self.server.remote, 'preflight_bind'), \
+                 patch('subprocess.Popen') as mock_popen:
+                mock_proc = Mock(wait=Mock(return_value=0))
+                def fake_popen(cmd, **kwargs):
+                    captured_cmd.extend(cmd)
+                    return mock_proc
+                mock_popen.side_effect = fake_popen
+                ret = self.server.main(['serve', '--root', str(root), '--network-config', str(net_config),
+                                        '--experiment', 'E2', '--samples-per-message', '100'])
+                self.assertEqual(ret, 0)
+                self.assertIn('--p8-e2-workload', captured_cmd)
+                idx = captured_cmd.index('--p8-e2-workload')
+                self.assertEqual(captured_cmd[idx + 1], 'steady_burst')
+                self.assertNotIn('--p8-e2-retry-mode', captured_cmd)
+
+            # steady_burst rejects --context and --reference
+            with self.assertRaisesRegex(ValueError, 'E2 steady_burst does not accept --context or --reference'):
+                self.server.main(['serve', '--root', str(Path(td) / 's2'), '--network-config', str(net_config),
+                                  '--experiment', 'E2', '--samples-per-message', '100',
+                                  '--workload', 'steady_burst', '--context', str(Path(td) / 'any.json')])
+
+    def test_serve_official_e2_propagates_explicit_optin(self):
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+            captured = []
+            with patch.object(self.server.remote, 'preflight_bind'), \
+                 patch('subprocess.Popen') as mock_popen:
+                mock_popen.side_effect = lambda cmd, **kwargs: (captured.extend(cmd) or Mock(wait=Mock(return_value=0)))
+                self.server.main(['serve','--root',str(Path(td)/'server'),'--network-config',str(net_config),
+                    '--experiment','E2','--profile','official','--official-opt-in',
+                    '--samples-per-message','100','--e2-offered-rate','1000',
+                    '--e2-duration-seconds','20','--e2-burst-messages','11',
+                    '--e2-pending-messages','1024','--e2-pending-bytes','8388608',
+                    '--e2-retry-mode','bounded_backoff_v1','--e2-retry-initial-interval-ms','500',
+                    '--e2-retry-max-interval-ms','8000','--e2-retry-jitter-percent','10',
+                    '--e2-retry-rate-per-second','100','--e2-retry-burst','20',
+                    '--deadline-seconds','1200'])
+            self.assertIn('--p8-official-opt-in',captured)
+            self.assertIn('--p8-profile',captured)
+            self.assertEqual(captured[captured.index('--p8-profile')+1],'official')
+            self.assertEqual(captured[captured.index('--p8-e2-offered-rate')+1],'1000')
+            self.assertEqual(captured[captured.index('--p8-e2-pending-messages')+1],'1024')
+            self.assertEqual(captured[captured.index('--p8-e2-pending-bytes')+1],'8388608')
+            for flag,value in (('--p8-e2-retry-mode','bounded_backoff_v1'),
+                ('--p8-e2-retry-initial-interval-ms','500'),('--p8-e2-retry-max-interval-ms','8000'),
+                ('--p8-e2-retry-jitter-percent','10'),('--p8-e2-retry-rate-per-second','100'),
+                ('--p8-e2-retry-burst','20')):
+                self.assertEqual(captured[captured.index(flag)+1],value)
+
+    def test_serve_e2_pending_dry_run_and_bound_rejection(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+            base = ['serve', '--root', str(Path(td) / 'server'), '--network-config', str(net_config),
+                '--experiment', 'E2', '--profile', 'official', '--official-opt-in',
+                '--samples-per-message', '100', '--e2-offered-rate', '1000',
+                '--e2-duration-seconds', '20', '--e2-burst-messages', '100',
+                '--deadline-seconds', '1200']
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.server.main(base + ['--dry-run', '--e2-pending-messages', '1024',
+                                         '--e2-pending-bytes', '8388608'])
+            plan = json.loads(output.getvalue())['e2_official_plan']
+            self.assertEqual(plan['pending_limits'], {'pending_messages': 1024, 'pending_bytes': 8388608})
+            self.assertEqual(plan['estimate']['unique_messages_estimate'], 20100)
+            with patch('subprocess.Popen') as process:
+                with self.assertRaisesRegex(ValueError, 'e2_estimate_input_rejected'):
+                    self.server.main(base + ['--e2-pending-bytes', str(1 << 30)])
+                process.assert_not_called()
+
+    def test_serve_e2_offered_rates_choices_accepted_and_rejected(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+            expected_rates = (100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000)
+            for rate in expected_rates:
+                dur = '5' if rate == 20000 else '10'
+                base = ['serve', '--root', str(Path(td) / f'server-{rate}'), '--network-config', str(net_config),
+                    '--experiment', 'E2', '--profile', 'official', '--official-opt-in',
+                    '--samples-per-message', '100', '--e2-offered-rate', str(rate),
+                    '--e2-duration-seconds', dur, '--deadline-seconds', '1200', '--dry-run']
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = self.server.main(base)
+                self.assertEqual(code, 0)
+                plan = json.loads(output.getvalue())['e2_official_plan']
+                self.assertEqual(plan['estimate']['rate_per_second'], rate)
+                rates = plan['producer_rates_per_second']
+                self.assertEqual(rates['A'], rate // 2)
+                self.assertEqual(rates['B'], rate - (rate // 2))
+
+            for bad_rate in (0, 50, 250, 300, 999, 12000, 25000):
+                bad_base = ['serve', '--root', str(Path(td) / 'server-bad'), '--network-config', str(net_config),
+                    '--experiment', 'E2', '--profile', 'official', '--official-opt-in',
+                    '--samples-per-message', '100', '--e2-offered-rate', str(bad_rate),
+                    '--e2-duration-seconds', '10', '--deadline-seconds', '1200', '--dry-run']
+                with self.assertRaises(SystemExit):
+                    self.server.main(bad_base)
+
+    def test_serve_e2_workload_equal_samples_requires_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+
+            # Missing --context
+            with self.assertRaisesRegex(ValueError, 'E2 equal_samples requires --context'):
+                self.server.main(['serve', '--root', str(Path(td) / 'server_missing'), '--network-config', str(net_config),
+                                  '--experiment', 'E2', '--workload', 'equal_samples',
+                                  '--samples-per-message', '100'])
+
+            # Valid context
+            ctx_path = Path(td) / 'valid_ctx.json'
+            ctx = self.build_ctx(total_samples=6000, sample_rate=100, seed=84)
+            ctx_path.write_text(json.dumps(ctx))
+            ctx_path.chmod(0o600)
+
+            captured_cmd = []
+            with patch.object(self.server.remote, 'preflight_bind'), \
+                 patch('subprocess.Popen') as mock_popen:
+                mock_proc = Mock(wait=Mock(return_value=0))
+                def fake_popen(cmd, **kwargs):
+                    captured_cmd.extend(cmd)
+                    return mock_proc
+                mock_popen.side_effect = fake_popen
+                ret = self.server.main(['serve', '--root', str(Path(td) / 'server_valid'), '--network-config', str(net_config),
+                                        '--deadline-seconds', '1200',
+                                        '--experiment', 'E2', '--workload', 'equal_samples',
+                                        '--samples-per-message', '100',
+                                        '--context', str(ctx_path)])
+                self.assertEqual(ret, 0)
+                self.assertIn('--p8-e2-workload', captured_cmd)
+                idx = captured_cmd.index('--p8-e2-workload')
+                self.assertEqual(captured_cmd[idx + 1], 'equal_samples')
+                self.assertIn('--p8-e2-context', captured_cmd)
+                c_idx = captured_cmd.index('--p8-e2-context')
+                self.assertEqual(captured_cmd[c_idx + 1], str(ctx_path))
+
+    def test_serve_rejects_mixing_and_unrelated_flags(self):
+        with tempfile.TemporaryDirectory() as td:
+            net_config = self._valid_net_config(td)
+
+            # E1 with --workload rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's1'), '--network-config', str(net_config),
+                                  '--experiment', 'E1', '--workload', 'equal_samples'])
+
+            # E4 with --workload rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's2'), '--network-config', str(net_config),
+                                  '--experiment', 'E4', '--workload', 'equal_samples'])
+
+            # E3 with equal_samples rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's3'), '--network-config', str(net_config),
+                                  '--experiment', 'E3', '--dispatch-mode', 'polling',
+                                  '--workload', 'equal_samples'])
+
+            # E2 with --arm rejected
+            with self.assertRaises(ValueError):
+                self.server.main(['serve', '--root', str(Path(td) / 's4'), '--network-config', str(net_config),
+                                  '--experiment', 'E2', '--samples-per-message', '100',
+                                  '--arm', 'optimized'])
+
+    def test_smoke_e2_fixture_equal_samples_disables_only_shaper(self):
+        with tempfile.TemporaryDirectory() as td:
+            ctx_path = Path(td) / 'context.json'
+            ctx = self.build_ctx(total_samples=6000, sample_rate=100, seed=84)
+            ctx_path.write_text(json.dumps(ctx))
+            ctx_path.chmod(0o600)
+
+            fixture_steady = smoke.prepare(Path(td) / 'f_steady', paper_p8_e2=True,
+                                           paper_p8_e2_workload='steady_burst')
+            self.assertEqual(fixture_steady.values['MQTT_SHAPER_ENABLED'], 'true')
+            self.assertEqual(fixture_steady.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture_steady.values['MQTT_MICROBATCH_MAX_WAIT'], '50ms')
+
+            fixture_equal = smoke.prepare(Path(td) / 'f_equal', paper_p8_e2=True,
+                                          paper_p8_e2_workload='equal_samples',
+                                          paper_p8_e2_context=str(ctx_path))
+            self.assertEqual(fixture_equal.values['MQTT_SHAPER_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_ENABLED'], 'true')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_MESSAGES'], '32')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_ROWS'], '500')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_PAYLOAD_BYTES'], '4194304')
+            self.assertEqual(fixture_equal.values['MQTT_MICROBATCH_MAX_WAIT'], '50ms')
+            self.assertEqual(fixture_equal.values['MQTT_RAM_DEDUP_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['STAGE5_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['STAGE5_WAKEUP_ENABLED'], 'false')
+            self.assertEqual(fixture_equal.values['WEBSOCKET_ENABLED'], 'false')
+
+    def test_smoke_e2_prepare_only_report_for_equal_samples(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fixture = type('Fixture', (), {'paper_p8_e2': True, 'paper_p8_e2_workload': 'equal_samples',
+                'project': 'e2-test', 'private': root / 'private', 'artifacts': root / 'artifacts'})()
+            fixture.private.mkdir()
+            fixture.artifacts.mkdir()
+            (fixture.private / 'session.json').write_text(json.dumps(
+                {'experiment': 'E2', 'phase_id': 'equal-samples-100', 'workload': 'equal_samples'}))
+            (fixture.artifacts / 'p8-e2-equal-samples-100-remote-result.json').write_text(json.dumps(
+                {'status': 'PASS', 'validation': {'valid': True}}))
+            report = smoke.paper_p8_prepare_only_report(fixture, remote_outcome='VALIDATED',
+                cleanup_verified=True, cleanup_counts={})
+            self.assertEqual(report['status'], 'PAPER_P8_E2_WORKLOAD_VERIFIED')
+            self.assertEqual(report['artifact'], 'p8-e2-equal-samples-100-remote-result.json')
+            self.assertTrue(report['p8_e2_workload_verified'])
+
+    def test_paper_p8_e2_profiles_valid_for_equal_samples(self):
+        # Equal samples profile with equal steady counts (e.g. 30 messages each for S=100)
+        profile_100 = {
+            'samples_per_message': 100,
+            'status': 'PASS',
+            'validation': {'valid': True, 'failures': []},
+            'workloads': {
+                'A': {'telemetry': {'generated_unique': 30, 'application_acks': 30, 'pending_messages': 0}},
+                'B': {'telemetry': {'generated_unique': 30, 'application_acks': 30, 'pending_messages': 0}},
+            }
+        }
+        profile_1 = {
+            'samples_per_message': 1,
+            'status': 'PASS',
+            'validation': {'valid': True, 'failures': []},
+            'workloads': {
+                'A': {'telemetry': {'generated_unique': 3000, 'application_acks': 3000, 'pending_messages': 0}},
+                'B': {'telemetry': {'generated_unique': 3000, 'application_acks': 3000, 'pending_messages': 0}},
+            }
+        }
+        evidence = {
+            'workload_type': 'equal_samples',
+            'profiles': [profile_100, profile_1]
+        }
+        self.assertTrue(smoke.paper_p8_e2_profiles_valid(evidence))
 
 
 if __name__ == "__main__":

@@ -154,9 +154,9 @@ CHECK (role IN ('owner', 'operator', 'viewer'))
 
 | Vai trò (`role`) | Tên hiển thị (VN) | Quyền hạn dữ liệu thực tế | Kế hoạch Giai đoạn sau (Downlink/Control/WebSocket/Media) | Hiển thị Client (Role Badge) |
 |---|---|---|---|---|
-| `owner` | **Chủ sở hữu** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường (`measurement`, `sample_interval_us`). Có quyền tạo cảm biến (`PUT /v1/gateways/{id}/sensors/{id}` hoặc `POST /v1/digital-twins`) và sửa tên cảm biến (`PATCH /v1/digital-twins/{id}/attrs`). | Cấu hình trạm (`desired_state`), ra lệnh điều khiển thiết bị an toàn trong server allowlist, nhận WebSocket realtime stream. | `Badge(Color: Amber, Label: "Chủ sở hữu", Icon: admin_panel_settings)` |
-| `operator` | **Người vận hành** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Không có quyền tạo/sửa cảm biến hoặc sửa trạm (`403 Forbidden`). | Được thực thi các lệnh vận hành an toàn trong server allowlist (ví dụ: `capture-image`). **Không** được sửa `desired_state`, **không** được sửa metadata cảm biến. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
-| `viewer` | **Người xem** | Hoàn toàn chỉ đọc (Read-only) danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Vĩnh viễn không có quyền ghi (`403 Forbidden`). | Tiếp tục duy trì trạng thái chỉ đọc trên telemetry, history, media, digital twin, WebSocket. Không có quyền gửi lệnh điều khiển. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
+| `owner` | **Chủ sở hữu** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường (`measurement`, `sample_interval_us`). Có quyền tạo cảm biến (`PUT /v1/gateways/{id}/sensors/{id}` hoặc `POST /v1/digital-twins`), sửa tên cảm biến (`PATCH /v1/digital-twins/{id}/attrs`), và điều khiển tần số lấy mẫu (`PATCH desired-state`). | Cấu hình tần số lấy mẫu cảm biến (`desired-state`), nhận WebSocket realtime stream. | `Badge(Color: Amber, Label: "Chủ sở hữu", Icon: admin_panel_settings)` |
+| `operator` | **Người vận hành** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Không có quyền tạo/sửa cảm biến hoặc sửa trạm (`403 Forbidden`). Được quyền đổi tần số lấy mẫu cảm biến (`PATCH desired-state`). | Đổi tần số lấy mẫu cảm biến của Sensor đã provision (`0 < Hz <= 100`). **Không** được sửa metadata cảm biến hay provisioning. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
+| `viewer` | **Người xem** | Hoàn toàn chỉ đọc (Read-only) danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Vĩnh viễn không có quyền ghi (`403 Forbidden`). | Tiếp tục duy trì trạng thái chỉ đọc trên telemetry, history, media, digital twin, WebSocket, command list/detail. Không có quyền gửi lệnh điều khiển. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
 
 ### 3.3. Trải nghiệm phân quyền trên Web Dashboard (Desktop / Tablet / Responsive)
 Khác với giao diện màn hình hẹp của thiết bị di động vốn chỉ hiển thị danh sách cuộn dọc đơn giản, nền tảng **Flutter Web Dashboard** sở hữu không gian hiển thị rộng rãi, cho phép tối ưu hóa trải nghiệm giám sát thông qua bố cục linh hoạt:
@@ -546,11 +546,11 @@ enum GatewayRole {
     }
   }
 
-  /// Kiểm tra vai trò cấu hình thiết bị (Giai đoạn sau)
-  bool get canConfigureDevice => this == GatewayRole.owner;
+  /// Kiểm tra vai trò cấu hình tần số lấy mẫu Sensor (P3/Stage 5: owner và operator)
+  bool get canConfigureSampling => this == GatewayRole.owner || this == GatewayRole.operator;
 
-  /// Kiểm tra vai trò gửi lệnh vận hành an toàn (Giai đoạn sau)
-  bool get canExecuteOperations => this == GatewayRole.owner || this == GatewayRole.operator;
+  /// Kiểm tra vai trò quản lý metadata trạm/cảm biến (chỉ owner)
+  bool get canManageMetadata => this == GatewayRole.owner;
 }
 ```
 

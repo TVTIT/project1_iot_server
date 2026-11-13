@@ -65,6 +65,18 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertTrue(WORKFLOW_PATH.is_file())
         self.assertGreater(len(self.raw_content), 100)
 
+    def test_var_tmp_fixture_jobs_prepare_both_roots_before_execution(self):
+        for name, consumer in (
+                ('stage2-e2e', 'test_stage2_ci.py'),
+                ('mosquitto-credential-integration', 'test-stage2-mqtt-credentials.sh'),
+                ('auth-integration', 'test-stage2-admin.sh'),
+                ('native-compose-smoke', 'test_native_compose_smoke.py')):
+            with self.subTest(job=name):
+                job = self._extract_job_section(name)
+                setup = re.search(r'mkdir -p /tmp/opencode /var/tmp/opencode', job)
+                self.assertIsNotNone(setup, 'fixture roots must exist on a clean runner')
+                self.assertLess(setup.start(), job.index(consumer))
+
     def test_lint_and_test_timeout_minutes_exists(self):
         """lint-and-test must define timeout-minutes to bound execution."""
         lint_job_section = self._extract_job_section("lint-and-test")
@@ -176,7 +188,7 @@ class TestCIFeatureJobs(unittest.TestCase):
         job = self._extract_job_section('dynsec-native-integration')
         self.assertIn('timeout-minutes: 20', job)
         self.assertIn('working-directory: .', job)
-        self.assertIn("go-version: '1.27.2'", job)
+        self.assertIn("go-version: '1.27.3'", job)
         self.assertIn('cache-dependency-path: src/go.sum', job)
         for image in (
             'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a',
@@ -299,7 +311,7 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertTrue(job.startswith('  stage3-uplink-integration:\n'))
         self.assertIn("timeout-minutes: 60", job)
         self.assertIn("working-directory: .", job)
-        self.assertIn("go-version: '1.27.2'", job)
+        self.assertIn("go-version: '1.27.3'", job)
         self.assertIn("cache-dependency-path: src/go.sum", job)
 
         # Prerequisites checks
@@ -369,7 +381,7 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertTrue(job.startswith('  stage4-api-integration:\n'))
         self.assertIn("timeout-minutes: 45", job)
         self.assertIn("working-directory: .", job)
-        self.assertIn("go-version: '1.27.2'", job)
+        self.assertIn("go-version: '1.27.3'", job)
         self.assertIn("cache-dependency-path: src/go.sum", job)
 
         # Prerequisites checks

@@ -1,0 +1,1859 @@
+import base64
+import hashlib
+import json
+import re
+import sqlite3
+import subprocess
+import sys
+import os
+import tempfile
+import time
+import unittest
+import contextlib
+import io
+from pathlib import Path
+from unittest import mock
+
+from scripts import paper_p8_client as client
+from scripts.tests import paper_p8_e4_support as e4_support
+from scripts.tests.test_paper_p8_bundle import PortableBundleTests, token, write
+
+
+class FragmentedSocket:
+    def __init__(self, response=b''):
+        self.response = response
+        self.sent = bytearray()
+        self.writes = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.closed = True
+
+    def settimeout(self, _):
+        pass
+
+    def sendall(self, value):
+        self.writes.append(value)
+        self.sent.extend(value)
+
+    def recv(self, size):
+        value = self.response[:min(size, 3)]
+        self.response = self.response[len(value):]
+        return value
+
+
+class IdentityAndProbeTests(unittest.TestCase):
+    def test_real_cli_exports_partial_e2_without_pythonpath(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        bundle_root = Path(fixture.export()['bundle_root'])
+        workspace = fixture.root / 'A' / 'workspace'
+        workspace.parent.mkdir(mode=0o700)
+        client.paper_p8_bundle.bind_bundle(bundle_root=bundle_root, workspace_leaf=workspace)
+
+        binding_path = workspace / 'runtime/binding.json'
+        binding = json.loads(binding_path.read_text())
+        binding['session'].update({'experiment': 'E2', 'run_id': 'e2-cli-partial'})
+        binding_path.write_text(json.dumps(binding))
+        binding_path.chmod(0o600)
+
+        spec_path = workspace / 'runtime/execution/run-spec.json'
+        spec = json.loads(spec_path.read_text())
+        for role, job in zip(('A', 'B'), spec['paperload']):
+            job['role'] = 'telemetry'
+            job['manifest'] = str(workspace / f'runtime/manifests/{role}.json')
+            output = workspace / f'outputs/{role}'
+            job['output_dir'] = str(output)
+            output.mkdir(mode=0o700)
+            policy = {'mode': 'bounded_backoff_v1', 'initial_interval_ms': 500,
+                      'max_interval_ms': 8000, 'jitter_percent': 10,
+                      'rate_per_second': 100, 'burst': 20}
+            workload = {'status': 'PARTIAL', 'experiment': 'E2', 'arm': role,
+                        'profile': 'official', 'mode': 'remote', 'run_id': 'e2-cli-partial',
+                        'retry_policy': policy}
+            write(output / 'workload.json', workload)
+        spec_path.write_text(json.dumps(spec))
+        spec_path.chmod(0o600)
+        binding['bound_run_spec_sha256'] = hashlib.sha256(spec_path.read_bytes()).hexdigest()
+        binding_path.write_text(json.dumps(binding))
+        binding_path.chmod(0o600)
+        write(workspace / 'outputs/run.json', {'status': 'PARTIAL'})
+        write(workspace / 'runtime/runner-provenance.json', {
+            'binary_sha256': 'a' * 64, 'binary_os': 'linux', 'binary_arch': 'amd64'})
+        output = fixture.root / 'exported'
+        repo = Path(__file__).resolve().parents[2]
+        env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        result = subprocess.run([sys.executable, str(repo / 'scripts/paper_p8_client.py'),
+            'export-results', '--workspace', str(workspace), '--output', str(output)],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads((output / 'results.json').read_text())
+        self.assertEqual(summary['runner_status'], 'PARTIAL')
+        self.assertEqual(summary['expected_workload_roles'], ['A', 'B'])
+        self.assertEqual(summary['present_workload_roles'], ['A', 'B'])
+        self.assertFalse(summary['full_p8_accepted'])
+        for role in ('A', 'B'):
+            exported = json.loads((output / f'results/workloads/{role}/workload.json').read_text())
+            self.assertEqual(exported['retry_policy']['mode'], 'bounded_backoff_v1')
+
+    def test_safe_workload_projects_retry_policy_and_keeps_absent_legacy_policy(self):
+        policy = {'mode':'bounded_backoff_v1','initial_interval_ms':500,'max_interval_ms':8000,
+                  'jitter_percent':10,'rate_per_second':100,'burst':20}
+        source = {'status':'COMPLETE','experiment':'E2','arm':'A','profile':'official',
+                  'mode':'remote','run_id':'e2-run','retry_policy':policy}
+        self.assertEqual(client._safe_workload(source, role='telemetry')['retry_policy'], policy)
+        self.assertNotIn('retry_policy', client._safe_workload(
+            {key:value for key,value in source.items() if key != 'retry_policy'}, role='telemetry'))
+        with self.assertRaises(ValueError):
+            client._safe_workload({**source,'retry_policy':dict(policy, burst=0)}, role='telemetry')
+
+    def test_conflict_transport_has_no_legacy_external_client_path(self):
+        self.assertFalse(hasattr(client, '_run_b_conflicts'))
+
+    def test_bound_e4_conflict_manifests_preflight_with_real_binary(self):
+        binary = os.environ.get('P8_TEST_PAPERLOAD')
+        if not binary:
+            self.skipTest('set P8_TEST_PAPERLOAD to a real paperload binary for offline preflight')
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        telemetry = dict(fixture.telemetry)
+        telemetry.update({'experiment': 'E4', 'arm': 'baseline', 'durability_mode': 'synthetic-load',
+            'retry_interval_ms': 500, 'publish_timeout_ms': 1000,
+            'topology': {'gateways': 2, 'sensors_per_gateway': 1, 'users': 0, 'viewers': 0},
+            'targets': [{'gateway_id': 'gw-1', 'sensor_id': 'sensor-1'},
+                        {'gateway_id': 'gw-2', 'sensor_id': 'sensor-2'}],
+            'gateway_identity_files': {'gw-1': '/A/private/gw-1.json',
+                                       'gw-2': '/A/private/gw-2.json'},
+            'e4': {'mode': 'unique', 'journal_path': 'outputs/e4-journal.sqlite',
+                   'max_messages': 20, 'max_bytes': 1 << 20}})
+        unique_path = write(fixture.src / 'unique.manifest.json', telemetry)
+        write(fixture.src / 'gw-1.json', {'username': 'gw-1', 'password': 'gw-1-password'})
+        gateway_env_1 = json.loads((fixture.src / 'gateway-env.json').read_text())
+        gateway_env_1['GATEWAY_MQTT_USERNAME'] = 'gw-1'
+        gateway_env_1['GATEWAY_MQTT_PASSWORD'] = 'gw-1-password'
+        write(fixture.src / 'gateway-env.json', gateway_env_1)
+        write(fixture.src / 'gw-2.json', {'username': 'gw-2', 'password': 'gw-2-password'})
+        write(fixture.src / 'gateway-env-2.json', {'GATEWAY_CONTROL_ENABLED': 'true',
+            'GATEWAY_ID': 'gw-2', 'SENSOR_ID': 'sensor-2',
+            'GATEWAY_MQTT_BROKER_URL': 'mqtts://broker.test:18884',
+            'GATEWAY_MQTT_CLIENT_ID': 'client-2', 'GATEWAY_MQTT_USERNAME': 'gw-2',
+            'GATEWAY_MQTT_PASSWORD': 'gw-2-password', 'GATEWAY_MQTT_CA_FILE': '/A/private/ca.pem',
+            'GATEWAY_OUTBOX_PATH': '/A/private/outbox-2.sqlite'})
+        spec_path = write(fixture.src / 'e4-run-spec.json', {'paperload': [
+            {'manifest': str(unique_path), 'output_dir': 'outputs/unique',
+             'role': 'telemetry', 'ready_timeout_seconds': 30}],
+            'gateways': [{'env_file': 'gateway-env.json', 'role': 'durable-telemetry'},
+                         {'env_file': 'gateway-env-2.json', 'role': 'durable-telemetry'}],
+            'stop_timeout_seconds': 30})
+        roles = {'roles': {'telemetry': {'role': 'telemetry', 'principals': []}},
+                 'gateways': {'gw-1': {'role': 'gateway', 'gateway_id': 'gw-1', 'username': 'gw-1'},
+                              'gw-2': {'role': 'gateway', 'gateway_id': 'gw-2', 'username': 'gw-2'}}}
+        exported = fixture.export(experiment='E4', phase='unique', manifests={'unique': unique_path},
+            identity_files={'telemetry': fixture.src / 'telemetry.json'}, role_metadata=roles,
+            gateway_identity_files={'gw-1': fixture.src / 'gw-1.json', 'gw-2': fixture.src / 'gw-2.json'},
+            gateway_env_files={'gw-1': fixture.src / 'gateway-env.json',
+                               'gw-2': fixture.src / 'gateway-env-2.json'},
+            run_spec=spec_path, workload={'experiment': 'E4', 'arm': 'baseline',
+                'run_id': 'run-1', 'profile': 'pilot', 'phase': 'unique',
+                'samples_per_message': 100, 'measure_seconds': 1})
+        workspace = fixture.root / 'B' / 'workspace'
+        workspace.parent.mkdir(mode=0o700)
+        client.paper_p8_bundle.bind_bundle(bundle_root=Path(exported['bundle_root']), workspace_leaf=workspace)
+        bound_spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        job = bound_spec['paperload'][0]
+        self.assertEqual(job['role'], 'telemetry')
+        self.assertEqual(Path(job['manifest']).name, 'unique.json')
+        source_manifest_path = Path(job['manifest'])
+        source_manifest_bytes = source_manifest_path.read_bytes()
+        source_manifest = json.loads(source_manifest_bytes)
+        self.assertEqual(len(source_manifest['targets']), 2)
+        self.assertEqual(set(source_manifest['gateway_identity_files']), {'gw-1', 'gw-2'})
+
+        # Build the exact client-side probe from a private journal, then run every
+        # generated manifest through the real Go preflight. Only network runs are mocked.
+        (workspace / 'outputs').mkdir(mode=0o700, exist_ok=True)
+        original = {'protocol_version': 1, 'message_id': '550e8400-e29b-41d4-a716-446655440000',
+            'message_type': 'telemetry_batch', 'gateway_id': 'gw-1', 'sensor_id': 'sensor-1',
+            'boot_id': 'boot-1', 'first_sequence': 10, 'sample_count': 100,
+            'measured_at': '2026-10-28T00:00:00Z', 'sample_interval_us': 10000,
+            'samples': [float(i) for i in range(100)]}
+        payload = json.dumps(original, separators=(',', ':')).encode()
+        record = {'topic': 'gateways/gw-1/telemetry/sensor-1', 'gateway_id': 'gw-1',
+            'sensor_id': 'sensor-1', 'message_id': original['message_id'], 'boot_id': 'boot-1',
+            'first_sequence': '10', 'sample_count': 100, 'payload_sha256': hashlib.sha256(payload).hexdigest(),
+            'payload': base64.b64encode(payload).decode()}
+        source_journal_path = workspace / 'outputs/e4-journal.sqlite'
+        write(source_journal_path, json.dumps(record) + '\n')
+        source_journal_bytes = source_journal_path.read_bytes()
+        write(workspace / 'runtime/e4-phase-state.json', {'unique_validated': True})
+        cases = client._export_conflict_probe(workspace, fixture.root / 'probe')
+        probe = json.loads((fixture.root / 'probe/conflict-probe.json').read_text())
+        conflict_cases = probe['cases']
+        source_manifest = client._private_json(source_manifest_path)
+        with self.assertRaisesRegex(ValueError, 'p8_e4_conflict_target_missing'):
+            client._select_bound_conflict_target(source_manifest, source_manifest_path, workspace,
+                'gw-absent', 'sensor-1')
+        wrong_credential_path = workspace / 'outputs/wrong-credential.json'
+        write(wrong_credential_path, {'username': 'not-gw-1', 'password': 'test-password'})
+        wrong_source_manifest = json.loads(json.dumps(source_manifest))
+        wrong_source_manifest['gateway_identity_files']['gw-1'] = str(wrong_credential_path)
+        with self.assertRaisesRegex(ValueError, 'p8_e4_conflict_credential_rejected'):
+            client._select_bound_conflict_target(wrong_source_manifest, source_manifest_path,
+                workspace, 'gw-1', 'sensor-1')
+        launches = []
+
+        def run_network_only_mock(argv, **kwargs):
+            if argv[-1] != '--run':
+                return real_run(argv, **kwargs)
+            manifest_path = Path(argv[argv.index('--manifest') + 1])
+            manifest = json.loads(manifest_path.read_text())
+            journal_bytes = Path(manifest['e4']['journal_path']).read_bytes()
+            row = json.loads(journal_bytes)
+            body = base64.b64decode(row['payload'])
+            message = json.loads(body)
+            launches.append((manifest, len(journal_bytes), len(body)))
+            output_dir = Path(argv[argv.index('--output-dir') + 1]); output_dir.mkdir(mode=0o700)
+            positive = manifest['run_id'].endswith('positive-control')
+            workload = {'status': 'COMPLETE' if positive else 'PARTIAL',
+                'telemetry': {'replay_offered': 1, 'replay_application_acks': 1 if positive else 0,
+                    'pending_messages': 0 if positive else 1, 'publish_attempts': 1,
+                    'broker_pubacks': 1, 'retries': 0 if positive else 1},
+                'phase_events': [{'event': 'workers_joined'}], 'cleanup_errors': []}
+            write(output_dir / 'workload.json', workload)
+            return subprocess.CompletedProcess(argv, 0 if positive else 4)
+
+        real_run = subprocess.run
+        with mock.patch.object(client.subprocess, 'run', side_effect=run_network_only_mock):
+            result = client._run_conflict_stage(workspace, binary=binary)
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual([item[0]['samples_per_message'] for item in launches], [100, 100, 100])
+        self.assertEqual(source_manifest_path.read_bytes(), source_manifest_bytes)
+        self.assertEqual(source_journal_path.read_bytes(), source_journal_bytes)
+        self.assertEqual(source_manifest['targets'], json.loads(source_manifest_path.read_text())['targets'])
+        self.assertTrue(all(item[0]['targets'] == [{'gateway_id': 'gw-1', 'sensor_id': 'sensor-1'}]
+                            and set(item[0]['gateway_identity_files']) == {'gw-1'} for item in launches))
+        self.assertTrue(all(item[0]['topology']['gateways'] == 1
+                            and item[0]['limits']['workers'] == 1
+                            and item[0]['limits']['connections'] == 1
+                            and item[0]['limits']['pending_messages'] == 1 for item in launches))
+        for label in ('positive-control', 'same_id_changed_payload',
+                      'different_first_sequence_overlap'):
+            row = json.loads((workspace / 'outputs/e4-conflicts' / label / 'journal.jsonl').read_text())
+            self.assertEqual((row['gateway_id'], row['sensor_id']), ('gw-1', 'sensor-1'))
+            self.assertEqual(row['topic'], 'gateways/gw-1/telemetry/sensor-1')
+        self.assertTrue(all(item[0]['e4']['max_bytes'] == item[1] for item in launches))
+        overlap_manifest = workspace / 'outputs/e4-conflicts/different_first_sequence_overlap/manifest.json'
+        self.assertEqual(json.loads(overlap_manifest.read_text())['samples_per_message'], 100)
+        overlap_message = json.loads(base64.b64decode(
+            json.loads((workspace / 'runtime/e4-conflicts.json').read_text())['cases']
+                ['different_first_sequence_overlap']['raw_payload_b64']))
+        self.assertNotEqual(overlap_message['message_id'], original['message_id'])
+        self.assertEqual(overlap_message['first_sequence'], original['first_sequence'] + 1)
+        self.assertEqual(overlap_message['sample_count'], 100)
+        self.assertLess(overlap_message['first_sequence'], original['first_sequence'] + original['sample_count'])
+        self.assertEqual(cases['cases'], 2)
+
+    def test_durable_helpers_load_without_test_pythonpath(self):
+        repo = Path(__file__).resolve().parents[2]
+        env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        code = ("from scripts import paper_p8_client as client; "
+                "assert all(callable(fn) for fn in client._durable_helpers())")
+        result = subprocess.run([sys.executable, '-c', code], cwd=repo, env=env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_e3_command_projection_keeps_reconciliation_fields_and_drops_private_fields(self):
+        projected = client._safe_workload({'status': 'COMPLETE', 'experiment': 'E3', 'arm': 'control',
+            'commands': [{'classification': 'succeeded', 'idempotency_key': 'a' * 36,
+                'command_id': 'cmd-1', 'sensor_id': 'sensor-1', 'gateway_id': 'gw-1',
+                'expected_desired_version': '4', 'desired_version': '5', 'frequency_hz': 0.5,
+                'sample_interval_us': 2000000, 'http_status': 202, 'client_round_trip_ms': 12,
+                'access_token': 'must-not-export'}]}, role='control')
+        row = projected['commands'][0]
+        self.assertEqual(row['command_id'], 'cmd-1')
+        self.assertEqual(row['sample_interval_us'], 2000000)
+        self.assertEqual(row['http_status'], 202)
+        self.assertNotIn('access_token', row)
+
+    def test_e3_safe_phase_projection_accepts_exact_control_child_label(self):
+        events = client._safe_phase_events([{'child': 'paperload-control:control.manifest.json',
+            'event': 'request_begin', 'elapsed_ns': 10,
+            'clock_qualification': 'runner observed pipe receipt; observation lag unknown',
+            'command_ordinal': 1}])
+        self.assertEqual(events[0]['child'], 'paperload-control:control.manifest.json')
+
+    def test_e3_phase_projection_bounds_full_thirty_command_lifecycle(self):
+        event = {'child': 'paperload-control:control.manifest.json',
+                 'event': 'request_begin', 'elapsed_ns': 10,
+                 'clock_qualification': 'runner observed pipe receipt; observation lag unknown',
+                 'command_ordinal': 1}
+        self.assertEqual(len(client._safe_phase_events([event] * 96)), 96)
+        with self.assertRaisesRegex(ValueError, 'phase event schema rejected'):
+            client._safe_phase_events([event] * 3101)
+
+    def test_e1_safe_phase_events_accepts_telemetry_child_labels(self):
+        for child in ('paperload-telemetry:telemetry.json',
+                      'paperload-telemetry:telemetry.manifest.json'):
+            with self.subTest(child=child):
+                event = {'child': child, 'event': 'measure_begin',
+                         'child_elapsed_ns': 10, 'observed_at_runner_monotonic_ns': 20,
+                         'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}
+                expected = {key: value for key, value in event.items() if key != 'child_elapsed_ns'}
+                expected['elapsed_ns'] = 10
+                self.assertEqual(client._safe_phase_events([event]), [expected])
+
+    def test_e5_safe_phase_events_accepts_initial_and_warm_replay_child_labels(self):
+        accepted_children = [
+            'paperload-telemetry:initial.json',
+            'paperload-telemetry:initial.manifest.json',
+            'paperload-telemetry:warm_replay.json',
+            'paperload-telemetry:warm_replay.manifest.json',
+            'paperload-telemetry:initial-replay.manifest.json',
+            'paperload-telemetry:initial-replay.json',
+            'paperload-telemetry:warm-replay.manifest.json',
+            'paperload-telemetry:warm-replay.json',
+            'paperload-telemetry:unique.json',
+            'paperload-telemetry:replay.json',
+            'paperload-telemetry:cold-replay.json',
+            'paperload-telemetry:expiry-replay.json',
+            'paperload-telemetry:expiry-replay.manifest.json',
+            'paperload-telemetry:A.json',
+            'paperload-telemetry:B.json',
+            'paperload-viewer:viewer.json',
+            'paperload-viewer:viewer.manifest.json',
+            'paperload-control:control.json',
+            'paperload-control:control.manifest.json',
+        ]
+        for child in accepted_children:
+            events = client._safe_phase_events([{'child': child,
+                'event': 'measure_begin', 'elapsed_ns': 100,
+                'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}])
+            self.assertEqual(events[0]['child'], child)
+
+    def test_safe_phase_events_rejects_malformed_and_mismatched_child_labels(self):
+        rejected_children = [
+            'paperload-telemetry:control.json',
+            'paperload-telemetry:viewer.json',
+            'paperload-viewer:initial.json',
+            'paperload-viewer:control.json',
+            'paperload-control:initial.json',
+            'paperload-control:viewer.json',
+            'paperload-viewer:telemetry.json',
+            'paperload-control:telemetry.json',
+            'paperload-telemetry:../telemetry.json',
+            'paperload-telemetry:telemetry.json.extra',
+            'paperload-telemetry:../expiry-replay.json',
+            'paperload-telemetry:expiry.json',
+            'paperload-telemetry:expiry-replay.manifest.json.extra',
+            'paperload-viewer:expiry-replay.json',
+            'paperload-telemetry:../initial.json',
+            'paperload-telemetry:/etc/passwd',
+            'paperload-telemetry:initial',
+            'paperload-telemetry:initial.yaml',
+            'http://evil.com/exploit.json',
+            'admin:secret_token_123',
+            'paperload-unknown:initial.json',
+            'arbitrary_child_label.json',
+        ]
+        for child in rejected_children:
+            with self.assertRaisesRegex(ValueError, 'result phase event schema rejected'):
+                client._safe_phase_events([{'child': child,
+                    'event': 'measure_begin', 'elapsed_ns': 100,
+                    'clock_qualification': 'runner observed pipe receipt; observation lag unknown'}])
+
+    def test_e3_control_workload_phase_qualification_is_bounded_and_preserved(self):
+        result = client._safe_workload({'status': 'COMPLETE', 'experiment': 'E3',
+            'arm': 'control', 'phase_observation_status':
+                'observed; maximum 9 command ordinals sampled; process-local clock'}, role='control')
+        self.assertEqual(result['phase_observation_status'],
+            'observed; maximum 9 command ordinals sampled; process-local clock')
+        complete = client._safe_workload({'status': 'COMPLETE', 'experiment': 'E3',
+            'arm': 'control', 'phase_observation_status':
+                'observed; all command ordinals; process-local clock'}, role='control')
+        self.assertEqual(complete['phase_observation_status'],
+            'observed; all command ordinals; process-local clock')
+
+    def test_viewer_map_probes_all_bounded_principals_for_rest_and_ws(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        workspace = fixture.root / 'B'
+        workspace.mkdir(mode=0o700)
+        bound = workspace / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=bound)
+        spec = bound / 'runtime/execution/run-spec.json'
+        with mock.patch.object(client, '_https_get') as rest, \
+                mock.patch.object(client, '_websocket_handshake') as ws, \
+                mock.patch.object(client, '_mqtt_connect_probe') as mqtt:
+            result = client._check_connection(bound, spec)
+        self.assertEqual(rest.call_count, 1)
+        self.assertEqual(ws.call_count, 1)
+        self.assertEqual(mqtt.call_count, 2)
+        self.assertEqual(result['mqtt_connections_checked'], 2)
+        manifest = json.loads(Path(json.loads(spec.read_text())['paperload'][0]['manifest']).read_text())
+        tokens = client._tokens(manifest, 'viewer')
+        self.assertEqual(len(tokens), 2)
+
+    def test_websocket_handshake_accepts_fragmented_headers_and_closes_without_subscribe(self):
+        client_key = base64.b64encode(b'nonce-test').decode()
+        nonce_accept = base64.b64encode(hashlib.sha1(
+            (client_key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+        response = (f'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+                    f'Connection: keep-alive, Upgrade\r\nSec-WebSocket-Protocol: iot.telemetry.v1\r\n'
+                    f'Sec-WebSocket-Accept: {nonce_accept}\r\n\r\n').encode()
+        stream = FragmentedSocket(response)
+        context = mock.Mock()
+        context.wrap_socket.side_effect = lambda raw, server_hostname: raw
+        manifest = {'tls': {'https_endpoint': 'https://example.test', 'https_ca_file': '/ca'},
+                    'identity_files': {'viewer': '/identity'}}
+        with mock.patch.object(client, '_tls_context', return_value=context), \
+                mock.patch.object(client, '_tokens', return_value=['header.payload.signature']), \
+                mock.patch.object(client.socket, 'create_connection', return_value=stream), \
+                mock.patch.object(client.os, 'urandom', return_value=b'nonce-test'):
+            client._websocket_handshake(manifest, 'viewer')
+        self.assertTrue(stream.closed)
+        request = bytes(stream.sent)
+        self.assertIn(b'Sec-WebSocket-Protocol: iot.telemetry.v1', request)
+        self.assertIn(b'Authorization: Bearer header.payload.signature', request)
+        self.assertNotIn(b'Subscribe', request)
+
+    def test_websocket_handshake_rejects_wrong_accept(self):
+        response = (b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+                    b'Connection: Upgrade\r\nSec-WebSocket-Protocol: iot.telemetry.v1\r\n'
+                    b'Sec-WebSocket-Accept: wrong\r\n\r\n')
+        stream = FragmentedSocket(response)
+        context = mock.Mock()
+        context.wrap_socket.side_effect = lambda raw, server_hostname: raw
+        manifest = {'tls': {'https_endpoint': 'https://example.test', 'https_ca_file': '/ca'},
+                    'identity_files': {'viewer': '/identity'}}
+        with mock.patch.object(client, '_tls_context', return_value=context), \
+                mock.patch.object(client, '_tokens', return_value=['header.payload.signature']), \
+                mock.patch.object(client.socket, 'create_connection', return_value=stream):
+            with self.assertRaisesRegex(ValueError, 'authenticated WebSocket handshake rejected'):
+                client._websocket_handshake(manifest, 'viewer')
+        self.assertTrue(stream.closed)
+
+    def test_rest_probe_checks_every_token_and_does_not_follow_redirects(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'; parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        manifest = json.loads(Path(spec['paperload'][0]['manifest']).read_text())
+        response = mock.MagicMock()
+        response.status = 200
+        response.geturl.return_value = 'https://fixture.test:14443/v1/me/permissions'
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(client, '_tls_context', return_value=mock.Mock()), \
+                mock.patch.object(client.urllib.request, 'build_opener', return_value=opener):
+            client._https_get(manifest, 'viewer')
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertTrue(all(call.args[0].get_header('Authorization').startswith('Bearer ')
+                            for call in opener.open.call_args_list))
+
+    def test_mqtt_read_exact_handles_fragmentation_and_invalid_token_map_is_rejected(self):
+        stream = FragmentedSocket(b'\x20\x02\x00\x00')
+        self.assertEqual(client._read_exact(stream, 4), b'\x20\x02\x00\x00')
+        path = Path(tempfile.mkdtemp()) / 'identity.json'
+        path.write_text(json.dumps({'viewer': 'not-a-jwt'}))
+        path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'role identity token map rejected'):
+            client._tokens({'identity_files': {'viewer': str(path)}}, 'viewer')
+        ca = Path(tempfile.mkdtemp(prefix='p8-bad-ca-', dir='/var/tmp/opencode')) / 'ca.pem'
+        ca.write_text('not a PEM certificate')
+        with self.assertRaises((OSError, ValueError)):
+            client.ssl.create_default_context(cafile=str(ca))
+
+    def test_mqtt_probe_is_connect_connack_disconnect_only(self):
+        stream = FragmentedSocket(b'\x20\x02\x00\x00')
+        context = mock.Mock()
+        context.wrap_socket.side_effect = lambda raw, server_hostname: raw
+        with mock.patch.object(client.ssl, 'create_default_context', return_value=context), \
+                mock.patch.object(client.socket, 'create_connection', return_value=stream):
+            client._mqtt_connect_probe(endpoint='mqtts://broker.example.test:8883',
+                ca_file='/ca.pem', server_name='broker.example.test',
+                gateway={'username': 'user', 'password': 'password'})
+        packets = bytes(stream.sent)
+        self.assertEqual(packets[-2:], b'\xe0\x00')
+        self.assertEqual(packets[0], 0x10)
+        self.assertEqual(stream.writes[-1], b'\xe0\x00')
+        self.assertEqual(len(stream.writes), 2)
+        self.assertTrue(stream.closed)
+
+    def test_e3_probe_checks_telemetry_credentials_and_each_same_gateway_executor_config(self):
+        root = Path(tempfile.mkdtemp(prefix='p8-client-e3-', dir='/var/tmp/opencode'))
+        root.chmod(0o700)
+        (root / 'private').mkdir(mode=0o700)
+        manifests = []
+        for index, gateway_id in enumerate(('gw-a', 'gw-b')):
+            credential = root / 'private' / f'{gateway_id}.json'
+            credential.write_text(json.dumps({'username': gateway_id, 'password': f'pw-{gateway_id}'}))
+            credential.chmod(0o600)
+            manifest = root / 'private' / f'arm-{index}.json'
+            manifest.write_text(json.dumps({'roles': ['telemetry'],
+                'tls': {'mqtt_tls_endpoint': f'mqtts://manifest-{index}.test:8883',
+                        'mqtt_tls_ca_file': str(root / 'ca.pem')},
+                'gateway_identity_files': {gateway_id: str(credential)}}))
+            manifest.chmod(0o600)
+            manifests.append(str(manifest))
+        (root / 'ca.pem').write_text('ca'); (root / 'ca.pem').chmod(0o600)
+        gateways = []
+        for index, sensor in enumerate(('control-1', 'control-2')):
+            password = root / 'private' / f'password-{index}.txt'
+            password.write_text('same-gateway-password'); password.chmod(0o600)
+            env = root / 'private' / f'executor-{index}.json'
+            env.write_text(json.dumps({'GATEWAY_MQTT_PASSWORD_FILE': str(password),
+                'GATEWAY_MQTT_USERNAME': 'gw-a', 'GATEWAY_MQTT_BROKER_URL': 'ssl://executor.test:8884',
+                'GATEWAY_MQTT_CA_FILE': str(root / 'ca.pem'),
+                'GATEWAY_MQTT_SERVER_NAME': 'mqtt.example.test', 'GATEWAY_MQTT_CLIENT_ID': f'client-{index}',
+                'GATEWAY_ID': 'gw-a', 'SENSOR_ID': sensor}))
+            env.chmod(0o600)
+            gateways.append({'env_file': str(env), 'role': 'executor'})
+        spec = root / 'spec.json'
+        spec.write_text(json.dumps({'paperload': [{'manifest': path} for path in manifests],
+                                    'gateways': gateways}))
+        spec.chmod(0o600)
+        with mock.patch.object(client, '_mqtt_connect_probe') as probe:
+            result = client._check_connection(root, spec)
+        self.assertEqual(result['mqtt_connections_checked'], 4)
+        endpoints = [call.kwargs['endpoint'] for call in probe.call_args_list]
+        self.assertIn('ssl://executor.test:8884', endpoints)
+        self.assertIn('mqtts://manifest-0.test:8883', endpoints)
+        self.assertIn('mqtts://manifest-1.test:8883', endpoints)
+        executor_checks = [call for call in probe.call_args_list
+                            if call.kwargs['endpoint'] == 'ssl://executor.test:8884']
+        self.assertEqual(len(executor_checks), 2)
+        self.assertTrue(all(call.kwargs['server_name'] == 'mqtt.example.test'
+                            for call in executor_checks))
+
+
+class ResultProjectionTests(unittest.TestCase):
+    def test_e1_e2_e3_profile_opt_in_reaches_preflight_and_run(self):
+        for experiment in ('E1', 'E2', 'E3'):
+            for profile in ('pilot', 'official'):
+                with self.subTest(experiment=experiment, profile=profile):
+                    fixture = PortableBundleTests()
+                    fixture.setUp()
+                    self.addCleanup(fixture.doCleanups)
+                    source = Path(fixture.export()['bundle_root'])
+                    parent = fixture.root / 'B'
+                    parent.mkdir(mode=0o700)
+                    workspace = parent / 'workspace'
+                    client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+                    binding_path = workspace / 'runtime/binding.json'
+                    binding = json.loads(binding_path.read_text())
+                    binding['session'].update(experiment=experiment, profile=profile)
+                    binding_path.write_text(json.dumps(binding))
+                    binary = parent / 'paperload'
+                    binary.write_text('test binary')
+                    binary.chmod(0o700)
+                    expected = profile == 'official'
+                    with mock.patch.object(client.paper_p8, 'preflight') as preflight, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(client.main(['preflight', '--workspace', str(workspace),
+                                                      '--binary', str(binary)]), 0)
+                    self.assertEqual(preflight.call_count, 2)
+                    preflight_official = [call.kwargs['official'] for call in preflight.call_args_list]
+                    with mock.patch.object(client.paper_p8, 'run_supervised',
+                                           return_value=('COMPLETE', {'status': 'COMPLETE'})) as run, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(client.main(['run', '--workspace', str(workspace),
+                                                      '--binary', str(binary)]), 0)
+                    self.assertIs(run.call_args.kwargs['official'], expected)
+                    self.assertEqual(preflight_official, [expected, expected])
+
+    def test_e4_official_profile_opt_in_reaches_phase_supervisor(self):
+        for profile, expected, unique_count, replay_count in (
+                ('official', True, 20, 10), ('pilot', False, 20, 10),
+                ('pilot', False, 8, 2), ('official', True, 1000, 100)):
+            with self.subTest(profile=profile):
+                fixture = PortableBundleTests()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                common = {**fixture.telemetry, 'experiment': 'E4', 'arm': 'warm',
+                    'profile': profile, 'run_id': 'e4-run',
+                    'phases': {'measure_seconds': 4}, 'topology': {'gateways': 2},
+                    'traffic': {'rate_per_second': 5}}
+                unique_manifest = e4_support.e4_phase_manifest(common,
+                    'outputs/e4-journal.sqlite', 'unique', unique_count=unique_count,
+                    replay_count=replay_count, official_opt_in=profile == 'official')
+                replay_manifest = e4_support.e4_phase_manifest(common,
+                    'outputs/e4-journal.sqlite', 'replay', unique_count=unique_count,
+                    replay_count=replay_count, official_opt_in=profile == 'official')
+                telemetry = {**common, **unique_manifest, 'experiment': 'E4', 'arm': 'warm',
+                    'profile': profile, 'run_id': 'e4-run'}
+                unique_path = write(fixture.src / 'e4-unique.json', telemetry)
+                replay_path = write(fixture.src / 'e4-replay.json',
+                    {**common, **replay_manifest, 'experiment': 'E4', 'arm': 'warm',
+                     'profile': profile, 'run_id': 'e4-run-replay'})
+                viewer = {**fixture.viewer, 'arm': 'warm', 'profile': profile}
+                viewer_path = write(fixture.src / 'e4-viewer.json', viewer)
+                e4_spec = write(fixture.src / 'e4-run-spec.json', {
+                    'paperload': [
+                        {'manifest': str(unique_path), 'output_dir': 'outputs/unique',
+                          'role': 'telemetry', 'ready_timeout_seconds': 30},
+                        {'manifest': str(replay_path), 'output_dir': 'outputs/replay',
+                         'role': 'telemetry', 'ready_timeout_seconds': 30},
+                        {'manifest': str(viewer_path), 'output_dir': 'outputs/viewer',
+                         'role': 'viewer', 'ready_timeout_seconds': 30}],
+                    'gateways': [{'env_file': 'gateway-env.json', 'role': 'durable-telemetry'}],
+                    'stop_timeout_seconds': 30})
+                exported = fixture.export(experiment='E4', arm='warm', phase='unique',
+                    manifests={'unique': unique_path, 'replay': replay_path, 'viewer': viewer_path},
+                    identity_files={'unique:telemetry': fixture.src / 'telemetry.json',
+                                    'replay:telemetry': fixture.src / 'telemetry.json',
+                                    'viewer': fixture.src / 'viewer.json'},
+                    role_metadata={'roles': {'unique:telemetry': {'role': 'telemetry', 'principals': []},
+                                             'replay:telemetry': {'role': 'telemetry', 'principals': []},
+                                             'viewer': {'role': 'viewer', 'principals': ['user-a', 'user-b']}},
+                                   'gateways': {'gw-1': {'role': 'gateway', 'gateway_id': 'gw-1',
+                                                         'username': 'gw-user'}}},
+                    workload={'experiment': 'E4', 'arm': 'warm', 'run_id': 'e4-run',
+                              'phase': 'unique', 'profile': profile}, run_spec=e4_spec)
+                workspace = fixture.root / 'B' / 'workspace'
+                workspace.parent.mkdir(mode=0o700)
+                client.paper_p8_bundle.bind_bundle(bundle_root=Path(exported['bundle_root']),
+                                                   workspace_leaf=workspace)
+                bound_jobs = json.loads(
+                    (workspace / 'runtime/execution/run-spec.json').read_text())['paperload']
+                selected_jobs = [job for job in bound_jobs
+                    if Path(job['manifest']).stem in ('unique', 'viewer')]
+                binary = fixture.root / 'paperload'
+                binary.write_bytes(b'test binary')
+                binary.chmod(0o700)
+                run_phase = 'unique'
+
+                with mock.patch.object(client.paper_p8, 'preflight') as preflight, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(client.main(['preflight', '--workspace', str(workspace),
+                                                  '--binary', str(binary)]), 0)
+                self.assertEqual([call.kwargs['official'] for call in preflight.call_args_list],
+                                 [expected, expected, expected])
+
+                # Keep the real bound CLI path through post-run count and journal checks;
+                # replace only the supervisor's child execution with deterministic files.
+                def completed_runner(**kwargs):
+                    for job in kwargs['jobs']:
+                        output = Path(job['output_dir'])
+                        output.mkdir(mode=0o700, parents=True)
+                        if job['role'] == 'telemetry':
+                            manifest = json.loads(Path(job['manifest']).read_text())
+                            mode = manifest['e4']['mode']
+                            total = unique_count if mode == 'unique' else replay_count
+                            headers = []
+                            for index in range(min(total, 20)):
+                                headers.append({'topic': f'gateways/gw-{index}/telemetry/s-{index}',
+                                    'gateway_id': f'gw-{index}', 'sensor_id': f's-{index}',
+                                    'message_id': f'm-{index}', 'boot_id': f'b-{index}',
+                                    'first_sequence': '0', 'sample_count': 100,
+                                    'payload_sha256': 'a' * 64})
+                            result = {'status': 'COMPLETE', 'experiment': 'E4', 'arm': 'warm',
+                                'profile': profile, 'run_id': manifest['run_id'], 'mode': 'local',
+                                'e4': {'mode': mode, 'journal_entry_count': total,
+                                    'safe_header_samples': headers},
+                                'telemetry': ({'generated_unique': unique_count,
+                                    'offered_unique': unique_count, 'application_acks': unique_count,
+                                    'ignored_valid_acks': 1, 'retries': 1, 'pending_messages': 0,
+                                    'pending_bytes': 0} if mode == 'unique' else {
+                                    'generated_unique': 0, 'offered_unique': 0, 'application_acks': 0,
+                                    'replay_offered': replay_count,
+                                    'replay_application_acks': replay_count,
+                                    'pending_messages': 0, 'pending_bytes': 0})}
+                        else:
+                            result = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'warm',
+                                'profile': profile, 'run_id': 'e4-run',
+                                'connected_distinct_viewers': 2, 'subscribed_distinct_viewers': 2,
+                                'receiving_distinct_viewers': (2 if run_phase == 'unique' else 0),
+                                'unique_events': (unique_count if run_phase == 'unique' else 0)}
+                        (output / 'workload.json').write_text(json.dumps(result))
+                    journal = workspace / 'outputs/e4-journal.sqlite'
+                    journal.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if run_phase == 'unique':
+                        journal.write_bytes(b'journal')
+                    return 'COMPLETE', {'status': 'COMPLETE'}
+                stderr = io.StringIO()
+                with mock.patch.object(client.paper_p8, 'run_supervised', side_effect=completed_runner) as run, \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(stderr):
+                    unique_status = client.main(['run', '--workspace', str(workspace), '--binary', str(binary),
+                                                 '--phase', 'unique'])
+                    run_phase = 'replay'
+                    replay_status = client.main(['run', '--workspace', str(workspace), '--binary', str(binary),
+                                                 '--phase', 'replay'])
+                self.assertEqual(unique_status, 0, stderr.getvalue())
+                self.assertEqual(replay_status, 0, stderr.getvalue())
+                self.assertEqual(run.call_count, 2)
+                self.assertIs(run.call_args.kwargs['official'], expected)
+
+    def test_preflight_uses_all_bound_manifests_without_creating_workload_dirs(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'; parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        binary = parent / 'paperload'; binary.write_text('test binary'); binary.chmod(0o700)
+        with mock.patch.object(client.paper_p8, 'preflight', return_value=mock.Mock(stdout='ok')) as preflight:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = client.main(['preflight', '--workspace', str(workspace), '--binary', str(binary)])
+        self.assertEqual(status, 0)
+        self.assertEqual(preflight.call_count, 2)
+        self.assertTrue(all(not Path(call.args[2]).exists()
+                            for call in preflight.call_args_list))
+
+    def test_export_preserves_role_counters_separates_roles_and_redacts_paths(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        for job in spec['paperload']:
+            output = Path(job['output_dir'])
+            output.mkdir(mode=0o700)
+            role = job['role']
+            value = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'baseline',
+                     'run_id': 'run-1', 'started_at': '2026-10-30T00:00:00Z',
+                     'finished_at': '2026-10-30T00:00:01Z',
+                     'telemetry': {'generated_unique': 20, 'offered_unique': 20,
+                                   'application_acks': 20, 'pending_messages': 0,
+                                   'pending_bytes': 0},
+                     'phase_events': [{'event': 'measure_end', 'elapsed_ns': 10,
+                                       'counters': {'offered_unique': 20}}],
+                      'primary_error': '/private/host/path secret'}
+            value['implementation_status'] = ('P8.4c viewer-only client; no control/durable/server orchestration'
+                if role == 'viewer' else 'P8.4b telemetry synthetic-load; no durable restart assurance')
+            if role == 'viewer':
+                value.update({'connected_distinct_viewers': 64,
+                              'viewers': [{'id': 'viewer-00000', 'events': 2,
+                                            'unique_events': 2, 'duplicates': 0, 'bytes': 300}],
+                              'identity_samples': [{'viewer_id':'viewer-001','gateway_id':'gw-a',
+                                'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                                'first_sequence':'1','sample_count':100,'header_sha256':'c'*64}]})
+            else:
+                value['phase_observation_status'] = 'observed_process_local_elapsed; runner_pipe_observation_lag_unknown'
+                value['identity_samples'] = [{'viewer_id':'','gateway_id':'gw-a',
+                    'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                    'first_sequence':'1','sample_count':100,'header_sha256':'d'*64}]
+            path = output / 'workload.json'
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        runner = workspace / 'outputs/run.json'
+        phase_event = {'child': 'paperload-telemetry:telemetry.json',
+                       'event': 'measure_end', 'child_elapsed_ns': 10,
+                       'observed_at_runner_monotonic_ns': 20,
+                       'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}
+        runner.write_text(json.dumps({'status': 'COMPLETE', 'children': [{'name': '/private/path'}],
+                                      'phase_observations': {'status': 'observed', 'events': [phase_event]},
+                                      'resource_sampling': {'status': 'not_collected_in_P8.4'}}))
+        runner.chmod(0o600)
+        provenance = workspace / 'runtime/runner-provenance.json'
+        provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                          'binary_os': 'linux', 'binary_arch': 'amd64'}))
+        provenance.chmod(0o600)
+        out = fixture.root / 'safe-results'
+        client._export_results(workspace, out)
+        summary = json.loads((out / 'results.json').read_text())
+        exported_runner = json.loads((out / 'results/runner/run.json').read_text())
+        expected_event = {key: value for key, value in phase_event.items() if key != 'child_elapsed_ns'}
+        expected_event['elapsed_ns'] = 10
+        self.assertEqual(exported_runner['phase_observations'],
+                         {'status': 'observed', 'events': [expected_event]})
+        self.assertEqual(len({row['path'] for row in summary['files']}), len(summary['files']))
+        self.assertEqual(set(summary['bound_manifest_sha256']), {'viewer','telemetry'})
+        self.assertTrue(all(re.fullmatch(r'[0-9a-f]{64}', digest) for digest in
+                            summary['bound_gateway_environment_sha256'].values()))
+        self.assertRegex(summary['bound_run_spec_sha256'], r'^[0-9a-f]{64}$')
+        viewer = json.loads((out / 'results/workloads/viewer/workload.json').read_text())
+        self.assertEqual(viewer['telemetry']['offered_unique'], 20)
+        self.assertEqual(viewer['viewer_summary_by_close_reason']['unspecified']['viewers'], 1)
+        self.assertEqual(viewer['viewers'][0]['id'], 'viewer-00000')
+        self.assertEqual(viewer['identity_samples'][0]['header_sha256'], 'c'*64)
+        telemetry = json.loads((out / 'results/workloads/telemetry/workload.json').read_text())
+        self.assertEqual(telemetry['identity_samples'][0]['viewer_id'], '')
+        self.assertEqual(telemetry['phase_observation_status'],
+                         'observed_process_local_elapsed; runner_pipe_observation_lag_unknown')
+        self.assertNotIn('private-user', (out / 'results/workloads/viewer/workload.json').read_text())
+        exported_text = '\n'.join(path.read_text() for path in out.rglob('*.json'))
+        self.assertNotIn('/private', exported_text)
+
+    def test_export_results_accepts_e4_expiry_replay_phase_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = root / 'workspace'
+            for path in (ws / 'inputs/certs', ws / 'runtime/execution',
+                         ws / 'runtime/manifests',
+                         ws / 'runtime/e4-phases/expiry-replay',
+                         ws / 'outputs/e4-phases/expiry-replay/expiry-replay',
+                         ws / 'outputs/e4-phases/expiry-replay/viewer'):
+                path.mkdir(mode=0o700, parents=True)
+
+            ca_file = ws / 'inputs/certs/mqtt-ca.pem'
+            ca_file.write_text('ca-content')
+            ca_file.chmod(0o600)
+
+            telemetry_manifest = ws / 'runtime/manifests/expiry-replay.json'
+            telemetry_manifest.write_text(json.dumps({'run_id': 'run-e4-expiry'}))
+            telemetry_manifest.chmod(0o600)
+            viewer_manifest = ws / 'runtime/manifests/viewer.json'
+            viewer_manifest.write_text(json.dumps({'run_id': 'run-e4-expiry-viewer'}))
+            viewer_manifest.chmod(0o600)
+
+            spec = {'paperload': [
+                {'role': 'telemetry', 'manifest': str(telemetry_manifest),
+                 'output_dir': str(ws / 'outputs/e4-phases/expiry-replay/expiry-replay')},
+                {'role': 'viewer', 'manifest': str(viewer_manifest),
+                 'output_dir': str(ws / 'outputs/e4-phases/expiry-replay/viewer')},
+            ]}
+            spec_data = json.dumps(spec)
+            spec_file = ws / 'runtime/execution/run-spec.json'
+            spec_file.write_text(spec_data)
+            spec_file.chmod(0o600)
+
+            binding = {'schema_version': 1,
+                       'session': {'experiment': 'E4', 'session_id': 'b' * 32,
+                                   'run_id': 'run-e4-expiry',
+                                   'endpoints': {'mqtt_tls': 'mqtts://127.0.0.1:18883'}},
+                       'source_bundle_sha256': 'c' * 64,
+                       'source_inventory': [{'path': 'certs/mqtt-ca.pem',
+                                             'sha256': hashlib.sha256(b'ca-content').hexdigest()}],
+                       'bound_manifest_sha256': {},
+                       'bound_gateway_environment_sha256': {},
+                       'bound_run_spec_sha256': hashlib.sha256(spec_data.encode()).hexdigest(),
+                       'elapsed_transfer_wait_seconds': 0,
+                       'required_token_lifetime_seconds': 3600}
+            binding_path = ws / 'runtime/binding.json'
+            binding_path.write_text(json.dumps(binding))
+            binding_path.chmod(0o600)
+
+            state_path = ws / 'runtime/e4-phase-state.json'
+            state_path.write_text(json.dumps({'unique_validated': True,
+                                              'last_completed_phase': 'expiry-replay',
+                                              'last_journal_sha256': 'd' * 64}))
+            state_path.chmod(0o600)
+
+            header = {'topic': 'gateways/gw-1/telemetry/sensor-1', 'gateway_id': 'gw-1',
+                      'sensor_id': 'sensor-1', 'message_id': 'm-1', 'boot_id': 'b-1',
+                      'first_sequence': '1', 'sample_count': 100, 'payload_sha256': 'e' * 64}
+            telemetry_workload = {'status': 'COMPLETE', 'experiment': 'E4', 'arm': 'warm',
+                                  'implementation_status': 'P8.4b telemetry synthetic-load; no durable restart assurance',
+                                  'telemetry': {'replay_scheduled': 100, 'replay_offered': 100,
+                                                'replay_application_acks': 100, 'publish_failures': 0,
+                                                'retries': 0, 'pending_messages': 0, 'pending_bytes': 0},
+                                  'e4': {'mode': 'replay', 'journal_entry_count': 100,
+                                         'sampling_qualification': 'synthetic_load_only; not SQLite/durable assurance',
+                                         'ignored_valid_acks': 0, 'replay_application_acks': 100,
+                                         'safe_header_samples': [header]}}
+            telemetry_path = ws / 'outputs/e4-phases/expiry-replay/expiry-replay/workload.json'
+            telemetry_path.write_text(json.dumps(telemetry_workload))
+            telemetry_path.chmod(0o600)
+            viewer_workload = {'status': 'COMPLETE', 'experiment': 'E4', 'arm': 'warm',
+                               'implementation_status': 'P8.4c viewer-only client; no control/durable/server orchestration',
+                               'connected_distinct_viewers': 2,
+                               'viewers': [{'id': 'e4-viewer-a', 'events': 100, 'unique_events': 100,
+                                            'duplicates': 0, 'bytes': 300}]}
+            viewer_path = ws / 'outputs/e4-phases/expiry-replay/viewer/workload.json'
+            viewer_path.write_text(json.dumps(viewer_workload))
+            viewer_path.chmod(0o600)
+
+            phase_dir = ws / 'outputs/e4-phases/expiry-replay'
+            events = [
+                {'child': 'paperload-telemetry:expiry-replay.json', 'event': 'warmup_begin',
+                 'elapsed_ns': 10,
+                 'clock_qualification': 'runner observed pipe receipt; observation lag unknown'},
+                {'child': 'paperload-telemetry:expiry-replay.manifest.json', 'event': 'measure_begin',
+                 'elapsed_ns': 20,
+                 'clock_qualification': 'runner observed pipe receipt; observation lag unknown'},
+            ]
+            (phase_dir / 'run.json').write_text(json.dumps({
+                'status': 'COMPLETE', 'actual_stop_confirmed': True,
+                'phase_observations': {'status': 'observed', 'events': events}}))
+            (phase_dir / 'run.json').chmod(0o600)
+            provenance = ws / 'runtime/e4-phases/expiry-replay/provenance.json'
+            provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                              'binary_os': 'linux', 'binary_arch': 'amd64'}))
+            provenance.chmod(0o600)
+
+            out = root / 'safe-results'
+            client._export_results(ws, out)
+            summary = json.loads((out / 'results.json').read_text())
+            exported_runner = json.loads(
+                (out / 'results/phases/expiry-replay/runner/run.json').read_text())
+            self.assertEqual(summary['phase'], 'expiry-replay')
+            self.assertEqual(summary['expected_workload_roles'], ['expiry-replay', 'viewer'])
+            self.assertEqual(summary['missing_workload_roles'], [])
+            self.assertEqual([event['child'] for event in
+                              exported_runner['phase_observations']['events']],
+                             ['paperload-telemetry:expiry-replay.json',
+                              'paperload-telemetry:expiry-replay.manifest.json'])
+            telemetry = json.loads(
+                (out / 'results/phases/expiry-replay/workloads/expiry-replay/workload.json').read_text())
+            self.assertEqual(telemetry['telemetry']['replay_application_acks'], 100)
+            self.assertEqual(telemetry['e4']['mode'], 'replay')
+            viewer = json.loads(
+                (out / 'results/phases/expiry-replay/workloads/viewer/workload.json').read_text())
+            self.assertEqual(viewer['viewers'][0]['id'], 'e4-viewer-a')
+
+    def test_export_results_preserves_equal_samples_workload(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        ctx_hash = 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792'
+        for job in spec['paperload']:
+            output = Path(job['output_dir'])
+            output.mkdir(mode=0o700)
+            role = job['role']
+            value = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'A' if role == 'telemetry' else 'baseline',
+                     'run_id': 'run-1', 'started_at': '2026-10-30T00:00:00Z',
+                     'finished_at': '2026-10-30T00:00:01Z',
+                     'telemetry': {'generated_unique': 20, 'offered_unique': 20,
+                                   'application_acks': 20, 'pending_messages': 0,
+                                   'pending_bytes': 0},
+                     'phase_events': [{'event': 'measure_end', 'elapsed_ns': 10,
+                                       'counters': {'offered_unique': 20}}]}
+            value['implementation_status'] = ('P8.4c viewer-only client; no control/durable/server orchestration'
+                if role == 'viewer' else 'P8.4b telemetry synthetic-load; no durable restart assurance')
+            if role == 'viewer':
+                value.update({'connected_distinct_viewers': 64,
+                              'viewers': [{'id': 'viewer-00000', 'events': 2,
+                                            'unique_events': 2, 'duplicates': 0, 'bytes': 300}],
+                              'identity_samples': [{'viewer_id':'viewer-001','gateway_id':'gw-a',
+                                'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                                'first_sequence':'1','sample_count':100,'header_sha256':'c'*64}]})
+            else:
+                value['phase_observation_status'] = 'observed_process_local_elapsed; runner_pipe_observation_lag_unknown'
+                value['identity_samples'] = [{'viewer_id':'','gateway_id':'gw-a',
+                    'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                    'first_sequence':'1','sample_count':100,'header_sha256':'d'*64}]
+                value['equal_samples'] = {
+                    'context_sha256': ctx_hash, 'workload_type': 'equal_samples',
+                    'logical_producer': 'A', 'total_samples': 6000, 'sample_rate': 100,
+                    'duration_seconds': 60, 'producer_sample_rate': 50, 'sample_interval_us': 20000,
+                    'samples_per_message': 100, 'expected_samples': 3000, 'expected_messages': 30,
+                    'generated_samples': 3000, 'generated_messages': 30, 'offered_unique_samples': 3000,
+                    'offered_unique_messages': 30, 'application_acks': 30, 'offered_unique_bytes': 15000,
+                    'attempted_bytes': 15000, 'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000,
+                    'completed_on_time': True,
+                    'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only'
+                }
+            path = output / 'workload.json'
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        runner = workspace / 'outputs/run.json'
+        runner.write_text(json.dumps({'status': 'COMPLETE', 'children': [],
+                                      'phase_observations': {'status': 'observed', 'events': []},
+                                      'resource_sampling': {'status': 'not_collected_in_P8.4'}}))
+        runner.chmod(0o600)
+        provenance = workspace / 'runtime/runner-provenance.json'
+        provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                          'binary_os': 'linux', 'binary_arch': 'amd64'}))
+        provenance.chmod(0o600)
+        out = fixture.root / 'safe-equal-results'
+        client._export_results(workspace, out)
+        telemetry = json.loads((out / 'results/workloads/telemetry/workload.json').read_text())
+        self.assertIn('equal_samples', telemetry)
+        self.assertEqual(len(telemetry['equal_samples']), 22)
+        self.assertEqual(telemetry['equal_samples']['context_sha256'], ctx_hash)
+        self.assertEqual(telemetry['equal_samples']['expected_messages'], 30)
+
+    def test_safe_generator_resources_validation_and_rejection(self):
+        valid = {
+            'schema_version': 1,
+            'role': 'generator_B',
+            'cpu_normalization': 'host_percent',
+            'cpu_normalization_description': 'ticks / CLK_TCK / interval / cpus * 100',
+            'host_cpus': 4,
+            'clk_tck': 100,
+            'scopes': {
+                'process_tree_scope': 'owned_children_capped_at_32',
+                'fd_scope': 'root_process_only',
+                'rss_scope': 'sum_sampled_RSS_may_double_count_shared_pages_not_peak',
+                'cpu_scope': 'monotonic_process_tree_ticks_delta_same_keys_only',
+            },
+            'units': {
+                'rss_bytes': 'bytes',
+                'cpu_percent': 'percent',
+                'elapsed_seconds': 'seconds',
+                'interval_seconds': 'seconds',
+                'delta_ticks': 'ticks',
+                'process_count': 'count',
+                'current_fd_count': 'count',
+            },
+            'clock': {
+                'monotonic_start': 100.0,
+                'sample_interval_seconds': 1.0,
+                'deadline_seconds': 120.0,
+                'max_snapshots': 128,
+            },
+            'summary': {
+                'total_samples': 1,
+                'available_samples': 1,
+                'unavailable_samples': 0,
+                'cpu_available_samples': 1,
+                'max_sample_rss_bytes': 1024,
+                'max_sample_rss_qualification': 'not_peak',
+                'fd_scope': 'root_process_only',
+                'missing_reasons': [],
+                'errors': [],
+            },
+            'samples': [
+                {
+                    'sample_index': 0,
+                    'timestamp': '2026-01-01T12:00:00Z',
+                    'elapsed_seconds': 0.0,
+                    'interval_seconds': None,
+                    'available': True,
+                    'cpu_percent': 10.0,
+                    'delta_ticks': 10,
+                    'rss_bytes': 1024,
+                    'process_count': 2,
+                    'current_fd_count': 5,
+                    'reason': None,
+                }
+            ],
+        }
+        safe = client._safe_generator_resources(valid)
+        self.assertEqual(safe['role'], 'generator_B')
+        self.assertEqual(safe['clk_tck'], 100)
+        self.assertEqual(len(safe['samples']), 1)
+
+        # Rejections
+        with self.assertRaisesRegex(ValueError, 'generator_resources_version_rejected'):
+            client._safe_generator_resources(dict(valid, schema_version=2))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_role_rejected'):
+            client._safe_generator_resources(dict(valid, role='generator_A'))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_cpu_norm_rejected'):
+            client._safe_generator_resources(dict(valid, cpu_normalization='invalid'))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_host_cpus_rejected'):
+            client._safe_generator_resources(dict(valid, host_cpus=0))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_clock_max_snaps_rejected'):
+            client._safe_generator_resources(dict(valid, clock=dict(valid['clock'], max_snapshots=200)))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_sample_fields_rejected'):
+            bad_samples = [dict(valid['samples'][0], unknown_field='bad')]
+            client._safe_generator_resources(dict(valid, samples=bad_samples))
+        with self.assertRaisesRegex(ValueError, 'generator_resources_sample_non_finite_rejected'):
+            bad_samples = [dict(valid['samples'][0], cpu_percent=float('nan'))]
+            client._safe_generator_resources(dict(valid, samples=bad_samples))
+
+    def test_export_results_includes_generator_resources(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        spec = json.loads((workspace / 'runtime/execution/run-spec.json').read_text())
+        for job in spec['paperload']:
+            output = Path(job['output_dir'])
+            output.mkdir(mode=0o700)
+            role = job['role']
+            value = {'status': 'COMPLETE', 'experiment': 'E1', 'arm': 'A' if role == 'telemetry' else 'baseline',
+                     'run_id': 'run-1', 'started_at': '2026-10-30T00:00:00Z',
+                     'finished_at': '2026-10-30T00:00:01Z',
+                     'telemetry': {'generated_unique': 20, 'offered_unique': 20,
+                                   'application_acks': 20, 'pending_messages': 0,
+                                   'pending_bytes': 0},
+                     'phase_events': [{'event': 'measure_end', 'elapsed_ns': 10,
+                                       'counters': {'offered_unique': 20}}]}
+            value['implementation_status'] = ('P8.4c viewer-only client; no control/durable/server orchestration'
+                if role == 'viewer' else 'P8.4b telemetry synthetic-load; no durable restart assurance')
+            if role == 'viewer':
+                value.update({'connected_distinct_viewers': 64,
+                              'viewers': [{'id': 'viewer-00000', 'events': 2,
+                                            'unique_events': 2, 'duplicates': 0, 'bytes': 300}],
+                              'identity_samples': [{'viewer_id':'viewer-001','gateway_id':'gw-a',
+                                'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                                'first_sequence':'1','sample_count':100,'header_sha256':'c'*64}]})
+            else:
+                value['phase_observation_status'] = 'observed_process_local_elapsed; runner_pipe_observation_lag_unknown'
+                value['identity_samples'] = [{'viewer_id':'','gateway_id':'gw-a',
+                    'sensor_id':'s-1','message_id':'m-1','boot_id':'b-1',
+                    'first_sequence':'1','sample_count':100,'header_sha256':'d'*64}]
+            path = output / 'workload.json'
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        runner = workspace / 'outputs/run.json'
+        runner.write_text(json.dumps({'status': 'COMPLETE', 'children': [],
+                                      'phase_observations': {'status': 'observed', 'events': []},
+                                      'resource_sampling': {'status': 'not_collected_in_P8.4'}}))
+        runner.chmod(0o600)
+        provenance = workspace / 'runtime/runner-provenance.json'
+        provenance.write_text(json.dumps({'binary_sha256': 'a' * 64,
+                                          'binary_os': 'linux', 'binary_arch': 'amd64'}))
+        provenance.chmod(0o600)
+
+        # Place generator resources in outputs
+        gen_data = {
+            'schema_version': 1,
+            'role': 'generator_B',
+            'cpu_normalization': 'host_percent',
+            'cpu_normalization_description': 'desc',
+            'host_cpus': 2,
+            'clk_tck': 100,
+            'scopes': {
+                'process_tree_scope': 'owned_children_capped_at_32',
+                'fd_scope': 'root_process_only',
+                'rss_scope': 'sum_sampled_RSS_may_double_count_shared_pages_not_peak',
+                'cpu_scope': 'monotonic_process_tree_ticks_delta_same_keys_only',
+            },
+            'units': {
+                'rss_bytes': 'bytes',
+                'cpu_percent': 'percent',
+                'elapsed_seconds': 'seconds',
+                'interval_seconds': 'seconds',
+                'delta_ticks': 'ticks',
+                'process_count': 'count',
+                'current_fd_count': 'count',
+            },
+            'clock': {
+                'monotonic_start': 100.0,
+                'sample_interval_seconds': 1.0,
+                'deadline_seconds': 120.0,
+                'max_snapshots': 128,
+            },
+            'summary': {
+                'total_samples': 1,
+                'available_samples': 1,
+                'unavailable_samples': 0,
+                'cpu_available_samples': 1,
+                'max_sample_rss_bytes': 2048,
+                'max_sample_rss_qualification': 'not_peak',
+                'fd_scope': 'root_process_only',
+                'missing_reasons': [],
+                'errors': [],
+            },
+            'samples': [
+                {
+                    'sample_index': 0,
+                    'timestamp': '2026-01-01T12:00:00Z',
+                    'elapsed_seconds': 0.0,
+                    'interval_seconds': None,
+                    'available': True,
+                    'cpu_percent': 5.0,
+                    'delta_ticks': 5,
+                    'rss_bytes': 2048,
+                    'process_count': 1,
+                    'current_fd_count': 3,
+                    'reason': None,
+                }
+            ],
+        }
+        (workspace / 'outputs/resources-generator.json').write_text(json.dumps(gen_data))
+        (workspace / 'outputs/resources-generator.json').chmod(0o600)
+
+        out = fixture.root / 'safe-res-results'
+        client._export_results(workspace, out)
+        summary = json.loads((out / 'results.json').read_text())
+        file_paths = {f['path'] for f in summary['files']}
+        self.assertIn('results/runner/resources-generator.json', file_paths)
+        res_file = out / 'results/runner/resources-generator.json'
+        self.assertTrue(res_file.is_file())
+        parsed_res = json.loads(res_file.read_text())
+        self.assertEqual(parsed_res['role'], 'generator_B')
+        self.assertEqual(parsed_res['clk_tck'], 100)
+
+    def test_client_run_starts_generator_sampler_for_e2_equal_samples(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+
+        # Mutate binding to E2 equal-samples-100
+        binding_path = workspace / 'runtime/binding.json'
+        binding = json.loads(binding_path.read_text())
+        binding['session']['experiment'] = 'E2'
+        binding['session']['phase'] = 'equal-samples-100'
+        binding['session']['workload'] = 'equal_samples'
+        binding_path.write_text(json.dumps(binding))
+
+        bin_file = fixture.root / 'paperload_bin'
+        bin_file.write_bytes(b'dummy-binary')
+        bin_file.chmod(0o700)
+
+        started_samplers = []
+        stopped_samplers = []
+
+        class SpySampler:
+            def __init__(self, interval=1.0):
+                self.interval = interval
+                started_samplers.append(self)
+            def start(self):
+                pass
+            def stop(self):
+                stopped_samplers.append(self)
+                return {
+                    'schema_version': 1,
+                    'role': 'generator_B',
+                    'cpu_normalization': 'host_percent',
+                    'cpu_normalization_description': 'desc',
+                    'host_cpus': 2,
+                    'clk_tck': 100,
+                    'scopes': {
+                        'process_tree_scope': 'owned_children_capped_at_32',
+                        'fd_scope': 'root_process_only',
+                        'rss_scope': 'sum_sampled_RSS_may_double_count_shared_pages_not_peak',
+                        'cpu_scope': 'monotonic_process_tree_ticks_delta_same_keys_only',
+                    },
+                    'units': {
+                        'rss_bytes': 'bytes',
+                        'cpu_percent': 'percent',
+                        'elapsed_seconds': 'seconds',
+                        'interval_seconds': 'seconds',
+                        'delta_ticks': 'ticks',
+                        'process_count': 'count',
+                        'current_fd_count': 'count',
+                    },
+                    'clock': {
+                        'monotonic_start': 100.0,
+                        'sample_interval_seconds': 1.0,
+                        'deadline_seconds': 120.0,
+                        'max_snapshots': 128,
+                    },
+                    'summary': {
+                        'total_samples': 1,
+                        'available_samples': 1,
+                        'unavailable_samples': 0,
+                        'cpu_available_samples': 1,
+                        'max_sample_rss_bytes': 1024,
+                        'max_sample_rss_qualification': 'not_peak',
+                        'fd_scope': 'root_process_only',
+                        'missing_reasons': [],
+                        'errors': [],
+                    },
+                    'samples': [{
+                        'sample_index': 0,
+                        'timestamp': '2026-01-01T12:00:00Z',
+                        'elapsed_seconds': 0.0,
+                        'interval_seconds': None,
+                        'available': True,
+                        'cpu_percent': 5.0,
+                        'delta_ticks': 5,
+                        'rss_bytes': 1024,
+                        'process_count': 1,
+                        'current_fd_count': 3,
+                        'reason': None,
+                    }],
+                }
+            def write_csv(self, path):
+                Path(path).write_text('csv-header\n')
+
+        def fake_run_supervised(**kwargs):
+            art = Path(kwargs['run_artifact'])
+            art.parent.mkdir(parents=True, exist_ok=True)
+            art.write_text(json.dumps({'status': 'COMPLETE'}))
+            return 'COMPLETE', {'status': 'COMPLETE'}
+
+        with mock.patch.object(client, 'GeneratorResourceSampler', SpySampler), \
+                mock.patch.object(client.paper_p8, 'run_supervised', fake_run_supervised):
+            exit_code = client.main(['run', '--workspace', str(workspace), '--binary', str(bin_file)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(started_samplers), 1)
+        self.assertEqual(len(stopped_samplers), 1)
+        res_json = workspace / 'outputs/resources-generator.json'
+        self.assertTrue(res_json.is_file())
+        res_csv = workspace / 'outputs/resources-generator.csv'
+        self.assertTrue(res_csv.is_file())
+
+    def test_e4_phase_selection_keeps_viewer_and_exactly_one_telemetry_writer(self):
+        jobs = [
+            {'role': 'telemetry', 'manifest': '/b/manifests/unique.json', 'output_dir': '/b/outputs/unique'},
+            {'role': 'telemetry', 'manifest': '/b/manifests/replay.json', 'output_dir': '/b/outputs/replay'},
+            {'role': 'viewer', 'manifest': '/b/manifests/viewer.json', 'output_dir': '/b/outputs/viewer'},
+        ]
+        selected = client._select_e4_phase_jobs(jobs, 'unique')
+        self.assertEqual({Path(item['manifest']).stem for item in selected}, {'unique', 'viewer'})
+        self.assertEqual(len([item for item in selected if item['role'] == 'telemetry']), 1)
+        with self.assertRaisesRegex(ValueError, 'unique_phase_not_validated'):
+            client._select_e4_phase_jobs(jobs, 'replay')
+        with self.assertRaisesRegex(ValueError, 'phase_rejected'):
+            client._select_e4_phase_jobs(jobs, 'warm')
+
+    def test_e4_cold_phase_is_opt_in_and_selects_cold_manifest_only(self):
+        jobs = [
+            {'role': 'telemetry', 'manifest': '/b/manifests/unique.json'},
+            {'role': 'telemetry', 'manifest': '/b/manifests/replay.json'},
+            {'role': 'telemetry', 'manifest': '/b/manifests/cold-replay.json'},
+            {'role': 'viewer', 'manifest': '/b/manifests/viewer.json'},
+        ]
+        with self.assertRaisesRegex(ValueError, 'unique_phase_not_validated'):
+            client._select_e4_phase_jobs(jobs, 'cold-replay')
+        selected = client._select_e4_phase_jobs(jobs, 'cold-replay', replay_validated=True)
+        self.assertEqual({Path(item['manifest']).stem for item in selected}, {'cold-replay', 'viewer'})
+        with self.assertRaisesRegex(ValueError, 'E4 phase input rejected'):
+            client._select_e4_phase_jobs(jobs[:-2] + jobs[-1:], 'cold-replay', replay_validated=True)
+
+    def test_e4_expiry_phase_selects_its_manifest_and_viewer(self):
+        jobs = [{'role': 'telemetry', 'manifest': '/b/manifests/unique.json'},
+                {'role': 'telemetry', 'manifest': '/b/manifests/replay.json'},
+                {'role': 'telemetry', 'manifest': '/b/manifests/expiry-replay.json'},
+                {'role': 'viewer', 'manifest': '/b/manifests/viewer.json'}]
+        selected = client._select_e4_phase_jobs(jobs, 'expiry-replay', replay_validated=True)
+        self.assertEqual({Path(item['manifest']).stem for item in selected}, {'expiry-replay', 'viewer'})
+
+    def test_e4_safe_projection_preserves_phase_proof_without_private_material(self):
+        payload = {'status': 'COMPLETE', 'experiment': 'E4', 'run_id': 'e4-unique',
+            'telemetry': {'generated_unique': 20, 'application_acks': 20},
+            'e4': {'mode': 'unique', 'journal_entry_count': 20,
+                'safe_header_samples': [{'topic': 'gateways/gw-a/telemetry/sensor-a', 'gateway_id': 'gw-a', 'sensor_id': 'sensor-a',
+                    'message_id': 'm-1', 'boot_id': 'boot-1', 'first_sequence': '1',
+                    'sample_count': 100, 'payload_sha256': 'a' * 64}]},
+            'primary_error': '/private/secrets'}
+        projected = client._safe_workload(payload, role='telemetry')
+        self.assertEqual(projected['e4']['mode'], 'unique')
+        self.assertEqual(projected['e4']['safe_header_samples'][0]['payload_sha256'], 'a' * 64)
+        self.assertNotIn('primary_error', projected)
+        with self.assertRaisesRegex(ValueError, 'E4 proof schema rejected'):
+            client._safe_workload({**payload, 'e4': {'mode': 'unique', 'journal_path': '/private/x'}},
+                                  role='telemetry')
+
+    def test_e4_workspace_lock_rejects_concurrent_phase_runner(self):
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
+            root = Path(tmp); (root / 'runtime').mkdir(mode=0o700)
+            first = client._e4_phase_lock(root)
+            try:
+                with self.assertRaisesRegex(ValueError, 'already active'):
+                    client._e4_phase_lock(root)
+            finally:
+                import os
+                os.close(first)
+            second = client._e4_phase_lock(root)
+            import os
+            os.close(second)
+
+    def test_e4_phase_result_requires_real_viewer_subscription_and_event_evidence(self):
+        telemetry = {'status': 'COMPLETE', 'experiment': 'E4', 'e4': {
+            'mode': 'unique', 'journal_entry_count': 20, 'safe_header_samples': [{} for _ in range(20)]},
+            'telemetry': {'generated_unique': 20, 'application_acks': 20,
+                'ignored_valid_acks': 1, 'retries': 1, 'pending_messages': 0}}
+        viewer = {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+            'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2,
+            'unique_events': 20}
+        client._validate_e4_phase_result('unique', telemetry, viewer, expected_unique=20, expected_replay=10)
+        viewer['subscribed_distinct_viewers'] = 0
+        with self.assertRaisesRegex(ValueError, 'viewer proof rejected'):
+            client._validate_e4_phase_result('unique', telemetry, viewer, expected_unique=20, expected_replay=10)
+
+    def test_e4_phase_result_uses_bound_manifest_counts_and_bounded_prefix(self):
+        viewer = {'status': 'COMPLETE', 'connected_distinct_viewers': 2,
+            'subscribed_distinct_viewers': 2, 'receiving_distinct_viewers': 2, 'unique_events': 1}
+        for unique_count, replay_count in ((20, 10), (8, 2), (1000, 100)):
+            common = {'run_id': 'e4-regression', 'profile': 'official',
+                'phases': {'measure_seconds': 4}, 'topology': {'gateways': 2},
+                'roles': ['telemetry']}
+            unique_manifest = e4_support.e4_phase_manifest(common, 'journal', 'unique',
+                unique_count=unique_count, replay_count=replay_count, official_opt_in=True)
+            replay_manifest = e4_support.e4_phase_manifest(common, 'journal', 'replay',
+                unique_count=unique_count, replay_count=replay_count, official_opt_in=True)
+            expected_unique, expected_replay = client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'unique')
+            self.assertEqual(client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'replay'), (unique_count, replay_count))
+            self.assertEqual(client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'cold-replay'), (unique_count, replay_count))
+            self.assertEqual(client._e4_manifest_counts(
+                [unique_manifest, replay_manifest], 'expiry-replay'), (unique_count, replay_count))
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest], 'unique')
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest, {**replay_manifest,
+                    'e4': {**replay_manifest['e4'], 'replay_count': 0}}], 'unique')
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest, replay_manifest], 'unexpected')
+            headers = [{'message_id': f'm{i}'} for i in range(min(unique_count, 20))]
+            unique = {'experiment': 'E4', 'e4': {'mode': 'unique',
+                'journal_entry_count': unique_count, 'safe_header_samples': headers},
+                'telemetry': {'generated_unique': unique_count, 'application_acks': unique_count,
+                    'ignored_valid_acks': 1, 'retries': 1, 'pending_messages': 0}}
+            replay_headers = headers[:min(replay_count, 20)]
+            replay = {'experiment': 'E4', 'e4': {'mode': 'replay',
+                'journal_entry_count': replay_count, 'safe_header_samples': replay_headers},
+                'telemetry': {'replay_offered': replay_count,
+                    'replay_application_acks': replay_count, 'pending_messages': 0}}
+            client._validate_e4_phase_result('unique', unique, viewer,
+                expected_unique=expected_unique, expected_replay=expected_replay)
+            client._validate_e4_phase_result('replay', replay, {**viewer, 'unique_events': 0},
+                expected_unique=expected_unique, expected_replay=expected_replay)
+            wrong = {**unique, 'telemetry': {**unique['telemetry'], 'application_acks': unique_count - 1}}
+            with self.assertRaisesRegex(ValueError, 'unique phase result rejected'):
+                client._validate_e4_phase_result('unique', wrong, viewer,
+                    expected_unique=expected_unique, expected_replay=expected_replay)
+            wrong_pending = {**unique, 'telemetry': {**unique['telemetry'], 'pending_messages': 1}}
+            with self.assertRaisesRegex(ValueError, 'unique phase result rejected'):
+                client._validate_e4_phase_result('unique', wrong_pending,
+                    {**viewer, 'unique_events': unique_count},
+                    expected_unique=expected_unique, expected_replay=expected_replay)
+            with self.assertRaisesRegex(ValueError, 'manifest count mismatch'):
+                client._e4_manifest_counts([unique_manifest, {**replay_manifest,
+                    'e4': {**replay_manifest['e4'], 'max_messages': unique_count + 1}}], 'unique')
+            with self.assertRaisesRegex(ValueError, 'journal headers changed'):
+                client._validate_e4_header_prefix(headers, [{'message_id': 'tampered'}] + replay_headers[1:],
+                    replay_count)
+            with self.assertRaisesRegex(ValueError, 'journal headers changed'):
+                client._validate_e4_header_prefix([], [], replay_count)
+
+    def test_e4_safe_projection_keeps_named_viewers_and_phase_observations(self):
+        workload = {'status': 'COMPLETE', 'experiment': 'E1',
+            'viewers': [{'id': 'e4-viewer-a', 'unique_events': 10, 'duplicates': 0,
+                         'close_reason': 'measurement_complete'}],
+            'phase_events': [{'child': 'paperload-telemetry:unique.json',
+                'event': 'measure_begin', 'elapsed_ns': 123,
+                'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}]}
+        projected = client._safe_workload(workload, role='viewer')
+        self.assertEqual(projected['viewers'][0]['id'], 'e4-viewer-a')
+        events = client._safe_phase_events(workload['phase_events'])
+        self.assertEqual(events[0]['child'], 'paperload-telemetry:unique.json')
+
+    def test_server_accepts_begin_request_and_rejects_finish_before_collector_ack(self):
+        from scripts import paper_p8_server
+        with self.assertRaises(FileNotFoundError):
+            paper_p8_server.main(['begin', '--root', '/nope', '--session-id', 'x',
+                                  '--phase', 'READY', '--phase-id', 'p', '--experiment', 'E3'])
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        from scripts.tests import paper_p8_supervisor
+        private = fixture.root / 'fixture/private'
+        private.mkdir(mode=0o700, parents=True)
+        state = paper_p8_supervisor.initialize(private, experiment='E1', arm='baseline',
+            seed=1, deadline_seconds=10, receipts=[], preparation_status='E1_PREPARED')
+        root = fixture.root
+        with self.assertRaisesRegex(ValueError, 'request_finish_transition_invalid'):
+            paper_p8_server.main(['finish-phase', '--root', str(root), '--session-id', state['session_id'],
+                                  '--phase', 'READY', '--phase-id', 'pilot', '--results', '/nope'])
+        paper_p8_server.main(['begin', '--root', str(root), '--session-id', state['session_id'],
+                              '--phase', 'READY', '--phase-id', 'pilot'])
+        request = json.loads((private / 'request.json').read_text())
+        self.assertEqual(request['command'], 'begin')
+        self.assertEqual(request['phase_id'], 'pilot')
+
+    def test_server_publishes_e3_begin_for_collector_import_slice(self):
+        from scripts import paper_p8_server
+        from scripts.tests import paper_p8_supervisor
+        fixture=PortableBundleTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        private=fixture.root/'fixture/private'; private.mkdir(mode=0o700,parents=True)
+        state=paper_p8_supervisor.initialize(private,experiment='E3',arm='polling',seed=89,
+            deadline_seconds=300,receipts=[],preparation_status='E3_PREPARED')
+        paper_p8_server.main(['begin','--root',str(fixture.root),'--experiment','E3',
+            '--session-id',state['session_id'],'--phase','READY','--phase-id','e3-low_load-polling'])
+        request=json.loads((private/'request.json').read_text())
+        self.assertEqual(request['command'],'begin')
+        self.assertEqual(request['phase_id'],'e3-low_load-polling')
+
+    def test_server_begin_accepts_explicit_e2_prepared_profile_only(self):
+        from scripts import paper_p8_server
+        from scripts.tests import paper_p8_supervisor
+        fixture = PortableBundleTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        private = fixture.root / 'fixture/private'; private.mkdir(mode=0o700, parents=True)
+        state = paper_p8_supervisor.initialize(private, experiment='E2', arm='E2-pilot',
+            seed=84, deadline_seconds=10, receipts=[], preparation_status='E2_PREPARED')
+        paper_p8_server.main(['begin', '--root', str(fixture.root), '--session-id', state['session_id'],
+            '--phase', 'READY', '--phase-id', 'samples-100', '--experiment', 'E2'])
+        request = json.loads((private / 'request.json').read_text())
+        self.assertEqual(request['phase_id'], 'samples-100')
+
+    def test_run_failure_keeps_partial_report_and_pending_evidence(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'
+        parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        binary = parent / 'paperload'; binary.write_text('binary'); binary.chmod(0o700)
+        pending = workspace / 'outputs/outbox/pending.sqlite'
+        with sqlite3.connect(pending) as database:
+            database.execute('CREATE TABLE pending (message_id TEXT PRIMARY KEY)')
+            database.execute('INSERT INTO pending VALUES (?)', ('keep-me',))
+        pending.chmod(0o600)
+
+        def failed_runner(*, run_artifact, **kwargs):
+            report = {'status': 'PARTIAL', 'cleanup_errors': ['fixture failure']}
+            Path(run_artifact).write_text(json.dumps(report))
+            Path(run_artifact).chmod(0o600)
+            return 'PARTIAL', report
+
+        stderr = io.StringIO()
+        with mock.patch.object(client.paper_p8, 'run_supervised', side_effect=failed_runner), \
+                contextlib.redirect_stderr(stderr):
+            status = client.main(['run', '--workspace', str(workspace), '--binary', str(binary)])
+        self.assertEqual(status, 1)
+        with sqlite3.connect(pending) as database:
+            self.assertEqual(database.execute('SELECT message_id FROM pending').fetchone(), ('keep-me',))
+        self.assertTrue((workspace / 'outputs/run.json').is_file())
+        self.assertTrue((workspace / 'runtime/runner-provenance.json').is_file())
+
+    def test_workspace_symlink_is_rejected(self):
+        fixture = PortableBundleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source = Path(fixture.export()['bundle_root'])
+        parent = fixture.root / 'B'; parent.mkdir(mode=0o700)
+        workspace = parent / 'workspace'
+        client.paper_p8_bundle.bind_bundle(bundle_root=source, workspace_leaf=workspace)
+        link = parent / 'workspace-link'; link.symlink_to(workspace, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'workspace symlink path rejected'):
+            client._workspace(link)
+        trusted = workspace / 'inputs/certs/https-ca.pem'
+        trusted.write_text('mutated CA')
+        trusted.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'bound input provenance mismatch'):
+            client._workspace(workspace)
+
+    def test_conflict_helpers_load_without_test_pythonpath(self):
+        repo = Path(__file__).resolve().parents[2]
+        env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        code = ("from scripts import paper_p8_client as client; "
+                "e4, p5a = client._conflict_helpers(); "
+                "assert callable(e4.generate_e4_conflict_payloads) and callable(p5a.conflict_payloads)")
+        result = subprocess.run([sys.executable, '-c', code], cwd=repo, env=env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_export_conflict_probe_and_conflict_stage_lifecycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = root / 'workspace'
+            ws.mkdir(mode=0o700, parents=True)
+            runtime = ws / 'runtime'
+            runtime.mkdir(mode=0o700, parents=True)
+            outputs = ws / 'outputs'
+            outputs.mkdir(mode=0o700, parents=True)
+            inputs = ws / 'inputs'
+            inputs.mkdir(mode=0o700, parents=True)
+            (inputs / 'certs').mkdir(mode=0o700, parents=True)
+            (inputs / 'private/gateways').mkdir(mode=0o700, parents=True)
+
+            ca_file = inputs / 'certs/mqtt-ca.pem'
+            ca_file.write_text('ca-content')
+            ca_file.chmod(0o600)
+
+            gw_cred = inputs / 'private/gateways/gw-1.json'
+            gw_cred.write_text(json.dumps({'username': 'gw-1', 'password': 'secret-pass'}))
+            gw_cred.chmod(0o600)
+
+            # Run spec
+            (runtime / 'execution').mkdir(mode=0o700, parents=True)
+            spec_file = runtime / 'execution/run-spec.json'
+            spec_file.write_text('{}')
+            spec_file.chmod(0o600)
+            spec_hash = hashlib.sha256(b'{}').hexdigest()
+
+            # Binding
+            binding = {
+                'schema_version': 1,
+                'session': {
+                    'experiment': 'E4',
+                    'session_id': 'b' * 32,
+                    'run_id': 'run-e4-1',
+                    'endpoints': {'mqtt_tls': 'mqtts://127.0.0.1:18883'}
+                },
+                'source_bundle_sha256': 'c' * 64,
+                'source_inventory': [
+                    {'path': 'certs/mqtt-ca.pem', 'sha256': hashlib.sha256(b'ca-content').hexdigest()},
+                    {'path': 'private/gateways/gw-1.json', 'sha256': hashlib.sha256(gw_cred.read_bytes()).hexdigest()}
+                ],
+                'bound_manifest_sha256': {},
+                'bound_gateway_environment_sha256': {},
+                'bound_run_spec_sha256': spec_hash,
+                'elapsed_transfer_wait_seconds': 0,
+                'required_token_lifetime_seconds': 3600
+            }
+            binding_path = runtime / 'binding.json'
+            binding_path.write_text(json.dumps(binding))
+            binding_path.chmod(0o600)
+
+            # Phase state: unique completed
+            phase_state = {
+                'unique_validated': True,
+                'last_completed_phase': 'replay'
+            }
+            state_path = runtime / 'e4-phase-state.json'
+            state_path.write_text(json.dumps(phase_state))
+            state_path.chmod(0o600)
+
+            # Journal
+            mid = '550e8400-e29b-41d4-a716-446655440000'
+            payload_dict = {
+                'protocol_version': 1, 'message_id': mid, 'message_type': 'telemetry_batch',
+                'gateway_id': 'gw-1', 'sensor_id': 'sensor-1', 'boot_id': 'boot-1',
+                'first_sequence': 10, 'sample_count': 100, 'measured_at': '2026-10-28T00:00:00Z',
+                'sample_interval_us': 10000, 'samples': [float(i) for i in range(100)]
+            }
+            raw_payload = json.dumps(payload_dict, separators=(',', ':')).encode()
+            digest = hashlib.sha256(raw_payload).hexdigest()
+            record = {
+                'topic': 'gateways/gw-1/telemetry/sensor-1',
+                'gateway_id': 'gw-1', 'sensor_id': 'sensor-1', 'message_id': mid,
+                'boot_id': 'boot-1', 'first_sequence': '10', 'sample_count': 100,
+                'payload_sha256': digest,
+                'payload': base64.b64encode(raw_payload).decode('ascii')
+            }
+            journal = outputs / 'e4-journal.sqlite'
+            journal.write_text(json.dumps(record) + '\n')
+            journal.chmod(0o600)
+
+            # 1. Export conflict probe
+            probe_out = root / 'probe-exported'
+            res = client._export_conflict_probe(ws, probe_out)
+            self.assertEqual(res['cases'], 2)
+            self.assertTrue((probe_out / 'conflict-probe.json').is_file())
+            self.assertTrue((probe_out / 'results.json').is_file())
+
+            # 2. Run conflict stage with mock transport
+            def mock_transport(gw, sensor, pwd, orig_pay, cases):
+                self.assertEqual(gw, 'gw-1')
+                self.assertEqual(sensor, 'sensor-1')
+                self.assertEqual(pwd, 'secret-pass')
+                self.assertEqual(orig_pay, raw_payload)
+                self.assertEqual(set(cases), {'same_id_changed_payload', 'different_first_sequence_overlap'})
+                return {
+                    name: {
+                        'message_id': cases[name]['message_id'],
+                        'payload_sha256': cases[name]['payload_sha256'],
+                        'schema_valid': True,
+                        'positive_control_ack_count': 1,
+                        'conflict_ack_count': 0,
+                        'raw_payload_b64': cases[name]['raw_payload_b64'],
+                        'status': 'PASS'
+                    }
+                    for name in cases
+                }
+
+            stage_res = client._run_conflict_stage(ws, transport=mock_transport)
+            self.assertEqual(stage_res['status'], 'PASS')
+            self.assertTrue((runtime / 'e4-conflicts.json').is_file())
+
+            # 3. Export conflict results
+            results_out = root / 'results-exported'
+            exp_res = client._export_conflict_results(ws, results_out)
+            self.assertEqual(exp_res['phase'], 'conflicts')
+            self.assertTrue((results_out / 'conflicts-proof.json').is_file())
+            self.assertTrue((results_out / 'results.json').is_file())
+            results_summary = json.loads((results_out / 'results.json').read_text())
+            self.assertEqual(results_summary['phase'], 'conflicts')
+            self.assertEqual(results_summary['proof']['path'], 'conflicts-proof.json')
+
+    def test_safe_phase_events_accepts_equal_samples_and_samples_child_labels(self):
+        phase_children = [
+            'paperload-telemetry:equal-samples-100.json',
+            'paperload-telemetry:equal-samples-100.manifest.json',
+            'paperload-telemetry:equal-samples-1.json',
+            'paperload-telemetry:equal-samples-1.manifest.json',
+            'paperload-telemetry:samples-100.json',
+            'paperload-telemetry:samples-100.manifest.json',
+            'paperload-telemetry:samples-1.json',
+            'paperload-telemetry:samples-1.manifest.json',
+            'paperload-telemetry:A.manifest.json',
+            'paperload-telemetry:B.manifest.json',
+        ]
+        for child in phase_children:
+            with self.subTest(child=child):
+                events = client._safe_phase_events([{'child': child,
+                    'event': 'measure_begin', 'elapsed_ns': 100,
+                    'clock_qualification': 'runner observed pipe receipt; observation lag unknown; child elapsed is process-local'}])
+                self.assertEqual(events[0]['child'], child)
+
+    def test_equal_samples_safe_projection_preserves_exact_22_fields(self):
+        raw = {
+            'status': 'COMPLETE',
+            'implementation_status': 'P8.4b telemetry synthetic-load; no durable restart assurance',
+            'experiment': 'E2',
+            'arm': 'A',
+            'profile': 'pilot',
+            'mode': 'remote',
+            'run_id': 'golden-run-100',
+            'durability_mode': 'synthetic-load',
+            'durable_gateway_count': 0,
+            'started_at': '2026-10-31T12:00:00.000000000Z',
+            'finished_at': '2026-10-31T12:01:00.000000000Z',
+            'configured_phases': {'warmup_seconds': 0, 'measure_seconds': 60, 'drain_seconds': 20, 'cooldown_seconds': 0},
+            'telemetry': {'scheduled_opportunities': 30, 'generated_unique': 30, 'offered_unique': 30,
+                          'application_acks': 30, 'pending_messages': 0, 'pending_bytes': 0},
+            'equal_samples': {
+                'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+                'workload_type': 'equal_samples',
+                'logical_producer': 'A',
+                'total_samples': 6000,
+                'sample_rate': 100,
+                'duration_seconds': 60,
+                'producer_sample_rate': 50,
+                'sample_interval_us': 20000,
+                'samples_per_message': 100,
+                'expected_samples': 3000,
+                'expected_messages': 30,
+                'generated_samples': 3000,
+                'generated_messages': 30,
+                'offered_unique_samples': 3000,
+                'offered_unique_messages': 30,
+                'application_acks': 30,
+                'offered_unique_bytes': 15000,
+                'attempted_bytes': 15000,
+                'schedule_misses': 0,
+                'scheduling_lag_max_ns': 1250000,
+                'completed_on_time': True,
+                'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+            }
+        }
+        projected = client._safe_workload(raw, role='telemetry')
+        self.assertIn('equal_samples', projected)
+        eq = projected['equal_samples']
+        self.assertEqual(len(eq), 22)
+        self.assertEqual(eq['context_sha256'], 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792')
+        self.assertEqual(eq['workload_type'], 'equal_samples')
+        self.assertEqual(eq['logical_producer'], 'A')
+        self.assertEqual(eq['total_samples'], 6000)
+        self.assertEqual(eq['sample_rate'], 100)
+        self.assertEqual(eq['duration_seconds'], 60)
+        self.assertEqual(eq['producer_sample_rate'], 50)
+        self.assertEqual(eq['sample_interval_us'], 20000)
+        self.assertEqual(eq['samples_per_message'], 100)
+        self.assertEqual(eq['expected_samples'], 3000)
+        self.assertEqual(eq['expected_messages'], 30)
+        self.assertEqual(eq['generated_samples'], 3000)
+        self.assertEqual(eq['generated_messages'], 30)
+        self.assertEqual(eq['offered_unique_samples'], 3000)
+        self.assertEqual(eq['offered_unique_messages'], 30)
+        self.assertEqual(eq['application_acks'], 30)
+        self.assertEqual(eq['offered_unique_bytes'], 15000)
+        self.assertEqual(eq['attempted_bytes'], 15000)
+        self.assertEqual(eq['schedule_misses'], 0)
+        self.assertEqual(eq['scheduling_lag_max_ns'], 1250000)
+        self.assertIs(eq['completed_on_time'], True)
+        self.assertEqual(eq['sampling_qualification'], 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only')
+
+    def test_equal_samples_safe_projection_rejects_unknown_fields(self):
+        raw = {
+            'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'run-1',
+            'equal_samples': {
+                'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+                'workload_type': 'equal_samples', 'logical_producer': 'A',
+                'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+                'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+                'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+                'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+                'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+                'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+                'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+                'unknown_extra_key': 999,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, 'equal_samples schema rejected'):
+            client._safe_workload(raw, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_omissions(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        for key_to_remove in ('completed_on_time', 'context_sha256', 'expected_samples', 'application_acks'):
+            with self.subTest(removed=key_to_remove):
+                corrupted = dict(valid_eq)
+                del corrupted[key_to_remove]
+                raw = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'run-1', 'equal_samples': corrupted}
+                with self.assertRaisesRegex(ValueError, 'equal_samples schema rejected'):
+                    client._safe_workload(raw, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_nan_and_floats(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        for bad_val in (float('nan'), float('inf'), 30.5, '3000'):
+            with self.subTest(bad_val=bad_val):
+                corrupted = dict(valid_eq, generated_samples=bad_val)
+                raw = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'run-1', 'equal_samples': corrupted}
+                with self.assertRaises(ValueError):
+                    client._safe_workload(raw, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_negative_and_unbounded(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, generated_samples=-1)}, role='telemetry')
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, generated_samples=(1 << 54))}, role='telemetry')
+
+    def test_equal_samples_safe_projection_rejects_malformed_identities(self):
+        valid_eq = {
+            'context_sha256': 'c27dc881d673d16486013066ee8a505d8d440a0317ef4194b6c8bd80cae36792',
+            'workload_type': 'equal_samples', 'logical_producer': 'A',
+            'total_samples': 6000, 'sample_rate': 100, 'duration_seconds': 60,
+            'producer_sample_rate': 50, 'sample_interval_us': 20000, 'samples_per_message': 100,
+            'expected_samples': 3000, 'expected_messages': 30, 'generated_samples': 3000,
+            'generated_messages': 30, 'offered_unique_samples': 3000, 'offered_unique_messages': 30,
+            'application_acks': 30, 'offered_unique_bytes': 15000, 'attempted_bytes': 15000,
+            'schedule_misses': 0, 'scheduling_lag_max_ns': 1250000, 'completed_on_time': True,
+            'sampling_qualification': 'logical_offered_stream; not physical sensor acquisition latency; commit ack from application outbox only',
+        }
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, context_sha256='not-hex')}, role='telemetry')
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, logical_producer='invalid-producer')}, role='telemetry')
+        with self.assertRaises(ValueError):
+            client._safe_workload({'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r',
+                                   'equal_samples': dict(valid_eq, logical_producer='B')}, role='A')
+
+    def test_equal_samples_legacy_absent_behavior_unchanged(self):
+        raw = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r'}
+        projected = client._safe_workload(raw, role='telemetry')
+        self.assertNotIn('equal_samples', projected)
+        raw_none = {'status': 'COMPLETE', 'experiment': 'E2', 'arm': 'A', 'run_id': 'r', 'equal_samples': None}
+        projected_none = client._safe_workload(raw_none, role='telemetry')
+        self.assertNotIn('equal_samples', projected_none)

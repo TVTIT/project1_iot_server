@@ -37,19 +37,10 @@ server {
         proxy_pass_header Authorization;
     }
 
-    # 3. Go Backend WebSocket for Realtime Telemetry (/v1/ws hoặc /v1/telemetry/ws)
-    location ~ ^/v1/(ws|telemetry/ws) {
-        proxy_pass http://backend_api;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Authorization $http_authorization;
-        proxy_pass_header Authorization;
-        proxy_read_timeout 86400;
+    # WS is unavailable in the base profile: never proxy an enabled handler
+    # without the opt-in Unix verifier perimeter.
+    location = /v1/ws {
+        return 404;
     }
 
     # 4. Go Backend Business REST API (/v1/*)

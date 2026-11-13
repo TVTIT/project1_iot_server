@@ -1,12 +1,155 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
 
 const testJWTSecret = "test-only-jwt-secret-at-least-32-characters"
+
+func TestMetricsFlagDefaultAndValidation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MetricsEnabled {
+		t.Fatal(cfg.MetricsEnabled, err)
+	}
+	values["METRICS_ENABLED"] = "true"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MetricsEnabled {
+		t.Fatal(cfg.MetricsEnabled, err)
+	}
+	values["METRICS_ENABLED"] = "invalid"
+	if _, err = Load(mapLookup(values)); err == nil {
+		t.Fatal("accepted invalid flag")
+	}
+}
+
+func TestWebSocketFlagOptIn(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.WebSocketEnabled {
+		t.Fatalf("default websocket flag=%v err=%v", cfg.WebSocketEnabled, err)
+	}
+	values["WEBSOCKET_ENABLED"] = "true"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.WebSocketEnabled {
+		t.Fatalf("enabled websocket flag=%v err=%v", cfg.WebSocketEnabled, err)
+	}
+	values["WEBSOCKET_ENABLED"] = "invalid"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("invalid websocket flag accepted")
+	}
+}
+
+func TestWebSocketLimitsDefaultsAndValidation(t *testing.T) {
+	cfg, err := Load(mapLookup(validConfigValues()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cfg.WebSocket
+	if cfg.WebSocketEnabled || w.MaxSessions != 32 || w.MaxSubscriptionsPerSession != 16 || w.GlobalEventSlots != 64 || w.GlobalEventBytes != 8<<20 || w.SessionReferenceBytes != 8<<20 || w.SessionEventSlots != 64 || w.SessionEventBytes != 256<<10 || w.MaxFrameBytes != 66560 || w.ReadFrameBytes != 4096 || w.RequestRatePerSecond != 10 || w.RecheckInterval != 5*time.Second || w.RecheckSweepBudget != 2*time.Second || w.RecheckConcurrency != 2 || w.HeartbeatInterval != 20*time.Second || w.PongTimeout != 45*time.Second || w.WriteTimeout != 5*time.Second || w.FanoutMode != "indexed" {
+		t.Fatalf("unexpected websocket defaults: enabled=%v config=%+v", cfg.WebSocketEnabled, w)
+	}
+	for key, value := range map[string]string{"WS_MAX_SUBSCRIPTIONS_PER_SESSION": "17", "WS_MAX_FRAME_BYTES": "66561", "WS_PONG_TIMEOUT": "19s", "WS_RECHECK_CONCURRENCY": "3"} {
+		values := validConfigValues()
+		values[key] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("accepted %s=%s", key, value)
+		}
+	}
+	for _, value := range []string{"0", "-1", "10001", "nope"} {
+		values := validConfigValues()
+		values["WS_MAX_SESSIONS"] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("accepted WS_MAX_SESSIONS=%q", value)
+		}
+	}
+	for _, value := range []string{"64", "10000"} {
+		values := validConfigValues()
+		values["WS_MAX_SESSIONS"] = value
+		cfg, err := Load(mapLookup(values))
+		if err != nil || cfg.WebSocket.MaxSessions != mustInt(t, value) {
+			t.Errorf("WS_MAX_SESSIONS=%s: config=%+v err=%v", value, cfg.WebSocket, err)
+		}
+	}
+	for _, value := range []string{"0", "-1", "268435457", "nope"} {
+		values := validConfigValues()
+		values["WS_SESSION_REFERENCE_BYTES"] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("accepted WS_SESSION_REFERENCE_BYTES=%q", value)
+		}
+	}
+	for _, value := range []string{"1", "268435456"} {
+		values := validConfigValues()
+		values["WS_SESSION_REFERENCE_BYTES"] = value
+		cfg, err := Load(mapLookup(values))
+		if err != nil || cfg.WebSocket.SessionReferenceBytes != mustInt(t, value) {
+			t.Errorf("WS_SESSION_REFERENCE_BYTES=%s: config=%+v err=%v", value, cfg.WebSocket, err)
+		}
+	}
+	values := validConfigValues()
+	values["WS_MAX_SESSIONS"] = "4"
+	values["WS_MAX_SUBSCRIPTIONS_PER_SESSION"] = "3"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || cfg.WebSocket.MaxSessions != 4 || cfg.WebSocket.MaxSubscriptionsPerSession != 3 {
+		t.Fatalf("lower test limits not accepted: %+v err=%v", cfg.WebSocket, err)
+	}
+}
+
+func TestWebSocketFanoutModeValidation(t *testing.T) {
+	// Default: WS_FANOUT_MODE unset -> "indexed"
+	cfg, err := Load(mapLookup(validConfigValues()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebSocket.FanoutMode != "indexed" {
+		t.Fatalf("default fanout mode=%q, want %q", cfg.WebSocket.FanoutMode, "indexed")
+	}
+
+	// Valid values: "indexed" and "scan"
+	for _, mode := range []string{"indexed", "scan"} {
+		values := validConfigValues()
+		values["WS_FANOUT_MODE"] = mode
+		c, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatalf("valid mode %q rejected: %v", mode, err)
+		}
+		if c.WebSocket.FanoutMode != mode {
+			t.Fatalf("loaded mode=%q, want %q", c.WebSocket.FanoutMode, mode)
+		}
+	}
+
+	// Empty string defaults to "indexed"
+	values := validConfigValues()
+	values["WS_FANOUT_MODE"] = ""
+	c, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("empty mode rejected: %v", err)
+	}
+	if c.WebSocket.FanoutMode != "indexed" {
+		t.Fatalf("empty mode resulted in %q, want %q", c.WebSocket.FanoutMode, "indexed")
+	}
+
+	// Invalid values: must reject with error
+	for _, mode := range []string{"invalid", "SCAN", "INDEXED", "broadcast", "direct", "1"} {
+		v := validConfigValues()
+		v["WS_FANOUT_MODE"] = mode
+		if _, err := Load(mapLookup(v)); err == nil {
+			t.Fatalf("accepted invalid WS_FANOUT_MODE=%q", mode)
+		}
+	}
+}
+
+func mustInt(t *testing.T, value string) int {
+	t.Helper()
+	var n int
+	if _, err := fmt.Sscan(value, &n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
 
 func TestMQTTRuntimeOptIn(t *testing.T) {
 	values := validConfigValues()

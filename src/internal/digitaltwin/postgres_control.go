@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"iot-platform/internal/metrics"
 )
 
 // ErrControlCapacity indicates a bounded durable-intent store is full. No intent
@@ -35,22 +37,41 @@ func DefaultControlConfig() ControlConfig {
 
 // PostgresControlRepository persists intent; it performs no network publication.
 type PostgresControlRepository struct {
-	db     TxDatabase
-	config ControlConfig
+	db       TxDatabase
+	config   ControlConfig
+	metrics  *ControlMetrics
+	timeline *metrics.ControlTimeline
+	notify   func()
 }
 
+// SetControlTimeline installs a shared process-local observer before runtime starts.
+func (r *PostgresControlRepository) SetControlTimeline(t *metrics.ControlTimeline) { r.timeline = t }
+
+// SetAdmissionNotifier installs a nonblocking post-commit signal before requests
+// are served. The callback must not perform I/O or wait for downstream work.
+func (r *PostgresControlRepository) SetAdmissionNotifier(notify func()) { r.notify = notify }
+
 // NewPostgresControlRepository constructs a bounded intent repository.
-func NewPostgresControlRepository(db TxDatabase, config ControlConfig) (*PostgresControlRepository, error) {
+func NewPostgresControlRepository(db TxDatabase, config ControlConfig, observers ...*ControlMetrics) (*PostgresControlRepository, error) {
 	if isNilDependency(db) || config.TTL < time.Second || config.TTL > 24*time.Hour || config.TTL%time.Microsecond != 0 ||
 		config.DBTimeout < time.Millisecond || config.DBTimeout > time.Minute || config.MaxPendingOutbox < 1 || config.MaxPendingOutbox > 1000000 ||
 		config.MaxReceipts < 1 || config.MaxReceipts > 1000000 {
 		return nil, ErrInvalidInput
 	}
-	return &PostgresControlRepository{db: db, config: config}, nil
+	r := &PostgresControlRepository{db: db, config: config}
+	if len(observers) > 0 {
+		r.metrics = observers[0]
+	}
+	return r, nil
 }
 
 // Admit atomically accepts or replays one actor-scoped Sensor intent.
 func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, urn string, request DesiredRequest) (RequestReceipt, error) {
+	outcome := "rejected"
+	if r != nil && r.metrics != nil {
+		start := time.Now()
+		defer func() { r.metrics.observe(outcome, time.Since(start)) }()
+	}
 	if ctx == nil {
 		return RequestReceipt{}, ErrInvalidInput
 	}
@@ -111,6 +132,7 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 		if err = tx.Commit(ctx); err != nil {
 			return RequestReceipt{}, controlCommitError(err)
 		}
+		outcome = "replay"
 		return response, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -201,6 +223,17 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return RequestReceipt{}, controlCommitError(err)
+	}
+	committedAt := time.Now()
+	outcome = "accepted"
+	if unchanged {
+		outcome = "noop"
+	}
+	if !unchanged && r.timeline != nil {
+		r.timeline.RegisterCommitted(ctx, *response.CommandID, committedAt)
+	}
+	if !unchanged && r.notify != nil {
+		r.notify()
 	}
 	return response, nil
 }

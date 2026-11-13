@@ -1,9 +1,9 @@
 # MQTT Application Protocol v1
 
 > Stage 3 uplink contract finalized on 2026-10-15 (Task 3.0). These are
-> requirements for subsequent implementation, not evidence that telemetry
-> ingestion, Twin writes or application ACKs already run. Downlink/status
-> sections remain separate contracts outside this task.
+> protocol contracts, not by themselves evidence of runtime behavior. Downlink
+> payload/endpoint rules below remain unchanged; for current Stage 5/P6 runtime
+> evidence see the [P6 Local MVP report](../backend/paper-p6-dispatch-and-mixed-load.md).
 
 ## Identity and topics
 
@@ -205,14 +205,36 @@ current observation, reported state becomes value 25.3 / sequence 12503 at
 
 ## Downlink commands
 
-> **Historical draft — not an implemented downlink contract.** This section
-> and “Command execution results” below retain the old Gateway-target /
-> `sampling_interval_seconds` examples for provenance only. Stage 5 targets
-> provisioned **Sensor** URNs, uses integer `sample_interval_us` and string
-> versions, and separates confirmed configuration from telemetry observations.
-> The [Task 5.0 contract](../backend/stage-5-task-5.0-baseline-and-contract.md)
-> supersedes these draft examples for subsequent implementation. Task 5.0 does
-> not implement or verify command publication, application or result ingress.
+### Dispatcher operation (P6; no payload or endpoint change)
+
+The backend may be configured to wake its existing dispatcher after a confirmed
+command-admission commit. This is an internal hint, not an MQTT client behavior
+or a change to the command contract:
+
+- `STAGE5_WAKEUP_ENABLED` is read from the backend process environment and is
+  mapped by Compose; its default is `false`. With it off, startup and periodic
+  polling continue as before. With it on, a bounded/coalescing notification
+  prompts discovery sooner, while startup and periodic scans remain recovery
+  paths for missed hints and process restarts.
+- `STAGE5_PUBLISH_QUEUE_CAPACITY` defaults to `32` (accepted range 1–4096).
+  `STAGE5_SCAN_BATCH` independently defaults to `32` (range 1–1024), and
+  `STAGE5_PUBLISH_WORKERS` defaults to `1` (range 1–16). The P6 tested profile
+  is therefore scan batch 32, pending-job queue 32, and one publisher worker;
+  it was not capacity-tuned. A full in-memory publish queue leaves the durable
+  outbox intent pending for a later scan; queue-full is not successful
+  publication. Worker-local jobs are bounded by worker count and payload size
+  is capped by the configured Stage 5 8 KiB limit. The separate result queue
+  defaults to 128 (range 1–4096), with result workers defaulting to 2
+  (range 1–16).
+- Status meanings do not change: `pending` is committed intent,
+  `published` means broker PUBACK only (not execution), and `succeeded` requires
+  a valid result accepted by the backend result transaction. Stable command
+  bytes and normal TTL/terminal-state checks remain in force.
+- Set `STAGE5_WAKEUP_ENABLED=false` to return to polling-only dispatch. This is
+  not a rollback of schema migration 24. Deployment defaults for Stage 5 and
+  wake-up remain disabled; check the P6 report and operations runbook before
+  any isolated fixture exercise. Clients must not publish commands directly
+  to MQTT, and this note does not broaden authorization or ACL scope.
 
 Commands originate from authorized user requests through the backend and are
 dispatched via the transactional outbox to:
@@ -221,37 +243,39 @@ dispatched via the transactional outbox to:
 gateways/<gateway_id>/commands/<command_id>
 ```
 
-Illustrative payload:
+Illustrative payload (P3 Sensor configuration control):
 
 ```json
 {
   "protocol_version": 1,
   "message_type": "command",
   "command_id": "0195e18c-9fc1-7a42-9064-69ea49e63bf3",
-  "entity_id": "urn:ngsi-ld:Gateway:gateway_001",
+  "gateway_id": "gateway_001",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
   "action": "update_configuration",
   "parameters": {
-    "sampling_interval_seconds": 5
+    "sample_interval_us": 10000000
   },
-  "desired_version": 12,
-  "issued_at": "2026-09-16T08:31:00Z",
-  "expires_at": "2026-09-16T08:32:00Z"
+  "desired_version": "3",
+  "issued_at": "2026-10-25T08:00:00.000000Z",
+  "expires_at": "2026-10-25T08:01:00.000000Z"
 }
 ```
 
 Rules:
-- `command_id` is a UUIDv4/UUIDv7 uniquely identifying the command instance.
-- The Gateway must verify `expires_at`; expired commands must be rejected with
-  status `failed` and error code `COMMAND_EXPIRED`.
-- The Gateway stores recently processed `command_id` values in its durable outbox/cache.
-  If a duplicate command arrives due to MQTT at-least-once delivery, the Gateway
-  re-publishes the cached result instead of executing the physical action twice.
+- QoS 1, retain=false. Commands are strictly directed to provisioned `Sensor` entities.
+- `command_id` is a UUID uniquely identifying the command instance.
+- `desired_version` is a non-negative string-encoded BIGINT.
+- `sample_interval_us` is an integer between 10.000 and 2^53 (9007199254740992).
+- The Gateway must verify `expires_at` and `desired_version`; expired commands are rejected
+  with status `failed` and error code `COMMAND_EXPIRED`. Commands with `desired_version <= current`
+  are rejected with `STALE_DESIRED_VERSION`.
+- The Gateway stores recently processed command receipts and results durably in SQLite.
+  Duplicate command delivery with the same ID and content returns the cached execution result
+  without re-executing or resetting sampling timers. Same ID with different payload is rejected
+  as an identity conflict.
 
 ## Command execution results
-
-> **Historical draft**, with the same limitations and replacement reference as
-> the preceding downlink section; the following transaction is not a runtime
-> capability claim.
 
 After executing a command, the Gateway publishes the execution result to:
 
@@ -267,20 +291,27 @@ Illustrative payload:
   "message_type": "command_result",
   "command_id": "0195e18c-9fc1-7a42-9064-69ea49e63bf3",
   "gateway_id": "gateway_001",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "desired_version": "3",
   "status": "succeeded",
   "reported_state": {
-    "sampling_interval_seconds": 5
+    "sample_interval_us": 10000000
   },
-  "completed_at": "2026-09-16T08:31:03Z"
+  "completed_at": "2026-10-25T08:00:00.250000Z"
 }
 ```
 
 Rules:
+- QoS 1, retain=false.
 - `status` must be either `succeeded` or `failed`.
-- When `status` is `failed`, `error_code` and a safe `error_message` should be provided.
-- `reported_state` contains the confirmed physical state following execution.
-- The backend reconciles the command status in `twin_commands` and updates `reported_state`
-  in `twin_states` in a single database transaction.
+- When `status` is `failed`, `error_code` from an allowlist (`COMMAND_EXPIRED`, `STALE_DESIRED_VERSION`,
+  `UNKNOWN_SENSOR`, `UNSUPPORTED_CONFIGURATION`, `APPLY_FAILED`) and a safe `error_message` are provided.
+- `reported_state` contains confirmed configuration following apply and readback; it is omitted on failure.
+- The backend correlates the result with the active intent and commits status and `reported.configuration`
+  atomically. Terminal states cannot regress, and late results after timeout are stored as immutable
+  late evidence without overwriting newer configuration.
+- Broker PUBACK does not prove backend database acceptance. Gateway resends unacknowledged cached results
+  periodically with bounded exponential backoff until the command window expires.
 
 ## Gateway status and heartbeat
 

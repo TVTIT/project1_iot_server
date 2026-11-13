@@ -1,6 +1,7 @@
 """Focused fixture security and compatibility contracts (no Docker)."""
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -9,6 +10,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class HarnessSecurity(unittest.TestCase):
+    def test_current_stage2_runner_passes_latest_terminal_to_all_verifiers(self):
+        terminal = max(int(path.name[:6]) for path in (ROOT / 'migrations').glob('*.up.sql'))
+        source = (ROOT / 'scripts/test-stage2-migrations.sh').read_text()
+        pins = [int(value) for value in re.findall(r'-v expected_schema_terminal=(\d+)', source)]
+        self.assertEqual(pins, [terminal] * 3)
+
+    def test_migration23_verifier_defaults_to_history_but_checks_requested_terminal(self):
+        source = (ROOT / 'scripts/sql/verify-migration-000023.sql').read_text()
+        self.assertIn(r'\if :{?expected_schema_terminal}', source)
+        self.assertIn(r'\set expected_schema_terminal 23', source)
+        self.assertIn('max(version) = :expected_schema_terminal', source)
+        self.assertIn(r'\if :terminal_verified', source)
+        self.assertIn('unexpected terminal schema', source)
+        self.assertIn("version=23 AND name='sensor_control_intent'", source)
+        self.assertNotRegex(source, r'version\s*>\s*23')
+
     def test_credentials_are_random_and_not_argument_values(self):
         text = (ROOT / 'scripts/test-stage2-migrations.sh').read_text()
         self.assertIn('secrets.token_hex(32)', text)
@@ -75,7 +92,15 @@ class CompatFixture(unittest.TestCase):
             self.assertGreater(run.call_args.kwargs['timeout'], 0)
 
     def test_exact_coverage_and_order(self):
-        with patch.object(self.f, 'sql', return_value='') as sql, \
+        migration24 = (ROOT / 'migrations/000024_telemetry_ledger_timestamp.up.sql').read_text()
+        seen_migration24 = False
+        def sql_stub(query, **kwargs):
+            nonlocal seen_migration24
+            if query == migration24 and not seen_migration24:
+                seen_migration24 = True
+                raise self.m.Failure('ERROR: Migration 24 conflicting telemetry provenance')
+            return ''
+        with patch.object(self.f, 'sql', side_effect=sql_stub) as sql, \
              patch.object(self.f, 'expect') as expect, patch.object(self.f, 'login') as login:
             self.f.verify()
         inputs = [call.args[0] for call in sql.call_args_list]
@@ -95,6 +120,80 @@ class CompatFixture(unittest.TestCase):
         self.assertEqual(inputs.count(migration23), 2)
         self.assertIn((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(), inputs)
         self.assertIn("DELETE FROM public.user_gateways WHERE false;", inputs)
+        terminal = max(int(path.name[:6]) for path in (ROOT / 'migrations').glob('*.up.sql'))
+        for version in (21, 22, 23):
+            verifier = next((ROOT / 'scripts/sql').glob(f'verify-migration-{version:06d}.sql')).read_text()
+            calls = [call for call in sql.call_args_list if call.args[0] == verifier]
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].kwargs.get('expected_schema_terminal'), terminal)
+
+    def test_sql_passes_explicit_terminal_to_psql(self):
+        with patch.object(self.f, 'command', return_value='verified') as command:
+            self.assertEqual(self.f.sql('SELECT 1;', expected_schema_terminal=26), 'verified')
+        args, kwargs = command.call_args
+        self.assertIn('expected_schema_terminal=26', args[0])
+        self.assertEqual(kwargs['input'], 'SELECT 1;\n')
+
+    def test_migration24_fixture_covers_rollback_backfill_and_reapply(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        compose = (ROOT / 'docker-compose.yml').read_text()
+        self.assertIn("migration24 = (ROOT / 'migrations/000024_telemetry_ledger_timestamp.up.sql').read_text()", source)
+        self.assertIn("self.sql(migration24)\n        self.sql(migration24)", source)
+        self.assertIn("conflicting telemetry provenance", source)
+        self.assertIn("telemetry_ledger_timestamp", source)
+        self.assertIn("000024_telemetry_ledger_timestamp.up.sql", compose)
+        self.assertIn("000025_drop_telemetry_sensor_fk.up.sql", compose)
+        self.assertLess(compose.index('000023_sensor_control_intent.up.sql'),
+                        compose.index('000024_telemetry_ledger_timestamp.up.sql'))
+        self.assertLess(compose.index('000024_telemetry_ledger_timestamp.up.sql'),
+                        compose.index('000025_drop_telemetry_sensor_fk.up.sql'))
+
+    def test_migration26_fixture_covers_redundant_index_removal(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        compose = (ROOT / 'docker-compose.yml').read_text()
+        self.assertIn("migration26 = (ROOT / 'migrations/000026_drop_telemetry_redundant_indexes.up.sql').read_text()", source)
+        self.assertIn("self.sql(migration26)", source)
+        self.assertIn("drop_telemetry_redundant_indexes", source)
+        self.assertIn("000026_drop_telemetry_redundant_indexes.up.sql", compose)
+        self.assertLess(compose.index('000025_drop_telemetry_sensor_fk.up.sql'),
+                        compose.index('000026_drop_telemetry_redundant_indexes.up.sql'))
+
+
+    def test_stage3_writer_fixtures_apply_post_auth_schema24_before_writer(self):
+        source = (ROOT / 'scripts/tests/stage3_persistence_runner.py').read_text()
+        helper = source[source.index('def apply_post_auth_compatibility'):source.index('def run_normal_fixture')]
+        self.assertIn("fixture.sql(b\"CREATE SCHEMA IF NOT EXISTS auth", helper)
+        for version, name in ((21, 'admin_user_management'), (22, 'gateway_membership_revocation'),
+                              (23, 'sensor_control_intent'), (24, 'telemetry_ledger_timestamp'),
+                              (25, 'drop_telemetry_sensor_fk'), (26, 'drop_telemetry_redundant_indexes')):
+            self.assertIn(f"({version}, '{name}')", helper)
+        self.assertIn("expected = (b'21:admin_user_management'", helper)
+        for fixture in ('run_normal_fixture', 'run_group_fixture'):
+            body = source[source.index(f'def {fixture}'):]
+            self.assertLess(body.index('apply_post_auth_compatibility(fixture)'), body.index('run_go_integration('))
+
+    def test_native_writer_cases_assert_schema24_timestamp(self):
+        source = (ROOT / 'src/internal/telemetry/postgres_integration_test.go').read_text()
+        self.assertIn('sample_count=100 AND timestamp=$4', source)
+        self.assertIn('sample_count,timestamp)::text FROM processed_messages', source)
+
+    def test_stage4_live_telemetry_writer_fixture_uses_schema24(self):
+        runner = (ROOT / 'scripts/tests/stage4_api_runner.py').read_text()
+        scenario = (ROOT / 'scripts/tests/stage4_vertical_scenario.py').read_text()
+        self.assertIn('TERMINAL_SCHEMA_VERSION = 26', runner)
+        self.assertIn('run_existing_migration_runner(fixture, TERMINAL_SCHEMA_VERSION)', runner)
+        self.assertIn("producer.publish_qos1(cap_topic, cap_payload)", scenario)
+
+    def test_stage3_live_writer_fixture_upgrades_to_schema24(self):
+        for filename, seed_call in (
+                ('stage3_mqtt_ingress_runner.py', 'seed_graph(fixture)'),
+                ('stage3_workload_runner.py', 'seed_graph(fixture,'),
+                ('stage3_uplink_runner.py', 'seed_graph(fixture,')):
+            source = (ROOT / 'scripts/tests' / filename).read_text()
+            self.assertIn('apply_post_auth_compatibility', source, filename)
+            fixture_start = source.index("run_existing_migration_runner(fixture, 20)")
+            self.assertLess(source.index('apply_post_auth_compatibility(fixture)', fixture_start),
+                            source.index(seed_call, fixture_start), filename)
 
     def test_login_secret_only_protected_stdin(self):
         with patch.object(self.f, 'command', return_value='supabase_auth_admin') as command:

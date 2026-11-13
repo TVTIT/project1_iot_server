@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "status": "PLANNED_INPUT_NOT_MEASURED",
+  "scope": "P8.0 workload and measurement contract only; no runtime/tooling acceptance",
+  "source_lock": {
+    "observed_at": "2026-10-28",
+    "branch": "feat/paper-requirement",
+    "revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+    "working_tree": "clean at P8.0 inspection; this manifest is a subsequent documentation change",
+    "source_terminal_migration": 24,
+    "database_schema": "unverified; source migration level does not establish actual fixture/shared DB state",
+    "deployment_defaults_false": [
+      "WEBSOCKET_ENABLED",
+      "STAGE5_ENABLED",
+      "STAGE5_WAKEUP_ENABLED",
+      "MQTT_SHAPER_ENABLED",
+      "MQTT_MICROBATCH_ENABLED",
+      "MQTT_RAM_DEDUP_ENABLED"
+    ],
+    "fingerprint_policy": {
+      "source": "record full git revision and SHA-256 of dirty-source material (status, diff, sorted untracked path/content); clean source records revision and clean status",
+      "images": "record immutable image reference and inspected image ID for every service; tags alone are not fingerprints",
+      "missing": "use null plus a qualification reason; never synthesize a hash or merge unlike source/image qualifications"
+    },
+    "historical_gates_not_reexecuted": [
+      "P7 full Python discovery: 3 failures and 4 errors, historically classified as environment/trusted-ancestor issues; not rerun for P7.11",
+      "P7 full/remote CI, HIL/AM5728, P8 capacity/soak and live rollout: NOT RUN",
+      "P7 native raw lanes retain full_p7_accepted=false; the aggregate source-qualified status is not a full acceptance"
+    ]
+  },
+  "topology": {
+    "machine_a": "one active backend with fixture DB, broker, Auth and Nginx; privileged collectors remain on A",
+    "machine_b": "Python coordinator and bounded Go load generators; only role-scoped client credentials, no DB/admin/Docker access",
+    "pilot_colocation_allowed": true,
+    "colocation_field_required": "generator_colocated",
+    "colocated_result_qualification": "tool/path pilot only, not split-machine capacity evidence",
+    "remote_pilot_without_machine_b": "NOT RUN"
+  },
+  "measurement": {
+    "sample_profiles": [100, 1],
+    "sample_profile_note": "1 sample/message is a distinct raw telemetry workload, not FFT/min-max/avg or downsampling",
+    "clocks": {
+      "server": "process-local monotonic durations for queues, persistence, confirmed-commit-to-write and command stages",
+      "generator": "same-process monotonic origin for publish-to-application-ACK and publish-to-WS-receive round trips",
+      "cross_machine_one_way": "unavailable unless clock synchronization method and error bound are measured and reported",
+      "sensor_measured_at": "payload measurement time only; never use as commit/latency clock"
+    },
+    "missing_data": "null/unavailable with reason for absent origin, process reset, missing scrape or incomparable instance; never replace missing values with zero",
+    "resource_sampling_seconds": 5,
+    "accounting": [
+      "offered_unique_messages",
+      "scheduled_messages",
+      "actual_publish_attempts_and_retries",
+      "broker_pubacks",
+      "backend_observed_admitted_rejected",
+      "new_committed_messages_and_duplicate_commits",
+      "raw_samples_committed",
+      "application_acks_published_received_and_outbox_deletions",
+      "websocket_expected_received_duplicate_unexpected_and_missing_deliveries",
+      "pending_messages_bytes_and_drain_remaining"
+    ],
+    "accounting_notes": [
+      "Do not equate a publish attempt or backend Admit observation with broker wire packets.",
+      "Retries do not increase unique-offered count; duplicate commit does not increase new raw samples.",
+      "Raw rows are messages multiplied by their sample profile only when that message commits as new.",
+      "Payload byte counts are not TCP/TLS/broker wire bytes; shaper is downstream of broker/Paho ingress."
+    ],
+    "artifact_convention": "planned runner output: run.json, metrics.csv, resources.csv plus workload results; fixed allowlisted metadata and long-form metric/bucket rows, no per-message payload capture"
+  },
+  "proposed_limits": {
+    "qualification": "proposed finite guardrails for future fixture runs; not implemented, effective, measured, or deployment settings",
+    "pilot": {
+      "wall_deadline_seconds": 1800,
+      "backend_cpu_cores": 2,
+      "backend_memory_bytes": 4294967296,
+      "fixture_disk_growth_bytes": 2147483648,
+      "pending_messages": 10000,
+      "pending_payload_bytes": 67108864,
+      "drain_deadline_seconds": 120,
+      "cooldown_seconds": 30,
+      "resource_sample_seconds": 5
+    },
+    "official_opt_in_per_run": {
+      "wall_deadline_seconds": 7200,
+      "backend_cpu_cores": 2,
+      "backend_memory_bytes": 4294967296,
+      "fixture_disk_growth_bytes": 10737418240,
+      "pending_messages": 100000,
+      "pending_payload_bytes": 536870912,
+      "drain_deadline_seconds": 600,
+      "cooldown_seconds": 60,
+      "resource_sample_seconds": 5,
+      "explicit_opt_in_required": true
+    },
+    "stop_on_first": [
+      "wall deadline reached",
+      "fixture disk growth bound reached",
+      "pending message or byte bound reached",
+      "required collector/source/process identity becomes unavailable",
+      "auth/TLS/membership failure or unexpected namespace delivery",
+      "operator interrupt"
+    ],
+    "abort_semantics": "stop creating new work first; signal owned generators idempotently; bounded drain only within the declared drain budget; join children and collect safe artifacts; retain original and cleanup errors separately; preserve pending/outbox state and report PARTIAL/FAILED with remaining counts; never clear pending or relabel an incomplete run PASS"
+  },
+  "phases": {
+    "ordinary_pilot": {"warmup_seconds": 30, "measure_seconds": 120, "stop_generation_before_drain": true, "drain_seconds_max": 120, "cooldown_seconds": 30},
+    "e1_handshake_ramp": {"warmup_seconds": 0, "measure_seconds": 120, "drain_seconds_max": 120, "cooldown_seconds": 30, "bootstrap_and_subscribe_in_measurement": false},
+    "notes": "Durations are proposed; provisioning, login, build and image pull are outside measured windows. Stop producers before drain. Only the E1 connection-ramp lane includes handshake ramp in its named measurement."
+  },
+  "experiments": {
+    "E1": {
+      "pilot": {"viewers": 64, "namespaces_min": 2, "subscription_shapes": ["sparse", "dense", "overlap"], "include_cap_plus_one_denial": true, "include_revoke_and_slow_viewer": true, "passes_recheck_cycles": 2},
+      "official_opt_in": {"viewer_rungs": [32, 64, 128, 512, 1000, 2000, 5000, 10000], "subscription_shapes": ["sparse", "dense", "overlap"], "slow_viewer_separate_case": true},
+      "measure": ["connected", "subscribed", "active_recipients", "expected_received_duplicate_unexpected_missing_deliveries", "close_drop_lag", "recheck", "resources_a_b"]
+    },
+    "E2": {
+      "pilot": {"gateways": 2, "sensors_per_gateway": 2, "unique_messages_per_sample_profile": 20, "sample_profiles": [100, 1], "traffic_phases": ["steady", "finite_burst", "bounded_drain"]},
+      "official_opt_in": {"offered_message_rates_per_second": [100, 200, 500, 1000, 2000, 5000, 8000, 10000, 15000, 20000], "sample_profiles": [100, 1], "rate_and_duration_caps_required": true},
+      "measure": ["actual_offered", "admitted", "new_committed", "raw_samples", "stage_latency", "ack", "queue_pending", "tx_copy_rows", "resources_a_b"]
+    },
+    "E3": {
+      "pilot": {"fresh_commands": 4, "sensors_min": 2, "background_phases": ["steady", "finite_burst"], "arms": ["polling", "wakeup"]},
+      "official_opt_in": {"commands_per_arm": 30, "arms": ["polling", "wakeup"], "frequency_hz_includes_below_one": true},
+      "measure": ["accepted_succeeded_failed_timeout_reject_noop_replay", "configuration_receipt", "dispatch_e2e_origin_or_missing", "telemetry_overlap_and_backlog"]
+    },
+    "E4": {
+      "pilot": {"unique_messages": 20, "replay_messages": 10, "ack_ignore_with_retry": 1, "include_warm_cold_reopen_and_conflict": true},
+      "official_opt_in": {"unique_messages": 1000, "replay_fraction": 0.1, "include_real_600_second_ttl_case": true},
+      "measure": ["exact_retry_identity_bytes", "ledger_raw_temporal_and_state_deltas", "valid_ack_outbox", "cache_and_repository_counters", "tx_copy_new_rows", "gamma_red_by_named_denominator"],
+      "ttl_pilot": "real-time 600-second expiry NOT RUN unless actually performed; do not add a shortened production TTL"
+    },
+    "E5": {
+      "pilot": {"reference_and_ablation_arms": ["shaper_off", "microbatch_off", "ram_dedup_off", "polling", "fanout_scan"], "reuse_compatible_E1_E4_artifacts": true},
+      "official_opt_in": {"independent_repeats": 3, "run_order_seeded": true, "arms_change_one_mechanism": true},
+      "measure": ["effective_flags", "input_counts", "mechanism_activation", "latency_throughput", "db_operations", "resources_drops_backlog", "per_run_then_median_range"]
+    }
+  },
+  "comparison_invariants": [
+    "Within a comparison, use the same source/binary, image identity, security, quota, payload, durability, topology, worker/pool policy and phase schedule except the explicitly named factor.",
+    "Run one backend active at a time; reset/restart only the owned fixture with recorded state qualification.",
+    "Keep baseline mechanisms honest: per-message persistence is still COPY per message; retain auth, ACL, commit-before-ACK and control isolation.",
+    "Do not call pilot capacity acceptance, infer 10000-viewer/20000-message-per-second/62.5-ms claims, or combine historical runs into a new measured pair."
+  ]
+}

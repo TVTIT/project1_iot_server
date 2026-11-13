@@ -31,7 +31,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/tests'))
 
 from task28_simplified_schema_runner import DatabaseFixture, ENV, sanitize_output  # noqa: E402
-from stage3_persistence_runner import bootstrap_to_9, run_existing_migration_runner  # noqa: E402
+from stage3_persistence_runner import (  # noqa: E402
+    apply_post_auth_compatibility, bootstrap_to_9, run_existing_migration_runner,
+)
 from stage3_mqtt_ingress_runner import (  # noqa: E402
     SIM_PROFILE, MOSQUITTO_IMAGE,
     run, docker, container_logs, docker_create, container_absent, remove_container,
@@ -41,7 +43,7 @@ from stage3_mqtt_ingress_runner import (  # noqa: E402
 )
 from task26_harness_helpers import RESPONSE  # noqa: E402
 from stage3_uplink_runner import (  # noqa: E402
-    ResourceRegistry, build_image, start_backend,
+    ResourceRegistry, build_owned_image, cleanup_owned_images, start_backend,
     parse_ingress_summary, sanitize, ensure_budget,
     SHARED_SENSOR_ID, SENSOR_UNIT,
     SIM_BROKER_HOST_IN_CONTAINER, SIM_BROKER_PORT,
@@ -842,6 +844,8 @@ def run_workload_orchestrator(backend_image: str, gateway_image: str, output_sum
         # Baseline migrations through 20
         bootstrap_to_9(fixture)
         run_existing_migration_runner(fixture, 20)
+        # This workload runs the current timestamp-aware telemetry writer.
+        apply_post_auth_compatibility(fixture)
 
         spec = GatewaySpec(
             gateway_id=WORKLOAD_GATEWAY_ID,
@@ -1216,15 +1220,16 @@ def main(argv=None) -> int:
         return 0
 
     suite_registry = ResourceRegistry()
+    owned_images = {}
     suite_hexid = secrets.token_hex(6)
     try:
         print('stage=build-images', flush=True)
         backend_tag = f'stage3-workload-backend-{suite_hexid}'
         gateway_tag = f'stage3-workload-gateway-{suite_hexid}'
-        backend_image = build_image('backend', backend_tag)
-        suite_registry.register('backend image', 'image', backend_image)
-        gateway_image = build_image('gateway', gateway_tag)
-        suite_registry.register('gateway image', 'image', gateway_image)
+        backend_image = build_owned_image('backend', backend_tag, owned_images)
+        suite_registry.register('backend image tag', 'image', backend_tag)
+        gateway_image = build_owned_image('gateway', gateway_tag, owned_images)
+        suite_registry.register('gateway image tag', 'image', gateway_tag)
         print(f'PASS: built backend image {backend_image} and gateway image {gateway_image}', flush=True)
 
         print('=== Running 600-batch 100 Hz workload ===', flush=True)
@@ -1232,11 +1237,11 @@ def main(argv=None) -> int:
         print('PASS: stage3 workload (600 batches verified)', flush=True)
         return 0
     finally:
-        for img in [ident for (_, kind, ident) in suite_registry.items if kind == 'image']:
-            try:
-                docker(['image', 'rm', '-f', img], timeout=30)
-            except Exception:
-                pass
+        cleanup_errors = cleanup_owned_images(owned_images)
+        remaining = suite_registry.still_present(absent)
+        if cleanup_errors or remaining:
+            raise RuntimeError('suite image cleanup incomplete: ' + '; '.join(cleanup_errors + remaining))
+        print('Suite image tag cleanup verified', flush=True)
 
 
 if __name__ == '__main__':

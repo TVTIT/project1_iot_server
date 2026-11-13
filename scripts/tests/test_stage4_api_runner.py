@@ -49,7 +49,7 @@ class SchemaEvidenceTests(unittest.TestCase):
 
     def test_schema_skip_or_history_drift_is_rejected(self):
         expected = R.expected_stage4_schema_history()
-        for history in (expected[:-1], expected + ['23:unexpected'],
+        for history in (expected[:-1], expected + ['24:unexpected'],
                         [row.replace('gateway_membership_revocation', 'wrong') for row in expected]):
             fixture = MagicMock()
             fixture.sql.return_value = (0, ('STAGE4_SCHEMA=' + json.dumps(history) + '\n').encode())
@@ -59,7 +59,7 @@ class SchemaEvidenceTests(unittest.TestCase):
     def test_schema_is_read_from_database(self):
         fixture = MagicMock()
         fixture.sql.return_value = (0, ('STAGE4_SCHEMA=' + json.dumps(R.expected_stage4_schema_history()) + '\n').encode())
-        self.assertEqual(R.verify_terminal_schema(fixture), 23)
+        self.assertEqual(R.verify_terminal_schema(fixture), R.TERMINAL_SCHEMA_VERSION)
         self.assertIn(b'schema_migrations', fixture.sql.call_args.args[0])
 
     def test_schema_read_errors_cannot_claim_success(self):
@@ -71,11 +71,11 @@ class SchemaEvidenceTests(unittest.TestCase):
 
     def test_scenario_result_uses_verified_fixture_metadata(self):
         ctx, cleanup = MagicMock(), MagicMock()
-        ctx.metadata = {'terminal_schema': 23}
+        ctx.metadata = {'terminal_schema': 24}
         with patch.object(R, 'create_stage4_fixture', return_value=(ctx, cleanup)), \
              patch.object(R, 'run_scenario', return_value={'status': 'PASS'}):
             result = R.run_single_scenario_fixture('contract', 'backend', 'gateway')
-        self.assertEqual(result['_verified_schema'], 23)
+        self.assertEqual(result['_verified_schema'], 24)
         cleanup.assert_called_once()
 
 

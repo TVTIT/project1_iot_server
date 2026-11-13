@@ -28,13 +28,14 @@ import (
 )
 
 type controlHTTPFixture struct {
-	t            *testing.T
-	ctx          context.Context
-	admin, app   *pgxpool.Pool
-	server       *httptest.Server
-	gateway, urn string
-	actors       map[string]uuid.UUID
-	tokens       map[string]string
+	t             *testing.T
+	ctx           context.Context
+	admin, app    *pgxpool.Pool
+	server        *httptest.Server
+	gateway, urn  string
+	actors        map[string]uuid.UUID
+	tokens        map[string]string
+	notifications int
 }
 
 func newControlHTTPFixture(t *testing.T) *controlHTTPFixture {
@@ -90,9 +91,11 @@ func newControlHTTPFixture(t *testing.T) *controlHTTPFixture {
 		t.Fatal(err)
 	}
 	cfg := validTestConfig()
+	cfg.MetricsEnabled = false
 	cfg.Stage5 = config.Stage5Config{Enabled: true, Control: digitaltwin.DefaultControlConfig()}
+	cfg.Stage5.Dispatch.WakeupEnabled = true
 	deps := controlHTTPDependencies(t, cfg, f.app, verifier)
-	if err = populateStage5Dependencies(&deps, cfg, f.app); err != nil {
+	if err = populateStage5Dependencies(&deps, cfg, f.app, func() { f.notifications++ }); err != nil {
 		t.Fatal(err)
 	}
 	handler, err := httpserver.NewRouter(deps)
@@ -241,6 +244,9 @@ func TestNativeControlHTTPIntentAndScope(t *testing.T) {
 	}
 	f.exec(`UPDATE twin_states SET reported_state='{"value":42,"sample_interval_us":10000}',reported_version=4 WHERE entity_id=(SELECT id FROM twin_entities WHERE entity_id=$1)`, f.urn)
 	h, original := f.request("PATCH", path+"/desired-state", "owner", "first", body, nil, 202)
+	if f.notifications != 1 {
+		t.Fatalf("confirmed HTTP intent notifications=%d", f.notifications)
+	}
 	var receipt struct {
 		CommandID, StatusURL, Status, DesiredVersion string
 		SampleIntervalUS                             int64
@@ -297,6 +303,9 @@ func TestNativeControlHTTPIntentAndScope(t *testing.T) {
 	_, replayed := f.request("PATCH", path+"/desired-state", "owner", "first", `{"frequency_hz":1e-1,"expected_desired_version":"0"}`, nil, 202)
 	if !bytes.Equal(original, replayed) {
 		t.Fatalf("replay regenerated %s vs %s", original, replayed)
+	}
+	if f.notifications != 2 {
+		t.Fatalf("second intent plus replay should notify once, got %d", f.notifications)
 	}
 	f.exec(`DELETE FROM user_gateways WHERE user_id=$1 AND gateway_id=$2`, f.actors["owner"], f.gateway)
 	f.request("PATCH", path+"/desired-state", "owner", "first", body, nil, 404)

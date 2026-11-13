@@ -1,4 +1,5 @@
-FROM golang:1.27.1-alpine AS builder
+# Reruns use the patched toolchain; historical spike results retain their original version.
+FROM golang:1.27.3-alpine AS builder
 WORKDIR /spike
 COPY go.mod go.sum ./
 RUN go mod download

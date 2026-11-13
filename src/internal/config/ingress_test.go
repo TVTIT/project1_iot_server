@@ -405,6 +405,190 @@ func TestIngressOperationalDefaults(t *testing.T) {
 	}
 }
 
+func TestIngressMicrobatchConfiguration(t *testing.T) {
+	t.Run("defaults off with finite caps", func(t *testing.T) {
+		cfg, err := Load(mapLookup(validConfigValues()))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		got := cfg.Ingress
+		if got.MicrobatchEnabled || got.MicrobatchMaxMessages != 64 || got.MicrobatchMaxRows != 6400 ||
+			got.MicrobatchMaxPayloadBytes != 4<<20 || got.MicrobatchMaxWait != time.Second {
+			t.Fatalf("microbatch defaults: enabled=%v messages=%d rows=%d bytes=%d wait=%s",
+				got.MicrobatchEnabled, got.MicrobatchMaxMessages, got.MicrobatchMaxRows,
+				got.MicrobatchMaxPayloadBytes, got.MicrobatchMaxWait)
+		}
+	})
+	t.Run("independent opt in", func(t *testing.T) {
+		values := validConfigValues()
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		cfg, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.Ingress.MicrobatchEnabled || cfg.Ingress.Enabled || cfg.Ingress.ShaperEnabled {
+			t.Fatalf("microbatch must be independent: ingress=%v shaper=%v microbatch=%v", cfg.Ingress.Enabled, cfg.Ingress.ShaperEnabled, cfg.Ingress.MicrobatchEnabled)
+		}
+	})
+}
+
+func TestIngressRAMDedupConfiguration(t *testing.T) {
+	t.Run("defaults off with finite independent caps", func(t *testing.T) {
+		cfg, err := Load(mapLookup(validConfigValues()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := cfg.Ingress
+		if got.RAMDedupEnabled || got.RAMDedupMaxEntries != 100_000 || got.RAMDedupMaxBytes != 64<<20 {
+			t.Fatalf("RAM dedup defaults: enabled=%v entries=%d bytes=%d", got.RAMDedupEnabled, got.RAMDedupMaxEntries, got.RAMDedupMaxBytes)
+		}
+	})
+	t.Run("enabled independently of ingress shaper and microbatch", func(t *testing.T) {
+		values := validConfigValues()
+		values["MQTT_RAM_DEDUP_ENABLED"] = "true"
+		cfg, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Ingress.RAMDedupEnabled || cfg.Ingress.Enabled || cfg.Ingress.ShaperEnabled || cfg.Ingress.MicrobatchEnabled {
+			t.Fatalf("RAM dedup flags are coupled: ingress=%v shaper=%v microbatch=%v cache=%v", cfg.Ingress.Enabled, cfg.Ingress.ShaperEnabled, cfg.Ingress.MicrobatchEnabled, cfg.Ingress.RAMDedupEnabled)
+		}
+	})
+	t.Run("disabled cache does not follow other opt-ins", func(t *testing.T) {
+		values := validConfigValues()
+		values["MQTT_SHAPER_ENABLED"] = "true"
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		values["METRICS_ENABLED"] = "true"
+		cfg, err := Load(mapLookup(values))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Ingress.RAMDedupEnabled || !cfg.Ingress.ShaperEnabled || !cfg.Ingress.MicrobatchEnabled || !cfg.MetricsEnabled {
+			t.Fatalf("RAM dedup must remain independent: cache=%v shaper=%v microbatch=%v metrics=%v", cfg.Ingress.RAMDedupEnabled, cfg.Ingress.ShaperEnabled, cfg.Ingress.MicrobatchEnabled, cfg.MetricsEnabled)
+		}
+	})
+	for _, tt := range []struct{ key, value string }{
+		{"MQTT_RAM_DEDUP_ENABLED", "sometimes"},
+		{"MQTT_RAM_DEDUP_MAX_ENTRIES", "0"}, {"MQTT_RAM_DEDUP_MAX_ENTRIES", "1000001"},
+		{"MQTT_RAM_DEDUP_MAX_BYTES", "0"}, {"MQTT_RAM_DEDUP_MAX_BYTES", "268435457"},
+		{"MQTT_RAM_DEDUP_MAX_BYTES", "9223372036854775808"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			values := validConfigValues()
+			values[tt.key] = tt.value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted invalid %s=%q", tt.key, tt.value)
+			}
+		})
+	}
+}
+
+func TestIngressMicrobatchBoundsUnconditional(t *testing.T) {
+	for _, tt := range []struct{ key, value string }{
+		{"MQTT_MICROBATCH_ENABLED", "sometimes"},
+		{"MQTT_MICROBATCH_MAX_MESSAGES", "0"}, {"MQTT_MICROBATCH_MAX_MESSAGES", "1025"},
+		{"MQTT_MICROBATCH_MAX_ROWS", "0"}, {"MQTT_MICROBATCH_MAX_ROWS", "100001"},
+		{"MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", "0"}, {"MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", "268435457"},
+		{"MQTT_MICROBATCH_MAX_PAYLOAD_BYTES", "9223372036854775808"},
+		{"MQTT_MICROBATCH_MAX_WAIT", "0s"}, {"MQTT_MICROBATCH_MAX_WAIT", "6s"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			values := validConfigValues()
+			values[tt.key] = tt.value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted invalid %s=%q", tt.key, tt.value)
+			}
+		})
+	}
+}
+
+func TestIngressMicrobatchAggregateBounds(t *testing.T) {
+	t.Run("aggregate worker memory bounded", func(t *testing.T) {
+		values := ingressValues()
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		values["MQTT_WORKER_COUNT"] = "8"
+		values["MQTT_MICROBATCH_MAX_MESSAGES"] = "1024"
+		values["MQTT_MICROBATCH_MAX_ROWS"] = "100000"
+		values["MQTT_MICROBATCH_MAX_PAYLOAD_BYTES"] = "268435456"
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatal("accepted aggregate microbatch worker memory above bound")
+		}
+	})
+	t.Run("enabled shutdown includes one shared batch wait", func(t *testing.T) {
+		values := ingressValues()
+		values["MQTT_MICROBATCH_ENABLED"] = "true"
+		values["SHUTDOWN_TIMEOUT"] = "8s"
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatal("accepted shutdown shorter than wait + persistence + publish budget")
+		}
+		values["SHUTDOWN_TIMEOUT"] = "9s"
+		if _, err := Load(mapLookup(values)); err != nil {
+			t.Fatalf("exact shared deadline: %v", err)
+		}
+	})
+}
+
+func TestIngressShaperAndBufferedByteDefaults(t *testing.T) {
+	cfg, err := Load(mapLookup(validConfigValues()))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	got := cfg.Ingress
+	if got.ShaperEnabled || got.ShaperRatePerSecond != 2 || got.ShaperBurst != 4 ||
+		got.ShaperMaxGateways != 4096 || got.ShaperIdleRetention != 10*time.Minute ||
+		got.BufferedPayloadBytes != 16<<20 {
+		t.Fatalf("shaper/buffer defaults: enabled=%v rate=%d burst=%d gateways=%d retention=%s bytes=%d",
+			got.ShaperEnabled, got.ShaperRatePerSecond, got.ShaperBurst, got.ShaperMaxGateways,
+			got.ShaperIdleRetention, got.BufferedPayloadBytes)
+	}
+}
+
+func TestIngressShaperAndBufferedByteBoundsUnconditional(t *testing.T) {
+	tests := []struct{ key, value string }{
+		{"MQTT_SHAPER_ENABLED", "sometimes"},
+		{"MQTT_SHAPER_RATE_PER_SECOND", "0"},
+		{"MQTT_SHAPER_RATE_PER_SECOND", "10001"},
+		{"MQTT_SHAPER_BURST", "-1"},
+		{"MQTT_SHAPER_BURST", "100001"},
+		{"MQTT_SHAPER_MAX_GATEWAYS", "0"},
+		{"MQTT_SHAPER_MAX_GATEWAYS", "100001"},
+		{"MQTT_SHAPER_IDLE_RETENTION", "59s"},
+		{"MQTT_SHAPER_IDLE_RETENTION", "24h1m"},
+		{"MQTT_INGRESS_BUFFERED_BYTES", "65535"},
+		{"MQTT_INGRESS_BUFFERED_BYTES", "268435457"},
+		{"MQTT_INGRESS_BUFFERED_BYTES", "9223372036854775808"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			values := validConfigValues() // ingress and shaper both disabled
+			values[tt.key] = tt.value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted invalid %s=%q while disabled", tt.key, tt.value)
+			}
+		})
+	}
+}
+
+func TestIngressShaperAndBufferedByteConfiguration(t *testing.T) {
+	values := ingressValues()
+	for k, v := range map[string]string{
+		"MQTT_SHAPER_ENABLED": "true", "MQTT_SHAPER_RATE_PER_SECOND": "10000",
+		"MQTT_SHAPER_BURST": "100000", "MQTT_SHAPER_MAX_GATEWAYS": "100000",
+		"MQTT_SHAPER_IDLE_RETENTION": "24h", "MQTT_INGRESS_BUFFERED_BYTES": "268435456",
+	} {
+		values[k] = v
+	}
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Ingress.ShaperEnabled || cfg.Ingress.ShaperRatePerSecond != 10000 ||
+		cfg.Ingress.ShaperBurst != 100000 || cfg.Ingress.ShaperMaxGateways != 100000 ||
+		cfg.Ingress.ShaperIdleRetention != 24*time.Hour || cfg.Ingress.BufferedPayloadBytes != 256<<20 {
+		t.Fatalf("unexpected parsed shaper config: %+v", cfg.Ingress)
+	}
+}
+
 func TestIngressRedaction(t *testing.T) {
 	cfg, err := Load(mapLookup(ingressValues()))
 	if err != nil {

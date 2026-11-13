@@ -139,7 +139,7 @@ class TestCISmokeJobs(unittest.TestCase):
     def test_compose_smoke_job_toolchain_prerequisites(self):
         job = self._extract_job_section("native-compose-smoke")
         # Must check Go, Python, Docker, Compose >= 2.24.4, openssl, setfacl/getfacl
-        self.assertIn("go-version: '1.27.2'", job)
+        self.assertIn("go-version: '1.27.3'", job)
         self.assertIn("setfacl", job)
         self.assertIn("getfacl", job)
         self.assertIn("openssl", job)

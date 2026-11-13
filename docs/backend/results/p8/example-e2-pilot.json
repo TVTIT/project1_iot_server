@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "experiment": "E2",
+  "arm": "reference",
+  "profile": "pilot",
+  "mode": "local",
+  "run_id": "example-e2-pilot",
+  "seed": 842,
+  "roles": ["telemetry"],
+  "samples_per_message": 100,
+  "topology": {"gateways": 2, "sensors_per_gateway": 2, "users": 0, "viewers": 0},
+  "targets": [
+    {"gateway_id": "gw-a", "sensor_id": "sensor-a"},
+    {"gateway_id": "gw-a", "sensor_id": "sensor-aa"},
+    {"gateway_id": "gw-b", "sensor_id": "sensor-b"},
+    {"gateway_id": "gw-b", "sensor_id": "sensor-bb"}
+  ],
+  "subscriptions": [],
+  "traffic": {"rate_per_second": 1, "ramp_seconds": 0, "burst_messages": 5},
+  "phases": {"warmup_seconds": 1, "measure_seconds": 20, "drain_seconds": 10, "cooldown_seconds": 1},
+  "limits": {"retries": 2, "workers": 2, "connections": 4, "pending_messages": 100, "pending_bytes": 1048576, "disk_growth_bytes": 1048576, "wall_seconds": 60},
+  "tls": {"https_endpoint": "https://localhost:18443", "mqtt_tls_endpoint": "mqtts://localhost:18884", "https_ca_file": "bundle/https-ca.pem", "mqtt_tls_ca_file": "bundle/mqtt-ca.pem"},
+  "identity_files": {"telemetry": "bundle/private/telemetry.json"},
+  "gateway_identity_files": {
+    "gw-a": "bundle/private/gateways/gw-a.json",
+    "gw-b": "bundle/private/gateways/gw-b.json"
+  },
+  "bundle_path": "bundle",
+  "durability_mode": "synthetic-load",
+  "retry_interval_ms": 1000,
+  "publish_timeout_ms": 5000
+}

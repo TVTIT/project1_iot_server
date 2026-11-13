@@ -1,12 +1,18 @@
 \set ON_ERROR_STOP on
+\if :{?expected_schema_terminal}
+\else
+\set expected_schema_terminal 23
+\endif
+SELECT max(version) = :expected_schema_terminal AS terminal_verified FROM public.schema_migrations \gset
+\if :terminal_verified
+\else
+DO $$ BEGIN RAISE EXCEPTION 'unexpected terminal schema'; END $$;
+\endif
 DO $$
 DECLARE role_name text; table_name text;
 BEGIN
     IF NOT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=23 AND name='sensor_control_intent') THEN
         RAISE EXCEPTION 'Migration 23 exact terminal is missing';
-    END IF;
-    IF EXISTS(SELECT 1 FROM public.schema_migrations WHERE version>23) THEN
-        RAISE EXCEPTION 'Unexpected future schema terminal';
     END IF;
     IF NOT EXISTS(SELECT 1 FROM pg_index WHERE indexrelid='public.uq_twin_commands_active_sensor'::regclass AND indisunique AND indisvalid AND indpred IS NOT NULL)
        OR NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='public.twin_command_requests'::regclass AND contype='p')

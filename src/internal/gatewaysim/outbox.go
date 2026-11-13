@@ -18,10 +18,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// outboxSchemaVersion is the only SQLite schema version this simulator writes.
-// A file with a different version is reported as unsupported instead of being
-// recreated, so an operator must migrate or move it deliberately.
-const outboxSchemaVersion = 1
+// outboxSchemaVersion includes durable Sensor configuration and command receipts.
+// Schema 1 upgrades transactionally; unknown versions are never recreated.
+const outboxSchemaVersion = 2
 
 // Outbox row statuses. Only these two values exist: a pending row can still be
 // published and acknowledged, a quarantined row is retained for inspection but
@@ -212,7 +211,9 @@ func OpenOutboxAdmin(path string, opTimeout time.Duration) (*Outbox, error) {
 		_ = release()
 		return nil, err
 	}
-	if version != outboxSchemaVersion {
+	// Administrative uplink reads/quarantine use the unchanged schema-1 tables.
+	// Never require an operational upgrade just to inspect an old outbox.
+	if version != 1 && version != outboxSchemaVersion {
 		_ = db.Close()
 		_ = release()
 		return nil, fmt.Errorf("%w: file version %d, supported version %d", ErrOutboxSchema, version, outboxSchemaVersion)
@@ -310,6 +311,17 @@ func (o *Outbox) prepare(ctx context.Context) error {
 	switch version {
 	case outboxSchemaVersion:
 		return o.verifyBinding(ctx)
+	case 1:
+		// Check binding before changing an existing file. In particular a wrong
+		// process identity must not upgrade a foreign Sensor's database.
+		gatewayID, sensorID, err := readBinding(ctx, o.db)
+		if err != nil {
+			return err
+		}
+		if gatewayID != o.gatewayID || sensorID != o.sensorID {
+			return ErrOutboxIdentity
+		}
+		return o.upgradeControlSchema(ctx)
 	case 0:
 		var tables int
 		if err := o.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").Scan(&tables); err != nil {
@@ -372,6 +384,9 @@ func (o *Outbox) createSchema(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return err
 		}
+	}
+	if err := createControlTables(ctx, tx); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO outbox_meta (id, gateway_id, sensor_id) VALUES (1, ?, ?)", o.gatewayID, o.sensorID); err != nil {
 		return err

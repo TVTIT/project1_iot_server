@@ -14,11 +14,12 @@ import (
 
 // Stage5Config keeps data traffic separate from bounded ACL inspection credentials.
 type Stage5Config struct {
-	Enabled    bool
-	Control    digitaltwin.ControlConfig
-	Dispatch   mqttcontrol.Config
-	Data       mqttingress.TransportOptions
-	Management mqttcredential.DynSecConfig
+	ResultWorkers int
+	Enabled       bool
+	Control       digitaltwin.ControlConfig
+	Dispatch      mqttcontrol.Config
+	Data          mqttingress.TransportOptions
+	Management    mqttcredential.DynSecConfig
 }
 
 // String redacts data and privileged management credentials.
@@ -30,7 +31,13 @@ func (c Stage5Config) GoString() string { return c.String() }
 func loadStage5(lookup LookupFunc) (Stage5Config, error) {
 	cfg := Stage5Config{Control: digitaltwin.DefaultControlConfig(), Dispatch: mqttcontrol.DefaultConfig()}
 	var err error
+	if cfg.ResultWorkers, err = integer(lookup, "STAGE5_RESULT_WORKERS", 2, 1, 16); err != nil {
+		return cfg, err
+	}
 	if cfg.Enabled, err = boolValue(lookup, "STAGE5_ENABLED", false); err != nil {
+		return cfg, err
+	}
+	if cfg.Dispatch.WakeupEnabled, err = boolValue(lookup, "STAGE5_WAKEUP_ENABLED", false); err != nil {
 		return cfg, err
 	}
 	if cfg.Control.DBTimeout, err = boundedDuration(lookup, "STAGE5_REQUEST_TIMEOUT", cfg.Control.DBTimeout, time.Millisecond, time.Minute); err != nil {
@@ -55,6 +62,7 @@ func loadStage5(lookup LookupFunc) (Stage5Config, error) {
 	}{
 		{"STAGE5_PUBLISH_WORKERS", &cfg.Dispatch.Workers, 1, 1, 16},
 		{"STAGE5_SCAN_BATCH", &cfg.Dispatch.BatchSize, 32, 1, 1024},
+		{"STAGE5_PUBLISH_QUEUE_CAPACITY", &cfg.Dispatch.QueueCapacity, 32, 1, 4096},
 		{"STAGE5_RESULT_QUEUE", &cfg.Dispatch.ResultQueueCapacity, 128, 1, 4096},
 		{"STAGE5_PAYLOAD_BYTES", &cfg.Dispatch.MaxPayloadBytes, 8192, 8192, 8192},
 	} {

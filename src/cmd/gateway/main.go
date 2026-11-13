@@ -63,6 +63,8 @@ run flags:
   --completion-timeout D  time to wait for application ACKs after the target
   --measure               enable bounded ACK latency measurement (requires --batches > 0)
   --measure-capacity N    explicit measurement capacity (defaults to --batches)
+  --ignore-first-valid-acks N  test fault: ignore up to 10 valid pending-row ACKs
+  --stop-after-ignored-ack     cooperatively stop after the first ignored ACK (requires finite --batches and N > 0)
 `
 
 // simTransport is the transport surface the run lifecycle composes. It is the
@@ -96,7 +98,7 @@ func run(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, stdou
 		ctx = context.Background()
 	}
 	if len(args) == 0 {
-		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0)
+		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0, 0, false)
 	}
 	switch args[0] {
 	case "run":
@@ -124,6 +126,8 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 	measure := fs.Bool("measure", false, "record ACK latency and emit measurement summary for finite run (requires --batches > 0)")
 	measureLatency := fs.Bool("measure-latency", false, "alias for --measure")
 	measureCap := fs.Int("measure-capacity", 0, "explicit measurement capacity (defaults to --batches)")
+	ignoreACKs := fs.Int("ignore-first-valid-acks", 0, "test-only: ignore at most 10 valid ACKs for pending rows")
+	stopAfterIgnore := fs.Bool("stop-after-ignored-ack", false, "test-only: stop after the first ignored valid ACK")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -136,6 +140,18 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 	}
 	if *batches < 0 || *batches > maxFiniteBatches {
 		writef(stderr, "--batches must be between 0 and %d\n", maxFiniteBatches)
+		return 2
+	}
+	if *ignoreACKs < 0 || *ignoreACKs > gatewaysim.MaxIgnoredValidACKs {
+		writef(stderr, "--ignore-first-valid-acks must be between 0 and %d\n", gatewaysim.MaxIgnoredValidACKs)
+		return 2
+	}
+	if *ignoreACKs > 0 && *batches == 0 {
+		writeln(stderr, "--ignore-first-valid-acks requires a finite run (--batches > 0)")
+		return 2
+	}
+	if *stopAfterIgnore && (*ignoreACKs == 0 || *batches == 0) {
+		writeln(stderr, "--stop-after-ignored-ack requires --batches > 0 and --ignore-first-valid-acks > 0")
 		return 2
 	}
 	if *completion < minCompletionTimeout || *completion > maxCompletionTimeout {
@@ -167,14 +183,14 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 		return 2
 	}
 
-	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity)
+	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity, *ignoreACKs, *stopAfterIgnore)
 }
 
 // runSimulator composes the outbox, ACK processor, transport and scheduler and
 // runs until the context ends, a finite target completes, or a classified fatal
 // stop occurs. Every resource opened here is closed on every exit path, and
 // SQLite is closed only after the scheduler and ACK worker have stopped.
-func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity int) int {
+func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity, ignoreACKBudget int, stopAfterIgnore bool) int {
 	cfg, err := gatewaysim.Load(lookup)
 	if err != nil {
 		writef(stderr, "configuration error: %s\n", err)
@@ -207,12 +223,16 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	var (
 		processor *gatewaysim.ACKProcessor
 		transport simTransport
+		control   *gatewaysim.ControlRuntime
 	)
 	// closeAll tears down every resource opened so far within one bounded
 	// budget. It is safe once, on any startup failure after the outbox opened.
 	closeAll := func() {
 		tctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
+		if control != nil {
+			_ = control.Close(tctx)
+		}
 		if processor != nil {
 			_ = processor.Stop(tctx)
 		}
@@ -222,7 +242,7 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		_ = outbox.Close()
 	}
 
-	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight), gatewaysim.WithACKLatencyRecorder(tracker))
+	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight), gatewaysim.WithACKLatencyRecorder(tracker), gatewaysim.WithACKIgnoreValidBudget(ignoreACKBudget))
 	if err != nil {
 		writeln(stderr, "error: could not create the ACK processor")
 		closeAll()
@@ -230,7 +250,13 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	}
 	processor = createdProcessor
 
-	createdTransport, err := buildTransport(cfg, processor)
+	var admit gatewaysim.ACKAdmitter = processor
+	var commands *gatewaysim.CommandInbox
+	if cfg.ControlEnabled {
+		commands = gatewaysim.NewCommandInbox(cfg.GatewayID, processor)
+		admit = commands
+	}
+	createdTransport, err := buildTransport(cfg, admit)
 	if err != nil {
 		writef(stderr, "error: could not create the MQTT transport: %s\n", transportErrorMessage(err))
 		closeAll()
@@ -246,12 +272,32 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		FiniteBatch:      batches,
 		CompletionBudget: completionBudget,
 		Latency:          tracker,
+		RuntimeSampling:  cfg.ControlEnabled,
 		Logger:           slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	})
 	if err != nil {
 		writeln(stderr, "error: could not create the scheduler")
 		closeAll()
 		return 1
+	}
+	if cfg.ControlEnabled {
+		controller, err := gatewaysim.NewController(outbox, scheduler)
+		if err != nil {
+			writeln(stderr, "error: could not create control owner")
+			closeAll()
+			return 1
+		}
+		control, err = gatewaysim.NewControlRuntime(controller, commands, transport, cfg.PublishTimeout)
+		if err != nil {
+			writeln(stderr, "error: could not create control workers")
+			closeAll()
+			return 1
+		}
+		if err := control.Start(ctx); err != nil {
+			writeln(stderr, "error: control recovery failed; supervised reopen required")
+			closeAll()
+			return 1
+		}
 	}
 
 	processor.Start()
@@ -277,10 +323,22 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 
 	schedulerDone := make(chan error, 1)
 	go func() { schedulerDone <- scheduler.Run(ctx) }()
+	var controlFatal <-chan struct{}
+	if control != nil {
+		controlFatal = control.FatalSignal()
+	}
+	intentionalFaultStop := false
+	var ignoredACKStop <-chan struct{}
+	if stopAfterIgnore {
+		ignoredACKStop = processor.IgnoredValidACKNotify()
+	}
 
 	select {
 	case <-ctx.Done():
 	case <-scheduler.Done():
+	case <-controlFatal:
+	case <-ignoredACKStop:
+		intentionalFaultStop = true
 	}
 
 	// One shutdown budget for every teardown step. The scheduler's own publish
@@ -290,6 +348,11 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	if deadline, ok := shutCtx.Deadline(); ok {
 		scheduler.BeginShutdown(deadline)
 	}
+	if control != nil {
+		if err := control.Close(shutCtx); err != nil {
+			writeln(stderr, "warning: control workers did not join within shutdown budget")
+		}
+	}
 	scheduler.Stop()
 
 	var schedErr error
@@ -297,6 +360,11 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	case schedErr = <-schedulerDone:
 	case <-shutCtx.Done():
 		schedErr = shutCtx.Err()
+	}
+	select {
+	case <-controlFatal:
+		schedErr = gatewaysim.ErrControlUnconfirmed
+	default:
 	}
 
 	if err := processor.Stop(shutCtx); err != nil {
@@ -318,13 +386,20 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		counts = gatewaysim.OutboxCounts{}
 	}
 
-	writef(stdout, "run summary: enqueued=%d publish_attempts=%d app_acknowledged=%d pending_rows=%d pending_bytes=%d quarantined_rows=%d quarantined_bytes=%d completed=%t\n",
+	writef(stdout, "run summary: enqueued=%d publish_attempts=%d app_acknowledged=%d ignored_valid_acks=%d intentional_fault_stop=%t pending_rows=%d pending_bytes=%d quarantined_rows=%d quarantined_bytes=%d completed=%t\n",
 		stats.UniqueEnqueued, stats.PublishAttempts, ackStats.Acknowledged,
+		ackStats.IgnoredValidACKs, intentionalFaultStop,
 		counts.PendingRows, counts.PendingBytes, counts.QuarantinedRows, counts.QuarantinedBytes, stats.Completed)
 
 	if tracker != nil {
+		writef(stdout, "serialization summary: unique_bytes=%d attempted_bytes=%d unique_samples=%d\n",
+			stats.UniquePayloadBytes, stats.AttemptedPayloadBytes, stats.UniqueSamples)
 		snap := tracker.Snapshot()
 		writef(stdout, "%s\n", gatewaysim.FormatMeasurementSummary(snap))
+	}
+	if control != nil {
+		cs := control.Stats()
+		writef(stdout, "control summary: rejected=%d queue_full=%d ignored=%d conflict=%d result_puback=%d result_publish_error=%d active_interval_us=%d\n", cs.Rejected, cs.QueueFull, cs.Ignored, cs.Conflict, cs.PublishOK, cs.PublishError, scheduler.ActiveSampleInterval())
 	}
 
 	switch {
@@ -332,6 +407,9 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		return 0
 	case errors.Is(schedErr, gatewaysim.ErrSchedulerCompletion):
 		writeln(stderr, "error: the finite run did not complete within the completion budget; unacknowledged items are preserved for the next run")
+		return 1
+	case intentionalFaultStop:
+		writeln(stdout, "stopped intentionally after ignored valid ACK; pending outbox rows are preserved for reopen/replay")
 		return 1
 	case schedErr != nil && errors.Is(schedErr, context.DeadlineExceeded):
 		writeln(stderr, "error: the scheduler did not stop within the shutdown budget; recovery is supervised")

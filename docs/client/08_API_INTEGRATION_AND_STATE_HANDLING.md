@@ -40,7 +40,7 @@ Tài liệu này cung cấp **danh mục quy chuẩn (checklist) thực tiễn, 
   - **Cập nhật phạm vi lịch sử:** Các phát biểu lịch sử trước đây ghi nhận "chưa có xóa membership" thuộc phạm vi giai đoạn trước; nay hệ thống đã chính thức bổ sung endpoint thứ sáu `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` dành cho Platform Admin. Các bằng chứng kiểm thử lịch sử cũ tiếp tục được bảo toàn nguyên trạng.
 - **Ngoại lệ Tồn đọng Chuyển tiếp (Deferred Exceptions & Boundaries):**
   - WebSocket (`/v1/ws`) tiếp tục trả về `501 Not Implemented` (chờ Stage 7).
-  - Điều khiển thiết bị lâu bền (`desired_state`, downlink commands, transactional outbox) chưa kích hoạt (chờ Stage 5).
+  - Điều khiển thiết bị lâu bền (`desired_state`, downlink commands, transactional outbox) đã hoàn thành và kiểm chứng cục bộ ở Giai đoạn P3 trên môi trường cô lập; deployment mặc định tiếp tục tắt (`STAGE5_ENABLED=false`) chờ live rollout.
   - API Reset credential có giám sát vẫn giữ rào chắn fail-closed `503 Service Unavailable` (`denyOnlyResetPrerequisite{}`).
 *Lưu ý an toàn:* Tuyệt đối không tuyên bố hệ thống sẵn sàng vận hành sản xuất (production-ready) hoặc client Flutter đã hoàn tất khi các cổng nghiệm thu nghiệp vụ và phần cứng thực tế chưa diễn ra. Không suy diễn bất kỳ cập nhật nào trên Flutter Client hay bộ kịch bản Bruno.
 
@@ -834,10 +834,10 @@ Nhằm đảm bảo sự nhất quán với toàn bộ tài liệu hệ thống 
 ### 11.2 Các tính năng CHƯA TRIỂN KHAI (Future Roadmap Stages)
 Theo lộ trình kiến trúc hệ thống (`AGENTS.md` và `Backend_summary_plan.md`), các tính năng dưới đây **chưa được kích hoạt** ở tầng người dùng:
 
-1. **Giai đoạn 5 (Stage 5) — Điều khiển Bản sao số Digital Twin:**
-   - Đột biến cấu hình thiết bị lâu bền (`PATCH /v1/digital-twins/{entity_id}/desired-state`).
-   - Phát hành lệnh điều khiển downlink (`POST /v1/digital-twins/{entity_id}/commands`).
-   - Cơ chế Transactional Outbox và MQTT command topic.
+1. **Giai đoạn 5 (Stage 5 / P3) — Điều khiển Bản sao số Digital Twin:**
+   - Đã hoàn thành và kiểm chứng E2E cục bộ ở P3 trên môi trường thử nghiệm: `PATCH /v1/digital-twins/{entity_id}/desired-state` (tần số thập phân `0 < Hz <= 100`, quyền `owner`/`operator`), nhận `202 Accepted` hoặc `200 OK` (no-op unchanged).
+   - Tra cứu lệnh qua `GET /v1/digital-twins/{entity_id}/commands` và chi tiết `.../commands/{command_id}` (không thêm POST command riêng).
+   - Cấu hình xác nhận nằm tại `reported.configuration`, tách biệt với quan trắc viễn trắc. Môi trường triển khai chung tiếp tục giữ `STAGE5_ENABLED=false` chờ rollout.
 2. **Giai đoạn 6 (Stage 6) — Bộ điều phối đối soát lệnh (Command Reconciliation Worker):**
    - Tự động đối soát trạng thái mong muốn (`desired_state`) và trạng thái thực tế (`reported_state`).
    - Quản lý vòng đời lệnh (`pending`, `published`, `acknowledged`, `succeeded`, `failed`, `timeout`).

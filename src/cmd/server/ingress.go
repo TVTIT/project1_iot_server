@@ -46,17 +46,55 @@ func (a *lateAdmitter) set(inner mqttingress.Admitter) {
 // reads the CA, so an HTTP-only deployment is unaffected. It is inert and safe
 // to stop even when it was never started.
 type ingressRuntime struct {
-	enabled   bool
-	transport *mqttingress.Transport
-	ingress   *mqttingress.Ingress
+	enabled    bool
+	transport  *mqttingress.Transport
+	ingress    *mqttingress.Ingress
+	repository telemetry.Repository
+	metrics    *telemetry.PersistenceMetrics
+}
+
+func mqttIngressOptions(cfg config.Config, sinks ...mqttingress.PostCommitSink) mqttingress.Options {
+	var sink mqttingress.PostCommitSink
+	if len(sinks) != 0 {
+		sink = sinks[0]
+	}
+	return mqttingress.Options{
+		MetricsEnabled:       cfg.MetricsEnabled,
+		QueueCapacity:        cfg.Ingress.QueueCapacity,
+		WorkerCount:          cfg.Ingress.WorkerCount,
+		MaxPayloadBytes:      cfg.Ingress.MaxPayloadBytes,
+		BufferedPayloadBytes: cfg.Ingress.BufferedPayloadBytes,
+		Shaper: mqttingress.ShaperOptions{
+			Enabled:       cfg.Ingress.ShaperEnabled,
+			RatePerSecond: cfg.Ingress.ShaperRatePerSecond,
+			Burst:         cfg.Ingress.ShaperBurst,
+			MaxGateways:   cfg.Ingress.ShaperMaxGateways,
+			IdleRetention: cfg.Ingress.ShaperIdleRetention,
+		},
+		PersistTimeout: cfg.Ingress.DBTimeout,
+		PublishTimeout: cfg.Ingress.PublishTimeout,
+		Microbatch: mqttingress.MicrobatchOptions{
+			Enabled: cfg.Ingress.MicrobatchEnabled, MaxMessages: cfg.Ingress.MicrobatchMaxMessages,
+			MaxRows: cfg.Ingress.MicrobatchMaxRows, MaxPayloadBytes: cfg.Ingress.MicrobatchMaxPayloadBytes,
+			MaxWait: cfg.Ingress.MicrobatchMaxWait,
+		},
+		RAMDedup: mqttingress.DedupCacheOptions{
+			Enabled: cfg.Ingress.RAMDedupEnabled, MaxEntries: int64(cfg.Ingress.RAMDedupMaxEntries), MaxBytes: cfg.Ingress.RAMDedupMaxBytes,
+		},
+		PostCommitSink: sink,
+	}
 }
 
 // composeIngress builds the telemetry validator, repository, ingress core and
 // data transport only when MQTT_INGRESS_ENABLED is true. An invalid CA or
 // broker configuration fails here, at startup, before any worker runs.
-func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, error) {
+func composeIngress(cfg config.Config, pool *pgxpool.Pool, sinks ...mqttingress.PostCommitSink) (ingressRuntime, error) {
 	if !cfg.Ingress.Enabled {
 		return ingressRuntime{}, nil
+	}
+	var sink mqttingress.PostCommitSink
+	if len(sinks) != 0 {
+		sink = sinks[0]
 	}
 
 	validator, err := telemetry.NewValidator(telemetry.Limits{
@@ -68,7 +106,27 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry validator: %w", err)
 	}
-	repository, err := telemetry.NewPostgresRepository(pool, cfg.Ingress.DBTimeout)
+	var persistenceMetrics *telemetry.PersistenceMetrics
+	if cfg.MetricsEnabled {
+		persistenceMetrics = &telemetry.PersistenceMetrics{}
+	}
+	var repository telemetry.Repository
+	var batchRepository telemetry.BatchRepository
+	if cfg.Ingress.MicrobatchEnabled {
+		batchRepository, err = telemetry.NewPostgresBatchRepositoryWithMetrics(pool, cfg.Ingress.DBTimeout, cfg.Ingress.MicrobatchMaxMessages, persistenceMetrics)
+		if err != nil {
+			return ingressRuntime{}, fmt.Errorf("create telemetry batch repository: %w", err)
+		}
+		var ok bool
+		repository, ok = batchRepository.(telemetry.Repository)
+		if !ok {
+			return ingressRuntime{}, errors.New("telemetry batch repository does not support baseline persistence")
+		}
+	} else if persistenceMetrics != nil {
+		repository, err = telemetry.NewPostgresRepositoryWithMetrics(pool, cfg.Ingress.DBTimeout, persistenceMetrics)
+	} else {
+		repository, err = telemetry.NewPostgresRepository(pool, cfg.Ingress.DBTimeout)
+	}
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry repository: %w", err)
 	}
@@ -91,19 +149,18 @@ func composeIngress(cfg config.Config, pool *pgxpool.Pool) (ingressRuntime, erro
 		return ingressRuntime{}, fmt.Errorf("create MQTT telemetry transport: %w", err)
 	}
 
-	core, err := mqttingress.New(mqttingress.Options{
-		QueueCapacity:   cfg.Ingress.QueueCapacity,
-		WorkerCount:     cfg.Ingress.WorkerCount,
-		MaxPayloadBytes: cfg.Ingress.MaxPayloadBytes,
-		PersistTimeout:  cfg.Ingress.DBTimeout,
-		PublishTimeout:  cfg.Ingress.PublishTimeout,
-	}, validator, repository, transport)
+	var core *mqttingress.Ingress
+	if cfg.Ingress.MicrobatchEnabled {
+		core, err = mqttingress.New(mqttIngressOptions(cfg, sink), validator, repository, transport, batchRepository)
+	} else {
+		core, err = mqttingress.New(mqttIngressOptions(cfg, sink), validator, repository, transport)
+	}
 	if err != nil {
 		return ingressRuntime{}, fmt.Errorf("create telemetry ingress: %w", err)
 	}
 	admitter.set(core)
 
-	return ingressRuntime{enabled: true, transport: transport, ingress: core}, nil
+	return ingressRuntime{enabled: true, transport: transport, ingress: core, repository: repository, metrics: persistenceMetrics}, nil
 }
 
 // start launches the transport supervisor and then the fixed worker pool. If the
@@ -174,6 +231,16 @@ func (r ingressRuntime) logSummary() {
 		"queue_depth", snap.QueueDepth,
 		"queue_capacity", snap.QueueCapacity,
 		"queue_high_water", snap.QueueHighWater,
+		"buffered_payload_bytes", snap.BufferedPayloadBytes,
+		"buffered_payload_capacity_bytes", snap.BufferedPayloadCapacityBytes,
+		"buffered_payload_high_water_bytes", snap.BufferedPayloadHighWaterBytes,
+		"byte_budget_full", snap.ByteBudgetFull,
+		"shaper_enabled", snap.ShaperEnabled,
+		"shaper_entries", snap.ShaperEntries,
+		"shaper_capacity", snap.ShaperCapacity,
+		"shaper_passed", snap.ShaperPassed,
+		"shaper_rate_limited", snap.ShaperRateLimited,
+		"shaper_state_capacity", snap.ShaperStateCapacity,
 	)
 }
 

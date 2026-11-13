@@ -527,6 +527,38 @@ func TestRun_MeasureFlagValidation(t *testing.T) {
 	}
 }
 
+func TestRun_ACKIgnoreFlagValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--ignore-first-valid-acks", "1"},
+		{"run", "--batches", "1", "--ignore-first-valid-acks", "11"},
+		{"run", "--stop-after-ignored-ack"},
+		{"run", "--batches", "1", "--stop-after-ignored-ack"},
+	} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), args, lookupFrom(nil), &out, &errOut); code != 2 {
+			t.Fatalf("args %v exit=%d want 2", args, code)
+		}
+	}
+}
+
+func TestRun_StopAfterIgnoredACKIsQualifiedAndPreservesPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	fake := newFakeTransport(true)
+	installFakeTransport(t, fake)
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"run", "--batches", "2", "--ignore-first-valid-acks", "1", "--stop-after-ignored-ack"}, lookupFrom(runEnv(path, nil)), &out, &errOut)
+	if code == 0 {
+		t.Fatalf("intentional fault stop reported successful completion: %q", out.String())
+	}
+	text := out.String()
+	if !strings.Contains(text, "ignored_valid_acks=1 intentional_fault_stop=true") || !strings.Contains(text, "pending_rows=1") || !strings.Contains(text, "completed=false") {
+		t.Fatalf("unqualified fault stop summary: %q", text)
+	}
+	if got := adminCounts(t, path); got.PendingRows != 1 {
+		t.Fatalf("pending after stopped run=%d", got.PendingRows)
+	}
+}
+
 func TestRun_FiniteBatch_WithMeasure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.db")
 	fake := newFakeTransport(true)
@@ -541,7 +573,7 @@ func TestRun_FiniteBatch_WithMeasure(t *testing.T) {
 
 	stdoutText := out.String()
 	// Both run summary and measurement summary must be printed
-	if !strings.Contains(stdoutText, "run summary: enqueued=2 publish_attempts=2 app_acknowledged=2 pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0 completed=true") {
+	if !strings.Contains(stdoutText, "run summary: enqueued=2 publish_attempts=2 app_acknowledged=2 ignored_valid_acks=0 intentional_fault_stop=false pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0 completed=true") {
 		t.Fatalf("unexpected or missing run summary: %q", stdoutText)
 	}
 
@@ -562,6 +594,9 @@ func TestRun_FiniteBatch_WithMeasure(t *testing.T) {
 	}
 
 	// Output must not contain secrets or payloads
+	if !strings.Contains(stdoutText, "serialization summary: unique_bytes=") || !strings.Contains(stdoutText, "unique_samples=200") {
+		t.Fatalf("missing bounded byte/sample counts: %q", stdoutText)
+	}
 	if strings.Contains(stdoutText, "test-only-gateway-password") || strings.Contains(stdoutText, "payload") {
 		t.Fatalf("stdout leaked credential or payload: %q", stdoutText)
 	}
@@ -580,7 +615,7 @@ func TestRun_FiniteBatch_WithoutMeasure_BackwardCompatibility(t *testing.T) {
 	}
 
 	stdoutText := out.String()
-	if !strings.Contains(stdoutText, "run summary: enqueued=2 publish_attempts=2 app_acknowledged=2 pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0 completed=true") {
+	if !strings.Contains(stdoutText, "run summary: enqueued=2 publish_attempts=2 app_acknowledged=2 ignored_valid_acks=0 intentional_fault_stop=false pending_rows=0 pending_bytes=0 quarantined_rows=0 quarantined_bytes=0 completed=true") {
 		t.Fatalf("unexpected or missing run summary: %q", stdoutText)
 	}
 

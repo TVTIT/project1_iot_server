@@ -512,6 +512,75 @@ func TestNativeControlCommitAndOverflow(t *testing.T) {
 	}
 }
 
+func TestNativeControlAdmissionNotifierOnlyAfterConfirmedNewCommit(t *testing.T) {
+	f := newControlFixture(t)
+	var notifications int
+	f.repo.SetAdmissionNotifier(func() { notifications++ })
+	req := controlRequest(t, "1", "0", "notify-new")
+	first, err := f.repo.Admit(f.ctx, f.owner, f.urn, req)
+	if err != nil || first.StatusCode != 202 || first.CommandID == nil || notifications != 1 {
+		t.Fatalf("new admission %+v notifications=%d err=%v", first, notifications, err)
+	}
+	replay, err := f.repo.Admit(f.ctx, f.owner, f.urn, req)
+	if err != nil || replay.StatusCode != first.StatusCode || string(replay.Response) != string(first.Response) || notifications != 1 {
+		t.Fatalf("replay %+v notifications=%d err=%v", replay, notifications, err)
+	}
+	if _, err = f.repo.Admit(f.ctx, f.owner, f.urn, controlRequest(t, "2", "1", "notify-busy")); !errors.Is(err, digitaltwin.ErrCommandInProgress) || notifications != 1 {
+		t.Fatalf("business rejection notifications=%d err=%v", notifications, err)
+	}
+
+	noopURN, _ := f.sensor(t, "noop")
+	f.exec(t, `UPDATE twin_states SET desired_state='{"sample_interval_us":1000000}',reported_state='{"configuration":{"sample_interval_us":1000000}}' WHERE entity_id=(SELECT id FROM twin_entities WHERE entity_id=$1)`, noopURN)
+	noop, err := f.repo.Admit(f.ctx, f.owner, noopURN, controlRequest(t, "1", "0", "notify-noop"))
+	if err != nil || noop.StatusCode != 200 || noop.CommandID != nil || notifications != 1 {
+		t.Fatalf("noop %+v notifications=%d err=%v", noop, notifications, err)
+	}
+	injectedOutboxError := errors.New("injected outbox write failure")
+	injections := 0
+	rollbackURN, rollbackEntity := f.sensor(t, "rollback-notifier")
+	rollbackFixture := *f
+	rollbackFixture.entity = rollbackEntity
+	rollbackBefore := rollbackFixture.counts(t)
+	rollbackRepo, err := digitaltwin.NewPostgresControlRepository(&faultInjectingTxDatabase{
+		underlying: f.app,
+		onTxBegin: func(tx pgx.Tx) pgx.Tx {
+			return &faultInjectingTx{Tx: tx, onExec: func(_ context.Context, _ pgx.Tx, sql string, _ ...any) (pgconn.CommandTag, error, bool) {
+				if strings.Contains(sql, "INSERT INTO public.twin_outbox") {
+					injections++
+					return pgconn.CommandTag{}, injectedOutboxError, true
+				}
+				return pgconn.CommandTag{}, nil, false
+			}}
+		},
+	}, digitaltwin.DefaultControlConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackRepo.SetAdmissionNotifier(func() { notifications++ })
+	if _, err = rollbackRepo.Admit(f.ctx, f.owner, rollbackURN, controlRequest(t, "2", "0", "notify-rollback")); !errors.Is(err, injectedOutboxError) || errors.Is(err, digitaltwin.ErrCommandInProgress) || injections != 1 || notifications != 1 {
+		t.Fatalf("rolled-back admission injections=%d notifications=%d err=%v", injections, notifications, err)
+	}
+	if rollbackBefore != rollbackFixture.counts(t) {
+		t.Fatal("rolled-back admission changed committed state")
+	}
+
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("uncertain_commit_%t", committed), func(t *testing.T) {
+			g := newControlFixture(t)
+			count := 0
+			db := &faultInjectingTxDatabase{underlying: g.app, onTxBegin: func(tx pgx.Tx) pgx.Tx { return &controlCommitTx{Tx: tx, after: committed} }}
+			repo, err := digitaltwin.NewPostgresControlRepository(db, digitaltwin.DefaultControlConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			repo.SetAdmissionNotifier(func() { count++ })
+			if _, err = repo.Admit(g.ctx, g.owner, g.urn, controlRequest(t, "1", "0", "notify-uncertain")); !errors.Is(err, digitaltwin.ErrControlCommitUncertain) || count != 0 {
+				t.Fatalf("uncertain commit notifications=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
 func TestNativeControlCapacityAndBounds(t *testing.T) {
 	f := newControlFixture(t)
 	config := digitaltwin.DefaultControlConfig()

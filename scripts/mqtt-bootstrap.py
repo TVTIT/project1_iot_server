@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import traceback
 import uuid
 
 PINNED_IMAGE = 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
@@ -48,6 +49,43 @@ MAX_TOTAL_LABELS = 32
 
 class BootstrapError(Exception):
     """Safe error: never contains credential/input/native output."""
+
+
+_SAFE_DIAGNOSTIC_EXCEPTIONS = frozenset({
+    'OSError', 'FileNotFoundError', 'PermissionError', 'TimeoutError',
+    'InterruptedError', 'ProcessLookupError', 'ChildProcessError',
+    'ConnectionError', 'BrokenPipeError',
+    'SubprocessError', 'CalledProcessError', 'TimeoutExpired'
+})
+
+
+def format_safe_diagnostic(exc):
+    """Formats minimal, secret-safe diagnostic dictionary for generic exception handler."""
+    exc_type = type(exc).__name__
+    if exc_type in _SAFE_DIAGNOSTIC_EXCEPTIONS:
+        safe_cls = exc_type
+    elif isinstance(exc, OSError):
+        safe_cls = 'OSError'
+    else:
+        safe_cls = 'SubprocessError'
+
+    errno_val = exc.errno if (isinstance(exc, OSError) and isinstance(getattr(exc, 'errno', None), int)) else None
+    returncode_val = exc.returncode if (isinstance(exc, subprocess.CalledProcessError) and isinstance(getattr(exc, 'returncode', None), int)) else None
+    timeout_val = exc.timeout if (isinstance(exc, subprocess.TimeoutExpired) and isinstance(getattr(exc, 'timeout', None), (int, float))) else None
+
+    frames = []
+    tb = getattr(exc, '__traceback__', None)
+    if tb is not None:
+        for f in traceback.extract_tb(tb):
+            frames.append({'function': str(f.name), 'line': int(f.lineno)})
+
+    return {
+        'exception_class': safe_cls,
+        'errno': errno_val,
+        'returncode': returncode_val,
+        'timeout': timeout_val,
+        'frames': frames,
+    }
 
 
 _cancelled = False
@@ -647,7 +685,7 @@ def allocate_helper(cmd, tracker, kind, runner=subprocess.run):
     item['receipt'] = save_intent(item)
     tracker.append(item)
     cmd[2:2] = ['--label', 'bootstrap.nonce=' + nonce]
-    res = runner(cmd, capture_output=True, timeout=10, check=False,
+    res = runner(cmd, capture_output=True, timeout=25, check=False,
                  env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
     if res.returncode:
         raise BootstrapError('helper creation failed; recovery required')
@@ -1032,8 +1070,13 @@ def main():
     except BootstrapError as error:
         print(str(error), file=sys.stderr)
         return 1
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
         print('bootstrap refused/failed; store and ownership require offline verification', file=sys.stderr)
+        try:
+            diag = format_safe_diagnostic(exc)
+            print('bootstrap_diagnostic: ' + json.dumps(diag, sort_keys=True), file=sys.stderr)
+        except Exception:
+            pass
         return 1
 
 

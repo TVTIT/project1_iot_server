@@ -4,16 +4,250 @@ Tài liệu này phân tích chi tiết các giới hạn kỹ thuật (Technica
 
 ---
 
-## Mốc Stage 5 tạm dừng sau Task 5.4 — 24/10/2026
+## P8 E2R — retry/diagnostics, dừng tại N1 (07/11/2026)
 
-Task 5.0–5.4 đã hoàn thành theo phạm vi duyệt; 5.5–5.8 hoãn lại, không tự triển
-khai tiếp. Đây là cập nhật hiện hành cho Stage 5 và security contract, supersede
-các mô tả Stage 5 còn hoàn toàn chưa làm hoặc global gate bên dưới nếu mâu thuẫn;
-các kết quả cũ vẫn là lịch sử. Xem [bàn giao mốc 5.4](../backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
+N1 `ncs_58056e3cbc51` giữ `PARTIAL` → `ABORTED`, cleanup exact 12/1/5; counters
+và giới hạn được bàn giao tại [P8 report](../backend/paper-p8-experiments-and-acceptance.md).
+N2/N3/N4 là các lane còn lại do user chạy riêng; chưa có native qualification trên
+source sau local repairs. Workload hữu hạn, colocated, chỉ 5 resource snapshots
+thưa và không có histogram trong N1 không chứng minh peak/RSS, sustained capacity,
+soak hay bottleneck DB. Giữ shaper/gates/drain/defaults hiện hành; không tối ưu DB
+hoặc nới capacity từ các counters này.
+
+**Bổ sung diagnostics source-local (07/11/2026):** smoke reader-only PostgreSQL
+16 đầu FAIL vì SQL thiếu ngoặc (exact cleanup đúng); sau sửa smoke PASS với 30
+I/O rows, quota cô lập 0,5 CPU, Docker one-shot, read-only receipt unchanged và
+exact cleanup. Không có telemetry, quota không phải E2 workload, và chưa chạy
+remote persistence trên source mới. N1 tiếp tục `PARTIAL`/`ABORTED`; E2R.1/5
+không được đánh dấu accepted, N2/N3/N4 còn chờ người dùng, P8 chưa hoàn tất.
+Chi tiết diagnostics, timestamp/reset/identity qualification và công thức delta
+nằm trong [runbook E2](../backend/paper-p8-e2-remote-gate.md#chẩn-đoán-persistence-e2-source-mới-chạy-riêng)
+và [P8 report](../backend/paper-p8-experiments-and-acceptance.md#bổ-sung--persistence-diagnostics-local-smoke-2026-11-07).
+
+**Cập nhật lưu giữ chẩn đoán E2 cục bộ (07/11/2026):** Khắc phục hiện tượng mất
+chứng cứ active do vòng đệm xoay vòng 64 mẫu/512 KiB bị trôi trong lượt `run07`
+trước đó, mã nguồn đã bổ sung cơ chế bounded active side capture cho E2 official
+`steady_burst` (giữ earliest evidence sau trigger HTTP `ingress.Received` của
+cùng `process_instance`, ngân sách mẫu lưu giữ theo kích thước JSON 128 mẫu / 2 MiB
+(serialized/logical, không phải phân bổ RAM cứng), pre-trigger buffer $\le 4$ mẫu /
+64 KiB, tổng dung lượng file JSON chẩn đoán tối đa 8 MiB, phân định rõ với RSS).
+Kiểm chứng cục bộ hoàn tất với 566 selected Python unit/mock regressions PASS (1
+lệnh duy nhất, không cộng dồn), cú pháp hợp lệ, `git diff --check` PASS, 9 tệp Go
+và 4 tệp Python khớp SHA256 chính xác. Native DB/broker/E2 official trên scheduler+retention
+source tiếp tục là NOT RUN; không có chứng minh năng lực 1.000 msg/s. Không nới
+capacity hay tự ý chuyển N2/N3/N4; việc sửa retention cục bộ không phải là cải
+thiện hiệu năng remote hay kết luận phần cứng.
+Chi tiết xem tại [runbook E2](../backend/paper-p8-e2-remote-gate.md#chẩn-đoán-persistence-e2-source-mới-chạy-riêng)
+và [P8 report](../backend/paper-p8-experiments-and-acceptance.md#bổ-sung--bounded-active-diagnostics-retention-và-kiểm-chứng-cục-bộ-2026-11-07).
+
+---
+
+## P3 Sensor control loop — nghiệm thu local MVP và giới hạn kỹ thuật (25/10/2026)
+
+Xem [báo cáo P3](../backend/paper-p3-sensor-control-loop.md).
+**Sau review:** Hai lỗi HIGH (panic khi result observer nil và bỏ delivery trước SUBACK/install) đã sửa, có regression RED → GREEN. Native mới `ncs_64809f03cce5` PASS 6 command (5 metrics-on + 1 metrics-off), cleanup exact 17 containers / 1 network / 7 volumes; Go race 8 packages và Python 224 tests PASS. Lượt bổ sung đầu `ncs_375e9aebcede` FAIL tại startup backend thay thế, cleanup verified; giữ nguyên lịch sử trong báo cáo. Các số liệu lượt nghiệm thu ban đầu dưới đây không được gán lại cho lượt mới.
+Vòng điều khiển Sensor tối thiểu đã hoàn tất và kiểm chứng E2E trên simulator qua profile HTTPS/RS256 cô lập: `PATCH desired-state` → intent transaction → MQTT command → Gateway apply/readback/dedup → MQTT result → result transaction → `reported.configuration` → REST reading.
+Lượt native E2E đầy đủ `ncs_79ba9068cca0` đạt PASS (`PAPER_P3_ACCEPTED`, `full_p3_accepted: true`, `exact_cleanup_verified: true`, dọn sạch 15 containers / 1 network / 7 volumes). Toàn bộ 5 commands (100 Hz, 100 Hz trên Sensor thứ hai cùng Gateway, 1.5 Hz decimal, 0.1 Hz có lỗi DB tạm thời phục hồi bằng resend, và 60 Hz có controlled restart/reopen) đều hoàn tất và đối chiếu đúng.
+Lỗi guard kiểm tra schema-hardening (Timescale chunk constraint copies) và thiếu công cụ hệ thống `setfacl`/`getfacl` đã được xử lý và ghi nhận đầy đủ lịch sử.
+Bàn giao P3 mức Local MVP hoàn tất sau khi rà soát đầy đủ 8 điều kiện hoàn thành. Deployment mặc định tiếp tục `STAGE5_ENABLED=false` do live rollout nằm ngoài phạm vi P3; remote CI và board HIL (AM5728) tiếp tục giữ trạng thái NOT RUN (được ghi nhận riêng tại checkpoint P8). Không tự mở P6 hay Stage 6.
+
+| Vướng mắc / Giới hạn | Ảnh hưởng | Xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Buffer delivery startup hữu hạn (sau sửa review P3) | Burst trước SUBACK/install vượt 32 messages, payload quá 8 KiB hoặc topic quá 256 bytes làm transport fail-closed; Paho có thể đã auto-ACK nên không hứa phục hồi delivery bằng reconnect | Buffer riêng từng lifetime, chỉ drain sau xác nhận subscription và install; overflow báo lỗi fatal, dừng reconnect. Downstream command/ACK queues vẫn có giới hạn riêng; không claim exactly-once hoặc lossless khi quá tải | Khi cần thay đổi capacity hoặc thiết kế recovery theo một yêu cầu riêng, không tự mở Stage 6 |
+| Lỗi guard hardening do Timescale chunk constraint copies — **ĐÃ SỬA THEO DUYỆT** | Lượt chạy trước FAIL tại `verify-schema-hardening.sql` do đếm conname trên toàn DB thấy 11 thay vì 9; inventory xác nhận 2 constraint phụ thuộc Timescale chunks | Sửa guard kiểm đúng 9 cặp (bảng cha + tên constraint) trong schema public; thêm negative test xác minh từ chối nếu thiếu cặp bắt buộc kể cả có constraint cùng tên ở bảng khác, rollback verified | Đã giải quyết; giữ regression trong intent fixture |
+| Thiếu gói hệ thống `acl` (`setfacl`/`getfacl`) trên host — **ĐÃ GIẢI QUYẾT** | Python guard TLS thất bại khi phân quyền khóa broker UID 1883; preflight E2E bị chặn | Người dùng đã cài gói `acl` (v2.3.2) trên host; 141 tests Python PASS, không nới lỏng quyền đọc khóa | Đã giải quyết |
+| Timeout sau apply có thể xảy ra khi mạng/DB gián đoạn kéo dài | Nếu kết quả không về kịp trước deadline (TTL 60s), command chuyển `timeout` tại DB dù Gateway có thể đã áp dụng cấu hình trên phần cứng | Backend giữ nguyên `timeout` không đi lùi và không rollback `desired_state`; late result (nếu về sau) được lưu tối đa một bản chứng cứ `late_result_bytes` không ghi đè cấu hình mới | Khi triển khai reconciliation tổng quát ở Stage 6 |
+| Cửa sổ retry và retention của Gateway có giới hạn | Gateway lưu receipt và resend có backoff (1–30s) trong thời hạn deadline gốc; sau retention (24h) dữ liệu cũ bị dọn dẹp | Command cũ không thể áp dụng đè lên cấu hình mới hơn; Gateway duy trì watermark `desired_version` đã cam kết trong `sensor_configuration` | Khi thiết kế giao thức hội tụ offline dài hạn |
+| Dữ liệu đo lường trễ toàn tuyến (D_dispatch / D_e2e) trong cùng tiến trình | Correlation bảng nhớ chỉ lưu trong cùng tiến trình Go backend; nếu backend restart giữa chừng, mốc bắt đầu HTTP bị mất | Đánh dấu `missing_origin` / `missing_dispatch` / `missing_result` tường minh trong metrics, không điền 0 giả mạo hoặc trừ đồng hồ hai máy khác nhau | Khi xây dựng distributed tracing toàn tuyến |
+| Dữ liệu cảm biến trên simulator là chuỗi sóng tam giác tổng hợp (Synthetic Data) | Chưa chứng minh thay đổi tốc độ chuyển đổi vật lý bên trong chip cảm biến thật | Simulator áp dụng chu kỳ timer thật cho nhịp đọc/lấy mẫu, phân định rõ ràng synthetic telemetry với cảm biến thật; board AM5728/HIL ghi NOT RUN | Khi kiểm nghiệm trên phần cứng thật tại checkpoint P8 |
+| Triển khai mặc định tiếp tục tắt điều khiển (`STAGE5_ENABLED=false`) | Live client chưa thể điều khiển tần số trên shared deployment | Giữ nguyên cờ tắt mặc định; chỉ bật trong fixture kiểm thử P3 riêng biệt; bảo đảm an toàn hệ thống đang chạy | Khi có kế hoạch rollout chính thức Stage 5 |
+
+---
+
+## P4 Shaper và ingress budget — Local MVP hoàn tất, giới hạn kỹ thuật (25/10/2026)
+
+Xem [báo cáo P4](../backend/paper-p4-shaper-and-ingress-budget.md). Native baseline
+off `ncs_4e31bc6aa1b1`, optimized `ncs_bd005abcca19` và P3 regression mới
+`ncs_705f0713b225` đều PASS, cleanup exact; Python final 228 tests PASS, Go affected
+race/build/vet/lint/format/ARMv7 checks PASS. P4 được bàn giao Local MVP;
+full/remote CI, HIL/board và rollout NOT RUN/ngoài phạm vi. FAIL lịch sử được giữ.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Token-bucket state chỉ nằm trong RAM | Backend restart reset quota/burst; không phải quota bền vững qua restart/process | Dùng một backend active, giữ `MQTT_SHAPER_ENABLED` opt-in và chấp nhận quota reset trong profile MVP; không suy ra distributed enforcement | Nếu có yêu cầu quota xuyên restart hoặc nhiều backend |
+| Token bucket không cam kết hard fairness hoặc global quota | Gateway chỉ bị rate-limited theo bucket/profile; scheduling/interleaving không bảo đảm mọi Gateway nhận cùng thông lượng, và từng process không chia sẻ quota | Cấu hình per-Gateway `r/b` theo workload; đo A progress trong fixture; không tuyên bố hard fairness/cross-process cap | Khi có yêu cầu fairness SLA hoặc multi-instance |
+| Gateway durable outbox có capacity hữu hạn (5.000 rows / 64 MiB theo profile hiện tại) | Khi shaper/backpressure kéo dài, pending rows có thể đầy; retry không thể bảo đảm drain vô hạn | Giữ workload hữu hạn, theo dõi pending rows/bytes, giảm offered load để drain; không xóa pending dữ liệu | Khi workload thực tế tiến gần quota hoặc cần capacity planning |
+| Broker/Paho có thể allocate/queue trước ingress shaper | Shaper chỉ thấy delivery sau broker/client receive; không chặn inbound network/broker memory, nhiều client cũng nhân per-client queue limits | Giữ packet/payload/inflight/queued bounds explicit và TLS/ACL; không gọi chúng là broker-wide memory ceiling | Khi cần broker-wide memory proof hoặc thay đổi topology/connection fan-in |
+| Payload budget không phải RSS cap | Payload copy cap không tính topic/metadata, decoded samples, Paho/network buffers, shaper state, worker-local memory và allocator overhead; Go maps/backing slices có thể giữ historical allocator capacity sau logical eviction | Giữ queue count cap và `MQTT_INGRESS_BUFFERED_BYTES`; tách logical accounting khỏi RSS, dùng snapshot chỉ như quan sát | Khi cần hard process memory ceiling hoặc có bằng chứng memory pressure |
+| Resource snapshots thưa và finite workload nhỏ | CPU/RAM samples không bắt peak tức thời/continuous behavior; 59 batches / 4.010 samples không chứng minh capacity/long soak | Báo cáo đúng cửa sổ, không nội suy peak hay năng lực; lặp lại cùng fixture khi có request đo mới | Khi capacity/soak target được xác định |
+
+---
+
+## P5a Microbatch persistence — nghiệm thu Local MVP và giới hạn kỹ thuật (25/10/2026)
+
+Xem [báo cáo P5a](../backend/paper-p5a-microbatch-persistence.md) để biết checklist, command/result/shutdown evidence, lịch sử FAIL và artifacts. Bốn workload off/on × 100/1 samples/message cùng các native regressions đại diện PASS trên fixture riêng; source dirty qualification được ghi rõ trong report. Microbatch mặc định off, độc lập với shaper/Stage 5. Không gọi đây là production certification hoặc proof mọi interleaving.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Batch wait đổi lấy ACK latency (đã quan sát) | Trong workload hữu hạn này on có ACK p50/p95 và generation+drain cao hơn off ở cả hai profiles; group wait tối đa 1s và flush thấp tải tạo thêm độ trễ. Operation giảm 24→20 tx/COPY ở 100 samples/message và 24→8 ở 1 sample/message, không đồng nghĩa throughput tổng cao hơn | Giữ `MQTT_MICROBATCH_ENABLED=false` deployment default; dùng `off` làm rollback/ablation. Nếu bật trong fixture, công bố wait/caps và đo ACK latency; không tune bằng cách đổi offered workload | Khi có mục tiêu ACK latency/workload paper đại diện; so sánh timer/caps với cùng workload và profile |
+| Group transaction giữ nhiều resource locks cùng lúc | Group có thể kéo dài thời gian khóa và tăng contention với telemetry/control/provisioning; concurrency cases representative PASS nhưng không chứng minh mọi interleaving hoặc fairness | Transaction chỉ mở khi group sẵn sàng flush; khóa resources theo thứ tự ổn định; cap nhóm và worker hữu hạn; microbatch tắt nếu có contention không chấp nhận được | Khi workload contention thực tế/latency DB tăng hoặc trước profile tải lớn hơn; xem lock-wait cụ thể thay vì mở proof matrix tổng quát |
+| Rollback rồi per-message fallback làm tăng chi phí persistence | Business/provenance conflict có thể trả chi phí transaction nhóm rollback cộng transaction fallback cho member; DB/timeout/commit-unconfirmed không bulk-fallback và không ACK chưa xác nhận | Giữ fallback hữu hạn theo members/deadline, metrics/counters thật; fallback=0 trong bốn workload compare. Dùng per-message mode để rollback feature nếu lỗi hoặc độ trễ không phù hợp | Khi fallback count/rollback rate xuất hiện trong workload đại diện hoặc cần điều chỉnh policy theo yêu cầu nghiệp vụ |
+| Raw-payload bytes không bao gồm decoded sample/metadata overhead | RSS/worker footprint thực lớn hơn payload byte accounting; `resources.csv` có snapshot thưa, không đo peak/continuous hoặc hard RSS ceiling | Giữ rows/messages/bytes/worker bounds và ingress total budget; diễn giải sampled CPU/RAM đúng snapshot, không gọi payload bytes là RSS | Khi có memory pressure hoặc cần hard process-memory target; làm profiling riêng trước khi đổi bounds |
+| Workload/simulator hữu hạn, tất cả service cùng host | 24 messages/profile trên simulator không chứng minh capacity, long soak, broker-wide memory, physical sensor behavior, AM5728/HIL hay môi trường đa máy; CPU/RAM 4–5 snapshots không bắt peak | Chỉ claim correctness/operation counts trong fixture/schema 23/Auth/TLS/ACL; giữ NOT RUN cho full/remote CI, HIL/AM5728, physical sensor và rollout | Tại P8/integration checkpoint nếu được giao, với workload/board/topology được xác định; không suy ngoại suy từ lượt hiện tại |
+| DB Tier-2 timestamp/index — **ĐÃ HOÀN THÀNH TRONG P5b LOCAL MVP** | Migration 24 bổ sung timestamp gốc/index đích; fixture nhỏ không dự báo thời gian khóa hoặc chi phí backfill trên DB lớn | Backfill chỉ từ sample 0 khớp provenance; legacy thiếu dữ liệu giữ NULL; mismatch/ambiguity refuse. Giữ unique guard `(gateway_id,message_id)`, hash/provenance và range overlap. Trước live upgrade cần preflight, backup, maintenance window | Trước bất kỳ upgrade database có dữ liệu thật; không rollback DDL một cách tùy tiện |
+
+**Checkpoint lịch sử P5 (26/10/2026):** P5a và P5b cùng hoàn tất ở phạm vi **Local MVP**; P5 tổng thể paper có thể đóng cho profile fixture, không phải production certification. P5b summary/evidence ở [báo cáo P5b](../backend/paper-p5b-ram-dedup-and-ledger.md). Khi checkpoint này được ghi, P6/Stage 6, full CI, board/HIL, physical sensor và live rollout vẫn chưa làm/NOT RUN; không tự tiếp tục. Deployment defaults hiện vẫn `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false`; P6 Local MVP status được ghi tại mục P6 bên dưới.
+
+### Các phát hiện kiểm thử toàn diện cần xử lý ở các giai đoạn sau (Independent Review Findings for Future Stages)
+
+Trong đợt re-review độc lập và chạy toàn bộ bộ kiểm thử tự động của P5b, reviewer ghi nhận 3 phát hiện (mức MEDIUM) thuộc phạm vi fixture/test suite cần lưu ý xử lý ở các giai đoạn tiếp theo (Stage 5 / P6 hoặc kiểm thử tích hợp mở rộng):
+
+| Mã | Phát hiện / Vướng mắc | Chi tiết kỹ thuật & Nguyên nhân | Ảnh hưởng vận hành / kiểm thử | Hướng xử lý đề xuất cho giai đoạn sau |
+|:---:|---|---|---|---|
+| **F-01** | **Xử lý ngoại lệ trong cleanup của `task266_provision.py` có thể bỏ sót tài nguyên** (`scripts/tests/task266_provision.py:319–329`) | Khối `finally` của `task266_provision.py` chỉ bắt `RuntimeError` khi gọi `cleanup_backend_if_present` hoặc `cleanup_container`. Nếu lệnh `subprocess.run` bên trong ném `subprocess.TimeoutExpired` hoặc `OSError`, vòng lặp dọn dẹp bị ngắt sớm, bỏ qua các container kế tiếp (`database`, `proxy`), `spike.cleanup()` và xóa thư mục tạm. | Khi Docker daemon bị timeout hoặc gặp lỗi OS trong lúc dọn container backend, container CSDL và proxy fixture có thể bị rò rỉ trên host. | Mở rộng khối `except` để bắt đủ `(RuntimeError, subprocess.TimeoutExpired, OSError)` hoặc bọc an toàn trong `cleanup_container`/`cleanup_backend_if_present`, ghi nhận `cleanup_failed = True` và tiếp tục dọn dẹp các tài nguyên còn lại trước khi fail-closed. |
+| **F-02** | **Stage 5 intent fixture chưa tương thích với writer schema 24** (`scripts/tests/stage5_intent_fixture.py:133–138`) | Fixture `stage5_intent_fixture.py` chỉ áp dụng migrations đến phiên bản 23 (`run_existing_migration_runner(fixture, 23)`), nhưng quá trình kiểm thử DB intent lại nạp mã nguồn Go telemetry writer hiện hành (đã yêu cầu schema 24 có cột `processed_messages.timestamp`). Điều này làm phát sinh lỗi SQL: `column "timestamp" of relation "processed_messages" does not exist`. | Lượt chạy native của `stage5_intent_fixture.py` thất bại ngay ở kịch bản fresh CSDL, khiến 4 kịch bản intent phía sau không thể chạy tiếp. | Khi mở lại Giai đoạn 5 (Stage 5/P6), cập nhật `stage5_intent_fixture.py` để giữ nguyên kiểm tra schema 23 lịch sử nơi cần thiết, đồng thời áp dụng migration 24 (kèm điều kiện post-Auth) trước khi gọi các hàm Go telemetry persistence hiện hành. |
+| **F-03** | **Điều kiện kiểm tra metrics timeline trong `mqttcontrol` có dấu hiệu flaky khi chạy tải cao** (`src/internal/mqttcontrol/metrics_test.go:54–55`) | Trong kiểm thử full race song song 20+ packages, assertion `m.QueueWait.Snapshot().Count` quan sát thấy giá trị 3 thay vì 2 do race condition giữa thời điểm worker dequeue và thời điểm quan sát hoàn tất publish. Khi chạy đơn lẻ package (`go test -race ./internal/mqttcontrol -count=20`), test PASS 20/20. | Có thể gây lỗi ngắt quãng (flaky test) trong các đợt chạy full CI hoặc môi trường máy chủ chịu tải cao, dù logic nghiệp vụ của control dispatch không sai. | Đồng bộ hóa kiểm thử bằng channel barrier / wait group rõ ràng giữa dequeue và publish observation, hoặc phân biệt ranh giới giữa số lượng dequeue và số lượng ghi nhận độ trễ publish thành công thay vì so sánh cứng số nguyên khi pipeline chưa hoàn toàn ổn định. |
+
+**Cập nhật trạng thái hiện tại theo P6 (26/10/2026):** các mô tả và FAIL lịch sử
+ở bảng trên không bị xóa hoặc đổi thành PASS. P6 report ghi kết quả mới tương ứng:
+
+| Finding | Trạng thái hiện tại / evidence | Ranh giới claim |
+|---|---|---|
+| F-01 cleanup independence | Đã sửa hẹp; Python regression có fault injection ở cleanup/setup; credential native xác nhận cleanup bình thường và exact-owned resources đã dọn. Xem [P6 report, findings/validation](../backend/paper-p6-dispatch-and-mixed-load.md). | Không tuyên bố native fault-injected cleanup; historical failure remains historical. |
+| F-02 current writer/schema | Lifecycle fixture giữ assertion/upgrade/refusal schema 23, sau đó current writer chạy schema 24; native intent có 18 required top-level tests PASS, không SKIP. Xem cùng [P6 report](../backend/paper-p6-dispatch-and-mixed-load.md). | Historical schema-23 writer failure được giữ nguyên, không đổi sang PASS. |
+| F-03 flaky metrics assertion | Retry test được đồng bộ bằng barriers; full local Go race cuối tại P6.9 PASS (21 packages; số event/skip chi tiết trong report). | Historical full-suite FAIL vẫn được giữ riêng; kết quả mới không chứng minh mọi interleaving. |
+
+## P6 Dispatch và mixed load — Local MVP: giới hạn và vận hành (26/10/2026)
+
+**Bổ sung repair review 26/10:** B-01/M-01/M-02/M-03 đã sửa hẹp fixture/tests và
+fresh retest; independent `go-reviewer` **APPROVE phạm vi repair**, cả bốn RESOLVED.
+Fresh independent wake-up/100 `ncs_1edca16397cd` PASS/exact cleanup25/1/9;
+native intent18/no SKIP và affected Python342 PASS. Xem phần đầu
+[báo cáo P6](../backend/paper-p6-dispatch-and-mixed-load.md) và
+[safe results mới](../backend/results/p6/review-fixes-20261026.json).
+Giữ FAIL `ncs_4362fca74089`/`ncs_ca4ddec72899`; 59 commits không chứng minh chỉ59
+enqueue, 415 rate-limit là toàn ingress. Mô hình mới dừng hai command producers
+sau final command/config verification khi A/B còn chạy, sau đó measured completion
+rồi giữ pending để same-volume drain; không tăng budget/đổi shaper/production.
+Pilot riêng + bốn fresh arms + recovery PASS/exact cleanup, source/RootFS parity
+được ghi riêng; không trộn arms cũ/mới hoặc claim capacity/fairness/causality.
+Full Go race mới PASS/F-03 PASS thực; full Python discovery còn FAIL3+ERROR4 do
+certificate/bootstrap trusted-ancestor environment, không nới guard/permission.
+Revisit: trusted-ancestor environment nếu cần full Python discovery xanh và owner
+quản lý status plan lịch sử; không mở phase/architecture/rollout tiếp theo.
+
+Xem [báo cáo P6](../backend/paper-p6-dispatch-and-mixed-load.md),
+[summary JSON](../backend/results/p6/summary.json) và
+[summary CSV](../backend/results/p6/summary.csv). Bốn accepted arms polling/wake-up
+và recovery native được kiểm trong fixture simulator. Đây là Local MVP evidence,
+không hoàn tất Stage 5 gốc hoặc chứng nhận production.
+
+| Giới hạn / điều chưa đo | Ảnh hưởng | Workaround hiện tại | Khi xem lại |
+|---|---|---|---|
+| PostgreSQL và Mosquitto cùng host; quota 2 CPU/4 GiB chỉ áp cho backend | Tranh chấp CPU/RAM/IO của dịch vụ khác có thể ảnh hưởng số đo; quota backend không giới hạn toàn host | Báo rõ topology/quota, giữ một backend active và tải fixture hữu hạn | Khi có target multi-host hoặc số đo contention đủ cụ thể |
+| Resource snapshots thưa | Không bắt peak CPU/RAM hoặc continuous behavior, không đo peak RSS | Không ngoại suy từ snapshots; cần profiling riêng nếu memory pressure/capacity là mục tiêu | Khi có yêu cầu profiling/capacity |
+| Queue accounting là logical và queue/worker/payload có giới hạn; TTL và Gateway outbox cũng hữu hạn | Queue-full không bỏ durable intent nhưng tiến độ có thể chậm; command có thể timeout theo deadline gốc; Gateway outbox không drain vô hạn | Giữ bounded configuration, periodic scan, theo dõi pending/terminal state và drain; không reset TTL hoặc xóa pending | Khi workload đại diện cho thấy backlog/outbox gần quota hoặc TTL không phù hợp |
+| Correlation/timeline là process-local | Backend restart làm mất command origin cũ; delay không còn đo được cho command phục hồi | Ghi `missing_origin`/missing timing, không gán 0 hoặc trừ clock khác process | Khi có nhu cầu distributed trace/correlation bền vững |
+| Histogram chỉ có 6 command samples mỗi arm, bucket thô | Percentiles là nearest-rank upper-bucket approximation, không phải latency chính xác hay bound; sparse sample dễ dao động | Xem counts/buckets và định nghĩa trong report; không cộng percentiles hay tuyên bố đạt 57/62.5 ms | Khi có workload/lặp đo phù hợp được yêu cầu |
+| Queue full/missed-signal proofs dùng fake repository; native workload không chủ động bão hòa dispatcher queue | Unit tests chứng minh coalescing/fallback logic nhưng không phải native DB/MQTT queue-saturation proof | Giữ periodic scan làm fallback; gọi đúng scope bằng chứng, không tuyên bố native saturation đã thử | Khi cần native queue-pressure acceptance cụ thể |
+| Mixed workload hữu hạn; command Sensors tự sinh telemetry khác nhau theo sampling/timing | Tổng ingress, raw, ACK, elapsed và shaper counters giữa arms khác; không thể quy khác biệt cho wake-up hay gọi đó là throughput gain | Đối chiếu telemetry measured-feed riêng với command-Sensor rows; không suy năng lực liên tục | Khi có workload ổn định/dài hơn với semantics tương đương |
+| Metrics-off native P3 regression chạy polling, không native wake-up | Không chứng minh cụ thể native wake-up mode khi metrics tắt; nil-observer/wake behavior được kiểm bằng unit tests | Nêu ranh giới này; không gộp P3 polling smoke với wake-up native evidence | Khi cần native metrics-off wake-up test |
+| Credential API enabled nhưng broker unavailable lúc backend startup | Startup readiness có thể giữ 503 cả sau khi broker hồi phục; automatic retry/semantic change không được chứng minh | Trong fixture-tested scope: xác nhận TLS/auth/ACL, giữ broker ổn định, restart backend-only, chờ `/readyz` 200; quy trình đầy đủ ở [runbook vận hành](deployment-and-operations.md) | Trước mọi vận hành tương tự; không áp dụng thao tác live nếu chưa được phê duyệt |
+| Source tree dirty tại các lượt P6 | Evidence gắn với source qualification/summary, không phải clean commit hoặc exact-final committed tree | Đọc revision + dirty qualifier trong report và sanitized summaries; không khái quát ngoài source được ghi | Khi tạo checkpoint/acceptance mới trên revision đã định danh |
+| Full/remote CI, HIL/AM5728, physical sensor, live rollout | Chưa có bằng chứng các môi trường/thiết bị này đã chạy; Stage 5 gốc chưa hoàn tất | Giữ các mục NOT RUN, deployment feature flags false; không mở rộng claim từ simulator | Chỉ tại checkpoint được giao và có điều kiện/approval phù hợp |
+| Broker-internal latency, SQL statement timing/DB-pool acquire riêng, host-wide throughput chưa đo | Backend publish duration và whole-pool snapshots không trả lời các số đo đó | Gọi measurement unavailable; không suy luận broker internals, SQL acquire, 20k msg/s hoặc throughput target từ fixture | Khi instrumentation và workload mục tiêu được xác định rõ |
+
+P6 đã có Local MVP verification, nhưng **không** hoàn tất Stage 5 gốc: full/remote
+CI requirement lane, AM5728/HIL, physical sensor và live rollout vẫn NOT RUN.
+Deployment defaults giữ `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`,
+`MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false` và
+`MQTT_RAM_DEDUP_ENABLED=false`. Backlog này là danh sách canonical; không tạo
+runbook hoặc backlog cạnh tranh trong report.
+
+## P5b RAM dedup + migration 24 — nghiệm thu Local MVP và giới hạn kỹ thuật (26/10/2026)
+
+Xem [báo cáo P5b](../backend/paper-p5b-ram-dedup-and-ledger.md) cho source revision/dirty qualification, exact artifact paths, profile table và historical failures. Migration 24 và cache functional, P3 regression, four cache off/on workloads, Go/schema/Python gates cùng affected Stage 3/4 checks đã PASS trong fixture scope. P5b/P5 Local MVP hoàn tất; không đồng nghĩa shared/live migration, production readiness hay capacity proof.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| RAM cache cold sau backend restart | Entries mất; duplicate tiếp theo chịu DB lookup/transaction, không có cache persistence | Cache proof chỉ tối ưu process-local; cache miss/cold restart dùng durable ledger, Gateway tiếp tục giữ outbox đến application ACK | Khi có yêu cầu nhiều backend hoặc warm recovery; không thêm distributed cache trong P5b |
+| Legacy ledger `timestamp IS NULL` khi không có nguồn gốc đủ tin cậy | Các row đó không tham gia đầy đủ unique index timestamp và không được cache; có thể tăng DB fallback/rejection thận trọng | Migration không bịa timestamp; giữ NULL, guard ID cũ và policy DB conservative; mismatch/ambiguity từ chối migration | Khi có dữ liệu legacy thực cần disposition có kiểm soát; migration 24 chỉ thử trên fixture nhỏ |
+| Cache byte budget là logical estimate, không RSS cap | Không tính chính xác Go map backing capacity, allocator, metadata/runtime và các buffer khác; eviction không bảo đảm RSS giảm ngay | Duy trì tổng entry/byte caps; metrics báo `logical_bytes`, không gọi đây là RSS; resource snapshots fixture chỉ là quan sát thưa | Khi có yêu cầu memory ceiling/triệu chứng pressure; profiling riêng trước khi nới caps |
+| Hai generation có thể giữ entry vật lý sau logical expiry/drop | Rotation mỗi 10 phút cộng expiry check từng lookup; logical release không đảm bảo backing storage được trả ngay | TTL 600 giây kiểm từng entry; không ACK expired proof, không renew/promote qua retry hoặc rotation; lifecycle rotation được join khi dừng | Khi có yêu cầu quản lý allocator/RSS hoặc thay đổi eviction policy |
+| TTL không gia hạn và pending entries không coalesce | Retry không làm proof sống lâu hơn; duplicate song song trước confirmed commit có thể cùng đi DB | Chỉ new confirmed commit warm; pending/rollback/unconfirmed không ACK từ cache. Durable DB path vẫn là trọng tài | Khi workload đo cho thấy vấn đề cụ thể; không dựng pending coordination/global-ID cache |
+| Cache không phải authorization | Hit chỉ xác nhận duplicate đã commit; không cấp quyền, provisioning, TLS/ACL hay thay validation | Lookup sau validation; identity/hash/topic/range conflict checks giữ nguyên; membership/ACL vẫn theo DB/broker hiện hành | Mỗi khi thay hợp đồng auth/ACL; không dùng cache telemetry làm quyền dương |
+| External DB restore/edit/maintenance không tự invalidate cache | Backend đang chạy có thể giữ proof cũ đối với state đã thay đổi bên ngoài process | Fencing ngoài backend phải phối hợp dừng/restart backend để cold-start cache sau thao tác DB; một active backend là phạm vi nghiệm thu | Trước thao tác bảo trì/restore hoặc nếu cần multi-instance/maintenance protocol |
+| Migration 24 và P5 workloads có scope fixture nhỏ/hữu hạn | ACCESS EXCLUSIVE lock, backfill/index cost chưa được đo trên DB lớn; native profile không phải capacity/soak | Trước live upgrade cần target-specific preflight, verified backup/restore và maintenance window; không casual rollback/drop migration | Trước rollout/schema upgrade; xem migration-specific plan và DBA window |
+| Manual duplicate ACK timing và resource samples | Timing gồm CLI/observer cost, không phải broker/Gateway latency; snapshots không bắt peak/RSS | Báo riêng manual replay timing và real Gateway ACK phase; giữ denominator 24/replay arm, cache hit denominator là 24 replay deliveries | Khi có yêu cầu đo latency/capacity đại diện; dùng instrumentation/host profile đã xác định |
+| Finite fixture, single backend, source tree dirty | Bốn profile và functional smoke chứng minh các đường kiểm tra được, không chứng minh mọi interleaving, 20k msg/s, SQL statement reduction hay production behavior | Native/affected gates PASS; full/remote CI, 600-batch Stage 3 workload, HIL/physical sensor, capacity/soak, peak RSS, live rollout NOT RUN. Historical FAILs giữ FAIL | Tại integration/release checkpoint được giao; P6, Stage 6 và rollout cần yêu cầu riêng |
+
+**Checkpoint lịch sử tại P5 (26/10/2026):** P5a/P5b Local MVP đã khép lại; khi
+ghi checkpoint này P6 chưa được giao/chạy và công việc dừng ở P5. P6 Local MVP
+hiện đã có báo cáo riêng phía trên; nội dung historical P5/checkpoint này không
+được hiểu là trạng thái tổng thể hiện tại, cũng không tự mở Stage 6, HIL/full CI
+hoặc rollout.
+
+---
+
+## P2 Auth/perimeter — nghiệm thu local MVP và giới hạn kỹ thuật (24/10/2026)
+
+Xem [checkpoint P2](../backend/paper-p2-auth-and-http-perimeter.md).
+Spike Supabase RS256/JWKS/Admin/Storage PASS; verifier Go mới có unit/race PASS.
+Lượt native đầy đủ chẩn đoán Storage `ncs_60a5e67bb655` và lượt kiểm chứng độc lập sau reboot `ncs_fcd6c1c6f81a` đều PASS (`full_p2_accepted: true`); xác minh kỹ thuật P2.8b hoàn tất 8/8 bước PASS.
+Toàn bộ kết quả FAIL lịch sử (`paper-p2-perimeter-20261024-first`, `paper-p2-full-20261024-first`) được bảo toàn nguyên vẹn.
+Bàn giao P2 mức Local MVP hoàn tất sau khi rà soát đầy đủ 9 điều kiện hoàn thành và ghi nhận checkpoint. Live rollout nằm ngoài phạm vi P2; remote CI và board HIL tiếp tục giữ trạng thái NOT RUN và không phải cổng bắt buộc của P2. Thao tác commit/push chưa được yêu cầu và không phải điều kiện hoàn thành. Stage 5 vẫn giữ `STAGE5_ENABLED=false` tạm dừng sau 5.4; không mở P3 hay stage khác.
+
+| Vướng mắc / Giới hạn | Ảnh hưởng | Xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| GO-2026-6809 trên Go 1.27.2 — **ĐÃ SỬA THEO DUYỆT** | Lượt scan cũ vẫn FAIL lịch sử; scan mới exit 0, không còn reachable/package finding | Nâng đồng bộ toolchain Go 1.27.3 trên host/module/Docker/CI; backend development rebuilt, healthy; race 21 packages PASS, native P1 regression PASS 40 messages/4.000 samples + 1 replay, cleanup verified. P2.8b xác minh 0 reachable vulnerabilities. Module-only OpenPGP advisory không import/call được ghi riêng trong report | Toolchain blocker đã giải quyết; giữ regression |
+| HTTPS fixture certificate thiếu AKI/SKI/CA KeyUsage — **ĐÃ SỬA THEO DUYỆT** | Lượt đầu `paper-p2-perimeter-20261024-first` vẫn FAIL lịch sử (Missing Authority Key Identifier); lượt mới `paper-p2-perimeter-20261024-strict-tls` PASS cả HTTPS/Unix fail-closed, cleanup verified | Bổ sung extensions x509 v3 và strict TLS guards; `https_verified` chỉ ghi sau response được verify; không hạ CA/hostname/strict checks | Blocker certificate đã giải quyết; giữ regression |
+| Storage API có upstream-unavailable tạm thời sau rotation — **ĐÃ SỬA THEO DUYỆT** | Lượt cũ `ncs_26b92ecb5dcd` FAIL lịch sử tại `rotation_storage_new_and_old`; lượt mới ghi nhận readiness 503×4→200 và K2 503→200; container healthy không đủ chứng minh API qua Envoy đã sẵn sàng | Phân tách probe riêng K1/K2 và bounded retry (tối đa 20 attempts / 30s deadline) chỉ cho lỗi transport/readiness; full fixture `ncs_60a5e67bb655` và rerun sau reboot `ncs_fcd6c1c6f81a` đều PASS, cleanup 19 containers/1 network/7 volumes, private inputs đã xóa và chỉ giữ artifacts an toàn. Không nới JWT/RLS/TLS; không suy diễn status lượt cũ | Blocker chẩn đoán đã giải quyết; giữ bounded retry trong quy trình rotation |
+| Xử lý phản hồi tạm thời 503 trong rotation (Bounded transient 503 handling) | Phản hồi tạm thời 503 được quan sát thấy trong các probe readiness/rotation của Storage (503 × 4 → 200 ở bucket readiness và 503 → 200 ở K2 read); không khẳng định đã chứng minh được nguyên nhân gốc cấp thấp (như cơ chế kết nối Envoy-to-Storage khi recreate/startup) | Runner áp dụng bounded retry (tối đa 20 attempts / deadline 30s) chỉ cho các phản hồi transport/readiness tạm thời được nhận diện, tuyệt đối không retry lỗi auth/policy/TLS hay HTTP 200 sai nội dung. Không có cam kết zero downtime khi thực hiện rotation | Khi thiết kế quy trình rotation không gián đoạn hoặc HA cho Supabase Storage |
+| Cập nhật tĩnh Storage JWKS (Static Storage JWKS update) | Trong profile được kiểm thử, Supabase Storage (v1.74.0) nhận cấu hình static `JWT_JWKS` lúc khởi động; quy trình của profile đòi hỏi cập nhật cấu hình và recreate container Storage khi cập nhật khóa K2 hoặc loại bỏ K1 (không khái quát hóa rằng Storage v1.74.0 không hỗ trợ cơ chế nào khác trong mọi ngữ cảnh) | Quy trình rotation trong profile thực hiện cập nhật static JWKS cho Storage và recreate container (không dùng bảo đảm reload chưa kiểm chứng); phân định rõ Go tự động refresh JWKS theo chính sách cache nhưng Storage trong profile này được cấu hình lại và recreate riêng, tránh suy diễn mọi thành phần tự động refresh hoặc không bao giờ có thể refresh | Khi xem lại kiến trúc cấu hình Supabase Storage ngoài profile kiểm thử |
+| Hành vi phân quyền request-scoped (Request-scoped membership behavior) | Các request mới sau khi transaction thu hồi quyền trong `user_gateways` đã commit sẽ kiểm tra DB và bị từ chối; tuy nhiên không có cơ chế hủy (cancellation) các truy vấn đang thực thi dở dang (in-flight queries) tại DB khi quyền bị xóa đồng thời | Kiểm tra DB quyền trên mỗi request mới theo ngữ cảnh request-scoped, không lưu cache quyền dương giữa các request; chấp nhận các truy vấn in-flight tiếp tục hoàn tất theo transaction hiện thời | Khi có yêu cầu kiểm soát hủy giao dịch thời gian thực |
+| Giới hạn cache và hết hạn token (Cache/expiry limits) | Hệ thống không có session blocklist phân tán hay Redis; JWT access token K1 vẫn hợp lệ đến khi hết hạn `exp` cộng clock skew (30 giây thuộc fixture/default P2; khoảng cấu hình cho phép 0–5 phút) chừng nào K1 còn nằm trong JWKS; không có cơ chế thu hồi JWT tức thì (instant revocation) O(1) | Go verifier áp dụng hard freshness TTL 60 giây theo cấu hình paper profile (từ chối key nếu refresh thất bại quá TTL); tài liệu ghi rõ token hết hạn theo exp+skew và operator phải loại bỏ K1 khỏi JWKS sau khi hết cửa sổ overlap | Khi mở rộng sang kiến trúc session quản lý tập trung ngoài phạm vi MVP |
+| Tuyến truyền thông nội bộ HTTP mạng riêng (Private-network internal HTTP) | Tuyến Nginx/Go tải JWKS từ Envoy và tuyến Nginx gọi Unix socket subrequest / Envoy proxy nội bộ là HTTP/Unix trên mạng Docker riêng (trust boundary nội bộ), không phải TLS toàn tuyến (end-to-end TLS) | Định rõ trust boundary mạng riêng Docker nội bộ; chỉ có kết nối client → Nginx là HTTPS xác minh CA/SAN thật. Direct Go tắt trusted proxies, chỉ tin JWT Bearer | Khi triển khai môi trường multi-host hoặc zero-trust network |
+| Lưu trữ artifact tạm thời (Ephemeral artifact retention) | Các tệp artifact trong `/tmp` có tính tạm thời (ephemeral) và bị mất khi hệ thống reboot (như đã xảy ra với lượt chạy cũ `ncs_60a5e67bb655` trước khi chạy lại `ncs_fcd6c1c6f81a`) | Chạy lượt kiểm chứng độc lập sau reboot `ncs_fcd6c1c6f81a` lưu trữ artifacts đầy đủ; bảo toàn các ghi nhận lịch sử; artifacts chỉ chứa metadata an toàn, không chứa credentials; private inputs được dọn sạch | Khi cấu hình kho lưu trữ artifact tập trung (persistent artifact store) |
+| Hoàn tất bàn giao P2 mức Local MVP và ranh giới ngoài phạm vi (P2 Local MVP handoff completed & Out-of-scope boundaries) | Bàn giao P2 mức Local MVP đã hoàn tất (9 điều kiện hoàn thành đã tick và checkpoint AGENTS.md đã ghi nhận). Live rollout nằm ngoài phạm vi P2 (deployment mặc định vẫn là HS256/HTTP; kết quả RS256/perimeter thuộc profile cô lập); remote CI và board HIL (AM5728) giữ NOT RUN và không phải cổng bắt buộc của P2; commit/push chưa được yêu cầu và không phải điều kiện hoàn thành P2 | Dừng đúng ranh giới được giao; giữ đầy đủ tài liệu và bằng chứng nghiệm thu; giữ `STAGE5_ENABLED=false` tạm dừng sau 5.4, không mở P3 hay stage khác | Khi có yêu cầu mở giai đoạn tiếp theo hoặc triển khai live rollout ngoài P2 |
+
+## P1 metrics — nghiệm thu local baseline và bộ ghi đo (24/10/2026)
+
+Xem [report P1](../backend/paper-p1-metrics-and-baseline.md): lượt baseline và lượt đối chứng
+`metrics-off` đều PASS (`PAPER_P1_ACCEPTED`), cleanup verified 15 containers / 1 network / 6 volumes.
+Lượt FAIL lịch sử do runner đăng ký sai credential telemetry được giữ nguyên. Không suy P1 thành
+benchmark năng lực tối đa hay rollout production.
 
 | Giới hạn / quyết định | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
 | --- | --- | --- | --- |
-| Chưa có Gateway apply/durable dedup/result (5.5) và result transaction (5.6) | REST nhận intent và publisher có thể chuyển published, nhưng không chứng minh đổi tần số hoặc cập nhật configuration; raw response queue chưa có consumer | Giữ `STAGE5_ENABLED=false` trên shared/live, không bật điều khiển client; không gọi PUBACK là succeeded; không rollback desired khi timeout | Khi có yêu cầu tiếp tục Stage 5 từ 5.5 |
+| Lượt đầu FAIL do subscriber capture dùng sai credential Gateway — **ĐÃ SỬA THEO DUYỆT** | Lượt đầu vẫn FAIL lịch sử (`paper_p1_subscription_failed`); lượt sau đã PASS 40 messages/4.000 samples | Đã sửa subscriber sang data principal backend với filter `gateways/+/telemetry/#` có sẵn; giữ credential Gateway cho replay/ACK, thêm guard | Đã xử lý; giữ regression |
+| Khối lượng workload ngắn (40 batch) trên cùng host 12 vCPU khiến chênh lệch overhead nhỏ hơn nhiễu đo lường | Chưa đo được overhead tách biệt của instrumentation; wall window (~40,2s vs ~40,5s) và drain window (<3ms) dao động ngẫu nhiên | Ghi nhận "chưa kết luận được overhead", không tuyên bố zero overhead; giữ cặp lệnh `--metrics-off` để so sánh | Khi chạy benchmark tải cao ở P8 |
+| Percentile từ Histogram của backend có độ phân giải hữu hạn (Fixed Buckets) | Không thể suy diễn p50/p95/p99 thành một số mili-giây chính xác duy nhất | Báo cáo theo khoảng bucket chứa percentile (ví dụ Persist p50 trong `(10; 25] ms`); Gateway ACK giữ nearest-rank từ mẫu | Khi cần profiling chi tiết ở phase tối ưu |
+| Command dispatch E2E, result confirmation và WebSocket chưa có runtime | Không có số đo trễ toàn tuyến cho command và realtime ở P1 | Đánh dấu `not_implemented` (giá trị `null`) và `disabled` (command); giữ `STAGE5_ENABLED=false` | Khi P3/P6/P7 được giao thực hiện |
+
+## P0 testbed — nghiệm thu local có giới hạn (24/10/2026)
+
+Xem [report P0](../backend/paper-p0-baseline-and-testbed.md): lượt cuối
+`PAPER_P0_ACCEPTED`, 205 guards PASS, cleanup verified. Hai FAIL lịch sử giữ nguyên;
+không suy P0 thành benchmark, full CI hoặc rollout production.
+
+| Giới hạn | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Lượt đầu FAIL `paper_p0_read_failed` do runner tạo timezone `+00:00` thay vì contract `Z` — **ĐÃ SỬA THEO DUYỆT** | Lượt đầu vẫn FAIL lịch sử; lượt hai đã qua HTTP temporal 100 điểm và bracket 200/404/200 | Chỉ sửa serialization runner/test, không đổi parser/response API; xem report P0 | Đã xử lý trong runner; giữ regression |
+| Lượt hai FAIL ở Git `dubious ownership` với private HOME — **ĐÃ SỬA THEO DUYỆT** | Lượt hai vẫn exit 1 lịch sử; lượt cuối đã có revision/branch/dirty và summary đầy đủ | Chỉ trust đúng ROOT trong từng lệnh Git đọc, `--no-optional-locks`; không sửa global config/owner, không wildcard hoặc bỏ metadata. Lượt cuối exit 0 | Đã xử lý; giữ regression private HOME |
+| Snapshot chỉ là bốn cửa sổ stats rất ngắn | CPU làm tròn 0,00% không chứng minh không tốn CPU; chưa đo peak/throughput/tail latency | Bốn snapshot cuối đã lưu, tách service/quota và timestamp trong report; không dùng làm benchmark | Khi phase đo workload được giao |
+| Profile P0 dùng HTTP loopback, tất cả dịch vụ cùng Docker host | Không chứng minh HTTPS public hoặc topology nhiều máy/capacity mục tiêu paper | Chỉ user/token fixture dùng một lần, không tunnel; mô tả đúng mạng và tranh chấp host, giữ MQTT TLS/DynSec | HTTPS ở P2; tài nguyên/workload ở phase đo được giao |
+| Backend có quota 2 vCPU/4 GiB, DB/broker/Supabase chưa có quota riêng | Có tranh chấp host; không tương đương máy DB 4 core/8 GB và máy sinh tải 8 core/16 GB độc lập | Report công bố inspect thực và host 12 logical CPUs/16.681.447.424 byte RAM; giữ một backend, không suy hiệu năng từ snapshot | Khi chốt testbed cho workload ở phase đo được giao |
+| Một số upstream refs là version tags, không phải digest immutable | Rebuild tương lai có thể không bit-for-bit giống lượt P0 nếu tag đổi | Ghi exact image IDs/references trong report; không tự upgrade/pull, kiểm lại IDs và baseline trước khi so sánh | Trước lượt đo mới hoặc khi đổi image/toolchain |
+
+## Mốc Stage 5 tạm dừng sau Task 5.4 — 24/10/2026 (Lịch sử)
+
+> **Ghi chú phân định lịch sử:** Đây là checkpoint lịch sử tại thời điểm kết thúc Task 5.4 (24/10/2026). Sau đó, kế hoạch Paper **P3 (25/10/2026)** đã hoàn tất triển khai Task 5.5 (Gateway apply/dedup/result) và Task 5.6 (result consumer/transaction) trên simulator (xem mục P3 phía trên). Tuy nhiên, Stage 5 gốc vẫn chưa hoàn tất toàn bộ do phần board AM5728/HIL, full CI requirement lane và live rollout chưa thực hiện.
+
+Task 5.0–5.4 đã hoàn thành theo phạm vi duyệt tại mốc 24/10; các mục bên dưới phản ánh giới hạn lịch sử ở mốc bàn giao 5.4 trước khi P3 được thực hiện. Xem [bàn giao mốc 5.4](../backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
+
+| Giới hạn / quyết định | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+| --- | --- | --- | --- |
+| Chưa có Gateway apply/durable dedup/result (5.5) và result transaction (5.6) tại mốc 5.4 | REST nhận intent và publisher có thể chuyển published, nhưng chưa chứng minh đổi tần số hoặc cập nhật configuration; raw response queue chưa có consumer tại mốc 5.4 | Đã được giải quyết trên simulator qua P3; trên deployment chung tiếp tục giữ `STAGE5_ENABLED=false` do live rollout nằm ngoài phạm vi P3 | Khi triển khai live rollout Stage 5 |
 | Mosquitto trực tiếp, không global gate theo backend lifecycle | Backend lỗi/dừng không đóng broker; test gate legacy không phải bảo vệ deployment | TLS/auth/ACL broker và API/readiness fail-closed là contract được duyệt; component gate giữ riêng, không khôi phục supervisor chỉ để test xanh | Khi có yêu cầu nghiệp vụ mới về global isolation |
 | ACL verifier dùng manager có quyền quản trị | Đường code chỉ đọc không làm credential thành chỉ-đọc; readback theo connection lifetime không bảo đảm ACL không bị admin đổi giữa phiên | Tách data/manager principal, bảo vệ secret/private listener, phối hợp thay đổi ACL; runtime không tự sửa ACL | Trước rollout hoặc khi thay đổi chính sách quản trị broker |
 | Migration 23 và evidence chỉ trên fixture local | Có table locks; chưa chứng minh thời gian migration trên DB lớn, chưa migrate live hay remote CI/Stage 5 E2E/board | Preflight/backup/window trước deployment; lưu phạm vi PASS/NOT RUN tại handoff, không tự mở thêm ma trận sự cố tổng quát cho mốc này | Khi được yêu cầu rollout hoặc tiếp tục 5.7 |
@@ -113,7 +347,20 @@ Runner tích hợp API Stage 4 (`scripts/test-stage4-api.sh`), bộ kịch bản
 | Đơn hàng timestamp ties trong temporal history không bảo đảm thứ tự tuyệt đối | Khi nhiều observations có cùng microsecond timestamp, thứ tự trả về giữa các bản ghi cùng thời điểm là multiset (bảo toàn toàn bộ các hàng, không mất dữ liệu, nhưng không cam kết thứ tự xác định theo khóa phụ) | API giữ nguyên dữ liệu gốc từ CSDL; độ phân giải microsecond đủ mịn trong vận hành bình thường; client xử lý dữ liệu cùng timestamp như tập hợp đồng thời | Nếu có yêu cầu nghiệp vụ bổ sung đòi hỏi sắp xếp thứ tự phụ (như theo `sequence_num` hoặc UUID) |
 | Giới hạn quy mô đo lường hữu hạn (10 phút / 60.000 mẫu telemetry + 580 temporal observations) | Các số đo M1–M5 và hiệu quả nén (~80% buffer hit reduction trên chunk nén) chứng minh tính đúng đắn và độ trễ thấp (<60ms CSDL) cho tải demo 10 phút, nhưng chưa chứng minh cho quy mô dữ liệu nhiều tháng/năm hay tải đồng thời lớn | Giữ nguyên Schema 20 và các chỉ mục hiện có; không tạo continuous aggregates hay speculative index khi chưa có nhu cầu đo lường thực tế; đáp ứng trọn vẹn yêu cầu demo MVP | Khi mở rộng quy mô dữ liệu sau Giai đoạn 9 hoặc khi có báo cáo nghẽn hiệu năng thực tế |
 | Chưa chạy runtime trên bo mạch nhúng ARM và các khoảng trống môi trường sản xuất | Chỉ mới xác nhận biên dịch chéo (cross-build) ARMv7; chưa kiểm chứng runtime trên phần cứng nhúng (TI AM5728 / Luckfox Pico); container dùng chung tài nguyên host; CSDL kết nối nội bộ `sslmode=disable`; chưa có kiểm chứng độ bền mất điện đột ngột (power-loss durability) hay multi-node failover | Giữ nguyên cấu hình headless và network; kiểm thử trên thiết bị phần cứng thật tại checkpoint tích hợp thiết bị (Giai đoạn 9); môi trường hiện tại tuân thủ quy chế test-only theo `AGENTS.md` mục 0.5 | Checkpoint tích hợp thiết bị (Giai đoạn 9) hoặc khi chuẩn bị môi trường production |
-| Ranh giới tính năng tương lai: Stage 5 (Twin Downlink Control) và Stage 7 (WebSocket Realtime) | Giai đoạn 4 chỉ hoàn thành đọc dữ liệu lịch sử/Digital Twin và cập nhật metadata (POST/PATCH). Luồng điều khiển thiết bị (desired state, command, outbox, MQTT execution feedback) chưa được triển khai (thuộc Giai đoạn 5); luồng WebSocket realtime chưa triển khai (thuộc Giai đoạn 7, endpoint `/v1/ws` hiện là stub 501) | Không mở nút điều khiển hay gọi WebSocket trên client; phân định rõ ranh giới theo kế hoạch tổng thể (Stage 5 là downlink control, Stage 7 là WebSocket & Realtime) | Bàn giao sang Giai đoạn 5 (Twin Downlink Control) và Giai đoạn 7 (WebSocket) |
+| Ranh giới tính năng tương lai: Stage 5 (Twin Downlink Control) và Stage 7 (WebSocket Realtime) | Historical Task 4 checkpoint text: Stage 5/7 chưa triển khai khi tài liệu đó được lập. Current status: P3/P6 Local MVP implemented; P7 WebSocket Local MVP opt-in; default Nginx exact `/v1/ws` is 404, Go authenticated disabled handler 501. | Không dùng historical task snapshots làm current route/status; xem README, P7 report/protocol/runbook. | Current phase reports; P8/HIL/full CI/rollout remain open. |
+
+### P7 WebSocket telemetry — Local MVP limitations (27/10/2026)
+
+| Giới hạn / ảnh hưởng | Cách hiểu và workaround | Mốc xem lại |
+|---|---|---|
+| WS event stream và gap không bền vững; disconnect/restart/overflow/oversize có thể mất event; batch có thể đến muộn, không total order hoặc exactly-once. Gap-notice helper không đồng nghĩa runtime hiện đảm bảo phát frame gap. | Client refresh bounded REST temporal windows sau reconnect/suspected gap; overlap có giới hạn, không dùng timestamp như durable cursor. | P8 nếu được giao; giữ nguyên giới hạn cho đến khi có event log/cursor được phê duyệt. |
+| Per-session/global queue caps là logical queued/in-flight accounting, không phải peak RSS; viewer đo nhỏ, resource sampler thưa. | Giữ caps; không ngoại suy capacity/fairness/zero overhead. Cặp 0-vs-2 viewer là descriptive với pair audit source-qualified, không strict image-ID equivalence hay causal benchmark. | P8 capacity/soak nếu được giao. |
+| Membership recheck định kỳ (5s interval, 2s global sweep budget, concurrency 2) không phải thu hồi tức thì; không thu hồi frame đã gửi hoặc hoạt động đang chạy. | Fail-closed khi recheck lỗi; client reconnect và REST phải authorize lại. | Khi có yêu cầu latency/revocation target mới. |
+| Close-cause ring tối đa 32 observations; ghi first observed trigger/cause class và process-local timing, không chứng minh physical root cause. | Dùng để chẩn đoán symptom; đối chiếu logs/runtime evidence riêng, không gọi là root-cause telemetry. | Khi operator observability scope được giao. |
+| Slow viewer lane phân biệt viewer healthy A (1000 events), healthy B (0 vì namespace B không có ingest) và probe slow client; sau resume slow probe đọc hàng trăm frame. | Không diễn giải `healthy_viewer_b_events=0` thành `slow_viewer_events=0`; raw run giữ nguyên. | Đã được làm rõ trong P7 report/results. |
+| REST fixture oracle dùng max_points=256, không xác lập giới hạn universal; chia cửa sổ phù hợp cấu hình endpoint hiện hành. | Chỉ nhận giới hạn từ parser/config thực tế; fixture 400-point truncation history giữ nguyên. | Khi thay đổi API bounds. |
+| P6 recovery evidence chỉ restart backend khi broker ổn định; full Python discovery ghi nhận 3 failures + 4 errors do environment/trusted-ancestor và không chạy lại trong P7.11. | Giữ nguyên lịch sử FAIL/NOT RUN; không dùng làm P7 failure mới hay blanket PASS. | Full CI checkpoint tích hợp/release, không thuộc docs handoff. |
+| HIL/AM5728, physical sensor, full/remote CI, P8 capacity/soak và live rollout chưa chạy. | Giữ `WEBSOCKET_ENABLED=false`, `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false` deployment defaults; opt-in profile là HTTP local fixture. | Chỉ khi có yêu cầu mới, preflight và rollout gate riêng. |
 
 ### Cập nhật Quản trị Người dùng & Quyền Thành viên Gateway (Tasks U0–U8) — 19/10/2026
 
@@ -267,6 +514,40 @@ Bảng dưới đây ghi nhận trạng thái giải quyết và danh mục các
 
 ## 3. Danh Mục Tồn Đọng Theo Thứ Tự Ưu Tiên (Prioritized Backlog)
 
+### Giới hạn bàn giao P8 (29/10/2026)
+
+- **E5 fanout readiness (ảnh hưởng: chưa kết luận được điều kiện kích hoạt scan-vs-index).** Raw counters ghi indexed 20 so với scan 40 evaluation và event viewer đúng, nhưng adapter thận trọng không ghi `readiness_verified`; arm activation là `INCONCLUSIVE: fanout_viewer_readiness_unverified`. Cách xử lý: chỉ báo raw counters đã quan sát, không công nhận scan eligible/có lợi. Chỉ xem lại khi adapter chứng minh readiness và có lượt repeat so sánh được, được cho phép riêng.
+- **E5 command measurement window (ảnh hưởng: không thể tuyên bố latency command-phase hoặc zero-sample).** Command-window timeline được giữ ở trạng thái `INCONCLUSIVE: counter_field_missing_events`; snapshot đầu được lấy trước khi gửi command. Cách xử lý: null/unavailable, không phải zero và không thay bằng RTT. Xem lại trong task instrumentation/evidence được giao rõ ràng, không đổi nhãn pilot cũ.
+- **Nghiệm thu remote/official/physical (ảnh hưởng: mục tiêu paper/capacity và tuyên bố deployment chưa được chứng minh).** Remote A/B, remote CI, ≥3 official repeats độc lập, các rung high-load/capacity/soak đã chọn, TTL thực 600s, AM5728/HIL, cảm biến vật lý và live rollout còn NOT RUN; legacy supervisor/reloader CI jobs còn DEFERRED. Cách xử lý: giữ các tuyên bố pending và deployment flags false. Chỉ xem lại khi có cửa sổ máy/board/CI được cho phép và kế hoạch chạy có giới hạn.
+- **Phạm vi recovery (ảnh hưởng: DB restore không bảo đảm disaster-recovery hoặc HA toàn hệ thống).** P8.13 restore database trong cùng PostgreSQL cluster thuộc fixture; Auth/roles/broker/keys/socket được giữ riêng. Cách xử lý: chỉ gọi là database restore. Backup toàn platform, restore cluster độc lập, broker state và HA/failover không thuộc bằng chứng này. Xem lại theo yêu cầu recovery có phạm vi riêng.
+
+### Bổ sung Giới hạn Bàn giao P8 Helper CLI & E5 Matrix (31/10/2026)
+
+- **Ngữ nghĩa bộ so sánh thô vs Derived Reporting Projection (ảnh hưởng: công cụ so sánh cần giải quyết alias nhị phân kết hợp và cửa sổ khai báo).** Báo cáo remote E5 sử dụng 2 client binaries độc lập (`paperload` và `gateway`) với hash băm kết hợp `combined_binary_sha256` và lưu thời gian chạy thực tế wall-clock trong `phase_seconds`. Khi so sánh đối chiếu cấu hình, adapter công cụ báo cáo `scripts/paper_p8_comparison.py` ánh xạ có kiểm soát sang `declared_measurement_windows` và `combined_binary_sha256` mà không làm thay đổi các artifact native gốc.
+- **Tính đại diện của Pilot Matrix đơn repeat (ảnh hưởng: chưa phải bằng chứng hiệu năng/capacity chính thức).** Ma trận 6 arm E5 đạt PASS trên cùng host với 1 repeat duy nhất (seed 805) trên dataset pilot 35 KB; các chỉ số bộ đếm Gamma chỉ áp dụng cho thao tác đo lường cụ thể trong cửa sổ đo, không đại diện cho mức tăng tốc thông lượng hay giảm trễ toàn hệ thống.
+- **Ranh giới tiêu chuẩn P8:** `full_p8_accepted: false`, `physical_ab: NOT RUN`, `generator_colocated: true` (hoặc co-located network). Thử nghiệm trên cảm biến vật lý, AM5728/HIL, $\ge 3$ repeats độc lập và rollout live tiếp tục là NOT RUN.
+
+Liên kết bằng chứng: [báo cáo nghiệm thu P8](../backend/paper-p8-experiments-and-acceptance.md), [chỉ mục bằng chứng E5 31/10](../backend/results/p8/helper-e5-20261031/index.md), [overview an toàn](../backend/results/p8/overview.json), [summary recovery](../backend/results/p8/recovery-summary.json), [handbook công cụ tải](../backend/paper-p8-load-tools.md). Các mục này nêu qualification cho bằng chứng hiện tại theo source; không thay thế lịch sử FAIL/PARTIAL/NOT RUN.
+
+### Bổ sung Giới hạn Bàn giao P8 E2 Equal Samples Workload (31/10/2026)
+
+| Giới hạn / Điều chưa đo | Ảnh hưởng | Workaround hiện tại | Khi xem lại |
+|---|---|---|---|
+| Cặp native Attempt 4 đơn lẻ phát sinh retry (Contaminated single native pair) | Lượt chạy phát sinh retry ở cả hai profile (S100: A=1, B=1; S1: A=11, B=10) khiến `clean_comparison=false` và trạng thái là `CONTAMINATED`; nguyên nhân chưa xác định (`unknown means unknown`). Không thể kết luận quan hệ nhân quả về hiệu năng hay tuyên bố tốc độ tăng tốc (`headline_speedup` là `UNAVAILABLE`) | Báo cáo trung thực số liệu thô và gắn nhãn `CONTAMINATED`; chỉ số dung lượng payload tầng ứng dụng per sample đạt tỉ lệ 0,030783 (`backend_admitted_attempt_bytes`), không tuyên bố profile nào chiến thắng | Khi có điều kiện đo lặp lại ($\ge 3$ repeats) trên môi trường cô lập cao hơn |
+| Thiếu bộ đếm DBtx và CPU server thưa (Missing DBtx retained counter & sparse server CPU) | Sampler rút gọn của Attempt 4 không lưu bộ đếm `confirmed_commits` của Go backend nên `db_transactions_per_sample` là `INCONCLUSIVE` (dưới microbatch, ledger != transactions). Docker stats chu kỳ ~8s kết thúc ở snapshot 8 trước khi ghi nhận ranh giới commit cuối cùng nên `active_cpu_seconds_per_sample` và `lifecycle_cpu_seconds_per_sample` là `INCONCLUSIVE` | Đánh dấu tường minh `INCONCLUSIVE` kèm lý do kỹ thuật; chỉ báo cáo số dòng ledger per sample (1.0 vs 0.01) và payload bytes per sample; không nội suy CPU | Khi nâng cấp sampler để lưu bộ đếm transaction thực và gắn ranh giới commit |
+| Thiếu delta ticks CPU generator do tiến trình xuất hiện động (Generator process-change delta gaps) | Cửa sổ active trên Host B chứa Sample 1 (1.002s) có `delta_ticks=None` do tiến trình con xuất hiện lúc khởi động (`process_appeared`); sampler chỉ cộng các delta hợp lệ nên `generator_active_cpu_seconds_per_sample` và `generator_lifecycle_cpu_seconds_per_sample` là `INCONCLUSIVE` | Đánh dấu `INCONCLUSIVE` theo chuẩn fail-closed; ghi nhận riêng số đo một phần `partial_observed_generator_lifecycle_cpu_seconds` (8,56s cho S1 vs 5,19s cho S100); các tỉ lệ CPU generator là `UNAVAILABLE` | Khi hoàn thiện cơ chế thu thập delta ticks xuyên suốt mọi trạng thái tiến trình |
+| Giới hạn sampler cap 128/120 không chứng minh trọn vẹn vòng đời | Dung lượng bộ đệm sampler (128 snapshots cho server, 120 cho generator) không bảo đảm bao phủ toàn bộ vòng đời nếu workload chạy kéo dài (120s phát + 20s drain + grace) | Giữ thời lượng workload trong giới hạn kiểm định (60s) và kiểm tra cờ ranh giới snapshot; không tuyên bố đã chứng minh vòng đời 120+20s | Khi thiết kế bộ đếm buffer động theo cấu hình workload |
+| Gọi CLI trực tiếp không có cấu hình HTTPS gặp lỗi endpoint string | Chạy trực tiếp `native_compose_smoke.py --paper-p8-e2` thiếu cấu hình HTTPS sẽ gặp lỗi `AttributeError` do endpoint ở dạng chuỗi ký tự (`str`) thay vì đối tượng `HTTPSEndpoint` | Sử dụng quy trình vận hành held server lifecycle chính thức (`paper_p8_server.py serve` kết hợp các lệnh điều khiển theo pha đã kiểm chứng); không chạy lệnh trực tiếp chưa cấu hình | Khi chuẩn hóa lớp đối tượng endpoint trong CLI trực tiếp |
+| Ranh giới kiểm chuẩn chưa thực hiện (NOT RUN) | Chưa chứng minh môi trường hai máy vật lý độc lập qua mạng (`physical_ab: NOT RUN`), chưa chạy lặp lại $\ge 3$ lần, chưa kiểm thử trên phần cứng nhúng HIL (AM5728), full CI từ xa và triển khai live rollout | Giữ nguyên metadata `generator_colocated='unverified'` (`same-host/unverified`), phân biệt với các lượt legacy cũ từng ghi `true`; deployment flags tiếp tục giữ `false`; dừng tại mốc ES.7 Local MVP | Chỉ khi có kế hoạch và tài nguyên phê duyệt riêng; không tự động mở các bước tiếp theo |
+
+### Bổ sung Tối ưu Hạ tầng Cơ sở Dữ liệu & Bàn giao E2 Official (09/11/2026)
+
+- **Tháo gỡ nghẽn I/O WAL dài hạn:** Cấu hình PostgreSQL (`docker-compose.yml`) với `min_wal_size=512MB`, `max_wal_size=2GB`, `wal_buffers=64MB`, `checkpoint_completion_target=0.9` và `checkpoint_timeout=15min` đã giải quyết triệt để sự cố `WALInitSync` kéo dài sau giây thứ 20. Độ trễ `commit` giảm từ 12,50 ms xuống 1,14–1,17 ms/group; đĩa `sda` chỉ bận 2,9% thay vì 15,8%.
+- **Tháo gỡ nghẽn Trigger Khóa ngoại khi COPY qua Migration 25:** Migration 25 (`000025_drop_telemetry_sensor_fk`) gỡ bỏ `fk_telemetry_sensor` trên hypertable `telemetry`, loại trừ System Trigger `RI_FKey_check_ins` trên từng dòng dữ liệu đo lường. Thời gian `copy` 500 mẫu ($S=100$) giảm từ 25,52 ms xuống ~3,8 ms; ngữ nghĩa `ON DELETE/UPDATE RESTRICT` được bảo toàn nguyên vẹn qua trigger đảo chiều `trg_sensors_restrict_telemetry` trên bảng `sensors`.
+- **Ranh giới an toàn vận hành:** Khi chạy kịch bản thử nghiệm thông qua runner, trần an toàn đĩa vẫn là `disk_growth_bytes = 10 GiB` (~50 phút chạy liên tục ở 2.000 msg/s). Khi triển khai production 24/7, hệ thống cần kích hoạt chính sách nén/dọn dẹp dữ liệu của TimescaleDB (Compression/Retention Policy) và điều chỉnh autovacuum bảng `digital_twin_state` để tránh Dead Tuples Bloat.
+
+Liên kết bằng chứng: [Chỉ mục Bằng chứng E2 equal_samples](../backend/results/p8/e2-equal-samples-20261031/index.md), [Bản tóm tắt JSON](../backend/results/p8/e2-equal-samples-20261031/summary.json), [runbook E2](../backend/paper-p8-e2-remote-gate.md). Không tự động triển khai công việc tiếp theo.
+
 | Thứ Tự | Hạng Mục Công Việc | Mức Độ Rủi Ro / Ảnh Hưởng | Hướng Hiện Thực Đề Xuất |
 |:---:|---|---|---|
 | **P1** | **Xác thực lưu trữ mật khẩu sau Rotate (ROT2 Verifier) & Nghiệm thu Khởi động lại (T10)** | Rủi ro nạp lại mật khẩu cũ nếu broker crash sau khi rotate; thiếu bằng chứng E2E cho T10. | Hiện thực bộ đọc phân tích hash mật khẩu mới trên snapshot `dynamic-security.json` trước khi finalize DB; bổ sung test case native khởi động lại Mosquitto container và xác minh kết nối. |
@@ -274,12 +555,41 @@ Bảng dưới đây ghi nhận trạng thái giải quyết và danh mục các
 | **P3** | **Hiện thực luồng Supervised Reset khả dụng với kiểm tra Tĩnh Lặng (T07)** | Hiện tại reset hợp lệ bị từ chối fail-closed tại prerequisite 503 (deny-only); thiếu quy trình tĩnh lặng để phục hồi khi gặp sự cố bất định hoặc mất secret. | Xây dựng quy trình `ResetPrerequisite` có giám sát của operator với kiểm tra tĩnh lặng (quiescence) của tiến trình backend quản trị cũ / các đột biến MQTT in-flight và tĩnh lặng luồng quản trị (management path quiescence), đảm bảo không stale overwrite, retain audit và không secret replay. |
 | **P4** | **Kiểm định Build Parity trên Dockerfile gốc cho DynSec (T11)** | Smoke full-HTTP đã build `src/Dockerfile`, nhưng diễn tập DynSec dùng nhị phân tĩnh từ host chưa kế thừa bằng chứng parity. | Kiểm tra tính tương đương của bản build `src/Dockerfile` chính thức trên toàn bộ kịch bản đột biến DynSec. |
 | **P5** | **Bổ sung kiểm thử End-to-End Telemetry Ingress & DB-Commit ACK (T01 / M04)** | Observer session chỉ mới chứng minh không bị ngắt; chưa chứng minh nhận tin và lưu vào TimescaleDB qua application-level ACK. | Viết test case client gửi telemetry batch và xác nhận nhận được application DB-commit ACK trên `gateways/<id>/acks/#` sau khi dữ liệu đã commit vào TimescaleDB. |
-| **P6** | **Mở rộng và kiểm chứng Ma trận ACL Backend cho Digital Twin Downlink (T02)** | `backend_service` hiện chưa có quyền gửi `commands/#` và chưa thể nhận `responses/#`, `status`; chưa thể triển khai điều khiển thiết bị hai chiều. | Mở rộng role `bootstrap_backend` trong script bootstrap và store để cấp quyền `publishClientSend` trên `gateways/+/commands/#`, `subscribeLiteral` / `publishClientReceive` trên `gateways/+/responses/#` và `gateways/+/status`; thiết lập kiểm thử phân quyền tích hợp. |
+| **P6** | **Mở rộng và kiểm chứng Ma trận ACL Backend cho Digital Twin Downlink (T02) — finding lịch sử, superseded bởi Stage 5/P3–P6** | Mô tả “backend_service hiện chưa có quyền” thuộc checkpoint cũ, không phải trạng thái runtime hiện hành. | Stage 5/P3–P6 đã nối command/result flow và ACL theo profile fixture; xem [P6 report](../backend/paper-p6-dispatch-and-mixed-load.md). Không chạy/sửa ACL theo đề xuất lịch sử nếu chưa có yêu cầu riêng; Stage 5 live vẫn chưa được nghiệm thu. |
 | **P7** | **Hoàn tất rà soát độc lập (Independent Reviewer Gate)** | Điều kiện tiên quyết trước khi nghiệm thu toàn bộ Task 2.8. | Chuyển giao mã nguồn và tài liệu cho reviewer độc lập thẩm định. |
+| **P8** | **F-01 cleanup independence — ĐÃ XỬ LÝ HẸP TRONG P6** | Mô tả failure dưới đây giữ nguyên lịch sử: `finally` block khi đó chỉ bắt `RuntimeError`; `TimeoutExpired`/`OSError` có thể ngắt sớm và rò rỉ tài nguyên. | Regression Python tiêm lỗi cleanup/setup; native credential path kiểm tra normal cleanup. Không tuyên bố native fault-injected cleanup. Xem [P6 report](../backend/paper-p6-dispatch-and-mixed-load.md). |
+| **P9** | **F-02 current writer/schema — ĐÃ XỬ LÝ HẸP TRONG P6** | Mô tả schema-23 mismatch và lỗi SQL giữ nguyên như failure lịch sử. | Fixture giữ assertions schema 23, current writer chạy schema 24; 18 required native intent tests PASS, không SKIP. Historical schema-23 failure không đổi trạng thái. Xem [P6 report](../backend/paper-p6-dispatch-and-mixed-load.md). |
+| **P10** | **F-03 TestTimelineMetrics synchronization — ĐÃ XỬ LÝ HẸP TRONG P6** | Mô tả race/QueueWait count failure giữ nguyên như lịch sử. | Retry test dùng barriers; final full local Go race PASS theo qualification P6. Historical full-suite FAIL vẫn được bảo toàn; không tuyên bố đã chứng minh mọi interleaving. Xem [P6 report](../backend/paper-p6-dispatch-and-mixed-load.md). |
 
 ---
 
 ## 4. Bảng Đối Chiếu Ma Trận Nghiệm Thu Có Giới Hạn T01–T12 (Bounded Acceptance Closeout Mapping)
+
+## P8 — Local tooling/checkpoint closeout và giới hạn paper (05/11/2026)
+
+BS.9b đã đồng bộ tài liệu dựa trên source-qualified reports và artifact có sẵn;
+không chạy thêm benchmark, không sửa code/deployment và không gộp các fingerprint
+khác nhau thành một source. BS.1, BS.2 và BS.6 local-tooling criteria được đóng
+theo bounded MVP evidence; official native experiments và các phần liệt kê dưới
+đây chưa hoàn tất. Xem [báo cáo P8](../backend/paper-p8-experiments-and-acceptance.md)
+và [kế hoạch chi tiết P8](../../../docs/backend_plan/paper/P8_detail_plan.md).
+
+| Giới hạn / phần chưa chạy | Ảnh hưởng | Cách xử lý hiện tại | Khi xem lại |
+|---|---|---|---|
+| P8 local pilots phần lớn colocated; physical A/B, remote CI và HIL chưa chạy | Không chứng minh tải qua hai host, năng lực mạng/host thật, AM5728 hoặc cảm biến vật lý | Giữ `generator_colocated=true`/`physical_ab=NOT RUN` theo run; deployment flags giữ false; không tuyên bố full P8 | Khi chạy official experiments trên máy B và có thiết bị/CI được phê duyệt |
+| E1 có native 2.000-viewer finite run và portable64 sau E1R repair; 5k/10k chỉ contract/preflight | Không là capacity/fairness/soak result; content audit bị giới hạn sampling; native 2.000 predates held-callback fix | Báo riêng theo run: 2.000/2.000 viewers, 16.665/16.665 deliveries, 20 ACK, DB 20/2.000/20/0, cleanup 12/1/5; portable64 530/530 delivery và collector 0 error. Giữ `full_p8_accepted=false`, physical A/B NOT RUN; xem [E1R report](../backend/paper-p8-experiments-and-acceptance.md#e1r7--sửa-luồng-large-viewer) | Khi được giao chọn rung tải lớn hoặc A/B vật lý |
+| E2 high rates, equal-samples clean comparison và extended soak chưa nghiệm thu | Hai official held-portable 100 msg/s/1s sample profiles là bounded correctness/accounting runs, không phải equal-sample speedup/capacity; retry và finite windows giới hạn headline performance | Giữ accounting S=100/S=1 riêng, actual retry/admitted/committed/pending; không gọi payload bytes là wire bytes. Xem [R0–R5 report](../backend/paper-p8-experiments-and-acceptance.md#r5b-checkpoint-2026-11-06) | Chỉ khi được giao clean equal-samples/high-rate/soak run với windows phù hợp |
+| E3 official 30-command stream dưới tải chưa chạy | Native portable three-command low-load không chứng minh storm/burst overlap; client RTT không thay server-origin timeline | Runbook update không chạy native E3 và không nâng qualification; giữ 3-command evidence tách biệt, E3 timeline 30/10, burst overlap/official30 là NOT RUN | Khi chạy workload E2 đã chọn cùng 30-command stream |
+| E4 real wall-clock TTL 600s, full raw enumeration và Γ_red performance claim chưa nghiệm thu | Held-portable 1000/100 cache-on/off PASS xác nhận warm-subset lifecycle và ACK/DB accounting; raw identity proof chỉ sample 10 IDs/sensor, không full enumeration hoặc TTL expiry | Giữ 250 msg/s pending-cap FAIL và 100/10 **outer report** FAIL (phase import validated; fixed 20/10 report guard, server exit 1); không tăng pending cap 64, không suy latency benefit, giữ TTL NOT RUN. Xem [R0–R5 report](../backend/paper-p8-experiments-and-acceptance.md#r5b-checkpoint-2026-11-06) | Khi được yêu cầu full raw audit hoặc expiry run |
+| E5 full six-arm repeat aggregation / performance conclusions chưa có | Portable representative 8/2 optimized-vs-ram_dedup_off pair PASS/comparable nhưng chỉ hai arms; không đủ làm six-arm repeat, ba-repeat aggregate hay causal performance claim. Historical Nov 5 six-arm pilot vẫn có shaper activation inconclusive và orchestration timeout. | Aggregate CLI nhận 3–10 structurally qualified six-arm summaries; không phải cryptographic attestation. Giữ lịch sử startup/DB-delta/raw/viewer/source failures, shaper inconclusive và timeout; không gán nguyên nhân unknown DB delta hoặc nâng `full_p8_accepted`. Xem [R0–R5 report](../backend/paper-p8-experiments-and-acceptance.md#r5b-checkpoint-2026-11-06) | Khi có yêu cầu rõ ràng cho đủ six-arm repeats/aggregate và nguồn lực được duyệt |
+| Resource snapshots thưa và bounded | Không đo peak RSS/continuous host behavior hoặc capacity | Diễn giải như quan sát cửa sổ; không suy hard memory bound từ logical bytes | Khi có mục tiêu profiling/capacity được giao |
+
+Các FAILED/PARTIAL lịch sử vẫn giữ nguyên. P8 tooling/checkpoint đã đóng ở phạm vi
+Local MVP, không phải official paper acceptance; official native E1–E5 runs, physical A/B,
+remote GitHub CI, TTL 600s, AM5728/HIL, physical sensors và rollout vẫn NOT RUN.
+Không tự mở P9/Stage 6.
+
+---
 
 ### 4.1 Bối cảnh đóng mốc Giai đoạn 2 (Stage 2 Pragmatic Closeout Context)
 - Theo yêu cầu và định hướng của người dùng nhằm khắc phục chậm trễ tiến độ đồ án, Giai đoạn 2 (Stage 2) được ghi nhận **đóng mốc có giới hạn (bounded scope closeout recorded under user intent)** với các ngoại lệ kỹ thuật và khoảng trống còn lại được ghi nhận minh bạch và khoanh vùng rõ ràng, phục vụ việc chuyển tiếp sang Giai đoạn 3.

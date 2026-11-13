@@ -12,7 +12,10 @@ import (
 
 	"iot-platform/internal/auth"
 	"iot-platform/internal/config"
+	"iot-platform/internal/digitaltwin"
 	"iot-platform/internal/httpapi"
+	"iot-platform/internal/metrics"
+	"iot-platform/internal/telemetryws"
 	"iot-platform/internal/usermanagement"
 )
 
@@ -23,6 +26,14 @@ type ReadinessChecker interface {
 
 // RouterDependencies contains the mandatory HTTP boundary dependencies.
 type RouterDependencies struct {
+	MetricsEnabled             bool
+	MetricsSnapshot            func() any
+	ControlMetrics             *digitaltwin.ControlMetrics
+	ControlTimeline            *metrics.ControlTimeline
+	HTTPMetrics                *HTTPMetrics
+	AuthMetrics                *auth.Metrics
+	UnixAuthMetrics            *auth.Metrics
+	UnixAuthDuration           *metrics.Histogram
 	ControlAPIEnabled          bool
 	ControlRequestTimeout      time.Duration
 	ControlRepository          ControlRepository
@@ -41,6 +52,8 @@ type RouterDependencies struct {
 	AdminInventoryMaxLimit     int
 	AdminMaxBodyBytes          int64
 	CredentialAPIEnabled       bool
+	WebSocketEnabled           bool
+	WebSocketHandler           *telemetryws.Handler
 	CredentialRequestTimeout   time.Duration
 	CredentialManager          CredentialManager
 	CredentialStartupReadiness CredentialStartupReadiness
@@ -67,6 +80,9 @@ type RouterDependencies struct {
 // NewRouter creates the backend HTTP routes and fails closed when an
 // authentication dependency is absent.
 func NewRouter(deps RouterDependencies) (http.Handler, error) {
+	if deps.MetricsEnabled && deps.MetricsSnapshot == nil {
+		return nil, fmt.Errorf("enabled metrics requires snapshot source")
+	}
 	if err := validateControlDependencies(deps); err != nil {
 		return nil, fmt.Errorf("invalid control API dependencies: %w", err)
 	}
@@ -78,6 +94,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	if auth.IsNilDependency(deps.TokenVerifier) {
 		return nil, fmt.Errorf("token verifier is required")
+	}
+	if deps.WebSocketEnabled && deps.WebSocketHandler == nil {
+		return nil, fmt.Errorf("enabled websocket requires owned handler")
 	}
 	if auth.IsNilDependency(deps.PlatformAdminChecker) {
 		return nil, fmt.Errorf("platform admin checker is required")
@@ -167,7 +186,27 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 
 	router := gin.New()
+	if deps.ControlTimeline != nil {
+		router.Use(func(c *gin.Context) {
+			if c.Request.Method == http.MethodPatch && c.FullPath() == "/v1/digital-twins/:entity_id/desired-state" {
+				c.Request = c.Request.WithContext(metrics.WithControlHTTPEntry(c.Request.Context(), time.Now()))
+			}
+			c.Next()
+		})
+	}
+	if err := router.SetTrustedProxies(nil); err != nil {
+		return nil, fmt.Errorf("disable untrusted proxy headers: %w", err)
+	}
+	if deps.HTTPMetrics != nil {
+		router.Use(deps.HTTPMetrics.middleware())
+	}
 	router.HandleMethodNotAllowed = true
+	router.Use(func(c *gin.Context) {
+		if c.Request.URL.Path == "/v1/admin/metrics" {
+			c.Header("Cache-Control", "no-store")
+		}
+		c.Next()
+	})
 	router.Use(
 		httpapi.RequestIDMiddleware(),
 		adminGatewayCacheMiddleware(),
@@ -221,6 +260,13 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		httpapi.WriteError(c, http.StatusNotImplemented, "not_implemented", "endpoint not implemented")
 	}
 	groups := newRouteGroups(router, deps)
+	groups.admin.GET("/metrics", func(c *gin.Context) {
+		if !deps.MetricsEnabled {
+			httpapi.WriteError(c, http.StatusNotFound, "not_found", "resource not found")
+			return
+		}
+		c.JSON(http.StatusOK, deps.MetricsSnapshot())
+	})
 	registerCredentialRoutes(groups.admin, deps)
 	groups.admin.GET("/gateways", listAdminGateways(deps.AdminGatewayLister, deps.AdminInventoryDefaultLimit, deps.AdminInventoryMaxLimit))
 	groups.admin.PUT("/gateways/:gateway_id", provisionGateway(deps.GatewayProvisioner, deps.AdminMaxBodyBytes))
@@ -236,7 +282,11 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	authenticated.GET("/gateways", listGateways(deps.GatewayReader))
 	authenticated.GET("/gateways/:gateway_id/sensors", listSensors(deps.SensorReader))
 	authenticated.PUT("/gateways/:gateway_id/sensors/:sensor_id", provisionSensorForOwner(deps.OwnerSensorProvisioner, deps.AdminMaxBodyBytes))
-	authenticated.GET("/ws", notImplemented)
+	if deps.WebSocketEnabled {
+		router.GET("/v1/ws", auth.WSAuthenticationMiddleware(deps.TokenVerifier, deps.AuthMetrics), deps.WebSocketHandler.ServeHTTP)
+	} else {
+		authenticated.GET("/ws", notImplemented)
+	}
 	authenticated.GET("/digital-twins", listDigitalTwins(deps.TwinListReader, deps.TwinQueryParser))
 	authenticated.POST("/digital-twins", postDigitalTwin(deps.EntityCreator, deps.TwinMaxBodyBytes))
 	authenticated.GET("/digital-twins/:entity_id", getDigitalTwinDetail(deps.TwinDetailReader, deps.TwinStateReader, deps.TwinQueryParser))
@@ -257,7 +307,7 @@ type routeGroups struct {
 }
 
 func newRouteGroups(router *gin.Engine, deps RouterDependencies) routeGroups {
-	authenticated := router.Group("/v1", auth.AuthenticationMiddleware(deps.TokenVerifier))
+	authenticated := router.Group("/v1", auth.AuthenticationMiddleware(deps.TokenVerifier, deps.AuthMetrics))
 	admin := authenticated.Group("/admin", auth.PlatformAdminMiddleware(deps.PlatformAdminChecker, deps.AuthorizationTimeout, slog.Default()))
 	return routeGroups{authenticated: authenticated, admin: admin}
 }

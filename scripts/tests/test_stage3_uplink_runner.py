@@ -16,11 +16,53 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/tests'))
 
 import stage3_uplink_runner as R  # noqa: E402
+
+
+class OwnedImageTests(unittest.TestCase):
+    def test_existing_tag_never_builds_or_becomes_owned(self):
+        owned = {}
+        with patch.object(R, 'image_absent', return_value=False), patch.object(R, 'build_image') as build:
+            with self.assertRaisesRegex(RuntimeError, 'collision'):
+                R.build_owned_image('backend', 'fixture-tag', owned)
+        self.assertEqual(owned, {})
+        build.assert_not_called()
+
+    def test_cleanup_untags_owned_reference_not_shared_image_id(self):
+        image_id = 'sha256:' + 'a' * 64
+        obj = {'Id': image_id, 'Config': {'Labels': {'io.iot.stage3-image-tag': 'fixture-tag'}}}
+        with patch.object(R, 'image_absent', side_effect=[False, True]), \
+                patch.object(R, 'docker', return_value=json.dumps([obj]).encode()) as docker:
+            self.assertEqual(R.cleanup_owned_images({'fixture-tag': image_id}), [])
+        self.assertIn(['image', 'rm', 'fixture-tag'], [c.args[0] for c in docker.call_args_list])
+        self.assertFalse(any('-f' in c.args[0] or image_id in c.args[0] for c in docker.call_args_list))
+
+    def test_changed_tag_never_authorizes_removal(self):
+        obj = {'Id': 'sha256:' + 'b' * 64, 'Config': {'Labels': {'io.iot.stage3-image-tag': 'fixture-tag'}}}
+        with patch.object(R, 'image_absent', return_value=False), \
+                patch.object(R, 'docker', return_value=json.dumps([obj]).encode()) as docker:
+            self.assertTrue(R.cleanup_owned_images({'fixture-tag': 'sha256:' + 'a' * 64}))
+        self.assertFalse(any(c.args[0][:2] == ['image', 'rm'] for c in docker.call_args_list))
+
+    def test_partial_build_tag_requires_ownership_label(self):
+        obj = {'Id': 'sha256:' + 'a' * 64, 'Config': {'Labels': {'io.iot.stage3-image-tag': 'foreign'}}}
+        with patch.object(R, 'image_absent', return_value=False), \
+                patch.object(R, 'docker', return_value=json.dumps([obj]).encode()) as docker:
+            self.assertTrue(R.cleanup_owned_images({'fixture-tag': None}))
+        self.assertEqual(docker.call_count, 1)
+
+    def test_remaining_tag_or_daemon_error_vetoes_success(self):
+        obj = {'Id': 'sha256:' + 'a' * 64, 'Config': {'Labels': {'io.iot.stage3-image-tag': 'fixture-tag'}}}
+        with patch.object(R, 'image_absent', return_value=False), \
+                patch.object(R, 'docker', return_value=json.dumps([obj]).encode()):
+            self.assertTrue(R.cleanup_owned_images({'fixture-tag': obj['Id']}))
+        with patch.object(R, 'image_absent', side_effect=RuntimeError('daemon unavailable')):
+            self.assertTrue(R.cleanup_owned_images({'fixture-tag': obj['Id']}))
 
 
 class ScenarioContractTests(unittest.TestCase):
@@ -496,6 +538,13 @@ class ProbeBatchTests(unittest.TestCase):
         self.assertTrue(R.probe_batch_is_valid(payload, a))
         # The same payload is not valid for another Gateway.
         self.assertFalse(R.probe_batch_is_valid(payload, b))
+        v7 = R.build_probe_batch(a, '00000000-0000-7000-8000-000000000010',
+                                 '00000000-0000-4000-8000-000000000020', R.FIRST_SEQUENCE)
+        self.assertTrue(R.probe_batch_is_valid(v7, a))
+        for unsupported in ('00000000-0000-1000-8000-000000000010',
+                            '00000000-0000-5000-8000-000000000010'):
+            self.assertFalse(R.probe_batch_is_valid(R.build_probe_batch(a, unsupported,
+                '00000000-0000-4000-8000-000000000020', R.FIRST_SEQUENCE), a))
 
     def test_probe_batch_rejects_malformed_payloads(self):
         a, _ = R.default_specs()

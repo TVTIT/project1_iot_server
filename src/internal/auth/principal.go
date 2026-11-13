@@ -2,6 +2,8 @@
 package auth
 
 import (
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -12,6 +14,10 @@ const principalContextKey = "authenticated_principal"
 type Principal struct {
 	UserID uuid.UUID
 	Role   string
+	// ExpiresAt is the verified JWT exp instant in UTC, without applying
+	// verifier clock skew. Session deadlines must close at this instant; skew
+	// permits request verification only and does not extend a session.
+	ExpiresAt time.Time
 }
 
 // SetPrincipal stores a verified principal without retaining the raw token.

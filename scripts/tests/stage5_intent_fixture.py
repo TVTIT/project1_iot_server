@@ -36,6 +36,63 @@ def verify(fixture):
         print(output.decode(), flush=True)
 
 
+def verify_schema_24(fixture):
+    fixture.sql(b"""DO $$ BEGIN
+        IF (SELECT max(version) FROM public.schema_migrations) <> 24
+           OR NOT EXISTS (SELECT 1 FROM public.schema_migrations
+                          WHERE version=24 AND name='telemetry_ledger_timestamp') THEN
+            RAISE EXCEPTION 'Migration 24 is not the exact schema terminal';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema='public' AND table_name='processed_messages'
+                         AND column_name='timestamp' AND data_type='timestamp with time zone') THEN
+            RAISE EXCEPTION 'Migration 24 processed_messages.timestamp guard missing';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conrelid='public.processed_messages'::regclass
+                         AND conname='processed_messages_pkey' AND contype='p'
+                         AND pg_get_constraintdef(oid)='PRIMARY KEY (gateway_id, message_id)') THEN
+            RAISE EXCEPTION 'Migration 24 ID guard missing';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_index i
+                       JOIN pg_class c ON c.oid=i.indexrelid
+                       WHERE c.oid='public.processed_messages_gateway_sensor_message_timestamp'::regclass
+                         AND i.indisunique AND i.indisvalid
+                         AND pg_get_indexdef(i.indexrelid) LIKE
+                           '%(gateway_id, sensor_id, message_id, "timestamp")%') THEN
+            RAISE EXCEPTION 'Migration 24 Tier-2 timestamp index guard missing';
+        END IF;
+    END $$;""")
+    print('Migration 24 terminal/timestamp/ID/Tier-2 guards: PASS', flush=True)
+
+
+def verify_hardening_parent_scope(fixture):
+    """A same-name constraint elsewhere must not hide a missing parent pair.
+
+    Rename, rather than drop, the fixture FK so enforcement remains intact.
+    The psql connection rolls this transaction back on the expected error;
+    the verifier also rolls back if a broken guard incorrectly succeeds.
+    """
+    guard = (ROOT / 'scripts/sql/verify-schema-hardening.sql').read_bytes()
+    _, output = fixture.sql(b"""BEGIN;
+        ALTER TABLE public.twin_entities RENAME CONSTRAINT
+            fk_twin_entities_gateway TO p3_guard_hidden_gateway_fk;
+        CREATE TABLE public.p3_guard_wrong_parent (
+            id integer CONSTRAINT fk_twin_entities_gateway CHECK(id > 0));
+        """ + guard, expect=False)
+    if b'expected 9 hardening constraints, found 8' not in output:
+        raise RuntimeError('hardening verifier did not reject missing parent pair')
+    fixture.sql(b"""DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conrelid='public.twin_entities'::regclass
+                         AND conname='fk_twin_entities_gateway')
+           OR to_regclass('public.p3_guard_wrong_parent') IS NOT NULL THEN
+            RAISE EXCEPTION 'Hardening negative check did not roll back';
+        END IF;
+    END $$;""")
+    print('Hardening parent-pair refusal with same-name decoy: PASS; rollback verified', flush=True)
+
+
 def native(fixture, binary):
     docker_cp(fixture, binary, '/tmp/control.test')
     output = docker_exec(fixture, ['sh', '-c',
@@ -105,9 +162,14 @@ def scenario(kind, binary):
         if kind == 'fresh':
             migrate(fixture, 23)
             verify(fixture)
+            verify_hardening_parent_scope(fixture)
+            # Keep the migration-23 verifier and historical assertions on their
+            # original terminal; the current telemetry writer requires schema 24.
+            run_existing_migration_runner(fixture, 24)
+            verify_schema_24(fixture)
             native(fixture, binary)
             run_existing_migration_runner(fixture, 23)
-            verify(fixture)
+            verify_schema_24(fixture)
         else:
             migrate(fixture, 22)
             seed_legacy(fixture)

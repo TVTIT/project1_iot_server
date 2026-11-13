@@ -89,6 +89,18 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "min_wal_size=512MB"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "wal_buffers=64MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "checkpoint_timeout=15min"
     ports:
       - "127.0.0.1:5432:5432"
     networks:
@@ -222,10 +234,13 @@ services:
       - ./migrations/000021_admin_user_management.up.sql:/migrations/000021_admin_user_management.up.sql:ro
       - ./migrations/000022_gateway_membership_revocation.up.sql:/migrations/000022_gateway_membership_revocation.up.sql:ro
       - ./migrations/000023_sensor_control_intent.up.sql:/migrations/000023_sensor_control_intent.up.sql:ro
+      - ./migrations/000024_telemetry_ledger_timestamp.up.sql:/migrations/000024_telemetry_ledger_timestamp.up.sql:ro
+      - ./migrations/000025_drop_telemetry_sensor_fk.up.sql:/migrations/000025_drop_telemetry_sensor_fk.up.sql:ro
+      - ./migrations/000026_drop_telemetry_redundant_indexes.up.sql:/migrations/000026_drop_telemetry_redundant_indexes.up.sql:ro
     command:
       - /bin/sh
       - -ec
-      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000023_sensor_control_intent.up.sql
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000026_drop_telemetry_redundant_indexes.up.sql
     networks:
       - iot_net
 
@@ -288,7 +303,26 @@ services:
     environment:
       SERVER_PORT: "8080"
       SERVER_ENV: ${SERVER_ENV:-development}
+      METRICS_ENABLED: ${METRICS_ENABLED:-false}
+      WEBSOCKET_ENABLED: ${WEBSOCKET_ENABLED:-false}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      WS_FANOUT_MODE: ${WS_FANOUT_MODE:-indexed}
+      WS_MAX_SESSIONS: ${WS_MAX_SESSIONS:-32}
+      WS_MAX_SUBSCRIPTIONS_PER_SESSION: ${WS_MAX_SUBSCRIPTIONS_PER_SESSION:-16}
+      WS_GLOBAL_EVENT_SLOTS: ${WS_GLOBAL_EVENT_SLOTS:-64}
+      WS_GLOBAL_EVENT_BYTES: ${WS_GLOBAL_EVENT_BYTES:-8388608}
+      WS_SESSION_EVENT_SLOTS: ${WS_SESSION_EVENT_SLOTS:-64}
+      WS_SESSION_EVENT_BYTES: ${WS_SESSION_EVENT_BYTES:-262144}
+      WS_SESSION_REFERENCE_BYTES: ${WS_SESSION_REFERENCE_BYTES:-8388608}
+      WS_MAX_FRAME_BYTES: ${WS_MAX_FRAME_BYTES:-66560}
+      WS_READ_FRAME_BYTES: ${WS_READ_FRAME_BYTES:-4096}
+      WS_REQUEST_RATE_PER_SECOND: ${WS_REQUEST_RATE_PER_SECOND:-10}
+      WS_RECHECK_INTERVAL: ${WS_RECHECK_INTERVAL:-5s}
+      WS_RECHECK_SWEEP_BUDGET: ${WS_RECHECK_SWEEP_BUDGET:-2s}
+      WS_RECHECK_CONCURRENCY: ${WS_RECHECK_CONCURRENCY:-2}
+      WS_HEARTBEAT_INTERVAL: ${WS_HEARTBEAT_INTERVAL:-20s}
+      WS_PONG_TIMEOUT: ${WS_PONG_TIMEOUT:-45s}
+      WS_WRITE_TIMEOUT: ${WS_WRITE_TIMEOUT:-5s}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       DATABASE_MAX_CONNS: ${DATABASE_MAX_CONNS:-10}
       DATABASE_MIN_CONNS: ${DATABASE_MIN_CONNS:-1}
@@ -310,6 +344,23 @@ services:
       MQTT_QUEUE_CAPACITY: ${MQTT_QUEUE_CAPACITY:-256}
       MQTT_WORKER_COUNT: ${MQTT_WORKER_COUNT:-4}
       MQTT_MAX_PAYLOAD_BYTES: ${MQTT_MAX_PAYLOAD_BYTES:-65536}
+      # Independent opt-in group bounds; payload bytes exclude decoded rows/metadata.
+      MQTT_MICROBATCH_ENABLED: ${MQTT_MICROBATCH_ENABLED:-false}
+      MQTT_MICROBATCH_MAX_MESSAGES: ${MQTT_MICROBATCH_MAX_MESSAGES:-64}
+      MQTT_MICROBATCH_MAX_ROWS: ${MQTT_MICROBATCH_MAX_ROWS:-6400}
+      MQTT_MICROBATCH_MAX_PAYLOAD_BYTES: ${MQTT_MICROBATCH_MAX_PAYLOAD_BYTES:-4194304}
+      MQTT_MICROBATCH_MAX_WAIT: ${MQTT_MICROBATCH_MAX_WAIT:-1s}
+      # RAM cache cap includes logical metadata estimates, not measured RSS.
+      MQTT_RAM_DEDUP_ENABLED: ${MQTT_RAM_DEDUP_ENABLED:-false}
+      MQTT_RAM_DEDUP_MAX_ENTRIES: ${MQTT_RAM_DEDUP_MAX_ENTRIES:-100000}
+      MQTT_RAM_DEDUP_MAX_BYTES: ${MQTT_RAM_DEDUP_MAX_BYTES:-67108864}
+      # Shaper rate/burst are per-Gateway delivery attempts; byte budget covers raw payload copies in queue and workers, not RSS.
+      MQTT_SHAPER_ENABLED: ${MQTT_SHAPER_ENABLED:-false}
+      MQTT_SHAPER_RATE_PER_SECOND: ${MQTT_SHAPER_RATE_PER_SECOND:-2}
+      MQTT_SHAPER_BURST: ${MQTT_SHAPER_BURST:-4}
+      MQTT_SHAPER_MAX_GATEWAYS: ${MQTT_SHAPER_MAX_GATEWAYS:-4096}
+      MQTT_SHAPER_IDLE_RETENTION: ${MQTT_SHAPER_IDLE_RETENTION:-10m}
+      MQTT_INGRESS_BUFFERED_BYTES: ${MQTT_INGRESS_BUFFERED_BYTES:-16777216}
       TELEMETRY_MAX_SAMPLES_PER_MESSAGE: ${TELEMETRY_MAX_SAMPLES_PER_MESSAGE:-1000}
       TELEMETRY_MAX_BATCH_DURATION: ${TELEMETRY_MAX_BATCH_DURATION:-60s}
       TELEMETRY_MAX_FUTURE_SKEW: ${TELEMETRY_MAX_FUTURE_SKEW:-2m}
@@ -361,7 +412,10 @@ services:
       STAGE5_MQTT_CLIENT_ID: ${STAGE5_MQTT_CLIENT_ID:-backend_control}
       STAGE5_PUBLISH_WORKERS: ${STAGE5_PUBLISH_WORKERS:-1}
       STAGE5_SCAN_BATCH: ${STAGE5_SCAN_BATCH:-32}
+      STAGE5_PUBLISH_QUEUE_CAPACITY: ${STAGE5_PUBLISH_QUEUE_CAPACITY:-32}
+      STAGE5_WAKEUP_ENABLED: ${STAGE5_WAKEUP_ENABLED:-false}
       STAGE5_RESULT_QUEUE: ${STAGE5_RESULT_QUEUE:-128}
+      STAGE5_RESULT_WORKERS: ${STAGE5_RESULT_WORKERS:-2}
       STAGE5_PAYLOAD_BYTES: ${STAGE5_PAYLOAD_BYTES:-8192}
       STAGE5_SCAN_INTERVAL: ${STAGE5_SCAN_INTERVAL:-1s}
       STAGE5_EXPIRE_INTERVAL: ${STAGE5_EXPIRE_INTERVAL:-1s}
@@ -375,6 +429,12 @@ services:
       TWIN_RELATIONSHIP_DEFAULT_LIMIT: ${TWIN_RELATIONSHIP_DEFAULT_LIMIT:-50}
       TWIN_RELATIONSHIP_MAX_LIMIT: ${TWIN_RELATIONSHIP_MAX_LIMIT:-200}
       SUPABASE_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      SUPABASE_JWT_MODE: ${SUPABASE_JWT_MODE:-hs256}
+      AUTH_UNIX_SOCKET_PATH: ${AUTH_UNIX_SOCKET_PATH:-}
+      SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL:-}
+      SUPABASE_JWKS_CACHE_TTL: ${SUPABASE_JWKS_CACHE_TTL:-60s}
+      SUPABASE_JWKS_HTTP_TIMEOUT: ${SUPABASE_JWKS_HTTP_TIMEOUT:-2s}
+      SUPABASE_JWKS_REFRESH_COOLDOWN: ${SUPABASE_JWKS_REFRESH_COOLDOWN:-5s}
       SUPABASE_JWT_ISSUER: ${GOTRUE_JWT_ISSUER:?GOTRUE_JWT_ISSUER is required}
       SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:?SUPABASE_JWT_AUDIENCE is required}
       SUPABASE_JWT_CLOCK_SKEW: ${SUPABASE_JWT_CLOCK_SKEW:-30s}

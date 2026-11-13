@@ -788,8 +788,7 @@ Hệ thống tuân thủ nghiêm ngặt lộ trình phát triển phân tầng k
 | Endpoint / Nhóm tính năng | Method | Trạng thái hiện tại | Kế hoạch triển khai & Ghi chú |
 |---|:---:|:---:|---|
 | `/v1/ws` | `GET` | `501 Not Implemented` | Kênh truyền dữ liệu thời gian thực WebSocket (Giai đoạn 7). |
-| **Device Control & Commands** | `POST /v1/digital-twins/{entity_id}/commands` | **Chưa khả dụng** | Gửi lệnh điều khiển (`twin_commands`) và cơ chế Transactional Outbox (Giai đoạn 5). |
-| **Desired State Mutation** | `PATCH /v1/digital-twins/{entity_id}/desired-state` | **Chưa khả dụng** | Cập nhật cấu hình bền vững `desired_state` (Giai đoạn 5). |
+| **Sensor Desired State & Commands** | `PATCH /v1/digital-twins/{entity_id}/desired-state`<br>`GET /v1/digital-twins/{entity_id}/commands`<br>`GET /v1/digital-twins/{entity_id}/commands/{command_id}` | **Đã hoàn thành P3 local** (`STAGE5_ENABLED=false` mặc định) | Điều khiển tần số lấy mẫu Sensor (`0 < Hz <= 100`) cho `owner`/`operator`. Trả về `202 Accepted` kèm `command_id` hoặc `200 OK` (no-op unchanged). Tra cứu trạng thái lệnh qua polling (`pending` → `published` → `succeeded`/`failed`/`timeout`). Cấu hình xác nhận nằm tại `reported.configuration`, tách biệt với quan trắc viễn trắc. |
 | **State Reconciliation** | Worker nền | **Chưa khả dụng** | Worker đối soát hội tụ trạng thái mong muốn và thực tế (Giai đoạn 6). |
 | **Media Upload & Read URLs** | `POST` / `GET` | **Chưa khả dụng** | Tạo signed upload URL và đọc ảnh từ private Supabase Storage qua Go REST API (Giai đoạn 8). |
 

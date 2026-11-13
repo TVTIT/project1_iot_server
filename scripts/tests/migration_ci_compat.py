@@ -15,6 +15,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = 'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a'
 LABEL = 'stage2.migration-compat'
+TERMINAL_SCHEMA_VERSION = 26
 
 
 class Failure(Exception):
@@ -34,7 +35,11 @@ class Fixture:
         except (OSError, subprocess.TimeoutExpired):
             raise Failure('Fixture command unavailable or timed out.') from None
         if result.returncode:
-            raise Failure('Fixture command failed.')
+            # stderr may contain only SQL diagnostics from this disposable fixture;
+            # never echo command arguments or stdin (which carries credentials).
+            detail = next((line.strip() for line in result.stderr.splitlines()
+                           if 'ERROR:' in line or 'FATAL:' in line), '')
+            raise Failure('Fixture command failed.' + ((' ' + detail[:240]) if detail else ''))
         return result.stdout.strip()
 
     def start(self):
@@ -52,11 +57,13 @@ class Fixture:
         print('Owned compatibility container created: ' + self.id, flush=True)
         self.command(['docker', 'start', self.id])
 
-    def sql(self, query, *, role='stage2_admin', password=None):
+    def sql(self, query, *, role='stage2_admin', password=None, expected_schema_terminal=None):
         args = ['docker', 'exec', '-i', self.id]
         if password is not None:
             args += ['sh', '-c', 'IFS= read -r PGPASSWORD; export PGPASSWORD; exec "$@"', 'sh']
         args += ['psql', '-v', 'ON_ERROR_STOP=1', '-U', role, '-d', 'stage2_test', '-At']
+        if expected_schema_terminal is not None:
+            args += ['-v', f'expected_schema_terminal={expected_schema_terminal}']
         if password is not None:
             args += ['-h', '127.0.0.1']
         return self.command(args, input=(password + '\n' if password is not None else '') + query + '\n')
@@ -103,22 +110,83 @@ class Fixture:
         # Apply and verify migration 21 once Auth tables and triggers exist
         for _ in range(2):
             self.sql((ROOT / 'migrations/000021_admin_user_management.up.sql').read_text())
-        self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text(),
+                 expected_schema_terminal=TERMINAL_SCHEMA_VERSION)
         self.expect("SELECT count(*) FROM schema_migrations WHERE version = 21 AND name = 'admin_user_management';", '1')
         print('Migration 21 repeated compatibility, least-privilege grants and verifier passed.', flush=True)
         self.expect("SELECT has_table_privilege('iot_backend_app', 'public.user_gateways', 'DELETE');", 'f')
         for _ in range(2):
             self.sql((ROOT / 'migrations/000022_gateway_membership_revocation.up.sql').read_text())
-        self.sql((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text(),
+                 expected_schema_terminal=TERMINAL_SCHEMA_VERSION)
         self.login('iot_backend_app', self.passwords['BACKEND_DB_PASSWORD'])
         self.sql('DELETE FROM public.user_gateways WHERE false;', role='iot_backend_app',
                  password=self.passwords['BACKEND_DB_PASSWORD'])
         print('Migration 22 repeated compatibility, runtime DELETE and human-role denials passed.', flush=True)
         for _ in range(2):
             self.sql((ROOT / 'migrations/000023_sensor_control_intent.up.sql').read_text())
-        self.sql((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(),
+                 expected_schema_terminal=TERMINAL_SCHEMA_VERSION)
         self.expect("SELECT count(*) FROM schema_migrations WHERE version=23 AND name='sensor_control_intent';", '1')
         print('Migration 23 repeated compatibility, control-intent grants and terminal passed.', flush=True)
+        # Exercise the actual post-Auth migration against this disposable DB.
+        # Keep a source row whose original sample timestamp must be preserved,
+        # plus an unverifiable legacy ledger row that must remain NULL.
+        self.sql("""INSERT INTO gateways(gateway_id,name) VALUES ('migration-fixture','migration fixture');
+            INSERT INTO sensors(gateway_id,sensor_id,name) VALUES
+                ('migration-fixture','sensor-a','sensor a'),('migration-fixture','sensor-b','sensor b');
+            INSERT INTO processed_messages
+            (gateway_id,message_id,payload_hash,source_topic,sensor_id,boot_id,first_sequence,last_sequence,sample_count)
+            VALUES ('migration-fixture','00000000-0000-0000-0000-000000000024','hash','site/migration-fixture/telemetry',
+                    'sensor-a','00000000-0000-0000-0000-000000000124',42,42,1),
+                   ('migration-fixture','00000000-0000-0000-0000-000000000025','hash','site/migration-fixture/telemetry',
+                    'sensor-b','00000000-0000-0000-0000-000000000125',43,43,1),
+                   ('migration-fixture','00000000-0000-0000-0000-000000000026','hash','site/migration-fixture/telemetry',
+                    'sensor-a','00000000-0000-0000-0000-000000000126',44,44,1);
+            INSERT INTO telemetry(measured_at,gateway_id,sensor_id,sequence_num,value,boot_id,message_id,sample_index)
+            VALUES ('2026-01-02T03:04:05.123456Z','migration-fixture','sensor-a',42,1,
+                    '00000000-0000-0000-0000-000000000124','00000000-0000-0000-0000-000000000024',0),
+                   ('2026-01-02T03:04:06Z','migration-fixture','sensor-b',44,1,
+                    '00000000-0000-0000-0000-000000000126','00000000-0000-0000-0000-000000000026',0);""")
+        migration24 = (ROOT / 'migrations/000024_telemetry_ledger_timestamp.up.sql').read_text()
+        try:
+            self.sql(migration24)
+            raise Failure('Conflicting provenance was not refused.')
+        except Failure as error:
+            if 'conflicting telemetry provenance' not in str(error).lower():
+                raise
+        self.expect("SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='processed_messages' AND column_name='timestamp';", '0')
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=24;", '0')
+        self.expect("SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='processed_messages' AND column_name='timestamp';", '0')
+        self.sql("DELETE FROM telemetry WHERE message_id='00000000-0000-0000-0000-000000000026'; DELETE FROM processed_messages WHERE message_id='00000000-0000-0000-0000-000000000026';")
+        self.sql(migration24)
+        self.sql(migration24)
+        self.expect("SELECT timestamp::text FROM processed_messages WHERE message_id='00000000-0000-0000-0000-000000000024';", '2026-01-02 03:04:05.123456+00')
+        self.expect("SELECT timestamp IS NULL FROM processed_messages WHERE message_id='00000000-0000-0000-0000-000000000025';", 't')
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=24 AND name='telemetry_ledger_timestamp';", '1')
+        self.expect("SELECT count(*) FROM processed_messages WHERE timestamp IS NULL;", '1')
+        self.expect("SELECT has_table_privilege('iot_backend_app','public.processed_messages','SELECT');", 't')
+        self.expect("SELECT pg_get_indexdef('processed_messages_gateway_sensor_message_timestamp'::regclass);", 'CREATE UNIQUE INDEX processed_messages_gateway_sensor_message_timestamp ON public.processed_messages USING btree (gateway_id, sensor_id, message_id, "timestamp")')
+        self.expect("SELECT count(*) FROM pg_constraint WHERE conrelid='processed_messages'::regclass AND conname='processed_messages_pkey';", '1')
+        self.expect("SELECT count(*) FROM pg_class WHERE oid='processed_stream_range'::regclass;", '1')
+        print('Migration 24 native sample-zero backfill, legacy NULL, unique index, retained guards and reapply passed.', flush=True)
+
+        migration25 = (ROOT / 'migrations/000025_drop_telemetry_sensor_fk.up.sql').read_text()
+        self.sql(migration25)
+        self.sql(migration25)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=25 AND name='drop_telemetry_sensor_fk';", '1')
+        self.expect("SELECT count(*) FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='fk_telemetry_sensor';", '0')
+        self.expect("SELECT count(*) FROM pg_trigger WHERE tgrelid='public.sensors'::regclass AND tgname='trg_sensors_restrict_telemetry';", '1')
+        print('Migration 25 native telemetry FK removal and sensors reverse restrict trigger passed.', flush=True)
+
+        migration26 = (ROOT / 'migrations/000026_drop_telemetry_redundant_indexes.up.sql').read_text()
+        self.sql(migration26)
+        self.sql(migration26)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=26 AND name='drop_telemetry_redundant_indexes';", '1')
+        self.expect("SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='telemetry_message_sample';", '0')
+        self.expect("SELECT count(*) FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='telemetry_pkey';", '0')
+        self.expect("SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='idx_telemetry_gateway_sensor_time';", '1')
+        print('Migration 26 native redundant index removal on telemetry passed.', flush=True)
 
     def cleanup(self):
         if self.id is None:

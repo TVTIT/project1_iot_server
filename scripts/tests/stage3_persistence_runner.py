@@ -60,7 +60,7 @@ def compile_integration_binary(directory):
     return binary
 
 
-def run_go_integration(fixture, binary, *, late_chunk=False, legacy=False, legacy_history=False):
+def run_go_integration(fixture, binary, *, late_chunk=False, legacy=False, legacy_history=False, grouped=False):
     docker_cp(fixture, binary, '/tmp/telemetry.test')
     test_run = '^TestNativeTelemetryHistoryUpgradedLegacyProvenance$' if legacy_history else '^TestPostgresTelemetryIntegration$'
     command = [
@@ -68,13 +68,14 @@ def run_go_integration(fixture, binary, *, late_chunk=False, legacy=False, legac
         'export TELEMETRY_TEST_ISOLATED=1 ' +
         ('TELEMETRY_TEST_LATE_CHUNK=1 ' if late_chunk else '') +
         ('TELEMETRY_TEST_LEGACY=1 ' if legacy else '') +
+        ('TELEMETRY_TEST_GROUP=1 ' if grouped else '') +
         ('TELEMETRY_TEST_LEGACY_HISTORY=1 ' if legacy_history else '') +
         'TELEMETRY_TEST_SETUP_URL="postgres://fixture_admin:${POSTGRES_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable" '
         'TELEMETRY_TEST_BACKEND_URL="postgres://iot_backend_app:${BACKEND_DB_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"; '
         f'exec /tmp/telemetry.test -test.v -test.run \'{test_run}\'',
     ]
     output = docker_exec(fixture, command, timeout=90)
-    marker = b'INTEGRATION CASE PASS:' if late_chunk or legacy or legacy_history else b'INTEGRATION CASES PASS:'
+    marker = b'GROUP INTEGRATION PASS:' if grouped else (b'INTEGRATION CASE PASS:' if late_chunk or legacy or legacy_history else b'INTEGRATION CASES PASS:')
     test_func = b'TestNativeTelemetryHistoryUpgradedLegacyProvenance' if legacy_history else b'TestPostgresTelemetryIntegration'
     if b'=== RUN   ' + test_func not in output or marker not in output or b'--- PASS: ' + test_func not in output:
         clean = sanitize_output(output.decode('utf-8', errors='replace'), fixture.passwords)
@@ -207,7 +208,27 @@ def common_graph_seed(fixture):
         WHERE p.entity_id='urn:ngsi-ld:Gateway:fixture_gw'
           AND c.entity_id='urn:ngsi-ld:Sensor:fixture_gw:fixture_sensor';
       INSERT INTO twin_states(entity_id) SELECT id FROM twin_entities;
-    """)
+     """)
+
+
+def apply_post_auth_compatibility(fixture):
+    """Apply the compatible 21-26 tail required by current telemetry writers."""
+    fixture.sql(b"CREATE SCHEMA IF NOT EXISTS auth; CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY, raw_user_meta_data jsonb NOT NULL DEFAULT '{}');")
+    fixture.sql((MIGRATIONS / '000004_supabase_compat.up.sql').read_bytes())
+    for version, name in (
+            (21, 'admin_user_management'),
+            (22, 'gateway_membership_revocation'),
+            (23, 'sensor_control_intent'),
+            (24, 'telemetry_ledger_timestamp'),
+            (25, 'drop_telemetry_sensor_fk'),
+            (26, 'drop_telemetry_redundant_indexes')):
+        fixture.sql((MIGRATIONS / f'{version:06d}_{name}.up.sql').read_bytes())
+    _, history = fixture.sql(b"SELECT version || ':' || name FROM schema_migrations WHERE version BETWEEN 21 AND 26 ORDER BY version;")
+    expected = (b'21:admin_user_management', b'22:gateway_membership_revocation',
+                b'23:sensor_control_intent', b'24:telemetry_ledger_timestamp',
+                b'25:drop_telemetry_sensor_fk', b'26:drop_telemetry_redundant_indexes')
+    if not all(row in history for row in expected):
+        raise RuntimeError(f'post-Auth compatibility history mismatch: {history!r}')
 
 
 def run_normal_fixture(integration_binary):
@@ -217,10 +238,21 @@ def run_normal_fixture(integration_binary):
         bootstrap_to_9(fixture)
         elapsed, _ = apply_20(fixture)
         common_graph_seed(fixture)
-        run_go_integration(fixture, integration_binary)
+        # Check schema-20 physical constraints before migrations 25/26 replace
+        # them. Current writer dedup/concurrency must still run on the full tail.
         _, out = fixture.sql((SQL / 'verify-migration-000020.sql').read_bytes())
         if b'Migration 000020 verification passed.' not in out:
             raise RuntimeError('fresh migration verifier did not pass')
+        # Its two raw probes and one ledger probe are not writer input. Remove
+        # only these known fixture IDs so the native writer owns its row totals.
+        fixture.sql(b"""
+          DELETE FROM telemetry WHERE gateway_id='fixture_gw' AND message_id IN
+            ('00000000-0000-4000-8000-000000000011', '00000000-0000-4000-8000-000000000013');
+          DELETE FROM processed_messages WHERE gateway_id='fixture_gw'
+            AND message_id='00000000-0000-4000-8000-000000000011';
+        """)
+        apply_post_auth_compatibility(fixture)
+        run_go_integration(fixture, integration_binary)
         remember_replay_state(fixture)
         fixture.sql((MIGRATIONS / '000020_stage3_telemetry_ingestion.up.sql').read_bytes())
         verify_replay_state(fixture)
@@ -245,6 +277,23 @@ def run_normal_fixture(integration_binary):
         finish_fixture(fixture, primary_error)
 
 
+def run_group_fixture(integration_binary):
+    fixture = new_fixture()
+    primary_error = None
+    try:
+        bootstrap_to_9(fixture)
+        apply_20(fixture)
+        apply_post_auth_compatibility(fixture)
+        common_graph_seed(fixture)
+        run_go_integration(fixture, integration_binary, grouped=True)
+        print('GROUPED PERSISTENCE FIXTURE: isolated PostgreSQL grouped transaction acceptance PASS', flush=True)
+    except Exception as exc:
+        primary_error = exc
+        raise
+    finally:
+        finish_fixture(fixture, primary_error)
+
+
 def run_upgrade_fixture(integration_binary):
     fixture = new_fixture()
     primary_error = None
@@ -259,9 +308,14 @@ def run_upgrade_fixture(integration_binary):
         _, verifier = fixture.sql((SQL / 'verify-migration-000020.sql').read_bytes())
         if b'Migration 000020 verification passed.' not in verifier:
             raise RuntimeError('upgrade schema and role verifier did not pass')
+        # This reader-only historical test seeds Supabase Auth-shaped fixture
+        # columns absent from the lean compatibility schema; it is not a writer.
+        run_go_integration(fixture, integration_binary, legacy_history=True)
+        # The upgrade fixture seeds historical schema-19 data, but its Go writer
+        # callers must still run against the current compatible schema terminal.
+        apply_post_auth_compatibility(fixture)
         run_go_integration(fixture, integration_binary, late_chunk=True)
         run_go_integration(fixture, integration_binary, legacy=True)
-        run_go_integration(fixture, integration_binary, legacy_history=True)
         remember_replay_state(fixture)
         fixture.sql((MIGRATIONS / '000020_stage3_telemetry_ingestion.up.sql').read_bytes())
         verify_replay_state(fixture)
@@ -339,7 +393,7 @@ def run_rollback_fixture():
 
 def main():
     parser = argparse.ArgumentParser(description='Database-only migration 020 rehearsal on isolated pinned Timescale fixtures.')
-    parser.add_argument('--fixture', choices=['all', 'normal', 'upgrade', 'rollback'], default='all',
+    parser.add_argument('--fixture', choices=['all', 'normal', 'group', 'upgrade', 'rollback'], default='all',
                         help='Fixture to run (default: all)')
     args = parser.parse_args()
 
@@ -350,6 +404,8 @@ def main():
         binary = compile_integration_binary(work)
         if args.fixture in ('all', 'normal'):
             run_normal_fixture(binary)
+        if args.fixture == 'group':
+            run_group_fixture(binary)
         if args.fixture in ('all', 'upgrade'):
             run_upgrade_fixture(binary)
         if args.fixture in ('all', 'rollback'):

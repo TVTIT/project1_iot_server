@@ -66,14 +66,18 @@ const (
 // Config is the validated Gateway simulator configuration. It contains only
 // Gateway-side values; it never carries database or Supabase settings.
 type Config struct {
-	GatewayID string
-	SensorID  string
+	ControlEnabled bool
+	GatewayID      string
+	SensorID       string
 
 	BrokerURL string
 	ClientID  string
 	Username  string
 	Password  string
 	CAFile    string
+	// MQTTServerName optionally overrides the TLS verification name for a
+	// trusted local tunnel. Certificate verification remains enabled.
+	MQTTServerName string
 
 	OutboxPath string
 
@@ -116,6 +120,12 @@ func Load(lookup LookupFunc) (Config, error) {
 	var c Config
 	var ok bool
 	var err error
+	if value, exists := lookup("GATEWAY_CONTROL_ENABLED"); exists {
+		c.ControlEnabled, err = strconv.ParseBool(value)
+		if err != nil {
+			return c, fmt.Errorf("GATEWAY_CONTROL_ENABLED must be a boolean")
+		}
+	}
 
 	gatewayID, ok := nonEmpty(lookup, "GATEWAY_ID")
 	if !ok {
@@ -171,6 +181,11 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if err = validateCleanAbsolutePath("GATEWAY_MQTT_CA_FILE", c.CAFile); err != nil {
 		return c, err
+	}
+	if c.MQTTServerName, ok = nonEmpty(lookup, "GATEWAY_MQTT_SERVER_NAME"); ok {
+		if len(c.MQTTServerName) > 253 || strings.ContainsAny(c.MQTTServerName, "/:@ \t\r\n") {
+			return c, fmt.Errorf("GATEWAY_MQTT_SERVER_NAME is invalid")
+		}
 	}
 
 	if c.OutboxPath, ok = nonEmpty(lookup, "GATEWAY_OUTBOX_PATH"); !ok {
