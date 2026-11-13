@@ -120,6 +120,19 @@ class CompatFixture(unittest.TestCase):
         self.assertEqual(inputs.count(migration23), 2)
         self.assertIn((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(), inputs)
         self.assertIn("DELETE FROM public.user_gateways WHERE false;", inputs)
+        terminal = max(int(path.name[:6]) for path in (ROOT / 'migrations').glob('*.up.sql'))
+        for version in (21, 22, 23):
+            verifier = next((ROOT / 'scripts/sql').glob(f'verify-migration-{version:06d}.sql')).read_text()
+            calls = [call for call in sql.call_args_list if call.args[0] == verifier]
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].kwargs.get('expected_schema_terminal'), terminal)
+
+    def test_sql_passes_explicit_terminal_to_psql(self):
+        with patch.object(self.f, 'command', return_value='verified') as command:
+            self.assertEqual(self.f.sql('SELECT 1;', expected_schema_terminal=26), 'verified')
+        args, kwargs = command.call_args
+        self.assertIn('expected_schema_terminal=26', args[0])
+        self.assertEqual(kwargs['input'], 'SELECT 1;\n')
 
     def test_migration24_fixture_covers_rollback_backfill_and_reapply(self):
         source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()

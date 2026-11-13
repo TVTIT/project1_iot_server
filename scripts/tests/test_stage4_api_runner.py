@@ -59,7 +59,7 @@ class SchemaEvidenceTests(unittest.TestCase):
     def test_schema_is_read_from_database(self):
         fixture = MagicMock()
         fixture.sql.return_value = (0, ('STAGE4_SCHEMA=' + json.dumps(R.expected_stage4_schema_history()) + '\n').encode())
-        self.assertEqual(R.verify_terminal_schema(fixture), 24)
+        self.assertEqual(R.verify_terminal_schema(fixture), R.TERMINAL_SCHEMA_VERSION)
         self.assertIn(b'schema_migrations', fixture.sql.call_args.args[0])
 
     def test_schema_read_errors_cannot_claim_success(self):

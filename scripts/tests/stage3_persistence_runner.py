@@ -237,12 +237,22 @@ def run_normal_fixture(integration_binary):
     try:
         bootstrap_to_9(fixture)
         elapsed, _ = apply_20(fixture)
-        apply_post_auth_compatibility(fixture)
         common_graph_seed(fixture)
-        run_go_integration(fixture, integration_binary)
+        # Check schema-20 physical constraints before migrations 25/26 replace
+        # them. Current writer dedup/concurrency must still run on the full tail.
         _, out = fixture.sql((SQL / 'verify-migration-000020.sql').read_bytes())
         if b'Migration 000020 verification passed.' not in out:
             raise RuntimeError('fresh migration verifier did not pass')
+        # Its two raw probes and one ledger probe are not writer input. Remove
+        # only these known fixture IDs so the native writer owns its row totals.
+        fixture.sql(b"""
+          DELETE FROM telemetry WHERE gateway_id='fixture_gw' AND message_id IN
+            ('00000000-0000-4000-8000-000000000011', '00000000-0000-4000-8000-000000000013');
+          DELETE FROM processed_messages WHERE gateway_id='fixture_gw'
+            AND message_id='00000000-0000-4000-8000-000000000011';
+        """)
+        apply_post_auth_compatibility(fixture)
+        run_go_integration(fixture, integration_binary)
         remember_replay_state(fixture)
         fixture.sql((MIGRATIONS / '000020_stage3_telemetry_ingestion.up.sql').read_bytes())
         verify_replay_state(fixture)

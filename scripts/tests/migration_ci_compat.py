@@ -15,6 +15,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = 'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a'
 LABEL = 'stage2.migration-compat'
+TERMINAL_SCHEMA_VERSION = 26
 
 
 class Failure(Exception):
@@ -56,11 +57,13 @@ class Fixture:
         print('Owned compatibility container created: ' + self.id, flush=True)
         self.command(['docker', 'start', self.id])
 
-    def sql(self, query, *, role='stage2_admin', password=None):
+    def sql(self, query, *, role='stage2_admin', password=None, expected_schema_terminal=None):
         args = ['docker', 'exec', '-i', self.id]
         if password is not None:
             args += ['sh', '-c', 'IFS= read -r PGPASSWORD; export PGPASSWORD; exec "$@"', 'sh']
         args += ['psql', '-v', 'ON_ERROR_STOP=1', '-U', role, '-d', 'stage2_test', '-At']
+        if expected_schema_terminal is not None:
+            args += ['-v', f'expected_schema_terminal={expected_schema_terminal}']
         if password is not None:
             args += ['-h', '127.0.0.1']
         return self.command(args, input=(password + '\n' if password is not None else '') + query + '\n')
@@ -107,20 +110,23 @@ class Fixture:
         # Apply and verify migration 21 once Auth tables and triggers exist
         for _ in range(2):
             self.sql((ROOT / 'migrations/000021_admin_user_management.up.sql').read_text())
-        self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000021.sql').read_text(),
+                 expected_schema_terminal=TERMINAL_SCHEMA_VERSION)
         self.expect("SELECT count(*) FROM schema_migrations WHERE version = 21 AND name = 'admin_user_management';", '1')
         print('Migration 21 repeated compatibility, least-privilege grants and verifier passed.', flush=True)
         self.expect("SELECT has_table_privilege('iot_backend_app', 'public.user_gateways', 'DELETE');", 'f')
         for _ in range(2):
             self.sql((ROOT / 'migrations/000022_gateway_membership_revocation.up.sql').read_text())
-        self.sql((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text(),
+                 expected_schema_terminal=TERMINAL_SCHEMA_VERSION)
         self.login('iot_backend_app', self.passwords['BACKEND_DB_PASSWORD'])
         self.sql('DELETE FROM public.user_gateways WHERE false;', role='iot_backend_app',
                  password=self.passwords['BACKEND_DB_PASSWORD'])
         print('Migration 22 repeated compatibility, runtime DELETE and human-role denials passed.', flush=True)
         for _ in range(2):
             self.sql((ROOT / 'migrations/000023_sensor_control_intent.up.sql').read_text())
-        self.sql((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text())
+        self.sql((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(),
+                 expected_schema_terminal=TERMINAL_SCHEMA_VERSION)
         self.expect("SELECT count(*) FROM schema_migrations WHERE version=23 AND name='sensor_control_intent';", '1')
         print('Migration 23 repeated compatibility, control-intent grants and terminal passed.', flush=True)
         # Exercise the actual post-Auth migration against this disposable DB.

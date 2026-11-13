@@ -65,6 +65,17 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertTrue(WORKFLOW_PATH.is_file())
         self.assertGreater(len(self.raw_content), 100)
 
+    def test_var_tmp_fixture_jobs_prepare_both_roots_before_execution(self):
+        for name, consumer in (
+                ('stage2-e2e', 'test_stage2_ci.py'),
+                ('mosquitto-credential-integration', 'test-stage2-mqtt-credentials.sh'),
+                ('auth-integration', 'test-stage2-admin.sh')):
+            with self.subTest(job=name):
+                job = self._extract_job_section(name)
+                setup = re.search(r'mkdir -p /tmp/opencode /var/tmp/opencode', job)
+                self.assertIsNotNone(setup, 'fixture roots must exist on a clean runner')
+                self.assertLess(setup.start(), job.index(consumer))
+
     def test_lint_and_test_timeout_minutes_exists(self):
         """lint-and-test must define timeout-minutes to bound execution."""
         lint_job_section = self._extract_job_section("lint-and-test")
