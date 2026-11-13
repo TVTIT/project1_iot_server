@@ -69,7 +69,8 @@ class TestCIFeatureJobs(unittest.TestCase):
         for name, consumer in (
                 ('stage2-e2e', 'test_stage2_ci.py'),
                 ('mosquitto-credential-integration', 'test-stage2-mqtt-credentials.sh'),
-                ('auth-integration', 'test-stage2-admin.sh')):
+                ('auth-integration', 'test-stage2-admin.sh'),
+                ('native-compose-smoke', 'test_native_compose_smoke.py')):
             with self.subTest(job=name):
                 job = self._extract_job_section(name)
                 setup = re.search(r'mkdir -p /tmp/opencode /var/tmp/opencode', job)

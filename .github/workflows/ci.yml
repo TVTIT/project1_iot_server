@@ -666,7 +666,7 @@ jobs:
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |
-          mkdir -p /tmp/opencode
+          mkdir -p /tmp/opencode /var/tmp/opencode
           python3 --version
           openssl version
           which setfacl getfacl

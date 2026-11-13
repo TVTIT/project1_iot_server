@@ -115,7 +115,7 @@ class PreparationTests(unittest.TestCase):
             def resolve(self, item):
                 return {'Id': item['receipt']['id']}
 
-        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode/p8-supplement/guards') as tmp:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as tmp:
             base = Path(tmp); private = base / 'private'; artifacts = base / 'artifacts'
             private.mkdir(mode=0o700); artifacts.mkdir(mode=0o700)
             fixture = dataclasses.make_dataclass('FixtureStub', ('base','private','artifacts'))(
@@ -848,7 +848,8 @@ class PreparationTests(unittest.TestCase):
             self.assertIn(str(config), compose)
 
     def test_10000_viewer_overlay_writes_baseline_fd_budget_to_nginx_and_compose(self):
-        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory, \
+             patch.object(smoke.resource, 'getrlimit', return_value=(65536, 65536)):
             fixture = smoke.prepare(Path(directory) / 'fixture', paper_p8_e1=True,
                 paper_p8_profile='official', paper_p8_official_opt_in=True,
                 paper_p8_e1_viewers=10000)
@@ -2551,11 +2552,30 @@ class PaperP0Tests(unittest.TestCase):
                 smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD', runner=runner)
 
     def test_p0_git_real_metadata_works_with_private_home(self):
+        import subprocess
+
         with tempfile.TemporaryDirectory() as directory:
             fixture = smoke.prepare(Path(directory) / 'paper', paper_p0=True)
-            self.assertRegex(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'), r'^[0-9a-f]{40}$')
-            self.assertTrue(smoke.paper_p0_git(fixture, 'branch', '--show-current'))
-            self.assertIsInstance(smoke.paper_p0_git(fixture, 'status', '--porcelain'), str)
+            source = Path(directory) / 'source'
+            source.mkdir(mode=0o700)
+
+            def git(*args):
+                return subprocess.run(['git', '-C', str(source), *args],
+                    env=smoke.process_env(fixture), capture_output=True,
+                    timeout=10, check=True).stdout.decode().strip()
+
+            git('init', '--quiet', '--object-format=sha1', '--initial-branch=fixture')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                'commit', '--quiet', '--allow-empty', '-m', 'fixture')
+            head = git('rev-parse', 'HEAD')
+            with patch.object(smoke, 'ROOT', source):
+                self.assertEqual(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'), head)
+                self.assertEqual(smoke.paper_p0_git(fixture, 'branch', '--show-current'), 'fixture')
+                self.assertEqual(smoke.paper_p0_git(fixture, 'status', '--porcelain'), '')
+                git('checkout', '--quiet', '--detach', 'HEAD')
+                self.assertEqual(smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'), head)
+                self.assertEqual(smoke.paper_p0_git(fixture, 'branch', '--show-current'), '')
+                self.assertEqual(smoke.paper_p0_git(fixture, 'status', '--porcelain'), '')
 
     def test_p0_temporal_query_uses_backend_utc_z_contract(self):
         from urllib.parse import parse_qs
