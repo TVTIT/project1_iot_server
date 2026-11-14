@@ -7,6 +7,7 @@
 - [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết quản lý User và Gateway Membership)
 - [`../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md`](../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md) (Kế hoạch chi tiết bổ sung DELETE Gateway Membership)
 - [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
+- [`../protocols/stage5-sensor-control-api.md`](../protocols/stage5-sensor-control-api.md) (REST desired sampling và polling command)
 - `docs/protocols/stage4-read-and-entity-api.md` (Hợp đồng Stage 4 Read & Entity API)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
@@ -85,6 +86,20 @@ Client tương tác với hệ sinh thái qua hai miền dịch vụ hoàn toàn
 ---
 
 ## 3. Trình tự Gọi API Thực tế và Cấu thành Trang Chi tiết (Actual Endpoint Sequence)
+
+### 3.0 Control Sensor Stage 5 (polling REST)
+
+Với Sensor đã provision, user `owner`/`operator` PATCH desired sampling bằng
+`frequency_hz` decimal, `expected_desired_version` JSON string và một
+`Idempotency-Key`; `viewer` chỉ đọc. Dùng version hiện hành và key mới cho
+intent mới; retry request chưa rõ kết quả bằng đúng body/key cũ. `202 pending`
+chỉ là committed intent; `published` chỉ là broker PUBACK. Poll command
+list/detail cho terminal state. Chỉ result hợp lệ được backend commit mới xác
+nhận `reported.configuration`; các measurement/sampling observations vẫn là
+quan sát riêng. Low-Hz chỉ hợp lệ khi interval round-half-up vẫn biểu diễn
+được trong `[10,000, 2^53]` µs. `failed`/`timeout` không chứng minh đã áp dụng
+cấu hình; không tự phát lệnh mới để bù timeout. Xem contract nguồn cho ví dụ,
+status/errors và các route cụ thể.
 
 ### 3.1 Trình tự tuần tự thực tế theo chuẩn ETSI GS CIM 009 V1.9.1 Profile
 Client bắt buộc phải gọi API theo đúng trình tự phân cấp:

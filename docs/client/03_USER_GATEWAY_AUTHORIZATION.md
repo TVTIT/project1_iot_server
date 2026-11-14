@@ -158,6 +158,17 @@ CHECK (role IN ('owner', 'operator', 'viewer'))
 | `operator` | **Người vận hành** | Đọc toàn bộ danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Không có quyền tạo/sửa cảm biến hoặc sửa trạm (`403 Forbidden`). Được quyền đổi tần số lấy mẫu cảm biến (`PATCH desired-state`). | Đổi tần số lấy mẫu cảm biến của Sensor đã provision (`0 < Hz <= 100`). **Không** được sửa metadata cảm biến hay provisioning. | `Badge(Color: Blue, Label: "Vận hành", Icon: engineering)` |
 | `viewer` | **Người xem** | Hoàn toàn chỉ đọc (Read-only) danh sách trạm, cảm biến, chi tiết Digital Twin, trạng thái, và lịch sử đo lường. Vĩnh viễn không có quyền ghi (`403 Forbidden`). | Tiếp tục duy trì trạng thái chỉ đọc trên telemetry, history, media, digital twin, WebSocket, command list/detail. Không có quyền gửi lệnh điều khiển. | `Badge(Color: Grey/Teal, Label: "Người xem", Icon: visibility)` |
 
+### 3.2.1. Quyền điều khiển sampling Stage 5
+
+Đối với Sensor đã provision, `owner` và `operator` có thể đổi desired sampling
+qua `PATCH .../desired-state`; `viewer` chỉ đọc state và command list/detail.
+Membership được kiểm tra lại theo DB cho từng request; quyền Platform Admin
+không bỏ qua membership. Đây không mở quyền sửa metadata/provisioning cho
+operator. Requested/desired state không đồng nghĩa với cấu hình đã xác nhận:
+chỉ result hợp lệ được backend commit mới cập nhật `reported.configuration`.
+Tần số decimal, optimistic version, idempotency, replay/conflict và polling
+được đặc tả tại [Stage 5 Sensor Control API](../protocols/stage5-sensor-control-api.md).
+
 ### 3.3. Trải nghiệm phân quyền trên Web Dashboard (Desktop / Tablet / Responsive)
 Khác với giao diện màn hình hẹp của thiết bị di động vốn chỉ hiển thị danh sách cuộn dọc đơn giản, nền tảng **Flutter Web Dashboard** sở hữu không gian hiển thị rộng rãi, cho phép tối ưu hóa trải nghiệm giám sát thông qua bố cục linh hoạt:
 
@@ -176,7 +187,7 @@ Khác với giao diện màn hình hẹp của thiết bị di động vốn ch�
    - Khi độ rộng màn hình $< 600\,\text{px}$, hệ thống hiển thị dạng danh sách thẻ đơn 1 cột, đảm bảo đầy đủ thông tin mà không bị vỡ bố cục hay tràn khung (overflow).
 
 ### 3.4. Chính sách bảo mật Giai đoạn 2 (Stage 2 Boundary & Fail-closed Policy)
-1. **Chế độ Fail-closed:** Trong Giai đoạn 2 hiện tại, Go Backend áp dụng nguyên tắc fail-closed toàn diện đối với mọi thao tác ghi hoặc lệnh điều khiển từ phía người dùng thông thường. Cả `owner`, `operator` và `viewer` đều hoạt động ở chế độ đọc an toàn trên 2 route khả dụng.
+1. **Chế độ Fail-closed:** Backend kiểm tra quyền động trong DB cho mọi request. Ngoài Stage 4 mutations, Stage 5 cho phép `owner`/`operator` điều khiển desired sampling của Sensor đã provision; `viewer` vẫn chỉ đọc. Đây không phải quyền metadata/provisioning; chi tiết xem [contract Stage 5](../protocols/stage5-sensor-control-api.md).
 2. **UI Hiding KHÔNG PHẢI là cơ chế bảo mật (UI Hiding is Not Security):**
    - Việc ẩn nút, ẩn form, hoặc làm mờ giao diện trên Client Web chỉ là kỹ thuật nâng cao trải nghiệm người dùng (UX) nhằm tránh gây bối rối cho người dùng đối với các tính năng chưa hỗ trợ.
    - **Tuyệt đối không coi UI hiding là ranh giới bảo mật:** Client có thể bị can thiệp bởi DevTools hoặc script độc hại. Go Backend luôn là chốt chặn cuối cùng, kiểm tra quyền động trong cơ sở dữ liệu trên từng request và từ chối ngay lập tức nếu request không hợp lệ.

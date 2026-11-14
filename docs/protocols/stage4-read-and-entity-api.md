@@ -25,6 +25,10 @@
 
 **Phạm vi:** Đặc tả contract kỹ thuật cho 5 endpoints Digital Twin chuẩn hóa theo ETSI GS CIM 009 V1.9.1 project profile, cùng bảng ánh xạ chuyển đổi từ 7 endpoint cũ.
 
+Stage 5 bổ sung ba route điều khiển dưới đường dẫn Sensor mà không thay đổi năm
+route Stage 4 canonical. Xem [Stage 5 Sensor Control API](stage5-sensor-control-api.md)
+để biết phân quyền, PATCH desired-state, polling command và semantics result hiện hành.
+
 Các đường dẫn source trong dấu backtick tính từ gốc `main_src/`. Liên kết Markdown
 tính từ vị trí tài liệu này.
 

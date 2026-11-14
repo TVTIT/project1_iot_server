@@ -2,8 +2,9 @@
 
 > Stage 3 uplink contract finalized on 2026-10-15 (Task 3.0). These are
 > protocol contracts, not by themselves evidence of runtime behavior. Downlink
-> payload/endpoint rules below remain unchanged; for current Stage 5/P6 runtime
-> evidence see the [P6 Local MVP report](../backend/paper-p6-dispatch-and-mixed-load.md).
+> payload/endpoint rules below remain unchanged; for current Stage 5 REST usage see
+> [Sensor Control API](stage5-sensor-control-api.md), and for P6 runtime evidence
+> see the [P6 Local MVP report](../backend/paper-p6-dispatch-and-mixed-load.md).
 
 ## Identity and topics
 
@@ -204,6 +205,11 @@ current observation, reported state becomes value 25.3 / sequence 12503 at
 `.020000Z`; the temporal interval value is 10000 us at the same time.
 
 ## Downlink commands
+
+REST admission and polling are documented in the
+[Stage 5 Sensor Control API](stage5-sensor-control-api.md). The MQTT command
+and result messages below are v1 runtime contracts; clients must not publish
+commands or results directly.
 
 ### Dispatcher operation (P6; no payload or endpoint change)
 
