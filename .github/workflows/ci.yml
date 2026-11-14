@@ -655,10 +655,6 @@ jobs:
     defaults:
       run:
         working-directory: .
-    env:
-      STAGE5_CONTROL_PRIVATE_DIR: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}
-      STAGE5_CONTROL_RUN_DIR: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/fixture
-      STAGE5_CONTROL_SAFE_REPORT: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
@@ -687,8 +683,12 @@ jobs:
           docker pull --platform linux/amd64 supabase/storage-api:v1.74.0
       - name: Prepare private P3 run directory
         run: |
-          test ! -e "$STAGE5_CONTROL_PRIVATE_DIR"
-          mkdir -m 700 -p "$STAGE5_CONTROL_PRIVATE_DIR"
+          private_dir="${RUNNER_TEMP:-/tmp}/stage5-control-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$private_dir"
+          mkdir -m 700 -p "$private_dir"
+          printf 'STAGE5_CONTROL_PRIVATE_DIR=%s\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'STAGE5_CONTROL_RUN_DIR=%s/fixture\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'STAGE5_CONTROL_SAFE_REPORT=%s/summary.json\n' "$private_dir" >> "$GITHUB_ENV"
       - name: Run P3 control require-run
         id: p3
         run: |
