@@ -309,3 +309,101 @@ bị mất và được ghi missing, không bịa latency 0. Bằng chứng ch�
 credential-enabled startup prerequisite và fixture này; không chứng minh mọi
 kiểu MQTT reconnect, tự phục hồi readiness, physical apply count, exactly-once,
 hay live recovery.
+
+### 2.7 Chuẩn bị rehearsal/rollout điều khiển Sensor Stage 5
+
+Phần này là checklist chuẩn bị cho **môi trường rehearsal do operator sở hữu**,
+không phải lệnh enable shared/live hay production acceptance. Contract API nằm
+tại [Stage 5 Sensor Control API](../protocols/stage5-sensor-control-api.md);
+transport và result tại [MQTT v1](../protocols/mqtt-v1.md). Shared/live enable,
+target migration/key/credential rehearsal và demo thuộc Stage 9, chỉ thực hiện
+khi có yêu cầu riêng.
+
+#### Preflight trước khi bật
+
+1. Chốt đúng checkout/config đích và xác nhận schema trong chính DB mục tiêu:
+   đọc `schema_migrations`, so với migration terminal trong source, kiểm tra
+   grants runtime cho `iot_backend_app`/`iot_backend`; không suy ra DB đã migrate
+   từ source. Với DB có dữ liệu, lập backup đã kiểm tra và cửa sổ bảo trì trước
+   migration có thể khóa/chạm dữ liệu. Không chạy migration tùy thứ tự, không
+   dùng fixture disposable credentials lên deployment DB.
+2. Kiểm tra broker URL, CA trust chain, SAN/hostname khớp endpoint thật, thời gian
+   UTC/certificate trên backend, broker và Gateway. Không tắt TLS hostname
+   verification để chữa lỗi.
+3. Duy trì tách biệt backend data principal với DynSec manager. Trước mỗi
+   data-connection lifetime, xác minh chính xác ACL readback bằng manager kể cả
+   khi credential API tắt. Manager có quyền quản trị; không đưa manager secret,
+   DB credential, service-role hay broker manager quyền cho Gateway/client.
+   Không tự sửa ACL runtime hoặc cấp quyền `$CONTROL`.
+4. Đối chiếu cấu hình thật với bounded defaults/limits trong `.env.example` và
+   `internal/config`: `STAGE5_PUBLISH_QUEUE_CAPACITY=32`,
+   `STAGE5_SCAN_BATCH=32`, `STAGE5_PUBLISH_WORKERS=1`,
+   `STAGE5_RESULT_QUEUE=128`, `STAGE5_RESULT_WORKERS=2`,
+   `STAGE5_COMMAND_TTL=60s`; payload cap mặc định 8 KiB. Đây là cấu hình mặc
+   định, không phải sizing/capacity evidence. `STAGE5_WAKEUP_ENABLED` chỉ bật
+   hint; periodic/startup scan vẫn là fallback. Không gia hạn TTL hoặc biến
+   timeout thành retry/reconciliation guarantee.
+5. Xác nhận `/readyz`, backend process health, broker TLS/auth, subscription/
+   publish readiness, membership và Sensor đã provision; thực hiện readback ACL
+   trước khi gửi intent. Readiness không thay thế kiểm tra permission hoặc
+   chứng minh thiết bị đã apply.
+
+#### Theo dõi và xử lý sự cố
+
+- Theo dõi admission/API errors, command list/detail qua REST polling, trạng thái
+  expiry, queue/worker saturation, broker publish/connect, result queue/worker,
+  result validation/commit và agreement giữa command terminal với
+  `reported.configuration`. Đối chiếu state qua `?format=simplified`; sampling
+  observations/history qua `/temporal`. Không dùng PUBACK làm bằng chứng apply.
+- Rehearsal hữu hạn cần kiểm tra broker unavailable và DB unavailable riêng,
+  request timeout/queue bounds, cùng controlled backend stop/reopen. Ghi status,
+  deadline gốc, readiness và dữ liệu bền đã đối chiếu; lỗi DB/broker không được
+  diễn giải thành success. Reuse P3/P6 recovery evidence: P6 đã kiểm tra backend
+  restart khi broker được giữ ổn định; không chứng minh mọi dạng broker outage,
+  tự phục hồi readiness, physical apply count hoặc exactly-once. Gateway SQLite
+  receipt/outbox bền, nhưng execution vật lý không thể suy ra chỉ từ receipt.
+- Khi dừng có kiểm soát, operator ngừng gửi request mới trước, dùng REST polling
+  theo dõi command đang active tới terminal/TTL gốc, rồi disable bằng feature
+  controls hiện có trong protected environment/configuration (`STAGE5_ENABLED`
+  và, nếu đang chạy Gateway control runtime, `GATEWAY_CONTROL_ENABLED`) và dùng
+  quy trình restart hiện hành của môi trường sở hữu. Không thêm quiesce API,
+  không xóa command/outbox và không gọi timeout là hoàn tác. Disable/rollback
+  binary hoặc flag không đảo ngược hành động thiết bị đã xảy ra; late result
+  không tự ghi đè configuration mới.
+
+Ví dụ API dùng placeholder; inject URL/token từ secret manager hoặc protected
+file (ví dụ header file riêng mode `0600`; không đặt secret trong shell history
+hay command arguments):
+
+```sh
+curl --fail-with-body \
+  -H "@${AUTH_HEADER_FILE}" \
+  -H 'Accept: application/json' \
+  --get "${API_BASE_URL}/v1/digital-twins/${SENSOR_ENTITY_ID}/commands" \
+  --data-urlencode 'limit=20'
+```
+
+`AUTH_HEADER_FILE` ở ví dụ GET có Bearer token của viewer (owner/operator cũng
+có quyền đọc). Chỉ owner/operator dùng header file tương ứng để PATCH; mỗi
+intent mới phải có version vừa đọc và idempotency key mới:
+
+```sh
+curl --fail-with-body \
+  -H "@${OWNER_OR_OPERATOR_AUTH_HEADER_FILE}" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: <NEW_OPAQUE_KEY>' \
+  --request PATCH \
+  --data '{"frequency_hz":1.5,"expected_desired_version":"<CURRENT_VERSION>"}' \
+  "${API_BASE_URL}/v1/digital-twins/${SENSOR_ENTITY_ID}/desired-state"
+```
+
+Viewer không được gọi PATCH; backend vẫn enforcement membership/role ở server.
+Không retry intent chưa rõ kết quả bằng key/body mới.
+
+Không `source .env` deployment để chạy thử, không in resolved Compose config
+hoặc credential. `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`,
+`GATEWAY_CONTROL_ENABLED=false` và các cờ shaper/microbatch/RAM-dedup/WebSocket
+đều giữ mặc định độc lập false; bật control không ngầm bật tối ưu hóa hoặc WS.
+AM5728 chưa có: board synthetic runtime và HIL cảm biến thật **NOT RUN**; simulator
+không thay thế hardware. Remote CI và mọi thao tác target/live chưa được thực
+hiện trong phần tài liệu này.

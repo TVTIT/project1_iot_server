@@ -10,11 +10,13 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
     - **Giai đoạn 5 (Stage 5 Downlink Control) & Paper P3–P5b (26/10/2026)**:
      - *Baseline lịch sử (24/10/2026)*: Task 5.0–5.4 đã hoàn thành validation số thập phân `frequency_hz`, migration 23, admission/receipt nguyên tử, ba REST routes nhận desired/tra cứu command và MQTT publisher/ACL/expiry. Xem [mốc bàn giao 5.4](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
      - *Triển khai vòng điều khiển Sensor trên simulator qua P3 (25/10/2026)*: Kế hoạch Paper P3 đã thực hiện Task 5.5 (Gateway nhận/áp dụng cấu hình, durable command receipt/result và chống trùng bền vững) và Task 5.6 (result ingress consumer, worker và transaction tiếp nhận xác nhận `reported.configuration`). E2E simulator và tài liệu cần thiết cho P3 đã hoàn tất và kiểm chứng.
-      - *Phần còn lại của Stage 5 gốc*: Chưa nghiệm thu tích hợp trên board phần cứng AM5728 / HIL và cảm biến vật lý thật (Task 5.7), chưa có lane remote CI Stage 5 require-run cho revision cuối, và chưa chốt bộ tài liệu vận hành/runbook toàn diện (Task 5.8). Các hạng mục này được theo dõi riêng tại checkpoint P8; Stage 5 gốc chưa được coi là hoàn tất toàn bộ hay production-ready.
+      - *Bàn giao downlink (14/11/2026)*: P3 control simulator đã đóng vòng; local require-run lane và CI wiring có rehearsal cục bộ ở R1/R2, nhưng remote CI **NOT RUN**. Contract REST/MQTT/client và runbook được đồng bộ trong [Stage 5 Sensor Control API](docs/protocols/stage5-sensor-control-api.md) và [operations](docs/dynsec/deployment-and-operations.md). Đây là tài liệu rehearsal/chuẩn bị, không phải Stage 5 full acceptance.
+       - *Phần còn lại của Stage 5 gốc*: Board AM5728 runtime synthetic và HIL cảm biến vật lý (5.7-R3/R4/R5) **DEFERRED / NOT RUN** vì chưa có board; simulator không thay thế hardware. Remote CI tại revision bàn giao **NOT RUN**; target schema/key/credential rehearsal và demo shared/live thuộc Stage 9, chưa thực hiện. Stage 5 gốc chưa hoàn tất toàn bộ hay production-ready.
+        - *Kiểm chứng/báo cáo cục bộ cuối (14/11/2026)*: Trên `develop`, HEAD `9a348709d6c92c394237fc0078759468c944a83` cộng dirty diff R1/R2/5.8-R1, simulator/control trên source hiện hành và rehearsal control tương đương CI cục bộ đều PASS; các kiểm tra Go/migration/Stage 2–4/Python đã chọn cũng PASS theo [báo cáo downlink](docs/backend/stage-5-downlink.md). Đây không phải remote/full CI. Remote CI, runtime board với dữ liệu tổng hợp, sensor vật lý/HIL và rollout shared/live giữ NOT RUN; migration source 26 không xác nhận schema deployment.
       - *P4/P5 Local MVP*: P4 shaper/ingress budget, P5a microbatch và P5b RAM dedup + migration 24 timestamp/index đã hoàn tất trên fixture cô lập. Stage 5 gốc vẫn chưa hoàn tất toàn bộ. Xem [báo cáo P5b](docs/backend/paper-p5b-ram-dedup-and-ledger.md), [báo cáo P5a](docs/backend/paper-p5a-microbatch-persistence.md) và [kế hoạch P5b](../docs/backend_plan/paper/P5b_detail_plan.md).
        - *Môi trường triển khai chung*: Giữ `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false`; rollout live nằm ngoài phạm vi và không suy ra từ Local MVP.
   - **Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership - Tasks U0–U8 & Follow-up D1–D5)**: Đã triển khai Migration 21 (`000021_admin_user_management.up.sql`), Migration 22 (`000022_gateway_membership_revocation.up.sql`) và 6 endpoint quản trị tập trung (`POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`, `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`), adapter Supabase Auth Admin (với `email_confirm: true`), cơ chế khóa Gateway cha tuần tự, cấm tự hạ quyền admin (`409 Conflict`), chuyển giao owner nguyên tử (owner cũ trở thành viewer), và thu hồi quyền thành viên viewer/operator (hoặc no-op khi không có membership: `204 No Content` body rỗng; cấm xóa owner khi chưa chuyển giao: `409 Conflict` `owner_transfer_required`; Gateway thiếu: `404 Not Found`; tuyệt đối không xóa tài khoản, profile hay global role, không đổi Gateway khác). Chi tiết xem [báo cáo quản trị người dùng & membership](docs/backend/admin-users-and-gateway-membership.md) và [kế hoạch bổ sung DELETE membership](../docs/backend_plan/gateway_membership_delete_detailed_plan.md).
-    - **Tình trạng mã nguồn & kiểm chứng (24/10/2026)**: `a5f9f812f3212413f772ef60e1299f58cca43837` đã commit Task 5.3/5.4 và sửa shutdown liên quan; mô tả worktree diff trên `bcce3fe` trong handoff là lịch sử trước commit. Source terminal migration **23**, không phải xác nhận shared/live DB đã migrate. Các native/affected local checks của mốc 5.4, full Go race 20 packages, format/vet/lint/build và Python guards đã **PASS** theo [bảng evidence](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md), không phải kết quả chạy mới của P0. **Chưa chạy** full local CI/remote CI cho revision P0, Stage 5 Gateway/result E2E, board/cảm biến thật hoặc rollout live; không gán remote PASS lịch sử cho mốc này. Chưa cập nhật đầy đủ Flutter/Bruno theo Stage 5. Xem [baseline/testbed P0](docs/backend/paper-p0-baseline-and-testbed.md) để biết kết quả riêng của profile paper.
+    - **Checkpoint lịch sử 24/10/2026**: `a5f9f812f3212413f772ef60e1299f58cca43837` đã commit Task 5.3/5.4 và sửa shutdown liên quan; mô tả worktree diff trên `bcce3fe` là lịch sử trước commit. Source terminal migration **23** ở checkpoint đó, không xác nhận shared/live DB đã migrate. Các native/affected checks khi ấy PASS theo [bảng evidence](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md); ghi nhận “chưa chạy Stage 5 Gateway/result E2E” chỉ mô tả trạng thái lịch sử 24/10, đã được P3 simulator kiểm chứng sau đó. Không gán các kết quả lịch sử cho revision mới. Xem [baseline/testbed P0](docs/backend/paper-p0-baseline-and-testbed.md) cho evidence riêng P0.
   - **Kiểm chứng CI từ xa (Remote CI Verification)**: GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` đã hoàn thành thành công toàn bộ **16/16 jobs**, bao gồm `lint-and-test` (job 118127109089), `stage4-api-integration` (job 118127109577), `stage3-uplink-integration` (job 118127109787) và `native-compose-smoke` (job 118129034156).
 - **Mặc định môi trường triển khai & Cổng nghiệm thu riêng (Rollout Gates)**:
    - Trên môi trường triển khai chính (root deployment), tính năng quản lý credential MQTT mặc định bị **vô hiệu hóa** (`MQTT_CREDENTIAL_API_ENABLED=false`, các endpoint trả về HTTP `503 credential_runtime_disabled`).
@@ -519,7 +521,7 @@ Không còn route WebSocket business stub mặc định: exact `/v1/ws` trả 40
 |---|---|---|---|---|
 | `GET` | `/v1/ws` | Bearer JWT or browser credential subprotocol | WebSocket telemetry; disabled authenticated Go handler returns 501; default Nginx exact route returns 404; opt-in profile behavior per protocol | HTTP 401 invalid/missing auth; 501 only if disabled Go handler is reached |
 
-#### 5. Endpoint điều khiển Sensor — đã hoàn thành P3 trên simulator, mặc định tắt trên deployment:
+#### 5. Endpoint điều khiển Sensor — vòng simulator P3 đã hoàn thành, mặc định tắt trên deployment:
 
 Các route đã đăng ký phục vụ nhận intent và tra cứu command; authenticated request
 khi Stage 5 tắt trả 503, thiếu/sai JWT trả 401. Vòng điều khiển khép kín (Gateway áp dụng cấu hình và backend xác nhận kết quả) đã được triển khai và kiểm chứng trên simulator qua P3, nhưng deployment chung vẫn giữ `STAGE5_ENABLED=false` do chưa rollout live.
@@ -529,6 +531,8 @@ khi Stage 5 tắt trả 503, thiếu/sai JWT trả 401. Vòng điều khiển kh
 | `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Owner/operator; Sensor đã provision | Nhận `frequency_hz` decimal + `expected_desired_version` string, bắt buộc Idempotency-Key; 202 nhận intent, 200 confirmed no-op; replay giữ status/body gốc |
 | `GET` | `/v1/digital-twins/{entity_id}/commands` | Owner/operator/viewer | Danh sách scope Sensor, keyset/Link, limit mặc định 20/tối đa 100 |
 | `GET` | `/v1/digital-twins/{entity_id}/commands/{command_id}` | Owner/operator/viewer | Chi tiết command đúng Sensor/Gateway; không trả outbox/raw diagnostics |
+
+Contract request/response, decimal rounding, replay/conflict, lỗi và polling xem tại [Stage 5 Sensor Control API](docs/protocols/stage5-sensor-control-api.md). `published` là PUBACK, không phải execution; chỉ result hợp lệ và transaction commit mới xác nhận configuration.
 
 Không có `POST .../commands`, `/v1/commands/{command_id}`, reboot hay capture-image.
 Chỉ hỗ trợ intent `update_configuration`/`sample_interval_us`. Global admin không
@@ -578,8 +582,8 @@ nằm tại `docs/protocols/mqtt-v1.md`.
   - `gateways/<gateway_id>/telemetry/#`: Gateway publish các batch mẫu đo lường.
   - `gateways/<gateway_id>/acks/#`: Gateway nhận application-level commit ACK từ Go Backend khi cần xác nhận đã lưu DB.
   - `gateways/<gateway_id>/status`: Gateway publish trạng thái kết nối / hoạt động (`online`, `offline`).
-   - `gateways/<gateway_id>/commands/#`: backend đã có publisher `update_configuration` cho Sensor; Gateway command handler chưa triển khai (5.5). Không có reboot/capture_image.
-   - `gateways/<gateway_id>/responses/#`: namespace kết quả theo thiết kế; backend mới subscribe/raw queue, chưa xử lý/commit result (5.6).
+   - `gateways/<gateway_id>/commands/#`: backend publish `update_configuration` cho Sensor; Gateway simulator apply/readback/receipt đã được kiểm chứng qua P3. Không có reboot/capture_image.
+   - `gateways/<gateway_id>/responses/#`: Gateway publish result; backend result consumer/transaction cập nhật `reported.configuration` đã được kiểm chứng qua P3. PUBACK không thay thế commit result.
 
 #### Định dạng gói tin telemetry (`telemetry_batch`):
 ```json
@@ -598,7 +602,7 @@ nằm tại `docs/protocols/mqtt-v1.md`.
 }
 ```
 
-#### Gói tin command hiện hành (publisher đã có ở 5.4, Gateway execution chưa có):
+#### Gói tin command hiện hành (Gateway execution đã được kiểm chứng trên simulator qua P3):
 ```json
 {
   "protocol_version": 1,
@@ -616,7 +620,7 @@ nằm tại `docs/protocols/mqtt-v1.md`.
 }
 ```
 
-#### Gói tin result theo contract (minh họa tương lai 5.5/5.6, chưa chạy runtime):
+#### Gói tin result (runtime P3; backend commit result/configuration):
 ```json
 {
   "protocol_version": 1,

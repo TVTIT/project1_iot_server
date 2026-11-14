@@ -514,6 +514,29 @@ Bảng dưới đây ghi nhận trạng thái giải quyết và danh mục các
 
 ## 3. Danh Mục Tồn Đọng Theo Thứ Tự Ưu Tiên (Prioritized Backlog)
 
+### Bàn giao Stage 5 sau kiểm chứng cục bộ — giới hạn còn mở (14/11/2026)
+
+Xem [báo cáo Stage 5 downlink](../backend/stage-5-downlink.md) và
+[kế hoạch bổ sung 5.7–5.8](../../../docs/backend_plan/stage5_remaining_detailed_plan.md).
+Simulator/control cục bộ và rehearsal control tương đương CI cục bộ PASS tại
+source qualification `develop`, HEAD `9a348709d6c92c394237fc0078759468c944a83`
+cộng dirty diff; remote CI, runtime AM5728, sensor vật lý/HIL và rollout
+shared/live NOT RUN. Người dùng chấp thuận hoãn R3/R4/R5 vì chưa có board
+AM5728; đây không phải bằng chứng hoàn tất yêu cầu phần cứng ban đầu.
+
+| Giới hạn / dependency | Ảnh hưởng | Workaround hiện tại | Khi xem lại |
+|---|---|---|---|
+| Job Remote CI hiện hành chưa chạy trên checkout remote | Rehearsal cục bộ/YAML không chứng minh Actions run tại một revision remote; không gán remote CI lịch sử làm acceptance hiện tại | Giữ remote CI NOT RUN; báo cáo chỉ xác nhận các kiểm tra cục bộ đã chạy | Khi có yêu cầu và revision được đưa lên remote |
+| Runtime board AM5728 với dữ liệu tổng hợp và sensor vật lý/HIL chưa chạy; R3/R4/R5 deferred | Simulator và ARMv7 cross-build không chứng minh runtime trên board, acquisition, readback hay sensor thật; adapter/acquisition chưa được triển khai | Giữ riêng hai mức board/HIL là NOT RUN; không tạo bằng chứng board giả lập hoặc PASS thay thế | Khi có board/driver/quyền truy cập và được yêu cầu tiếp tục |
+| Migration source dừng ở 26, nhưng schema deployment chưa xác nhận | Không thể kết luận target DB đã migrate/tương thích chỉ từ source tree | Kiểm tra trước schema, grants, backup/window tại target trước rollout; handoff này không tác động DB dùng chung | Stage 9 khi được giao rollout tại target |
+| Rollout shared/live, diễn tập key/credential và demo target chưa thực hiện | PASS trên fixture cục bộ không chứng minh cấu hình, ACL, credentials hay readiness tại môi trường được bàn giao | Giữ mọi feature defaults false; chưa enable điều khiển cho client | Stage 9 khi có approval và kế hoạch target cụ thể |
+| Semantics Stage 6 chưa đầy đủ | Fixed retry/backoff không phải full retry policy; cancellation/reconciliation và acknowledged runtime contract chưa được chốt | Giữ expiry/late-result behavior Stage 5 hiện tại; không tự retry command hoặc tuyên bố đã hội tụ | Chỉ khi Stage 6 được giao riêng |
+
+Stage 9 tái sử dụng bằng chứng local/CI/board thực sự đã có, đồng thời phụ trách
+target preflight, rollout và demo/acceptance cuối; không coi bằng chứng board
+đang deferred là đã hoàn tất. Media Stage 8/P9 và các thí nghiệm paper chính
+thức vẫn thuộc roadmap riêng.
+
 ### Giới hạn bàn giao P8 (29/10/2026)
 
 - **E5 fanout readiness (ảnh hưởng: chưa kết luận được điều kiện kích hoạt scan-vs-index).** Raw counters ghi indexed 20 so với scan 40 evaluation và event viewer đúng, nhưng adapter thận trọng không ghi `readiness_verified`; arm activation là `INCONCLUSIVE: fanout_viewer_readiness_unverified`. Cách xử lý: chỉ báo raw counters đã quan sát, không công nhận scan eligible/có lợi. Chỉ xem lại khi adapter chứng minh readiness và có lượt repeat so sánh được, được cho phép riêng.
