@@ -649,6 +649,111 @@ jobs:
           path: ${{ runner.temp }}/stage4-api-${{ github.run_id }}-${{ github.run_attempt }}.json
           if-no-files-found: error
 
+  stage5-control-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: .
+    env:
+      STAGE5_CONTROL_PRIVATE_DIR: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}
+      STAGE5_CONTROL_RUN_DIR: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/fixture
+      STAGE5_CONTROL_SAFE_REPORT: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: src/go.sum
+      - name: Check prerequisites
+        run: |
+          mkdir -p /tmp/opencode /var/tmp/opencode
+          python3 --version
+          openssl version
+          which setfacl getfacl
+          docker version
+          docker compose version
+          go version
+      - name: Test P3 runner and CI wiring
+        run: |
+          python3 -m unittest scripts/tests/test_paper_p3_support.py scripts/tests/test_dynsec_bootstrap_cli.py scripts/tests/test_ci_feature_jobs.py
+      - name: Pull full P3 profile images
+        run: |
+          docker pull --platform linux/amd64 timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          docker pull --platform linux/amd64 eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+          docker pull --platform linux/amd64 nginx:1.25-alpine
+          docker pull --platform linux/amd64 supabase/gotrue:v2.196.0
+          docker pull --platform linux/amd64 envoyproxy/envoy:v1.39.1
+          docker pull --platform linux/amd64 supabase/storage-api:v1.74.0
+      - name: Prepare private P3 run directory
+        run: |
+          test ! -e "$STAGE5_CONTROL_PRIVATE_DIR"
+          mkdir -m 700 -p "$STAGE5_CONTROL_PRIVATE_DIR"
+      - name: Run P3 control require-run
+        id: p3
+        run: |
+          # GNU timeout sends TERM to the wrapper/process group; the owned fixture
+          # receives time to run its bounded exact-receipt cleanup before KILL.
+          timeout --signal=TERM --kill-after=180s 2100s sh scripts/test-paper-p3.sh "$STAGE5_CONTROL_RUN_DIR" \
+            > "$STAGE5_CONTROL_PRIVATE_DIR/runner.log" 2>&1
+      - name: Stage safe P3 summary
+        run: |
+          python3 - "$STAGE5_CONTROL_RUN_DIR/artifacts/startup-summary.json" "$STAGE5_CONTROL_SAFE_REPORT" "$GITHUB_SHA" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          source, destination, checkout_sha = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          if source.is_symlink() or not source.is_file():
+              raise SystemExit("P3 acceptance summary missing or not a regular file")
+          try:
+              report = json.loads(source.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit("P3 acceptance summary is unreadable or malformed") from None
+          if not isinstance(report, dict):
+              raise SystemExit("P3 acceptance summary rejected")
+          sys.path.insert(0, str(Path.cwd() / "scripts" / "tests"))
+          import paper_p3_support
+          try:
+              paper_p3_support.require_paper_p3_run(report, 0)
+          except ValueError:
+              raise SystemExit("P3 acceptance summary did not satisfy require-run") from None
+          if (type(report.get("schema_version")) is not int or report["schema_version"] != 1 or
+                  not isinstance(report.get("project"), str) or
+                  not re.fullmatch(r"ncs_[0-9a-f]{12}", report["project"]) or
+                  not re.fullmatch(r"[0-9a-f]{40}", checkout_sha)):
+              raise SystemExit("P3 safe report provenance rejected")
+          counts = report.get("cleanup_counts")
+          if (not isinstance(counts, dict) or set(counts) != {"container", "network", "volume"} or
+                  any(type(value) is not int or value < 0 for value in counts.values())):
+              raise SystemExit("P3 safe report cleanup counts rejected")
+          safe = {
+              "schema_version": 1,
+              "status": report["status"],
+              "project": report["project"],
+              "native_executed": True,
+              "full_p3_accepted": True,
+              "exact_cleanup_verified": True,
+              "cleanup_counts": counts,
+              "checkout_sha": checkout_sha,
+              "profile": "P3",
+          }
+          destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as output:
+              json.dump(safe, output, sort_keys=True)
+              output.write("\n")
+          print("P3 safe summary staged for checkout " + checkout_sha)
+          PY
+      - name: Upload safe P3 report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage5-control-safe-report
+          path: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
+          if-no-files-found: error
+
   native-compose-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30

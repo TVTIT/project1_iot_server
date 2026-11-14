@@ -13,6 +13,21 @@ from datetime import datetime, timedelta, timezone
 MICROBATCH_REGRESSION_TRAFFIC_LABEL = 'fixture_mqtt_publish_not_gateway_generation'
 
 
+def require_paper_p3_run(report, runner_exit_code):
+    """Require a successful baseline P3 execution and its exact-owned cleanup."""
+    if runner_exit_code != 0:
+        raise ValueError('paper_p3_runner_exit_nonzero')
+    if type(report) is not dict:
+        raise ValueError('paper_p3_summary_missing_or_malformed')
+    if (report.get('status') != 'PAPER_P3_ACCEPTED'
+            or report.get('native_executed') is not True
+            or report.get('full_p3_accepted') is not True
+            or report.get('exact_cleanup_verified') is not True
+            or report.get('error') is not None):
+        raise ValueError('paper_p3_require_run_rejected')
+    return True
+
+
 def microbatch_regression_accepted(result):
     return (type(result) is dict and result.get('microbatch_enabled') is True
             and result.get('command_result_confirmed') is True

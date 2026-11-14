@@ -9,6 +9,56 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paper_p3_support as runner
 
 
+class RequireRunTests(unittest.TestCase):
+    def setUp(self):
+        self.accepted = {
+            'status': 'PAPER_P3_ACCEPTED',
+            'native_executed': True,
+            'full_p3_accepted': True,
+            'exact_cleanup_verified': True,
+            'error': None,
+        }
+
+    def test_accepts_only_completed_baseline_p3_with_clean_exit(self):
+        self.assertTrue(runner.require_paper_p3_run(self.accepted, 0))
+
+    def test_rejects_missing_or_prepared_only_summary(self):
+        for report in (None, {}, {'status': 'STARTUP_VERIFIED_NOT_HTTP_ACCEPTED'}):
+            with self.subTest(report=report), self.assertRaises(ValueError):
+                runner.require_paper_p3_run(report, 0)
+
+    def test_rejects_each_missing_acceptance_field(self):
+        for field in ('status', 'native_executed', 'full_p3_accepted',
+                      'exact_cleanup_verified'):
+            candidate = dict(self.accepted)
+            del candidate[field]
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                runner.require_paper_p3_run(candidate, 0)
+
+    def test_rejects_wrong_status_and_false_acceptance_or_cleanup(self):
+        for mutation in (
+                {'status': 'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED'},
+                {'native_executed': False},
+                {'full_p3_accepted': False},
+                {'exact_cleanup_verified': False},
+                {'error': 'fixture_failure'}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                runner.require_paper_p3_run(dict(self.accepted, **mutation), 0)
+
+    def test_rejects_failed_execution_even_if_summary_claims_acceptance(self):
+        with self.assertRaises(ValueError):
+            runner.require_paper_p3_run(self.accepted, 1)
+
+    def test_rejects_malformed_acceptance_field_types(self):
+        for mutation in (
+                {'native_executed': 1},
+                {'full_p3_accepted': 'true'},
+                {'exact_cleanup_verified': 1},
+                {'error': False}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                runner.require_paper_p3_run(dict(self.accepted, **mutation), 0)
+
+
 class MetricsOffReplacementTests(unittest.TestCase):
     def setUp(self):
         self.fixture = SimpleNamespace(project='ncs_fixture', private=Path('/unused/private'))

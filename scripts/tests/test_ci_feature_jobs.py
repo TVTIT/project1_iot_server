@@ -24,10 +24,18 @@ Verifies the workflow structure, steps, commands, and options for:
   * Runs from repo root (working-directory: .).
   * Sets PROVISIONING_TEST_COVERAGE.
   * Uploads distinct provisioning coverage artifact.
+- stage5-control-integration:
+  * Runs the P3 require-run fixture with a bounded timeout.
+  * Stages only a validated allowlist summary with checkout provenance.
 """
 
+import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -70,7 +78,8 @@ class TestCIFeatureJobs(unittest.TestCase):
                 ('stage2-e2e', 'test_stage2_ci.py'),
                 ('mosquitto-credential-integration', 'test-stage2-mqtt-credentials.sh'),
                 ('auth-integration', 'test-stage2-admin.sh'),
-                ('native-compose-smoke', 'test_native_compose_smoke.py')):
+                ('native-compose-smoke', 'test_native_compose_smoke.py'),
+                ('stage5-control-integration', 'test_paper_p3_support.py')):
             with self.subTest(job=name):
                 job = self._extract_job_section(name)
                 setup = re.search(r'mkdir -p /tmp/opencode /var/tmp/opencode', job)
@@ -260,10 +269,10 @@ class TestCIFeatureJobs(unittest.TestCase):
         assert_credential_job_contract(cred_job)
         assert_runtime_job_contract(runtime_job)
 
-        # Verify all 16 job IDs remain defined
+        # Verify all 17 job IDs remain defined
         jobs_content = self.raw_content.split('\njobs:\n', 1)[1]
         all_jobs = re.findall(r'^  ([a-z0-9-]+):[ \t]*$', jobs_content, re.MULTILINE)
-        self.assertEqual(len(all_jobs), 16, f"expected 16 jobs, found {len(all_jobs)}: {all_jobs}")
+        self.assertEqual(len(all_jobs), 17, f"expected 17 jobs, found {len(all_jobs)}: {all_jobs}")
         expected_jobs = {
             'lint-and-test', 'cross-compile', 'migration-check',
             'docker-build', 'authorization-integration',
@@ -273,12 +282,204 @@ class TestCIFeatureJobs(unittest.TestCase):
             'legacy-runtime-image-build', 'dynsec-native-integration',
             'dynsec-bootstrap-tests', 'stage3-uplink-integration',
             'stage4-api-integration', 'native-compose-smoke',
+            'stage5-control-integration',
         }
         self.assertEqual(set(all_jobs), expected_jobs)
 
         # Verify gates/needs remain intact
         smoke_job = self._extract_job_section('native-compose-smoke')
         self.assertIn('needs: [lint-and-test, migration-check, dynsec-native-integration, dynsec-bootstrap-tests]', smoke_job)
+
+    def test_stage5_control_job_runs_the_p3_require_run_lane(self):
+        job = self._extract_job_section('stage5-control-integration')
+        self.assertTrue(job, "stage5-control-integration must exist")
+        self.assertIn('timeout-minutes: 45', job)
+        self.assertIn('working-directory: .', job)
+        self.assertIn("go-version: '1.27.3'", job)
+        self.assertIn("cache-dependency-path: src/go.sum", job)
+        self.assertIn('timeout --signal=TERM --kill-after=180s 2100s sh scripts/test-paper-p3.sh "$STAGE5_CONTROL_RUN_DIR"', job)
+        self.assertIn('scripts/tests/test_paper_p3_support.py', job)
+        self.assertIn('scripts/tests/test_dynsec_bootstrap_cli.py', job)
+        self.assertIn('scripts/tests/test_ci_feature_jobs.py', job)
+        self.assertLess(job.index('test_paper_p3_support.py'), job.index('test-paper-p3.sh'))
+
+    def test_stage5_control_job_pulls_full_p3_profile_images(self):
+        job = self._extract_job_section('stage5-control-integration')
+        # Effective P3 source includes the Auth/Storage/Envoy topology, PostgreSQL
+        # compatibility services and DynSec broker, not only the HTTP smoke subset.
+        for image in (
+            'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a',
+            'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9',
+            'nginx:1.25-alpine',
+            'supabase/gotrue:v2.196.0',
+            'envoyproxy/envoy:v1.39.1',
+            'supabase/storage-api:v1.74.0',
+        ):
+            self.assertIn(f'docker pull --platform linux/amd64 {image}', job)
+        self.assertNotIn('--full-http', job)
+        self.assertNotIn('native_compose_smoke.py --prepare', job)
+
+    def test_stage5_control_job_stages_only_validated_safe_summary(self):
+        job = self._extract_job_section('stage5-control-integration')
+        self.assertIn('startup-summary.json', job)
+        self.assertIn('require_paper_p3_run', job)
+        self.assertIn('GITHUB_SHA', job)
+        self.assertIn('stage5-control-safe-report', job)
+        self.assertIn('path: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/summary.json', job)
+        self.assertIn('if-no-files-found: error', job)
+        self.assertNotIn('run.json', job)
+        self.assertNotIn('metrics.csv', job)
+        self.assertNotIn('if: always()', job)
+        self.assertNotIn('continue-on-error', job)
+        self.assertNotIn('prune', job)
+        self.assertNotIn('.env', job)
+
+    def test_stage5_control_timeout_and_interruption_exit_statuses_fail_step(self):
+        job = self._extract_job_section('stage5-control-integration')
+        match = re.search(
+            r"      - name: Run P3 control require-run\n        id: p3\n        run: \|\n((?:          [^\n]*\n)+)",
+            job + "\n",
+        )
+        self.assertIsNotNone(match, "P3 runner step must remain executable and bounded")
+        script = textwrap.dedent(match.group(1))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "bin"
+            private = root / "private"
+            bin_dir.mkdir()
+            private.mkdir(mode=0o700)
+            trace = root / "timeout-argv"
+            fake_timeout = bin_dir / "timeout"
+            fake_timeout.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "open(os.environ['TIMEOUT_TRACE'], 'w').write('\\n'.join(sys.argv[1:]))\n"
+                "raise SystemExit(int(os.environ['TIMEOUT_STATUS']))\n",
+                encoding="utf-8",
+            )
+            fake_timeout.chmod(0o755)
+            for status in (124, 143):
+                result = subprocess.run(
+                    ["/bin/bash", "-e", "-o", "pipefail", "-c", script],
+                    env={
+                        **os.environ,
+                        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                        "TIMEOUT_TRACE": str(trace),
+                        "TIMEOUT_STATUS": str(status),
+                        "STAGE5_CONTROL_PRIVATE_DIR": str(private),
+                        "STAGE5_CONTROL_RUN_DIR": str(root / "fixture"),
+                    },
+                    cwd=str(Path(__file__).resolve().parents[2]),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                args = trace.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    args,
+                    [
+                        "--signal=TERM", "--kill-after=180s", "2100s",
+                        "sh", "scripts/test-paper-p3.sh", str(root / "fixture"),
+                    ],
+                )
+                self.assertFalse((root / "fixture").exists())
+
+    def test_stage5_control_safe_report_step_rejects_unaccepted_summary(self):
+        job = self._extract_job_section('stage5-control-integration')
+        match = re.search(
+            r"      - name: Stage safe P3 summary\n        run: \|\n((?:(?:          [^\n]*|[ \t]*)\n)+)",
+            job + "\n",
+        )
+        self.assertIsNotNone(match, "Safe summary staging step must be executable and testable")
+        script_lines = textwrap.dedent(match.group(1)).splitlines()
+        self.assertTrue(script_lines[0].startswith("python3 - "))
+        self.assertEqual(script_lines[0].split("<<", 1)[1], "'PY'")
+        self.assertEqual(script_lines[-1], "PY")
+        script = "\n".join(script_lines[1:-1])
+        accepted = {
+            "schema_version": 1,
+            "status": "PAPER_P3_ACCEPTED",
+            "project": "ncs_0123456789ab",
+            "native_executed": True,
+            "full_p3_accepted": True,
+            "exact_cleanup_verified": True,
+            "cleanup_counts": {"container": 17, "network": 1, "volume": 7},
+            "private_diagnostic": "must-not-be-staged",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "artifacts" / "startup-summary.json"
+            source.parent.mkdir()
+            staged = root / "private" / "summary.json"
+
+            def invoke(report, sha="0123456789abcdef"):
+                source.write_text(json.dumps(report), encoding="utf-8")
+                return subprocess.run(
+                    [sys.executable, "-c", script,
+                     str(source), str(staged), sha],
+                    env={
+                        **os.environ,
+                        "STAGE5_CONTROL_RUN_DIR": str(root),
+                        "STAGE5_CONTROL_SAFE_REPORT": str(staged),
+                        "GITHUB_SHA": sha,
+                    },
+                    cwd=str(Path(__file__).resolve().parents[2]),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+
+            sha = "0123456789abcdef" * 2 + "01234567"
+            result = invoke(accepted, sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(staged.read_text(encoding="utf-8"))
+            self.assertEqual(payload["checkout_sha"], sha)
+            self.assertEqual(payload["profile"], "P3")
+            self.assertEqual(payload["cleanup_counts"], accepted["cleanup_counts"])
+            self.assertNotIn("private_diagnostic", payload)
+            self.assertEqual(
+                set(payload),
+                {
+                    "schema_version", "status", "project", "native_executed",
+                    "full_p3_accepted", "exact_cleanup_verified", "cleanup_counts",
+                    "checkout_sha", "profile",
+                },
+            )
+
+            for invalid in (
+                None,
+                {},
+                {**accepted, "status": "PREPARED_NOT_EXECUTED"},
+                {**accepted, "native_executed": False},
+                {**accepted, "full_p3_accepted": False},
+                {**accepted, "exact_cleanup_verified": False},
+                {**accepted, "error": "failure"},
+                {**accepted, "schema_version": True},
+            ):
+                if staged.exists():
+                    staged.unlink()
+                result = invoke(invalid, sha)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(staged.exists())
+
+            source.unlink()
+            result = subprocess.run(
+                [sys.executable, "-c", script,
+                 str(source), str(staged), sha],
+                env={
+                    **os.environ,
+                    "STAGE5_CONTROL_RUN_DIR": str(root),
+                    "STAGE5_CONTROL_SAFE_REPORT": str(staged),
+                    "GITHUB_SHA": sha,
+                },
+                cwd=str(Path(__file__).resolve().parents[2]),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(staged.exists())
 
     def test_lint_and_test_gateway_exception_removed(self):
         """Allow-no-test-package exception for cmd/gateway must be removed since it now has tests."""
