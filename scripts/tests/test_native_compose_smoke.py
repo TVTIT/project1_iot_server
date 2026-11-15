@@ -1294,6 +1294,22 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn(f"{key}={value}\n", env_text)
             self.assertNotIn("deployment-value-must-not-leak", env_text)
 
+    def test_stage6_control_resilience_defaults_are_explicit_and_default_off(self):
+        expected = {
+            "STAGE6_ENABLED": "false",
+            "STAGE6_RETRY_MAX_BACKOFF": "8s",
+            "STAGE6_RETRY_MAX_ATTEMPTS": "5",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                key: "deployment-value-must-not-leak" for key in expected}):
+            fixture = self.prepare(directory)
+            env_text = fixture.env_file.read_text()
+            for key, value in expected.items():
+                self.assertEqual(smoke.DEFAULTS.get(key), value, key)
+                self.assertEqual(fixture.values[key], value)
+                self.assertIn(f"{key}={value}\n", env_text)
+            self.assertNotIn("deployment-value-must-not-leak", env_text)
+
     def test_p4_broker_configs_keep_packet_overhead_and_control_bounds(self):
         root_config = smoke.ROOT / "config/mosquitto/mosquitto.conf"
         text = root_config.read_text()
@@ -2696,15 +2712,25 @@ class PaperP0Tests(unittest.TestCase):
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 25);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 27);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("26:drop_telemetry_redundant_indexes", expected)
+        self.assertIn("27:stage6_control_resilience", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
+
+    def test_historical_schema26_context_remains_explicitly_supported(self):
+        expected = smoke.expected_schema_history()
+        history26 = ",".join(row for row in expected.split(",")
+                              if int(row.split(":", 1)[0]) <= 26)
+        self.assertTrue(history26.endswith("26:drop_telemetry_redundant_indexes"))
+        self.assertTrue(smoke.schema_history_verified(
+            0, history26, history26, terminal="26:drop_telemetry_redundant_indexes"))
+        # The default verifier remains pinned to current terminal 27.
+        self.assertFalse(smoke.schema_history_verified(0, history26, history26))
 
     def test_historical_schema25_context_remains_explicitly_supported(self):
         expected = smoke.expected_schema_history()
@@ -2713,7 +2739,7 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertTrue(history25.endswith("25:drop_telemetry_sensor_fk"))
         self.assertTrue(smoke.schema_history_verified(
             0, history25, history25, terminal="25:drop_telemetry_sensor_fk"))
-        # The default verifier remains pinned to current terminal 26.
+        # The default verifier remains pinned to current terminal 27.
         self.assertFalse(smoke.schema_history_verified(0, history25, history25))
 
     def test_historical_schema23_context_remains_explicitly_supported(self):
@@ -2723,7 +2749,7 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertTrue(history23.endswith("23:sensor_control_intent"))
         self.assertTrue(smoke.schema_history_verified(
             0, history23, history23, terminal="23:sensor_control_intent"))
-        # The default verifier remains pinned to current terminal 25.
+        # The default verifier remains pinned to current terminal 27.
         self.assertFalse(smoke.schema_history_verified(0, history23, history23))
 
     def test_historical_schema24_context_remains_explicitly_supported(self):
@@ -2737,22 +2763,22 @@ class SchemaHistoryTests(unittest.TestCase):
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",26:drop_telemetry_redundant_indexes")
+        stale = expected.removesuffix(",27:stage6_control_resilience")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "26:drop_telemetry_redundant_indexes")
+        missing = ",".join(p for p in expected.split(",") if p != "27:stage6_control_resilience")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("26:drop_telemetry_redundant_indexes", "26:unexpected_name")
+        wrong = expected.replace("27:stage6_control_resilience", "27:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
         expected = smoke.expected_schema_history()
-        self.assertFalse(smoke.schema_history_verified(0, expected + ",26:future_migration", expected))
+        self.assertFalse(smoke.schema_history_verified(0, expected + ",28:future_migration", expected))
 
     def test_failed_migration_returncode_rejected(self):
         expected = smoke.expected_schema_history()
@@ -2763,7 +2789,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("26:drop_telemetry_redundant_indexes", "27:future_migration")
+        future = expected.replace("27:stage6_control_resilience", "28:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 
@@ -2914,6 +2940,9 @@ class AssertionTests(unittest.TestCase):
         self.assertEqual(smoke.DEFAULTS["STAGE5_COMMAND_TTL"], "60s")
         self.assertEqual(smoke.DEFAULTS["STAGE5_MAX_PENDING_OUTBOX"], "10000")
         self.assertEqual(smoke.DEFAULTS["STAGE5_MAX_RECEIPTS"], "100000")
+        self.assertEqual(smoke.DEFAULTS["STAGE6_ENABLED"], "false")
+        self.assertEqual(smoke.DEFAULTS["STAGE6_RETRY_MAX_BACKOFF"], "8s")
+        self.assertEqual(smoke.DEFAULTS["STAGE6_RETRY_MAX_ATTEMPTS"], "5")
 
     def test_denial_snapshot_preserves_full_rows_not_just_counts(self):
         before = {"sensors": [{"gateway_id": "gw", "sensor_id": "s", "name": "old", "unit": "C"}],

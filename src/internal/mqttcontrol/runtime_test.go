@@ -744,10 +744,7 @@ func TestStage6RuntimeDispatchAndFencing(t *testing.T) {
 
 	pub.ack <- struct{}{} // allow publish attempt
 	failStart := time.Now()
-	r.jobs <- dispatchJob{id: failID}
-	r.mu.Lock()
-	r.inflight[failID] = true
-	r.mu.Unlock()
+	enqueueStage6Job(r, failID)
 
 	// Wait for failID to be removed from inflight
 	failDeadline := time.Now().Add(2 * time.Second)
@@ -785,10 +782,7 @@ func TestStage6RuntimeDispatchAndFencing(t *testing.T) {
 	repo.dispatch = expiredDispatch
 	repo.mu.Unlock()
 
-	r.jobs <- dispatchJob{id: skipID}
-	r.mu.Lock()
-	r.inflight[skipID] = true
-	r.mu.Unlock()
+	enqueueStage6Job(r, skipID)
 
 	skipDeadline := time.Now().Add(2 * time.Second)
 	for {
