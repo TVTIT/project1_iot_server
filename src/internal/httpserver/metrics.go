@@ -24,6 +24,7 @@ var metricRoutes = [...]string{
 	"GET /v1/digital-twins/:entity_id", "PATCH /v1/digital-twins/:entity_id/attrs",
 	"GET /v1/digital-twins/:entity_id/temporal", "PATCH /v1/digital-twins/:entity_id/desired-state",
 	"GET /v1/digital-twins/:entity_id/commands", "GET /v1/digital-twins/:entity_id/commands/:command_id",
+	"POST /v1/digital-twins/:entity_id/commands/:command_id/cancel",
 }
 
 // HTTPMetrics has a compile-time bound independent of request data.

@@ -39,6 +39,7 @@ type controlRepositoryStub struct {
 	admit     func(context.Context, uuid.UUID, string, digitaltwin.DesiredRequest) (digitaltwin.RequestReceipt, error)
 	list      func(context.Context, uuid.UUID, string, int, string) (digitaltwin.ControlCommandPage, error)
 	get       func(context.Context, uuid.UUID, string, string) (digitaltwin.ControlCommandView, error)
+	cancel    func(context.Context, uuid.UUID, string, string) (digitaltwin.CommandCancellation, error)
 }
 
 func TestControlHTTPEntrySurvivesAuthorizationAndEarlyEvents(t *testing.T) {
@@ -87,6 +88,12 @@ func (s *controlRepositoryStub) ListCommands(ctx context.Context, id uuid.UUID, 
 }
 func (s *controlRepositoryStub) GetCommand(ctx context.Context, id uuid.UUID, urn, id2 string) (digitaltwin.ControlCommandView, error) {
 	return s.get(ctx, id, urn, id2)
+}
+func (s *controlRepositoryStub) CancelControl(ctx context.Context, id uuid.UUID, urn, commandID string) (digitaltwin.CommandCancellation, error) {
+	if s.cancel == nil {
+		return digitaltwin.CommandCancellation{}, digitaltwin.ErrNotFound
+	}
+	return s.cancel(ctx, id, urn, commandID)
 }
 
 func TestControlTimeoutReplayAndFailureBoundaries(t *testing.T) {

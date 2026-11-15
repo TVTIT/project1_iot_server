@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +24,7 @@ type ControlRepository interface {
 	Admit(context.Context, uuid.UUID, string, digitaltwin.DesiredRequest) (digitaltwin.RequestReceipt, error)
 	ListCommands(context.Context, uuid.UUID, string, int, string) (digitaltwin.ControlCommandPage, error)
 	GetCommand(context.Context, uuid.UUID, string, string) (digitaltwin.ControlCommandView, error)
+	CancelControl(context.Context, uuid.UUID, string, string) (digitaltwin.CommandCancellation, error)
 }
 
 func controlHandler(deps RouterDependencies, operation string) gin.HandlerFunc {
@@ -44,23 +46,29 @@ func controlHandler(deps RouterDependencies, operation string) gin.HandlerFunc {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), deps.ControlRequestTimeout)
 		defer cancel()
 		c.Request = c.Request.WithContext(ctx)
-		if operation == "admit" {
-			// Context cancellation alone does not interrupt net/http Body.Read.
-			// Interrupt it only when this budget ends, preserving any earlier
-			// server read deadline. Join a started callback before connection reuse.
-			done := make(chan struct{})
-			stop := context.AfterFunc(ctx, func() {
+
+		// For admit/cancel operations, install a read deadline interrupter that fires
+		// when the request budget expires. This interrupts any blocked Body.Read.
+		// Join the callback before handler/context reuse on ALL paths.
+		var (
+			readDeadlineStop func() bool
+			readDeadlineDone chan struct{}
+		)
+		if operation == "admit" || operation == "cancel" {
+			readDeadlineDone = make(chan struct{})
+			readDeadlineStop = context.AfterFunc(ctx, func() {
 				_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now())
-				close(done)
+				close(readDeadlineDone)
 			})
 			defer func() {
-				if !stop() {
-					<-done
+				if !readDeadlineStop() {
+					<-readDeadlineDone
 				}
 			}()
 		}
+
 		urn := c.Param("entity_id") // net/http decoded once; never unescape again.
-		if err := deps.ControlRepository.AuthorizeControlTarget(ctx, principal.UserID, urn, operation == "admit"); err != nil {
+		if err := deps.ControlRepository.AuthorizeControlTarget(ctx, principal.UserID, urn, operation == "admit" || operation == "cancel"); err != nil {
 			writeControlError(c, err)
 			return
 		}
@@ -85,6 +93,27 @@ func controlHandler(deps RouterDependencies, operation string) gin.HandlerFunc {
 			// Data writes the original receipt bytes, without JSON re-encoding or
 			// querying current command status (including after newer versions).
 			c.Data(receipt.StatusCode, "application/json; charset=utf-8", receipt.Response)
+		case "cancel":
+			if err := parseCancelRequest(c.Request); err != nil {
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				}
+				// On non-empty body rejection, synchronously interrupt post-handler drain
+				// and prevent connection reuse BEFORE writing the error response.
+				if isBodyRejected(err) {
+					setBodyRejectionClosePolicy(c)
+				}
+				writeControlError(c, err)
+				return
+			}
+			outcome, err := deps.ControlRepository.CancelControl(ctx, principal.UserID, urn, c.Param("command_id"))
+			if err != nil {
+				writeControlError(c, err)
+				return
+			}
+			// The outcome is built from persisted cancellation evidence, so a
+			// repeated request returns exactly the same body.
+			c.JSON(http.StatusOK, outcome)
 		case "list":
 			limit, cursor, err := parseControlQuery(c.Request, false)
 			if err != nil {
@@ -113,6 +142,25 @@ func controlHandler(deps RouterDependencies, operation string) gin.HandlerFunc {
 			}
 			c.JSON(http.StatusOK, view)
 		}
+	}
+}
+
+// isBodyRejected reports whether the error is a non-empty body rejection
+// (ErrInvalidInput) rather than a context deadline/cancellation.
+func isBodyRejected(err error) bool {
+	return errors.Is(err, digitaltwin.ErrInvalidInput) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
+}
+
+// setBodyRejectionClosePolicy synchronously configures the response to prevent
+// post-handler body drain and connection reuse on early body rejection.
+// Must be called BEFORE writeControlError / WriteHeader.
+func setBodyRejectionClosePolicy(c *gin.Context) {
+	// Immediately interrupt any post-handler body read.
+	_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now())
+	// For HTTP/1.x, mark connection for close so net/http doesn't attempt to drain/reuse.
+	// For HTTP/2, Connection header is not valid; net/http handles stream reset.
+	if !c.Request.ProtoAtLeast(2, 0) {
+		c.Header("Connection", "close")
 	}
 }
 
@@ -173,13 +221,27 @@ func controlCacheMiddleware() gin.HandlerFunc {
 
 func isControlRoute(path string) bool {
 	p := strings.Split(strings.TrimSuffix(path, "/"), "/")
-	return len(p) >= 5 && p[1] == "v1" && p[2] == "digital-twins" && p[3] != "" &&
-		((len(p) == 5 && (p[4] == "desired-state" || p[4] == "commands")) ||
-			(len(p) == 6 && p[4] == "commands" && p[5] != ""))
+	if len(p) < 5 || p[1] != "v1" || p[2] != "digital-twins" || p[3] == "" {
+		return false
+	}
+	switch len(p) {
+	case 5:
+		return p[4] == "desired-state" || p[4] == "commands"
+	case 6:
+		return p[4] == "commands" && p[5] != ""
+	case 7:
+		return p[4] == "commands" && p[5] != "" && p[6] == "cancel"
+	default:
+		return false
+	}
 }
 
 func validateControlDependencies(deps RouterDependencies) error {
 	if deps.ControlAPIEnabled && (auth.IsNilDependency(deps.ControlRepository) || deps.ControlRequestTimeout < time.Millisecond || deps.ControlRequestTimeout > time.Minute) {
+		return digitaltwin.ErrDependencyUnavailable
+	}
+	if deps.ControlCancelEnabled && !deps.ControlAPIEnabled {
+		// The cancellation surface exists only together with the control API.
 		return digitaltwin.ErrDependencyUnavailable
 	}
 	return nil

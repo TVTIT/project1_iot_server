@@ -795,6 +795,8 @@ def main(argv=None) -> int:
             from stage5_intent_fixture import migrate, verify
             migrate(fixture, 23)
             verify(fixture)
+            # The Stage 6 durable retry lane needs the current schema terminal.
+            run_existing_migration_runner(fixture, 27)
         else:
             bootstrap_to_9(fixture)
             run_existing_migration_runner(fixture, 20)

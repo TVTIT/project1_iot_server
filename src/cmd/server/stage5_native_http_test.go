@@ -36,9 +36,20 @@ type controlHTTPFixture struct {
 	actors        map[string]uuid.UUID
 	tokens        map[string]string
 	notifications int
+	control       digitaltwin.ControlConfig
 }
 
 func newControlHTTPFixture(t *testing.T) *controlHTTPFixture {
+	return newControlHTTPFixtureMode(t, false)
+}
+
+// newControlHTTPFixtureStage6 serves the same composition with the validated
+// Stage 6 flag enabled, so the opt-in cancellation route exists.
+func newControlHTTPFixtureStage6(t *testing.T) *controlHTTPFixture {
+	return newControlHTTPFixtureMode(t, true)
+}
+
+func newControlHTTPFixtureMode(t *testing.T, stage6 bool) *controlHTTPFixture {
 	t.Helper()
 	if os.Getenv("CONTROL_TEST_ISOLATED") != "1" {
 		t.Skip("requires owned Task 5 PostgreSQL fixture; never reads deployment .env")
@@ -94,6 +105,11 @@ func newControlHTTPFixture(t *testing.T) *controlHTTPFixture {
 	cfg.MetricsEnabled = false
 	cfg.Stage5 = config.Stage5Config{Enabled: true, Control: digitaltwin.DefaultControlConfig()}
 	cfg.Stage5.Dispatch.WakeupEnabled = true
+	if stage6 {
+		cfg.Stage5.Stage6Enabled = true
+		cfg.Stage5.Control.Stage6Enabled = true
+	}
+	f.control = cfg.Stage5.Control
 	deps := controlHTTPDependencies(t, cfg, f.app, verifier)
 	if err = populateStage5Dependencies(&deps, cfg, f.app, func() { f.notifications++ }); err != nil {
 		t.Fatal(err)
@@ -345,6 +361,186 @@ func assertControlHTTPError(t *testing.T, data []byte, code string) {
 	if err := json.Unmarshal(data, &envelope); err != nil || envelope.Error.Code != code {
 		t.Fatalf("want %s: %s (%v)", code, data, err)
 	}
+}
+
+// TestNativeControlHTTPCancelOptIn exercises the routed cancellation API
+// against the real repository, the real JWT authentication and the current
+// membership of the fixture database.
+func TestNativeControlHTTPCancelOptIn(t *testing.T) {
+	// With Stage 6 disabled the route does not exist at all.
+	off := newControlHTTPFixture(t)
+	offCommand := uuid.New()
+	off.exec(`INSERT INTO twin_commands(command_id,entity_id,action,parameters,status,desired_version,issued_at,expires_at,control_version,requested_frequency_hz)
+		VALUES($1,(SELECT id FROM twin_entities WHERE entity_id=$2),'update_configuration','{"sample_interval_us":10000000}','pending',1,clock_timestamp(),clock_timestamp()+interval '1 minute',1,'0.1')`, offCommand, off.urn)
+	off.request("POST", "/v1/digital-twins/"+url.PathEscape(off.urn)+"/commands/"+offCommand.String()+"/cancel", "owner", "", "", nil, 404)
+	var offStatus string
+	if err := off.admin.QueryRow(off.ctx, `SELECT status FROM twin_commands WHERE command_id=$1`, offCommand).Scan(&offStatus); err != nil || offStatus != "pending" {
+		t.Fatalf("disabled cancellation changed the command: %s %v", offStatus, err)
+	}
+
+	f := newControlHTTPFixtureStage6(t)
+	base := "/v1/digital-twins/" + url.PathEscape(f.urn)
+	_, admitted := f.request("PATCH", base+"/desired-state", "owner", "cancel-http", `{"frequency_hz":0.1,"expected_desired_version":"0"}`, nil, 202)
+	var admission struct {
+		CommandID string `json:"command_id"`
+	}
+	if err := json.Unmarshal(admitted, &admission); err != nil || admission.CommandID == "" {
+		t.Fatalf("admission %s (%v)", admitted, err)
+	}
+	cancelPath := base + "/commands/" + admission.CommandID + "/cancel"
+
+	// The cancellation is a mutation: only owner/operator may perform it.
+	for role, want := range map[string]int{"": 401, "viewer": 403, "nonmember": 404, "admin": 404} {
+		f.request("POST", cancelPath, role, "", "", nil, want)
+	}
+	var untouched string
+	if err := f.admin.QueryRow(f.ctx, `SELECT status FROM twin_commands WHERE command_id=$1`, admission.CommandID).Scan(&untouched); err != nil || untouched != "pending" {
+		t.Fatalf("denied cancellation changed the command: %s %v", untouched, err)
+	}
+
+	before := f.snapshot()
+	_, cancelled := f.request("POST", cancelPath, "owner", "", "", nil, 200)
+	var outcome struct {
+		EntityID       string `json:"entity_id"`
+		CommandID      string `json:"command_id"`
+		Status         string `json:"status"`
+		DesiredVersion string `json:"desired_version"`
+		CancelledAt    string `json:"cancelled_at"`
+		StatusURL      string `json:"status_url"`
+	}
+	if err := json.Unmarshal(cancelled, &outcome); err != nil {
+		t.Fatal(err)
+	}
+	if outcome.EntityID != f.urn || outcome.CommandID != admission.CommandID || outcome.Status != "cancelled" || outcome.DesiredVersion != "1" || outcome.CancelledAt == "" || outcome.StatusURL == "" {
+		t.Fatalf("cancellation body %s", cancelled)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, outcome.CancelledAt); err != nil {
+		t.Fatalf("cancellation timestamp %q: %v", outcome.CancelledAt, err)
+	}
+	var commandStatus, outboxStatus, cancelReason string
+	var cancelledAt *time.Time
+	if err := f.admin.QueryRow(f.ctx, `SELECT c.status,o.status,c.retry_stop_reason,c.cancelled_at FROM twin_commands c JOIN twin_outbox o USING(command_id) WHERE c.command_id=$1`, admission.CommandID).Scan(&commandStatus, &outboxStatus, &cancelReason, &cancelledAt); err != nil {
+		t.Fatal(err)
+	}
+	if commandStatus != "cancelled" || outboxStatus != "failed" || cancelReason != "cancelled" || cancelledAt == nil {
+		t.Fatalf("cancellation state %s/%s/%s %v", commandStatus, outboxStatus, cancelReason, cancelledAt)
+	}
+	if after := f.snapshot(); after != before {
+		t.Fatal("cancellation changed desired, reported or receipt state")
+	}
+
+	// A repeated request returns the same persisted outcome.
+	_, repeated := f.request("POST", cancelPath, "operator", "", "", nil, 200)
+	if !bytes.Equal(cancelled, repeated) {
+		t.Fatalf("repeated cancellation body differs: %s vs %s", cancelled, repeated)
+	}
+
+	// The command projection exposes the safe Stage 6 metadata only.
+	_, detail := f.request("GET", base+"/commands/"+admission.CommandID, "viewer", "", "", nil, 200)
+	for _, forbidden := range []string{"payload_bytes", "outbox", "@context", "result_bytes", "cancelled_by", "receipt"} {
+		if bytes.Contains(detail, []byte(forbidden)) {
+			t.Fatalf("unsafe command JSON field %s in %s", forbidden, detail)
+		}
+	}
+	var projection struct {
+		Status         string  `json:"status"`
+		CancelledAt    *string `json:"cancelled_at"`
+		AttemptCount   *int    `json:"attempt_count"`
+		RetryStop      *string `json:"retry_stop_reason"`
+		Origin         *string `json:"origin"`
+		RootCommandID  *string `json:"root_command_id"`
+		AcknowledgedAt *string `json:"acknowledged_at"`
+		ParentID       *string `json:"parent_command_id"`
+	}
+	if err := json.Unmarshal(detail, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if projection.Status != "cancelled" || projection.CancelledAt == nil || projection.AttemptCount == nil || *projection.AttemptCount != 0 ||
+		projection.RetryStop == nil || *projection.RetryStop != "cancelled" || projection.Origin == nil || *projection.Origin != "client" ||
+		projection.RootCommandID == nil || *projection.RootCommandID != admission.CommandID || projection.AcknowledgedAt != nil || projection.ParentID != nil {
+		t.Fatalf("projection %s", detail)
+	}
+
+	// A reserved command can no longer be cancelled.
+	reservedURN := f.sensor("reserved")
+	_, reservedAdmission := f.request("PATCH", "/v1/digital-twins/"+url.PathEscape(reservedURN)+"/desired-state", "owner", "cancel-reserved", `{"frequency_hz":0.2,"expected_desired_version":"0"}`, nil, 202)
+	var reserved struct {
+		CommandID string `json:"command_id"`
+	}
+	if err := json.Unmarshal(reservedAdmission, &reserved); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := digitaltwin.NewPostgresControlRepository(f.app, f.control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := repo.PrepareControl(f.ctx, uuid.MustParse(reserved.CommandID))
+	if err != nil || dispatch == nil {
+		t.Fatalf("reservation %+v %v", dispatch, err)
+	}
+	_, conflict := f.request("POST", "/v1/digital-twins/"+url.PathEscape(reservedURN)+"/commands/"+reserved.CommandID+"/cancel", "owner", "", "", nil, 409)
+	assertControlHTTPError(t, conflict, "command_not_cancellable")
+
+	// A legacy row has unknown dispatch history and is refused.
+	legacyURN := f.sensor("legacy")
+	legacyID := uuid.New()
+	f.exec(`INSERT INTO twin_commands(command_id,entity_id,action,parameters,status,desired_version,issued_at,expires_at,control_version,requested_frequency_hz)
+		VALUES($1,(SELECT id FROM twin_entities WHERE entity_id=$2),'update_configuration','{"sample_interval_us":10000000}','pending',1,clock_timestamp(),clock_timestamp()+interval '1 minute',1,'0.1')`, legacyID, legacyURN)
+	_, conflict = f.request("POST", "/v1/digital-twins/"+url.PathEscape(legacyURN)+"/commands/"+legacyID.String()+"/cancel", "owner", "", "", nil, 409)
+	assertControlHTTPError(t, conflict, "command_not_cancellable")
+	_, legacyDetail := f.request("GET", "/v1/digital-twins/"+url.PathEscape(legacyURN)+"/commands/"+legacyID.String(), "viewer", "", "", nil, 200)
+	var legacyProjection struct {
+		AttemptCount *int    `json:"attempt_count"`
+		Origin       *string `json:"origin"`
+		RootCommand  *string `json:"root_command_id"`
+		Parent       *string `json:"parent_command_id"`
+	}
+	if err := json.Unmarshal(legacyDetail, &legacyProjection); err != nil {
+		t.Fatal(err)
+	}
+	if legacyProjection.AttemptCount != nil {
+		t.Fatalf("legacy attempt history must stay unknown: %s", legacyDetail)
+	}
+	if legacyProjection.Origin != nil || legacyProjection.RootCommand != nil || legacyProjection.Parent != nil {
+		t.Fatalf("legacy provenance must stay unknown: %s", legacyDetail)
+	}
+
+	// An expired command is refused.
+	expiredURN := f.sensor("expired")
+	expiredID := uuid.New()
+	f.exec(`INSERT INTO twin_commands(command_id,entity_id,action,parameters,status,desired_version,issued_at,expires_at,control_version,requested_frequency_hz)
+		VALUES($1,(SELECT id FROM twin_entities WHERE entity_id=$2),'update_configuration','{"sample_interval_us":10000000}','pending',1,clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '1 minute',1,'0.1')`, expiredID, expiredURN)
+	_, conflict = f.request("POST", "/v1/digital-twins/"+url.PathEscape(expiredURN)+"/commands/"+expiredID.String()+"/cancel", "owner", "", "", nil, 409)
+	assertControlHTTPError(t, conflict, "command_not_cancellable")
+
+	// Malformed requests never reach the repository.
+	pendingURN := f.sensor("pending")
+	_, pendingAdmission := f.request("PATCH", "/v1/digital-twins/"+url.PathEscape(pendingURN)+"/desired-state", "owner", "cancel-malformed", `{"frequency_hz":0.3,"expected_desired_version":"0"}`, nil, 202)
+	var pending struct {
+		CommandID string `json:"command_id"`
+	}
+	if err := json.Unmarshal(pendingAdmission, &pending); err != nil {
+		t.Fatal(err)
+	}
+	pendingPath := "/v1/digital-twins/" + url.PathEscape(pendingURN) + "/commands/" + pending.CommandID + "/cancel"
+	f.request("POST", pendingPath, "owner", "", " ", nil, 400)
+	f.request("POST", pendingPath+"?limit=1", "owner", "", "", nil, 400)
+	f.request("POST", pendingPath, "owner", "", "", map[string]string{"Accept": "application/ld+json"}, 406)
+	f.request("POST", pendingPath, "owner", "", "", map[string]string{"Content-Type": "text/plain"}, 415)
+	f.request("POST", "/v1/digital-twins/not-a-sensor/commands/"+pending.CommandID+"/cancel", "owner", "", "", nil, 400)
+	f.request("POST", "/v1/digital-twins/"+url.PathEscape(pendingURN)+"/commands/not-a-uuid/cancel", "owner", "", "", nil, 400)
+	f.request("POST", "/v1/digital-twins/"+url.PathEscape(pendingURN)+"/commands/"+uuid.NewString()+"/cancel", "owner", "", "", nil, 404)
+	var stillPending string
+	if err := f.admin.QueryRow(f.ctx, `SELECT status FROM twin_commands WHERE command_id=$1`, pending.CommandID).Scan(&stillPending); err != nil || stillPending != "pending" {
+		t.Fatalf("malformed cancellation changed the command: %s %v", stillPending, err)
+	}
+
+	// The cancellation is scoped to the exact Sensor.
+	otherURN := f.sensor("other")
+	f.request("POST", "/v1/digital-twins/"+url.PathEscape(otherURN)+"/commands/"+pending.CommandID+"/cancel", "owner", "", "", nil, 404)
+	// A revoked membership loses the authorization immediately.
+	f.exec(`DELETE FROM user_gateways WHERE user_id=$1 AND gateway_id=$2`, f.actors["owner"], f.gateway)
+	f.request("POST", pendingPath, "owner", "", "", nil, 404)
 }
 
 func TestNativeControlHTTPValidationAndPagination(t *testing.T) {

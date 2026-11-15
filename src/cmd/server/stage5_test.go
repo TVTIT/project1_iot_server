@@ -11,7 +11,7 @@ import (
 func TestStage5CompositionFlagAndDependencies(t *testing.T) {
 	var deps httpserver.RouterDependencies
 	cfg := validTestConfig()
-	if err := populateStage5Dependencies(&deps, cfg, nil); err != nil || deps.ControlAPIEnabled || deps.ControlRepository != nil {
+	if err := populateStage5Dependencies(&deps, cfg, nil); err != nil || deps.ControlAPIEnabled || deps.ControlCancelEnabled || deps.ControlRepository != nil {
 		t.Fatal("disabled stage 5 required dependencies", err)
 	}
 	cfg.Stage5 = config.Stage5Config{Enabled: true, Control: digitaltwin.DefaultControlConfig()}
@@ -19,8 +19,13 @@ func TestStage5CompositionFlagAndDependencies(t *testing.T) {
 		t.Fatal("enabled without pool")
 	}
 	pool := testPool(t)
-	if err := populateStage5Dependencies(&deps, cfg, pool); err != nil || deps.ControlRepository == nil || deps.ControlRequestTimeout != cfg.Stage5.Control.DBTimeout {
+	if err := populateStage5Dependencies(&deps, cfg, pool); err != nil || deps.ControlRepository == nil || deps.ControlRequestTimeout != cfg.Stage5.Control.DBTimeout || deps.ControlCancelEnabled {
 		t.Fatal("composition", err)
+	}
+	cfg.Stage5.Stage6Enabled = true
+	cfg.Stage5.Control.Stage6Enabled = true
+	if err := populateStage5Dependencies(&deps, cfg, pool); err != nil || !deps.ControlCancelEnabled {
+		t.Fatal("Stage 6 cancellation route flag did not follow the shared Stage 6 flag", err)
 	}
 	cfg.Stage5.Control.TTL = 0
 	if err := populateStage5Dependencies(&deps, cfg, pool); err == nil {

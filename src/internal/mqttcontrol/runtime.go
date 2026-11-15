@@ -20,6 +20,8 @@ type Config struct {
 	Workers, BatchSize, QueueCapacity, ResultQueueCapacity, MaxPayloadBytes int
 	ScanInterval, ExpireInterval, RetryBackoff, PublishTimeout              time.Duration
 	WakeupEnabled                                                           bool
+	Stage6Enabled                                                           bool
+	RetryPolicy                                                             digitaltwin.RetryPolicy
 }
 
 // Validate rejects unbounded or inconsistent work settings.
@@ -32,12 +34,29 @@ func (c Config) Validate() error {
 			return errors.New("invalid control timeout")
 		}
 	}
+	if c.Stage6Enabled {
+		if err := c.RetryPolicy.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // DefaultConfig supplies conservative starting bounds, not a capacity claim.
 func DefaultConfig() Config {
-	return Config{Workers: 1, BatchSize: 32, QueueCapacity: 32, ResultQueueCapacity: 128, MaxPayloadBytes: 8192, ScanInterval: time.Second, ExpireInterval: time.Second, RetryBackoff: time.Second, PublishTimeout: 3 * time.Second}
+	return Config{
+		Workers:             1,
+		BatchSize:           32,
+		QueueCapacity:       32,
+		ResultQueueCapacity: 128,
+		MaxPayloadBytes:     8192,
+		ScanInterval:        time.Second,
+		ExpireInterval:      time.Second,
+		RetryBackoff:        time.Second,
+		PublishTimeout:      3 * time.Second,
+		Stage6Enabled:       false,
+		RetryPolicy:         digitaltwin.DefaultRetryPolicy(),
+	}
 }
 
 // Repository never holds a SQL transaction across a Publisher call.
@@ -45,6 +64,7 @@ type Repository interface {
 	PendingControl(context.Context, int) ([]uuid.UUID, error)
 	PrepareControl(context.Context, uuid.UUID) (*digitaltwin.ControlDispatch, error)
 	MarkControlPublished(context.Context, uuid.UUID) error
+	MarkControlReservationPublished(context.Context, uuid.UUID, int) error
 	ExpireControl(context.Context, int) error
 }
 
@@ -294,47 +314,86 @@ func (r *Runtime) worker() {
 				return
 			}
 			var err error
+			var dispatch *digitaltwin.ControlDispatch
+			// Runtime mode stays known even when Prepare fails or the commit is
+			// ambiguous and no dispatch authority is returned.
+			stage6Mode := r.cfg.Stage6Enabled
+			managed := false
 			if r.pub.Ready() {
-				var d *digitaltwin.ControlDispatch
 				prepareStart := time.Now()
-				d, err = r.repo.PrepareControl(r.ctx, id)
+				dispatch, err = r.repo.PrepareControl(r.ctx, id)
 				if r.metrics != nil {
 					r.metrics.prepare.Observe(time.Since(prepareStart))
 				}
-				if err == nil && d != nil && r.pub.Ready() {
-					ctx, cancel := context.WithTimeout(r.ctx, r.cfg.PublishTimeout)
-					var start time.Time
-					if r.metrics != nil {
-						start = time.Now()
+				if err == nil && dispatch != nil {
+					managed = dispatch.Stage6
+					if r.metrics != nil && managed {
+						// Only a confirmed Stage 6 grant is a durable reservation.
+						r.metrics.stage6Reservations.Add(1)
 					}
-					err = r.pub.Publish(ctx, *d)
-					if err == nil && r.timeline != nil {
-						r.timeline.PUBACK(id.String(), time.Now())
-					}
-					if r.metrics != nil {
-						r.metrics.publish.Observe(time.Since(start))
-						if err == nil {
-							r.metrics.puback.Add(1)
+					if r.pub.Ready() {
+						timeout, ok := dispatch.ContextTimeout(r.cfg.PublishTimeout, time.Now())
+						if !ok {
+							if r.metrics != nil {
+								r.metrics.grantsSkipped.Add(1)
+							}
+							err = errors.New("dispatch authority expired before publish")
 						} else {
-							r.metrics.publishFailures.Add(1)
-						}
-					}
-					cancel()
-					if err == nil {
-						markStart := time.Now()
-						err = r.repo.MarkControlPublished(r.ctx, id)
-						if r.metrics != nil {
-							r.metrics.mark.Observe(time.Since(markStart))
+							ctx, cancel := context.WithTimeout(r.ctx, timeout)
+							var start time.Time
+							if r.metrics != nil {
+								start = time.Now()
+								r.metrics.publishCalls.Add(1)
+								if managed && dispatch.Attempt > 1 {
+									r.metrics.stage6RetryCalls.Add(1)
+								}
+							}
+							err = r.pub.Publish(ctx, *dispatch)
+							if err == nil && r.timeline != nil {
+								r.timeline.PUBACK(id.String(), time.Now())
+							}
+							if r.metrics != nil {
+								r.metrics.publish.Observe(time.Since(start))
+								if err == nil {
+									r.metrics.puback.Add(1)
+								} else {
+									r.metrics.publishFailures.Add(1)
+								}
+							}
+							cancel()
 							if err == nil {
-								r.metrics.markSuccessCalls.Add(1)
-							} else {
-								r.metrics.markErrors.Add(1)
+								markStart := time.Now()
+								if managed {
+									err = r.repo.MarkControlReservationPublished(r.ctx, id, dispatch.Attempt)
+								} else {
+									err = r.repo.MarkControlPublished(r.ctx, id)
+								}
+								if r.metrics != nil {
+									r.metrics.mark.Observe(time.Since(markStart))
+									if err == nil {
+										r.metrics.markSuccessCalls.Add(1)
+									} else {
+										r.metrics.markErrors.Add(1)
+									}
+								}
 							}
 						}
+					} else {
+						if r.metrics != nil {
+							r.metrics.grantsSkipped.Add(1)
+						}
+						err = errors.New("transport unready after reservation")
 					}
 				}
 			}
-			if err != nil {
+			// The Stage 5 backoff paces the legacy dispatch path only. A managed
+			// Stage 6 attempt releases its slot immediately: the durable schedule
+			// in the database decides when the next attempt happens.
+			legacyPacing := !stage6Mode
+			if dispatch != nil {
+				legacyPacing = !managed
+			}
+			if err != nil && legacyPacing {
 				timer := time.NewTimer(r.cfg.RetryBackoff)
 				select {
 				case <-timer.C:
@@ -351,7 +410,15 @@ func (r *Runtime) worker() {
 			// Once the bounded retry delay has elapsed, one coalesced pass can
 			// refill a batch whose durable pending prefix was previously in-flight.
 			// Disabled wake-up retains timer-only polling behavior.
-			if r.cfg.WakeupEnabled {
+			// In Stage 6, completion wake-up is suppressed whenever no dispatch
+			// authority or progress was returned (dispatch == nil or error): the
+			// bounded periodic scan remains the recovery path for those rows,
+			// preventing immediate hot loops and prefix starvation.
+			wake := r.cfg.WakeupEnabled
+			if stage6Mode {
+				wake = wake && dispatch != nil && err == nil
+			}
+			if wake {
 				select {
 				case r.wakeup <- struct{}{}:
 				default:

@@ -18,6 +18,9 @@ func populateStage5Dependencies(deps *httpserver.RouterDependencies, cfg config.
 		return fmt.Errorf("router dependencies are required")
 	}
 	deps.ControlAPIEnabled = cfg.Stage5.Enabled
+	// The cancellation route shares the validated Stage 6 flag. It stays
+	// absent while Stage 6 is disabled.
+	deps.ControlCancelEnabled = cfg.Stage5.Stage6Enabled
 	deps.ControlRepository = nil
 	deps.ControlRequestTimeout = cfg.Stage5.Control.DBTimeout
 	if !cfg.Stage5.Enabled {

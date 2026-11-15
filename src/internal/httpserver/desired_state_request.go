@@ -99,6 +99,8 @@ func controlErrorResponse(err error) (int, string) {
 		return 409, "idempotency_conflict"
 	case errors.Is(err, digitaltwin.ErrDesiredVersionOverflow):
 		return 409, "desired_version_overflow"
+	case errors.Is(err, digitaltwin.ErrCommandNotCancellable):
+		return 409, "command_not_cancellable"
 	case errors.Is(err, digitaltwin.ErrInvalidInput), errors.Is(err, digitaltwin.ErrInvalidFrequency):
 		return 400, "invalid_request"
 	default:

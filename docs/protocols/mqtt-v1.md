@@ -211,6 +211,20 @@ REST admission and polling are documented in the
 and result messages below are v1 runtime contracts; clients must not publish
 commands or results directly.
 
+> **Stage 6 Cross-Reference (Thiết kế / Chưa triển khai):** Kế hoạch Giai đoạn 6 mở rộng
+> vòng đời command với device receipt bền vững (`acknowledged`), cancellation an toàn,
+> và các envelopes MQTT mới (`command_receipt`, `configuration_query`, `configuration_snapshot`).
+> Xem chi tiết tại [Stage 5 Sensor Control API: Giai đoạn 6](stage5-sensor-control-api.md#giai-đoạn-6--thiết-kế--chưa-triển-khai-vòng-đời-mở-rộng-và-cơ-chế-retryreservation-bền-vững).
+> Hợp đồng envelope MQTT v1 hiện hành dưới đây giữ nguyên vẹn cho Stage 5 runtime.
+>
+> **Đã triển khai (Opt-in `STAGE6_ENABLED=true`, mặc định `false`):** cơ chế cấp quyền
+> gửi (dispatch reservation) bền vững và lịch retry lũy thừa có jitter của Stage 6 **không
+> thay đổi envelope, topic, QoS hay retain của MQTT v1**: cùng command ID, cùng topic
+> `gateways/<gateway_id>/commands/<command_id>`, cùng `payload_bytes`, cùng `desired_version`,
+> `issued_at` và `expires_at` được gửi lại nguyên vẹn qua mọi lượt retry. Các envelope mới
+> (`command_receipt`, `configuration_query`, `configuration_snapshot`) vẫn **chưa** được phát
+> hay xử lý và thuộc các Task R5–R7.
+
 ### Dispatcher operation (P6; no payload or endpoint change)
 
 The backend may be configured to wake its existing dispatcher after a confirmed
@@ -310,6 +324,9 @@ Illustrative payload:
 Rules:
 - QoS 1, retain=false.
 - `status` must be either `succeeded` or `failed`.
+- `cancelled` is a server-side stored command status written by the safe cancellation transaction
+  (REST contract section 5). A device must never report it as a result status, and the result
+  allowlist stays `succeeded`/`failed` only.
 - When `status` is `failed`, `error_code` from an allowlist (`COMMAND_EXPIRED`, `STALE_DESIRED_VERSION`,
   `UNKNOWN_SENSOR`, `UNSUPPORTED_CONFIGURATION`, `APPLY_FAILED`) and a safe `error_message` are provided.
 - `reported_state` contains confirmed configuration following apply and readback; it is omitted on failure.

@@ -54,6 +54,10 @@ func (r *retryMetricsRepository) MarkControlPublished(context.Context, uuid.UUID
 	return nil
 }
 
+func (r *retryMetricsRepository) MarkControlReservationPublished(context.Context, uuid.UUID, int) error {
+	return nil
+}
+
 func (*retryMetricsRepository) ExpireControl(context.Context, int) error { return nil }
 
 type retryMetricsPublisher struct {

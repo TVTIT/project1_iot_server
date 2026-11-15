@@ -38,10 +38,10 @@ def verify(fixture):
 
 def verify_schema_24(fixture):
     fixture.sql(b"""DO $$ BEGIN
-        IF (SELECT max(version) FROM public.schema_migrations) <> 24
+        IF (SELECT max(version) FROM public.schema_migrations) < 24
            OR NOT EXISTS (SELECT 1 FROM public.schema_migrations
                           WHERE version=24 AND name='telemetry_ledger_timestamp') THEN
-            RAISE EXCEPTION 'Migration 24 is not the exact schema terminal';
+            RAISE EXCEPTION 'Migration 24 is not applied';
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_schema='public' AND table_name='processed_messages'
@@ -167,6 +167,7 @@ def scenario(kind, binary):
             # original terminal; the current telemetry writer requires schema 24.
             run_existing_migration_runner(fixture, 24)
             verify_schema_24(fixture)
+            run_existing_migration_runner(fixture, 27)
             native(fixture, binary)
             run_existing_migration_runner(fixture, 23)
             verify_schema_24(fixture)

@@ -115,3 +115,84 @@ func TestStage5ResultWorkersAndPoolReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestStage6ConfigurationAndValidation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stage5.Stage6Enabled {
+		t.Fatalf("expected STAGE6_ENABLED default false, got true")
+	}
+
+	// STAGE6_ENABLED=true without STAGE5_ENABLED=true must fail
+	values["STAGE6_ENABLED"] = "true"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected error when STAGE6_ENABLED=true but STAGE5_ENABLED=false")
+	}
+
+	// Enable STAGE5
+	values["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		values[k] = v
+	}
+	values["STAGE6_RETRY_MAX_BACKOFF"] = "16s"
+	values["STAGE6_RETRY_MAX_ATTEMPTS"] = "7"
+	cfg6, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("valid Stage 6 configuration failed: %v", err)
+	}
+	if !cfg6.Stage5.Stage6Enabled || cfg6.Stage5.Control.RetryPolicy.CapDelay != 16*time.Second || cfg6.Stage5.Control.RetryPolicy.MaxAttempts != 7 {
+		t.Fatalf("Stage 6 mapping mismatch: %+v", cfg6.Stage5.Control.RetryPolicy)
+	}
+	// The repository and the runtime must receive the same mode and the same
+	// single policy; a divergent policy would fence differently.
+	if !cfg6.Stage5.Control.Stage6Enabled || !cfg6.Stage5.Dispatch.Stage6Enabled {
+		t.Fatal("Stage 6 mode must be enabled for both the repository and the runtime")
+	}
+	if cfg6.Stage5.Control.RetryPolicy != cfg6.Stage5.Dispatch.RetryPolicy {
+		t.Fatalf("repository and runtime policy diverged: %+v vs %+v", cfg6.Stage5.Control.RetryPolicy, cfg6.Stage5.Dispatch.RetryPolicy)
+	}
+	if cfg6.Stage5.Dispatch.PublishTimeout != cfg6.Stage5.Control.RetryPolicy.PublishTimeout {
+		t.Fatal("runtime publish timeout must match the repository lease policy")
+	}
+
+	// STAGE5_RETRY_BACKOFF > STAGE6_RETRY_MAX_BACKOFF must fail (base > cap)
+	values["STAGE5_RETRY_BACKOFF"] = "20s"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected error when base backoff exceeds cap delay")
+	}
+
+	// Stage 5 only: STAGE5_RETRY_BACKOFF=30s must succeed when STAGE6_ENABLED=false
+	stage5Only := validConfigValues()
+	stage5Only["STAGE5_RETRY_BACKOFF"] = "30s"
+	cfg5, err := Load(mapLookup(stage5Only))
+	if err != nil || cfg5.Stage5.Dispatch.RetryBackoff != 30*time.Second {
+		t.Fatalf("Stage 5 valid backoff 30s failed: %v", err)
+	}
+
+	// Stage 6 enabled: sub-10ms STAGE5_RETRY_BACKOFF must fail
+	valuesSub10ms := validConfigValues()
+	valuesSub10ms["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		valuesSub10ms[k] = v
+	}
+	valuesSub10ms["STAGE6_ENABLED"] = "true"
+	valuesSub10ms["STAGE5_RETRY_BACKOFF"] = "5ms"
+	if _, err := Load(mapLookup(valuesSub10ms)); err == nil {
+		t.Fatal("expected error when STAGE5_RETRY_BACKOFF < 10ms with Stage 6 enabled")
+	}
+
+	// Stage 6 enabled: sub-10ms STAGE5_PUBLISH_TIMEOUT must fail
+	valuesSubPub := validConfigValues()
+	valuesSubPub["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		valuesSubPub[k] = v
+	}
+	valuesSubPub["STAGE6_ENABLED"] = "true"
+	valuesSubPub["STAGE5_PUBLISH_TIMEOUT"] = "5ms"
+	if _, err := Load(mapLookup(valuesSubPub)); err == nil {
+		t.Fatal("expected error when STAGE5_PUBLISH_TIMEOUT < 10ms with Stage 6 enabled")
+	}
+}

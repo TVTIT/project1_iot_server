@@ -111,6 +111,29 @@ def exact_native_acls(manager, port, work, backend_password, gateway_password):
         other.close()
 
 
+def stage6_native(fixture, work, manager_password, backend_password, gateway_password):
+    """Stage 6 durable retry/reservation proof against the same owned broker.
+
+    The lane reuses the existing fixture database, broker, credentials and
+    Gateway identity. No second testbed and no custom verifier is created.
+    """
+    script = 'set -e\nexport CONTROL_TEST_ISOLATED=1 CONTROL_MQTT_ISOLATED=1\n'
+    script += 'export CONTROL_TEST_SETUP_URL="postgres://fixture_admin:${POSTGRES_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"\n'
+    script += 'export CONTROL_TEST_BACKEND_URL="postgres://iot_backend_app:${BACKEND_DB_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"\n'
+    for key, value in {'CONTROL_MQTT_MANAGER_PASSWORD': manager_password,
+                       'CONTROL_MQTT_BACKEND_PASSWORD': backend_password,
+                       'CONTROL_MQTT_GATEWAY_PASSWORD': gateway_password}.items():
+        script += 'export ' + key + '=' + shlex.quote(value) + '\n'
+    script += 'exec /tmp/control-mqtt.test -test.v -test.timeout=180s -test.run "^TestNativeMQTTStage6RetryResilience$"\n'
+    output = run(['docker', 'exec', '-i', fixture.container_id, 'sh'],
+                 input_data=script.encode(), timeout=220)
+    text = output.decode()
+    print(text, flush=True)
+    if '--- PASS: TestNativeMQTTStage6RetryResilience (' not in text or '--- SKIP:' in text:
+        raise RuntimeError('native Stage 6 retry test did not pass without skips')
+    print('PASS native Stage 6 durable retry/reservation proof against the real broker', flush=True)
+
+
 def exercise(fixture, work, broker, port, manager_password, backend_password, gateway_password, server, network):
     # Same native binary/container pattern used by Task 5.2/5.3.
     binary = work / 'control-mqtt.test'
@@ -206,6 +229,9 @@ def exercise(fixture, work, broker, port, manager_password, backend_password, ga
     if coverage:
         Path(coverage).write_bytes(docker(['exec', fixture.container_id, 'cat', '/tmp/control-mqtt.cover']))
     print('PASS Task 5.4 native DB+Mosquitto required lifecycle proof; no result ingestion', flush=True)
+
+    # Stage 6 durable retry lane on the same owned broker and database.
+    stage6_native(fixture, work, manager_password, backend_password, gateway_password)
 
     # Composition/lifecycle only: no HTTP->Gateway result flow or Stage 5 E2E.
     env = {

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Task 5.3 HTTP + PostgreSQL only, using the owned existing native fixture.
+"""Task 5.3 HTTP + PostgreSQL native fixture, extended for Stage 6 R4.2 cancel.
 
-No deployment environment, broker, Gateway, broad cleanup or Stage 5 E2E lane.
+Uses the owned existing fixture composition. No deployment environment, broker,
+Gateway, broad cleanup or Stage 5 E2E lane.
 """
 import os
 from pathlib import Path
@@ -9,9 +10,9 @@ import re
 import subprocess
 import tempfile
 
-from stage5_intent_fixture import migrate, verify
+from stage5_intent_fixture import migrate, verify, verify_schema_24
 from stage3_persistence_runner import (
-    ROOT, docker_cp, docker_exec, finish_fixture, new_fixture,
+    ROOT, docker_cp, docker_exec, finish_fixture, new_fixture, run_existing_migration_runner,
 )
 
 
@@ -27,6 +28,11 @@ def main():
         try:
             migrate(fixture, 23)
             verify(fixture)
+            # The Stage 6 control schema carries the cancellation evidence and
+            # the dispatch history columns of the command projection.
+            run_existing_migration_runner(fixture, 24)
+            verify_schema_24(fixture)
+            run_existing_migration_runner(fixture, 27)
             docker_cp(fixture, binary, '/tmp/server.test')
             output = docker_exec(fixture, ['sh', '-c',
                 'export CONTROL_TEST_ISOLATED=1 '

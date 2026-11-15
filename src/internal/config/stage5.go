@@ -16,6 +16,7 @@ import (
 type Stage5Config struct {
 	ResultWorkers int
 	Enabled       bool
+	Stage6Enabled bool
 	Control       digitaltwin.ControlConfig
 	Dispatch      mqttcontrol.Config
 	Data          mqttingress.TransportOptions
@@ -88,6 +89,48 @@ func loadStage5(lookup LookupFunc) (Stage5Config, error) {
 			return cfg, err
 		}
 	}
+	if cfg.Stage6Enabled, err = boolValue(lookup, "STAGE6_ENABLED", false); err != nil {
+		return cfg, err
+	}
+	if cfg.Stage6Enabled {
+		if !cfg.Enabled {
+			return cfg, fmt.Errorf("STAGE6_ENABLED requires STAGE5_ENABLED=true")
+		}
+		if cfg.Dispatch.RetryBackoff < 10*time.Millisecond {
+			return cfg, fmt.Errorf("STAGE5_RETRY_BACKOFF must be at least 10ms when Stage 6 is enabled")
+		}
+		if cfg.Dispatch.PublishTimeout < 10*time.Millisecond {
+			return cfg, fmt.Errorf("STAGE5_PUBLISH_TIMEOUT must be at least 10ms when Stage 6 is enabled")
+		}
+		maxBackoff, err := boundedDuration(lookup, "STAGE6_RETRY_MAX_BACKOFF", 8*time.Second, 10*time.Millisecond, 24*time.Hour)
+		if err != nil {
+			return cfg, err
+		}
+		maxAttempts, err := integer(lookup, "STAGE6_RETRY_MAX_ATTEMPTS", 5, 1, 100)
+		if err != nil {
+			return cfg, err
+		}
+		if cfg.Dispatch.RetryBackoff > maxBackoff {
+			return cfg, fmt.Errorf("STAGE5_RETRY_BACKOFF must not exceed STAGE6_RETRY_MAX_BACKOFF")
+		}
+
+		policy := digitaltwin.RetryPolicy{
+			BaseDelay:      cfg.Dispatch.RetryBackoff,
+			CapDelay:       maxBackoff,
+			MaxAttempts:    maxAttempts,
+			PublishTimeout: cfg.Dispatch.PublishTimeout,
+			SafetyMargin:   time.Second,
+		}
+		if err := policy.Validate(); err != nil {
+			return cfg, fmt.Errorf("invalid Stage 6 retry policy: %w", err)
+		}
+
+		cfg.Control.Stage6Enabled = true
+		cfg.Control.RetryPolicy = policy
+		cfg.Dispatch.Stage6Enabled = true
+		cfg.Dispatch.RetryPolicy = policy
+	}
+
 	if !cfg.Enabled {
 		return cfg, nil
 	}

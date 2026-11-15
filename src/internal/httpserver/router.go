@@ -35,6 +35,7 @@ type RouterDependencies struct {
 	UnixAuthMetrics            *auth.Metrics
 	UnixAuthDuration           *metrics.Histogram
 	ControlAPIEnabled          bool
+	ControlCancelEnabled       bool
 	ControlRequestTimeout      time.Duration
 	ControlRepository          ControlRepository
 	ReadinessChecker           ReadinessChecker
@@ -295,6 +296,11 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	authenticated.PATCH("/digital-twins/:entity_id/desired-state", controlHandler(deps, "admit"))
 	authenticated.GET("/digital-twins/:entity_id/commands", controlHandler(deps, "list"))
 	authenticated.GET("/digital-twins/:entity_id/commands/:command_id", controlHandler(deps, "detail"))
+	if deps.ControlCancelEnabled {
+		// The cancellation surface is opt-in. With Stage 6 disabled the route
+		// does not exist and the request is a plain not-found.
+		authenticated.POST("/digital-twins/:entity_id/commands/:command_id/cancel", controlHandler(deps, "cancel"))
+	}
 
 	return router, nil
 }
