@@ -33,6 +33,17 @@ func newControlFixture(t *testing.T) *controlFixture {
 }
 
 func newControlFixtureGateway(t *testing.T, gateway string) *controlFixture {
+	return newControlFixtureGatewayMode(t, gateway, false)
+}
+
+// newControlFixtureGatewayReuse attaches to a Gateway that already exists in
+// the owned fixture database. It reuses the Gateway identity (and therefore
+// its MQTT identity) while creating fresh actors and a fresh Sensor.
+func newControlFixtureGatewayReuse(t *testing.T, gateway string) *controlFixture {
+	return newControlFixtureGatewayMode(t, gateway, true)
+}
+
+func newControlFixtureGatewayMode(t *testing.T, gateway string, reuse bool) *controlFixture {
 	t.Helper()
 	if os.Getenv("CONTROL_TEST_ISOLATED") != "1" {
 		t.Skip("requires owned native PostgreSQL fixture")
@@ -61,14 +72,27 @@ func newControlFixtureGateway(t *testing.T, gateway string) *controlFixture {
 	for _, actor := range []uuid.UUID{f.owner, f.operator, f.viewer, f.outsider} {
 		f.exec(t, `INSERT INTO auth.users(id,email) VALUES($1,$2)`, actor, actor.String()+"@fixture.invalid")
 	}
-	f.exec(t, `INSERT INTO gateways(gateway_id,name) VALUES($1,'control fixture')`, f.gw)
+	if reuse {
+		var exists bool
+		if err = f.admin.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM gateways WHERE gateway_id=$1)`, f.gw).Scan(&exists); err != nil || !exists {
+			t.Fatalf("reuse requested for an unknown gateway %q: %v", f.gw, err)
+		}
+	} else {
+		f.exec(t, `INSERT INTO gateways(gateway_id,name) VALUES($1,'control fixture')`, f.gw)
+	}
 	for i, actor := range []uuid.UUID{f.owner, f.operator, f.viewer} {
 		f.exec(t, `INSERT INTO user_gateways(user_id,gateway_id,role) VALUES($1,$2,$3)`, actor, f.gw, []string{"owner", "operator", "viewer"}[i])
 	}
 	f.exec(t, `INSERT INTO platform_admins(user_id) VALUES($1)`, f.outsider)
-	f.exec(t, `INSERT INTO twin_entities(entity_id,entity_type,gateway_id,name) VALUES($1,'Gateway',$2,'control fixture')`, digitaltwin.GatewayURNPrefix+f.gw, f.gw)
-	f.exec(t, `INSERT INTO twin_states(entity_id) SELECT id FROM twin_entities WHERE gateway_id=$1`, f.gw)
-	f.urn, f.entity = f.sensor(t, "s1")
+	if !reuse {
+		f.exec(t, `INSERT INTO twin_entities(entity_id,entity_type,gateway_id,name) VALUES($1,'Gateway',$2,'control fixture')`, digitaltwin.GatewayURNPrefix+f.gw, f.gw)
+		f.exec(t, `INSERT INTO twin_states(entity_id) SELECT id FROM twin_entities WHERE gateway_id=$1`, f.gw)
+	}
+	sensor := "s1"
+	if reuse {
+		sensor = "s6"
+	}
+	f.urn, f.entity = f.sensor(t, sensor)
 	f.repo, err = digitaltwin.NewPostgresControlRepository(f.app, digitaltwin.DefaultControlConfig())
 	if err != nil {
 		t.Fatal(err)

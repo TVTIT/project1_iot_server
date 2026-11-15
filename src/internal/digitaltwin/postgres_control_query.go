@@ -25,6 +25,15 @@ type ControlCommandView struct {
 	ErrorMessage   string              `json:"error_message,omitempty"`
 	Result         *CommandResult      `json:"result,omitempty"`
 	Legacy         bool                `json:"legacy,omitempty"`
+	// Stage 6 metadata. AttemptCount stays null while the dispatch history is
+	// unknown, and Origin stays null when the provenance cannot be proven.
+	CancelledAt     *time.Time `json:"cancelled_at"`
+	AttemptCount    *int       `json:"attempt_count"`
+	AcknowledgedAt  *time.Time `json:"acknowledged_at"`
+	RetryStopReason *string    `json:"retry_stop_reason"`
+	Origin          *string    `json:"origin"`
+	RootCommandID   *string    `json:"root_command_id"`
+	ParentCommandID *string    `json:"parent_command_id"`
 }
 
 // ControlCommandPage is a bounded keyset page; NextCursor is empty at the end.
@@ -139,7 +148,14 @@ const controlViewSelect = `SELECT c.command_id::text,c.status,c.desired_version,
 CASE WHEN c.control_version=1 THEN c.parameters ELSE NULL END,
 c.issued_at,c.expires_at,c.completed_at,
 CASE WHEN c.error_code IN('COMMAND_EXPIRED','STALE_DESIRED_VERSION','UNKNOWN_SENSOR','UNSUPPORTED_CONFIGURATION','APPLY_FAILED') THEN c.error_code ELSE NULL END,
-c.control_version,c.result_bytes
+c.control_version,c.result_bytes,
+c.cancelled_at,
+CASE WHEN c.stage6_managed THEN c.attempt_count ELSE NULL END,
+c.acknowledged_at,
+c.retry_stop_reason,
+CASE WHEN c.stage6_managed THEN c.origin ELSE NULL END,
+CASE WHEN c.stage6_managed THEN c.root_command_id::text ELSE NULL END,
+CASE WHEN c.stage6_managed THEN c.parent_command_id::text ELSE NULL END
 FROM public.twin_commands c JOIN public.twin_entities e ON e.id=c.entity_id JOIN public.user_gateways ug ON ug.gateway_id=e.gateway_id`
 
 func (r *PostgresControlRepository) controlRead(ctx context.Context, actor uuid.UUID, urn string) (pgx.Tx, *ResolvedEntity, context.CancelFunc, error) {
@@ -183,7 +199,8 @@ func scanControlView(row controlRow, entity *ResolvedEntity) (ControlCommandView
 	var contract *int
 	var parameters, result []byte
 	var errorCode *string
-	err := row.Scan(&view.CommandID, &view.Status, &version, &parameters, &view.IssuedAt, &view.ExpiresAt, &view.CompletedAt, &errorCode, &contract, &result)
+	err := row.Scan(&view.CommandID, &view.Status, &version, &parameters, &view.IssuedAt, &view.ExpiresAt, &view.CompletedAt, &errorCode, &contract, &result,
+		&view.CancelledAt, &view.AttemptCount, &view.AcknowledgedAt, &view.RetryStopReason, &view.Origin, &view.RootCommandID, &view.ParentCommandID)
 	if err != nil {
 		return ControlCommandView{}, err
 	}
@@ -193,6 +210,14 @@ func scanControlView(row controlRow, entity *ResolvedEntity) (ControlCommandView
 	if view.CompletedAt != nil {
 		ts := view.CompletedAt.UTC()
 		view.CompletedAt = &ts
+	}
+	if view.CancelledAt != nil {
+		ts := view.CancelledAt.UTC()
+		view.CancelledAt = &ts
+	}
+	if view.AcknowledgedAt != nil {
+		ts := view.AcknowledgedAt.UTC()
+		view.AcknowledgedAt = &ts
 	}
 	if version != nil {
 		v := Version(*version)

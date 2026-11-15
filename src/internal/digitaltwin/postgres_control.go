@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,11 +30,20 @@ type ControlConfig struct {
 	DBTimeout        time.Duration
 	MaxPendingOutbox int
 	MaxReceipts      int
+	Stage6Enabled    bool
+	RetryPolicy      RetryPolicy
 }
 
 // DefaultControlConfig supplies conservative admission defaults, not a throughput claim.
 func DefaultControlConfig() ControlConfig {
-	return ControlConfig{TTL: time.Minute, DBTimeout: 5 * time.Second, MaxPendingOutbox: 10000, MaxReceipts: 100000}
+	return ControlConfig{
+		TTL:              time.Minute,
+		DBTimeout:        5 * time.Second,
+		MaxPendingOutbox: 10000,
+		MaxReceipts:      100000,
+		Stage6Enabled:    false,
+		RetryPolicy:      DefaultRetryPolicy(),
+	}
 }
 
 // PostgresControlRepository persists intent; it performs no network publication.
@@ -42,6 +53,37 @@ type PostgresControlRepository struct {
 	metrics  *ControlMetrics
 	timeline *metrics.ControlTimeline
 	notify   func()
+	// jitter is the single-sample source for one reservation. It is guarded so
+	// deterministic test injection cannot race a live reservation.
+	jitterMu sync.RWMutex
+	jitter   func() float64
+}
+
+// SetJitterFunc overrides random jitter generation for deterministic tests.
+// It is safe to call concurrently with a reservation.
+func (r *PostgresControlRepository) SetJitterFunc(fn func() float64) {
+	if r == nil || fn == nil {
+		return
+	}
+	r.jitterMu.Lock()
+	r.jitter = fn
+	r.jitterMu.Unlock()
+}
+
+// jitterFactor samples the jitter source exactly once for one reservation.
+// The default source (math/rand/v2.Float64) is concurrency-safe.
+func (r *PostgresControlRepository) jitterFactor() float64 {
+	r.jitterMu.RLock()
+	fn := r.jitter
+	r.jitterMu.RUnlock()
+	if fn == nil {
+		return 0.5
+	}
+	factor := fn()
+	if math.IsNaN(factor) || math.IsInf(factor, 0) {
+		return 0.5
+	}
+	return factor
 }
 
 // SetControlTimeline installs a shared process-local observer before runtime starts.
@@ -58,7 +100,12 @@ func NewPostgresControlRepository(db TxDatabase, config ControlConfig, observers
 		config.MaxReceipts < 1 || config.MaxReceipts > 1000000 {
 		return nil, ErrInvalidInput
 	}
-	r := &PostgresControlRepository{db: db, config: config}
+	if config.Stage6Enabled {
+		if err := config.RetryPolicy.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	r := &PostgresControlRepository{db: db, config: config, jitter: rand.Float64}
 	if len(observers) > 0 {
 		r.metrics = observers[0]
 	}
@@ -157,6 +204,20 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 		return RequestReceipt{}, ErrCommandInProgress
 	}
 	unchanged := storedInterval(desired, false) == request.Frequency.SampleIntervalUS() && storedInterval(reported, true) == request.Frequency.SampleIntervalUS()
+	if unchanged && r.config.Stage6Enabled {
+		// A cancelled intent stays blocked for automatic reconciliation. A new
+		// user PATCH re-asserts that intent and must create a new root command
+		// instead of a silent no-op. The block is matched on the current
+		// desired version only, never on a historical cancellation, and a
+		// replayed key never reaches this branch.
+		blocked, blockErr := currentIntentBlockedTx(ctx, tx, entity, version)
+		if blockErr != nil {
+			return RequestReceipt{}, classifyAvailabilityError(blockErr)
+		}
+		if blocked {
+			unchanged = false
+		}
+	}
 	if !unchanged && version == math.MaxInt64 {
 		return RequestReceipt{}, ErrDesiredVersionOverflow
 	}
@@ -167,8 +228,14 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 		return RequestReceipt{}, classifyAvailabilityError(err)
 	}
 	var receiptCount, outboxCount int
-	if err = tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM public.twin_command_requests),(SELECT count(*) FROM public.twin_outbox WHERE status='pending')`).Scan(&receiptCount, &outboxCount); err != nil {
-		return RequestReceipt{}, classifyAvailabilityError(err)
+	if r.config.Stage6Enabled {
+		if err = tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM public.twin_command_requests),(SELECT count(*) FROM public.twin_commands WHERE target_entity_type='Sensor' AND status IN ('pending','published','acknowledged'))`).Scan(&receiptCount, &outboxCount); err != nil {
+			return RequestReceipt{}, classifyAvailabilityError(err)
+		}
+	} else {
+		if err = tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM public.twin_command_requests),(SELECT count(*) FROM public.twin_outbox WHERE status='pending')`).Scan(&receiptCount, &outboxCount); err != nil {
+			return RequestReceipt{}, classifyAvailabilityError(err)
+		}
 	}
 	if receiptCount >= r.config.MaxReceipts || (!unchanged && outboxCount >= r.config.MaxPendingOutbox) {
 		return RequestReceipt{}, errors.Join(ErrDependencyUnavailable, ErrControlCapacity)
@@ -196,9 +263,16 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 		if _, err = tx.Exec(ctx, `UPDATE public.twin_states SET desired_state=desired_state || $2::jsonb,desired_version=$3,last_desired_by=$4,last_desired_at=$5,updated_at=$5 WHERE entity_id=$1`, entity, parameters, version, actor, now); err != nil {
 			return RequestReceipt{}, classifyAvailabilityError(err)
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO public.twin_commands(command_id,entity_id,action,parameters,status,desired_version,idempotency_key,issued_by,issued_at,expires_at,control_version,requested_frequency_hz)
+		if r.config.Stage6Enabled {
+			if _, err = tx.Exec(ctx, `INSERT INTO public.twin_commands(command_id,entity_id,action,parameters,status,desired_version,idempotency_key,issued_by,issued_at,expires_at,control_version,requested_frequency_hz,stage6_managed,origin,root_command_id,original_actor_id,reconcile_blocked,auto_successors_used)
+		 VALUES($1,$2,'update_configuration',$3::jsonb,'pending',$4,$5,$6,$7,$8,1,$9,true,'client',$1,$6,false,0)`, id, entity, parameters, version, request.IdempotencyKey, actor, now, deadline, string(request.Frequency.RequestedHz())); err != nil {
+				return RequestReceipt{}, classifyAvailabilityError(err)
+			}
+		} else {
+			if _, err = tx.Exec(ctx, `INSERT INTO public.twin_commands(command_id,entity_id,action,parameters,status,desired_version,idempotency_key,issued_by,issued_at,expires_at,control_version,requested_frequency_hz)
 		 VALUES($1,$2,'update_configuration',$3::jsonb,'pending',$4,$5,$6,$7,$8,1,$9)`, id, entity, parameters, version, request.IdempotencyKey, actor, now, deadline, string(request.Frequency.RequestedHz())); err != nil {
-			return RequestReceipt{}, classifyAvailabilityError(err)
+				return RequestReceipt{}, classifyAvailabilityError(err)
+			}
 		}
 		if _, err = tx.Exec(ctx, `INSERT INTO public.twin_outbox(command_id,topic,payload,payload_bytes,status,next_attempt_at,created_at) VALUES($1,$2,$3::jsonb,$4,'pending',$5,$5)`, id, "gateways/"+identity.GatewayID+"/commands/"+id, payload, payload, now); err != nil {
 			return RequestReceipt{}, classifyAvailabilityError(err)

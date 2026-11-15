@@ -32,6 +32,10 @@ var (
 	ErrIdempotencyConflict       = errors.New("idempotency_conflict")
 	ErrDesiredVersionOverflow    = errors.New("desired_version_overflow")
 	ErrControlPayloadTooLarge    = errors.New("control_payload_too_large")
+	// ErrCommandNotCancellable reports that the safe cancellation boundary is
+	// not provable for this command. It is a business rejection, never an
+	// availability or authorization failure.
+	ErrCommandNotCancellable = errors.New("command_not_cancellable")
 )
 
 // Version is a nonnegative PostgreSQL BIGINT encoded as a JSON string, never a
@@ -69,6 +73,10 @@ func (v *Version) UnmarshalJSON(data []byte) error {
 type CommandStatus string
 
 // Stored command lifecycle values and the separate no-op request outcome.
+//
+// CommandCancelled is the terminal status of a safely cancelled command. It is
+// a stored command status only: the MQTT result envelope allowlist stays
+// succeeded/failed, so a device can never report "cancelled".
 const (
 	CommandPending      CommandStatus = "pending"
 	CommandPublished    CommandStatus = "published"
@@ -76,6 +84,7 @@ const (
 	CommandSucceeded    CommandStatus = "succeeded"
 	CommandFailed       CommandStatus = "failed"
 	CommandTimeout      CommandStatus = "timeout"
+	CommandCancelled    CommandStatus = "cancelled"
 	RequestUnchanged                  = "unchanged"
 )
 
@@ -86,7 +95,7 @@ func (s CommandStatus) Active() bool {
 
 // Terminal reports statuses that must never regress after result ingestion.
 func (s CommandStatus) Terminal() bool {
-	return s == CommandSucceeded || s == CommandFailed || s == CommandTimeout
+	return s == CommandSucceeded || s == CommandFailed || s == CommandTimeout || s == CommandCancelled
 }
 
 // Valid reports whether this is a stored command status (not a request outcome).

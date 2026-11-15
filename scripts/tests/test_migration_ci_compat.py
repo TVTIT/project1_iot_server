@@ -99,6 +99,24 @@ class CompatFixture(unittest.TestCase):
             if query == migration24 and not seen_migration24:
                 seen_migration24 = True
                 raise self.m.Failure('ERROR: Migration 24 conflicting telemetry provenance')
+            if '00000000-0000-0000-0000-00000000000a' in query:
+                raise self.m.Failure('ERROR: duplicate key value violates unique constraint "uq_twin_commands_active_sensor"')
+            if "receipt_bytes = 'test'::bytea WHERE" in query or "receipt_hash = 'badhash'" in query or "repeat('a', 8193)" in query:
+                raise self.m.Failure('ERROR: check constraint "chk_twin_commands_receipt"')
+            if "receipt_bytes = 'new'::bytea" in query:
+                raise self.m.Failure('ERROR: Canonical command receipt evidence is immutable')
+            if "cancelled_at = now() - interval '1s'" in query:
+                raise self.m.Failure('ERROR: Command cancellation evidence is immutable')
+            if "first_reserved_at = NULL" in query:
+                raise self.m.Failure('ERROR: First reservation timestamp is immutable once written')
+            if "auto_successors_used = 2" in query:
+                raise self.m.Failure('ERROR: check constraint "chk_twin_commands_auto_successors"')
+            if "00000000-0000-0000-0000-000000000008" in query and "NULL, 0" in query:
+                raise self.m.Failure('ERROR: check constraint "chk_twin_commands_lineage"')
+            if "DELETE FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000007'" in query:
+                raise self.m.Failure('ERROR: update or delete on table "twin_commands" violates foreign key constraint "fk_twin_commands_root"')
+            if "SET ROLE anon;" in query or "SET ROLE authenticated;" in query:
+                raise self.m.Failure('ERROR: permission denied for table twin_commands')
             return ''
         with patch.object(self.f, 'sql', side_effect=sql_stub) as sql, \
              patch.object(self.f, 'expect') as expect, patch.object(self.f, 'login') as login:
@@ -129,9 +147,9 @@ class CompatFixture(unittest.TestCase):
 
     def test_sql_passes_explicit_terminal_to_psql(self):
         with patch.object(self.f, 'command', return_value='verified') as command:
-            self.assertEqual(self.f.sql('SELECT 1;', expected_schema_terminal=26), 'verified')
+            self.assertEqual(self.f.sql('SELECT 1;', expected_schema_terminal=27), 'verified')
         args, kwargs = command.call_args
-        self.assertIn('expected_schema_terminal=26', args[0])
+        self.assertIn('expected_schema_terminal=27', args[0])
         self.assertEqual(kwargs['input'], 'SELECT 1;\n')
 
     def test_migration24_fixture_covers_rollback_backfill_and_reapply(self):
@@ -157,6 +175,16 @@ class CompatFixture(unittest.TestCase):
         self.assertIn("000026_drop_telemetry_redundant_indexes.up.sql", compose)
         self.assertLess(compose.index('000025_drop_telemetry_sensor_fk.up.sql'),
                         compose.index('000026_drop_telemetry_redundant_indexes.up.sql'))
+
+    def test_migration27_fixture_covers_resilience(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        compose = (ROOT / 'docker-compose.yml').read_text()
+        self.assertIn("migration27 = (ROOT / 'migrations/000027_stage6_control_resilience.up.sql').read_text()", source)
+        self.assertIn("self.sql(migration27)", source)
+        self.assertIn("stage6_control_resilience", source)
+        self.assertIn("000027_stage6_control_resilience.up.sql", compose)
+        self.assertLess(compose.index('000026_drop_telemetry_redundant_indexes.up.sql'),
+                        compose.index('000027_stage6_control_resilience.up.sql'))
 
 
     def test_stage3_writer_fixtures_apply_post_auth_schema24_before_writer(self):

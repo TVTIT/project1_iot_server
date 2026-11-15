@@ -15,7 +15,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = 'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a'
 LABEL = 'stage2.migration-compat'
-TERMINAL_SCHEMA_VERSION = 26
+TERMINAL_SCHEMA_VERSION = 27
 
 
 class Failure(Exception):
@@ -69,8 +69,9 @@ class Fixture:
         return self.command(args, input=(password + '\n' if password is not None else '') + query + '\n')
 
     def expect(self, query, expected):
-        if self.sql(query) != expected:
-            raise Failure('Compatibility assertion failed.')
+        got = self.sql(query)
+        if got != expected:
+            raise Failure(f'Compatibility assertion failed: query={query} got={got!r} expected={expected!r}')
 
     def wait_ready(self, attempts=90):
         for _ in range(attempts):
@@ -187,6 +188,171 @@ class Fixture:
         self.expect("SELECT count(*) FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='telemetry_pkey';", '0')
         self.expect("SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='idx_telemetry_gateway_sensor_time';", '1')
         print('Migration 26 native redundant index removal on telemetry passed.', flush=True)
+
+        # Pre-seed representative legacy control dataset before applying migration 27:
+        # 1. User profile
+        self.sql("INSERT INTO auth.users(id) VALUES ('11111111-1111-1111-1111-111111111111');")
+        # 2. Twin entities and twin states
+        self.sql("""INSERT INTO twin_entities(id, entity_id, entity_type, gateway_id)
+            VALUES ('22222222-2222-2222-2222-222222222222', 'urn:ngsi-ld:Sensor:migration-fixture:sensor-a', 'Sensor', 'migration-fixture'),
+                   ('33333333-3333-3333-3333-333333333333', 'urn:ngsi-ld:Sensor:migration-fixture:sensor-b', 'Sensor', 'migration-fixture');
+            INSERT INTO twin_states(entity_id)
+            VALUES ('22222222-2222-2222-2222-222222222222'),
+                   ('33333333-3333-3333-3333-333333333333');""")
+        # 3. Legacy pending command with attempt_count 0 and payload bytes
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz)
+            VALUES ('00000000-0000-0000-0000-000000000001', '22222222-2222-2222-2222-222222222222', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'pending', 1, 'key-1', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '10');
+            INSERT INTO twin_outbox(command_id, topic, payload, payload_bytes, status, next_attempt_at)
+            VALUES ('00000000-0000-0000-0000-000000000001', 'gateways/migration-fixture/commands/00000000-0000-0000-0000-000000000001', '{"cmd":1}'::jsonb, '{"cmd":1}'::bytea, 'pending', now());""")
+        # 4. Legacy succeeded command with result bytes
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, completed_at, control_version, requested_frequency_hz, result_bytes, result_hash, result_received_at)
+            VALUES ('00000000-0000-0000-0000-000000000002', '33333333-3333-3333-3333-333333333333', 'update_configuration', '{"sample_interval_us": 200000}'::jsonb, 'succeeded', 2, 'key-2', '11111111-1111-1111-1111-111111111111', now() - interval '10s', now() + interval '50s', now(), 1, '5', 'result'::bytea, encode(sha256('result'::bytea),'hex'), now());
+            INSERT INTO twin_outbox(command_id, topic, payload, payload_bytes, status)
+            VALUES ('00000000-0000-0000-0000-000000000002', 'gateways/migration-fixture/commands/00000000-0000-0000-0000-000000000002', '{"cmd":2}'::jsonb, '{"cmd":2}'::bytea, 'published');""")
+        # 5. Pre-existing legacy cancelled command without cancellation evidence (permitted by schema 8)
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, completed_at, control_version, requested_frequency_hz)
+            VALUES ('00000000-0000-0000-0000-000000000003', '33333333-3333-3333-3333-333333333333', 'update_configuration', '{"sample_interval_us": 500000}'::jsonb, 'cancelled', 1, 'key-3', '11111111-1111-1111-1111-111111111111', now() - interval '20s', now() - interval '10s', now() - interval '10s', 1, '2');""")
+
+        migration27 = (ROOT / 'migrations/000027_stage6_control_resilience.up.sql').read_text()
+        self.sql(migration27)
+        self.sql(migration27)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=27 AND name='stage6_control_resilience';", '1')
+        self.expect("SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='twin_commands' AND column_name='stage6_managed';", '1')
+        self.expect("SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='twin_states' AND column_name='next_query_at';", '1')
+
+        # 1. Verify legacy data survival and UNKNOWN history (byte-exact equality):
+        self.expect("SELECT count(*) FROM twin_commands WHERE stage6_managed = false;", '3')
+        self.expect("SELECT c.status || '|' || c.attempt_count || '|' || encode(o.payload_bytes, 'escape') FROM twin_commands c JOIN twin_outbox o USING(command_id) WHERE command_id='00000000-0000-0000-0000-000000000001';", 'pending|0|{"cmd":1}')
+        self.expect("SELECT status || '|' || encode(result_bytes, 'escape') || '|' || result_hash FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000002';", 'succeeded|result|f6a214f7a5fcda0c2cee9660b7fc29f5649e3c68aad48e20e950137c98913a68')
+        self.expect("SELECT status || '|' || (cancelled_at IS NULL)::text || '|' || stage6_managed::text FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000003';", 'cancelled|true|false')
+
+        # 2. Verify fresh Stage 5-style insert without Stage 6 columns:
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz)
+            VALUES ('00000000-0000-0000-0000-000000000004', '33333333-3333-3333-3333-333333333333', 'update_configuration', '{"sample_interval_us": 300000}'::jsonb, 'pending', 3, 'key-4', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '3.33');""")
+        self.expect("SELECT stage6_managed::text || '|' || origin FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000004';", 'false|client')
+
+        # 3. Verify active sensor unique constraint (sensor-a already has command 1 pending):
+        try:
+            self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz)
+                VALUES ('00000000-0000-0000-0000-00000000000a', '22222222-2222-2222-2222-222222222222', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'pending', 2, 'key-a', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '10');""")
+            raise Failure('Duplicate active sensor command was not refused.')
+        except Failure as error:
+            if 'uq_twin_commands_active_sensor' not in str(error):
+                raise
+
+        # 4. Verify receipt evidence constraints and write-once immutability:
+        self.sql("""INSERT INTO sensors(gateway_id, sensor_id, name) VALUES ('migration-fixture', 'sensor-c', 'sensor c');
+            INSERT INTO twin_entities(id, entity_id, entity_type, gateway_id) VALUES ('44444444-4444-4444-4444-444444444444', 'urn:ngsi-ld:Sensor:migration-fixture:sensor-c', 'Sensor', 'migration-fixture');
+            INSERT INTO twin_states(entity_id) VALUES ('44444444-4444-4444-4444-444444444444');
+            INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz, stage6_managed, origin, root_command_id)
+            VALUES ('00000000-0000-0000-0000-000000000005', '44444444-4444-4444-4444-444444444444', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'pending', 1, 'key-5', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '10', true, 'client', '00000000-0000-0000-0000-000000000005');""")
+        # Partial receipt rejected:
+        try:
+            self.sql("UPDATE twin_commands SET receipt_bytes = 'test'::bytea WHERE command_id='00000000-0000-0000-0000-000000000005';")
+            raise Failure('Partial receipt was not refused.')
+        except Failure as error:
+            if 'chk_twin_commands_receipt' not in str(error):
+                raise
+        # Hash mismatch rejected:
+        try:
+            self.sql("UPDATE twin_commands SET receipt_bytes = 'test'::bytea, receipt_hash = 'badhash', receipt_received_at = now() WHERE command_id='00000000-0000-0000-0000-000000000005';")
+            raise Failure('Receipt hash mismatch was not refused.')
+        except Failure as error:
+            if 'chk_twin_commands_receipt' not in str(error):
+                raise
+        # Oversize receipt (>8192 bytes) rejected:
+        try:
+            self.sql("UPDATE twin_commands SET receipt_bytes = repeat('a', 8193)::bytea, receipt_hash = encode(sha256(repeat('a', 8193)::bytea),'hex'), receipt_received_at = now() WHERE command_id='00000000-0000-0000-0000-000000000005';")
+            raise Failure('Oversize receipt (>8192) was not refused.')
+        except Failure as error:
+            if 'chk_twin_commands_receipt' not in str(error):
+                raise
+        # Valid receipt accepted:
+        self.sql("UPDATE twin_commands SET receipt_bytes = 'test'::bytea, receipt_hash = encode(sha256('test'::bytea),'hex'), receipt_received_at = now(), status = 'acknowledged' WHERE command_id='00000000-0000-0000-0000-000000000005';")
+        # Receipt immutability enforced:
+        try:
+            self.sql("UPDATE twin_commands SET receipt_bytes = 'new'::bytea WHERE command_id='00000000-0000-0000-0000-000000000005';")
+            raise Failure('Receipt mutation was not refused.')
+        except Failure as error:
+            if 'canonical command receipt evidence is immutable' not in str(error).lower():
+                raise
+        # Complete command 5 so sensor-c active slot is released:
+        self.sql("UPDATE twin_commands SET status = 'succeeded', completed_at = now() WHERE command_id='00000000-0000-0000-0000-000000000005';")
+
+        # 5. Verify cancellation evidence, immutability, and user deletion:
+        self.sql("INSERT INTO auth.users(id) VALUES ('55555555-5555-5555-5555-555555555555');")
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, completed_at, control_version, requested_frequency_hz, stage6_managed, cancelled_at, cancelled_by, origin, root_command_id)
+            VALUES ('00000000-0000-0000-0000-000000000006', '44444444-4444-4444-4444-444444444444', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'cancelled', 2, 'key-6', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', now(), 1, '10', true, now(), '55555555-5555-5555-5555-555555555555', 'client', '00000000-0000-0000-0000-000000000006');""")
+        # Mutating cancelled_at rejected:
+        try:
+            self.sql("UPDATE twin_commands SET cancelled_at = now() - interval '1s' WHERE command_id='00000000-0000-0000-0000-000000000006';")
+            raise Failure('Cancellation mutation was not refused.')
+        except Failure as error:
+            if 'cancellation evidence is immutable' not in str(error).lower():
+                raise
+        # Deleting actor profile does NOT fail or violate trigger because cancelled_by is an immutable audit snapshot:
+        self.sql("DELETE FROM auth.users WHERE id = '55555555-5555-5555-5555-555555555555';")
+        self.expect("SELECT cancelled_by::text FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000006';", '55555555-5555-5555-5555-555555555555')
+
+        # 6. Verify first reservation barrier immutability:
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz, stage6_managed, first_reserved_at, attempt_count, origin, root_command_id)
+            VALUES ('00000000-0000-0000-0000-000000000007', '44444444-4444-4444-4444-444444444444', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'pending', 3, 'key-7', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '10', true, now(), 1, 'client', '00000000-0000-0000-0000-000000000007');""")
+        try:
+            self.sql("UPDATE twin_commands SET first_reserved_at = NULL WHERE command_id='00000000-0000-0000-0000-000000000007';")
+            raise Failure('Clearing first reservation was not refused.')
+        except Failure as error:
+            if 'first reservation timestamp is immutable once written' not in str(error).lower():
+                raise
+
+        # 7. Verify lineage, budget bound 0..1, and deletion restriction:
+        try:
+            self.sql("UPDATE twin_commands SET auto_successors_used = 2 WHERE command_id='00000000-0000-0000-0000-000000000007';")
+            raise Failure('Budget > 1 was not refused.')
+        except Failure as error:
+            if 'chk_twin_commands_auto_successors' not in str(error):
+                raise
+        self.sql("UPDATE twin_commands SET auto_successors_used = 1, status = 'timeout' WHERE command_id='00000000-0000-0000-0000-000000000007';")
+        # Successor without parent rejected:
+        try:
+            self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz, stage6_managed, origin, root_command_id, parent_command_id, auto_successors_used)
+                VALUES ('00000000-0000-0000-0000-000000000008', '44444444-4444-4444-4444-444444444444', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'pending', 4, 'key-8', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '10', true, 'reconciliation', '00000000-0000-0000-0000-000000000007', NULL, 0);""")
+            raise Failure('Successor without parent was not refused.')
+        except Failure as error:
+            if 'chk_twin_commands_lineage' not in str(error):
+                raise
+        # Valid successor accepted:
+        self.sql("""INSERT INTO twin_commands(command_id, entity_id, action, parameters, status, desired_version, idempotency_key, issued_by, issued_at, expires_at, control_version, requested_frequency_hz, stage6_managed, origin, root_command_id, parent_command_id, auto_successors_used)
+            VALUES ('00000000-0000-0000-0000-000000000008', '44444444-4444-4444-4444-444444444444', 'update_configuration', '{"sample_interval_us": 100000}'::jsonb, 'pending', 4, 'key-8', '11111111-1111-1111-1111-111111111111', now(), now() + interval '60s', 1, '10', true, 'reconciliation', '00000000-0000-0000-0000-000000000007', '00000000-0000-0000-0000-000000000007', 0);""")
+        # Deleting root command rejected by RESTRICT constraint:
+        try:
+            self.sql("DELETE FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000007';")
+            raise Failure('Deleting root command with active successor was not refused.')
+        except Failure as error:
+            if 'fk_twin_commands_root' not in str(error):
+                raise
+
+        # 8. Privileges & RLS:
+        # Verify anon denied INSERT:
+        try:
+            self.sql("SET ROLE anon; INSERT INTO public.twin_commands(command_id, entity_id, action, parameters, status, desired_version, expires_at, target_entity_type) VALUES ('00000000-0000-0000-0000-000000000099', '22222222-2222-2222-2222-222222222222', 'update_configuration', '{}', 'pending', 1, now(), 'Sensor');")
+            raise Failure('Anon INSERT was not refused.')
+        except Failure as error:
+            if 'permission denied' not in str(error).lower():
+                raise
+        # Verify authenticated denied UPDATE:
+        try:
+            self.sql("SET ROLE authenticated; UPDATE public.twin_commands SET status='failed';")
+            raise Failure('Authenticated UPDATE was not refused.')
+        except Failure as error:
+            if 'permission denied' not in str(error).lower():
+                raise
+        # Reset role back to admin for subsequent operations:
+        self.sql("RESET ROLE;")
+        # Verify iot_backend_app can perform legitimate UPDATE using real login:
+        self.sql("UPDATE public.twin_commands SET retry_stop_reason = 'result_received' WHERE command_id = '00000000-0000-0000-0000-000000000004';",
+                 role='iot_backend_app', password=self.passwords['BACKEND_DB_PASSWORD'])
+        self.expect("SELECT retry_stop_reason FROM twin_commands WHERE command_id = '00000000-0000-0000-0000-000000000004';", 'result_received')
+        print('Migration 27 native control resilience schema, legacy preservation, constraints and triggers passed.', flush=True)
 
     def cleanup(self):
         if self.id is None:

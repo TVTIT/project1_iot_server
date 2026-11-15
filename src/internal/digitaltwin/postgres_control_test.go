@@ -92,3 +92,30 @@ func TestControlRepositoryBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestControlRepositoryStage6PolicyAndFailClosed(t *testing.T) {
+	cfg := digitaltwin.DefaultControlConfig()
+	cfg.Stage6Enabled = true
+	cfg.RetryPolicy.BaseDelay = 0 // invalid!
+	if _, err := digitaltwin.NewPostgresControlRepository(controlUnavailableDB{}, cfg); err == nil {
+		t.Fatal("invalid retry policy accepted with Stage6 enabled")
+	}
+
+	validCfg := digitaltwin.DefaultControlConfig()
+	validCfg.Stage6Enabled = true
+	repo, err := digitaltwin.NewPostgresControlRepository(controlUnavailableDB{}, validCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// PrepareControl fails closed with no dispatch authority when DB fails
+	dispatch, err := repo.PrepareControl(context.Background(), uuid.New())
+	if err == nil || dispatch != nil {
+		t.Fatalf("expected fail closed on unavailable DB: dispatch=%v err=%v", dispatch, err)
+	}
+
+	// MarkControlReservationPublished fails closed when DB fails
+	if err := repo.MarkControlReservationPublished(context.Background(), uuid.New(), 1); err == nil {
+		t.Fatal("expected failure on unavailable DB")
+	}
+}
