@@ -20,7 +20,7 @@ import (
 
 // outboxSchemaVersion includes durable Sensor configuration and command receipts.
 // Schema 1 upgrades transactionally; unknown versions are never recreated.
-const outboxSchemaVersion = 2
+const outboxSchemaVersion = 3
 
 // Outbox row statuses. Only these two values exist: a pending row can still be
 // published and acknowledged, a quarantined row is retained for inspection but
@@ -213,7 +213,7 @@ func OpenOutboxAdmin(path string, opTimeout time.Duration) (*Outbox, error) {
 	}
 	// Administrative uplink reads/quarantine use the unchanged schema-1 tables.
 	// Never require an operational upgrade just to inspect an old outbox.
-	if version != 1 && version != outboxSchemaVersion {
+	if version != 1 && version != 2 && version != outboxSchemaVersion {
 		_ = db.Close()
 		_ = release()
 		return nil, fmt.Errorf("%w: file version %d, supported version %d", ErrOutboxSchema, version, outboxSchemaVersion)
@@ -311,6 +311,11 @@ func (o *Outbox) prepare(ctx context.Context) error {
 	switch version {
 	case outboxSchemaVersion:
 		return o.verifyBinding(ctx)
+	case 2:
+		if err := o.verifyBinding(ctx); err != nil {
+			return err
+		}
+		return o.upgradeReceiptEvidenceSchema(ctx)
 	case 1:
 		// Check binding before changing an existing file. In particular a wrong
 		// process identity must not upgrade a foreign Sensor's database.

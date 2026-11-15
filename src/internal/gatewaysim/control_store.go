@@ -40,11 +40,23 @@ type ControlReceipt struct {
 	Command         digitaltwin.Command
 	Topic           string
 	Payload, Result []byte
+	ReceiptBytes    []byte
+	ReceiptHash     string
+	ReceivedAt      time.Time
 	Fresh           bool
 }
 
 // ReserveControl durably admits one command before any scheduler side effect.
 func (o *Outbox) ReserveControl(ctx context.Context, topic string, payload []byte, now time.Time) (ControlReceipt, error) {
+	return o.reserveControl(ctx, topic, payload, nil, now)
+}
+
+// ReserveControlWithReceipt durably admits one command and its canonical wire receipt evidence.
+func (o *Outbox) ReserveControlWithReceipt(ctx context.Context, topic string, payload, receiptBytes []byte, now time.Time) (ControlReceipt, error) {
+	return o.reserveControl(ctx, topic, payload, receiptBytes, now)
+}
+
+func (o *Outbox) reserveControl(ctx context.Context, topic string, payload, receiptBytes []byte, now time.Time) (ControlReceipt, error) {
 	c, err := digitaltwin.ParseMQTTCommand(topic, payload, false)
 	if err != nil {
 		return ControlReceipt{}, err
@@ -54,6 +66,15 @@ func (o *Outbox) ReserveControl(ctx context.Context, topic string, payload []byt
 	}
 	if now.IsZero() {
 		return ControlReceipt{}, digitaltwin.ErrInvalidInput
+	}
+	var receiptHash string
+	var receiptReceivedAt int64
+	if len(receiptBytes) > 0 {
+		if len(receiptBytes) > digitaltwin.MaxControlPayloadBytes {
+			return ControlReceipt{}, digitaltwin.ErrControlPayloadTooLarge
+		}
+		receiptHash = fmt.Sprintf("%x", sha256.Sum256(receiptBytes))
+		receiptReceivedAt = now.UnixMicro()
 	}
 	ctx, cancel := context.WithTimeout(ctx, o.opTimeout)
 	defer cancel()
@@ -67,6 +88,11 @@ func (o *Outbox) ReserveControl(ctx context.Context, topic string, payload []byt
 		if !bytes.Equal(stored.Payload, payload) || stored.Topic != topic {
 			return ControlReceipt{}, ErrControlConflict
 		}
+		if len(receiptBytes) > 0 {
+			if len(stored.ReceiptBytes) > 0 && !bytes.Equal(stored.ReceiptBytes, receiptBytes) {
+				return ControlReceipt{}, ErrControlConflict
+			}
+		}
 		return stored, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -78,13 +104,13 @@ func (o *Outbox) ReserveControl(ctx context.Context, topic string, payload []byt
 		return ControlReceipt{}, err
 	}
 	var prepared, rows, used int64
-	if err = tx.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(length(command_topic)+length(command_bytes)+COALESCE(length(result_bytes),8192)),0),COALESCE(sum(status='prepared'),0) FROM command_receipts`).Scan(&rows, &used, &prepared); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(length(command_topic)+length(command_bytes)+COALESCE(length(result_bytes),8192)+COALESCE(length(receipt_bytes),0)),0),COALESCE(sum(status='prepared'),0) FROM command_receipts`).Scan(&rows, &used, &prepared); err != nil {
 		return ControlReceipt{}, err
 	}
 	if prepared != 0 {
 		return ControlReceipt{}, ErrControlBusy
 	}
-	if rows >= controlMaxReceipts || used+int64(len(topic)+len(payload)+digitaltwin.MaxControlPayloadBytes) > controlMaxBytes {
+	if rows >= controlMaxReceipts || used+int64(len(topic)+len(payload)+len(receiptBytes)+digitaltwin.MaxControlPayloadBytes) > controlMaxBytes {
 		return ControlReceipt{}, ErrControlFull
 	}
 	retainFrom := c.ExpiresAt
@@ -92,14 +118,27 @@ func (o *Outbox) ReserveControl(ctx context.Context, topic string, payload []byt
 		retainFrom = now
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(payload))
-	_, err = tx.ExecContext(ctx, `INSERT INTO command_receipts(command_id,command_hash,command_topic,command_bytes,desired_version,sample_interval_us,expires_at,status,retain_until) VALUES(?,?,?,?,?,?,?,'prepared',?)`, c.CommandID, hash, topic, payload, int64(c.DesiredVersion), c.Parameters.SampleIntervalUS, c.ExpiresAt.UnixMicro(), retainFrom.Add(controlRetention).UnixMicro())
+	var sqlReceiptBytes, sqlReceiptHash any
+	var sqlReceiptReceivedAt any
+	if len(receiptBytes) > 0 {
+		sqlReceiptBytes = receiptBytes
+		sqlReceiptHash = receiptHash
+		sqlReceiptReceivedAt = receiptReceivedAt
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO command_receipts(command_id,command_hash,command_topic,command_bytes,desired_version,sample_interval_us,expires_at,status,retain_until,receipt_bytes,receipt_hash,receipt_received_at) VALUES(?,?,?,?,?,?,?,'prepared',?,?,?,?)`, c.CommandID, hash, topic, payload, int64(c.DesiredVersion), c.Parameters.SampleIntervalUS, c.ExpiresAt.UnixMicro(), retainFrom.Add(controlRetention).UnixMicro(), sqlReceiptBytes, sqlReceiptHash, sqlReceiptReceivedAt)
 	if err != nil {
 		return ControlReceipt{}, err
 	}
 	if err = o.commit(tx); err != nil {
 		return ControlReceipt{}, fmt.Errorf("%w: %v", ErrOutboxCommitUnknown, err)
 	}
-	return ControlReceipt{Command: c, Topic: topic, Payload: append([]byte(nil), payload...), Fresh: true}, nil
+	res := ControlReceipt{Command: c, Topic: topic, Payload: append([]byte(nil), payload...), Fresh: true}
+	if len(receiptBytes) > 0 {
+		res.ReceiptBytes = append([]byte(nil), receiptBytes...)
+		res.ReceiptHash = receiptHash
+		res.ReceivedAt = time.UnixMicro(receiptReceivedAt).UTC()
+	}
+	return res, nil
 }
 
 // CompleteControl commits stable result bytes and, on success, configuration.
@@ -200,12 +239,15 @@ func (o *Outbox) ControlReceipts(ctx context.Context) ([]ControlReceipt, error) 
 	return receipts, rows.Err()
 }
 
-const controlReceiptSelect = `SELECT command_topic,command_bytes,command_hash,status,result_bytes FROM command_receipts`
+const controlReceiptSelect = `SELECT command_topic,command_bytes,command_hash,status,result_bytes,receipt_bytes,receipt_hash,receipt_received_at FROM command_receipts`
 
 func scanControlReceipt(scan func(...any) error) (ControlReceipt, error) {
 	var r ControlReceipt
 	var hash, status string
-	if err := scan(&r.Topic, &r.Payload, &hash, &status, &r.Result); err != nil {
+	var receiptBytes []byte
+	var receiptHash sql.NullString
+	var receiptReceivedAt sql.NullInt64
+	if err := scan(&r.Topic, &r.Payload, &hash, &status, &r.Result, &receiptBytes, &receiptHash, &receiptReceivedAt); err != nil {
 		return ControlReceipt{}, err
 	}
 	c, err := digitaltwin.ParseMQTTCommand(r.Topic, r.Payload, false)
@@ -213,6 +255,20 @@ func scanControlReceipt(scan func(...any) error) (ControlReceipt, error) {
 		return ControlReceipt{}, ErrOutboxCorrupt
 	}
 	r.Command = c
+	if len(receiptBytes) > 0 {
+		if len(receiptBytes) > digitaltwin.MaxControlPayloadBytes {
+			return ControlReceipt{}, ErrOutboxCorrupt
+		}
+		expectedHash := fmt.Sprintf("%x", sha256.Sum256(receiptBytes))
+		if !receiptHash.Valid || receiptHash.String != expectedHash || !receiptReceivedAt.Valid || receiptReceivedAt.Int64 <= 0 {
+			return ControlReceipt{}, ErrOutboxCorrupt
+		}
+		r.ReceiptBytes = receiptBytes
+		r.ReceiptHash = receiptHash.String
+		r.ReceivedAt = time.UnixMicro(receiptReceivedAt.Int64).UTC()
+	} else if receiptHash.Valid || receiptReceivedAt.Valid {
+		return ControlReceipt{}, ErrOutboxCorrupt
+	}
 	if status == "completed" {
 		result, err := digitaltwin.ParseMQTTResult("gateways/"+c.GatewayID+"/responses/"+c.CommandID, r.Result, false)
 		if err != nil || digitaltwin.ValidateResultForCommand(result, c) != nil {
@@ -222,6 +278,31 @@ func scanControlReceipt(scan func(...any) error) (ControlReceipt, error) {
 		return ControlReceipt{}, ErrOutboxCorrupt
 	}
 	return r, nil
+}
+
+func createControlReceiptTriggers(ctx context.Context, tx *sql.Tx) error {
+	triggers := []string{
+		`CREATE TRIGGER IF NOT EXISTS command_receipts_evidence_insert BEFORE INSERT ON command_receipts
+		FOR EACH ROW BEGIN
+			SELECT CASE WHEN NOT (
+				(NEW.receipt_bytes IS NULL AND NEW.receipt_hash IS NULL AND NEW.receipt_received_at IS NULL) OR
+				(NEW.receipt_bytes IS NOT NULL AND length(NEW.receipt_bytes) BETWEEN 1 AND 8192 AND NEW.receipt_hash IS NOT NULL AND length(NEW.receipt_hash) = 64 AND NEW.receipt_received_at IS NOT NULL AND NEW.receipt_received_at > 0)
+			) THEN RAISE(ABORT, 'CHECK constraint failed: command_receipts receipt evidence must be all-null or complete') END;
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS command_receipts_evidence_update BEFORE UPDATE ON command_receipts
+		FOR EACH ROW BEGIN
+			SELECT CASE WHEN NOT (
+				(NEW.receipt_bytes IS NULL AND NEW.receipt_hash IS NULL AND NEW.receipt_received_at IS NULL) OR
+				(NEW.receipt_bytes IS NOT NULL AND length(NEW.receipt_bytes) BETWEEN 1 AND 8192 AND NEW.receipt_hash IS NOT NULL AND length(NEW.receipt_hash) = 64 AND NEW.receipt_received_at IS NOT NULL AND NEW.receipt_received_at > 0)
+			) THEN RAISE(ABORT, 'CHECK constraint failed: command_receipts receipt evidence must be all-null or complete') END;
+		END;`,
+	}
+	for _, trigger := range triggers {
+		if _, err := tx.ExecContext(ctx, trigger); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // createControlTables is shared by fresh creation and the schema-1 upgrade;
@@ -245,8 +326,13 @@ func createControlTables(ctx context.Context, tx *sql.Tx) error {
 			status TEXT NOT NULL CHECK(status IN ('prepared','completed')),
 			result_bytes BLOB,
 			retain_until INTEGER NOT NULL,
+			receipt_bytes BLOB,
+			receipt_hash TEXT CHECK(receipt_hash IS NULL OR length(receipt_hash)=64),
+			receipt_received_at INTEGER CHECK(receipt_received_at IS NULL OR receipt_received_at > 0),
 			CHECK((status='prepared' AND result_bytes IS NULL) OR
-			 (status='completed' AND length(result_bytes) BETWEEN 1 AND 8192 AND result_bytes IS NOT NULL))
+			 (status='completed' AND length(result_bytes) BETWEEN 1 AND 8192 AND result_bytes IS NOT NULL)),
+			CHECK((receipt_bytes IS NULL AND receipt_hash IS NULL AND receipt_received_at IS NULL) OR
+			 (receipt_bytes IS NOT NULL AND length(receipt_bytes) BETWEEN 1 AND 8192 AND receipt_hash IS NOT NULL AND receipt_received_at IS NOT NULL))
 		)`,
 		`CREATE UNIQUE INDEX one_prepared_command ON command_receipts(status) WHERE status='prepared'`,
 		`CREATE INDEX command_receipts_retention ON command_receipts(status,retain_until)`,
@@ -255,7 +341,7 @@ func createControlTables(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 	}
-	return nil
+	return createControlReceiptTriggers(ctx, tx)
 }
 
 func (o *Outbox) upgradeControlSchema(ctx context.Context) error {
@@ -267,7 +353,34 @@ func (o *Outbox) upgradeControlSchema(ctx context.Context) error {
 	if err := createControlTables(ctx, tx); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version=2"); err != nil {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", outboxSchemaVersion)); err != nil {
+		return err
+	}
+	if err := o.commit(tx); err != nil {
+		return fmt.Errorf("%w: %v", ErrOutboxCommitUnknown, err)
+	}
+	return nil
+}
+
+func (o *Outbox) upgradeReceiptEvidenceSchema(ctx context.Context) error {
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []string{
+		"ALTER TABLE command_receipts ADD COLUMN receipt_bytes BLOB CHECK(receipt_bytes IS NULL OR length(receipt_bytes) BETWEEN 1 AND 8192)",
+		"ALTER TABLE command_receipts ADD COLUMN receipt_hash TEXT CHECK(receipt_hash IS NULL OR length(receipt_hash) = 64)",
+		"ALTER TABLE command_receipts ADD COLUMN receipt_received_at INTEGER CHECK(receipt_received_at IS NULL OR receipt_received_at > 0)",
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	if err := createControlReceiptTriggers(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", outboxSchemaVersion)); err != nil {
 		return err
 	}
 	if err := o.commit(tx); err != nil {
