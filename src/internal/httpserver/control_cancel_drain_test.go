@@ -284,6 +284,133 @@ func TestControlCancelPartialContentLengthBodyKeepAlive(t *testing.T) {
 	}
 }
 
+func TestControlCancelUnsupportedMediaPartialChunkedBodyKeepAlive(t *testing.T) {
+	deps := testRouterDependencies(readinessCheckerFunc(func(context.Context) error { return nil }))
+	deps.ControlAPIEnabled = true
+	deps.ControlCancelEnabled = true
+	deps.ControlRequestTimeout = 50 * time.Millisecond
+
+	var cancelCallCount int32
+	stub := &cancelStubRepository{}
+	stub.authorize = func(context.Context, uuid.UUID, string, bool) error { return nil }
+	stub.cancel = func(_ context.Context, _ uuid.UUID, urn, cmdID string) (digitaltwin.CommandCancellation, error) {
+		atomic.AddInt32(&cancelCallCount, 1)
+		return digitaltwin.CommandCancellation{EntityID: urn, CommandID: cmdID, Status: digitaltwin.CommandCancelled}, nil
+	}
+	deps.ControlRepository = stub
+	router, err := NewRouter(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(router)
+	server.Config.ReadTimeout = time.Second
+	server.Start()
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	request := "POST /v1/digital-twins/urn:ngsi-ld:Sensor:gw:s1/commands/00000000-0000-4000-8000-000000000001/cancel HTTP/1.1\r\n" +
+		"Host: fixture.invalid\r\n" +
+		"Authorization: Bearer token\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"\r\n" +
+		"1\r\n" +
+		"{\r\n"
+	if _, err := fmt.Fprint(conn, request); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	elapsed := time.Since(started)
+	t.Logf("request budget=50ms; response=%v error=%v elapsed=%s", response, err, elapsed)
+	if err != nil || response == nil {
+		t.Fatalf("expected 415 within cancel request budget, got response=%v error=%v elapsed=%s",
+			response, err, elapsed)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected status 415, got %d after %s", response.StatusCode, elapsed)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("415 response took %s, exceeded request budget tolerance", elapsed)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertControlErrorCode(t, body, "unsupported_media_type")
+	if !response.Close {
+		t.Fatal("expected HTTP/1.1 connection close after early body rejection")
+	}
+	if atomic.LoadInt32(&cancelCallCount) != 0 {
+		t.Fatalf("unsupported media request reached cancellation repository %d times", cancelCallCount)
+	}
+}
+
+func TestControlCancelUnsupportedAcceptPartialChunkedBodyKeepAlive(t *testing.T) {
+	deps := testRouterDependencies(readinessCheckerFunc(func(context.Context) error { return nil }))
+	deps.ControlAPIEnabled = true
+	deps.ControlCancelEnabled = true
+	deps.ControlRequestTimeout = 50 * time.Millisecond
+	stub := &cancelStubRepository{}
+	stub.authorize = func(context.Context, uuid.UUID, string, bool) error { return nil }
+	deps.ControlRepository = stub
+	router, err := NewRouter(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(router)
+	server.Config.ReadTimeout = time.Second
+	server.Start()
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	request := "POST /v1/digital-twins/urn:ngsi-ld:Sensor:gw:s1/commands/00000000-0000-4000-8000-000000000001/cancel HTTP/1.1\r\n" +
+		"Host: fixture.invalid\r\n" +
+		"Authorization: Bearer token\r\n" +
+		"Accept: text/plain\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"\r\n" +
+		"1\r\n" +
+		"{\r\n"
+	if _, err := fmt.Fprint(conn, request); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	elapsed := time.Since(started)
+	if err != nil || response == nil {
+		t.Fatalf("expected 406 within cancel rejection policy, got response=%v error=%v elapsed=%s",
+			response, err, elapsed)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusNotAcceptable || elapsed > 200*time.Millisecond || !response.Close {
+		t.Fatalf("early Accept rejection did not close promptly: status=%d elapsed=%s close=%t",
+			response.StatusCode, elapsed, response.Close)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertControlErrorCode(t, body, "not_acceptable")
+}
+
 // TestControlCancelHTTP2NoConnectionHeader tests that setBodyRejectionClosePolicy
 // does not emit Connection header for HTTP/2 requests.
 // Uses Gin test context with HTTP/2 proto; no network exchange.

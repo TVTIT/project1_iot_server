@@ -36,8 +36,14 @@ type mediaRange struct {
 // - If the best matching range has q <= 0.0 (e.g. q=0 exclusion), negotiation fails -> 406 Not Acceptable.
 // - If no media range matches the served representation, negotiation fails -> 406 Not Acceptable.
 // - On 406, writes httpapi.WriteError with status 406, code "not_acceptable", and returns false.
-func negotiateAccept(c *gin.Context, servedBaseMediaType string) bool {
+func negotiateAccept(c *gin.Context, servedBaseMediaType string, beforeReject ...func()) bool {
 	addVary(c.Writer.Header(), "Accept")
+	reject := func() {
+		for _, callback := range beforeReject {
+			callback()
+		}
+		httpapi.WriteError(c, http.StatusNotAcceptable, "not_acceptable", "acceptable media type not available")
+	}
 
 	acceptValues := c.Request.Header.Values("Accept")
 	if len(acceptValues) == 0 {
@@ -67,7 +73,7 @@ func negotiateAccept(c *gin.Context, servedBaseMediaType string) bool {
 
 	// If client provided Accept header values, but all were unparseable, return 406
 	if len(allRanges) == 0 {
-		httpapi.WriteError(c, http.StatusNotAcceptable, "not_acceptable", "acceptable media type not available")
+		reject()
 		return false
 	}
 
@@ -109,7 +115,7 @@ func negotiateAccept(c *gin.Context, servedBaseMediaType string) bool {
 	}
 
 	if bestSpecificity == -1 || bestQ <= 0.0 {
-		httpapi.WriteError(c, http.StatusNotAcceptable, "not_acceptable", "acceptable media type not available")
+		reject()
 		return false
 	}
 

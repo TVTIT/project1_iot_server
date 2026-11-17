@@ -33,7 +33,11 @@ func controlHandler(deps RouterDependencies, operation string) gin.HandlerFunc {
 			writeControlError(c, digitaltwin.ErrDependencyUnavailable)
 			return
 		}
-		if !negotiateAccept(c, mimeJSON) {
+		if operation == "cancel" {
+			if !negotiateAccept(c, mimeJSON, func() { setBodyRejectionClosePolicy(c) }) {
+				return
+			}
+		} else if !negotiateAccept(c, mimeJSON) {
 			return
 		}
 		principal, ok := auth.PrincipalFrom(c)
@@ -148,7 +152,8 @@ func controlHandler(deps RouterDependencies, operation string) gin.HandlerFunc {
 // isBodyRejected reports whether the error is a non-empty body rejection
 // (ErrInvalidInput) rather than a context deadline/cancellation.
 func isBodyRejected(err error) bool {
-	return errors.Is(err, digitaltwin.ErrInvalidInput) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
+	return (errors.Is(err, digitaltwin.ErrInvalidInput) || errors.Is(err, errControlMediaType)) &&
+		!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
 }
 
 // setBodyRejectionClosePolicy synchronously configures the response to prevent

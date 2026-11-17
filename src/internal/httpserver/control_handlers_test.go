@@ -34,6 +34,65 @@ func TestControlRoutesAuthenticationAndCache(t *testing.T) {
 	}
 }
 
+func TestControlCommandListAndDetailExposeOnlySafeReconciliationProjection(t *testing.T) {
+	rootBudget, childBlocked, rootBlocked := 1, false, false
+	view := digitaltwin.ControlCommandView{
+		CommandID:        "00000000-0000-4000-8000-000000000002",
+		EntityID:         "urn:ngsi-ld:Sensor:gw:s1",
+		Status:           digitaltwin.CommandPending,
+		Origin:           stringPointer("reconciliation"),
+		RootCommandID:    stringPointer("00000000-0000-4000-8000-000000000001"),
+		ParentCommandID:  stringPointer("00000000-0000-4000-8000-000000000001"),
+		ReconcileBlocked: &childBlocked, RootReconcileBlocked: &rootBlocked,
+		RootAutoSuccessorsUsed: &rootBudget,
+		CurrentReconciliation: &digitaltwin.ControlReconciliationContext{
+			DesiredVersion: 2, Decision: string(digitaltwin.ReconciliationSuccessorCreated),
+		},
+	}
+	deps := testRouterDependencies(readinessCheckerFunc(func(context.Context) error { return nil }))
+	deps.ControlAPIEnabled = true
+	deps.ControlRequestTimeout = time.Second
+	deps.ControlRepository = &controlRepositoryStub{
+		authorize: func(context.Context, uuid.UUID, string, bool) error { return nil },
+		list: func(context.Context, uuid.UUID, string, int, string) (digitaltwin.ControlCommandPage, error) {
+			return digitaltwin.ControlCommandPage{Commands: []digitaltwin.ControlCommandView{view}}, nil
+		},
+		get: func(context.Context, uuid.UUID, string, string) (digitaltwin.ControlCommandView, error) {
+			return view, nil
+		},
+	}
+	router, err := NewRouter(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw%3As1/commands",
+		"/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agw%3As1/commands/00000000-0000-4000-8000-000000000002",
+	} {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Header.Set("Authorization", "Bearer token")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		body := w.Body.String()
+		for _, want := range []string{
+			`"origin":"reconciliation"`, `"root_auto_successors_used":1`,
+			`"root_reconcile_blocked":false`, `"current_reconciliation"`,
+			`"decision":"successor_created"`, `"desired_version":"2"`,
+		} {
+			if w.Code != http.StatusOK || !strings.Contains(body, want) {
+				t.Fatalf("%s status=%d body=%s missing=%s", path, w.Code, body, want)
+			}
+		}
+		for _, forbidden := range []string{"payload_bytes", "receipt_bytes", "idempotency_key", "issued_by"} {
+			if strings.Contains(body, forbidden) {
+				t.Fatalf("%s exposed %q: %s", path, forbidden, body)
+			}
+		}
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
 type controlRepositoryStub struct {
 	authorize func(context.Context, uuid.UUID, string, bool) error
 	admit     func(context.Context, uuid.UUID, string, digitaltwin.DesiredRequest) (digitaltwin.RequestReceipt, error)
