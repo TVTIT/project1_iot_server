@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import sys
 import unittest
 from unittest import mock
+import hashlib
+import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paper_p3_support as runner
@@ -21,6 +23,8 @@ class RequireRunTests(unittest.TestCase):
 
     def test_accepts_only_completed_baseline_p3_with_clean_exit(self):
         self.assertTrue(runner.require_paper_p3_run(self.accepted, 0))
+        self.assertTrue(runner.require_paper_p3_run(
+            dict(self.accepted, stage6_profile=None, stage6_scenario_accepted=None), 0))
 
     def test_rejects_missing_or_prepared_only_summary(self):
         for report in (None, {}, {'status': 'STARTUP_VERIFIED_NOT_HTTP_ACCEPTED'}):
@@ -57,6 +61,62 @@ class RequireRunTests(unittest.TestCase):
                 {'error': False}):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 runner.require_paper_p3_run(dict(self.accepted, **mutation), 0)
+
+    def test_stage6_acceptance_requires_opt_in_profile_and_scenario_evidence(self):
+        report = dict(self.accepted, stage6_profile={
+            'backend_enabled': True, 'gateway_enabled': True,
+        }, stage6_scenario_accepted=True)
+        self.assertTrue(runner.require_paper_p3_run(report, 0, require_stage6=True))
+
+        incomplete = [
+            self.accepted,
+            dict(report, stage6_profile={'backend_enabled': False, 'gateway_enabled': True}),
+            dict(report, stage6_profile={'backend_enabled': True, 'gateway_enabled': False}),
+            dict(report, stage6_scenario_accepted=False),
+            dict(report, stage6_scenario_accepted=None),
+            dict(report, exact_cleanup_verified=False),
+        ]
+        for candidate in incomplete:
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                runner.require_paper_p3_run(candidate, 0, require_stage6=True)
+
+    def test_stage6_requires_canonical_persisted_gateway_receipt_evidence(self):
+        command_id = '123e4567-e89b-12d3-a456-426614174000'
+        command = {
+            'protocol_version': 1, 'message_type': 'command', 'command_id': command_id,
+            'gateway_id': 'gateway-fixture', 'entity_id': 'urn:ngsi-ld:Sensor:gateway-fixture:sensor-fixture',
+            'desired_version': '1',
+        }
+        command_bytes = json.dumps(command, separators=(',', ':')).encode()
+        command_hash = hashlib.sha256(command_bytes).hexdigest()
+        received_at = '2026-11-17T10:00:00.123456Z'
+        receipt = {
+            'protocol_version': 1, 'message_type': 'command_receipt', 'command_id': command_id,
+            'gateway_id': command['gateway_id'], 'entity_id': command['entity_id'],
+            'desired_version': '1', 'received_at': received_at, 'command_hash': command_hash,
+        }
+        receipt_bytes = json.dumps(receipt, separators=(',', ':')).encode()
+        record = {
+            'command_id': command_id, 'command_topic': f"gateways/{command['gateway_id']}/commands/{command_id}",
+            'command_bytes': command_bytes, 'command_hash': command_hash, 'result_bytes': b'{}',
+            'receipt_bytes': receipt_bytes, 'receipt_hash': hashlib.sha256(receipt_bytes).hexdigest(),
+            'receipt_received_at': 1794909600123456,
+        }
+        self.assertTrue(runner.stage6_device_receipts_valid(
+            [record], command['gateway_id'], command['entity_id'], expected_count=1))
+        for mutation in (
+                {'receipt_bytes': None},
+                {'receipt_hash': '0' * 64},
+                {'receipt_received_at': None},
+                {'command_hash': '0' * 64},
+                {'receipt_bytes': b'{}'},
+                {'result_bytes': b''}):
+            with self.subTest(mutation=mutation):
+                self.assertFalse(runner.stage6_device_receipts_valid(
+                    [dict(record, **mutation)], command['gateway_id'], command['entity_id'],
+                    expected_count=1))
+        self.assertFalse(runner.stage6_device_receipts_valid(
+            [], command['gateway_id'], command['entity_id'], expected_count=1))
 
 
 class MetricsOffReplacementTests(unittest.TestCase):

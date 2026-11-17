@@ -236,6 +236,59 @@ def mapped_port(cid: str, container_port: str) -> int:
     return int(out.splitlines()[-1].rsplit(':', 1)[1])
 
 
+def diagnose_broker_start(cid: str, work: Path, dynsec_volume: str):
+    """Emit sanitized startup evidence for this fixture's own broker only."""
+    inspect_format = (
+        'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} '
+        'oom={{.State.OOMKilled}} image={{.Config.Image}} user={{.Config.User}} '
+        'entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}} '
+        'readonly={{.HostConfig.ReadonlyRootfs}} bindings={{json .HostConfig.PortBindings}} '
+        'ports={{json .NetworkSettings.Ports}}')
+    try:
+        state = docker(['inspect', '-f', inspect_format, cid], timeout=15).decode().strip()
+    except Exception as exc:  # noqa: BLE001 - diagnostic must not hide primary failure
+        state = f'inspect unavailable: {sanitize(str(exc))}'
+    print(f'broker startup diagnostic: {state}', flush=True)
+
+    # This helper runs as the same unprivileged broker UID, with the same pinned
+    # image and read-only config/read-write DynSec mounts. It prints metadata
+    # and access checks only, never certificate/key or DynSec contents.
+    check_script = (
+        'set -eu\n'
+        'for p in /mosquitto/config /mosquitto/config/certs '
+        '/mosquitto/config/mosquitto.conf /mosquitto/config/certs/ca.crt '
+        '/mosquitto/config/certs/server.crt /mosquitto/config/certs/server.key '
+        '/mosquitto/dynsec /mosquitto/dynsec/dynamic-security.json; do '
+        'stat -c "%u:%g:%a %n" "$p"; done\n'
+        'test -x /mosquitto/config && test -x /mosquitto/config/certs\n'
+        'test -r /mosquitto/config/mosquitto.conf\n'
+        'test -r /mosquitto/config/certs/ca.crt\n'
+        'test -r /mosquitto/config/certs/server.crt\n'
+        'test -r /mosquitto/config/certs/server.key\n'
+        'test -x /mosquitto/dynsec && test -r /mosquitto/dynsec/dynamic-security.json\n'
+        'test -w /mosquitto/dynsec/dynamic-security.json\n'
+        'echo broker_uid_access=ok\n')
+    helper_name = f'stage3-broker-diagnostic-{secrets.token_hex(6)}'
+    try:
+        access = docker([
+            'run', '--rm', '--pull=never', '--name', helper_name, '--network', 'none',
+            '--user', '1883:1883', '--read-only', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges:true',
+            '--mount', f'type=bind,src={work / "broker"},dst=/mosquitto/config,readonly',
+            '--mount', f'type=volume,src={dynsec_volume},dst=/mosquitto/dynsec',
+            '--entrypoint', '/bin/sh', MOSQUITTO_IMAGE, '-c', check_script,
+        ], timeout=20).decode()
+        print('broker mount access diagnostic:\n' + sanitize(access), flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f'broker mount access diagnostic failed: {sanitize(str(exc))}', flush=True)
+
+    logs = container_logs(cid)
+    if logs:
+        print('broker startup logs (sanitized):\n' + sanitize(logs[-4000:]), flush=True)
+    else:
+        print('broker startup logs: empty', flush=True)
+
+
 def write_private(path: Path, data: bytes, mode=0o600):
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     with os.fdopen(fd, 'wb') as stream:
@@ -827,8 +880,12 @@ def main(argv=None) -> int:
             '-c', '/mosquitto/config/mosquitto.conf',
         ])
         docker(['start', broker_cid], timeout=CONTAINER_START_TIMEOUT)
-        broker_port = mapped_port(broker_cid, '8883/tcp')
-        wait_tcp(broker_port, BROKER_READY_TIMEOUT)
+        try:
+            broker_port = mapped_port(broker_cid, '8883/tcp')
+            wait_tcp(broker_port, BROKER_READY_TIMEOUT)
+        except Exception:
+            diagnose_broker_start(broker_cid, work, dynsec_volume)
+            raise
 
         if mode == 'control':
             from stage5_mqtt_fixture import exercise

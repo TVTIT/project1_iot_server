@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 MICROBATCH_REGRESSION_TRAFFIC_LABEL = 'fixture_mqtt_publish_not_gateway_generation'
 
 
-def require_paper_p3_run(report, runner_exit_code):
-    """Require a successful baseline P3 execution and its exact-owned cleanup."""
+def require_paper_p3_run(report, runner_exit_code, require_stage6=False):
+    """Require the selected P3 profile, native workload, and exact-owned cleanup."""
     if runner_exit_code != 0:
         raise ValueError('paper_p3_runner_exit_nonzero')
     if type(report) is not dict:
@@ -25,6 +25,76 @@ def require_paper_p3_run(report, runner_exit_code):
             or report.get('exact_cleanup_verified') is not True
             or report.get('error') is not None):
         raise ValueError('paper_p3_require_run_rejected')
+    if require_stage6:
+        profile = report.get('stage6_profile')
+        if (type(profile) is not dict
+                or profile.get('backend_enabled') is not True
+                or profile.get('gateway_enabled') is not True
+                or report.get('stage6_scenario_accepted') is not True):
+            raise ValueError('paper_p3_stage6_require_run_rejected')
+    return True
+
+
+def stage6_device_receipts_valid(records, gateway_id, entity_id, expected_count):
+    """Validate durable Gateway receipt bytes, metadata hashes, and command binding."""
+    if type(records) is not list or len(records) != expected_count or expected_count < 1:
+        return False
+    seen = set()
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    for record in records:
+        if type(record) is not dict:
+            return False
+        command_id = record.get('command_id')
+        command_bytes = record.get('command_bytes')
+        command_hash = record.get('command_hash')
+        receipt_bytes = record.get('receipt_bytes')
+        receipt_hash = record.get('receipt_hash')
+        received_at_us = record.get('receipt_received_at')
+        result_bytes = record.get('result_bytes')
+        try:
+            if (not isinstance(command_id, str) or command_id in seen
+                    or not isinstance(command_bytes, bytes) or not command_bytes
+                    or not isinstance(receipt_bytes, bytes) or not receipt_bytes
+                    or not isinstance(result_bytes, bytes) or not result_bytes
+                    or not isinstance(command_hash, str) or not isinstance(receipt_hash, str)
+                    or type(received_at_us) is not int or received_at_us <= 0):
+                return False
+            seen.add(command_id)
+            command = json.loads(command_bytes)
+            receipt = json.loads(receipt_bytes)
+            actual_command_hash = hashlib.sha256(command_bytes).hexdigest()
+            actual_receipt_hash = hashlib.sha256(receipt_bytes).hexdigest()
+            if command_hash != actual_command_hash or receipt_hash != actual_receipt_hash:
+                return False
+            if record.get('command_topic') != f'gateways/{gateway_id}/commands/{command_id}':
+                return False
+            if (not isinstance(command, dict) or command.get('command_id') != command_id
+                    or command.get('gateway_id') != gateway_id or command.get('entity_id') != entity_id
+                    or command.get('message_type') != 'command'):
+                return False
+            fields = ('protocol_version', 'message_type', 'command_id', 'gateway_id',
+                      'entity_id', 'desired_version', 'received_at', 'command_hash')
+            if type(receipt) is not dict or tuple(receipt.keys()) != fields:
+                return False
+            if (receipt['protocol_version'] != 1 or receipt['message_type'] != 'command_receipt'
+                    or receipt['command_id'] != command_id or receipt['gateway_id'] != gateway_id
+                    or receipt['entity_id'] != entity_id or receipt['command_hash'] != actual_command_hash
+                    or receipt['desired_version'] != command.get('desired_version')
+                    or not isinstance(receipt['received_at'], str)):
+                return False
+            received_at = datetime.fromisoformat(receipt['received_at'].replace('Z', '+00:00'))
+            if received_at.tzinfo is None:
+                return False
+            delta = received_at.astimezone(timezone.utc) - epoch
+            canonical_received_at_us = ((delta.days * 86400 + delta.seconds) * 1_000_000
+                                        + delta.microseconds)
+            if canonical_received_at_us != received_at_us:
+                return False
+            canonical_bytes = json.dumps(receipt, separators=(',', ':'), ensure_ascii=False).encode()
+            if canonical_bytes != receipt_bytes:
+                return False
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
     return True
 
 
@@ -122,14 +192,15 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
     secondary = SensorTarget(specs[0].gateway_id, 'sensor_p3_secondary', specs[0].sensor_unit)
     run = {'schema_version': 1, 'run_id': fixture.project, 'status': 'FAIL',
            'full_p3_accepted': False,
-           'mode': ('p5b_cache_control_regression' if fixture.paper_p5b_control_regression else
+           'mode': ('stage6_integrated' if getattr(fixture, 'paper_p3_stage6', False) else
+                    'p5b_cache_control_regression' if fixture.paper_p5b_control_regression else
                     'microbatch_control_regression' if fixture.paper_p3_microbatch else 'baseline'),
            'effective_optimizations': (['mqtt_microbatch', 'mqtt_ram_dedup'] if fixture.paper_p5b_control_regression
                                       else ['mqtt_microbatch'] if fixture.paper_p3_microbatch else []),
            'effective_flags': {'MQTT_MICROBATCH_ENABLED': fixture.values['MQTT_MICROBATCH_ENABLED'],
                                'MQTT_RAM_DEDUP_ENABLED': fixture.values['MQTT_RAM_DEDUP_ENABLED'],
-                               'MQTT_RAM_DEDUP_MAX_ENTRIES': fixture.values['MQTT_RAM_DEDUP_MAX_ENTRIES'],
-                               'MQTT_RAM_DEDUP_MAX_BYTES': fixture.values['MQTT_RAM_DEDUP_MAX_BYTES']},
+                                'MQTT_RAM_DEDUP_MAX_ENTRIES': fixture.values['MQTT_RAM_DEDUP_MAX_ENTRIES'],
+                                'MQTT_RAM_DEDUP_MAX_BYTES': fixture.values['MQTT_RAM_DEDUP_MAX_BYTES']},
            'revision': smoke.paper_p0_git(fixture, 'rev-parse', 'HEAD'),
            'branch': smoke.paper_p0_git(fixture, 'branch', '--show-current'),
            'dirty': bool(smoke.paper_p0_git(fixture, 'status', '--porcelain')),
@@ -143,6 +214,7 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
                'STAGE5_SCAN_INTERVAL', 'STAGE5_PUBLISH_WORKERS')},
            'checks': {}, 'commands': [], 'cleanup_verified': False}
     samples, private_control = [], {}
+    stage6_enabled = getattr(fixture, 'paper_p3_stage6', False)
 
     def persist():
         smoke.durable_json(fixture.artifacts / 'run.json', run)
@@ -152,6 +224,14 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         persist()
         if not success:
             raise ValueError('paper_p3_acceptance_failed')
+
+    if stage6_enabled:
+        backend_env = registry.resolve(containers['backend'])['Config']['Env']
+        backend_profile_ok = ('STAGE6_ENABLED=true' in backend_env
+                              and 'STAGE5_ENABLED=true' in backend_env)
+        check('stage6_backend_profile_readback', backend_profile_ok)
+        run['stage6_profile'] = {'backend_enabled': backend_profile_ok, 'gateway_enabled': False}
+        run['effective_flags']['STAGE6_ENABLED'] = fixture.values['STAGE6_ENABLED']
 
     def sql(query, **variables):
         return smoke.db_psql(registry, pg, query, variables).strip()
@@ -401,14 +481,22 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         obj = registry.resolve(item)
         check('stop_' + tag, registry.command(['kill', '--signal=SIGTERM', obj['Id']]).returncode == 0)
 
-    def sqlite_snapshot(tag, phase):
+    def sqlite_snapshot(tag, phase, stage6_evidence=False):
         item = next(i for i in registry.items if i['name'] == fixture.project + '-gateway-' + tag)
         target = fixture.private / ('p3-' + phase + '.db')
         result = registry.command(['cp', registry.resolve(item)['Id'] + ':/data/outbox/outbox.db', str(target)])
         check('sqlite_copy_' + phase, result.returncode == 0)
         with sqlite3.connect('file:' + str(target) + '?mode=ro', uri=True, timeout=2) as db:
             cfg = db.execute('SELECT sample_interval_us,desired_version FROM sensor_configuration').fetchone()
-            receipts = db.execute('SELECT command_id,command_hash,result_bytes FROM command_receipts ORDER BY command_id').fetchall()
+            if stage6_evidence:
+                rows = db.execute('''SELECT command_id,command_topic,command_bytes,command_hash,result_bytes,
+                                     receipt_bytes,receipt_hash,receipt_received_at
+                                     FROM command_receipts ORDER BY command_id''').fetchall()
+                fields = ('command_id', 'command_topic', 'command_bytes', 'command_hash', 'result_bytes',
+                          'receipt_bytes', 'receipt_hash', 'receipt_received_at')
+                receipts = [dict(zip(fields, row)) for row in rows]
+            else:
+                receipts = db.execute('SELECT command_id,command_hash,result_bytes FROM command_receipts ORDER BY command_id').fetchall()
             pending = db.execute("SELECT message_id,payload FROM outbox WHERE status='pending' ORDER BY id").fetchall()
         return cfg, receipts, pending
 
@@ -442,16 +530,32 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         check('volume_' + tag, result.returncode == 0 and registry.resolve(volume) is not None)
         env = gateway_env(spec.gateway_id, passwords[0])
         env.update(SENSOR_ID=spec.sensor_id, GATEWAY_MQTT_BROKER_URL='ssl://mosquitto:8883',
-                   GATEWAY_MQTT_CLIENT_ID=fixture.project + '_' + tag, GATEWAY_CONTROL_ENABLED='true')
+                   GATEWAY_MQTT_CLIENT_ID=fixture.project + '_' + tag, GATEWAY_CONTROL_ENABLED='true',
+                   GATEWAY_STAGE6_ENABLED='true' if stage6_enabled else 'false')
         env_file = fixture.private / ('gateway-' + tag + '.env')
         smoke.private_write(env_file, ''.join(k + '=' + v + '\n' for k, v in env.items()))
         volumes[tag], envs[tag] = volume, env_file
 
     def gateway(tag, spec_tag, args, during=None):
         return smoke.paper_p0_gateway_cli(fixture, registry, images['gateway'], volumes[spec_tag], envs[spec_tag],
-            fixture.private / 'certs/ca.crt', tag, args, state, during=during, timeout=40)
+            fixture.private / 'certs/ca.crt', tag, args, state, during=during,
+            timeout=75 if stage6_enabled else 40)
+
+    def gateway_stage6_profile_ok(tag):
+        item = next(i for i in registry.items if i['name'] == fixture.project + '-gateway-' + tag)
+        obj = registry.resolve(item)
+        if obj is None or not obj['State'].get('Running'):
+            return False
+        env_file = envs['p3-a' if tag == 'p3-a' else 'p3-second']
+        return 'GATEWAY_STAGE6_ENABLED=true\n' in env_file.read_text()
 
     def exercise():
+        if stage6_enabled:
+            gateway_profile_ok = (gateway_stage6_profile_ok('p3-a')
+                                  and gateway_stage6_profile_ok('p3-second'))
+            check('stage6_gateway_profile_supplied_to_running_gateways', gateway_profile_ok)
+            run['stage6_profile']['gateway_enabled'] = gateway_profile_ok
+            persist()
         first = patch(primary, 100, 0, tokens['a'])
         other = patch(secondary, 100, 0, tokens['a'])
         confirmed(primary, first, 10000)
@@ -479,6 +583,14 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
         restore = patch(primary, 60, 3, tokens['a'])
         confirmed(primary, restore, 16667)
         run['restart_command'] = {'desired_version': restore['desired_version'], 'sample_interval_us': 16667}
+        if stage6_enabled:
+            # The real periodic query reads Gateway durable + actual state and
+            # persists the matching decision; no state is seeded by this test.
+            correlated_query = poll('stage6_correlated_query_converged',
+                lambda: sql("""SELECT last_reconcile_decision='converged' FROM twin_states s
+                  JOIN twin_entities e ON e.id=s.entity_id WHERE e.entity_id=:'urn';""",
+                  urn=primary.sensor_urn) == 't', budget=40)
+            check('stage6_correlated_query_converged', correlated_query is not None)
         # Block new telemetry commits so a controlled stop/reopen has real
         # pending payloads; no application ACK can be fabricated for them.
         sql("""CREATE FUNCTION public.p3_hold_telemetry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
@@ -496,8 +608,59 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
             secondary_output.append(gateway('p3-second', 'p3-second', ['run', '--batches', '2', '--completion-timeout', '30s'], exercise))
         gateway('p3-a', 'p3-a', ['run'], both)
         check('secondary_application_ack', parse_run_summary(secondary_output[0]).get('pending_rows') == '0')
-        cfg, receipts, pending = sqlite_snapshot('p3-a', 'before-reopen')
+        cfg, receipts, pending = sqlite_snapshot('p3-a', 'before-reopen', stage6_evidence=stage6_enabled)
         check('durable_config_receipts_pending', cfg == (16667, 4) and len(receipts) == 4 and bool(pending))
+        if stage6_enabled:
+            device_receipts_valid = stage6_device_receipts_valid(
+                receipts, primary.gateway_id, primary.sensor_urn, expected_count=4)
+            check('stage6_device_receipt_evidence_valid', device_receipts_valid,
+                  receipt_count=len(receipts))
+            backend_results = []
+            backend_receipts_received = 0
+            backend_result_first = 0
+            backend_evidence_valid = True
+            for device in receipts:
+                outbox = json.loads(sql("""SELECT json_build_object(
+                  'topic',topic,'payload_hex',encode(payload_bytes,'hex'))
+                  FROM twin_outbox WHERE command_id=:'id';""", id=device['command_id']))
+                if (outbox.get('topic') != device['command_topic']
+                        or bytes.fromhex(outbox.get('payload_hex', '')) != device['command_bytes']):
+                    backend_evidence_valid = False
+                backend = json.loads(sql("""SELECT json_build_object(
+                  'status',c.status,
+                  'result_hex',CASE WHEN c.result_bytes IS NULL THEN NULL ELSE encode(c.result_bytes,'hex') END,
+                  'receipt_hex',CASE WHEN c.receipt_bytes IS NULL THEN NULL ELSE encode(c.receipt_bytes,'hex') END,
+                  'receipt_hash',c.receipt_hash,'acknowledged_at',c.acknowledged_at)
+                  FROM twin_commands c WHERE c.command_id=:'id';""", id=device['command_id']))
+                result_hex = device['result_bytes'].hex() if device['result_bytes'] else None
+                backend_results.append((device['command_id'], result_hex))
+                if (backend.get('status') != 'succeeded'
+                        or backend.get('result_hex') != result_hex or result_hex is None):
+                    backend_evidence_valid = False
+                if backend.get('receipt_hex') is not None:
+                    backend_receipts_received += 1
+                    if (backend.get('receipt_hex') != device['receipt_bytes'].hex()
+                            or backend.get('receipt_hash') != device['receipt_hash']
+                            or backend.get('acknowledged_at') is None):
+                        backend_evidence_valid = False
+                else:
+                    backend_result_first += 1
+                    if backend.get('receipt_hash') is not None or backend.get('acknowledged_at') is not None:
+                        backend_evidence_valid = False
+            check('stage6_backend_result_bytes_match', backend_evidence_valid,
+                  backend_result_count=len(backend_results))
+            check('stage6_backend_receipt_evidence_classified',
+                  backend_receipts_received + backend_result_first == len(receipts),
+                  receipt_evidence_count=backend_receipts_received,
+                  result_first_count=backend_result_first)
+            run['stage6_scenario_accepted'] = all(
+                run['checks'].get(name, {}).get('status') == 'PASS'
+                for name in ('stage6_backend_profile_readback', 'stage6_gateway_profile_supplied_to_running_gateways',
+                             'stage6_correlated_query_converged',
+                             'stage6_device_receipt_evidence_valid',
+                             'stage6_backend_result_bytes_match',
+                             'stage6_backend_receipt_evidence_classified'))
+            persist()
         restore_id = private_control['restore_id']
         sql('DROP TRIGGER p3_hold_telemetry ON public.processed_messages;')
         duplicate_before = scrape('before_reopen')['command_result']['duplicate']
@@ -508,7 +671,8 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
             poll('cached_result_after_reopen', lambda: scrape('reopen_duplicate')['command_result']['duplicate'] > duplicate_before)
         output = gateway('p3-reopen', 'p3-a', ['run', '--batches', '1', '--completion-timeout', '30s'], duplicate_command)
         check('reopen_active_readback', 'active_interval_us=16667' in output and parse_run_summary(output).get('pending_rows') == '0')
-        cfg_after, receipts_after, pending_after = sqlite_snapshot('p3-reopen', 'after-reopen')
+        cfg_after, receipts_after, pending_after = sqlite_snapshot(
+            'p3-reopen', 'after-reopen', stage6_evidence=stage6_enabled)
         check('canonical_receipts_byte_exact', cfg_after == cfg and receipts_after == receipts and not pending_after)
         for message_id, payload in pending:
             digest = sql("SELECT payload_hash FROM processed_messages WHERE gateway_id=:'gw' AND message_id=:'id';", gw=primary.gateway_id, id=message_id)
@@ -572,6 +736,10 @@ def run(smoke, fixture, registry, endpoint, containers, images, state):
                    else 'WORKLOAD_VERIFIED_CLEANUP_PENDING',
                    command_count=6, metrics_disabled_command_count=1,
                    db_counts=smoke.paper_p1_count_db(registry, pg))
+        if stage6_enabled:
+            run['stage6_scenario_accepted'] = (
+                run.get('stage6_scenario_accepted') is True
+                and run['stage6_profile'] == {'backend_enabled': True, 'gateway_enabled': True})
         return run
     finally:
         persist()

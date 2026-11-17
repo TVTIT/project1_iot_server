@@ -840,15 +840,16 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
               paper_p8_profile='pilot', paper_p8_official_opt_in=False,
               paper_p8_e2_offered_rate=100, paper_p8_e2_duration_seconds=10,
               paper_p8_e2_burst_messages=0,
-              paper_p8_e2_samples_per_message=1,
-              paper_p8_e2_retry_rate_per_second=0,
-              paper_p8_e2_retry_burst=0,
-              paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e3_command_count=4,
-              paper_p8_e3_schedule='smoke', paper_p8_e4=None,
-               paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
-                paper_p8_recovery=False, remote_network_config=None,
-                paper_p8_e1_viewers=64, paper_p8_e1_principals=2,
-                paper_p8_e1_density='mixed', paper_p8_e1_messages_per_target=5):
+               paper_p8_e2_samples_per_message=1,
+               paper_p8_e2_retry_rate_per_second=0,
+               paper_p8_e2_retry_burst=0,
+               paper_p8_e3=None, paper_p8_e3_workload='mixed', paper_p8_e3_command_count=4,
+               paper_p8_e3_schedule='smoke', paper_p8_e4=None,
+                paper_p8_e5=None, paper_p8_e5_context=None, paper_p8_e5_reference=None,
+                 paper_p8_recovery=False, remote_network_config=None,
+                 paper_p8_e1_viewers=64, paper_p8_e1_principals=2,
+                 paper_p8_e1_density='mixed', paper_p8_e1_messages_per_target=5,
+                 paper_p3_stage6=False):
     if remote_network_config is not None:
         paper_p2 = True
         # Re-validate the canonical profile's exact input fields before it affects config.
@@ -953,6 +954,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         paper_p2 = True
     if paper_p3_microbatch and (not paper_p3 or not metrics_enabled or paper_p4 or paper_p5a):
         raise ValueError('paper_p3_microbatch_mode_rejected')
+    if paper_p3_stage6 and (not paper_p3 or paper_p3_microbatch or not metrics_enabled):
+        raise ValueError('paper_p3_stage6_mode_rejected')
     if paper_p7:
         if (paper_p2 or paper_p0 or paper_p1 or paper_p2_spike or paper_p3 or paper_p4
                 or paper_p5a is not None or paper_p5b is not None or
@@ -1132,6 +1135,8 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
         values['METRICS_ENABLED'] = 'true'
     if paper_p3:
         values.update(STAGE5_ENABLED='true', DATABASE_MAX_CONNS='12')
+        if paper_p3_stage6:
+            values['STAGE6_ENABLED'] = 'true'
         if paper_p3_microbatch:
             values['MQTT_MICROBATCH_ENABLED'] = 'true'
         if paper_p5b_control_regression:
@@ -1226,6 +1231,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
                        paper_p3_microbatch, paper_p5a_shutdown, paper_p5b_cache_smoke,
                         paper_p5b_control_regression)
     object.__setattr__(fixture, 'paper_p7', paper_p7)
+    object.__setattr__(fixture, 'paper_p3_stage6', paper_p3_stage6)
     object.__setattr__(fixture, 'paper_p7_mode', paper_p7_mode or 'handshake_only')
     object.__setattr__(fixture, 'paper_p8_sessions', paper_p8_sessions)
     object.__setattr__(fixture, 'paper_p8_slow', paper_p8_slow)
@@ -1330,11 +1336,17 @@ def verify_bootstrap_result(fixture, result):
 
 
 def paper_p3_acceptance_report(project, evidence, cleanup_verified, microbatch_enabled=False,
-                               cleanup_counts=None, p5b_cache_enabled=False):
+                               cleanup_counts=None, p5b_cache_enabled=False, stage6_enabled=False):
     p3_ok = cleanup_verified is True and evidence.get('full_p3_accepted') is True
     regression_ok = (not microbatch_enabled or
                      evidence.get('microbatch_control_regression_accepted') is True)
-    accepted = p3_ok and regression_ok
+    stage6_profile = evidence.get('stage6_profile')
+    stage6_ok = (not stage6_enabled or
+                 (type(stage6_profile) is dict
+                  and stage6_profile.get('backend_enabled') is True
+                  and stage6_profile.get('gateway_enabled') is True
+                  and evidence.get('stage6_scenario_accepted') is True))
+    accepted = p3_ok and regression_ok and stage6_ok
     return {'schema_version': 1,
             'status': ('PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED' if p5b_cache_enabled else
                        'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED' if microbatch_enabled else 'PAPER_P3_ACCEPTED')
@@ -1345,6 +1357,9 @@ def paper_p3_acceptance_report(project, evidence, cleanup_verified, microbatch_e
             'ram_dedup_enabled': p5b_cache_enabled,
             'microbatch_control_regression_accepted': (evidence.get('microbatch_control_regression_accepted')
                                                         if microbatch_enabled else None),
+            'stage6_profile': stage6_profile if stage6_enabled else None,
+            'stage6_scenario_accepted': (evidence.get('stage6_scenario_accepted')
+                                         if stage6_enabled else None),
             'effective_optimizations': (['mqtt_microbatch', 'mqtt_ram_dedup'] if p5b_cache_enabled else
                                         ['mqtt_microbatch'] if microbatch_enabled else []),
             'exact_cleanup_verified': cleanup_verified is True,
@@ -2452,7 +2467,9 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
             accepted = (not failure and cleanup_verified and
                         run.get('full_p3_accepted') is True and
                         (not fixture.paper_p3_microbatch or
-                         run.get('microbatch_control_regression_accepted') is True))
+                         run.get('microbatch_control_regression_accepted') is True) and
+                        (not getattr(fixture, 'paper_p3_stage6', False) or
+                         run.get('stage6_scenario_accepted') is True))
             run.update(status=(('PAPER_P5B_CONTROL_PRESERVATION_ACCEPTED'
                                 if fixture.paper_p5b_control_regression else
                                 'PAPER_P5A_CONTROL_REGRESSION_ACCEPTED') if fixture.paper_p3_microbatch
@@ -2465,6 +2482,10 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                            if fixture.paper_p5b_control_regression else None),
                        microbatch_control_regression_accepted=(run.get('microbatch_control_regression_accepted')
                                                                if fixture.paper_p3_microbatch else None),
+                       stage6_profile=(run.get('stage6_profile')
+                                       if getattr(fixture, 'paper_p3_stage6', False) else None),
+                       stage6_scenario_accepted=(run.get('stage6_scenario_accepted')
+                                                 if getattr(fixture, 'paper_p3_stage6', False) else None),
                        exact_cleanup_verified=cleanup_verified, cleanup_counts=cleanup_counts,
                        error=sanitize_failure_code(failure) if failure else None)
         durable_json(path, run)
@@ -2535,7 +2556,8 @@ def startup_only(fixture, registry=None, positive_http=False, role_http=False, f
                           'cleanup_counts': cleanup_counts, 'checks': run.get('checks')}
         elif fixture.paper_p3:
             report = paper_p3_acceptance_report(fixture.project, evidence['paper_p3'], cleanup_verified,
-                fixture.paper_p3_microbatch, cleanup_counts, fixture.paper_p5b_control_regression)
+                fixture.paper_p3_microbatch, cleanup_counts, fixture.paper_p5b_control_regression,
+                getattr(fixture, 'paper_p3_stage6', False))
             if report['status'] == 'FAIL':
                 raise ValueError('cleanup_acceptance_incomplete')
         elif fixture.paper_p7:
@@ -4669,7 +4691,7 @@ FROM telemetry WHERE gateway_id=:'gw';
 
 def cli_arguments():
     return ("--prepare", "--startup-only", "--positive-http-only", "--role-http-only", "--full-http",
-            "--paper-p0", "--paper-p1", "--paper-p3", "--p5a-control-regression", "--p5b-control-regression",
+            "--paper-p0", "--paper-p1", "--paper-p3", "--stage6-p3", "--p5a-control-regression", "--p5b-control-regression",
             "--paper-p4", "--paper-p5a", "--paper-p5b", "--cache-mode", "--mode", "--dataset")
 
 
@@ -6423,6 +6445,8 @@ def main():
     parser.add_argument('--paper-p8-e5-reference', type=Path, help='Successful optimized E5 artifact required for immutable ablation image reuse')
     parser.add_argument('--paper-p8-recovery', action='store_true', help='Run the bounded native P8.13 recovery fixture using a fresh E5 optimized input context')
     parser.add_argument('--paper-p3', action='store_true', help='P3 isolated Sensor control loop using the P2 HTTPS profile')
+    parser.add_argument('--stage6-p3', action='store_true',
+                        help='Opt in to Stage 6 only within the isolated --paper-p3 control fixture')
     parser.add_argument('--p5a-control-regression', action='store_true',
                         help='With --paper-p3, opt in to microbatch and run the focused command/result preservation regression')
     parser.add_argument('--p5b-control-regression', action='store_true',
@@ -6557,6 +6581,8 @@ def main():
                               args.startup_only, args.positive_http_only, args.role_http_only,
                               args.full_http, args.paper_p4, args.paper_p5a, args.mode, args.dataset, args.metrics_off)):
         parser.error('P3 cannot be combined with other execution modes')
+    if args.stage6_p3 and (not args.paper_p3 or args.p5a_control_regression or args.p5b_control_regression):
+        parser.error('--stage6-p3 requires baseline --paper-p3 and conflicts with P5 control profiles')
     if args.p5a_control_regression and not args.paper_p3:
         parser.error('--p5a-control-regression requires --paper-p3')
     if args.p5b_control_regression and not (args.paper_p3 and args.p5a_control_regression):
@@ -6632,6 +6658,7 @@ def main():
                           metrics_enabled=not args.metrics_off, paper_p2_spike=args.paper_p2_spike,
                            paper_p2=args.paper_p2 or remote_profile is not None, paper_p7=args.paper_p7,
                           paper_p7_mode=args.paper_p7_mode, paper_p3=args.paper_p3,
+                            paper_p3_stage6=args.stage6_p3,
                            paper_p3_microbatch=args.p5a_control_regression,
                            paper_p5b_control_regression=args.p5b_control_regression,
                            paper_p4=args.mode if args.paper_p4 else None,

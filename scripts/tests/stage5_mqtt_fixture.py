@@ -134,6 +134,25 @@ def stage6_native(fixture, work, manager_password, backend_password, gateway_pas
     print('PASS native Stage 6 durable retry/reservation proof against the real broker', flush=True)
 
 
+def stage6_gateway_receipt_native(fixture, manager_password, backend_password, gateway_password):
+    """Exercise the composed backend consumer with the actual Gateway runtime."""
+    script = 'set -e\nexport CONTROL_TEST_ISOLATED=1 CONTROL_MQTT_ISOLATED=1\n'
+    script += 'export CONTROL_TEST_SETUP_URL="postgres://fixture_admin:${POSTGRES_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"\n'
+    script += 'export CONTROL_TEST_BACKEND_URL="postgres://iot_backend_app:${BACKEND_DB_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"\n'
+    for key, value in {'CONTROL_MQTT_MANAGER_PASSWORD': manager_password,
+                       'CONTROL_MQTT_BACKEND_PASSWORD': backend_password,
+                       'CONTROL_MQTT_GATEWAY_PASSWORD': gateway_password}.items():
+        script += 'export ' + key + '=' + shlex.quote(value) + '\n'
+    script += 'exec /tmp/control-mqtt.test -test.v -test.timeout=180s -test.run "^TestNativeMQTTStage6GatewayQueryAndReceiptRoundTrip$"\n'
+    output = run(['docker', 'exec', '-i', fixture.container_id, 'sh'],
+                 input_data=script.encode(), timeout=220).decode()
+    print(output, flush=True)
+    if ('--- PASS: TestNativeMQTTStage6GatewayQueryAndReceiptRoundTrip (' not in output or
+            'R7.3 convergence PASS:' not in output or '--- SKIP:' in output):
+        raise RuntimeError('native Stage 6 query/receipt/convergence proof did not pass without skips')
+    print('PASS native Stage 6 query/readback, receipt/result roundtrip, lost-result reconciliation and finite successor budget', flush=True)
+
+
 def exercise(fixture, work, broker, port, manager_password, backend_password, gateway_password, server, network):
     # Same native binary/container pattern used by Task 5.2/5.3.
     binary = work / 'control-mqtt.test'
@@ -240,6 +259,7 @@ def exercise(fixture, work, broker, port, manager_password, backend_password, ga
         'SUPABASE_JWT_ISSUER': 'http://auth.invalid/auth/v1', 'SUPABASE_JWT_AUDIENCE': 'authenticated',
         'SERVER_ENV': 'smoke', 'MQTT_CREDENTIAL_API_ENABLED': 'false', 'MQTT_CREDENTIAL_RUNTIME_ENABLED': 'false',
         'STAGE5_ENABLED': 'true', 'MQTT_INGRESS_ENABLED': 'true', 'MQTT_WORKER_COUNT': '2',
+        'STAGE6_ENABLED': 'true',
         'MQTT_BROKER_URL': 'ssl://broker:8883', 'MQTT_CLIENT_ID': 'stage54-ingress',
         'STAGE5_MQTT_CLIENT_ID': 'stage54-command', 'MQTT_USERNAME': 'bootstrap_backend',
         'MQTT_PASSWORD': backend_password, 'MQTT_TLS_CA_FILE': '/certs/ca.crt',
@@ -263,6 +283,8 @@ def exercise(fixture, work, broker, port, manager_password, backend_password, ga
         http_port = mapped_port(backend, '8080/tcp')
         wait_http(http_port, '/readyz', 20)
         wait_http(http_port, '/healthz', 10)
+        print('stage=stage6-gateway-query-reconnect-roundtrip', flush=True)
+        stage6_gateway_receipt_native(fixture, manager_password, backend_password, gateway_password)
 
         def not_ready():
             deadline = time.monotonic() + 5
