@@ -1,8 +1,11 @@
 package mqttcontrol
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,40 @@ import (
 // ResultRepository commits validated device results without human actor scope.
 type ResultRepository interface {
 	AcceptControlResult(context.Context, string, []byte, time.Time) (digitaltwin.ControlResultOutcome, error)
+}
+
+// ReceiptRepository commits a strictly validated durable Gateway receipt.
+type ReceiptRepository interface {
+	AcceptControlReceipt(context.Context, string, []byte, time.Time) (digitaltwin.ControlReceiptOutcome, error)
+}
+
+// SnapshotHandler receives validated raw snapshot candidates on the existing
+// bounded consumer workers. It must remain synchronous and bounded.
+type SnapshotHandler func(context.Context, RawResult)
+
+// ReceiptMetrics contains fixed receipt counters; it is independent of command-result metrics/timelines.
+type ReceiptMetrics struct {
+	accepted, duplicate, late, rejected, dependencyError, dbError, queueFull atomic.Int64
+}
+
+// ReceiptMetricsSnapshot contains no command/device identifiers.
+type ReceiptMetricsSnapshot struct {
+	Accepted        int64 `json:"accepted"`
+	Duplicate       int64 `json:"duplicate"`
+	Late            int64 `json:"late"`
+	Rejected        int64 `json:"rejected"`
+	DependencyError int64 `json:"dependency_error"`
+	DBError         int64 `json:"db_error"`
+	QueueFull       int64 `json:"queue_full"`
+}
+
+// Snapshot returns fixed receipt counters without identifiers or payload data.
+func (m *ReceiptMetrics) Snapshot() ReceiptMetricsSnapshot {
+	return ReceiptMetricsSnapshot{
+		Accepted: m.accepted.Load(), Duplicate: m.duplicate.Load(), Late: m.late.Load(),
+		Rejected: m.rejected.Load(), DependencyError: m.dependencyError.Load(),
+		DBError: m.dbError.Load(), QueueFull: m.queueFull.Load(),
+	}
 }
 
 // ResultMetrics uses fixed counters and local processing durations only.
@@ -48,6 +85,11 @@ type ResultConsumer struct {
 	repo             ResultRepository
 	source           <-chan RawResult
 	metrics          *ResultMetrics
+	receiptRepo      ReceiptRepository
+	receiptMetrics   *ReceiptMetrics
+	receiptsEnabled  bool
+	snapshotsEnabled bool
+	snapshotHandler  SnapshotHandler
 	mu               sync.Mutex
 	started, stopped bool
 	running          atomic.Bool
@@ -56,6 +98,35 @@ type ResultConsumer struct {
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	done             chan struct{}
+}
+
+// ConfigureReceipts enables receipt routing on the existing bounded response
+// worker. It must be called before Start; Stage 5 remains result-only.
+func (r *ResultConsumer) ConfigureReceipts(enabled bool, repo ReceiptRepository, m *ReceiptMetrics) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.started || r.stopped || (enabled && nilDependency(repo)) {
+		return digitaltwin.ErrInvalidInput
+	}
+	r.receiptsEnabled = enabled
+	if enabled {
+		r.receiptRepo = repo
+	}
+	r.receiptMetrics = m
+	return nil
+}
+
+// ConfigureSnapshots enables strict snapshot routing on the same bounded
+// response worker set. Stage 5 remains result-only.
+func (r *ResultConsumer) ConfigureSnapshots(enabled bool, handler SnapshotHandler) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.started || r.stopped || (enabled && handler == nil) {
+		return digitaltwin.ErrInvalidInput
+	}
+	r.snapshotsEnabled = enabled
+	r.snapshotHandler = handler
+	return nil
 }
 
 // NewResultConsumer creates an inert consumer with explicitly bounded workers/DB calls.
@@ -134,12 +205,33 @@ func (r *ResultConsumer) worker() {
 }
 
 func (r *ResultConsumer) process(raw RawResult) {
+	messageType, typeErr := responseMessageType(raw.Payload)
+	if messageType == "command_receipt" {
+		r.processReceipt(raw)
+		return
+	}
+	if messageType == "configuration_snapshot" {
+		r.processSnapshot(raw, typeErr)
+		return
+	}
 	if r.metrics != nil {
 		start := time.Now()
 		defer func() { r.metrics.processing.Observe(time.Since(start)) }()
 		if !raw.QueuedAt.IsZero() {
 			r.metrics.queueWait.Observe(start.Sub(raw.QueuedAt))
 		}
+	}
+	if typeErr != nil || messageType != "command_result" {
+		if r.metrics != nil {
+			r.metrics.rejected.Add(1)
+		}
+		return
+	}
+	if raw.Retained {
+		if r.metrics != nil {
+			r.metrics.rejected.Add(1)
+		}
+		return
 	}
 	_, err := digitaltwin.ParseMQTTResult(raw.Topic, raw.Payload, false)
 	if err != nil || raw.ReceivedAt.IsZero() {
@@ -182,5 +274,121 @@ func (r *ResultConsumer) process(raw RawResult) {
 		r.metrics.late.Add(1)
 	default:
 		r.metrics.rejected.Add(1)
+	}
+}
+
+func (r *ResultConsumer) processSnapshot(raw RawResult, typeErr error) {
+	r.mu.Lock()
+	enabled, handler := r.snapshotsEnabled, r.snapshotHandler
+	r.mu.Unlock()
+	if !enabled || typeErr != nil || raw.Retained || raw.ReceivedAt.IsZero() {
+		return
+	}
+	if _, err := digitaltwin.ParseMQTTConfigurationSnapshot(raw.Topic, raw.Payload, false); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
+	defer cancel()
+	handler(ctx, raw)
+}
+
+// responseMessageType is only a narrow discriminator. Repository calls always
+// follow the complete strict type-specific parser, which rejects duplicate and
+// unknown envelope fields.
+func responseMessageType(payload []byte) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return "", digitaltwin.ErrInvalidInput
+	}
+	seen := make(map[string]struct{})
+	messageType := ""
+	duplicates := false
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return messageType, digitaltwin.ErrInvalidInput
+		}
+		if _, exists := seen[key]; exists {
+			duplicates = true
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return messageType, digitaltwin.ErrInvalidInput
+		}
+		if key == "message_type" {
+			var parsed string
+			if json.Unmarshal(value, &parsed) != nil {
+				return messageType, digitaltwin.ErrInvalidInput
+			}
+			if messageType == "" {
+				messageType = parsed
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return messageType, digitaltwin.ErrInvalidInput
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF || messageType == "" || duplicates {
+		return messageType, digitaltwin.ErrInvalidInput
+	}
+	return messageType, nil
+}
+
+func (r *ResultConsumer) processReceipt(raw RawResult) {
+	m := r.receiptMetrics
+	reject := func() {
+		if m != nil {
+			m.rejected.Add(1)
+		}
+	}
+	if !r.receiptsEnabled || raw.Retained {
+		reject()
+		return
+	}
+	if _, err := digitaltwin.ParseMQTTReceipt(raw.Topic, raw.Payload, false); err != nil || raw.ReceivedAt.IsZero() {
+		reject()
+		return
+	}
+	if nilDependency(r.receiptRepo) {
+		if m != nil {
+			m.dependencyError.Add(1)
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
+	defer cancel()
+	outcome, err := r.receiptRepo.AcceptControlReceipt(ctx, raw.Topic, raw.Payload, raw.ReceivedAt)
+	if err != nil {
+		if m != nil {
+			switch {
+			case errors.Is(err, digitaltwin.ErrDependencyUnavailable):
+				m.dependencyError.Add(1)
+			case errors.Is(err, digitaltwin.ErrInvalidInput),
+				errors.Is(err, digitaltwin.ErrNotFound),
+				errors.Is(err, digitaltwin.ErrControlResultConflict),
+				errors.Is(err, digitaltwin.ErrCommandReceiptUnavailable):
+				m.rejected.Add(1)
+			default:
+				m.dbError.Add(1)
+			}
+		}
+		return
+	}
+	if m == nil {
+		return
+	}
+	switch outcome {
+	case digitaltwin.ControlReceiptAccepted:
+		m.accepted.Add(1)
+	case digitaltwin.ControlReceiptDuplicate:
+		m.duplicate.Add(1)
+	case digitaltwin.ControlReceiptLate:
+		m.late.Add(1)
+	default:
+		m.rejected.Add(1)
 	}
 }

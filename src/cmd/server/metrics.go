@@ -29,30 +29,34 @@ type poolMetrics struct {
 }
 
 type processMetrics struct {
-	SchemaVersion     int                                   `json:"schema_version"`
-	ProcessInstance   string                                `json:"process_instance"`
-	StartedAt         time.Time                             `json:"started_at"`
-	ObservedAt        time.Time                             `json:"observed_at"`
-	ElapsedSeconds    float64                               `json:"elapsed_seconds"`
-	Availability      map[string]string                     `json:"availability"`
-	Ingress           *mqttingress.Snapshot                 `json:"ingress"`
-	RAMDedup          *mqttingress.DedupCacheSnapshot       `json:"ram_dedup,omitempty"`
-	HTTP              []httpserver.HTTPMetricSnapshot       `json:"http"`
-	Auth              auth.MetricsSnapshot                  `json:"auth"`
-	UnixAuth          *auth.MetricsSnapshot                 `json:"unix_auth,omitempty"`
-	UnixAuthHandler   *metrics.HistogramSnapshot            `json:"unix_auth_handler,omitempty"`
-	JWKSCache         *auth.JWKSCacheSnapshot               `json:"jwks_cache,omitempty"`
-	DB                poolMetrics                           `json:"db"`
-	Persistence       *telemetry.PersistenceMetricsSnapshot `json:"persistence,omitempty"`
-	CommandAdmission  *digitaltwin.ControlMetricsSnapshot   `json:"command_admission"`
-	CommandDispatch   *mqttcontrol.MetricsSnapshot          `json:"command_dispatch"`
-	CommandResult     *mqttcontrol.ResultMetricsSnapshot    `json:"command_result,omitempty"`
-	CommandTimeline   *metrics.ControlTimelineSnapshot      `json:"command_timeline,omitempty"`
-	DispatchE2E       *float64                              `json:"dispatch_e2e_seconds"`
-	ResultE2E         *float64                              `json:"result_e2e_seconds"`
-	BatchWait         *float64                              `json:"batch_wait_seconds"`
-	WebSocket         *float64                              `json:"websocket_seconds"`
-	WebSocketSnapshot *telemetryws.MetricsSnapshot          `json:"websocket_metrics,omitempty"`
+	SchemaVersion     int                                           `json:"schema_version"`
+	ProcessInstance   string                                        `json:"process_instance"`
+	StartedAt         time.Time                                     `json:"started_at"`
+	ObservedAt        time.Time                                     `json:"observed_at"`
+	ElapsedSeconds    float64                                       `json:"elapsed_seconds"`
+	Availability      map[string]string                             `json:"availability"`
+	Ingress           *mqttingress.Snapshot                         `json:"ingress"`
+	RAMDedup          *mqttingress.DedupCacheSnapshot               `json:"ram_dedup,omitempty"`
+	HTTP              []httpserver.HTTPMetricSnapshot               `json:"http"`
+	Auth              auth.MetricsSnapshot                          `json:"auth"`
+	UnixAuth          *auth.MetricsSnapshot                         `json:"unix_auth,omitempty"`
+	UnixAuthHandler   *metrics.HistogramSnapshot                    `json:"unix_auth_handler,omitempty"`
+	JWKSCache         *auth.JWKSCacheSnapshot                       `json:"jwks_cache,omitempty"`
+	DB                poolMetrics                                   `json:"db"`
+	Persistence       *telemetry.PersistenceMetricsSnapshot         `json:"persistence,omitempty"`
+	CommandAdmission  *digitaltwin.ControlMetricsSnapshot           `json:"command_admission"`
+	CommandDispatch   *mqttcontrol.MetricsSnapshot                  `json:"command_dispatch"`
+	CommandResult     *mqttcontrol.ResultMetricsSnapshot            `json:"command_result,omitempty"`
+	CommandReceipt    *mqttcontrol.ReceiptMetricsSnapshot           `json:"command_receipt,omitempty"`
+	ControlQuery      *mqttcontrol.ControlQueryMetricsSnapshot      `json:"control_query,omitempty"`
+	Reconciliation    *mqttcontrol.ReconciliationMetricsSnapshot    `json:"reconciliation,omitempty"`
+	ResponseAdmission *mqttcontrol.ResponseAdmissionMetricsSnapshot `json:"command_response_admission,omitempty"`
+	CommandTimeline   *metrics.ControlTimelineSnapshot              `json:"command_timeline,omitempty"`
+	DispatchE2E       *float64                                      `json:"dispatch_e2e_seconds"`
+	ResultE2E         *float64                                      `json:"result_e2e_seconds"`
+	BatchWait         *float64                                      `json:"batch_wait_seconds"`
+	WebSocket         *float64                                      `json:"websocket_seconds"`
+	WebSocketSnapshot *telemetryws.MetricsSnapshot                  `json:"websocket_metrics,omitempty"`
 }
 
 // Sources are read-only, bounded memory/pool snapshots; never SQL or environment.
@@ -79,7 +83,7 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 			dedupAvailability = "unavailable"
 		}
 		s := processMetrics{SchemaVersion: 1, ProcessInstance: instance, StartedAt: started.UTC(), ObservedAt: now.UTC(), ElapsedSeconds: now.Sub(started).Seconds(),
-			Availability: map[string]string{"ingress": "disabled", "ram_dedup": dedupAvailability, "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "persistence": "unavailable", "group_persistence": batchAvailability, "batch_wait": batchAvailability, "websocket": "disabled"},
+			Availability: map[string]string{"ingress": "disabled", "ram_dedup": dedupAvailability, "http": "available", "auth": "available", "db": "available", "command": "disabled", "dispatch_e2e": "not_implemented", "result": "not_implemented", "receipt": "disabled", "response_admission": "disabled", "persistence": "unavailable", "group_persistence": batchAvailability, "batch_wait": batchAvailability, "websocket": "disabled"},
 			HTTP:         deps.HTTPMetrics.Snapshot(), Auth: deps.AuthMetrics.Snapshot()}
 		if deps.UnixAuthMetrics != nil {
 			a, h := deps.UnixAuthMetrics.Snapshot(), deps.UnixAuthDuration.Snapshot()
@@ -126,6 +130,26 @@ func populateMetricsDependencies(deps *httpserver.RouterDependencies, cfg config
 			v := control.resultMetrics.Snapshot()
 			s.CommandResult = &v
 			s.Availability["result"] = "available"
+		}
+		if control.receiptMetrics != nil {
+			v := control.receiptMetrics.Snapshot()
+			s.CommandReceipt = &v
+			s.Availability["receipt"] = "available"
+		}
+		if control.queryMetrics != nil {
+			v := control.queryMetrics.Snapshot()
+			s.ControlQuery = &v
+			s.Availability["control_query"] = "available"
+		}
+		if control.reconciliationMetrics != nil {
+			v := control.reconciliationMetrics.Snapshot()
+			s.Reconciliation = &v
+			s.Availability["reconciliation"] = "available"
+		}
+		if control.admissionMetrics != nil {
+			v := control.admissionMetrics.Snapshot()
+			s.ResponseAdmission = &v
+			s.Availability["response_admission"] = "available"
 		}
 		if control.timeline != nil {
 			v := control.timeline.Snapshot()

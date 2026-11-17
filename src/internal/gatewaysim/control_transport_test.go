@@ -15,14 +15,29 @@ import (
 func TestControlGatewayConfigurationOptIn(t *testing.T) {
 	env := validGatewayEnv()
 	cfg, err := Load(mapLookup(env))
-	if err != nil || cfg.ControlEnabled {
-		t.Fatalf("default opt-in %v/%v", cfg.ControlEnabled, err)
+	if err != nil || cfg.ControlEnabled || cfg.Stage6Enabled {
+		t.Fatalf("default opt-in %v/%v/%v", cfg.ControlEnabled, cfg.Stage6Enabled, err)
 	}
 	env["GATEWAY_CONTROL_ENABLED"] = "true"
 	cfg, err = Load(mapLookup(env))
 	if err != nil || !cfg.ControlEnabled || !TransportOptionsFromConfig(cfg).ControlEnabled {
 		t.Fatalf("control flag not mapped %v/%v", cfg.ControlEnabled, err)
 	}
+	env["GATEWAY_STAGE6_ENABLED"] = "true"
+	cfg, err = Load(mapLookup(env))
+	if err != nil || !cfg.Stage6Enabled {
+		t.Fatalf("Stage 6 flag not mapped %v/%v", cfg.Stage6Enabled, err)
+	}
+	delete(env, "GATEWAY_CONTROL_ENABLED")
+	if _, err := Load(mapLookup(env)); err == nil {
+		t.Fatal("Stage 6 accepted without control")
+	}
+	env["GATEWAY_CONTROL_ENABLED"] = "true"
+	env["GATEWAY_STAGE6_ENABLED"] = "typo"
+	if _, err := Load(mapLookup(env)); err == nil {
+		t.Fatal("invalid Stage 6 flag accepted")
+	}
+	delete(env, "GATEWAY_STAGE6_ENABLED")
 	env["GATEWAY_CONTROL_ENABLED"] = "typo"
 	if _, err := Load(mapLookup(env)); err == nil {
 		t.Fatal("invalid flag accepted")

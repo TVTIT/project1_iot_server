@@ -2,11 +2,15 @@ package digitaltwin
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 )
+
+var controlHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func controlIdentity(topic string, m map[string]json.RawMessage, kind string) (commandID, gatewayID, entityID string, err error) {
 	commandID, err = controlString(m["command_id"])
@@ -154,6 +158,70 @@ func ParseMQTTResult(topic string, data []byte, retained bool) (CommandResult, e
 	}
 	r.ProtocolVersion = 1
 	return r, nil
+}
+
+// ParseMQTTReceipt validates the Stage 6 durable-store receipt envelope. It is
+// deliberately separate from ParseMQTTResult: receipt is not execution result.
+func ParseMQTTReceipt(topic string, data []byte, retained bool) (CommandReceipt, error) {
+	if len(data) > MaxControlPayloadBytes {
+		return CommandReceipt{}, ErrControlPayloadTooLarge
+	}
+	if retained {
+		return CommandReceipt{}, ErrInvalidInput
+	}
+	fields := []string{"protocol_version", "message_type", "command_id", "gateway_id", "entity_id", "desired_version", "received_at", "command_hash"}
+	m, err := controlObject(data, fields...)
+	if err != nil || len(m) != len(fields) || !bytes.Equal(bytes.TrimSpace(m["protocol_version"]), []byte("1")) {
+		return CommandReceipt{}, ErrInvalidInput
+	}
+	var r CommandReceipt
+	r.CommandID, r.GatewayID, r.EntityID, err = controlIdentity(topic, m, "responses")
+	if err != nil {
+		return CommandReceipt{}, err
+	}
+	id, err := uuid.Parse(r.CommandID)
+	if err != nil || id == uuid.Nil || id.String() != r.CommandID {
+		return CommandReceipt{}, ErrInvalidInput
+	}
+	r.MessageType, err = controlString(m["message_type"])
+	if err != nil || r.MessageType != "command_receipt" {
+		return CommandReceipt{}, ErrInvalidInput
+	}
+	if err = r.DesiredVersion.UnmarshalJSON(m["desired_version"]); err != nil {
+		return CommandReceipt{}, err
+	}
+	r.ReceivedAt, err = controlTime(m["received_at"])
+	if err != nil {
+		return CommandReceipt{}, err
+	}
+	r.CommandHash, err = controlString(m["command_hash"])
+	if err != nil || !controlHashPattern.MatchString(r.CommandHash) {
+		return CommandReceipt{}, ErrInvalidInput
+	}
+	if _, err = hex.DecodeString(r.CommandHash); err != nil {
+		return CommandReceipt{}, ErrInvalidInput
+	}
+	r.ProtocolVersion = 1
+	return r, nil
+}
+
+// MarshalMQTTReceipt validates and serializes the canonical field-ordered
+// receipt envelope used for durable evidence and retransmission.
+func MarshalMQTTReceipt(r CommandReceipt) ([]byte, error) {
+	if r.ProtocolVersion != 1 || r.MessageType != "command_receipt" || r.ReceivedAt.IsZero() {
+		return nil, ErrInvalidInput
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		return nil, ErrInvalidInput
+	}
+	if len(data) > MaxControlPayloadBytes {
+		return nil, ErrControlPayloadTooLarge
+	}
+	if _, err := ParseMQTTReceipt("gateways/"+r.GatewayID+"/responses/"+r.CommandID, data, false); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // ValidateResultForCommand performs pure correlation, not ingestion or terminal

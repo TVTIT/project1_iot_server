@@ -32,6 +32,7 @@ var (
 	ErrIdempotencyConflict       = errors.New("idempotency_conflict")
 	ErrDesiredVersionOverflow    = errors.New("desired_version_overflow")
 	ErrControlPayloadTooLarge    = errors.New("control_payload_too_large")
+	ErrCommandReceiptUnavailable = errors.New("command_receipt_unavailable")
 	// ErrCommandNotCancellable reports that the safe cancellation boundary is
 	// not provable for this command. It is a business rejection, never an
 	// availability or authorization failure.
@@ -80,7 +81,7 @@ type CommandStatus string
 const (
 	CommandPending      CommandStatus = "pending"
 	CommandPublished    CommandStatus = "published"
-	CommandAcknowledged CommandStatus = "acknowledged" // legacy reserved active slot
+	CommandAcknowledged CommandStatus = "acknowledged" // durable Gateway receipt, not execution confirmation
 	CommandSucceeded    CommandStatus = "succeeded"
 	CommandFailed       CommandStatus = "failed"
 	CommandTimeout      CommandStatus = "timeout"
@@ -134,6 +135,19 @@ type CommandResult struct {
 	CompletedAt     time.Time           `json:"completed_at"`
 	ErrorCode       string              `json:"error_code,omitempty"`
 	ErrorMessage    string              `json:"error_message,omitempty"`
+}
+
+// CommandReceipt proves the Gateway durably stored the immutable command bytes.
+// It does not attest execution or configuration readback.
+type CommandReceipt struct {
+	ProtocolVersion int       `json:"protocol_version"`
+	MessageType     string    `json:"message_type"`
+	CommandID       string    `json:"command_id"`
+	GatewayID       string    `json:"gateway_id"`
+	EntityID        string    `json:"entity_id"`
+	DesiredVersion  Version   `json:"desired_version"`
+	ReceivedAt      time.Time `json:"received_at"`
+	CommandHash     string    `json:"command_hash"`
 }
 
 // CommandRecord is domain data, not an outbox or SQL repository implementation.

@@ -27,13 +27,25 @@ type ControlCommandView struct {
 	Legacy         bool                `json:"legacy,omitempty"`
 	// Stage 6 metadata. AttemptCount stays null while the dispatch history is
 	// unknown, and Origin stays null when the provenance cannot be proven.
-	CancelledAt     *time.Time `json:"cancelled_at"`
-	AttemptCount    *int       `json:"attempt_count"`
-	AcknowledgedAt  *time.Time `json:"acknowledged_at"`
-	RetryStopReason *string    `json:"retry_stop_reason"`
-	Origin          *string    `json:"origin"`
-	RootCommandID   *string    `json:"root_command_id"`
-	ParentCommandID *string    `json:"parent_command_id"`
+	CancelledAt            *time.Time                    `json:"cancelled_at"`
+	AttemptCount           *int                          `json:"attempt_count"`
+	AcknowledgedAt         *time.Time                    `json:"acknowledged_at"`
+	RetryStopReason        *string                       `json:"retry_stop_reason"`
+	Origin                 *string                       `json:"origin"`
+	RootCommandID          *string                       `json:"root_command_id"`
+	ParentCommandID        *string                       `json:"parent_command_id"`
+	ReconcileBlocked       *bool                         `json:"reconcile_blocked"`
+	RootReconcileBlocked   *bool                         `json:"root_reconcile_blocked"`
+	RootAutoSuccessorsUsed *int                          `json:"root_auto_successors_used"`
+	CurrentReconciliation  *ControlReconciliationContext `json:"current_reconciliation,omitempty"`
+}
+
+// ControlReconciliationContext is Sensor state, attached only to a command
+// whose desired version is the Sensor's current desired version.
+type ControlReconciliationContext struct {
+	DesiredVersion   Version    `json:"desired_version"`
+	Decision         string     `json:"decision"`
+	LastReconciledAt *time.Time `json:"last_reconciled_at,omitempty"`
 }
 
 // ControlCommandPage is a bounded keyset page; NextCursor is empty at the end.
@@ -153,10 +165,43 @@ c.cancelled_at,
 CASE WHEN c.stage6_managed THEN c.attempt_count ELSE NULL END,
 c.acknowledged_at,
 c.retry_stop_reason,
-CASE WHEN c.stage6_managed THEN c.origin ELSE NULL END,
-CASE WHEN c.stage6_managed THEN c.root_command_id::text ELSE NULL END,
-CASE WHEN c.stage6_managed THEN c.parent_command_id::text ELSE NULL END
-FROM public.twin_commands c JOIN public.twin_entities e ON e.id=c.entity_id JOIN public.user_gateways ug ON ug.gateway_id=e.gateway_id`
+CASE WHEN lineage.valid THEN c.origin ELSE NULL END,
+CASE WHEN lineage.valid THEN c.root_command_id::text ELSE NULL END,
+CASE WHEN lineage.valid THEN c.parent_command_id::text ELSE NULL END,
+CASE WHEN lineage.valid THEN c.reconcile_blocked ELSE NULL END,
+CASE WHEN lineage.valid THEN root.reconcile_blocked ELSE NULL END,
+CASE WHEN lineage.valid THEN root.auto_successors_used ELSE NULL END,
+CASE WHEN c.desired_version=st.desired_version AND st.last_reconcile_decision IN
+	('converged','successor_created','active_busy','blocked_cancelled','blocked_budget',
+	 'manual_unconfirmed','corrupt_unavailable','precondition_unmet')
+	THEN st.desired_version ELSE NULL END,
+CASE WHEN c.desired_version=st.desired_version AND st.last_reconcile_decision IN
+	('converged','successor_created','active_busy','blocked_cancelled','blocked_budget',
+	 'manual_unconfirmed','corrupt_unavailable','precondition_unmet')
+	THEN st.last_reconcile_decision ELSE NULL END,
+CASE WHEN c.desired_version=st.desired_version AND st.last_reconcile_decision IN
+	('converged','successor_created','active_busy','blocked_cancelled','blocked_budget',
+	 'manual_unconfirmed','corrupt_unavailable','precondition_unmet')
+	THEN st.last_reconciled_at ELSE NULL END
+FROM public.twin_commands c
+JOIN public.twin_entities e ON e.id=c.entity_id
+JOIN public.user_gateways ug ON ug.gateway_id=e.gateway_id
+JOIN public.twin_states st ON st.entity_id=c.entity_id
+LEFT JOIN public.twin_commands root ON root.command_id=c.root_command_id AND root.entity_id=c.entity_id
+LEFT JOIN LATERAL (SELECT
+	(c.stage6_managed AND c.control_version=1 AND c.target_entity_type='Sensor'
+	 AND c.action='update_configuration' AND root.stage6_managed AND root.control_version=1
+	 AND root.target_entity_type='Sensor' AND root.action='update_configuration'
+	 AND root.origin='client' AND root.root_command_id=root.command_id
+	 AND root.parent_command_id IS NULL AND root.original_actor_id IS NOT NULL
+	 AND ((c.origin='client' AND c.command_id=root.command_id
+	       AND c.root_command_id=c.command_id AND c.parent_command_id IS NULL
+	       AND c.original_actor_id=root.original_actor_id)
+	   OR (c.origin='reconciliation' AND c.root_command_id=root.command_id
+	       AND c.parent_command_id=root.command_id
+	       AND c.desired_version=root.desired_version+1
+	       AND c.original_actor_id=root.original_actor_id
+	       AND root.auto_successors_used=1))) AS valid) lineage ON true`
 
 func (r *PostgresControlRepository) controlRead(ctx context.Context, actor uuid.UUID, urn string) (pgx.Tx, *ResolvedEntity, context.CancelFunc, error) {
 	if ctx == nil {
@@ -199,8 +244,14 @@ func scanControlView(row controlRow, entity *ResolvedEntity) (ControlCommandView
 	var contract *int
 	var parameters, result []byte
 	var errorCode *string
+	var currentVersion *int64
+	var currentDecision *string
+	var currentAt *time.Time
 	err := row.Scan(&view.CommandID, &view.Status, &version, &parameters, &view.IssuedAt, &view.ExpiresAt, &view.CompletedAt, &errorCode, &contract, &result,
-		&view.CancelledAt, &view.AttemptCount, &view.AcknowledgedAt, &view.RetryStopReason, &view.Origin, &view.RootCommandID, &view.ParentCommandID)
+		&view.CancelledAt, &view.AttemptCount, &view.AcknowledgedAt, &view.RetryStopReason,
+		&view.Origin, &view.RootCommandID, &view.ParentCommandID, &view.ReconcileBlocked,
+		&view.RootReconcileBlocked, &view.RootAutoSuccessorsUsed, &currentVersion,
+		&currentDecision, &currentAt)
 	if err != nil {
 		return ControlCommandView{}, err
 	}
@@ -228,6 +279,16 @@ func scanControlView(row controlRow, entity *ResolvedEntity) (ControlCommandView
 		if view.ErrorMessage != "" {
 			view.ErrorCode = *errorCode
 		}
+	}
+	if currentVersion != nil && currentDecision != nil {
+		current := &ControlReconciliationContext{
+			DesiredVersion: Version(*currentVersion), Decision: *currentDecision,
+		}
+		if currentAt != nil {
+			at := currentAt.UTC()
+			current.LastReconciledAt = &at
+		}
+		view.CurrentReconciliation = current
 	}
 	view.Legacy = contract == nil || *contract != 1
 	if !view.Legacy {

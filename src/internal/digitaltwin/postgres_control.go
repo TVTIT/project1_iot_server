@@ -89,8 +89,9 @@ func (r *PostgresControlRepository) jitterFactor() float64 {
 // SetControlTimeline installs a shared process-local observer before runtime starts.
 func (r *PostgresControlRepository) SetControlTimeline(t *metrics.ControlTimeline) { r.timeline = t }
 
-// SetAdmissionNotifier installs a nonblocking post-commit signal before requests
-// are served. The callback must not perform I/O or wait for downstream work.
+// SetAdmissionNotifier installs a nonblocking post-commit dispatch signal for
+// newly committed commands from admission or reconciliation. The callback must
+// not perform I/O or wait for downstream work.
 func (r *PostgresControlRepository) SetAdmissionNotifier(notify func()) { r.notify = notify }
 
 // NewPostgresControlRepository constructs a bounded intent repository.
@@ -260,7 +261,7 @@ func (r *PostgresControlRepository) Admit(ctx context.Context, actor uuid.UUID, 
 			return RequestReceipt{}, ErrUnexpected
 		}
 		parameters, _ := json.Marshal(command.Parameters)
-		if _, err = tx.Exec(ctx, `UPDATE public.twin_states SET desired_state=desired_state || $2::jsonb,desired_version=$3,last_desired_by=$4,last_desired_at=$5,updated_at=$5 WHERE entity_id=$1`, entity, parameters, version, actor, now); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE public.twin_states SET desired_state=desired_state || $2::jsonb,desired_version=$3,last_desired_by=$4,last_desired_at=$5,last_reconciled_at=NULL,last_reconcile_decision=NULL,updated_at=$5 WHERE entity_id=$1`, entity, parameters, version, actor, now); err != nil {
 			return RequestReceipt{}, classifyAvailabilityError(err)
 		}
 		if r.config.Stage6Enabled {

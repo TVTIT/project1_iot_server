@@ -71,6 +71,14 @@ func (m *ControlTimeline) RegisterCommitted(ctx context.Context, id string, comm
 	m.register(ctx, id, committedAt)
 }
 
+// MissingOrigin records a committed system command that has no HTTP request
+// origin; it deliberately creates no per-command timeline entry.
+func (m *ControlTimeline) MissingOrigin() {
+	m.mu.Lock()
+	m.missingOrigin++
+	m.mu.Unlock()
+}
+
 func (m *ControlTimeline) register(ctx context.Context, id string, committedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

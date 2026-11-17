@@ -2,6 +2,7 @@ package gatewaysim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -52,7 +53,10 @@ func (i *CommandInbox) Admit(topic string, payload []byte, retained bool) {
 }
 
 // ControlRuntimeStats contains fixed counters only, with no device/command labels.
-type ControlRuntimeStats struct{ Rejected, QueueFull, Ignored, Conflict, PublishOK, PublishError int64 }
+type ControlRuntimeStats struct {
+	Rejected, QueueFull, Ignored, Conflict, PublishOK, PublishError  int64
+	QueryAccepted, QueryRejected, SnapshotPublished, SnapshotDropped int64
+}
 
 // ControlRuntime has one apply worker and one independent bounded resend worker.
 type ControlRuntime struct {
@@ -67,14 +71,20 @@ type ControlRuntime struct {
 	cancel                                     context.CancelFunc
 	done, fatal                                chan struct{}
 	fatalOnce                                  sync.Once
-	results                                    chan resultRequest
+	results, receipts, snapshots               chan resultRequest
 	wg                                         sync.WaitGroup
 	ignored, conflict, publishOK, publishError atomic.Int64
+	queryAccepted, queryRejected               atomic.Int64
+	snapshotPublished, snapshotDropped         atomic.Int64
 }
 
 type resultRequest struct {
-	command digitaltwin.Command
-	payload []byte
+	command  digitaltwin.Command
+	topic    string
+	payload  []byte
+	receipt  bool
+	snapshot bool
+	expires  time.Time
 }
 type resultRetry struct {
 	next, expires time.Time
@@ -86,7 +96,9 @@ func NewControlRuntime(c *Controller, i *CommandInbox, pub Publisher, timeout ti
 	if c == nil || i == nil || pub == nil || timeout <= 0 {
 		return nil, digitaltwin.ErrInvalidInput
 	}
-	return &ControlRuntime{controller: c, inbox: i, out: c.out, pub: pub, timeout: timeout, done: make(chan struct{}), fatal: make(chan struct{}), results: make(chan resultRequest, controlQueueCapacity)}, nil
+	r := &ControlRuntime{controller: c, inbox: i, out: c.out, pub: pub, timeout: timeout, done: make(chan struct{}), fatal: make(chan struct{}), results: make(chan resultRequest, controlQueueCapacity), receipts: make(chan resultRequest, controlQueueCapacity), snapshots: make(chan resultRequest, controlQueueCapacity)}
+	c.enqueueReceipt = r.enqueueReceipt
+	return r, nil
 }
 
 // Start recovers durable work and starts the fixed workers.
@@ -134,7 +146,12 @@ func (r *ControlRuntime) FatalSignal() <-chan struct{} { return r.fatal }
 
 // Stats returns a payload-free snapshot.
 func (r *ControlRuntime) Stats() ControlRuntimeStats {
-	return ControlRuntimeStats{Rejected: r.inbox.rejected.Load(), QueueFull: r.inbox.full.Load(), Ignored: r.ignored.Load(), Conflict: r.conflict.Load(), PublishOK: r.publishOK.Load(), PublishError: r.publishError.Load()}
+	return ControlRuntimeStats{
+		Rejected: r.inbox.rejected.Load(), QueueFull: r.inbox.full.Load(), Ignored: r.ignored.Load(),
+		Conflict: r.conflict.Load(), PublishOK: r.publishOK.Load(), PublishError: r.publishError.Load(),
+		QueryAccepted: r.queryAccepted.Load(), QueryRejected: r.queryRejected.Load(),
+		SnapshotPublished: r.snapshotPublished.Load(), SnapshotDropped: r.snapshotDropped.Load(),
+	}
 }
 
 func (r *ControlRuntime) fail() {
@@ -153,6 +170,14 @@ func (r *ControlRuntime) applyLoop() {
 		case <-r.ctx.Done():
 			return
 		case raw := <-r.inbox.queue:
+			var envelope struct {
+				MessageType string `json:"message_type"`
+			}
+			_ = json.Unmarshal(raw.payload, &envelope)
+			if envelope.MessageType == "configuration_query" {
+				r.handleConfigurationQuery(raw)
+				continue
+			}
 			ctx, cancel := context.WithTimeout(r.ctx, 3*r.out.opTimeout)
 			result, err := r.controller.Handle(ctx, raw.topic, raw.payload, false)
 			cancel()
@@ -178,7 +203,7 @@ func (r *ControlRuntime) applyLoop() {
 				return
 			}
 			select {
-			case r.results <- resultRequest{command, result}:
+			case r.results <- resultRequest{command: command, payload: result}:
 			default:
 				r.inbox.full.Add(1)
 			}
@@ -186,69 +211,229 @@ func (r *ControlRuntime) applyLoop() {
 	}
 }
 
+func (r *ControlRuntime) handleConfigurationQuery(raw rawCommand) {
+	if !r.controller.stage6Enabled || !r.pub.Ready() {
+		r.queryRejected.Add(1)
+		return
+	}
+	query, err := digitaltwin.ParseMQTTConfigurationQuery(raw.topic, raw.payload, false)
+	if err != nil || !query.ValidAt(time.Now()) {
+		r.queryRejected.Add(1)
+		return
+	}
+	deadline := query.ExpiresAt
+	if capDeadline := time.Now().Add(3 * r.out.opTimeout); capDeadline.Before(deadline) {
+		deadline = capDeadline
+	}
+	ctx, cancel := context.WithDeadline(r.ctx, deadline)
+	snapshot, err := r.controller.Readback(ctx, query)
+	cancel()
+	if err != nil || !query.ValidAt(time.Now()) {
+		r.queryRejected.Add(1)
+		return
+	}
+	payload, err := digitaltwin.MarshalMQTTConfigurationSnapshot(snapshot)
+	if err != nil {
+		r.queryRejected.Add(1)
+		return
+	}
+	response := resultRequest{
+		topic:    "gateways/" + query.GatewayID + "/responses/" + query.RequestID,
+		payload:  payload,
+		snapshot: true,
+		expires:  deadline,
+	}
+	select {
+	case r.snapshots <- response:
+		r.queryAccepted.Add(1)
+	default:
+		r.snapshotDropped.Add(1)
+	}
+}
+
 func (r *ControlRuntime) resultLoop() {
 	defer r.wg.Done()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	retries := make(map[string]resultRetry)
+	resultRetries := make(map[string]resultRetry)
+	receiptRetries := make(map[string]resultRetry)
+	nextLane := 0
+	nextScan := time.Now().Add(time.Second)
 	for {
 		if r.ctx.Err() != nil {
 			return
+		}
+		if !time.Now().Before(nextScan) {
+			if !r.scanResponses(time.Now(), resultRetries, receiptRetries) {
+				return
+			}
+			nextScan = time.Now().Add(time.Second)
+			continue
+		}
+		if request, lane, ok := r.takeResponse(nextLane); ok {
+			nextLane = (lane + 1) % 3
+			if request.receipt {
+				r.publishResponse(request, receiptRetries)
+			} else if request.snapshot {
+				r.publishResponse(request, nil)
+			} else {
+				r.publishResponse(request, resultRetries)
+			}
+			continue
 		}
 		select {
 		case <-r.ctx.Done():
 			return
 		case result := <-r.results:
-			r.publishResult(result, retries)
+			nextLane = 1
+			r.publishResponse(result, resultRetries)
+		case receipt := <-r.receipts:
+			nextLane = 2
+			r.publishResponse(receipt, receiptRetries)
+		case snapshot := <-r.snapshots:
+			nextLane = 0
+			r.publishResponse(snapshot, nil)
 		case <-ticker.C:
-			now := time.Now()
-			for id, retry := range retries {
-				if !now.Before(retry.expires) {
-					delete(retries, id)
-				}
-			}
-			receipts, err := r.out.ControlReceipts(r.ctx)
-			if err != nil {
-				if r.ctx.Err() == nil {
-					r.fail()
-				}
+			if !r.scanResponses(time.Now(), resultRetries, receiptRetries) {
 				return
 			}
-			attempted := 0
-			for _, receipt := range receipts {
-				if len(receipt.Result) == 0 || !now.Before(receipt.Command.ExpiresAt) || now.Before(retries[receipt.Command.CommandID].next) {
-					continue
-				}
-				r.publishResult(resultRequest{receipt.Command, receipt.Result}, retries)
-				attempted++
-				if attempted >= 8 {
-					break
-				}
-			}
+			nextScan = time.Now().Add(time.Second)
 		}
 	}
 }
 
-func (r *ControlRuntime) publishResult(result resultRequest, retries map[string]resultRetry) {
+// scanResponses gives durable retry/expiry work a bounded opportunity even
+// while immediate response queues remain nonempty. Stage 5 retains its former
+// eight-result scan budget; Stage 6 splits that same total budget fairly.
+func (r *ControlRuntime) scanResponses(now time.Time, resultRetries, receiptRetries map[string]resultRetry) bool {
+	for id, retry := range resultRetries {
+		if !now.Before(retry.expires) {
+			delete(resultRetries, id)
+		}
+	}
+	for id, retry := range receiptRetries {
+		if !now.Before(retry.expires) {
+			delete(receiptRetries, id)
+		}
+	}
+	receipts, err := r.out.ControlReceipts(r.ctx)
+	if err != nil {
+		if r.ctx.Err() == nil {
+			r.fail()
+		}
+		return false
+	}
+	maxResults, maxReceipts := 8, 0
+	if r.controller.stage6Enabled {
+		maxResults, maxReceipts = 4, 4
+	}
+	var dueReceipts, dueResults []resultRequest
+	for _, receipt := range receipts {
+		id := receipt.Command.CommandID
+		if r.controller.stage6Enabled && len(receipt.ReceiptBytes) > 0 && now.Before(receipt.Command.ExpiresAt) &&
+			!now.Before(receiptRetries[id].next) && len(dueReceipts) < maxReceipts {
+			dueReceipts = append(dueReceipts, resultRequest{command: receipt.Command, payload: receipt.ReceiptBytes, receipt: true})
+		}
+		if len(receipt.Result) > 0 && now.Before(receipt.Command.ExpiresAt) &&
+			!now.Before(resultRetries[id].next) && len(dueResults) < maxResults {
+			dueResults = append(dueResults, resultRequest{command: receipt.Command, payload: receipt.Result})
+		}
+		if len(dueReceipts) == maxReceipts && len(dueResults) == maxResults {
+			break
+		}
+	}
+	for i := 0; i < maxResults || i < maxReceipts; i++ {
+		if i < len(dueReceipts) {
+			r.publishResponse(dueReceipts[i], receiptRetries)
+		}
+		if i < len(dueResults) {
+			r.publishResponse(dueResults[i], resultRetries)
+		}
+	}
+	return true
+}
+
+func (r *ControlRuntime) takeResponse(start int) (resultRequest, int, bool) {
+	lanes := [3]<-chan resultRequest{r.results, r.receipts, r.snapshots}
+	for offset := 0; offset < len(lanes); offset++ {
+		lane := (start + offset) % len(lanes)
+		select {
+		case req := <-lanes[lane]:
+			return req, lane, true
+		default:
+		}
+	}
+	return resultRequest{}, 0, false
+}
+
+func (r *ControlRuntime) enqueueReceipt(receipt ControlReceipt) {
+	if !r.controller.stage6Enabled {
+		return
+	}
+	req := resultRequest{command: receipt.Command, payload: append([]byte(nil), receipt.ReceiptBytes...), receipt: true}
+	select {
+	case r.receipts <- req:
+	default:
+		r.inbox.full.Add(1)
+	}
+}
+
+func (r *ControlRuntime) publishResponse(result resultRequest, retries map[string]resultRetry) {
 	if r.ctx.Err() != nil {
+		if result.snapshot {
+			r.snapshotDropped.Add(1)
+		}
+		return
+	}
+	if result.snapshot {
+		if !r.controller.stage6Enabled || !time.Now().Before(result.expires) || !r.pub.Ready() {
+			r.snapshotDropped.Add(1)
+			return
+		}
+		publishDeadline := result.expires
+		if timeoutDeadline := time.Now().Add(r.timeout); timeoutDeadline.Before(publishDeadline) {
+			publishDeadline = timeoutDeadline
+		}
+		ctx, cancel := context.WithDeadline(r.ctx, publishDeadline)
+		defer cancel()
+		if err := r.pub.Publish(ctx, result.topic, result.payload); err != nil {
+			r.snapshotDropped.Add(1)
+			return
+		}
+		r.snapshotPublished.Add(1)
 		return
 	}
 	c := result.command
+	now := time.Now()
+	if result.receipt && !r.controller.stage6Enabled {
+		return
+	}
+	if result.receipt && !now.Before(c.ExpiresAt) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
-	// A duplicate may request one cached response after expiry. Periodic resend
-	// is independently limited to the original command window, never renewed.
-	if time.Now().Before(c.ExpiresAt) {
+	// A duplicate may request one cached result after expiry. Receipt and
+	// periodic resends are limited to the original command window.
+	if now.Before(c.ExpiresAt) {
 		ctx, cancel = context.WithDeadline(ctx, c.ExpiresAt)
 		defer cancel()
 	}
 	topic := "gateways/" + c.GatewayID + "/responses/" + c.CommandID
-	err := r.pub.Publish(ctx, topic, result.payload)
-	if !r.pub.Ready() || err != nil {
-		slog.Warn("gateway publish result error", "error", err, "ready", r.pub.Ready(), "command", c.CommandID)
+	var err error
+	ready := r.pub.Ready()
+	if ready {
+		err = r.pub.Publish(ctx, topic, result.payload)
+	}
+	kind := "result"
+	if result.receipt {
+		kind = "receipt"
+	}
+	if !ready || err != nil {
+		slog.Warn("gateway publish response error", "kind", kind, "error", err, "ready", ready, "command", c.CommandID)
 		r.publishError.Add(1)
 	} else {
-		slog.Info("gateway publish result ok", "command", c.CommandID)
+		slog.Info("gateway publish response ok", "kind", kind, "command", c.CommandID)
 		r.publishOK.Add(1)
 	}
 	if time.Now().Before(c.ExpiresAt) {

@@ -69,12 +69,20 @@ func (o *Outbox) reserveControl(ctx context.Context, topic string, payload, rece
 	}
 	var receiptHash string
 	var receiptReceivedAt int64
+	var parsedReceipt digitaltwin.CommandReceipt
 	if len(receiptBytes) > 0 {
 		if len(receiptBytes) > digitaltwin.MaxControlPayloadBytes {
 			return ControlReceipt{}, digitaltwin.ErrControlPayloadTooLarge
 		}
+		var parseErr error
+		parsedReceipt, parseErr = digitaltwin.ParseMQTTReceipt("gateways/"+c.GatewayID+"/responses/"+c.CommandID, receiptBytes, false)
+		if parseErr != nil || parsedReceipt.CommandID != c.CommandID || parsedReceipt.GatewayID != c.GatewayID ||
+			parsedReceipt.EntityID != c.EntityID || parsedReceipt.DesiredVersion != c.DesiredVersion ||
+			parsedReceipt.CommandHash != fmt.Sprintf("%x", sha256.Sum256(payload)) {
+			return ControlReceipt{}, digitaltwin.ErrInvalidInput
+		}
 		receiptHash = fmt.Sprintf("%x", sha256.Sum256(receiptBytes))
-		receiptReceivedAt = now.UnixMicro()
+		receiptReceivedAt = parsedReceipt.ReceivedAt.UnixMicro()
 	}
 	ctx, cancel := context.WithTimeout(ctx, o.opTimeout)
 	defer cancel()
@@ -97,6 +105,9 @@ func (o *Outbox) reserveControl(ctx context.Context, topic string, payload, rece
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return ControlReceipt{}, err
+	}
+	if len(receiptBytes) > 0 && !parsedReceipt.ReceivedAt.Equal(now.UTC().Truncate(time.Microsecond)) {
+		return ControlReceipt{}, digitaltwin.ErrInvalidInput
 	}
 	// Retention is checked only for new admission, never ahead of a duplicate.
 	// Prepared receipts cannot be evicted, even if the device was offline past TTL.
@@ -239,6 +250,19 @@ func (o *Outbox) ControlReceipts(ctx context.Context) ([]ControlReceipt, error) 
 	return receipts, rows.Err()
 }
 
+func (o *Outbox) findControlReceipt(ctx context.Context, commandID string) (ControlReceipt, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, o.opTimeout)
+	defer cancel()
+	r, err := scanControlReceipt(o.db.QueryRowContext(ctx, controlReceiptSelect+" WHERE command_id=?", commandID).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ControlReceipt{}, false, nil
+	}
+	if err != nil {
+		return ControlReceipt{}, false, err
+	}
+	return r, true, nil
+}
+
 const controlReceiptSelect = `SELECT command_topic,command_bytes,command_hash,status,result_bytes,receipt_bytes,receipt_hash,receipt_received_at FROM command_receipts`
 
 func scanControlReceipt(scan func(...any) error) (ControlReceipt, error) {
@@ -261,6 +285,13 @@ func scanControlReceipt(scan func(...any) error) (ControlReceipt, error) {
 		}
 		expectedHash := fmt.Sprintf("%x", sha256.Sum256(receiptBytes))
 		if !receiptHash.Valid || receiptHash.String != expectedHash || !receiptReceivedAt.Valid || receiptReceivedAt.Int64 <= 0 {
+			return ControlReceipt{}, ErrOutboxCorrupt
+		}
+		parsed, parseErr := digitaltwin.ParseMQTTReceipt("gateways/"+c.GatewayID+"/responses/"+c.CommandID, receiptBytes, false)
+		if parseErr != nil || parsed.CommandID != c.CommandID || parsed.GatewayID != c.GatewayID ||
+			parsed.EntityID != c.EntityID || parsed.DesiredVersion != c.DesiredVersion ||
+			parsed.CommandHash != fmt.Sprintf("%x", sha256.Sum256(r.Payload)) ||
+			parsed.ReceivedAt.UnixMicro() != receiptReceivedAt.Int64 {
 			return ControlReceipt{}, ErrOutboxCorrupt
 		}
 		r.ReceiptBytes = receiptBytes

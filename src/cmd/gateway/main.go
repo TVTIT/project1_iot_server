@@ -281,7 +281,7 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		return 1
 	}
 	if cfg.ControlEnabled {
-		controller, err := gatewaysim.NewController(outbox, scheduler)
+		controller, err := gatewaysim.NewController(outbox, scheduler, cfg.Stage6Enabled)
 		if err != nil {
 			writeln(stderr, "error: could not create control owner")
 			closeAll()

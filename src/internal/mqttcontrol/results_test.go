@@ -2,8 +2,11 @@ package mqttcontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +15,12 @@ import (
 
 	"iot-platform/internal/digitaltwin"
 )
+
+type receiptRepoFunc func(context.Context, string, []byte, time.Time) (digitaltwin.ControlReceiptOutcome, error)
+
+func (f receiptRepoFunc) AcceptControlReceipt(ctx context.Context, topic string, payload []byte, at time.Time) (digitaltwin.ControlReceiptOutcome, error) {
+	return f(ctx, topic, payload, at)
+}
 
 type resultRepoFunc func(context.Context, string, []byte, time.Time) (digitaltwin.ControlResultOutcome, error)
 
@@ -27,6 +36,27 @@ func validRawResult(t *testing.T) RawResult {
 		t.Fatal(err)
 	}
 	return RawResult{Topic: "gateways/fixture_gw/responses/" + r.CommandID, Payload: b, ReceivedAt: time.Now()}
+}
+
+func validRawReceipt(t *testing.T) RawResult {
+	t.Helper()
+	id := uuid.NewString()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	commandBytes := []byte(`{"original":"command bytes"}`)
+	payload, err := digitaltwin.MarshalMQTTReceipt(digitaltwin.CommandReceipt{
+		ProtocolVersion: 1,
+		MessageType:     "command_receipt",
+		CommandID:       id,
+		GatewayID:       "fixture_gw",
+		EntityID:        "urn:ngsi-ld:Sensor:fixture_gw:s1",
+		DesiredVersion:  1,
+		ReceivedAt:      now,
+		CommandHash:     fmt.Sprintf("%x", sha256.Sum256(commandBytes)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return RawResult{Topic: "gateways/fixture_gw/responses/" + id, Payload: payload, ReceivedAt: now}
 }
 
 func waitResult(t *testing.T, what string, f func() bool) {
@@ -99,6 +129,159 @@ func TestResultConsumerRealWorkersValidateAndClassify(t *testing.T) {
 	}
 	if snapshot := m.Snapshot(); snapshot.QueueWait.Count != 6 || snapshot.Processing.Count != 6 || snapshot.ReceivedToConfirmedCommit.Count != 0 {
 		t.Fatalf("timings = %+v; fake repo does not prove commit point", snapshot)
+	}
+}
+
+func TestResponseConsumerRoutesStrictReceiptSeparatelyFromResultMetrics(t *testing.T) {
+	resultMetrics, receiptMetrics := &ResultMetrics{}, &ReceiptMetrics{}
+	var resultCalls, receiptCalls atomic.Int64
+	resultRepo := resultRepoFunc(func(context.Context, string, []byte, time.Time) (digitaltwin.ControlResultOutcome, error) {
+		resultCalls.Add(1)
+		return digitaltwin.ControlResultAccepted, nil
+	})
+	receiptRepo := receiptRepoFunc(func(context.Context, string, []byte, time.Time) (digitaltwin.ControlReceiptOutcome, error) {
+		switch receiptCalls.Add(1) {
+		case 1:
+			return digitaltwin.ControlReceiptAccepted, nil
+		case 2:
+			return digitaltwin.ControlReceiptDuplicate, nil
+		case 3:
+			return digitaltwin.ControlReceiptLate, nil
+		default:
+			return "", digitaltwin.ErrControlResultConflict
+		}
+	})
+	q := make(chan RawResult, 16)
+	c, err := NewResultConsumer(1, time.Second, resultRepo, q, resultMetrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ConfigureReceipts(true, receiptRepo, receiptMetrics); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := c.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+
+	receipt := validRawReceipt(t)
+	q <- receipt
+	q <- receipt
+	q <- receipt
+	badDuplicateKey := receipt
+	badDuplicateKey.Payload = append(append([]byte(nil), receipt.Payload[:len(receipt.Payload)-1]...), []byte(`,"message_type":"command_receipt"}`)...)
+	q <- badDuplicateKey
+	wrongIdentity := receipt
+	wrongIdentity.Topic = "gateways/other_gateway/responses/" + strings.TrimPrefix(receipt.Topic, "gateways/fixture_gw/responses/")
+	q <- wrongIdentity
+	retained := receipt
+	retained.Retained = true
+	q <- retained
+
+	result := validRawResult(t)
+	q <- result
+	waitResult(t, "response outcomes not consumed", func() bool {
+		return receiptMetrics.Snapshot().Accepted == 1 &&
+			receiptMetrics.Snapshot().Duplicate == 1 &&
+			receiptMetrics.Snapshot().Late == 1 &&
+			receiptMetrics.Snapshot().Rejected == 3 &&
+			resultMetrics.Snapshot().Accepted == 1
+	})
+	if receiptCalls.Load() != 3 || resultCalls.Load() != 1 {
+		t.Fatalf("repository calls receipt/result=%d/%d", receiptCalls.Load(), resultCalls.Load())
+	}
+	if got := resultMetrics.Snapshot(); got.Accepted != 1 || got.ReceivedToConfirmedCommit.Count != 0 {
+		t.Fatalf("receipt contaminated result metrics/timeline: %+v", got)
+	}
+}
+
+func TestResponseConsumerRoutesOnlyStrictStage6Snapshots(t *testing.T) {
+	var resultCalls atomic.Int64
+	repo := resultRepoFunc(func(context.Context, string, []byte, time.Time) (digitaltwin.ControlResultOutcome, error) {
+		resultCalls.Add(1)
+		return digitaltwin.ControlResultAccepted, nil
+	})
+	q := make(chan RawResult, 1)
+	consumer, err := NewResultConsumer(1, time.Second, repo, q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var routed atomic.Int64
+	if err := consumer.ConfigureSnapshots(true, func(ctx context.Context, _ RawResult) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("snapshot handler was not bounded")
+		}
+		routed.Add(1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	query := digitaltwin.ConfigurationQuery{
+		ProtocolVersion: 1, MessageType: "configuration_query", RequestID: uuid.NewString(),
+		GatewayID: "fixture_gw", EntityID: "urn:ngsi-ld:Sensor:fixture_gw:s1",
+		IssuedAt: now, ExpiresAt: now.Add(5 * time.Second),
+	}
+	snapshot := snapshotForQuery(t, query)
+	consumer.process(snapshot)
+	if routed.Load() != 1 || resultCalls.Load() != 0 {
+		t.Fatalf("snapshot routing/result path=%d/%d", routed.Load(), resultCalls.Load())
+	}
+	retained := snapshot
+	retained.Retained = true
+	consumer.process(retained)
+	malformed := snapshot
+	malformed.Payload = []byte(`{"message_type":"configuration_snapshot","message_type":"configuration_snapshot"}`)
+	consumer.process(malformed)
+	if routed.Load() != 1 {
+		t.Fatalf("retained or malformed snapshot routed: %d", routed.Load())
+	}
+
+	stage5, err := NewResultConsumer(1, time.Second, repo, make(chan RawResult), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage5.process(snapshot)
+	if routed.Load() != 1 || resultCalls.Load() != 0 {
+		t.Fatal("Stage 5-only consumer routed snapshot")
+	}
+}
+
+func TestResponseConsumerStage5RejectsReceiptAndRetainedFlagSurvivesQueueBoundary(t *testing.T) {
+	var resultCalls, receiptCalls atomic.Int64
+	resultRepo := resultRepoFunc(func(context.Context, string, []byte, time.Time) (digitaltwin.ControlResultOutcome, error) {
+		resultCalls.Add(1)
+		return digitaltwin.ControlResultAccepted, nil
+	})
+	receiptRepo := receiptRepoFunc(func(context.Context, string, []byte, time.Time) (digitaltwin.ControlReceiptOutcome, error) {
+		receiptCalls.Add(1)
+		return digitaltwin.ControlReceiptAccepted, nil
+	})
+	c, err := NewResultConsumer(1, time.Second, resultRepo, make(chan RawResult), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ConfigureReceipts(false, receiptRepo, nil); err != nil {
+		t.Fatal(err)
+	}
+	receipt := validRawReceipt(t)
+	c.process(receipt)
+	if receiptCalls.Load() != 0 || resultCalls.Load() != 0 {
+		t.Fatal("Stage 5-only consumer called a repository for a receipt")
+	}
+
+	// Simulate a retained delivery that crossed RawResult admission. The
+	// consumer boundary must reject it even if transport admission regresses.
+	result := validRawResult(t)
+	result.Retained = true
+	c.process(result)
+	if resultCalls.Load() != 0 {
+		t.Fatal("retained flag was lost across the raw-result queue boundary")
 	}
 }
 

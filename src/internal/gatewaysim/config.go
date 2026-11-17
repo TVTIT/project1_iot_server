@@ -67,6 +67,7 @@ const (
 // Gateway-side values; it never carries database or Supabase settings.
 type Config struct {
 	ControlEnabled bool
+	Stage6Enabled  bool
 	GatewayID      string
 	SensorID       string
 
@@ -125,6 +126,15 @@ func Load(lookup LookupFunc) (Config, error) {
 		if err != nil {
 			return c, fmt.Errorf("GATEWAY_CONTROL_ENABLED must be a boolean")
 		}
+	}
+	if value, exists := lookup("GATEWAY_STAGE6_ENABLED"); exists {
+		c.Stage6Enabled, err = strconv.ParseBool(value)
+		if err != nil {
+			return c, fmt.Errorf("GATEWAY_STAGE6_ENABLED must be a boolean")
+		}
+	}
+	if c.Stage6Enabled && !c.ControlEnabled {
+		return c, fmt.Errorf("GATEWAY_STAGE6_ENABLED requires GATEWAY_CONTROL_ENABLED")
 	}
 
 	gatewayID, ok := nonEmpty(lookup, "GATEWAY_ID")

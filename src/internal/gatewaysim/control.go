@@ -1,9 +1,12 @@
 package gatewaysim
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -21,18 +24,22 @@ type SamplingController interface {
 
 // Controller serializes one Sensor's durable command/apply/result lifecycle.
 type Controller struct {
-	mu      sync.Mutex
-	out     *Outbox
-	sampler SamplingController
-	now     func() time.Time
+	mu             sync.Mutex
+	out            *Outbox
+	sampler        SamplingController
+	now            func() time.Time
+	stage6Enabled  bool
+	recovered      bool
+	enqueueReceipt func(ControlReceipt)
 }
 
 // NewController creates an inert owner; Recover must run before sampling starts.
-func NewController(out *Outbox, sampler SamplingController) (*Controller, error) {
-	if out == nil || sampler == nil {
+func NewController(out *Outbox, sampler SamplingController, stage6Enabled ...bool) (*Controller, error) {
+	if out == nil || sampler == nil || len(stage6Enabled) > 1 {
 		return nil, ErrControlUnconfirmed
 	}
-	return &Controller{out: out, sampler: sampler, now: time.Now}, nil
+	stage6 := len(stage6Enabled) == 1 && stage6Enabled[0]
+	return &Controller{out: out, sampler: sampler, now: time.Now, stage6Enabled: stage6}, nil
 }
 
 // Handle returns only durable canonical result bytes, never a synthetic ACK.
@@ -42,13 +49,49 @@ func (c *Controller) Handle(ctx context.Context, topic string, payload []byte, r
 	if ctx == nil {
 		return nil, digitaltwin.ErrInvalidInput
 	}
-	if _, err := digitaltwin.ParseMQTTCommand(topic, payload, retained); err != nil {
-		return nil, err
-	}
-	receipt, err := c.out.ReserveControl(ctx, topic, payload, c.now())
+	command, err := digitaltwin.ParseMQTTCommand(topic, payload, retained)
 	if err != nil {
 		return nil, err
 	}
+	now := c.now()
+	var receipt ControlReceipt
+	if c.stage6Enabled {
+		existing, found, findErr := c.out.findControlReceipt(ctx, command.CommandID)
+		if findErr != nil {
+			return nil, findErr
+		}
+		if found {
+			if existing.Topic != topic || !bytes.Equal(existing.Payload, payload) {
+				return nil, ErrControlConflict
+			}
+			c.enqueue(existing)
+			if len(existing.Result) > 0 {
+				return existing.Result, nil
+			}
+			return nil, ErrControlBusy
+		}
+		var wireReceipt []byte
+		wireReceipt, err = digitaltwin.MarshalMQTTReceipt(digitaltwin.CommandReceipt{
+			ProtocolVersion: 1,
+			MessageType:     "command_receipt",
+			CommandID:       command.CommandID,
+			GatewayID:       command.GatewayID,
+			EntityID:        command.EntityID,
+			DesiredVersion:  command.DesiredVersion,
+			ReceivedAt:      now.UTC().Truncate(time.Microsecond),
+			CommandHash:     fmt.Sprintf("%x", sha256.Sum256(payload)),
+		})
+		if err != nil {
+			return nil, err
+		}
+		receipt, err = c.out.ReserveControlWithReceipt(ctx, topic, payload, wireReceipt, now)
+	} else {
+		receipt, err = c.out.ReserveControl(ctx, topic, payload, now)
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.enqueue(receipt)
 	if len(receipt.Result) > 0 {
 		return receipt.Result, nil
 	}
@@ -81,12 +124,99 @@ func (c *Controller) Recover(ctx context.Context) error {
 	}
 	for _, r := range receipts {
 		if len(r.Result) == 0 {
+			c.enqueue(r)
 			if _, err := c.apply(ctx, r); err != nil {
 				return err
 			}
 		}
 	}
+	c.recovered = true
 	return nil
+}
+
+// Readback returns a transient, read-only view serialized with command apply.
+// Waiting for the apply mutex and the SQLite read are bounded by the query context.
+func (c *Controller) Readback(ctx context.Context, query digitaltwin.ConfigurationQuery) (digitaltwin.ConfigurationSnapshot, error) {
+	if ctx == nil || !c.stage6Enabled || !query.ValidAt(c.now()) ||
+		query.GatewayID != c.out.gatewayID ||
+		query.EntityID != "urn:ngsi-ld:Sensor:"+c.out.gatewayID+":"+c.out.sensorID {
+		return digitaltwin.ConfigurationSnapshot{}, digitaltwin.ErrInvalidInput
+	}
+	if err := c.lockContext(ctx); err != nil {
+		return digitaltwin.ConfigurationSnapshot{}, err
+	}
+	defer c.mu.Unlock()
+	if !c.recovered {
+		return digitaltwin.ConfigurationSnapshot{}, digitaltwin.ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil || !query.ValidAt(c.now()) {
+		if err != nil {
+			return digitaltwin.ConfigurationSnapshot{}, err
+		}
+		return digitaltwin.ConfigurationSnapshot{}, digitaltwin.ErrInvalidInput
+	}
+
+	snapshot := digitaltwin.ConfigurationSnapshot{
+		ProtocolVersion:    1,
+		MessageType:        "configuration_snapshot",
+		RequestID:          query.RequestID,
+		GatewayID:          query.GatewayID,
+		EntityID:           query.EntityID,
+		ConfigurationState: "unavailable",
+	}
+	actual := c.sampler.ActiveSampleInterval()
+	if actual >= digitaltwin.MinSampleIntervalUS && actual <= digitaltwin.MaxSampleIntervalUS {
+		snapshot.ActualSampleIntervalUS = &actual
+	}
+
+	config, found, err := c.out.Configuration(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return digitaltwin.ConfigurationSnapshot{}, ctx.Err()
+		}
+		// A damaged/unavailable store is never represented as an empty watermark.
+		snapshot.WatermarkVersion = 0
+		readAt := c.now()
+		if !query.ValidAt(readAt) {
+			return digitaltwin.ConfigurationSnapshot{}, digitaltwin.ErrInvalidInput
+		}
+		snapshot.ReadbackAt = readAt.UTC().Truncate(time.Microsecond)
+		return snapshot, nil
+	}
+	if found {
+		snapshot.ConfigurationState = "configured"
+		snapshot.WatermarkVersion = config.DesiredVersion
+		durable := config.SampleIntervalUS
+		snapshot.DurableSampleIntervalUS = &durable
+	} else {
+		snapshot.ConfigurationState = "unconfigured"
+	}
+	readAt := c.now()
+	if !query.ValidAt(readAt) {
+		return digitaltwin.ConfigurationSnapshot{}, digitaltwin.ErrInvalidInput
+	}
+	snapshot.ReadbackAt = readAt.UTC().Truncate(time.Microsecond)
+	return snapshot, nil
+}
+
+func (c *Controller) lockContext(ctx context.Context) error {
+	for {
+		if c.mu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Controller) enqueue(receipt ControlReceipt) {
+	if c.stage6Enabled && len(receipt.ReceiptBytes) > 0 && c.enqueueReceipt != nil {
+		c.enqueueReceipt(receipt)
+	}
 }
 
 func (c *Controller) apply(ctx context.Context, receipt ControlReceipt) ([]byte, error) {

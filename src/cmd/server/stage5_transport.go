@@ -17,12 +17,17 @@ import (
 )
 
 type stage5Runtime struct {
-	transport     *mqttcontrol.Transport
-	workers       *mqttcontrol.Runtime
-	metrics       *mqttcontrol.Metrics
-	results       *mqttcontrol.ResultConsumer
-	resultMetrics *mqttcontrol.ResultMetrics
-	timeline      *metrics.ControlTimeline
+	transport             *mqttcontrol.Transport
+	workers               *mqttcontrol.Runtime
+	metrics               *mqttcontrol.Metrics
+	results               *mqttcontrol.ResultConsumer
+	resultMetrics         *mqttcontrol.ResultMetrics
+	receiptMetrics        *mqttcontrol.ReceiptMetrics
+	admissionMetrics      *mqttcontrol.ResponseAdmissionMetrics
+	queryRuntime          *mqttcontrol.ControlQueryRuntime
+	queryMetrics          *mqttcontrol.ControlQueryMetrics
+	reconciliationMetrics *mqttcontrol.ReconciliationMetrics
+	timeline              *metrics.ControlTimeline
 }
 
 func composeStage5Transport(cfg config.Config, pool *pgxpool.Pool) (stage5Runtime, error) {
@@ -73,20 +78,49 @@ func composeStage5Transport(cfg config.Config, pool *pgxpool.Pool) (stage5Runtim
 		observer = &mqttcontrol.Metrics{}
 	}
 	var resultObserver *mqttcontrol.ResultMetrics
+	var receiptObserver *mqttcontrol.ReceiptMetrics
+	var responseAdmissionObserver *mqttcontrol.ResponseAdmissionMetrics
 	if cfg.MetricsEnabled {
 		resultObserver = &mqttcontrol.ResultMetrics{}
+		receiptObserver = &mqttcontrol.ReceiptMetrics{}
+		responseAdmissionObserver = &mqttcontrol.ResponseAdmissionMetrics{}
 	}
 	transport.SetResultMetrics(resultObserver)
+	transport.SetReceiptMetrics(receiptObserver)
+	transport.SetResponseAdmissionMetrics(responseAdmissionObserver)
 	results, err := mqttcontrol.NewResultConsumer(cfg.Stage5.ResultWorkers, cfg.Stage5.Control.DBTimeout, repo, transport.Results(), resultObserver)
 	if err != nil {
 		return stage5Runtime{}, err
+	}
+	if err := results.ConfigureReceipts(cfg.Stage5.Stage6Enabled, repo, receiptObserver); err != nil {
+		return stage5Runtime{}, fmt.Errorf("configure stage 5 receipt consumer: %w", err)
 	}
 	workers, err := mqttcontrol.New(cfg.Stage5.Dispatch, repo, transport, observer)
 	if err != nil {
 		return stage5Runtime{}, err
 	}
 	workers.SetControlTimeline(timeline)
-	return stage5Runtime{transport: transport, workers: workers, metrics: observer, results: results, resultMetrics: resultObserver, timeline: timeline}, nil
+	var queryMetrics *mqttcontrol.ControlQueryMetrics
+	var queryRuntime *mqttcontrol.ControlQueryRuntime
+	var reconciliationMetrics *mqttcontrol.ReconciliationMetrics
+	if cfg.Stage5.Stage6Enabled {
+		if cfg.MetricsEnabled {
+			queryMetrics = &mqttcontrol.ControlQueryMetrics{}
+			reconciliationMetrics = &mqttcontrol.ReconciliationMetrics{}
+		}
+		if cfg.Stage5.Dispatch.WakeupEnabled {
+			repo.SetAdmissionNotifier(workers.Notify)
+		}
+		queryRuntime, err = mqttcontrol.NewControlQueryRuntime(repo, transport,
+			mqttcontrol.NewReconciliationSnapshotHandler(repo, reconciliationMetrics), queryMetrics)
+		if err != nil {
+			return stage5Runtime{}, fmt.Errorf("configure stage 6 query runtime: %w", err)
+		}
+		if err := results.ConfigureSnapshots(true, queryRuntime.HandleSnapshot); err != nil {
+			return stage5Runtime{}, fmt.Errorf("configure stage 6 snapshot routing: %w", err)
+		}
+	}
+	return stage5Runtime{transport: transport, workers: workers, metrics: observer, results: results, resultMetrics: resultObserver, receiptMetrics: receiptObserver, admissionMetrics: responseAdmissionObserver, queryRuntime: queryRuntime, queryMetrics: queryMetrics, reconciliationMetrics: reconciliationMetrics, timeline: timeline}, nil
 }
 func (r stage5Runtime) start() error {
 	if r.transport == nil {
@@ -99,7 +133,17 @@ func (r stage5Runtime) start() error {
 		r.stop()
 		return err
 	}
-	return r.workers.Start()
+	if err := r.workers.Start(); err != nil {
+		r.stop()
+		return err
+	}
+	if r.queryRuntime != nil {
+		if err := r.queryRuntime.Start(); err != nil {
+			r.stop()
+			return err
+		}
+	}
+	return nil
 }
 func (r stage5Runtime) stop() {
 	if r.transport != nil {
@@ -111,6 +155,9 @@ func (r stage5Runtime) stop() {
 	if r.workers != nil {
 		r.workers.Stop()
 	}
+	if r.queryRuntime != nil {
+		r.queryRuntime.Stop()
+	}
 	if r.transport != nil {
 		r.transport.StopIntake()
 	}
@@ -120,7 +167,11 @@ func (r stage5Runtime) close(ctx context.Context) error {
 	if r.transport == nil {
 		return nil
 	}
-	return errors.Join(r.transport.Close(ctx), r.workers.Close(ctx), r.results.Close(ctx))
+	var queryErr error
+	if r.queryRuntime != nil {
+		queryErr = r.queryRuntime.Close(ctx)
+	}
+	return errors.Join(r.transport.Close(ctx), r.workers.Close(ctx), r.results.Close(ctx), queryErr)
 }
 
 func (r stage5Runtime) Ready() bool {

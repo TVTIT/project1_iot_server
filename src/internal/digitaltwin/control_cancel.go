@@ -217,16 +217,31 @@ func cancellationOutcome(urn string, id uuid.UUID, desiredVersion int64, cancell
 	}
 }
 
-// currentIntentBlockedTx reports whether the intent of the current desired
-// version was cancelled. It matches the current desired version only, never a
-// historical cancellation of another version.
+// currentIntentBlockedTx reports whether the current desired lineage is
+// cancelled, spent, or unverifiable. It matches the current desired version
+// only, never a historical block belonging to an older root.
 //
 // The caller must already hold the Sensor, Entity and state locks.
 func currentIntentBlockedTx(ctx context.Context, tx pgx.Tx, entity uuid.UUID, desiredVersion int64) (bool, error) {
 	var blocked bool
-	err := tx.QueryRow(ctx, `SELECT reconcile_blocked FROM public.twin_commands
-		WHERE entity_id=$1 AND desired_version=$2 AND control_version=1
-		ORDER BY issued_at DESC,command_id DESC LIMIT 1`, entity, desiredVersion).Scan(&blocked)
+	err := tx.QueryRow(ctx, `SELECT CASE
+		WHEN c.stage6_managed AND c.target_entity_type='Sensor' AND c.action='update_configuration'
+			AND c.origin='client' AND c.root_command_id=c.command_id
+			THEN c.reconcile_blocked OR c.auto_successors_used>=1
+		WHEN c.stage6_managed AND c.target_entity_type='Sensor' AND c.action='update_configuration'
+			AND c.origin='reconciliation' AND c.parent_command_id IS NOT NULL
+			AND r.command_id IS NOT NULL AND c.root_command_id=r.command_id
+			AND c.parent_command_id=r.command_id AND c.desired_version=r.desired_version+1
+			AND c.original_actor_id=r.original_actor_id
+			AND r.stage6_managed AND r.target_entity_type='Sensor' AND r.action='update_configuration'
+			AND r.origin='client' AND r.root_command_id=r.command_id
+			THEN c.reconcile_blocked OR r.reconcile_blocked OR r.auto_successors_used>=1
+		ELSE true
+		END
+		FROM public.twin_commands c
+		LEFT JOIN public.twin_commands r ON r.command_id=c.root_command_id AND r.entity_id=c.entity_id
+		WHERE c.entity_id=$1 AND c.desired_version=$2 AND c.control_version=1
+		ORDER BY c.issued_at DESC,c.command_id DESC LIMIT 1`, entity, desiredVersion).Scan(&blocked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}

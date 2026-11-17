@@ -43,7 +43,21 @@ func newControlFixtureGatewayReuse(t *testing.T, gateway string) *controlFixture
 	return newControlFixtureGatewayMode(t, gateway, true)
 }
 
+// newControlFixtureGatewayReuseSensor keeps native MQTT scenarios isolated
+// when they share the same owned Gateway and PostgreSQL fixture.
+func newControlFixtureGatewayReuseSensor(t *testing.T, gateway, sensor string) *controlFixture {
+	t.Helper()
+	if sensor == "" {
+		t.Fatal("reused Gateway fixture requires an explicit Sensor identity")
+	}
+	return newControlFixtureGatewayModeSensor(t, gateway, true, sensor)
+}
+
 func newControlFixtureGatewayMode(t *testing.T, gateway string, reuse bool) *controlFixture {
+	return newControlFixtureGatewayModeSensor(t, gateway, reuse, "")
+}
+
+func newControlFixtureGatewayModeSensor(t *testing.T, gateway string, reuse bool, sensorOverride string) *controlFixture {
 	t.Helper()
 	if os.Getenv("CONTROL_TEST_ISOLATED") != "1" {
 		t.Skip("requires owned native PostgreSQL fixture")
@@ -91,6 +105,16 @@ func newControlFixtureGatewayMode(t *testing.T, gateway string, reuse bool) *con
 	sensor := "s1"
 	if reuse {
 		sensor = "s6"
+	}
+	if sensorOverride != "" {
+		sensor = sensorOverride
+		var exists bool
+		if err := f.admin.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sensors WHERE gateway_id=$1 AND sensor_id=$2)`, f.gw, sensor).Scan(&exists); err != nil {
+			t.Fatal("check unique native Sensor fixture:", err)
+		}
+		if exists {
+			t.Fatalf("native Sensor fixture identity already exists: %s", sensor)
+		}
 	}
 	f.urn, f.entity = f.sensor(t, sensor)
 	f.repo, err = digitaltwin.NewPostgresControlRepository(f.app, digitaltwin.DefaultControlConfig())
