@@ -514,6 +514,28 @@ Bảng dưới đây ghi nhận trạng thái giải quyết và danh mục các
 
 ## 3. Danh Mục Tồn Đọng Theo Thứ Tự Ưu Tiên (Prioritized Backlog)
 
+### Stage 6 R2 — giới hạn retention PostgreSQL còn mở
+
+Review độc lập tại source commit `6250cc8` và các thay đổi tài liệu kết luận
+**REQUEST_CHANGES** cho retention; Stage 6 vẫn **PARTIAL**, R9 hoàn thành tài liệu
+nhưng không đóng finding review này. Các phát hiện dưới đây chưa được sửa:
+
+| Mức / giới hạn | Ảnh hưởng và bằng chứng | Workaround hiện tại | Khi xem lại |
+|---|---|---|---|
+| **MEDIUM — guard `json_each` phụ thuộc thứ tự đánh giá `AND`** | Trong `scripts/sql/stage6-command-retention-candidates.sql`, wrapper `reported_state` xuất hiện hai lần, lần đầu là scalar và lần sau là object, có thể khiến `json_each` nhận scalar nếu PostgreSQL đánh giá toán hạng con sớm. Probe PostgreSQL 16.15 chạy riêng biểu thức con xác nhận lỗi `cannot deconstruct a scalar` cho cả canonical và late result. Cùng dữ liệu qua dry-run và apply của entrypoint hiện hành đều PASS, giữ evidence lỗi và chỉ xóa control hợp lệ; **chưa tái hiện abort hoặc mất dữ liệu qua entrypoint**. | Chưa thực hiện retention apply trên DB shared/live khi finding còn mở; nếu cần vận hành, dừng và đưa case vào review, không tự bỏ qua lỗi hoặc thay selector. Dry-run không xóa dữ liệu nghiệp vụ nhưng không chứng minh mọi thứ tự đánh giá là an toàn. | Sửa guard bằng `CASE` kiểm đúng giá trị JSON gốc là object trước `json_each` con; chạy regression canonical/late có wrapper scalar trước object hợp lệ và xác nhận candidate hợp lệ khác vẫn được xử lý. |
+| **LOW — assertion timestamp của regression chưa khớp mô tả handoff** | `scripts/tests/migration_ci_compat.py` đối chiếu số lượng root/child/outbox/receipt cùng bytes/hash, nhưng snapshot chính chưa bao gồm `result_received_at`, `late_result_received_at` và `completed_at`. Probe độc lập có so các timestamp trong biến thể được thử và PASS; đây không phải lỗi đã chứng minh làm thay đổi dữ liệu. | Khi báo cáo chỉ gán byte/hash và số lượng cho regression chính; ghi riêng timestamp PASS thuộc probe bổ sung, không coi là assertion của fixture chính. | Bổ sung timestamp vào snapshot regression hoặc tiếp tục mô tả đúng phạm vi kiểm tra. |
+
+Các kiểm tra local đã ghi nhận: native upgrade 26→27 lần đầu trên dữ liệu Stage 5
+và reapply giữ oracle được kiểm tra; fixture duplicate-key giữ các lineage lỗi,
+chỉ xóa control; dry-run backlog 1.000 root/10 Sensor hoàn tất khoảng 0,96 giây,
+apply khoảng 1,01 giây cho 100 lineage trong fixture. Đây là số đo local, không
+phải SLA. Checkpoint migration/intent/HTTP/MQTT, P3 baseline/P3 Stage 6 và full
+HTTP đã PASS tại source được kiểm; không thay kết quả đó thành FAIL. Dòng 563–564
+của kế hoạch chưa đủ đóng do MEDIUM còn mở. Remote CI cho mã nguồn Stage 6
+đã PASS tại commit `a648ec1c8e22b99d3a185aa480a8b17534f7df8f` (Actions run 44501549344);
+tuy nhiên board/HIL và rollout chưa được xác minh; target backup/restore
+và vận hành shared/live cũng chưa được kiểm chứng.
+
 ### Bàn giao Stage 5 sau kiểm chứng cục bộ — giới hạn còn mở (14/11/2026)
 
 Xem [báo cáo Stage 5 downlink](../backend/stage-5-downlink.md) và
@@ -530,7 +552,7 @@ AM5728; đây không phải bằng chứng hoàn tất yêu cầu phần cứng 
 | Runtime board AM5728 với dữ liệu tổng hợp và sensor vật lý/HIL chưa chạy; R3/R4/R5 deferred | Simulator và ARMv7 cross-build không chứng minh runtime trên board, acquisition, readback hay sensor thật; adapter/acquisition chưa được triển khai | Giữ riêng hai mức board/HIL là NOT RUN; không tạo bằng chứng board giả lập hoặc PASS thay thế | Khi có board/driver/quyền truy cập và được yêu cầu tiếp tục |
 | Migration source dừng ở 26, nhưng schema deployment chưa xác nhận | Không thể kết luận target DB đã migrate/tương thích chỉ từ source tree | Kiểm tra trước schema, grants, backup/window tại target trước rollout; handoff này không tác động DB dùng chung | Stage 9 khi được giao rollout tại target |
 | Rollout shared/live, diễn tập key/credential và demo target chưa thực hiện | PASS trên fixture cục bộ không chứng minh cấu hình, ACL, credentials hay readiness tại môi trường được bàn giao | Giữ mọi feature defaults false; chưa enable điều khiển cho client | Stage 9 khi có approval và kế hoạch target cụ thể |
-| Semantics Stage 6 chưa đầy đủ | Fixed retry/backoff không phải full retry policy; cancellation/reconciliation và acknowledged runtime contract chưa được chốt | Giữ expiry/late-result behavior Stage 5 hiện tại; không tự retry command hoặc tuyên bố đã hội tụ | Chỉ khi Stage 6 được giao riêng |
+| Semantics Stage 6 đã hoàn thành trong mã nguồn nhưng retention còn mở | Stage 6 R0–R8 đã triển khai và pass remote CI (Actions run 44501549344); retention script còn finding MEDIUM mở; rollout/demo target chưa chạy | Giữ các cờ `STAGE6_ENABLED=false`, `GATEWAY_STAGE6_ENABLED=false`; không chạy retention apply trên shared/live | Xem mục Stage 6 R2 phía trên và báo cáo Stage 6 |
 
 Stage 9 tái sử dụng bằng chứng local/CI/board thực sự đã có, đồng thời phụ trách
 target preflight, rollout và demo/acceptance cuối; không coi bằng chứng board

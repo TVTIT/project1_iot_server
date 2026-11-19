@@ -115,8 +115,15 @@ rollback hành động thiết bị.
 ## [Giai đoạn 6 — BỔ SUNG ĐIỀU KHIỂN & KHẢ NĂNG PHỤC HỒI] Vòng đời mở rộng và cơ chế Retry/Reservation bền vững
 
 > **Lưu ý ranh giới:** Mục này mô tả thiết kế và trạng thái thực hiện của Giai đoạn 6 (Stage 6).
-> - **Đã triển khai trong mã nguồn backend (Opt-in qua `STAGE6_ENABLED=true`):** Cơ chế cấp quyền gửi (dispatch reservation) bền vững, lịch retry lũy thừa kèm jitter ngẫu nhiên trong khoảng 50–100%, bảo vệ fencing chống stale worker, giới hạn thời gian publish theo lease/TTL, các primitives hoàn tất trên repository/runtime dispatcher (`digitaltwin` và `mqttcontrol`), và endpoint hủy an toàn `POST /v1/digital-twins/{entity_id}/commands/{command_id}/cancel` cùng DTO command an toàn. Mặc định triển khai vẫn là `false`.
-> - **Chưa triển khai (Designed / Not Yet Implemented):** Phát sinh và xử lý MQTT device receipt (`command_receipt`), và điều phối đối soát sau reconnect (`configuration_query`/`configuration_snapshot`). Các tính năng này thuộc R5–R7, chưa được mở trong phạm vi R4.
+> - **Đã triển khai trong mã nguồn backend và Gateway simulator (Opt-in qua `STAGE6_ENABLED=true` / `GATEWAY_STAGE6_ENABLED=true`, mặc định `false`):**
+>   - Lịch retry lũy thừa kèm jitter ngẫu nhiên 50–100%, bảo vệ fencing chống stale worker, giới hạn thời gian publish theo lease/TTL (R3).
+>   - Endpoint hủy an toàn `POST /v1/digital-twins/{entity_id}/commands/{command_id}/cancel` (chỉ hủy trước reservation, trả 409 nếu đã cấp quyền dispatch, trả 200 idempotent lặp lại) (R4).
+>   - Envelope `command_receipt` và trạng thái `acknowledged` (Gateway lưu receipt bền vững trước apply, backend chuyển status `acknowledged`; không thay thế result thành công) (R5).
+>   - Envelopes `configuration_query` và `configuration_snapshot` cho phép backend đọc lại cấu hình thực tế từ Gateway sampler và SQLite watermark sau reconnect/discovery (R6).
+>   - Engine đối soát hội tụ tự động (Reconciliation Engine): phát hiện sai lệch, kiểm tra điều kiện (chưa bị cancel, còn budget <= 1), tạo command successor với ID mới, version mới tăng 1, cùng giá trị desired sampling (R7).
+>   - Tích hợp CI và diễn tập hồi quy (R8): GitHub Actions run 44501549344 đã PASS trên commit `a648ec1c8e22b99d3a185aa480a8b17534f7df8f`.
+>   - Kiểm chứng nâng cấp schema migration 26→27 và script dọn dẹp retention 30 ngày (R2 follow-up).
+> - **Tổng thể Stage 6 vẫn PARTIAL:** Script retention còn finding review độc lập (MEDIUM guard `json_each` thứ tự đánh giá, LOW timestamp snapshot); target demo/preflight/restore và rollout shared/live NOT RUN; board AM5728 / real sensor / HIL DEFERRED / NOT RUN. Mọi cờ triển khai vẫn mặc định `false`.
 
 ### 1. Ma trận chuyển trạng thái vòng đời (State Transition Matrix)
 
@@ -330,6 +337,9 @@ Trên API `GET .../commands` và `GET .../commands/{command_id}`:
 - `retry_stop_reason`: chuỗi nullable thuộc allowlist vận hành đã lưu, ví dụ `"retry_exhausted"` hoặc `"cancelled"`.
 - `origin`: `"client"`, `"reconciliation"` hoặc `null`. Giá trị mặc định do migration cấp cho dữ liệu cũ không phải bằng chứng provenance; vì vậy bản ghi `stage6_managed=false` trả `null`.
 - `root_command_id`, `parent_command_id`: UUID lineage nullable; chỉ được chiếu khi provenance Stage 6 đã được chứng minh.
+- `reconcile_blocked`: block marker nullable cho chính command, chỉ khi lineage hợp lệ; `root_reconcile_blocked` và `root_auto_successors_used` là block/budget của root đã xác thực, không phải budget của child.
+- `current_reconciliation`: decision/time của **Sensor state hiện tại**, chỉ có khi `command.desired_version` bằng `twin_states.desired_version`; không phải kết quả lịch sử của command cũ. Decision thuộc allowlist hữu hạn; không có snapshot thô hoặc payload.
+- Khi PATCH thực sự tạo desired version mới, transaction xóa `last_reconcile_decision`/`last_reconciled_at` cũ cùng lúc cập nhật desired; replay và no-op không làm mới/che khuất lịch sử hiện tại.
 
 DTO không chứa `cancelled_by`, payload/outbox bytes, raw SQL, receipt bytes hoặc chẩn đoán riêng của thiết bị.
 
@@ -366,9 +376,59 @@ DTO không chứa `cancelled_by`, payload/outbox bytes, raw SQL, receipt bytes h
   Stage 5 + Stage 6 retry regression trên fixture sở hữu; các required native test PASS, không skip và
   cleanup được xác minh. Đây là local source qualification tại HEAD + dirty tree, **không phải** remote
   CI, board/HIL, production certification hoặc rollout approval.
-- **Chưa hiện thực:** MQTT device receipt (`command_receipt`, R5) và runtime reconciliation
-  (`configuration_query`/`configuration_snapshot`, R7). Không có direct MQTT abort. Mọi cờ triển khai vẫn
-  mặc định `false`; migration 27 vẫn là schema draft trong working tree, chưa áp dụng DB dùng chung.
+- **Đã hiện thực một phần (6-R5.1):** parser/serializer receipt riêng và backend `AcceptControlReceipt`
+  transaction đã được kiểm tra trên PostgreSQL thật. Phạm vi R5.1 không bao gồm Gateway hoặc MQTT
+  runtime; các phần Gateway thuộc R5.2 được ghi riêng bên dưới.
+- **Đã hiện thực một phần (6-R5.2):** Gateway simulator opt-in `GATEWAY_STAGE6_ENABLED` tạo canonical
+  receipt từ nguyên command bytes, lưu receipt/hash/timestamp nguyên tử cùng reservation trước apply,
+  enqueue không-blocking và resend receipt/result qua một bounded fair response worker. Prepared recovery
+  dùng receipt đã lưu; legacy rows không được cấp receipt lịch sử. Khi Stage 6 tắt, receipt evidence cũ
+  vẫn giữ nguyên trong storage nhưng không được phát; periodic retry scan vẫn có lượt chạy hữu hạn khi
+  response queue liên tục có dữ liệu và Stage 5 giữ ngân sách scan 8 result. Đây không phải exactly-once.
+ - **Đã hiện thực (6-R5.3, local acceptance 17/11/2026):** receipt và result dùng chung bounded `ResultConsumer`; consumer
+  phân loại hẹp `message_type`, rồi gọi parser strict type-specific trước repository tương ứng.
+  Retained delivery bị từ chối cả khi transport admission và tại queue consumer; receipt có counters
+  riêng, không thêm result/timeline latency observation. Server chỉ bật receipt repository path qua
+  `STAGE6_ENABLED`; mặc định deployment vẫn `false`. Focused consumer/server tests PASS.
+ - **Nghiệm thu native 6-R5.3:** Stage 5 MQTT fixture chạy hết lifecycle Stage 5, Stage 6 retry và
+   `TestNativeMQTTStage6GatewayReceiptRoundTrip`, không skip; cleanup container/network/volume/workdir
+   được xác minh. Bài test dùng Gateway simulator thật (SQLite, TLS MQTT) và composed backend consumer
+   với PostgreSQL fixture: receipt canonical được publish/nhận và khớp bytes SQLite trong khi apply
+   đang bị giữ; trạng thái reported chưa đổi. Sau khi thả apply, result thành công cập nhật reported;
+   phát lại command nguyên bản chỉ gửi lại receipt/result bytes đã lưu, không gọi sampler thêm lần nữa.
+   Intent fixture PASS 33 test top-level, không skip, 5 scenario cleanup; P3 require-run PASS
+   (`PAPER_P3_ACCEPTED`, cleanup 17 containers/1 network/7 volumes). Affected Go race/static/build,
+   Python guards và ARMv7 build PASS. Đây là local source qualification tại HEAD + dirty tree, không
+   phải remote CI, board/HIL, production certification hoặc rollout approval.
+ - **Lịch sử lỗi được giữ nguyên:** một lượt trước đó báo Mosquitto exit code 3 và stdout Docker logs
+   rỗng; cause cụ thể không được xác định và lỗi không tái hiện ở các lượt hoàn chỉnh sau đó. Fixture
+   hiện lưu combined broker logs cùng state/mount access diagnostics nếu startup/port mapping lỗi;
+   không xem lịch sử này là blocker hiện tại hoặc đổi thành một root cause chưa được chứng minh.
+   Bằng chứng được tổng hợp trong các báo cáo nghiệm thu kỹ thuật và tài liệu nguồn.
+- **R6.1 đã hiện thực (local unit/source scope):** strict parser/serializer riêng cho query/snapshot và
+  Gateway Stage 6 opt-in read-only responder sau recovery/subscription readiness. Snapshot đọc
+  committed SQLite configuration và actual sampler dưới cùng apply mutex; queue/TTL hữu hạn, không lưu
+  snapshot, không tạo command result/receipt. Các cờ vẫn mặc định `false`.
+- **R6.2 implementation và native intent DB qualification:** backend bounded discovery/cooldown reservation
+  qua `twin_states.next_query_at`, một publisher typed query path, fixed scan/publish workers, tối đa 32
+  correlation RAM-only, snapshot strict demux và current-context recheck. Snapshot chỉ được chuyển tiếp
+  như untrusted candidate; không ghi snapshot/desired/reported/command/result hay tạo successor. Focused
+  mqttcontrol tests, package race/vet/lint/build pass. Native `stage5_intent_fixture.py` require-ran 34
+  top-level tests (including query due traversal, durable cooldown across repository reconstruction,
+  and stale-context rejection), no skips; fresh/upgrade and three preflight-refusal scenarios all passed
+  with cleanup verified.
+- **R6.3 và R7.1–R7.3 đã nghiệm thu:** R6.3 native TLS/DynSec query → Gateway SQLite+sampler readback;
+  R7.1 transaction/decision; R7.2 runtime composition, REST projection (`origin`, `root_command_id`,
+  `parent_command_id`, `reconcile_blocked`, `current_reconciliation`) và metrics nhãn cố định; R7.3 native
+  convergence trên fixture sở hữu (mất result $\to$ timeout root $\to$ snapshot readback $\to$ tạo successor
+  với ID/version mới $\to$ Gateway áp dụng thành công $\to$ cập nhật reported). Lệnh hủy trực tiếp qua MQTT
+  không tồn tại (no remote abort).
+- **R8 tích hợp CI và R2 follow-up đã hoàn tất:** CI từ xa qua GitHub Actions run 44501549344 đã PASS
+  toàn bộ các job `stage5-control-integration` (P3 baseline, P3 opt-in Stage 6, MQTT retry/convergence),
+  `dynsec-bootstrap-tests`, `migration-check` và `native-compose-smoke` trên commit `a648ec1c8e22b99d3a185aa480a8b17534f7df8f`.
+  Kiểm chứng nâng cấp schema migration 26→27 và script retention PASS trên fixture cục bộ.
+- **Trạng thái tổng thể Stage 6 vẫn PARTIAL:** Do script retention còn finding review chưa đóng,
+  target demo/preflight/restore và rollout shared/live NOT RUN, board AM5728 / real sensor / HIL DEFERRED / NOT RUN.
 
 ---
 
@@ -564,10 +624,10 @@ Mọi envelope JSON mới trong Giai đoạn 6 (`command_receipt`, `configuratio
 2. **Precondition Guard:** Chỉ áp dụng auto recovery cho Sensor đã được provision VÀ đã có **committed user intent thực sự** trong cơ sở dữ liệu. Tuyệt đối không tự động sinh successor từ initial desired defaults khi chưa từng có user intent nào được commit.
 3. **Safety & Block Guards (Ưu tiên cao hơn các nhánh mismatch):**
    - Gateway version cao hơn server, hoặc store SQLite hỏng (`configuration_state == "unavailable"`), hoặc không thể xác minh nguồn gốc $\to$ **UNCONFIRMED / MANUAL**. Không tự nâng server watermark theo số Gateway tự khai.
-   - Lỗi unsupported / unknown Sensor / corrupt store $\to$ **MANUAL ACTION**, không được tự động tạo successor.
+   - Lỗi unsupported / unknown Sensor / corrupt store hoặc readback configured nhưng thiếu `actual_sample_interval_us` $\to$ **MANUAL ACTION**, không được tự động tạo successor. `UNKNOWN_SENSOR`, `UNSUPPORTED_CONFIGURATION`, `APPLY_FAILED` và error code lưu không nhận diện được fail closed; timeout/mất result và `COMMAND_EXPIRED`/`STALE_DESIRED_VERSION` không bị nhầm thành lỗi permanent.
    - Cancelled block guard: Nếu intent của desired version hiện tại đã bị hủy (`reconcile_blocked == true`) $\to$ **BLOCKED**.
    - Budget guard: Nếu root intent đã sử dụng hết ngân sách tự động (`auto_successors_used >= max_auto_successors`) $\to$ **BLOCKED**.
-4. **Convergence Check:** Desired == Reported == Durable == Actual VÀ Desired version == Watermark $\to$ **CONVERGED**.
+4. **Convergence Check:** Desired == Reported == Durable == Actual VÀ Desired version == Watermark $\to$ **CONVERGED**. Version xác nhận cấu hình lấy từ `reported.configuration.desired_version`; `twin_states.reported_version` là bộ đếm báo cáo tổng hợp, không phải config version.
 5. **Recovery Branches (Chỉ khi vượt qua toàn bộ các guards trên):**
    - Thiết bị đã áp dụng nhưng thiếu xác nhận reported $\to$ **CREATE_SUCCESSOR** (không lấy snapshot ghi reported).
    - Watermark thấp hơn / unconfigured / readback lệch $\to$ **CREATE_SUCCESSOR**.
@@ -670,4 +730,256 @@ Mọi envelope JSON mới trong Giai đoạn 6 (`command_receipt`, `configuratio
 3. **Giới hạn Hạ cấp Ứng dụng (Application Rollback Limitations):**
    - Hạ cấp binary ứng dụng không được chứng minh hay bảo đảm chỉ bằng việc gạt cờ tính năng hay drain hàng đợi outbox. Dữ liệu lệnh có trạng thái `cancelled` hay các cột mới sẽ không tương thích với DTO/parser của binary Stage 5 cũ nếu không có bản sao lưu schema tương thích được phục hồi.
 4. **Ranh giới Thực hiện:**
-   - Tại mốc R2 này, **chỉ có tầng lưu trữ schema PostgreSQL (Migration 27) và SQLite (user_version 3) được cài đặt và kiểm nghiệm tương thích**; toàn bộ runtime nghiệp vụ retry, cancel, receipt emission/handling và reconciliation của Stage 6 **chưa được kích hoạt hay triển khai** (thuộc các Task R3–R7 tiếp theo). Các cờ tính năng mặc định tiếp tục là `false`.
+   - Các lát cắt R0–R8 và R2 follow-up đã hoàn tất cài đặt trong mã nguồn backend (`internal/digitaltwin`, `internal/mqttcontrol`, `internal/httpserver`, `cmd/server`) và Gateway simulator (`internal/gatewaysim`, `cmd/gateway`), và đã PASS CI từ xa (GitHub Actions run 44501549344 trên commit `a648ec1c8e22b99d3a185aa480a8b17534f7df8f`).
+   - Mặc định triển khai vẫn là **TẮT** (`STAGE6_ENABLED=false`, `GATEWAY_STAGE6_ENABLED=false`).
+   - Tổng thể Stage 6 vẫn **PARTIAL** do script retention còn finding review chưa đóng, target demo/preflight/restore và rollout shared/live NOT RUN, board AM5728 / real sensor / HIL DEFERRED / NOT RUN.
+
+---
+
+### 12. Ví dụ Luồng REST và Thao tác Vận hành Thực tế (Worked REST Examples & Operational Flows)
+
+Các ví dụ dưới đây minh họa chính xác các luồng REST thực tế trên API kiểm soát cảm biến Stage 6 dựa trên mã nguồn và hợp đồng hiện hành.
+
+#### 12.1. Luồng 1: PATCH Tạo Intent $\to$ Tra cứu Status $\to$ Hủy An toàn (Safe Cancel)
+
+##### Bước 1.1: Gửi yêu cầu thay đổi tần số lấy mẫu (PATCH Desired State)
+```http
+PATCH /v1/digital-twins/urn:ngsi-ld:Sensor:gateway_001:sensor_001/desired-state HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <OWNER_OR_OPERATOR_JWT>
+Content-Type: application/json
+Idempotency-Key: patch-intent-20261118-001
+
+{
+  "frequency_hz": 1.5,
+  "expected_desired_version": "12"
+}
+```
+
+Phản hồi chấp thuận (`202 Accepted`):
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/json; charset=utf-8
+Location: /v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agateway_001%3Asensor_001/commands/0195e18d-0001-7a42-9064-69ea49e63bf1
+
+{
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "status": "pending",
+  "requested_frequency_hz": "1.5",
+  "effective_frequency_hz": 1.5,
+  "sample_interval_us": 666667,
+  "desired_version": "13",
+  "expires_at": "2026-11-18T10:01:00.000000Z",
+  "status_url": "/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agateway_001%3Asensor_001/commands/0195e18d-0001-7a42-9064-69ea49e63bf1"
+}
+```
+
+##### Bước 1.2: Tra cứu trạng thái lệnh (GET Command Detail)
+```http
+GET /v1/digital-twins/urn:ngsi-ld:Sensor:gateway_001:sensor_001/commands/0195e18d-0001-7a42-9064-69ea49e63bf1 HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <VIEWER_OWNER_OPERATOR_JWT>
+Accept: application/json
+```
+
+Phản hồi (`200 OK` — quan sát tại thời điểm lệnh vẫn ở trạng thái pending, attempt count = 0):
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "status": "pending",
+  "desired_version": "13",
+  "parameters": {
+    "sample_interval_us": 666667
+  },
+  "issued_at": "2026-11-18T10:00:00.000000Z",
+  "expires_at": "2026-11-18T10:01:00.000000Z",
+  "attempt_count": 0,
+  "origin": "client",
+  "root_command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "parent_command_id": null,
+  "reconcile_blocked": false,
+  "root_reconcile_blocked": false,
+  "root_auto_successors_used": 0
+}
+```
+*(Lưu ý: Việc `GET` thấy `status: "pending"` chỉ là quan sát tại thời điểm đọc, không bảo đảm lệnh chưa bị worker cấp quyền dispatch ngay sau đó. Thao tác cancel tiếp theo sẽ tái kiểm tra có khóa trong cơ sở dữ liệu; nếu lệnh đã được reserve, API sẽ trả về 409 Conflict).*
+
+##### Bước 1.3: Hủy an toàn khi lệnh chưa được cấp quyền dispatch (POST Cancel)
+```http
+POST /v1/digital-twins/urn:ngsi-ld:Sensor:gateway_001:sensor_001/commands/0195e18d-0001-7a42-9064-69ea49e63bf1/cancel HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <OWNER_OR_OPERATOR_JWT>
+Content-Length: 0
+```
+*(Lưu ý: Endpoint cancel yêu cầu body rỗng. Nếu gửi body hoặc Content-Type lạ sẽ bị từ chối 415/400 trước khi chạm logic database).*
+
+Phản hồi hủy thành công (`200 OK`):
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "status": "cancelled",
+  "desired_version": "13",
+  "cancelled_at": "2026-11-18T10:00:01.234567Z",
+  "status_url": "/v1/digital-twins/urn%3Angsi-ld%3ASensor%3Agateway_001%3Asensor_001/commands/0195e18d-0001-7a42-9064-69ea49e63bf1"
+}
+```
+
+- **Phát lại lệnh hủy (Replay Cancel):** Gọi lại chính xác `POST .../cancel` trên command đã `cancelled` bởi caller có thẩm quyền sẽ trả về đúng `200 OK` với cùng kết quả lưu trữ (cùng `cancelled_at`), kể cả sau khi `expires_at` gốc đã trôi qua.
+- **Trường hợp từ chối hủy (Conflict 409):** Nếu worker đã cấp quyền dispatch (`first_reserved_at != nil` hoặc `attempt_count > 0`), hoặc lệnh đã bước vào trạng thái active/terminal khác (`published`, `acknowledged`, `succeeded`, `failed`, hoặc `timeout`), server trả về mã lỗi và thông điệp chuẩn:
+```http
+HTTP/1.1 409 Conflict
+Content-Type: application/json; charset=utf-8
+
+{
+  "error": {
+    "code": "command_not_cancellable",
+    "message": "command not cancellable",
+    "request_id": "0195e18d-0000-7a42-9064-69ea49e63bf0"
+  }
+}
+```
+
+---
+
+#### 12.2. Luồng 2: Lệnh Timeout $\to$ Readback $\to$ Successor Mới $\to$ Succeeded
+
+##### Bước 2.1: Lệnh ban đầu bị Timeout (mất gói tin result trên mạng)
+Lệnh root `0195e18d-0001-7a42-9064-69ea49e63bf1` được phát với desired version `"14"` (interval `666667` us).
+Sau các lần thử theo ngân sách cấp quyền dispatch (mặc định 5 lượt, cấu hình qua `STAGE6_RETRY_MAX_ATTEMPTS`) và hết hạn TTL (`expires_at`), kết quả thực thi không đến.
+Khi tra cứu `GET .../commands/0195e18d-0001-7a42-9064-69ea49e63bf1`:
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "status": "timeout",
+  "desired_version": "14",
+  "parameters": {
+    "sample_interval_us": 666667
+  },
+  "attempt_count": 5,
+  "retry_stop_reason": "retry_exhausted",
+  "origin": "client",
+  "root_command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "parent_command_id": null,
+  "reconcile_blocked": false,
+  "root_reconcile_blocked": false,
+  "root_auto_successors_used": 0
+}
+```
+**`timeout` là trạng thái kết thúc (terminal)**, không bị xóa hay đảo ngược thành `succeeded`.
+
+##### Bước 2.2: Reconnect và Readback qua `configuration_query` / `configuration_snapshot`
+Khi Gateway kết nối lại, backend discovery quét thấy Sensor cần đối soát (`desired_version: "14"`, `reported.configuration.desired_version: "13"`).
+Backend gửi `configuration_query` downlink. Gateway phản hồi `configuration_snapshot` uplink:
+- Gateway báo `watermark_version: "13"`, `configuration_state: "configured"`, `actual_sample_interval_us: 1000000`.
+- Mismatch được xác thực: Gateway đang ở watermark `"13"` cũ, cadence thực tế `1000000` us lệch so với server mong muốn `666667` us.
+- Guard kiểm tra: chưa bị cancel (`reconcile_blocked: false`), ngân sách còn (`auto_successors_used: 0 < 1`).
+
+##### Bước 2.3: Reconciliation Engine sinh Successor Command mới
+Engine tạo một successor command nguyên tử:
+- **`command_id` mới:** `0195e18d-0002-7a42-9064-69ea49e63bf2`.
+- **`desired_version` tăng lên 1 đơn vị:** `"15"`.
+- **Giá trị thông số mong muốn giữ nguyên:** `sample_interval_us: 666667` (1.5 Hz).
+- Dòng dõi: `origin = "reconciliation"`, `root_command_id = "0195e18d-0001-7a42-9064-69ea49e63bf1"`, `parent_command_id = "0195e18d-0001-7a42-9064-69ea49e63bf1"`.
+- Ngân sách tự động của root được cập nhật: `root_auto_successors_used = 1`.
+- Lệnh root cũ vẫn giữ nguyên `status = "timeout"`.
+
+##### Bước 2.4: Successor được Gateway áp dụng và xác nhận
+- Gateway nhận successor, ghi SQLite receipt $\to$ phát `command_receipt` (backend chuyển successor sang `acknowledged` nếu quan sát được trước khi result đến).
+- Gateway gọi sampler apply cấu hình `666667` us $\to$ thành công $\to$ phát `command_result` (`succeeded`).
+- Backend nhận result $\to$ chuyển successor sang `succeeded`.
+- `twin_states.reported.configuration` cập nhật (kèm `applied_at`):
+  `{"sample_interval_us": 666667, "desired_version": "15", "applied_at": "2026-11-18T10:05:01.350000Z"}`.
+- Tra cứu successor `GET .../commands/0195e18d-0002-7a42-9064-69ea49e63bf2`:
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "command_id": "0195e18d-0002-7a42-9064-69ea49e63bf2",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "status": "succeeded",
+  "desired_version": "15",
+  "parameters": {
+    "sample_interval_us": 666667
+  },
+  "attempt_count": 1,
+  "acknowledged_at": "2026-11-18T10:05:01.100000Z",
+  "completed_at": "2026-11-18T10:05:01.350000Z",
+  "origin": "reconciliation",
+  "root_command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "parent_command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "reconcile_blocked": false,
+  "root_reconcile_blocked": false,
+  "root_auto_successors_used": 1
+}
+```
+*(Lưu ý về precedence: Việc kiểm tra ngân sách diễn ra trước kiểm tra hội tụ. Successor thành công đưa version khớp nhau có thể khiến discovery dừng quét nên không nhất thiết phải hiển thị snapshot decision `converged`. Nếu sau đó gói tin result muộn của root ban đầu đến: backend ghi nhận bằng chứng late result riêng, tuyệt đối không ghi đè cấu hình đã hội tụ).*
+
+---
+
+#### 12.3. Luồng 3: Trường hợp Bị chặn (Blocked) và Hướng dẫn Xử lý Thủ công (Manual Action)
+
+##### Trường hợp 3A: Intent đã bị Hủy (`decision = "blocked_cancelled"`)
+Khi người dùng đã chủ động hủy intent bằng `POST .../cancel`, cờ `reconcile_blocked = true` được gán trên root intent.
+Khi nhận snapshot, Engine đối soát kiểm tra guard cancel trước và quyết định: `decision = "blocked_cancelled"`. Không successor nào được tạo.
+
+##### Trường hợp 3B: Hết Ngân sách Tự động (`decision = "blocked_budget"`)
+Successor duy nhất được phép (`maxAutomaticReconcileSuccessors = 1`) đã phát hành nhưng cũng bị timeout hoặc thất bại.
+Engine kiểm tra ngân sách trước kiểm tra hội tụ và quyết định: `decision = "blocked_budget"`.
+*Lưu ý phân định:* Hết ngân sách tự động hoàn toàn tách biệt với hủy lệnh; `blocked_budget` **không** đặt `reconcile_blocked = true` hay `root_reconcile_blocked = true`.
+
+Tra cứu lệnh successor khi hết ngân sách:
+```http
+GET /v1/digital-twins/urn:ngsi-ld:Sensor:gateway_001:sensor_001/commands/0195e18d-0002-7a42-9064-69ea49e63bf2 HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <VIEWER_OWNER_OPERATOR_JWT>
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "command_id": "0195e18d-0002-7a42-9064-69ea49e63bf2",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "status": "timeout",
+  "desired_version": "15",
+  "origin": "reconciliation",
+  "root_command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "parent_command_id": "0195e18d-0001-7a42-9064-69ea49e63bf1",
+  "reconcile_blocked": false,
+  "root_reconcile_blocked": false,
+  "root_auto_successors_used": 1,
+  "current_reconciliation": {
+    "desired_version": "15",
+    "decision": "blocked_budget",
+    "last_reconciled_at": "2026-11-18T10:10:00.000000Z"
+  }
+}
+```
+
+##### Trường hợp 3C: Thiết bị Báo lỗi hoặc Store SQLite Hỏng
+- Gateway phản hồi snapshot với `configuration_state: "unavailable"` $\to$ Engine ghi nhận `decision = "corrupt_unavailable"`.
+- Gateway watermark cao hơn server, hoặc snapshot báo `configured` nhưng thiếu interval, hoặc unconfigured thiếu actual $\to$ Engine ghi nhận `decision = "manual_unconfirmed"`.
+
+##### Hướng dẫn Xử lý Hành động cho Người vận hành / Client:
+1. **Kiểm tra tình trạng vật lý:** Kiểm tra kết nối mạng của Gateway, tính sẵn sàng của sensor phần cứng và log lỗi Gateway.
+2. **Đọc trạng thái hiện hành:** Gọi `GET /v1/digital-twins/{entity_id}?format=simplified` để xác định `desired_version` và `reported_state` hiện tại; tra cứu chi tiết lệnh qua `GET /v1/digital-twins/{entity_id}/commands/{command_id}` để đối chiếu quyết định đối soát gần nhất.
+3. **Mở lại intent mới:** Người dùng hoặc ứng dụng client gửi một request **PATCH mới** tới `/v1/digital-twins/{entity_id}/desired-state`:
+   - Phải sử dụng header `Idempotency-Key` mới (không dùng lại key cũ).
+   - `expected_desired_version` phải khớp với version hiện hành vừa đọc được (ở ví dụ trên là `"15"`).
+   - Khi request PATCH mới được chấp thuận (`202 Accepted`): Server khởi tạo một root intent mới (tăng version lên `"16"`, cấp `command_id` mới, `root_command_id` chính là ID mới này, `auto_successors_used = 0`), đồng thời **xóa sạch trạng thái đối soát của Sensor state (`last_reconciled_at = NULL, last_reconcile_decision = NULL`)** trong cùng transaction. Lưu ý: Intent mới không thay đổi hay xóa cờ trên bản ghi command root lịch sử cũ, mà bắt đầu một lineage hoàn toàn mới!
+   - Tuyệt đối không thử gửi lại key cũ hoặc trông đợi hệ thống tự lặp vô hạn.

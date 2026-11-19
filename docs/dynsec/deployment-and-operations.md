@@ -400,6 +400,140 @@ curl --fail-with-body \
 Viewer không được gọi PATCH; backend vẫn enforcement membership/role ở server.
 Không retry intent chưa rõ kết quả bằng key/body mới.
 
+### Vận hành Phân hệ Điều khiển Hồi phục Stage 6 (Control Resilience)
+
+#### 1. Cấu hình Cờ Tính năng Opt-in (Feature Flags & Prerequisites)
+
+Toàn bộ các tính năng mở rộng của Stage 6 (lịch retry lũy thừa + jitter, endpoint hủy an toàn, device receipt, đối soát cấu hình sau reconnect) mặc định bị **vô hiệu hóa** trên môi trường triển khai chung:
+
+- **Backend:** `STAGE6_ENABLED=false` (mặc định tắt).
+  - *Điều kiện tiên quyết:* Bắt buộc phải có `STAGE5_ENABLED=true`. Nếu cấu hình `STAGE6_ENABLED=true` mà `STAGE5_ENABLED=false`, tiến trình backend sẽ dừng khởi động ngay lập tức (fail-fast) với lỗi cấu hình rõ ràng.
+  - Khi bật (`STAGE6_ENABLED=true`), backend kích hoạt: lịch retry có jitter (`AttemptCount`, `FirstReservedAt`), endpoint hủy lệnh `POST /v1/digital-twins/{entity_id}/commands/{command_id}/cancel`, bộ xử lý receipt `command_receipt` chuyển trạng thái sang `acknowledged`, và worker đối soát định kỳ (`configuration_query` / `configuration_snapshot`).
+- **Gateway Simulator:** `GATEWAY_STAGE6_ENABLED=false` (mặc định tắt).
+  - *Điều kiện tiên quyết:* Bắt buộc phải có `GATEWAY_CONTROL_ENABLED=true`. Nếu cấu hình `GATEWAY_STAGE6_ENABLED=true` mà `GATEWAY_CONTROL_ENABLED=false`, Gateway simulator sẽ fail-fast ngay khi khởi động.
+  - Khi bật (`GATEWAY_STAGE6_ENABLED=true`), Gateway simulator kích hoạt: tự động tạo và lưu bền vững canonical receipt trong SQLite trước khi apply, phát `command_receipt` lên broker, và phản hồi `configuration_snapshot` khi nhận được `configuration_query`.
+- **Nguyên tắc phối hợp:** Luôn bật/tắt đồng bộ cả hai phía khi kiểm thử. Nếu backend bật nhưng Gateway tắt tính năng Stage 6, Gateway sẽ bỏ qua `configuration_query` và không gửi phản hồi. Phía backend sẽ hết hạn query (timeout) sau 5 giây và hủy correlation tạm trong RAM; sự im lặng này không cấu thành snapshot hợp lệ và không tự ý ghi nhận trạng thái thiết bị hay đưa ra quyết định đối soát.
+
+#### 2. Quy trình Tiền kiểm tra (Preflight), Migration 27 và Sao lưu
+
+1. **Migration PostgreSQL 27 (`000027_stage6_control_resilience.up.sql`):**
+   - Bổ sung các cột phục hồi vào `twin_commands`: `stage6_managed`, `first_reserved_at`, `retry_stop_reason`, `receipt_bytes`, `receipt_hash`, `receipt_received_at`, `cancelled_at`, `cancelled_by`, `origin`, `root_command_id`, `parent_command_id`, `original_actor_id`, `reconcile_blocked`, `auto_successors_used`. (Lưu ý: `attempt_count` và `acknowledged_at` là các trường cơ bản đã có từ migration 23; `twin_outbox` không thêm cột mới trong migration 27 vì `attempt_count` và `next_attempt_at` đã tồn tại từ migration 23).
+   - Bổ sung vào `twin_states` đúng 3 cột: `next_query_at`, `last_reconciled_at`, `last_reconcile_decision`. (Hai trường `reconcile_blocked` và `auto_successors_used` nằm trên `twin_commands`, không nằm trên `twin_states`).
+   - Ràng buộc khóa ngoại `root_command_id` và `parent_command_id` sử dụng `ON DELETE RESTRICT` để bảo vệ dòng dõi lệnh.
+2. **Tiền kiểm tra (Preflight Checklist):**
+   - Đối chiếu endpoint và cluster database đúng mục tiêu (host, port, database name).
+   - Xác nhận dung lượng đĩa còn đủ để thực hiện DDL và ghi log WAL.
+   - **Sao lưu bắt buộc:** Tạo bản sao lưu cơ sở dữ liệu (logical hoặc physical) và xác nhận bản sao lưu có khả năng restore thành công trước khi áp dụng migration. Không tự cấp chứng chỉ target cho bất kỳ môi trường nào khi chưa có diễn tập restore thực tế.
+   - Migration áp dụng lock ngắn trên các bảng liên quan; do đó phải thiết lập maintenance window và tạm dừng admissions mới trước khi chạy.
+3. **Nâng cấp SQLite Gateway Simulator (`user_version = 3`):**
+   - Quá trình nâng cấp SQLite diễn ra tự động khi Gateway simulator mở file cơ sở dữ liệu (`OpenOutbox`). Binary Gateway cũ chỉ hỗ trợ `user_version = 2` sẽ từ chối mở file đã nâng cấp.
+
+#### 3. Quy trình Tạm dừng và Xả hàng đợi (Quiesce & Drain)
+
+Trước khi thực hiện bảo trì, nâng cấp hoặc dọn dẹp dữ liệu:
+1. **Dừng tiếp nhận (Quiesce Admissions):** Ngừng toàn bộ lưu lượng client gọi `PATCH .../desired-state` (qua cấu hình Nginx gateway hoặc firewall).
+2. **Xả hàng đợi Outbox (Drain Outbox):** Đợi các worker publisher xử lý hết các bản ghi đang chờ trong cơ sở dữ liệu:
+   ```sql
+   SELECT count(*) FROM public.twin_outbox WHERE status = 'pending';
+   ```
+   Xác nhận số lượng pending về 0 và không còn bản ghi due nào cần phát; không bao giờ giả định hàng đợi rỗng đồng nghĩa với không còn tác vụ due.
+3. **Đợi lệnh In-flight:** Chờ các lệnh đã phát hành nhận được `command_result` hoặc chạm mốc timeout tự nhiên (`expires_at`), đảm bảo không còn lệnh active (`pending`, `published`, `acknowledged`) trước khi thao tác bảo trì sâu.
+
+#### 4. Khởi động lại có Kiểm soát, Hạ cấp và Giới hạn Rollback
+
+- **Khởi động lại có kiểm soát (Controlled Restart):** Toàn bộ trạng thái bền vững của Stage 6 (lịch hẹn retry `next_attempt_at`, số lần thử `attempt_count`, version watermark, ngân sách root intent, và receipt lưu trữ) đều được duy trì trong PostgreSQL và SQLite. Tuy nhiên, tương quan `request_id` của query đối soát trong RAM sẽ bị xóa sạch khi restart; các worker khi khởi động lại sẽ quét định kỳ có giới hạn (scan batch 16, cooldown 30s) để tái khám phá thiết bị.
+- **Tắt tính năng Stage 6 (Feature Flag Downgrade):** Việc khởi động lại với cờ tính năng tắt (`STAGE6_ENABLED=false`, `GATEWAY_STAGE6_ENABLED=false`) không phải là phương án hạ cấp an toàn vô điều kiện. Cần phải quiesce lưu lượng và drain sạch các lệnh active (`pending`, `published`, `acknowledged`) trước; không giả định trạng thái rảnh là an toàn để tắt cờ khi còn tác vụ due dở dang.
+- **Giới hạn Hạ cấp Binary (Binary Downgrade Warning):** Hạ cấp binary ứng dụng về phiên bản cũ (trước Stage 6) **hoàn toàn không được hỗ trợ nếu chỉ gạt cờ hay drain outbox**. Dữ liệu lệnh có trạng thái `cancelled` hoặc các cột schema mới trong cơ sở dữ liệu sẽ không tương thích với parser/DTO của binary cũ. Muốn hạ cấp binary hoàn toàn, bắt buộc phải khôi phục cơ sở dữ liệu từ bản sao lưu trước khi áp dụng Migration 27.
+
+#### 5. Khả năng Không Hỗ trợ (Unsupported Capabilities) và Thao tác Thủ công (Manual Action)
+
+- **Không hỗ trợ Remote Abort qua MQTT:** Backend tuyệt đối không gửi tin nhắn hủy xuống broker hoặc thiết bị. Lệnh hủy REST (`POST .../cancel`) chỉ có hiệu lực khi lệnh chưa từng được worker cấp quyền dispatch (`attempt_count == 0` và `first_reserved_at IS NULL`). Nếu lệnh đã dispatch hoặc đang active trên kênh truyền, endpoint trả về `409 Conflict` (`command_not_cancellable`).
+- **Không cam kết Exactly-once:** Toàn bộ giao thức hoạt động theo cơ chế at-least-once kết hợp với deduplication bền vững và version watermark.
+- **Các trường hợp cần can thiệp thủ công (Manual Action):**
+  - Gateway báo trạng thái hỏng store SQLite (`configuration_state: "unavailable"`) $\to$ Engine ghi nhận `decision = "corrupt_unavailable"`.
+  - Thiết bị báo watermark cao hơn server hoặc cấu hình thiếu thông số $\to$ Engine ghi nhận `decision = "manual_unconfirmed"`.
+  - Intent đã bị người dùng hủy $\to$ `decision = "blocked_cancelled"`.
+  - Đã dùng hết ngân sách tự động (`root_auto_successors_used >= maxAutomaticReconcileSuccessors`) $\to$ `decision = "blocked_budget"`.
+  - Khi gặp các trường hợp trên, Engine đối soát dừng tự động tạo successor (fail-closed, ghi nhận quyết định tương ứng).
+  - **Hành động của Operator/User:** Kiểm tra thiết bị vật lý, kiểm tra trạng thái hiện tại qua `GET /v1/digital-twins/{entity_id}?format=simplified` và tra cứu chi tiết lệnh qua `GET /v1/digital-twins/{entity_id}/commands/{command_id}`, sau đó phát một request `PATCH` mới với `Idempotency-Key` mới và `expected_desired_version` cập nhật.
+
+### Dọn lịch sử command Stage 6 (thao tác operator, retention 30 ngày)
+
+**Trạng thái an toàn: REQUEST_CHANGES, chưa vận hành apply trên DB shared/live.**
+Selector còn một guard `json_each` phụ thuộc thứ tự đánh giá `AND` khi JSON có
+hai wrapper `reported_state` và wrapper đầu là scalar. Probe biểu thức con trên
+PostgreSQL 16.15 báo `cannot deconstruct a scalar`; dry-run và apply qua entrypoint
+thật với cùng dữ liệu thử đều PASS, không có abort hay mất dữ liệu được tái hiện
+qua entrypoint. Cần sửa guard và xác minh lại trước khi cân nhắc apply; chi tiết,
+giới hạn regression timestamp và hướng xử lý nằm trong
+[backlog chung](limitations-and-backlog.md#stage-6-r2--giới-hạn-retention-postgresql-còn-mở).
+
+Retention chỉ chạy thủ công trên PostgreSQL đã migrate đúng schema Stage 6.
+Entrypoint là `scripts/sql/stage6-command-retention.sql`; kết nối bằng danh tính
+operator được cấp quyền xóa các bảng liên quan, dùng `psql -X` và chỉ định tên
+database đích tường minh. Không chạy từ backend, cron, startup hook hay trên DB
+dùng chung/live nếu chưa có phê duyệt vận hành riêng.
+
+Trước khi vào cửa sổ apply, đối chiếu endpoint/cluster theo inventory đã phê
+duyệt (host, port và định danh cluster; tên DB riêng lẻ không định danh duy nhất
+một đích), yêu cầu target approval, xác nhận backup mới nhất đã hoàn tất và có
+thể restore, dừng admissions mới, drain/stop các writer liên quan và xác nhận
+không còn maintenance writer cạnh tranh. Nếu không đạt đủ điều kiện, dừng ở
+dry-run; không tự tạo backup hay đổi cấu hình triển khai trong quy trình này.
+
+Mặc định script chạy **dry-run** và không sửa business rows. Decoder JSON fail-closed
+là temporary function được tạo trong transaction dry-run rồi transaction được
+`ROLLBACK`; do đó dry-run không phải `READ ONLY` transaction, nhưng không ghi dữ
+liệu business, không giữ helper sau transaction và không lấy write lock trên bảng
+business. Dùng primary/đích writable có quyền `TEMP` trên database cho temporary
+function. Nếu không có quyền này, script phải fail thay vì bỏ qua decode/error
+handling. Dùng libpq service file được bảo vệ cho host/port/database/user và
+`PGPASSFILE` mode `0600` cho password; không đặt DSN chứa password trong argv,
+shell history hay log:
+
+```sh
+export PGSERVICE=stage6_retention
+export PGSERVICEFILE='<PROTECTED_LIBPQ_SERVICE_FILE>'
+export PGPASSFILE='<PROTECTED_PGPASSFILE>'
+psql -X "service=$PGSERVICE" \
+  -v target_database='<EXPECTED_DATABASE_NAME>' \
+  -f scripts/sql/stage6-command-retention.sql
+```
+
+Chỉ các lineage Stage 6 terminal có bằng chứng nhất quán, đã hết hạn lưu ít nhất
+30×24 giờ theo UTC tính từ bằng chứng gần nhất, và không còn là desired version
+hiện hành mới đủ điều kiện. Lineage chỉ hỗ trợ root đơn hoặc đúng một successor
+reconciliation. Dữ liệu legacy, lineage không hoàn chỉnh/mơ hồ, receipt hoặc
+result sai lệch, current intent, receipt no-op và các trường hợp không được nhận
+dạng sẽ được giữ lại (fail closed). Mỗi lượt xem/xóa tối đa 100 lineage; đọc số
+lượng và chạy lại dry-run để xem batch kế tiếp.
+
+Apply là thao tác destructive: chỉ thực hiện sau khi đã xem dry-run, xác nhận đúng
+endpoint/cluster, xác nhận backup/restore và quiesce/drain, đồng thời có target
+approval trong cửa sổ đã thống nhất. Hai biến xác nhận phải khớp chính xác tên DB
+đang kết nối; lệnh dưới đây là mẫu, thay placeholder bằng giá trị đã kiểm tra:
+
+```sh
+psql -X "service=$PGSERVICE" \
+  -v target_database='<EXPECTED_DATABASE_NAME>' \
+  -v retention_mode=apply \
+  -v confirm_apply_target='<EXPECTED_DATABASE_NAME>' \
+  -f scripts/sql/stage6-command-retention.sql
+```
+
+Apply tạo decoder tạm trong transaction, khóa các bảng liên quan với timeout hữu
+hạn, chọn và xóa một batch trong cùng transaction; successor, receipt và command được xóa có thứ tự, outbox
+được xử lý theo FK. Lỗi hoặc sai số lượng sẽ rollback cả batch. Kiểm tra kết quả
+bằng dry-run mới, kiểm tra readiness và đối chiếu các luồng/queue rồi mới resume
+admissions, writers và traffic theo quy trình vận hành đã duyệt. Không xóa
+`twin_states`, không thay đổi desired/reported configuration hoặc version
+watermark. Sau khi receipt bị purge, không hứa replay response cũ hoặc GET/cancel
+được command lịch sử; stale PATCH dùng expected version cũ vẫn bị từ chối. Muốn
+gửi intent mới, đọc version hiện tại và dùng idempotency key mới; không refresh
+version rồi gửi lại bằng key cũ. Không tạo tombstone, vì vậy không có bảo đảm
+phát hiện hay phục hồi receipt đã hết retention. Đây là lưu trữ lịch sử có giới
+hạn, không phải backup hay cam kết lưu trữ pháp lý.
+
 Không `source .env` deployment để chạy thử, không in resolved Compose config
 hoặc credential. `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`,
 `GATEWAY_CONTROL_ENABLED=false` và các cờ shaper/microbatch/RAM-dedup/WebSocket

@@ -211,19 +211,20 @@ REST admission and polling are documented in the
 and result messages below are v1 runtime contracts; clients must not publish
 commands or results directly.
 
-> **Stage 6 Cross-Reference (Thiết kế / Chưa triển khai):** Kế hoạch Giai đoạn 6 mở rộng
+> **Stage 6 Cross-Reference (đã triển khai R0–R8, opt-in; tổng thể PARTIAL):** Kế hoạch Giai đoạn 6 mở rộng
 > vòng đời command với device receipt bền vững (`acknowledged`), cancellation an toàn,
-> và các envelopes MQTT mới (`command_receipt`, `configuration_query`, `configuration_snapshot`).
-> Xem chi tiết tại [Stage 5 Sensor Control API: Giai đoạn 6](stage5-sensor-control-api.md#giai-đoạn-6--thiết-kế--chưa-triển-khai-vòng-đời-mở-rộng-và-cơ-chế-retryreservation-bền-vững).
-> Hợp đồng envelope MQTT v1 hiện hành dưới đây giữ nguyên vẹn cho Stage 5 runtime.
+> lịch retry lũy thừa có jitter và đối soát cấu hình sau reconnect qua các envelope MQTT mới:
+> `command_receipt`, `configuration_query`, và `configuration_snapshot`.
+> Xem chi tiết hợp đồng tại [Stage 5 Sensor Control API: Giai đoạn 6](stage5-sensor-control-api.md#giai-đoạn-6--thiết-kế--chưa-triển-khai-vòng-đời-mở-rộng-và-cơ-chế-retryreservation-bền-vững).
+> Hợp đồng envelope MQTT v1 cho command và result hiện hành giữ nguyên vẹn cho Stage 5 runtime.
 >
-> **Đã triển khai (Opt-in `STAGE6_ENABLED=true`, mặc định `false`):** cơ chế cấp quyền
-> gửi (dispatch reservation) bền vững và lịch retry lũy thừa có jitter của Stage 6 **không
-> thay đổi envelope, topic, QoS hay retain của MQTT v1**: cùng command ID, cùng topic
-> `gateways/<gateway_id>/commands/<command_id>`, cùng `payload_bytes`, cùng `desired_version`,
-> `issued_at` và `expires_at` được gửi lại nguyên vẹn qua mọi lượt retry. Các envelope mới
-> (`command_receipt`, `configuration_query`, `configuration_snapshot`) vẫn **chưa** được phát
-> hay xử lý và thuộc các Task R5–R7.
+> **Đặc tả và hành vi Stage 6 đã kiểm chứng:**
+> - **Opt-in flags (mặc định `false`):** Backend `STAGE6_ENABLED=true` (yêu cầu `STAGE5_ENABLED=true`), Gateway `GATEWAY_STAGE6_ENABLED=true` (yêu cầu `GATEWAY_CONTROL_ENABLED=true`).
+> - **Lịch retry bền vững (R3):** Cơ chế cấp quyền gửi (dispatch reservation) bền vững trong cơ sở dữ liệu và lịch retry lũy thừa kèm jitter ngẫu nhiên 50–100% (ngân sách cấp quyền dispatch mặc định 5 lượt, cấu hình qua `STAGE6_RETRY_MAX_ATTEMPTS`) **không thay đổi envelope, topic, QoS hay retain của MQTT v1**: cùng command ID, cùng topic `gateways/<gateway_id>/commands/<command_id>`, cùng `payload_bytes`, cùng `desired_version`, `issued_at` và `expires_at` được phát lại nguyên byte qua mọi lượt retry.
+> - **Device receipt & `acknowledged` (R5):** Gateway opt-in phát `command_receipt` trên `gateways/<gateway_id>/responses/<command_id>` (QoS 1, retain false) khi đã lưu bền vững receipt/reservation trong SQLite trước khi gọi sampler apply. Backend nhận receipt chuyển command sang `status = "acknowledged"` (`acknowledged_at`). **`acknowledged` chỉ xác nhận Gateway đã nhận và lưu receipt bền vững, KHÔNG PHẢI xác nhận áp dụng cấu hình thành công**. Cấu hình chỉ được xác nhận khi Gateway gửi `command_result` (`succeeded`) và backend commit transaction.
+> - **Readback & Đối soát (R6 & R7):** Backend phát `configuration_query` (`gateways/<gateway_id>/commands/<request_id>`, TTL 5s, cooldown 30s) để Gateway đọc committed watermark và actual sampler rồi phản hồi `configuration_snapshot` (`gateways/<gateway_id>/responses/<request_id>`). Khi phát hiện sai lệch và thỏa mãn điều kiện phục hồi (chưa bị hủy, còn budget), backend sinh successor command với **command ID mới, desired version mới tăng 1, cùng giá trị desired sampling**. Command cũ hết hạn giữ nguyên `timeout`.
+> - **Ranh giới an toàn:** Không có remote abort qua MQTT (lệnh hủy chỉ chặn outbox backend nếu chưa dispatch; đã dispatch trả 409 `command_not_cancellable`). Không tuyên bố exactly-once: giao thức là at-least-once kết hợp deduplication và watermark.
+> - **Trạng thái:** Mã nguồn và kiểm thử R0–R8 đã PASS CI từ xa (GitHub Actions run 44501549344 trên commit `a648ec1c8e22b99d3a185aa480a8b17534f7df8f`). Tổng thể Stage 6 vẫn **PARTIAL** do retention còn finding review chưa đóng, target demo/preflight/restore và rollout NOT RUN, board AM5728 / real sensor / HIL DEFERRED / NOT RUN.
 
 ### Dispatcher operation (P6; no payload or endpoint change)
 
