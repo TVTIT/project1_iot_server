@@ -2,7 +2,7 @@
 """A8c HTTP native runner for ONE Go testcase (TestSimplifiedHTTPNativeRotateRevoke).
 
 Offline source/unit testable runner with strict boundaries:
-- Finite timeouts, private root under /tmp/opencode
+- Finite timeouts, private root under /var/tmp/opencode
 - Precheck local pinned images (no pull/latest)
 - Compile single cmd/server test binary with CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 - Apply ONLY ordered 000000 roles.sh and 000001..000019 .up.sql on own fixture
@@ -355,7 +355,7 @@ def run_http_native_suite(dry_run: bool = False) -> dict[str, Any]:
         }
         return res
 
-    tmp_base = Path('/tmp/opencode')
+    tmp_base = Path('/var/tmp/opencode')
     tmp_base.mkdir(parents=True, exist_ok=True)
 
     fixture_dir, host_receipt = create_verified_host_fixture_dir(tmp_base)

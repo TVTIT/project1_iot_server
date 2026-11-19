@@ -7,6 +7,7 @@
 - [`../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md`](../../../docs/backend_plan/admin_users_and_gateway_membership_detailed_plan.md) (Kế hoạch chi tiết quản lý User và Gateway Membership)
 - [`../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md`](../../../docs/backend_plan/gateway_membership_delete_detailed_plan.md) (Kế hoạch chi tiết bổ sung DELETE Gateway Membership)
 - [`../backend/admin-users-and-gateway-membership.md`](../backend/admin-users-and-gateway-membership.md) (Báo cáo tổng kết và bàn giao Task U0–U8)
+- [`../protocols/stage5-sensor-control-api.md`](../protocols/stage5-sensor-control-api.md) (REST desired sampling và polling command)
 - `docs/protocols/stage4-read-and-entity-api.md` (Hợp đồng Stage 4 Read & Entity API)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
@@ -40,7 +41,7 @@ Tài liệu này cung cấp **danh mục quy chuẩn (checklist) thực tiễn, 
   - **Cập nhật phạm vi lịch sử:** Các phát biểu lịch sử trước đây ghi nhận "chưa có xóa membership" thuộc phạm vi giai đoạn trước; nay hệ thống đã chính thức bổ sung endpoint thứ sáu `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}` dành cho Platform Admin. Các bằng chứng kiểm thử lịch sử cũ tiếp tục được bảo toàn nguyên trạng.
 - **Ngoại lệ Tồn đọng Chuyển tiếp (Deferred Exceptions & Boundaries):**
   - WebSocket (`/v1/ws`) tiếp tục trả về `501 Not Implemented` (chờ Stage 7).
-  - Điều khiển thiết bị lâu bền (`desired_state`, downlink commands, transactional outbox) chưa kích hoạt (chờ Stage 5).
+  - Điều khiển thiết bị lâu bền (`desired_state`, downlink commands, transactional outbox) đã hoàn thành và kiểm chứng cục bộ ở Giai đoạn P3 trên môi trường cô lập; deployment mặc định tiếp tục tắt (`STAGE5_ENABLED=false`) chờ live rollout.
   - API Reset credential có giám sát vẫn giữ rào chắn fail-closed `503 Service Unavailable` (`denyOnlyResetPrerequisite{}`).
 *Lưu ý an toàn:* Tuyệt đối không tuyên bố hệ thống sẵn sàng vận hành sản xuất (production-ready) hoặc client Flutter đã hoàn tất khi các cổng nghiệm thu nghiệp vụ và phần cứng thực tế chưa diễn ra. Không suy diễn bất kỳ cập nhật nào trên Flutter Client hay bộ kịch bản Bruno.
 
@@ -85,6 +86,20 @@ Client tương tác với hệ sinh thái qua hai miền dịch vụ hoàn toàn
 ---
 
 ## 3. Trình tự Gọi API Thực tế và Cấu thành Trang Chi tiết (Actual Endpoint Sequence)
+
+### 3.0 Control Sensor Stage 5 (polling REST)
+
+Với Sensor đã provision, user `owner`/`operator` PATCH desired sampling bằng
+`frequency_hz` decimal, `expected_desired_version` JSON string và một
+`Idempotency-Key`; `viewer` chỉ đọc. Dùng version hiện hành và key mới cho
+intent mới; retry request chưa rõ kết quả bằng đúng body/key cũ. `202 pending`
+chỉ là committed intent; `published` chỉ là broker PUBACK. Poll command
+list/detail cho terminal state. Chỉ result hợp lệ được backend commit mới xác
+nhận `reported.configuration`; các measurement/sampling observations vẫn là
+quan sát riêng. Low-Hz chỉ hợp lệ khi interval round-half-up vẫn biểu diễn
+được trong `[10,000, 2^53]` µs. `failed`/`timeout` không chứng minh đã áp dụng
+cấu hình; không tự phát lệnh mới để bù timeout. Xem contract nguồn cho ví dụ,
+status/errors và các route cụ thể.
 
 ### 3.1 Trình tự tuần tự thực tế theo chuẩn ETSI GS CIM 009 V1.9.1 Profile
 Client bắt buộc phải gọi API theo đúng trình tự phân cấp:
@@ -834,10 +849,10 @@ Nhằm đảm bảo sự nhất quán với toàn bộ tài liệu hệ thống 
 ### 11.2 Các tính năng CHƯA TRIỂN KHAI (Future Roadmap Stages)
 Theo lộ trình kiến trúc hệ thống (`AGENTS.md` và `Backend_summary_plan.md`), các tính năng dưới đây **chưa được kích hoạt** ở tầng người dùng:
 
-1. **Giai đoạn 5 (Stage 5) — Điều khiển Bản sao số Digital Twin:**
-   - Đột biến cấu hình thiết bị lâu bền (`PATCH /v1/digital-twins/{entity_id}/desired-state`).
-   - Phát hành lệnh điều khiển downlink (`POST /v1/digital-twins/{entity_id}/commands`).
-   - Cơ chế Transactional Outbox và MQTT command topic.
+1. **Giai đoạn 5 (Stage 5 / P3) — Điều khiển Bản sao số Digital Twin:**
+   - Đã hoàn thành và kiểm chứng E2E cục bộ ở P3 trên môi trường thử nghiệm: `PATCH /v1/digital-twins/{entity_id}/desired-state` (tần số thập phân `0 < Hz <= 100`, quyền `owner`/`operator`), nhận `202 Accepted` hoặc `200 OK` (no-op unchanged).
+   - Tra cứu lệnh qua `GET /v1/digital-twins/{entity_id}/commands` và chi tiết `.../commands/{command_id}` (không thêm POST command riêng).
+   - Cấu hình xác nhận nằm tại `reported.configuration`, tách biệt với quan trắc viễn trắc. Môi trường triển khai chung tiếp tục giữ `STAGE5_ENABLED=false` chờ rollout.
 2. **Giai đoạn 6 (Stage 6) — Bộ điều phối đối soát lệnh (Command Reconciliation Worker):**
    - Tự động đối soát trạng thái mong muốn (`desired_state`) và trạng thái thực tế (`reported_state`).
    - Quản lý vòng đời lệnh (`pending`, `published`, `acknowledged`, `succeeded`, `failed`, `timeout`).

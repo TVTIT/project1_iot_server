@@ -50,7 +50,7 @@ class Spike:
         mqtt_connection(self.port, self.d / 'ca.crt', user,
                         password or self.passwords[user], accepted).close()
 
-    def prepare(self):
+    def prepare(self, *, broker_san=False):
         # Isolated port, identities and credentials never target deployment.
         print('isolated fixture; no deployment .env access', flush=True)
         broker = self.d / 'broker'
@@ -66,7 +66,7 @@ class Spike:
         ):
             args = [str(self.d / a) if a.endswith(('.key', '.crt', '.csr')) else a for a in args]
             run(['openssl'] + args)
-        (self.d / 'extensions').write_text('subjectAltName=DNS:localhost\n'
+        (self.d / 'extensions').write_text('subjectAltName=DNS:localhost' + (',DNS:broker' if broker_san else '') + '\n'
             'extendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n')
         run(['openssl', 'x509', '-req', '-in', str(self.d / 'server.csr'),
              '-CA', str(self.d / 'ca.crt'), '-CAkey', str(self.d / 'ca.key'),

@@ -4,7 +4,7 @@
 Disposable fixture stack, all owned resources created and removed by exact ID
 under /tmp/opencode:
 
-  * pinned TimescaleDB container (reused DatabaseFixture), migrations 1..20,
+  * pinned TimescaleDB container (reused DatabaseFixture), migrations 1..24,
     seeded Gateway/Sensor graph with sentinel desired/Gateway state;
   * pinned Mosquitto 2.0.18 broker using the production config file (with the
     new max_packet_size/message_size_limit limits), TLS and a fresh DynSec store
@@ -56,7 +56,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/tests'))
 from task28_simplified_schema_runner import DatabaseFixture, ENV, sanitize_output  # noqa: E402
-from stage3_persistence_runner import bootstrap_to_9, run_existing_migration_runner  # noqa: E402
+from stage3_persistence_runner import (  # noqa: E402
+    apply_post_auth_compatibility, bootstrap_to_9, run_existing_migration_runner,
+)
 from task26_harness_helpers import MQTT, RESPONSE  # noqa: E402
 
 MOSQUITTO_IMAGE = 'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9'
@@ -232,6 +234,59 @@ def mapped_port(cid: str, container_port: str) -> int:
     if not out:
         raise RuntimeError('no published port')
     return int(out.splitlines()[-1].rsplit(':', 1)[1])
+
+
+def diagnose_broker_start(cid: str, work: Path, dynsec_volume: str):
+    """Emit sanitized startup evidence for this fixture's own broker only."""
+    inspect_format = (
+        'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} '
+        'oom={{.State.OOMKilled}} image={{.Config.Image}} user={{.Config.User}} '
+        'entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}} '
+        'readonly={{.HostConfig.ReadonlyRootfs}} bindings={{json .HostConfig.PortBindings}} '
+        'ports={{json .NetworkSettings.Ports}}')
+    try:
+        state = docker(['inspect', '-f', inspect_format, cid], timeout=15).decode().strip()
+    except Exception as exc:  # noqa: BLE001 - diagnostic must not hide primary failure
+        state = f'inspect unavailable: {sanitize(str(exc))}'
+    print(f'broker startup diagnostic: {state}', flush=True)
+
+    # This helper runs as the same unprivileged broker UID, with the same pinned
+    # image and read-only config/read-write DynSec mounts. It prints metadata
+    # and access checks only, never certificate/key or DynSec contents.
+    check_script = (
+        'set -eu\n'
+        'for p in /mosquitto/config /mosquitto/config/certs '
+        '/mosquitto/config/mosquitto.conf /mosquitto/config/certs/ca.crt '
+        '/mosquitto/config/certs/server.crt /mosquitto/config/certs/server.key '
+        '/mosquitto/dynsec /mosquitto/dynsec/dynamic-security.json; do '
+        'stat -c "%u:%g:%a %n" "$p"; done\n'
+        'test -x /mosquitto/config && test -x /mosquitto/config/certs\n'
+        'test -r /mosquitto/config/mosquitto.conf\n'
+        'test -r /mosquitto/config/certs/ca.crt\n'
+        'test -r /mosquitto/config/certs/server.crt\n'
+        'test -r /mosquitto/config/certs/server.key\n'
+        'test -x /mosquitto/dynsec && test -r /mosquitto/dynsec/dynamic-security.json\n'
+        'test -w /mosquitto/dynsec/dynamic-security.json\n'
+        'echo broker_uid_access=ok\n')
+    helper_name = f'stage3-broker-diagnostic-{secrets.token_hex(6)}'
+    try:
+        access = docker([
+            'run', '--rm', '--pull=never', '--name', helper_name, '--network', 'none',
+            '--user', '1883:1883', '--read-only', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges:true',
+            '--mount', f'type=bind,src={work / "broker"},dst=/mosquitto/config,readonly',
+            '--mount', f'type=volume,src={dynsec_volume},dst=/mosquitto/dynsec',
+            '--entrypoint', '/bin/sh', MOSQUITTO_IMAGE, '-c', check_script,
+        ], timeout=20).decode()
+        print('broker mount access diagnostic:\n' + sanitize(access), flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f'broker mount access diagnostic failed: {sanitize(str(exc))}', flush=True)
+
+    logs = container_logs(cid)
+    if logs:
+        print('broker startup logs (sanitized):\n' + sanitize(logs[-4000:]), flush=True)
+    else:
+        print('broker startup logs: empty', flush=True)
 
 
 def write_private(path: Path, data: bytes, mode=0o600):
@@ -739,7 +794,7 @@ def docker_available() -> bool:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Task 3.4/3.5 bounded real integration smoke')
-    parser.add_argument('--mode', choices=('ingress', 'simulator'), default='ingress',
+    parser.add_argument('--mode', choices=('ingress', 'simulator', 'control'), default='ingress',
                         help='ingress: Task 3.4 Python producer; simulator: actual cmd/gateway CLI')
     opts = parser.parse_args(argv)
     mode = opts.mode
@@ -789,9 +844,19 @@ def main(argv=None) -> int:
         docker(['network', 'connect', '--alias', 'database', net_name, fixture.container_id], timeout=30)
 
         print('stage=migrate-000020', flush=True)
-        bootstrap_to_9(fixture)
-        run_existing_migration_runner(fixture, 20)
-        seed_graph(fixture)
+        if mode == 'control':
+            from stage5_intent_fixture import migrate, verify
+            migrate(fixture, 23)
+            verify(fixture)
+            # The Stage 6 durable retry lane needs the current schema terminal.
+            run_existing_migration_runner(fixture, 27)
+        else:
+            bootstrap_to_9(fixture)
+            run_existing_migration_runner(fixture, 20)
+            # This fixture runs the current telemetry writer, which requires the
+            # timestamp ledger column introduced by schema 24.
+            apply_post_auth_compatibility(fixture)
+            seed_graph(fixture)
 
         print('stage=bootstrap-dynsec', flush=True)
         dynsec_volume = bootstrap_dynsec(work, manager_password, backend_password)
@@ -815,8 +880,17 @@ def main(argv=None) -> int:
             '-c', '/mosquitto/config/mosquitto.conf',
         ])
         docker(['start', broker_cid], timeout=CONTAINER_START_TIMEOUT)
-        broker_port = mapped_port(broker_cid, '8883/tcp')
-        wait_tcp(broker_port, BROKER_READY_TIMEOUT)
+        try:
+            broker_port = mapped_port(broker_cid, '8883/tcp')
+            wait_tcp(broker_port, BROKER_READY_TIMEOUT)
+        except Exception:
+            diagnose_broker_start(broker_cid, work, dynsec_volume)
+            raise
+
+        if mode == 'control':
+            from stage5_mqtt_fixture import exercise
+            exercise(fixture, work, broker_cid, broker_port, manager_password, backend_password, gateway_password, server, net_name)
+            return 0
 
         print('stage=dynsec-control', flush=True)
         manager = connect_manager(broker_port, work, manager_password)

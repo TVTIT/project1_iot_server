@@ -65,6 +65,24 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadConfiguredTLSServerNameKeepsVerificationEnabled(t *testing.T) {
+	values := validGatewayEnv()
+	values["GATEWAY_MQTT_SERVER_NAME"] = "broker.example.test"
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := TransportOptionsFromConfig(cfg).ServerName; got != "broker.example.test" {
+		t.Fatalf("ServerName = %q", got)
+	}
+	for _, invalid := range []string{"broker/test", "broker:8883", "broker name"} {
+		values["GATEWAY_MQTT_SERVER_NAME"] = invalid
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("expected invalid TLS server name %q to fail", invalid)
+		}
+	}
+}
+
 func TestLoadRequiresEveryKey(t *testing.T) {
 	for _, key := range []string{
 		"GATEWAY_ID", "SENSOR_ID", "GATEWAY_MQTT_BROKER_URL", "GATEWAY_MQTT_CLIENT_ID",

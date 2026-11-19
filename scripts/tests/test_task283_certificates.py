@@ -20,7 +20,7 @@ def certificate_fixture_env(root, fake_openssl=False, rootful=False, foreign_own
     driver = binaries / 'python3'
     driver.write_text('''#!/usr/bin/python3
 import os, sys
-ambient = os.lstat('/tmp/opencode')
+ambient = os.lstat('/var/tmp/opencode')
 lstat, fstat = os.lstat, os.fstat
 def adjusted(st, path):
     fields = list(st)
@@ -120,7 +120,7 @@ class CertificateDestinationTests(unittest.TestCase):
     def test_ancestor_symlinks_reject_before_any_mutation_nonroot_and_rootful_model(self):
         for level in ['config', 'config/mosquitto', 'config/mosquitto/certs', 'certs']:
             for rootful in [False, True]:
-                with self.subTest(level=level, rootful=rootful), tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+                with self.subTest(level=level, rootful=rootful), tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
                     base = Path(d)
                     root = base / 'checkout'
                     root.mkdir(mode=0o700)
@@ -137,7 +137,7 @@ class CertificateDestinationTests(unittest.TestCase):
 
     def test_symlinked_checkout_and_script_parent_are_not_silently_resolved(self):
         for level in ['checkout', 'scripts']:
-            with self.subTest(level=level), tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+            with self.subTest(level=level), tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
                 base = Path(d)
                 root = base / 'real'
                 root.mkdir(mode=0o700)
@@ -159,7 +159,7 @@ class CertificateDestinationTests(unittest.TestCase):
     def test_unsafe_modes_preserve_old_contents_modes_and_ownership(self):
         for relative, mode in [('config', 0o777), ('config', 0o1777), ('config', 0o775), ('config/mosquitto', 0o777),
                                ('config/mosquitto/certs', 0o775), ('certs', 0o755)]:
-            with self.subTest(relative=relative, mode=oct(mode)), tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+            with self.subTest(relative=relative, mode=oct(mode)), tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
                 root = Path(d)
                 script = self.prepare(root)
                 (root / relative).chmod(mode)
@@ -173,7 +173,7 @@ class CertificateDestinationTests(unittest.TestCase):
                 self.assertEqual((root / relative).stat().st_mode & 0o7777, mode)
 
     def test_foreign_parent_owner_rejected_before_mutation_rootful_model(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             root = Path(d)
             script = self.prepare(root)
             before = self.snapshot(root / 'config/mosquitto/certs')
@@ -185,7 +185,7 @@ class CertificateDestinationTests(unittest.TestCase):
 
     def test_protected_env_cannot_redirect_fixed_destinations_or_execute_shell(self):
         for key in ['PROJECT_ROOT', 'MOSQUITTO_CERTS_DIR', 'SECURE_CA_DIR', 'shell']:
-            with self.subTest(key=key), tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+            with self.subTest(key=key), tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
                 root = Path(d)
                 script = self.prepare(root)
                 outside = root / 'outside'
@@ -202,7 +202,7 @@ class CertificateDestinationTests(unittest.TestCase):
                 self.assertEqual(self.snapshot(outside), before)
 
     def test_nonroot_cannot_assign_another_uid_without_insecure_fallback(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             root = Path(d)
             script = self.prepare(root)
             before = self.snapshot(root / 'config/mosquitto/certs')
@@ -214,7 +214,7 @@ class CertificateDestinationTests(unittest.TestCase):
 
     def test_unsafe_leaves_and_unprotected_env_are_rejected_without_repairs(self):
         for kind in ['symlink', 'hardlink', 'fifo', 'key0644', 'env0644']:
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
                 root = Path(d)
                 script = self.prepare(root)
                 key = root / 'config/mosquitto/certs/server.key'
@@ -242,7 +242,7 @@ class CertificateDestinationTests(unittest.TestCase):
                 self.assertEqual(self.snapshot(root / 'config/mosquitto/certs'), before)
 
     def test_rootful_assignment_failure_keeps_old_certificates_and_ca_untouched(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             root = Path(d)
             script = self.prepare(root)
             env = certificate_fixture_env(root, fake_openssl=True, rootful=True)
@@ -258,7 +258,7 @@ class CertificateDestinationTests(unittest.TestCase):
             self.assertEqual(self.snapshot(root / 'config/mosquitto/certs'), server)
 
     def test_second_publication_failure_restores_all_preexisting_inodes(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             root = Path(d)
             script = self.prepare(root)
             env = certificate_fixture_env(root, fake_openssl=True)
@@ -275,7 +275,7 @@ exec /usr/bin/mv "$@"
             self.assertEqual(self.snapshot(root / 'config/mosquitto/certs'), server)
 
     def test_mid_generation_ancestor_swap_is_detected_without_following_replacement(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             base = Path(d)
             root, outside = base / 'checkout', base / 'outside'
             root.mkdir(mode=0o700)
@@ -294,7 +294,7 @@ exec /usr/bin/mv "$@"
             self.assertEqual(self.snapshot(root / 'relocated-config'), original)
 
     def test_protected_fixture_env_is_parsed_as_data_and_rootful_metadata_model_succeeds(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             root = Path(d)
             script = self.prepare(root, seeded=False)
             config = root / '.env'
@@ -306,7 +306,7 @@ exec /usr/bin/mv "$@"
             self.assertEqual((root / 'config/mosquitto/certs/server.key').stat().st_mode & 0o777, 0o600)
 
     def test_trusted_success_reuses_ca_and_never_chmods_or_chowns_existing_directories(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as d:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as d:
             root = Path(d)
             script = self.prepare(root, seeded=False)
             env = certificate_fixture_env(root)

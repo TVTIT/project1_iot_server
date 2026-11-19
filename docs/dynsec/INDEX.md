@@ -29,6 +29,16 @@ Bộ tài liệu kỹ thuật DynSec được phân chia thành các chuyên đ�
    - Phân định ranh giới giữa kiểm thử diễn tập (rehearsal container) và tính tương đương bản build Dockerfile gốc (`root build parity`).
    - Danh mục công việc tồn đọng (Backlog) được phân cấp theo thứ tự ưu tiên rõ ràng.
    - Bảng đối chiếu ma trận nghiệm thu có giới hạn T01–T12 và các ngoại lệ đóng Giai đoạn 2.
+5. **[P6 — Dispatch và tải hỗn hợp (Local MVP)](../backend/paper-p6-dispatch-and-mixed-load.md):**
+   - Báo cáo so sánh polling/wake-up, recovery fixture và ranh giới bằng chứng; summary an toàn tại [JSON](../backend/results/p6/summary.json) / [CSV](../backend/results/p6/summary.csv).
+
+**Trạng thái hiện hành (26/10/2026):** P6 Local MVP đã được kiểm trên simulator,
+nhưng Stage 5 gốc vẫn chưa hoàn tất; full/remote CI requirement lane, AM5728/HIL,
+physical sensor và live rollout NOT RUN. Các bảng ACL/status ở tài liệu DynSec
+phản ánh các checkpoint riêng được ghi trong từng mục; với vận hành Stage 5 hiện
+tại, dùng [P6 report](../backend/paper-p6-dispatch-and-mixed-load.md),
+[protocol MQTT](../protocols/mqtt-v1.md) và [runbook](deployment-and-operations.md)
+thay vì coi các ghi chú downlink cũ là trạng thái runtime hiện tại.
 
 ---
 

@@ -108,7 +108,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/tests'))
 from task28_simplified_schema_runner import DatabaseFixture, ENV, sanitize_output  # noqa: E402
-from stage3_persistence_runner import bootstrap_to_9, run_existing_migration_runner  # noqa: E402
+from stage3_persistence_runner import (  # noqa: E402
+    apply_post_auth_compatibility, bootstrap_to_9, run_existing_migration_runner,
+)
 from stage3_mqtt_ingress_runner import (  # noqa: E402
     Envelope, SIM_BASE, SIM_PERIOD, SIM_PROFILE, MOSQUITTO_IMAGE,
     run, docker, container_logs, docker_create, container_absent, remove_container,
@@ -515,7 +517,7 @@ def build_probe_batch(spec: GatewaySpec, message_id: str, boot_id: str, first_se
     }, separators=(',', ':')).encode()
 
 
-def probe_batch_is_valid(payload: bytes, spec: GatewaySpec) -> bool:
+def probe_batch_is_valid(payload: bytes, spec: GatewaySpec, *, expected_samples: int = SAMPLE_COUNT) -> bool:
     """Structural check that a probe payload matches the telemetry contract.
 
     This keeps the cross-Gateway negative honest: the payload is a genuine valid
@@ -534,12 +536,12 @@ def probe_batch_is_valid(payload: bytes, spec: GatewaySpec) -> bool:
         return False
     if obj['gateway_id'] != spec.gateway_id or obj['sensor_id'] != spec.sensor_id:
         return False
-    if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',
-                        obj['message_id']):
+    if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',
+                        obj['message_id'], re.IGNORECASE):
         return False
     if not isinstance(obj['samples'], list) or len(obj['samples']) != obj['sample_count']:
         return False
-    if obj['sample_count'] != SAMPLE_COUNT:
+    if type(expected_samples) is not int or expected_samples < 1 or obj['sample_count'] != expected_samples:
         return False
     return True
 
@@ -896,7 +898,7 @@ def seed_graph(fixture: DatabaseFixture, specs: list[GatewaySpec]):
     fixture.sql(('\n'.join(stmts)).encode())
 
 
-def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str) -> str:
+def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str, *, expected_messages: int = 1) -> str:
     """Independent SQL state assertion scoped to exactly one Gateway.
 
     Mirrors the Task 3.4 shared assertion but parameterized by ``spec`` so two
@@ -905,6 +907,10 @@ def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str) -> s
     """
     def q(value: str) -> str:
         return "'" + value + "'"
+
+    if not 1 <= expected_messages <= 1000 or expected_messages > 1 and env.message_id is None:
+        raise ValueError('bounded multi-message assertion requires one selected batch')
+    selected_message = " AND message_id=" + q(env.message_id) + "::uuid" if expected_messages > 1 else ""
 
     if env.message_id is not None:
         msg_known = (f"IF msg <> {q(env.message_id)}::uuid THEN "
@@ -967,11 +973,11 @@ def build_gateway_assert_sql(spec: GatewaySpec, env: Envelope, marker: str) -> s
     BEGIN
       SELECT count(*) INTO ledger FROM public.processed_messages
         WHERE gateway_id={q(spec.gateway_id)} AND sensor_id={q(spec.sensor_id)};
-      IF ledger <> 1 THEN RAISE EXCEPTION 'ledger rows %', ledger; END IF;
+      IF ledger <> {expected_messages} THEN RAISE EXCEPTION 'ledger rows %', ledger; END IF;
       SELECT message_id, boot_id, first_sequence, last_sequence, sample_count, sensor_id, source_topic
         INTO msg, boot, l_first, l_last, l_count, l_sensor, l_topic
         FROM public.processed_messages
-        WHERE gateway_id={q(spec.gateway_id)} AND sensor_id={q(spec.sensor_id)};
+        WHERE gateway_id={q(spec.gateway_id)} AND sensor_id={q(spec.sensor_id)}{selected_message};
       IF l_first <> {env.first_sequence} OR l_last <> {env.last_sequence} OR l_count <> {env.sample_count} THEN
         RAISE EXCEPTION 'ledger envelope first/last/count % % %', l_first, l_last, l_count; END IF;
       IF l_sensor <> {q(spec.sensor_id)} THEN RAISE EXCEPTION 'ledger sensor_id %', l_sensor; END IF;
@@ -1210,7 +1216,8 @@ def assert_ack_fields(raw: bytes, message_id: str):
 
 def build_image(target: str, tag: str) -> str:
     proc = subprocess.run(
-        ['docker', 'build', '--target', target, '-t', tag, '-f', 'Dockerfile', '.'],
+        ['docker', 'build', '--target', target, '-t', tag,
+         '--label', 'io.iot.stage3-image-tag=' + tag, '-f', 'Dockerfile', '.'],
         cwd=ROOT / 'src', env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=IMAGE_BUILD_TIMEOUT)
     if proc.returncode:
@@ -1220,6 +1227,38 @@ def build_image(target: str, tag: str) -> str:
     if len(image_id) < 12:
         raise RuntimeError(f'image {tag} has no inspect id')
     return image_id
+
+
+def build_owned_image(target: str, tag: str, owned: dict) -> str:
+    if not image_absent(tag):
+        raise RuntimeError('fixture image tag collision or inspection failure')
+    # Record intent before building, including builds that fail after tagging.
+    owned[tag] = None
+    image_id = build_image(target, tag)
+    owned[tag] = image_id
+    return image_id
+
+
+def cleanup_owned_images(owned: dict) -> list[str]:
+    """Remove only generated tags; a shared image ID never authorizes removal."""
+    errors = []
+    for tag, expected_id in owned.items():
+        try:
+            if image_absent(tag):
+                continue
+            objects = json.loads(docker(['image', 'inspect', tag], timeout=15))
+            if len(objects) != 1:
+                raise RuntimeError('ambiguous image inspection')
+            image = objects[0]
+            if ((expected_id is not None and image.get('Id') != expected_id) or
+                    (image.get('Config', {}).get('Labels') or {}).get('io.iot.stage3-image-tag') != tag):
+                raise RuntimeError('image tag ownership changed')
+            docker(['image', 'rm', tag], timeout=60)
+            if not image_absent(tag):
+                raise RuntimeError('image tag remains after cleanup')
+        except Exception as exc:  # noqa: BLE001 - veto success, preserve other owned-tag cleanup
+            errors.append(tag + ': ' + sanitize(str(exc)))
+    return errors
 
 
 def generate_untrusted_ca(work: Path, name: str) -> Path:
@@ -4259,6 +4298,8 @@ def run_single_scenario_fixture(scenario: str, backend_image: str, gateway_image
         print('stage=migrate-000020', flush=True)
         bootstrap_to_9(fixture)
         run_existing_migration_runner(fixture, 20)
+        # This fixture runs the current timestamp-aware telemetry writer.
+        apply_post_auth_compatibility(fixture)
         seed_graph(fixture, specs)
 
         ensure_budget('dynsec')
@@ -4456,6 +4497,7 @@ def main(argv=None) -> int:
     scenarios = list(IMPLEMENTED_SCENARIOS.keys()) if opts.scenario == 'all' else [opts.scenario]
 
     suite_registry = ResourceRegistry()
+    owned_images = {}
     suite_hexid = secrets.token_hex(6)
     backend_image = None
     gateway_image = None
@@ -4466,10 +4508,10 @@ def main(argv=None) -> int:
         print('stage=build-images', flush=True)
         backend_tag = f'stage3-uplink-backend-{suite_hexid}'
         gateway_tag = f'stage3-uplink-gateway-{suite_hexid}'
-        backend_image = build_image('backend', backend_tag)
-        suite_registry.register('backend image', 'image', backend_image)
-        gateway_image = build_image('gateway', gateway_tag)
-        suite_registry.register('gateway image', 'image', gateway_image)
+        backend_image = build_owned_image('backend', backend_tag, owned_images)
+        suite_registry.register('backend image tag', 'image', backend_tag)
+        gateway_image = build_owned_image('gateway', gateway_tag, owned_images)
+        suite_registry.register('gateway image tag', 'image', gateway_tag)
         print(f'PASS: built backend image {backend_image} and gateway image {gateway_image} from src/Dockerfile', flush=True)
 
         for sc in scenarios:
@@ -4481,15 +4523,7 @@ def main(argv=None) -> int:
         primary_error = exc
         raise
     finally:
-        cleanup_errors = []
-        for label, action in (
-            ('backend image', lambda: (docker(['image', 'rm', '-f', backend_image], timeout=60) and None) if backend_image else None),
-            ('gateway image', lambda: (docker(['image', 'rm', '-f', gateway_image], timeout=60) and None) if gateway_image else None),
-        ):
-            try:
-                action()
-            except Exception as cleanup_exc:  # noqa: BLE001
-                cleanup_errors.append(f'{label}: {sanitize(str(cleanup_exc))}')
+        cleanup_errors = cleanup_owned_images(owned_images)
 
         remaining = suite_registry.still_present(absent)
         if cleanup_errors or remaining:

@@ -852,6 +852,13 @@ func TestSchedulerFiniteCompletion(t *testing.T) {
 		t.Fatalf("finite run returned %v, want nil", err)
 	}
 	st := run.sched.Stats()
+	var wantBytes int64
+	for _, it := range items {
+		wantBytes += int64(len(it.Payload))
+	}
+	if st.UniquePayloadBytes != wantBytes || st.AttemptedPayloadBytes != wantBytes || st.UniqueSamples != int64(2*cfg.SamplesPerBatch) {
+		t.Fatalf("payload counts: %+v, want bytes %d", st, wantBytes)
+	}
 	if !st.Completed {
 		t.Fatalf("Completed = false, want true")
 	}
@@ -883,6 +890,35 @@ func TestSchedulerFiniteBudgetExpiryIsNotCompleted(t *testing.T) {
 	}
 	if got := pendingRows(t, run.outbox); got != 1 {
 		t.Fatalf("pending = %d, want 1 retained for the next run", got)
+	}
+}
+
+func TestSchedulerCancelledPublishesStillCompleteDrain(t *testing.T) {
+	// Cancellation stops production, not completion accounting. Every invocation
+	// below returns immediately with cancellation; none may leave a phantom
+	// statePublishing entry for the shutdown drain to wait on.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	clock := newFakeClock()
+	const count = 32
+	s := &Scheduler{
+		ctx: ctx, clock: clock, pub: newFakePublisher(clock),
+		cfg:        schedulerConfig{shutdownTimeout: time.Second, retryMin: time.Second, retryMax: time.Second},
+		randFloat:  func() float64 { return 0.5 },
+		inflight:   make(map[uuid.UUID]*inflightEntry),
+		pubResults: make(chan publishResult, count),
+		done:       make(chan struct{}),
+	}
+	defer close(s.done)
+	for i := 0; i < count; i++ {
+		id := seqUUID(uint64(i + 1))
+		e := &inflightEntry{item: Item{MessageID: id}}
+		s.inflight[id] = e
+		s.startPublish(e)
+	}
+	s.waitPublishes()
+	if got := s.publishingCount(); got != 0 {
+		t.Fatalf("%d completed publishes lost their results during cancellation", got)
 	}
 }
 

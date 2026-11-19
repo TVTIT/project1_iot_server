@@ -128,6 +128,56 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(cleanup.call_count, 4)
         spike.cleanup.assert_called_once()
 
+    def test_main_continues_independent_cleanup_and_fails_closed(self):
+        from unittest.mock import MagicMock
+        for error in (RuntimeError('cleanup'), subprocess.TimeoutExpired('docker', 30), OSError('docker')):
+            with self.subTest(error=type(error).__name__):
+                spike = MagicMock()
+                spike.compose = ['compose', 'fixture']
+                spike.command.return_value = b'broker-id'
+                spike.setup.return_value = b'{"clients": []}'
+                inspected = [{'Mounts': [], 'NetworkSettings': {'Networks': {'isolated': {}}}}]
+                attempted = []
+
+                def cleanup(name):
+                    attempted.append(name)
+
+                with patch.object(fixture, 'Spike', return_value=spike), \
+                        patch.object(fixture, 'run', return_value=json.dumps(inspected).encode()), \
+                        patch.object(fixture, 'prepare_database_image'), \
+                        patch.object(fixture, 'start_database', side_effect=RuntimeError('primary_failure')), \
+                        patch.object(fixture, 'cleanup_container', side_effect=cleanup), \
+                        patch('task2612_standalone.cleanup_backend_if_present', side_effect=error), \
+                        patch('stage2_mqtt_credentials.qualify_network'), \
+                        patch('stage2_mqtt_credentials.start_proxy'):
+                    with patch.object(fixture.Path, 'chmod'):
+                        with self.assertRaisesRegex(RuntimeError, '^primary_failure$'):
+                            fixture.main(standalone=True)
+                self.assertEqual(len(attempted), 3)
+                spike.cleanup.assert_called_once()
+
+    def test_spike_cleanup_runs_when_final_permission_setup_fails(self):
+        from unittest.mock import MagicMock
+        spike = MagicMock()
+        spike.compose = ['compose', 'fixture']
+        spike.command.return_value = b'broker-id'
+        inspected = [{'Mounts': [], 'NetworkSettings': {'Networks': {'isolated': {}}}}]
+
+        def setup(script, *args, **kwargs):
+            if script.startswith('chown -R'):
+                raise OSError('permission setup failed')
+            return b''
+
+        with patch.object(fixture, 'Spike', return_value=spike), \
+                patch.object(fixture, 'run', return_value=json.dumps(inspected).encode()), \
+                patch.object(fixture, 'prepare_database_image'), \
+                patch.object(fixture, 'start_database', side_effect=RuntimeError('primary_failure')), \
+                patch.object(fixture, 'cleanup_container'), patch.object(spike, 'setup', side_effect=setup):
+            with patch.object(fixture.Path, 'chmod'):
+                with self.assertRaisesRegex(RuntimeError, '^primary_failure$'):
+                    fixture.main()
+        spike.cleanup.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

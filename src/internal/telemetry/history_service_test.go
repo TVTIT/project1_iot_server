@@ -1015,6 +1015,7 @@ func TestTelemetryHistoryService_ExecuteEffectiveHistoryQuery(t *testing.T) {
 
 		// nil context
 		q := validHistoryQuery()
+		//lint:ignore SA1012 Intentionally exercise the public service's nil-context validation.
 		_, err = svc.ExecuteEffectiveHistoryQuery(nil, actor, q) //nolint:staticcheck // testing nil context handling explicitly
 		if !errors.Is(err, telemetry.ErrHistoryInvalidInput) {
 			t.Fatalf("expected ErrHistoryInvalidInput for nil ctx, got %v", err)

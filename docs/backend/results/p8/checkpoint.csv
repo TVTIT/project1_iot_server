@@ -1,0 +1,19 @@
+check,status,value,qualification
+Go format/vet/lint/build/full race,PASS,source revision 52fd9456a9dbaa3316196eb92de40d14ba4ef32e; dirty SHA-256 b73d86246e44e5d0c4afa6c46fc4c74459170b769cbe1e0bdbc95318aa168800,source-mapped local gate
+Required test guards,PASS,35,not summed with overlapping test events
+Coverage,INFO,77.7%,not a coverage gate
+Native opt-in tests,SKIP,106 events,skip is not pass
+Selected Python guards/harnesses,PASS,selected only,not full Python discovery
+Remote GitHub CI,NOT_RUN,,no push to obtain CI
+Compose full HTTP RBAC/JWT,PASS,14 role denials; 9 JWT denials; cleanup 10/1/3,local disposable fixture
+Stage 3,PASS,9 uplink scenarios + persistence fresh/upgrade/rollback,exact cleanup
+Stage 4,PASS,60000 raw; 580 temporal; 2 chunks,exact cleanup
+Migration readiness initial,FAIL retained,cause unknown,not rewritten by retry evidence
+Legacy supervisor/reloader native CI,DEFERRED,,not pass
+P8.12 final source index,PASS,p812-final-source-20261029; sha256:975c59cc714ca5ac1cf97570f25b851b9bee0789b288758674eb686f4395b4b9,source-qualified local checks
+P8.12 DB/Auth index,PASS,p812-db-auth-retry-20261029; sha256:f6012de59f79e3d44a9b07a297ec0a6f0d26e38d19c4fc574c3fcc054d1ddcfe,first migration readiness failure retained separately
+P8.12 MQTT index,PASS,p812-native-mqtt-20261028; sha256:906d173c90d92b294ccb241f9e014b34df344e1f6cf2d594703bcb8886b32683,credentials/DynSec/bootstrap lanes
+P8.12 Stage3 persistence,PASS,p812-stage3-persistence; evidence index persistence.index sha256:bc61de56a29823f2c1f3214e10e9dcef95cd4a1e2d20879057d57454f33287cb,source/upgrade/rollback; digest is index not raw report
+P8.12 Stage3 uplink,PASS,p812-stage3-uplink; evidence index uplink.index sha256:5133813b98bca143f5aece0babf38d86b66dbf4903f0452374d4c03fc62b26e7,nine scenarios; digest is index not raw report
+P8.12 Stage4 API,PASS,p812-stage4-api; sha256:76f7962d64d921e906832d1930173694d82350b9cc7a304c2664c2f268c6e1d8,60k raw/580 temporal fixture
+P8.12 Compose/Docker,PASS,p812-final-compose-docker; evidence index command-index.txt sha256:bcd38defbb87763825230bdf53f12a4a80fdf4262a56092132993b24c0918549,legacy native deferred jobs remain deferred; digest is index not raw report

@@ -1,6 +1,9 @@
 """Focused fixture security and compatibility contracts (no Docker)."""
 import importlib.util
+import os
 from pathlib import Path
+import re
+import tempfile
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -9,6 +12,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class HarnessSecurity(unittest.TestCase):
+    def test_current_stage2_runner_passes_latest_terminal_to_all_verifiers(self):
+        terminal = max(int(path.name[:6]) for path in (ROOT / 'migrations').glob('*.up.sql'))
+        source = (ROOT / 'scripts/test-stage2-migrations.sh').read_text()
+        pins = [int(value) for value in re.findall(r'-v expected_schema_terminal=(\d+)', source)]
+        self.assertEqual(pins, [terminal] * 3)
+
+    def test_migration23_verifier_defaults_to_history_but_checks_requested_terminal(self):
+        source = (ROOT / 'scripts/sql/verify-migration-000023.sql').read_text()
+        self.assertIn(r'\if :{?expected_schema_terminal}', source)
+        self.assertIn(r'\set expected_schema_terminal 23', source)
+        self.assertIn('max(version) = :expected_schema_terminal', source)
+        self.assertIn(r'\if :terminal_verified', source)
+        self.assertIn('unexpected terminal schema', source)
+        self.assertIn("version=23 AND name='sensor_control_intent'", source)
+        self.assertNotRegex(source, r'version\s*>\s*23')
+
     def test_credentials_are_random_and_not_argument_values(self):
         text = (ROOT / 'scripts/test-stage2-migrations.sh').read_text()
         self.assertIn('secrets.token_hex(32)', text)
@@ -62,6 +81,45 @@ class CompatFixture(unittest.TestCase):
             with self.assertRaises(self.m.Failure):
                 self.f.cleanup()
 
+    def test_cleanup_removes_staged_directory_without_container(self):
+        with tempfile.TemporaryDirectory() as parent:
+            staged = Path(parent) / 'init'
+            staged.mkdir()
+            self.f.id = None
+            self.f.init_dir = staged
+            self.f.init_root = staged.parent
+            info = staged.stat()
+            self.f.init_identity = (info.st_dev, info.st_ino, info.st_uid)
+            with patch.object(self.m.shutil, 'rmtree') as remove:
+                self.f.cleanup()
+            remove.assert_called_once_with(staged)
+
+    def test_cleanup_removal_error_vetoes_success(self):
+        with tempfile.TemporaryDirectory() as parent:
+            staged = Path(parent) / 'init'
+            staged.mkdir()
+            self.f.id = None
+            self.f.init_dir = staged
+            self.f.init_root = staged.parent
+            info = staged.stat()
+            self.f.init_identity = (info.st_dev, info.st_ino, info.st_uid)
+            with patch.object(self.m.shutil, 'rmtree', side_effect=OSError('denied')):
+                with self.assertRaises(self.m.Failure):
+                    self.f.cleanup()
+
+    def test_cleanup_refuses_staged_directory_with_changed_identity(self):
+        with tempfile.TemporaryDirectory() as parent:
+            staged = Path(parent) / 'init'
+            staged.mkdir()
+            self.f.id = None
+            self.f.init_dir = staged
+            self.f.init_root = staged.parent
+            self.f.init_identity = (0, 0, os.getuid())
+            with patch.object(self.m.shutil, 'rmtree') as remove:
+                with self.assertRaises(self.m.Failure):
+                    self.f.cleanup()
+            remove.assert_not_called()
+
     def test_role_login_failure_is_fatal(self):
         with patch.object(self.f, 'sql', side_effect=self.m.Failure('login')):
             with self.assertRaises(self.m.Failure):
@@ -75,7 +133,35 @@ class CompatFixture(unittest.TestCase):
             self.assertGreater(run.call_args.kwargs['timeout'], 0)
 
     def test_exact_coverage_and_order(self):
-        with patch.object(self.f, 'sql', return_value='') as sql, \
+        migration24 = (ROOT / 'migrations/000024_telemetry_ledger_timestamp.up.sql').read_text()
+        seen_migration24 = False
+        def sql_stub(query, **kwargs):
+            nonlocal seen_migration24
+            if 'SELECT jsonb_build_object(' in query:
+                return 'fixture oracle'
+            if query == migration24 and not seen_migration24:
+                seen_migration24 = True
+                raise self.m.Failure('ERROR: Migration 24 conflicting telemetry provenance')
+            if '00000000-0000-0000-0000-00000000000a' in query:
+                raise self.m.Failure('ERROR: duplicate key value violates unique constraint "uq_twin_commands_active_sensor"')
+            if "receipt_bytes = 'test'::bytea WHERE" in query or "receipt_hash = 'badhash'" in query or "repeat('a', 8193)" in query:
+                raise self.m.Failure('ERROR: check constraint "chk_twin_commands_receipt"')
+            if "receipt_bytes = 'new'::bytea" in query:
+                raise self.m.Failure('ERROR: Canonical command receipt evidence is immutable')
+            if "cancelled_at = now() - interval '1s'" in query:
+                raise self.m.Failure('ERROR: Command cancellation evidence is immutable')
+            if "first_reserved_at = NULL" in query:
+                raise self.m.Failure('ERROR: First reservation timestamp is immutable once written')
+            if "auto_successors_used = 2" in query:
+                raise self.m.Failure('ERROR: check constraint "chk_twin_commands_auto_successors"')
+            if "00000000-0000-0000-0000-000000000008" in query and "NULL, 0" in query:
+                raise self.m.Failure('ERROR: check constraint "chk_twin_commands_lineage"')
+            if "DELETE FROM twin_commands WHERE command_id='00000000-0000-0000-0000-000000000007'" in query:
+                raise self.m.Failure('ERROR: update or delete on table "twin_commands" violates foreign key constraint "fk_twin_commands_root"')
+            if "SET ROLE anon;" in query or "SET ROLE authenticated;" in query:
+                raise self.m.Failure('ERROR: permission denied for table twin_commands')
+            return ''
+        with patch.object(self.f, 'sql', side_effect=sql_stub) as sql, \
              patch.object(self.f, 'expect') as expect, patch.object(self.f, 'login') as login:
             self.f.verify()
         inputs = [call.args[0] for call in sql.call_args_list]
@@ -91,7 +177,131 @@ class CompatFixture(unittest.TestCase):
         migration22 = (ROOT / 'migrations/000022_gateway_membership_revocation.up.sql').read_text()
         self.assertEqual(inputs.count(migration22), 2)
         self.assertIn((ROOT / 'scripts/sql/verify-migration-000022.sql').read_text(), inputs)
+        migration23 = (ROOT / 'migrations/000023_sensor_control_intent.up.sql').read_text()
+        self.assertEqual(inputs.count(migration23), 2)
+        self.assertIn((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(), inputs)
         self.assertIn("DELETE FROM public.user_gateways WHERE false;", inputs)
+        for version in (21, 22, 23):
+            verifier = next((ROOT / 'scripts/sql').glob(f'verify-migration-{version:06d}.sql')).read_text()
+            calls = [call for call in sql.call_args_list if call.args[0] == verifier]
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].kwargs.get('expected_schema_terminal'), version)
+
+    def test_sql_passes_explicit_terminal_to_psql(self):
+        with patch.object(self.f, 'command', return_value='verified') as command:
+            self.assertEqual(self.f.sql('SELECT 1;', expected_schema_terminal=27), 'verified')
+        args, kwargs = command.call_args
+        self.assertIn('expected_schema_terminal=27', args[0])
+        self.assertEqual(kwargs['input'], 'SELECT 1;\n')
+
+    def test_migration24_fixture_covers_rollback_backfill_and_reapply(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        compose = (ROOT / 'docker-compose.yml').read_text()
+        self.assertIn("migration24 = (ROOT / 'migrations/000024_telemetry_ledger_timestamp.up.sql').read_text()", source)
+        self.assertIn("self.sql(migration24)\n        self.sql(migration24)", source)
+        self.assertIn("conflicting telemetry provenance", source)
+        self.assertIn("telemetry_ledger_timestamp", source)
+        self.assertIn("000024_telemetry_ledger_timestamp.up.sql", compose)
+        self.assertIn("000025_drop_telemetry_sensor_fk.up.sql", compose)
+        self.assertLess(compose.index('000023_sensor_control_intent.up.sql'),
+                        compose.index('000024_telemetry_ledger_timestamp.up.sql'))
+        self.assertLess(compose.index('000024_telemetry_ledger_timestamp.up.sql'),
+                        compose.index('000025_drop_telemetry_sensor_fk.up.sql'))
+
+    def test_migration26_fixture_covers_redundant_index_removal(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        compose = (ROOT / 'docker-compose.yml').read_text()
+        self.assertIn("migration26 = (ROOT / 'migrations/000026_drop_telemetry_redundant_indexes.up.sql').read_text()", source)
+        self.assertIn("self.sql(migration26)", source)
+        self.assertIn("drop_telemetry_redundant_indexes", source)
+        self.assertIn("000026_drop_telemetry_redundant_indexes.up.sql", compose)
+        self.assertLess(compose.index('000025_drop_telemetry_sensor_fk.up.sql'),
+                        compose.index('000026_drop_telemetry_redundant_indexes.up.sql'))
+
+    def test_migration27_fixture_covers_resilience(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        compose = (ROOT / 'docker-compose.yml').read_text()
+        self.assertIn("migration27 = (ROOT / 'migrations/000027_stage6_control_resilience.up.sql').read_text()", source)
+        self.assertIn("self.sql(migration27)\n        self.expect(\"SELECT count(*) FROM schema_migrations WHERE version=27 AND name='stage6_control_resilience';\", '1')", source)
+        self.assertIn("Migration 27 FIRST data-bearing application preserved Stage 5 oracle byte-for-byte.", source)
+        self.assertIn("Migration 27 separate idempotent reapply preserved the same oracle.", source)
+        self.assertIn("int(match.group(1)) <= 20", source)
+        self.assertIn("WHERE version=27;", source)
+        self.assertIn("twin_command_requests WHERE status_code=202", source)
+        self.assertIn("'state_completed', (SELECT jsonb_build_object", source)
+        self.assertIn("stage6_control_resilience", source)
+        self.assertIn("000027_stage6_control_resilience.up.sql", compose)
+        self.assertLess(compose.index('000026_drop_telemetry_redundant_indexes.up.sql'),
+                        compose.index('000027_stage6_control_resilience.up.sql'))
+
+    def test_native_fixture_requires_stage6_retention_entrypoint(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        self.assertIn('fixture.verify_retention()', source)
+        entrypoint = (ROOT / 'scripts/sql/stage6-command-retention.sql').read_text()
+        candidates = (ROOT / 'scripts/sql/stage6-command-retention-candidates.sql').read_text()
+        self.assertIn("'-f', '/tmp/stage6-command-retention.sql'", source)
+        self.assertIn(r'\ir stage6-command-retention-candidates.sql', entrypoint)
+        self.assertIn("interval '720 hours'", candidates)
+        self.assertIn('pg_temp.stage6_retention_json', candidates)
+        self.assertIn('json_each', candidates)
+        self.assertIn("nested_entry.key = 'sample_interval_us'", candidates)
+        self.assertIn("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;", entrypoint)
+        self.assertIn("ROLLBACK;", entrypoint)
+        self.assertIn("to_regprocedure('pg_temp.stage6_retention_json(bytea)') IS NULL", entrypoint)
+        self.assertNotIn("REPEATABLE READ READ ONLY", entrypoint)
+        self.assertIn("((c.parameters->>'sample_interval_us')::numeric - 0.5)", candidates)
+        self.assertIn("1000000 < ((c.parameters->>'sample_interval_us')::numeric + 0.5)", candidates)
+        self.assertIn("raw_frequency.requested_hz > 0", candidates)
+        self.assertIn("c.retry_stop_reason = 'acknowledged'", candidates)
+        self.assertIn("c.retry_stop_reason = 'retry_exhausted'", candidates)
+        self.assertIn("NOT r.reconcile_blocked", candidates)
+        self.assertIn("current_root.reconcile_blocked", candidates)
+        self.assertIn("COALESCE(r.result_received_at, r.completed_at)", candidates)
+
+    def test_fixture_scratch_root_is_existing_user_owned_ci_or_persistent_path(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        self.assertIn("Path('/var/tmp/opencode'), Path('/tmp/opencode')", source)
+        self.assertIn('metadata.st_uid != os.getuid()', source)
+        self.assertIn('candidate.is_symlink()', source)
+        self.assertIn("dir=self.init_root", source)
+        self.assertNotIn("dir='/var/tmp/opencode'", source)
+
+
+    def test_stage3_writer_fixtures_apply_post_auth_schema24_before_writer(self):
+        source = (ROOT / 'scripts/tests/stage3_persistence_runner.py').read_text()
+        helper = source[source.index('def apply_post_auth_compatibility'):source.index('def run_normal_fixture')]
+        self.assertIn("fixture.sql(b\"CREATE SCHEMA IF NOT EXISTS auth", helper)
+        for version, name in ((21, 'admin_user_management'), (22, 'gateway_membership_revocation'),
+                              (23, 'sensor_control_intent'), (24, 'telemetry_ledger_timestamp'),
+                              (25, 'drop_telemetry_sensor_fk'), (26, 'drop_telemetry_redundant_indexes')):
+            self.assertIn(f"({version}, '{name}')", helper)
+        self.assertIn("expected = (b'21:admin_user_management'", helper)
+        for fixture in ('run_normal_fixture', 'run_group_fixture'):
+            body = source[source.index(f'def {fixture}'):]
+            self.assertLess(body.index('apply_post_auth_compatibility(fixture)'), body.index('run_go_integration('))
+
+    def test_native_writer_cases_assert_schema24_timestamp(self):
+        source = (ROOT / 'src/internal/telemetry/postgres_integration_test.go').read_text()
+        self.assertIn('sample_count=100 AND timestamp=$4', source)
+        self.assertIn('sample_count,timestamp)::text FROM processed_messages', source)
+
+    def test_stage4_live_telemetry_writer_fixture_uses_schema24(self):
+        runner = (ROOT / 'scripts/tests/stage4_api_runner.py').read_text()
+        scenario = (ROOT / 'scripts/tests/stage4_vertical_scenario.py').read_text()
+        self.assertIn('TERMINAL_SCHEMA_VERSION = 26', runner)
+        self.assertIn('run_existing_migration_runner(fixture, TERMINAL_SCHEMA_VERSION)', runner)
+        self.assertIn("producer.publish_qos1(cap_topic, cap_payload)", scenario)
+
+    def test_stage3_live_writer_fixture_upgrades_to_schema24(self):
+        for filename, seed_call in (
+                ('stage3_mqtt_ingress_runner.py', 'seed_graph(fixture)'),
+                ('stage3_workload_runner.py', 'seed_graph(fixture,'),
+                ('stage3_uplink_runner.py', 'seed_graph(fixture,')):
+            source = (ROOT / 'scripts/tests' / filename).read_text()
+            self.assertIn('apply_post_auth_compatibility', source, filename)
+            fixture_start = source.index("run_existing_migration_runner(fixture, 20)")
+            self.assertLess(source.index('apply_post_auth_compatibility(fixture)', fixture_start),
+                            source.index(seed_call, fixture_start), filename)
 
     def test_login_secret_only_protected_stdin(self):
         with patch.object(self.f, 'command', return_value='supabase_auth_admin') as command:

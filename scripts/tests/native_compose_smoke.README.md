@@ -1,6 +1,114 @@
 # Native Compose smoke preparation
 
-## Latest phased startup result (supersedes historical preparation status)
+## Hiện hành — P2 RS256/JWKS và HTTP perimeter (24/10/2026)
+
+P2 đã **PASS** cục bộ trên fixture cô lập qua wrapper `scripts/test-paper-p2.sh` và runner `native_compose_smoke.py --paper-p2`. Source terminal migration là **23**.
+
+```sh
+sh scripts/test-paper-p2.sh [NEW_RUN_DIRECTORY]
+```
+
+- **Thư mục thực thi:** Đối số `NEW_RUN_DIRECTORY` bắt buộc phải là thư mục mới, chưa tồn tại; nếu để trống, wrapper tự động tạo thư mục ngẫu nhiên dạng `/tmp/opencode/paper-p2-$(date +%Y%m%d-%H%M%S)-$$`. Không chạy đè lên thư mục cũ hoặc artifacts trước đó.
+- **Tiền điều kiện môi trường:**
+  - Docker Engine & Docker Compose (Compose >= 2.24.4).
+  - Python 3 có sẵn thư viện `cryptography` (để sinh cặp khóa RSA testbed và xác minh chữ ký token cục bộ) cùng thư viện chuẩn.
+  - OpenSSL, `setfacl`.
+  - Upstream pinned images đã có trong local cache: `supabase/gotrue:v2.196.0`, `supabase/storage-api:v1.74.0`, `envoyproxy/envoy:v1.39.1`, `nginx:1.25-alpine`, `timescale/timescaledb@sha256:...`, `eclipse-mosquitto@sha256:...`.
+- **Vòng đời cô lập và tài nguyên:**
+  - Kế thừa lifecycle, registry, kiểm tra schema và quota từ P0/P1: backend quota 2 vCPU / 4 GiB RAM; ingress bật (queue 256, 4 workers, payload 65.536 byte, DB pool 10 kết nối).
+  - Schema terminal **23**; tuyệt đối không sửa file migration và không chạy trên shared/live deployment database. Không đọc hoặc `source` file `.env` triển khai thật.
+- **Phạm vi opt-in và kiến trúc perimeter:**
+  - Môi trường triển khai mặc định (root Compose) tiếp tục giữ nguyên cấu hình **HS256** và **HTTP plain**. P2 là hồ sơ opt-in phục vụ kiểm chứng bảo mật.
+  - User token chuyển sang **RS256**: Auth giữ private signing JWK và thêm key legacy verify-only để duy trì tính tương thích của API keys (`anon`, `service_role`).
+  - Đường truyền client: Client kết nối Nginx qua HTTPS (chứng chỉ testbed có SAN phù hợp). Nginx thực hiện xác thực ngoại vi qua chỉ thị `auth_request` tới Unix domain socket (`/internal/auth/verify`) được phục vụ bởi chính tiến trình Go backend duy nhất (`AUTH_UNIX_SOCKET_PATH`).
+  - Đường truyền JWKS nội bộ: Go tải JWKS từ Envoy (`SUPABASE_JWKS_URL`) qua mạng nội bộ HTTP (`http://supabase-envoy:8000/...`), **không phải TLS toàn tuyến** (not end-to-end TLS).
+  - Cảnh báo biến cấu hình: Việc chỉ bật `SUPABASE_JWT_MODE=rs256` trong môi trường không tự động cấu hình các khóa Auth, khóa công khai Storage, chứng chỉ HTTPS Nginx hay thư mục socket/chủ quyền UID:GID.
+- **Biến môi trường mới tham chiếu từ `.env.example`:**
+  - `SUPABASE_JWT_MODE`: `hs256` mặc định, `rs256` opt-in (không automatic fallback).
+  - `SUPABASE_JWKS_URL`: URL công khai để Go tải JWKS; khi cấu hình HTTPS ngoài sẽ áp dụng strict system CA/hostname verification.
+  - `SUPABASE_JWKS_CACHE_TTL` (`60s`): thời gian cache cứng, tự động refresh nền ở `TTL/2`.
+  - `SUPABASE_JWKS_HTTP_TIMEOUT` (`2s`), `SUPABASE_JWKS_REFRESH_COOLDOWN` (`5s`): chặn ngưỡng timeout và tốc độ refresh khi gặp key lạ/hết hạn.
+  - `AUTH_UNIX_SOCKET_PATH`: đường dẫn Unix domain socket (mặc định rỗng/tắt; P2 fixture dùng `/run/iot-auth/auth.sock` với quyền `0660` trong thư mục setgid thuộc quyền sở hữu `1883:101/2710` cho backend UID 1883 và Nginx worker GID 101).
+  - `AUTHORIZATION_TIMEOUT` (`2s`), `ADMIN_MAX_BODY_BYTES` (`16384`), `SUPABASE_JWT_AUDIENCE` (`authenticated`), `SUPABASE_JWT_CLOCK_SKEW` (`30s`).
+- **Storage, Rotation và Fail-Closed:**
+  - Storage sử dụng tập khóa RSA công khai tĩnh (`JWT_JWKS`); khi rotation khóa phải cập nhật cấu hình tĩnh và reload/recreate Storage.
+  - Cơ chế ký URL của Storage (`signed URL`) tiếp tục dùng HMAC bí mật riêng, phân biệt rạch ròi với xác thực RS256 user; không cấp Auth private key sang Storage.
+  - Storage readiness áp dụng bounded retry (tối đa 20 attempts, deadline 30s) phân loại mã lỗi tạm thời `503 upstream_unavailable` trong cửa sổ tái tạo dịch vụ, tuyệt đối không bypass xác thực JWT, RLS hay TLS.
+  - Thử nghiệm fail-closed: Khi Unix auth upstream/socket của Go không khả dụng, hệ thống trả về 500 fail-closed an toàn, không rò rỉ quyền vào business handler.
+- **Bộ 5 artifacts an toàn và dọn dẹp chính xác:**
+  - Xuất đủ 5 file tại thư mục artifacts: `run.json`, `metrics.csv`, `resources.csv`, `spike.json`, `startup-summary.json`. Tuyệt đối không chứa token values, signed URLs, raw payloads, private keys, cấu hình `.env` thật hay thông tin cá nhân.
+  - Dọn dẹp tài nguyên chính xác (`cleanup_counts`): đúng **19 containers, 1 network, 7 volumes**. Tự động dọn sạch các file env, chứng chỉ và khóa riêng tư tạm thời sau khi hoàn tất.
+- **Bằng chứng kiểm chứng thực tế:**
+  - Lượt chạy cô lập mới sau reboot: `ncs_fcd6c1c6f81a` tại `/tmp/opencode/paper-p2-reverify-after-reboot-20261024-220120-30702/artifacts`.
+  - Trạng thái: `status: PASS`, `PAPER_P2_ACCEPTED`, `cleanup_verified: true`.
+  - Tải dữ liệu: 2 Gateway CLI × 20 batch = 40 message / 4.000 samples, 1 replay byte-exact (DB không đổi dữ liệu), outbox SQLite rút cạn về 0 (`pending_rows=0`), đọc `/temporal` qua HTTPS trả về đúng 199 điểm dữ liệu.
+  - Bằng chứng lịch sử (ví dụ lượt `ncs_60a5e67bb655` trước reboot) được lưu giữ nguyên trạng để đối chiếu, phân biệt rõ với bằng chứng tái kiểm tra tươi.
+- **Giới hạn phạm vi & Chuyển đổi:**
+  - Stage 5 tiếp tục giữ `STAGE5_ENABLED=false`, dừng lại sau Task 5.4; không tự mở rộng 5.5–5.8 hoặc P3.
+  - Không tuyên bố zero-downtime, thu hồi token tức thì (instant revocation) hay nghiệm thu production.
+  - Chi tiết thứ tự chuyển đổi (transition runbook) và phương án rollback: xem tại [báo cáo RS256 và HTTP perimeter P2](../../docs/backend/paper-p2-auth-and-http-perimeter.md).
+
+## Checkpoint trước — P1 metrics và baseline (24/10/2026)
+
+P1 đã PASS cục bộ qua wrapper `test-paper-p1.sh` và runner `--paper-p1 --mode baseline|optimized`.
+Source terminal là **23**.
+
+```sh
+sh scripts/test-paper-p1.sh --mode baseline /tmp/opencode/NEW-P1-DIRECTORY
+sh scripts/test-paper-p1.sh --mode baseline /tmp/opencode/NEW-P1-OFF-DIRECTORY --metrics-off
+```
+
+- Kế thừa toàn bộ lifecycle, topology 10 service (7 dài hạn + 3 init jobs), quota backend 2 vCPU/4 GiB của P0.
+- Bật công tắc `METRICS_ENABLED=true` khi chạy mode P1 thông thường; cờ `--metrics-off` tắt instrumentation và scraper cho lượt đối chứng overhead.
+- Bảo vệ endpoint `/v1/admin/metrics` bằng JWT platform-admin qua Nginx (401/403/200).
+- Chạy 2 Gateway CLI × 20 batch = 40 message / 4.000 samples, 1 replay byte-exact, đối chiếu khớp chính xác DB (ledger, raw, temporal).
+- Xuất 3 artifacts an toàn: `run.json`, `metrics.csv`, `resources.csv` (không chứa secrets/payloads).
+- Lượt baseline cuối: `/tmp/opencode/paper-p1-baseline-20261024-approved`, exit 0, `PAPER_P1_ACCEPTED`.
+- Lượt đối chứng cuối: `/tmp/opencode/paper-p1-metrics-off-20261024`, exit 0, `PAPER_P1_ACCEPTED`.
+- Chi tiết xem [báo cáo metrics và baseline P1](../../docs/backend/paper-p1-metrics-and-baseline.md).
+
+## Checkpoint trước — P0 paper testbed (24/10/2026)
+
+P0 đã PASS cục bộ qua wrapper sau sửa runner được duyệt; các checkpoint phía dưới
+là lịch sử, không mô tả schema/mode hiện tại. Source terminal là **23**.
+
+Từ repo root, với Docker/Compose >= 2.24.4, Python3, OpenSSL, `setfacl` và upstream
+images đã có trong Docker cache:
+
+```sh
+sh scripts/test-paper-p0.sh /tmp/opencode/NEW-P0-DIRECTORY
+```
+
+Thư mục phải mới; bỏ đối số để wrapper tạo tên ngẫu nhiên. Wrapper gọi
+`native_compose_smoke.py --prepare <new-directory> --paper-p0`, giữ exit status,
+không đổi thiếu Docker/lỗi thành PASS. `--paper-p0` không kết hợp mode khác.
+
+- Reuse lifecycle/registry/Compose root, thêm fragment `compose.paper-p0.override.yml`.
+  Mười service (7 dài hạn + 3 init jobs); Storage chỉ thêm trong P0. Hai Gateway CLI
+  chạy hữu hạn cùng mạng với outbox riêng; không có backend thứ hai hoặc tunnel.
+- Backend quota 2 vCPU/4 GiB, ingress bật, queue 256/workers 4/payload 65.536 byte,
+  DB max pool 10; legacy credential runtime và Stage 5 tắt. Credential API bật
+  trong fixture để setup. Không đổi default hoặc assertions của các mode cũ.
+- HTTP loopback Nginx → Go hoặc Envoy → GoTrue/Storage; MQTT TLS + DynSec trên mạng
+  riêng. Chỉ Nginx có cổng host động/loopback. Không đọc/source deployment `.env`.
+- Ba login thật, provisioning A/B, 200 raw/2 ledger/2 temporal, hai commit ACK và
+  SQLite outbox drain; canonical temporal 100 điểm và denial bracket 200/404/200.
+  `/temporal` backend không đổi: runner gửi timestamp UTC hậu tố `Z` đúng contract.
+- Metadata Git dùng private HOME và trust đúng ROOT chỉ trong ba lệnh đọc, thêm
+  `--no-optional-locks`; không sửa global config, owner hay trust wildcard.
+- Success `PAPER_P0_ACCEPTED` chỉ sau cleanup đúng 15 containers/1 network/6 volumes;
+  private env/TLS/store/logs/receipts được xóa sau thành công. Failure giữ private
+  diagnostics để chẩn đoán, **không upload**; cleanup lỗi không được coi là PASS.
+  Build images/cache được giữ lại, không prune.
+- Giữ summary an toàn `artifacts/startup-summary.json`; không upload cả fixture.
+  Bốn snapshot Docker stats chỉ là smoke, không phải benchmark/peak/capacity.
+
+Lượt cuối: `/tmp/opencode/paper-p0-20261024-final`, exit 0; **205 guard tests PASS**.
+Xem [report P0 và hai FAIL lịch sử](../../docs/backend/paper-p0-baseline-and-testbed.md)
+để có image IDs, quota/host/snapshot, phạm vi NOT RUN và backlog. Không tự triển
+khai P1, WebSocket, media workflow hoặc Stage 5.5–5.8.
+
+## Historical phased startup result (2026-10-13)
 
 `--startup-only` now executes real phased startup, while `execute_native()` and
 HTTP acceptance remain closed. Latest evidence:

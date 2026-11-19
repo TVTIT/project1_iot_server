@@ -24,11 +24,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |
-          mkdir -p /tmp/opencode
+          mkdir -p /tmp/opencode /var/tmp/opencode
           python3 --version
           openssl version
           docker version
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Format check
         run: |
@@ -170,7 +170,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Build server (linux/amd64)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/server
@@ -256,7 +256,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Prepare test directory
         working-directory: .
@@ -279,7 +279,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Prepare test directory
         working-directory: .
@@ -302,8 +302,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
+      - name: Prepare fixture directories
+        working-directory: .
+        run: mkdir -p /tmp/opencode /var/tmp/opencode
       - name: Test Auth harness
         working-directory: .
         run: python3 -m unittest discover -s scripts/tests -p 'test_stage2_auth.py'
@@ -324,23 +327,19 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Prepare coverage directory
-        run: mkdir -p /tmp/opencode
+        run: mkdir -p /tmp/opencode /var/tmp/opencode
       - name: Test credential harness
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_stage2_mqtt_credentials.py'
           python3 -m unittest discover -s scripts/tests -p 'test_task2612_standalone.py'
-      - name: Legacy credential execution deferred notice
+      - name: Current simplified credential acceptance
         run: |
-          notice=$(printf '%s\n' \
-            "legacy-execution-deferred: mosquitto-credential-integration" \
-            "Omitted native scenario: legacy credential lifecycle and controller standalone integration." \
-            "Known unresolved failure: standalone controller gate mismatch source-proven (cmd/server does not call legacy OpenVerified); gate closed." \
-            "Current replacement verification jobs: dynsec-native-integration and native-compose-smoke.")
-          printf '%s\n' "$notice"
-          printf '%s\n' "$notice" >> "$GITHUB_STEP_SUMMARY"
+          sh scripts/test-stage2-mqtt-credentials.sh
+          echo "current-simplified-acceptance: TLS/auth/ACL, API/readiness/shutdown; no global gate guarantee" >> "$GITHUB_STEP_SUMMARY"
+          echo "Retained gate/controller tests are LEGACY COMPONENT-ONLY: sh scripts/test-legacy-mqtt-controller.sh (not deployment acceptance)." >> "$GITHUB_STEP_SUMMARY"
       - name: Lint credentials
         uses: golangci/golangci-lint-action@v9
         with:
@@ -362,7 +361,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Prepare test directory
         run: mkdir -p /tmp/opencode
@@ -392,7 +391,7 @@ jobs:
             "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Test native harness
         run: |
@@ -495,7 +494,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |
@@ -591,7 +590,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |
@@ -650,6 +649,182 @@ jobs:
           path: ${{ runner.temp }}/stage4-api-${{ github.run_id }}-${{ github.run_attempt }}.json
           if-no-files-found: error
 
+  stage5-control-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: src/go.sum
+      - name: Check prerequisites
+        run: |
+          mkdir -p /tmp/opencode /var/tmp/opencode
+          python3 --version
+          openssl version
+          which setfacl getfacl
+          docker version
+          docker compose version
+          go version
+      - name: Test P3 runner and CI wiring
+        run: |
+          python3 -m unittest scripts/tests/test_paper_p3_support.py scripts/tests/test_stage6_r73_fixture_contract.py scripts/tests/test_stage6_r81_p3_contract.py scripts/tests/test_dynsec_bootstrap_cli.py scripts/tests/test_ci_feature_jobs.py
+      - name: Pull full P3 profile images
+        run: |
+          docker pull --platform linux/amd64 timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          docker pull --platform linux/amd64 eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+          docker pull --platform linux/amd64 nginx:1.25-alpine
+          docker pull --platform linux/amd64 supabase/gotrue:v2.196.0
+          docker pull --platform linux/amd64 envoyproxy/envoy:v1.39.1
+          docker pull --platform linux/amd64 supabase/storage-api:v1.74.0
+      - name: Prepare private P3 run directory
+        run: |
+          private_dir="${RUNNER_TEMP:-/tmp}/stage5-control-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$private_dir"
+          mkdir -m 700 -p "$private_dir"
+          printf 'STAGE5_CONTROL_PRIVATE_DIR=%s\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'STAGE5_CONTROL_RUN_DIR=%s/fixture\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'STAGE5_CONTROL_SAFE_REPORT=%s/summary.json\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'STAGE6_CONTROL_RUN_DIR=%s/stage6-fixture\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'STAGE6_CONTROL_SAFE_REPORT=%s/stage6-summary.json\n' "$private_dir" >> "$GITHUB_ENV"
+      - name: Run P3 control require-run
+        id: p3
+        run: |
+          # GNU timeout sends TERM to the wrapper/process group; the owned fixture
+          # receives time to run its bounded exact-receipt cleanup before KILL.
+          timeout --signal=TERM --kill-after=180s 2100s sh scripts/test-paper-p3.sh "$STAGE5_CONTROL_RUN_DIR" \
+            > "$STAGE5_CONTROL_PRIVATE_DIR/runner.log" 2>&1
+      - name: Stage safe P3 summary
+        run: |
+          python3 - "$STAGE5_CONTROL_RUN_DIR/artifacts/startup-summary.json" "$STAGE5_CONTROL_SAFE_REPORT" "$GITHUB_SHA" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          source, destination, checkout_sha = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          if source.is_symlink() or not source.is_file():
+              raise SystemExit("P3 acceptance summary missing or not a regular file")
+          try:
+              report = json.loads(source.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit("P3 acceptance summary is unreadable or malformed") from None
+          if not isinstance(report, dict):
+              raise SystemExit("P3 acceptance summary rejected")
+          sys.path.insert(0, str(Path.cwd() / "scripts" / "tests"))
+          import paper_p3_support
+          try:
+              paper_p3_support.require_paper_p3_run(report, 0)
+          except ValueError:
+              raise SystemExit("P3 acceptance summary did not satisfy require-run") from None
+          if (type(report.get("schema_version")) is not int or report["schema_version"] != 1 or
+                  not isinstance(report.get("project"), str) or
+                  not re.fullmatch(r"ncs_[0-9a-f]{12}", report["project"]) or
+                  not re.fullmatch(r"[0-9a-f]{40}", checkout_sha)):
+              raise SystemExit("P3 safe report provenance rejected")
+          counts = report.get("cleanup_counts")
+          if (not isinstance(counts, dict) or set(counts) != {"container", "network", "volume"} or
+                  any(type(value) is not int or value < 0 for value in counts.values())):
+              raise SystemExit("P3 safe report cleanup counts rejected")
+          safe = {
+              "schema_version": 1,
+              "status": report["status"],
+              "project": report["project"],
+              "native_executed": True,
+              "full_p3_accepted": True,
+              "exact_cleanup_verified": True,
+              "cleanup_counts": counts,
+              "checkout_sha": checkout_sha,
+              "profile": "P3",
+          }
+          destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as output:
+              json.dump(safe, output, sort_keys=True)
+              output.write("\n")
+          print("P3 safe summary staged for checkout " + checkout_sha)
+          PY
+      - name: Run opt-in Stage 6 integrated P3 require-run
+        run: |
+          # Sequentially reuse the exact owned P3 testbed; keep raw logs private.
+          timeout --signal=TERM --kill-after=180s 2100s sh scripts/test-paper-p3.sh --stage6 "$STAGE6_CONTROL_RUN_DIR" \
+            > "$STAGE5_CONTROL_PRIVATE_DIR/stage6-runner.log" 2>&1
+      - name: Stage safe Stage 6 summary
+        run: |
+          python3 - "$STAGE6_CONTROL_RUN_DIR/artifacts/startup-summary.json" "$STAGE6_CONTROL_SAFE_REPORT" "$GITHUB_SHA" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          source, destination, checkout_sha = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          if source.is_symlink() or not source.is_file():
+              raise SystemExit("Stage 6 acceptance summary missing or not a regular file")
+          try:
+              report = json.loads(source.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit("Stage 6 acceptance summary is unreadable or malformed") from None
+          if not isinstance(report, dict):
+              raise SystemExit("Stage 6 acceptance summary rejected")
+          sys.path.insert(0, str(Path.cwd() / "scripts" / "tests"))
+          import paper_p3_support
+          try:
+              paper_p3_support.require_paper_p3_run(report, 0, require_stage6=True)
+          except ValueError:
+              raise SystemExit("Stage 6 summary did not satisfy native profile/scenario require-run") from None
+          if (type(report.get("schema_version")) is not int or report["schema_version"] != 1 or
+                  not isinstance(report.get("project"), str) or
+                  not re.fullmatch(r"ncs_[0-9a-f]{12}", report["project"]) or
+                  not re.fullmatch(r"[0-9a-f]{40}", checkout_sha)):
+              raise SystemExit("Stage 6 safe report provenance rejected")
+          counts = report.get("cleanup_counts")
+          if (not isinstance(counts, dict) or set(counts) != {"container", "network", "volume"} or
+                  any(type(value) is not int or value < 0 for value in counts.values())):
+              raise SystemExit("Stage 6 safe report cleanup counts rejected")
+          safe = {
+              "schema_version": 1,
+              "status": report["status"],
+              "project": report["project"],
+              "native_executed": True,
+              "stage6_profile": {"backend_enabled": True, "gateway_enabled": True},
+              "stage6_scenario_accepted": True,
+              "exact_cleanup_verified": True,
+              "cleanup_counts": counts,
+              "checkout_sha": checkout_sha,
+              "profile": "P3+Stage6",
+          }
+          destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as output:
+              json.dump(safe, output, sort_keys=True)
+              output.write("\n")
+          print("Stage 6 safe summary staged for checkout " + checkout_sha)
+          PY
+      - name: Run owned Stage 6 MQTT retry and convergence acceptance
+        run: |
+          # This runner owns its DB/broker/Gateway fixture and fails on missing
+          # required native PASS markers, SKIP, or unsuccessful exact cleanup.
+          timeout --signal=TERM --kill-after=90s 1200s python3 scripts/tests/stage5_mqtt_fixture.py \
+            > "$STAGE5_CONTROL_PRIVATE_DIR/stage6-mqtt-native.log" 2>&1
+      - name: Upload safe P3 report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage5-control-safe-report
+          path: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
+          if-no-files-found: error
+      - name: Upload safe Stage 6 report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage5-control-stage6-safe-report
+          path: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/stage6-summary.json
+          if-no-files-found: error
+
   native-compose-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -663,11 +838,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache-dependency-path: src/go.sum
       - name: Check prerequisites
         run: |
-          mkdir -p /tmp/opencode
+          mkdir -p /tmp/opencode /var/tmp/opencode
           python3 --version
           openssl version
           which setfacl getfacl

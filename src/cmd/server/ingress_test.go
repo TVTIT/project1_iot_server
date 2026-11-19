@@ -8,6 +8,7 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"log/slog"
@@ -22,6 +23,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"iot-platform/internal/config"
+	"iot-platform/internal/httpserver"
+	"iot-platform/internal/mqttingress"
+	"iot-platform/internal/telemetry"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -94,6 +98,270 @@ func ingressTestConfig(caFile string) config.Config {
 	}
 }
 
+func TestMQTTIngressOptionsWireConfiguredByteBudgetAndShaper(t *testing.T) {
+	cfg := ingressTestConfig("unused")
+	cfg.MetricsEnabled = false
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
+
+	got := mqttIngressOptions(cfg)
+	if got.BufferedPayloadBytes != 2<<20 {
+		t.Errorf("BufferedPayloadBytes = %d, want %d", got.BufferedPayloadBytes, 2<<20)
+	}
+	want := (mqttingress.ShaperOptions{Enabled: true, RatePerSecond: 7, Burst: 9, MaxGateways: 11, IdleRetention: 3 * time.Minute})
+	if got.Shaper != want {
+		t.Errorf("Shaper options = %+v, want %+v", got.Shaper, want)
+	}
+}
+
+func TestMQTTIngressOptionsPreservePostCommitSinkIndependentOfMetrics(t *testing.T) {
+	ws, err := composeWebSocket(config.Config{WebSocketEnabled: true, WebSocket: config.WebSocketConfig{MaxSessions: 2, MaxSubscriptionsPerSession: 2, GlobalEventSlots: 2, GlobalEventBytes: 1 << 20, SessionEventSlots: 2, SessionEventBytes: 1 << 16, MaxFrameBytes: 66560}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ws.close(context.Background()); err != nil {
+			t.Errorf("close websocket runtime: %v", err)
+		}
+	}()
+	cfg := config.Config{}
+	got := mqttIngressOptions(cfg, ws.events)
+	if got.PostCommitSink != ws.events {
+		t.Fatal("ingress sink does not use the composed EventRuntime")
+	}
+	if got.MetricsEnabled {
+		t.Fatal("metrics unexpectedly enabled")
+	}
+}
+
+func TestComposeWebSocketDisabledHasNoRuntimeAndCloseIsIdempotent(t *testing.T) {
+	w, err := composeWebSocket(config.Config{})
+	if err != nil || w.hub != nil || w.events != nil {
+		t.Fatalf("disabled runtime=%+v err=%v", w, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestComposeWebSocketEnabledClosesOwnedWorkerWithinSharedBudget(t *testing.T) {
+	cfg := config.Config{WebSocketEnabled: true, WebSocket: config.WebSocketConfig{MaxSessions: 2, GlobalEventSlots: 2, GlobalEventBytes: 4096, SessionEventSlots: 2, SessionEventBytes: 4096, MaxFrameBytes: 66560}}
+	w, err := composeWebSocket(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.hub == nil || w.events == nil {
+		t.Fatal("enabled composition omitted hub/runtime")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := w.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMQTTIngressOptionsWireEveryMicrobatchLimit(t *testing.T) {
+	cfg := ingressTestConfig("unused")
+	cfg.Ingress.MicrobatchEnabled = true
+	cfg.Ingress.MicrobatchMaxMessages = 7
+	cfg.Ingress.MicrobatchMaxRows = 91
+	cfg.Ingress.MicrobatchMaxPayloadBytes = 12345
+	cfg.Ingress.MicrobatchMaxWait = 250 * time.Millisecond
+
+	got := mqttIngressOptions(cfg).Microbatch
+	want := mqttingress.MicrobatchOptions{Enabled: true, MaxMessages: 7, MaxRows: 91, MaxPayloadBytes: 12345, MaxWait: 250 * time.Millisecond}
+	if got != want {
+		t.Fatalf("Microbatch options = %+v, want %+v", got, want)
+	}
+}
+
+func TestMQTTIngressOptionsWireRAMDedupIndependently(t *testing.T) {
+	cfg := ingressTestConfig("unused")
+	cfg.Ingress.RAMDedupEnabled = true
+	cfg.Ingress.RAMDedupMaxEntries = 321
+	cfg.Ingress.RAMDedupMaxBytes = 987654
+	got := mqttIngressOptions(cfg)
+	if got.RAMDedup != (mqttingress.DedupCacheOptions{Enabled: true, MaxEntries: 321, MaxBytes: 987654}) {
+		t.Fatalf("RAM dedup options = %+v", got.RAMDedup)
+	}
+	if got.Microbatch.Enabled || got.MetricsEnabled {
+		t.Fatalf("cache options unexpectedly changed independent flags: %+v", got)
+	}
+}
+
+func TestComposeIngressRAMDedupMetricsOffStillEnforcesAndExportsFixedSnapshot(t *testing.T) {
+	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.RAMDedupEnabled = true
+	cfg.Ingress.RAMDedupMaxEntries = 321
+	cfg.Ingress.RAMDedupMaxBytes = 987654
+	cfg.MetricsEnabled = false
+	runtime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := runtime.ingress.Snapshot()
+	if !snapshot.RAMDedup.Enabled || snapshot.RAMDedup.MaxEntries != 321 || snapshot.RAMDedup.MaxBytes != 987654 || snapshot.RAMDedup.TTLSeconds != 600 {
+		t.Fatalf("effective cache config missing with metrics off: %+v", snapshot.RAMDedup)
+	}
+	if runtime.metrics != nil {
+		t.Fatal("persistence instrumentation should remain off")
+	}
+
+	// Metrics are an optional observer; cache enforcement and its accounting live
+	// in the ingress/cache and remain available even if that observer is absent.
+	cache := runtime.ingress.DedupCacheSnapshot()
+	if !cache.Enabled || cache.MaxEntries != 321 || cache.MaxBytes != 987654 {
+		t.Fatalf("cache enforcement snapshot = %+v", cache)
+	}
+
+	cfg.MetricsEnabled = true
+	metricsRuntime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := &httpserver.RouterDependencies{}
+	populateMetricsDependencies(deps, cfg, testPool(t), metricsRuntime, stage5Runtime{})
+	process := deps.MetricsSnapshot().(processMetrics)
+	if process.RAMDedup == nil || process.Availability["ram_dedup"] != "available" {
+		t.Fatalf("metrics snapshot missing cache state: %+v", process)
+	}
+	if process.RAMDedup.Enabled != true || process.RAMDedup.TTLSeconds != 600 || process.RAMDedup.MaxEntries != 321 || process.RAMDedup.MaxBytes != 987654 {
+		t.Fatalf("wrong fixed cache metrics: %+v", process.RAMDedup)
+	}
+}
+
+func TestProcessMetricsDistinguishesDisabledAndUnavailableRAMDedup(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		cfg        config.Config
+	}{
+		{name: "disabled", want: "disabled", cfg: config.Config{MetricsEnabled: true}},
+		{name: "cache disabled without ingress source", want: "disabled", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{Enabled: true}}},
+		{name: "ingress disabled with cache flag", want: "disabled", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{RAMDedupEnabled: true}}},
+		{name: "enabled without ingress source", want: "unavailable", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{Enabled: true, RAMDedupEnabled: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := &httpserver.RouterDependencies{}
+			populateMetricsDependencies(deps, tc.cfg, testPool(t), ingressRuntime{}, stage5Runtime{})
+			got := deps.MetricsSnapshot().(processMetrics)
+			if got.Availability["ram_dedup"] != tc.want {
+				t.Fatalf("ram_dedup availability = %q, want %q", got.Availability["ram_dedup"], tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessMetricsRAMDedupAvailabilityUsesRuntimeSnapshot(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "available"}[enabled], func(t *testing.T) {
+			cfg := ingressTestConfig(writeIngressTestCA(t))
+			cfg.MetricsEnabled = true
+			cfg.Ingress.RAMDedupEnabled = enabled
+			cfg.Ingress.RAMDedupMaxEntries = 10
+			cfg.Ingress.RAMDedupMaxBytes = 65536
+			runtime, err := composeIngress(cfg, testPool(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			deps := &httpserver.RouterDependencies{}
+			populateMetricsDependencies(deps, cfg, testPool(t), runtime, stage5Runtime{})
+			got := deps.MetricsSnapshot().(processMetrics)
+			want := "disabled"
+			if enabled {
+				want = "available"
+			}
+			if got.RAMDedup == nil || got.RAMDedup.Enabled != enabled || got.Availability["ram_dedup"] != want {
+				t.Fatalf("RAM dedup snapshot = %+v, availability = %q, want %q", got.RAMDedup, got.Availability["ram_dedup"], want)
+			}
+		})
+	}
+}
+
+func TestComposeIngressUsesConfiguredRepositoryModeAndSharedMetrics(t *testing.T) {
+	t.Run("default off keeps baseline path and no collector", func(t *testing.T) {
+		cfg := ingressTestConfig(writeIngressTestCA(t))
+		runtime, err := composeIngress(cfg, testPool(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.metrics != nil {
+			t.Fatal("metrics collector exists while metrics are disabled")
+		}
+		if runtime.ingress.Snapshot().Microbatch.Enabled {
+			t.Fatal("default-off composition did not remain on baseline Persist path")
+		}
+	})
+	t.Run("enabled requires same batch repository and shared collector", func(t *testing.T) {
+		cfg := ingressTestConfig(writeIngressTestCA(t))
+		cfg.MetricsEnabled = true
+		cfg.Ingress.MicrobatchEnabled = true
+		cfg.Ingress.MicrobatchMaxMessages = 3
+		cfg.Ingress.MicrobatchMaxRows = 17
+		cfg.Ingress.MicrobatchMaxPayloadBytes = 8192
+		cfg.Ingress.MicrobatchMaxWait = 125 * time.Millisecond
+		runtime, err := composeIngress(cfg, testPool(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.metrics == nil {
+			t.Fatal("metrics collector missing")
+		}
+		batch, ok := runtime.repository.(telemetry.BatchRepository)
+		if !ok || batch == nil {
+			t.Fatal("enabled composition did not use a BatchRepository")
+		}
+		if runtime.repository == nil {
+			t.Fatal("baseline repository missing")
+		}
+		if !runtime.ingress.Snapshot().Microbatch.Enabled || runtime.ingress.Snapshot().Microbatch.MaxMessages != 3 {
+			t.Fatalf("effective batching options = %+v", runtime.ingress.Snapshot().Microbatch)
+		}
+		deps := &httpserver.RouterDependencies{}
+		populateMetricsDependencies(deps, cfg, testPool(t), runtime, stage5Runtime{})
+		process := deps.MetricsSnapshot().(processMetrics)
+		if process.Persistence == nil || process.Availability["persistence"] != "available" || process.Availability["group_persistence"] != "available" || process.Availability["batch_wait"] != "available" {
+			t.Fatalf("metrics snapshot missing actual persistence sources: %+v", process)
+		}
+		if process.Ingress == nil || process.Ingress.Durations.BatchWait.Count != 0 {
+			t.Fatalf("batch-wait histogram not preserved in ingress snapshot: %+v", process.Ingress)
+		}
+	})
+}
+
+func TestProcessMetricsReportsPersistenceAndBatchAvailabilityHonestly(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		cfg                        config.Config
+		wantPersistence, wantBatch string
+	}{
+		{name: "disabled", cfg: config.Config{MetricsEnabled: true}, wantPersistence: "unavailable", wantBatch: "disabled"},
+		{name: "enabled without metrics source", cfg: config.Config{MetricsEnabled: true, Ingress: config.IngressConfig{Enabled: true, MicrobatchEnabled: true}}, wantPersistence: "unavailable", wantBatch: "unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := &httpserver.RouterDependencies{}
+			pool := testPool(t)
+			runtime := ingressRuntime{}
+			if tc.cfg.Ingress.Enabled {
+				runtime = ingressRuntime{enabled: true}
+			}
+			populateMetricsDependencies(deps, tc.cfg, pool, runtime, stage5Runtime{})
+			got := deps.MetricsSnapshot().(processMetrics)
+			if got.Availability["persistence"] != tc.wantPersistence || got.Availability["group_persistence"] != tc.wantBatch || got.Availability["batch_wait"] != tc.wantBatch {
+				t.Fatalf("availability = %#v", got.Availability)
+			}
+		})
+	}
+}
+
 // TestComposeIngressDisabledIsInert verifies that a disabled flag composes no
 // transport, reads no CA (an unusable path is not touched) and that every
 // lifecycle call is a safe no-op.
@@ -124,12 +392,25 @@ func TestComposeIngressEnabledInvalidCAFailsStartup(t *testing.T) {
 
 func TestComposeIngressEnabledComposesAndCleansUpFinite(t *testing.T) {
 	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
 	runtime, err := composeIngress(cfg, testPool(t))
 	if err != nil {
 		t.Fatalf("composeIngress(enabled) = %v", err)
 	}
 	if !runtime.enabled || runtime.transport == nil || runtime.ingress == nil {
 		t.Fatalf("enabled ingress missing components: %+v", runtime)
+	}
+	snapshot := runtime.ingress.Snapshot()
+	if snapshot.BufferedPayloadCapacityBytes != cfg.Ingress.BufferedPayloadBytes {
+		t.Fatalf("buffered payload capacity = %d, want configured %d", snapshot.BufferedPayloadCapacityBytes, cfg.Ingress.BufferedPayloadBytes)
+	}
+	if !snapshot.ShaperEnabled || snapshot.ShaperCapacity != cfg.Ingress.ShaperMaxGateways {
+		t.Fatalf("shaper snapshot = enabled %v capacity %d, want enabled capacity %d", snapshot.ShaperEnabled, snapshot.ShaperCapacity, cfg.Ingress.ShaperMaxGateways)
 	}
 
 	// Never started: stopIntake and drainAndClose must stay inert and finite.
@@ -254,6 +535,12 @@ func TestLogSummaryDisabledIsInert(_ *testing.T) {
 
 func TestLogSummaryEnabledEmitsStructuredSummary(t *testing.T) {
 	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
 	runtime, err := composeIngress(cfg, testPool(t))
 	if err != nil {
 		t.Fatalf("composeIngress = %v", err)
@@ -276,14 +563,67 @@ func TestLogSummaryEnabledEmitsStructuredSummary(t *testing.T) {
 		"committed=0",
 		"queue_capacity=256",
 		"queue_high_water=0",
+		"buffered_payload_bytes=0",
+		"buffered_payload_capacity_bytes=2097152",
+		"buffered_payload_high_water_bytes=0",
+		"byte_budget_full=0",
+		"shaper_enabled=true",
+		"shaper_entries=0",
+		"shaper_capacity=11",
+		"shaper_passed=0",
+		"shaper_rate_limited=0",
+		"shaper_state_capacity=0",
 	} {
 		if !strings.Contains(out, expectedField) {
 			t.Fatalf("logSummary output missing field %q; full log:\n%s", expectedField, out)
 		}
 	}
-	for _, forbidden := range []string{"password", "secret", "token", "payload"} {
+	for _, forbidden := range []string{"password", "secret", "token", "payload="} {
 		if strings.Contains(strings.ToLower(out), forbidden) {
 			t.Fatalf("logSummary output contains forbidden sensitive key %q; full log:\n%s", forbidden, out)
+		}
+	}
+}
+
+func TestProcessMetricsIngressSnapshotExportsOnlyFixedP4Fields(t *testing.T) {
+	cfg := ingressTestConfig(writeIngressTestCA(t))
+	cfg.Ingress.BufferedPayloadBytes = 2 << 20
+	cfg.Ingress.ShaperEnabled = true
+	cfg.Ingress.ShaperRatePerSecond = 7
+	cfg.Ingress.ShaperBurst = 9
+	cfg.Ingress.ShaperMaxGateways = 11
+	cfg.Ingress.ShaperIdleRetention = 3 * time.Minute
+	runtime, err := composeIngress(cfg, testPool(t))
+	if err != nil {
+		t.Fatalf("composeIngress = %v", err)
+	}
+	snapshot := runtime.ingress.Snapshot()
+	payload, err := json.Marshal(processMetrics{Ingress: &snapshot})
+	if err != nil {
+		t.Fatalf("marshal ingress metrics: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal ingress metrics: %v", err)
+	}
+	ingress, ok := decoded["ingress"].(map[string]any)
+	if !ok {
+		t.Fatalf("serialized ingress metrics missing: %s", payload)
+	}
+	want := map[string]any{
+		"BufferedPayloadBytes": float64(0), "BufferedPayloadCapacityBytes": float64(2 << 20),
+		"BufferedPayloadHighWaterBytes": float64(0), "ByteBudgetFull": float64(0),
+		"ShaperEnabled": true, "ShaperEntries": float64(0), "ShaperCapacity": float64(11),
+		"ShaperPassed": float64(0), "ShaperRateLimited": float64(0), "ShaperStateCapacity": float64(0),
+	}
+	for field, expected := range want {
+		if ingress[field] != expected {
+			t.Errorf("serialized ingress %s = %#v, want %#v", field, ingress[field], expected)
+		}
+	}
+	for _, forbidden := range []string{"Gateway", "Sensor", `"payload"`} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Errorf("serialized metrics contain forbidden %q: %s", forbidden, payload)
 		}
 	}
 }

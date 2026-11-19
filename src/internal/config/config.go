@@ -17,6 +17,10 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
+	MetricsEnabled             bool
+	WebSocketEnabled           bool
+	WebSocket                  WebSocketConfig
+	Stage5                     Stage5Config
 	Credential                 CredentialConfig
 	Ingress                    IngressConfig
 	MQTTCredentialRuntime      mqttcredential.StartupConfig
@@ -44,6 +48,26 @@ type Config struct {
 	SupabaseJWTIssuer          string
 	SupabaseJWTAudience        string
 	SupabaseJWTClockSkew       time.Duration
+	SupabaseJWTMode            string
+	SupabaseJWKSURL            string
+	JWKSCacheTTL               time.Duration
+	JWKSHTTPTimeout            time.Duration
+	JWKSRefreshCooldown        time.Duration
+	AuthUnixSocketPath         string
+}
+
+// WebSocketConfig contains policy bounds. Limits are clamped to the hard caps
+// enforced by telemetryws access state and recheck worker.
+type WebSocketConfig struct {
+	MaxSessions, MaxSubscriptionsPerSession             int
+	GlobalEventSlots, GlobalEventBytes                  int
+	SessionReferenceBytes                               int
+	SessionEventSlots, SessionEventBytes                int
+	MaxFrameBytes, ReadFrameBytes, RequestRatePerSecond int
+	RecheckInterval, RecheckSweepBudget                 time.Duration
+	RecheckConcurrency                                  int
+	HeartbeatInterval, PongTimeout, WriteTimeout        time.Duration
+	FanoutMode                                          string
 }
 
 // LoadFromEnvironment loads configuration from the process environment.
@@ -66,15 +90,23 @@ func Load(lookup LookupFunc) (Config, error) {
 		DatabaseURL: databaseURL,
 		ServerEnv:   valueOrDefault(lookup, "SERVER_ENV", "development"),
 	}
+	if cfg.MetricsEnabled, err = boolValue(lookup, "METRICS_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.WebSocketEnabled, err = boolValue(lookup, "WEBSOCKET_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.WebSocket, err = loadWebSocket(lookup); err != nil {
+		return Config{}, err
+	}
 
-	jwtSecret, ok := nonEmpty(lookup, "SUPABASE_JWT_SECRET")
-	if !ok {
-		return Config{}, fmt.Errorf("SUPABASE_JWT_SECRET is required")
+	if err := loadJWTMode(lookup, &cfg); err != nil {
+		return Config{}, err
 	}
-	if len(jwtSecret) < 32 {
-		return Config{}, fmt.Errorf("SUPABASE_JWT_SECRET must be at least 32 characters")
+	cfg.AuthUnixSocketPath, _ = nonEmpty(lookup, "AUTH_UNIX_SOCKET_PATH")
+	if cfg.AuthUnixSocketPath != "" && (!strings.HasPrefix(cfg.AuthUnixSocketPath, "/") || len(cfg.AuthUnixSocketPath) > 100 || strings.ContainsAny(cfg.AuthUnixSocketPath, "\x00\r\n")) {
+		return Config{}, fmt.Errorf("AUTH_UNIX_SOCKET_PATH must be an absolute short path")
 	}
-	cfg.SupabaseJWTSecret = jwtSecret
 
 	jwtIssuer, ok := nonEmpty(lookup, "SUPABASE_JWT_ISSUER")
 	if !ok {
@@ -171,6 +203,24 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if cfg.UserManagement, err = loadUserManagement(lookup, cfg.AdminMaxBodyBytes); err != nil {
 		return Config{}, err
+	}
+	if cfg.Stage5, err = loadStage5(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.Stage5.Enabled {
+		workers := cfg.Stage5.Dispatch.Workers + cfg.Stage5.ResultWorkers + 1
+		if cfg.Ingress.Enabled {
+			workers += cfg.Ingress.WorkerCount
+			if cfg.Stage5.Data.ClientID == cfg.Ingress.ClientID {
+				return Config{}, fmt.Errorf("stage 5 and telemetry MQTT client IDs must differ")
+			}
+		}
+		if err = checkIngressPoolReservation(workers, cfg.DatabaseMaxConns, cfg.Credential.Enabled); err != nil {
+			return Config{}, err
+		}
+		if cfg.ShutdownTimeout < cfg.Stage5.Control.DBTimeout+cfg.Stage5.Dispatch.PublishTimeout {
+			return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must cover stage 5 DB and publish budgets")
+		}
 	}
 	return cfg, nil
 }

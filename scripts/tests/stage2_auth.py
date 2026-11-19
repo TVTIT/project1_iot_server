@@ -53,6 +53,21 @@ def assert_response(status: int, body: object, headers: dict, expected: int) -> 
         raise RuntimeError("401 response is missing Bearer challenge")
 
 
+def assert_route_response(
+    path: str, status: int, body: object, headers: dict, expected: int
+) -> None:
+    try:
+        assert_response(status, body, headers, expected)
+    except RuntimeError as error:
+        raise RuntimeError(f"route {path} contract failed: {error}") from error
+
+
+def assert_route_status(path: str, status: int, expected: int) -> None:
+    """Check perimeter status-only responses such as Nginx's stock 404 page."""
+    if status != expected:
+        raise RuntimeError(f"route {path} contract failed: HTTP {status}; expected {expected}")
+
+
 def assert_startup_failure(
     code: int, output: str, field: str, sensitive: list[str]
 ) -> None:
@@ -516,6 +531,9 @@ SELECT
             "SUPABASE_JWT_ISSUER": ISSUER,
             "SUPABASE_JWT_AUDIENCE": "authenticated",
             "SUPABASE_JWT_CLOCK_SKEW": "30s",
+            # Keep this fixture on the approved default-off route contract even
+            # if the caller's environment enables WebSocket for another profile.
+            "WEBSOCKET_ENABLED": "false",
         }
 
     def negative_startup(self, config: dict) -> None:
@@ -579,16 +597,38 @@ SELECT
         )
         return base
 
-    def check_routes(self, base: str, token: str) -> None:
+    def check_routes(self, base: str, token: str, *, via_proxy: bool = False) -> None:
         for path in ("/healthz", "/v1/health"):
-            assert_response(*http_request(base, path), 200)
-        for path in ("/v1/digital-twins", "/v1/ws"):
-            assert_response(*http_request(base, path), 401)
-        assert_response(*http_request(base, "/v1/digital-twins", token), 200)
-        assert_response(*http_request(base, "/v1/ws", token), 501)
-        assert_response(*http_request(base, "/v1/ws", upgrade=True), 401)
-        assert_response(*http_request(base, "/v1/ws", token, upgrade=True), 501)
-        print("PASS: public 200, unauthenticated 401, authenticated handlers 200 and stub 501")
+            assert_route_response(path, *http_request(base, path), 200)
+        for path in ("/v1/digital-twins",):
+            assert_route_response(path, *http_request(base, path), 401)
+        assert_route_response(
+            "/v1/digital-twins", *http_request(base, "/v1/digital-twins", token), 200
+        )
+        # The direct Go router retains an authenticated 501 stub while disabled;
+        # Nginx's exact /v1/ws perimeter route returns 404 before reaching Go.
+        # Keep these distinct so proxy behavior cannot mask Go authentication.
+        ws_statuses = (
+            (404, 404, 404, 404)
+            if via_proxy
+            else (401, 501, 401, 501)
+        )
+        for (ws_token, upgrade), expected in zip(
+            ((None, False), (token, False), (None, True), (token, True)),
+            ws_statuses,
+        ):
+            response = http_request(base, "/v1/ws", ws_token, upgrade=upgrade)
+            if via_proxy:
+                # Nginx's stock exact-location 404 is an HTML perimeter response,
+                # not the Go API's JSON error envelope.
+                assert_route_status("/v1/ws", response[0], expected)
+            else:
+                assert_route_response("/v1/ws", *response, expected)
+        boundary = "Nginx proxy" if via_proxy else "direct Go"
+        print(
+            f"PASS: {boundary} public 200, protected 401/200, "
+            + ("default-off WebSocket 404" if via_proxy else "default-off WebSocket 401/501")
+        )
 
     def check_bad_tokens(self, base: str, claims: dict) -> None:
         now = int(time.time())
@@ -603,7 +643,9 @@ SELECT
         ):
             token = make_token(self.secret, {**claims, **change})
             self.sensitive.append(token)
-            assert_response(*http_request(base, "/v1/ws", token), 401)
+            assert_route_response(
+                "/v1/digital-twins", *http_request(base, "/v1/digital-twins", token), 401
+            )
         for token in (
             "malformed",
             make_token("wrong-test-secret", claims),
@@ -611,7 +653,9 @@ SELECT
         ):
             if token != "malformed":
                 self.sensitive.append(token)
-            assert_response(*http_request(base, "/v1/ws", token), 401)
+            assert_route_response(
+                "/v1/digital-twins", *http_request(base, "/v1/digital-twins", token), 401
+            )
         print("PASS: invalid signature/algorithm/claims rejected through HTTP")
 
     def check_account_rows(self, email: str, present: bool) -> None:
@@ -1013,7 +1057,7 @@ LATERAL (VALUES
                 )
                 if claims["sub"] != user_id:
                     raise RuntimeError("GoTrue token subject does not match test user")
-                self.check_routes(base, token)
+                self.check_routes(base, token, via_proxy=True)
                 self.check_bad_tokens(base, claims)
                 # Human identity (even later bootstrapped admin) is not a service key.
                 status, _, _ = http_request(
@@ -1053,8 +1097,17 @@ LATERAL (VALUES
                     for key in ("iss", "sub", "aud", "role")
                 ):
                     raise RuntimeError("refresh changed stable identity claims")
-                assert_response(
-                    *http_request(base, "/v1/ws", refreshed["access_token"]), 501
+                assert_route_response(
+                    "/v1/digital-twins",
+                    *http_request(base, "/v1/digital-twins", refreshed["access_token"]),
+                    200,
+                )
+                # Refresh is authenticated on a live route above. Separately
+                # verify the Nginx perimeter intentionally masks /v1/ws.
+                assert_route_status(
+                    "/v1/ws",
+                    http_request(base, "/v1/ws", refreshed["access_token"])[0],
+                    404,
                 )
                 if len(users) == 1:
                     admin_token = token
@@ -1214,7 +1267,7 @@ def main() -> None:
             },
         )
         stack.sensitive.append(token)
-        stack.check_routes(base, token)
+        stack.check_routes(base, token, via_proxy=False)
         if args.mode == "auth":
             stack.real_auth()
         stack.check_logs()

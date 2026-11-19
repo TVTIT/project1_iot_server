@@ -135,6 +135,24 @@ func (m *Message) Samples() []SampleCandidate {
 	return append([]SampleCandidate(nil), m.samples...)
 }
 
+// SampleCount returns the number of validated sample candidates without
+// allocating a defensive copy of the samples slice.
+func (m *Message) SampleCount() int {
+	if m == nil {
+		return 0
+	}
+	return len(m.samples)
+}
+
+// Identity returns the immutable identity derived from the validated topic and
+// batch without copying the batch's sample slice.
+func (m *Message) Identity() MessageIdentity {
+	if m == nil {
+		return MessageIdentity{}
+	}
+	return MessageIdentity{GatewayID: m.topic.GatewayID, SensorID: m.topic.SensorID, BootID: m.batch.BootID, MessageID: m.batch.MessageID}
+}
+
 // FirstSample returns the first checked candidate, if the message has one.
 func (m *Message) FirstSample() (SampleCandidate, bool) {
 	if m == nil || len(m.samples) == 0 {

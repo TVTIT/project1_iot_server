@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "status": "LOCAL_MVP_COMPLETE_SOURCE_QUALIFIED",
+  "full_p7_accepted_in_any_native_run": false,
+  "scope": "P7 WebSocket telemetry Local MVP; sanitized fixed-field rollup",
+  "source_hash_note": "Non-null per-run source_hash values are copied from that lane's recorded fingerprint; source_hash_kind is supplied where verified (slow-viewer dirty_source_build_hash). Grouped/single lane hashes unavailable in sanitized source are null with precise source_qualification; no placeholder text is used as a hash.",
+  "source_qualification": {
+    "branch": "feat/paper-requirement",
+    "head": "104a2cde82c3f49c6b73d123aa24be3ed8521a38",
+    "dirty": true,
+    "schema": 24,
+    "backend_quota": {"cpu": 2, "memory_bytes": 4294967296},
+    "note": "Each run retains its own artifact/source fingerprint; HEAD+dirty does not imply one identical dirty tree for every historical lane."
+  },
+  "effective_runtime": {
+    "WEBSOCKET_ENABLED": "opt-in true in fixture; deployment default false",
+    "deployment_defaults_false": ["WEBSOCKET_ENABLED", "STAGE5_ENABLED", "STAGE5_WAKEUP_ENABLED", "MQTT_SHAPER_ENABLED", "MQTT_MICROBATCH_ENABLED", "MQTT_RAM_DEDUP_ENABLED"],
+    "max_sessions": 32,
+    "subscriptions_per_session": 16,
+    "global_event_slots": 64,
+    "global_event_bytes": 8388608,
+    "session_event_slots": 64,
+    "session_event_bytes": 262144,
+    "max_frame_bytes": 66560,
+    "read_frame_bytes": 4096,
+    "max_targets_per_request": 16,
+    "request_id_max_chars": 64,
+    "request_rate_per_second": 10,
+    "recheck_interval_seconds": 5,
+    "recheck_sweep_budget_seconds": 2,
+    "recheck_concurrency": 2,
+    "heartbeat_interval_seconds": 20,
+    "pong_timeout_seconds": 45,
+    "write_timeout_seconds": 5,
+    "event_workers": 1,
+    "interpretation": "Queue byte caps are logical queued/in-flight accounting, not RSS."
+  },
+  "runs": [
+    {"run_id":"ncs_53d9f50403ce","lane":"lifecycle","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"0eb9a13f1128b2562991445b0805f5110a03e1666790b0cd1d3ae060c9217316","counts":{"cleanup_containers":20,"cleanup_networks":1,"cleanup_volumes":6},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/lifecycle-final-20261027T123115-1063069/report.md"},
+    {"run_id":"ncs_7683e0d0ccb9","lane":"grouped_telemetry","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":null,"source_hash_kind":null,"source_qualification":"Per-lane report records HEAD+dirty; no cryptographic source hash verified in sanitized rollup.","counts":{"application_ack":8,"ledger":8,"raw_samples":800,"temporal":8,"events_per_viewer":4,"duplicate_replay_events":0,"cleanup_containers":17,"cleanup_networks":1,"cleanup_volumes":7},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/pilot-rest-window-1793065739-3c5b2d70/report.md"},
+    {"run_id":"ncs_60528ce1704e","lane":"single_path","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":null,"source_hash_kind":null,"source_qualification":"Per-lane report records HEAD+dirty; no cryptographic source hash verified in sanitized rollup.","counts":{"application_ack":8,"ledger":8,"raw_samples":800,"temporal":8,"events_per_viewer":4,"duplicate_replay_events":0,"cleanup_containers":17,"cleanup_networks":1,"cleanup_volumes":7},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/native-single-1793066986-6b191a90/report.md"},
+    {"run_id":"ncs_6c8b46e346c9","lane":"slow_viewer","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"edb305eec9658726ae1783a4c7671376751002a2908b87ea3831ca71d706e279","source_hash_kind":"dirty_source_build_hash","counts":{"application_ack":1000,"ledger":1000,"raw_samples":1000000,"temporal":1000,"healthy_viewer_a_events":1000,"healthy_viewer_b_events":0,"slow_probe_resumed_frames":"hundreds_read","queue_overflow_closes":1,"slow_close_seconds":31.286,"cleanup_containers":13,"cleanup_networks":1,"cleanup_volumes":5},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/slow-final-acceptance-20261027-181200-957642/safe-result.json"},
+    {"run_id":"ncs_8170a8d33dfc","lane":"overhead_0_viewers","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"cf070b38b69581cf09ec9c51a7f870aa27e14e3469bccdc59033abd9dd6544bc","counts":{"application_ack":40,"ledger":40,"raw_samples":4000,"temporal":40,"viewers":0,"writes":0,"resource_samples":10,"cpu_mean_percent":1.163,"cpu_min_percent":0,"cpu_max_sampled_percent":5.29,"ram_mean_bytes":8170713.4,"ram_min_bytes":7356809,"ram_max_sampled_bytes":8442085,"cleanup_containers":16,"cleanup_networks":1,"cleanup_volumes":7},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/overhead-qualified-results-20261027T120930-1033547/qualified-comparison.json"},
+    {"run_id":"ncs_2c0e4d70d51d","lane":"overhead_2_viewers","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"cf070b38b69581cf09ec9c51a7f870aa27e14e3469bccdc59033abd9dd6544bc","counts":{"application_ack":40,"ledger":40,"raw_samples":4000,"temporal":40,"viewers":2,"events_each":20,"deliveries":40,"writes":40,"resource_samples":9,"cpu_mean_percent":1.4866666667,"cpu_min_percent":0.58,"cpu_max_sampled_percent":5.08,"ram_mean_bytes":8130191.8,"ram_min_bytes":7704936,"ram_max_sampled_bytes":8360296,"cleanup_containers":17,"cleanup_networks":1,"cleanup_volumes":7},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/overhead-qualified-results-20261027T120930-1033547/qualified-comparison.json"},
+    {"run_id":"ncs_b8c56847b265","lane":"p6_ws_regression","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"dfd8760daa4a2ff1573b1602f949f270588a7e86fc2f3a3b22d018eaee772b7f","counts":{"commands_succeeded":6,"application_ack":128,"ledger":128,"raw_samples":11135,"temporal":128,"viewer_a_events":60,"viewer_b_events":36,"cleanup_containers":26,"cleanup_networks":1,"cleanup_volumes":9},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/native-p6-ws-20261027-192320-27545/report.md"},
+    {"run_id":"ncs_c6652c3afa5a","lane":"handshake","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"00b26645e25eaa0b9e58a0d92e5c28b13db77fee6f60fdc92f46aa1d4c5ddd7a","counts":{"negative_controls":10,"credential_leaks":0,"cleanup_containers":15,"cleanup_networks":1,"cleanup_volumes":5},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/final-perimeter-oracle-20261027T125831-1097868/verification-completion-report.md"},
+    {"run_id":"ncs_3e03c73b006b","lane":"reconnect","status":"PASS","accepted_lane":true,"full_p7_accepted":false,"source_hash":"00b26645e25eaa0b9e58a0d92e5c28b13db77fee6f60fdc92f46aa1d4c5ddd7a","counts":{"live_samples":100,"catchup_rows":200,"model_rows":200,"application_ack":3,"outbox_pending_rows":0,"cleanup_containers":16,"cleanup_networks":1,"cleanup_volumes":6},"cleanup_verified":true,"evidence_ref":"/var/tmp/opencode/paper-p7/final-perimeter-oracle-20261027T125831-1097868/verification-completion-report.md"}
+  ],
+  "measurement_interpretation": {
+    "overhead_pair": "Descriptive only: sparse CPU/RAM snapshots and process-local monotonic histograms; no statistical/causal overhead, capacity, peak RSS, or zero-overhead claim.",
+    "zero_viewer_write_histogram": "count 0 means no write observations, not zero latency",
+    "historical_environment_failures": {"failures":3,"errors":4,"classification":"historical full Python discovery environment/trusted-ancestor issues; not rerun for P7.11 docs-only handoff"}
+  },
+  "historical_failures_preserved": [
+    {"run_id":"ncs_9347970642a6","reason":"browser capture failed MAX_LIFETIME_MS/scope handling; not REST window mismatch"},
+    {"run_id":"ncs_db8ce208242e","reason":"400 REST points truncated by max_points 256; corrected by subwindow oracle"},
+    {"run_id":"ncs_79210b22a678","reason":"old perimeter counter oracle; corrected P7.10 asserts websocket_deny separately"},
+    {"run_id":"ncs_7d90f4dbc982","reason":"historical reconnect MIME/Accept failure; corrected client Accept contract"},
+    {"run_id":"ncs_375e9aebcede","reason":"P3 historical startup health failure; not a P7 native failure"},
+    {"run_id":"ncs_ac73c962fdbd","reason":"exit 0; functional+cleanup PASS; PARTIAL because formatter did not complete"},
+    {"run_id":"overhead-image-comparator","reason":"strict original image-ID comparator rejected differing image IDs; independent audit later qualified identical RootFS/runtime configuration and backend/Gateway binaries; original rejection/artifacts unchanged"}
+  ],
+  "technical_checks": {
+    "p7_10_affected_python": "297 PASS in corrected selected invocation; do not add overlapping counts",
+    "full_python_discovery": "Historical FAIL: 3 failures + 4 errors, environment/trusted-ancestor issues; not rerun for P7.11 docs-only handoff",
+    "go_race_vet_lint_build_armv7": "PASS as previously recorded/qualified; no Go runtime changes in P7.10 late oracle correction",
+    "remote_ci_hil_p8_capacity_soak_live_rollout": "NOT RUN"
+  },
+  "limits": ["No native run has full_p7_accepted=true.","No 5k/10k-viewer capacity, fairness, soak, peak RSS, production WSS rollout, or exactly-once claim.","Native lanes use isolated fixtures and do not prove deployment database migration state.","WebSocket events/gaps are nondurable; ordering may be late; bounded buffers are logical accounting, not RSS.","Membership revocation is periodic; close-cause records identify first observed trigger, not physical root cause.","Resource samples are sparse (0 vs 2 viewers); pair audit is qualified, not causal or zero-overhead evidence.","P6 recovery was backend-only with broker stable; full Python failures are historical environment evidence.","HIL/AM5728, full/remote CI, P8 capacity/soak and live rollout remain NOT RUN."]
+}

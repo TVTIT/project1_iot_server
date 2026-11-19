@@ -6,20 +6,33 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 - **Trạng thái phát triển hiện tại**:
   - **Giai đoạn 2 (Stage 2 Bounded Closeout)**: Đã triển khai xác thực JWT qua Supabase Auth, phân quyền platform admin (`platform_admins`), danh sách trạm/cảm biến (`/v1/gateways*`), provisioning Gateway/Sensor, và chu trình sống Dynamic Security (DynSec) Mosquitto.
   - **Giai đoạn 3 (Stage 3 Telemetry Uplink Pipeline)**: Đã triển khai pipeline thu thập telemetry từ Gateway qua MQTT TLS đến TimescaleDB, khử trùng lặp `processed_messages`, xác nhận commit-before-ACK qua MQTT application ACK, Gateway simulator với outbox SQLite bền vững, và kiểm chứng tích hợp 9 kịch bản uplink trên runner dịch vụ thật.
-  - **Giai đoạn 4 (Stage 4 History & Digital Twin API - ETSI GS CIM 009 V1.9.1 Profile)**: Đã triển khai và chuẩn hóa 5 endpoint canonical Digital Twin (`GET /v1/digital-twins`, `POST /v1/digital-twins`, `GET /v1/digital-twins/{id}`, `PATCH /v1/digital-twins/{id}/attrs`, `GET /v1/digital-twins/{id}/temporal` kèm query extension `?format=simplified`).
+   - **Giai đoạn 4 (Stage 4 History & Digital Twin API - ETSI GS CIM 009 V1.9.1 Profile)**: Đã triển khai và chuẩn hóa 5 endpoint canonical Digital Twin (`GET /v1/digital-twins`, `POST /v1/digital-twins`, `GET /v1/digital-twins/{id}`, `PATCH /v1/digital-twins/{id}/attrs`, `GET /v1/digital-twins/{id}/temporal` kèm query extension `?format=simplified`).
+    - **Giai đoạn 5 (Stage 5 Downlink Control) & Paper P3–P5b (26/10/2026)**:
+     - *Baseline lịch sử (24/10/2026)*: Task 5.0–5.4 đã hoàn thành validation số thập phân `frequency_hz`, migration 23, admission/receipt nguyên tử, ba REST routes nhận desired/tra cứu command và MQTT publisher/ACL/expiry. Xem [mốc bàn giao 5.4](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
+     - *Triển khai vòng điều khiển Sensor trên simulator qua P3 (25/10/2026)*: Kế hoạch Paper P3 đã thực hiện Task 5.5 (Gateway nhận/áp dụng cấu hình, durable command receipt/result và chống trùng bền vững) và Task 5.6 (result ingress consumer, worker và transaction tiếp nhận xác nhận `reported.configuration`). E2E simulator và tài liệu cần thiết cho P3 đã hoàn tất và kiểm chứng.
+      - *Bàn giao downlink (14/11/2026)*: P3 control simulator đã đóng vòng; local require-run lane và CI wiring có rehearsal cục bộ ở R1/R2, nhưng remote CI **NOT RUN**. Contract REST/MQTT/client và runbook được đồng bộ trong [Stage 5 Sensor Control API](docs/protocols/stage5-sensor-control-api.md) và [operations](docs/dynsec/deployment-and-operations.md). Đây là tài liệu rehearsal/chuẩn bị, không phải Stage 5 full acceptance.
+       - *Phần còn lại của Stage 5 gốc*: Board AM5728 runtime synthetic và HIL cảm biến vật lý (5.7-R3/R4/R5) **DEFERRED / NOT RUN** vì chưa có board; simulator không thay thế hardware. Remote CI tại revision bàn giao **NOT RUN**; target schema/key/credential rehearsal và demo shared/live thuộc Stage 9, chưa thực hiện. Stage 5 gốc chưa hoàn tất toàn bộ hay production-ready.
+        - *Kiểm chứng/báo cáo cục bộ cuối (14/11/2026)*: Trên `develop`, HEAD `9a348709d6c92c394237fc0078759468c944a83` cộng dirty diff R1/R2/5.8-R1, simulator/control trên source hiện hành và rehearsal control tương đương CI cục bộ đều PASS; các kiểm tra Go/migration/Stage 2–4/Python đã chọn cũng PASS theo [báo cáo downlink](docs/backend/stage-5-downlink.md). Đây không phải remote/full CI. Remote CI, runtime board với dữ liệu tổng hợp, sensor vật lý/HIL và rollout shared/live giữ NOT RUN; migration source 26 không xác nhận schema deployment.
+      - *P4/P5 Local MVP*: P4 shaper/ingress budget, P5a microbatch và P5b RAM dedup + migration 24 timestamp/index đã hoàn tất trên fixture cô lập. Stage 5 gốc vẫn chưa hoàn tất toàn bộ. Xem [báo cáo P5b](docs/backend/paper-p5b-ram-dedup-and-ledger.md), [báo cáo P5a](docs/backend/paper-p5a-microbatch-persistence.md) và [kế hoạch P5b](../docs/backend_plan/paper/P5b_detail_plan.md).
+       - *Môi trường triển khai chung*: Giữ `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false`; rollout live nằm ngoài phạm vi và không suy ra từ Local MVP.
+    - **Giai đoạn 6 (Stage 6 Control Resilience & Reconciliation — 19/11/2026): PARTIAL.**
+      - *Mã nguồn & Kiểm thử*: Đã hoàn tất các lát cắt R0–R8 và R2 follow-up trong mã nguồn backend (`internal/digitaltwin`, `internal/mqttcontrol`, `internal/httpserver`) và Gateway simulator (`internal/gatewaysim`), bao gồm: lịch retry có jitter, endpoint hủy an toàn `POST .../cancel`, device receipt `command_receipt` (`acknowledged`), đối soát sau reconnect (`configuration_query` / `configuration_snapshot`), và reconciliation successor engine.
+      - *Kiểm chứng CI từ xa*: GitHub Actions Run [44501549344](https://github.com/TVTIT/project1_iot_server/actions/runs/44501549344) trên commit HEAD `a648ec1c8e22b99d3a185aa480a8b17534f7df8f` đã hoàn thành thành công toàn bộ các jobs `migration-check`, `dynsec-bootstrap-tests`, `stage5-control-integration` và `native-compose-smoke`.
+      - *Giới hạn còn mở*: Script retention còn finding review chưa đóng (MEDIUM guard `json_each` thứ tự đánh giá, LOW timestamp snapshot); target demo/preflight/restore và rollout shared/live NOT RUN; board AM5728 / real sensor / HIL DEFERRED / NOT RUN. Mặc định triển khai tiếp tục tắt: `STAGE6_ENABLED=false`, `GATEWAY_STAGE6_ENABLED=false`.
+      - *Tài liệu chi tiết*: Xem [báo cáo kỹ thuật Stage 6](docs/backend/stage-6-control-resilience.md), [hợp đồng Sensor Control API](docs/protocols/stage5-sensor-control-api.md) và [sổ tay vận hành](docs/dynsec/deployment-and-operations.md).
   - **Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership - Tasks U0–U8 & Follow-up D1–D5)**: Đã triển khai Migration 21 (`000021_admin_user_management.up.sql`), Migration 22 (`000022_gateway_membership_revocation.up.sql`) và 6 endpoint quản trị tập trung (`POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`, `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`), adapter Supabase Auth Admin (với `email_confirm: true`), cơ chế khóa Gateway cha tuần tự, cấm tự hạ quyền admin (`409 Conflict`), chuyển giao owner nguyên tử (owner cũ trở thành viewer), và thu hồi quyền thành viên viewer/operator (hoặc no-op khi không có membership: `204 No Content` body rỗng; cấm xóa owner khi chưa chuyển giao: `409 Conflict` `owner_transfer_required`; Gateway thiếu: `404 Not Found`; tuyệt đối không xóa tài khoản, profile hay global role, không đổi Gateway khác). Chi tiết xem [báo cáo quản trị người dùng & membership](docs/backend/admin-users-and-gateway-membership.md) và [kế hoạch bổ sung DELETE membership](../docs/backend_plan/gateway_membership_delete_detailed_plan.md).
-  - **Tình trạng triển khai & kiểm chứng hiện tại (Current Status)**: Baseline hiện tại là `HEAD 8f9f984` kèm uncommitted diff cho D1–D4 (Go unit/race/vet/lint/build, native PostgreSQL DB/Auth/Envoy HTTP, fresh/upgrade isolated migration, Stage 4 `all`, Compose smoke `--full-http`, và Python suite 898/898 tests đều **PASS**). Migration 22 đã được áp dụng vào shared TEST DB (PostgreSQL 16.15 / TimescaleDB 2.29.2). Container backend đang chạy chưa được rebuild và CI từ xa **CHƯA CHẠY** (NOT RUN) cho uncommitted diff này; các kết quả CI 16/16 thành công trước đó chỉ có phạm vi trên commit lịch sử `35b6136`/`8f9f984`. Hệ thống không tuyên bố hoàn thành production rollout, và chưa cập nhật Flutter Web client hay Bruno collections theo hợp đồng mới.
+    - **Checkpoint lịch sử 24/10/2026**: `a5f9f812f3212413f772ef60e1299f58cca43837` đã commit Task 5.3/5.4 và sửa shutdown liên quan; mô tả worktree diff trên `bcce3fe` là lịch sử trước commit. Source terminal migration **23** ở checkpoint đó, không xác nhận shared/live DB đã migrate. Các native/affected checks khi ấy PASS theo [bảng evidence](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md); ghi nhận “chưa chạy Stage 5 Gateway/result E2E” chỉ mô tả trạng thái lịch sử 24/10, đã được P3 simulator kiểm chứng sau đó. Không gán các kết quả lịch sử cho revision mới. Xem [baseline/testbed P0](docs/backend/paper-p0-baseline-and-testbed.md) cho evidence riêng P0.
   - **Kiểm chứng CI từ xa (Remote CI Verification)**: GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` đã hoàn thành thành công toàn bộ **16/16 jobs**, bao gồm `lint-and-test` (job 118127109089), `stage4-api-integration` (job 118127109577), `stage3-uplink-integration` (job 118127109787) và `native-compose-smoke` (job 118129034156).
 - **Mặc định môi trường triển khai & Cổng nghiệm thu riêng (Rollout Gates)**:
-  - Trên môi trường triển khai chính (root deployment), tính năng quản lý credential MQTT mặc định bị **vô hiệu hóa** (`MQTT_CREDENTIAL_API_ENABLED=false`, các endpoint trả về HTTP `503 credential_runtime_disabled`).
-  - Việc kích hoạt trên production yêu cầu các cổng chuyển đổi riêng biệt (separate rollout gates) chưa hoàn thành: kiểm chứng topology Rathole thật không bypass qua Internet, chính sách xử lý mất kết nối CSDL sau khi Ingress Gate OPEN, và quy trình nghiệm thu bàn giao secret qua phần cứng USB/encrypted storage.
-- **Tình trạng CI & E2E (Task 2.7)**:
-  - Pipeline GitHub Actions hiện bao gồm **10 jobs độc lập** (9 jobs thành phần và job tích hợp thứ 10 `stage2-e2e`, xem mục 3.4).
-  - Job thứ 10 **`stage2-e2e`** đã được triển khai: thực thi 2 lượt chạy cô lập liên tiếp (`run-1` và `run-2`) bao phủ toàn bộ 27 kịch bản E01–E27 qua tất cả các selector, giới hạn thời gian 30 phút (`timeout-minutes: 30`), xuất báo cáo có cấu trúc đã qua quét an toàn (`safe-reports`), và kiểm chứng dọn dẹp tài nguyên sở hữu (`verified owned cleanup`).
-  - Các lượt chạy cục bộ tương đương CI (CI-equivalent local runs) đã PASS theo báo cáo của worker.
-  - Việc nghiệm thu CI từ xa trên GitHub Actions và chứng nhận commit exact-final-SHA vẫn ở trạng thái **PENDING** (chưa có remote exact-final-SHA acceptance; không tuyên bố toàn bộ Stage 2 đạt 10/10 remote hay production-ready). Các cổng kích hoạt môi trường triển khai thực tế (production rollout gates) tiếp tục được giữ tách biệt.
+   - Trên môi trường triển khai chính (root deployment), tính năng quản lý credential MQTT mặc định bị **vô hiệu hóa** (`MQTT_CREDENTIAL_API_ENABLED=false`, các endpoint trả về HTTP `503 credential_runtime_disabled`).
+   - Phân hệ điều khiển Stage 5 cũng mặc định **tắt** (`STAGE5_ENABLED=false`) trên môi trường triển khai chung (root deployment). Giữ tắt shared/live và không mở điều khiển cho client: việc rollout live nằm ngoài phạm vi P3 (dù vòng điều khiển simulator đã hoàn thành E2E trên profile thử nghiệm cô lập). ACL update/store migration chỉ được kiểm chứng trên fixture sở hữu, không phải rollout live.
+   - **Security contract hiện hành:** Compose chạy Mosquitto trực tiếp với TLS/auth/ACL; backend chịu API/readiness fail-closed và bounded shutdown, **không cam kết đóng broker khi backend lỗi hoặc dừng**. Gate/controller legacy chỉ còn component-only; không phải rollout gate bắt buộc cho kiến trúc này. Xem [nghiệm thu credential hiện hành](docs/backend/stage-2-current-credential-acceptance.md). Topology mạng và bàn giao secret thực tế vẫn cần nghiệm thu riêng trước rollout; không suy diễn local fixture thành production-ready.
+- **Tình trạng CI & E2E**:
+   - `.github/workflows/ci.yml` là nguồn danh sách job hiện hành. Báo cáo 10 jobs/27 kịch bản của Task 2.7 mô tả checkpoint legacy, không phải cam kết mọi job/scenario đó đang được chạy trong composition hiện tại.
+   - Entry point credential hiện hành là `sh scripts/test-stage2-mqtt-credentials.sh`, kiểm thử native TLS/auth/ACL trên broker trực tiếp; test gate/controller legacy giữ riêng tại `scripts/test-legacy-mqtt-controller.sh`. CI credential job đã được cập nhật nhưng **chưa có remote run** cho diff 5.3/5.4.
+   - Mốc 5.4 có affected local verification PASS, không tuyên bố full-local-CI hoặc remote exact-final-SHA PASS; các remote run đã nêu phía trên chỉ là evidence lịch sử.
 - **Hạ tầng Mosquitto**:
-  - Phân biệt giữa hạ tầng file tĩnh legacy (Task 2.5: named volume `mosquitto_auth` mới chỉ seed tài khoản nội bộ `backend_service`, không tự động import tài khoản từ file prototype tracked trong git) và chu trình sống Dynamic Security (Task 2.6: quản lý tài khoản động qua DynSec adapter, Ingress Gate, global maintenance và thu hồi phiên tức thời).
+   - Phân biệt hạ tầng file tĩnh legacy (Task 2.5), controller/gate legacy component và composition DynSec hiện hành. Composition hiện hành quản lý tài khoản động qua DynSec adapter và broker TLS/ACL trực tiếp; không suy diễn global gate/maintenance từ component legacy thành bảo đảm của deployment.
 - Xem thêm:
   [contract xác thực và verification](docs/backend/stage-2-task-2.2-authentication.md),
   [quản trị tài khoản tập trung Task 2.2A](docs/backend/stage-2-task-2.2A-centralized-accounts.md),
@@ -31,6 +44,48 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
   [nghiệm thu E2E Task 2.7](docs/backend/stage-2-task-2.7-acceptance.md)
   để phân biệt phần đã triển khai với telemetry/WebSocket/device control tương lai.
 - **Gateway Simulator (Stage 3, Task 3.5)** — công cụ phát triển phát telemetry tổng hợp qua MQTT/TLS với outbox SQLite bền vững và lệnh `run`/`pending`/`count`/`quarantine`: xem [hướng dẫn Gateway Simulator](docs/backend/stage-3-task-3.5-gateway-simulator.md).
+- **P0 — testbed paper local (24/10/2026): PASS** trên fixture riêng: Auth/API/Storage, schema 23, hai Gateway/200 mẫu/commit ACK/outbox drain và denial chéo Gateway; backend quota 2 vCPU/4 GiB. Chạy từ repo root bằng `sh scripts/test-paper-p0.sh` (tự tạo fixture mới, smoke rồi cleanup). Xem [baseline, số đo và lịch sử FAIL/PASS P0](docs/backend/paper-p0-baseline-and-testbed.md). Không đổi backend/API, không nghiệm thu production/benchmark, không tự mở P1 hoặc Stage 5.
+- **P1 — metrics và bộ ghi baseline (24/10/2026): PASS** trên fixture riêng: endpoint `/v1/admin/metrics` bảo vệ bằng JWT platform-admin, xuất `run.json`, `metrics.csv`, `resources.csv`; 2 Gateway × 20 batch (40 message / 4.000 samples) đối chiếu khớp DB; đo payload thực 1.066,2 B/msg; 1 replay byte-exact không tăng dữ liệu; cặp kiểm chứng `--metrics-off` PASS. Chạy từ repo root bằng `sh scripts/test-paper-p1.sh --mode baseline <NEW_DIR>`. Xem [báo cáo metrics và baseline P1](docs/backend/paper-p1-metrics-and-baseline.md). Không đổi Stage 5 (vẫn tắt), không tự mở P2.
+- **P2 — RS256/JWKS và HTTP perimeter (24/10/2026): PASS** trên fixture riêng: Auth cấp RS256 user token kèm legacy verify-only key, Go public JWKS verifier, Nginx client-to-gateway HTTPS kết hợp xác thực ngoại vi `auth_request` qua Unix socket nội bộ trong cùng tiến trình Go; Storage xác thực bằng public JWKS tĩnh và giữ URL signing HMAC; kiểm chứng rotation K1/K2 overlap, retry Storage bounded phân loại 503, fail-closed khi upstream gián đoạn; 2 Gateway × 20 batch (40 message / 4.000 samples) + 1 replay byte-exact, DB đối chiếu khớp, đọc temporal 199 điểm qua HTTPS; dọn dẹp chính xác 19 containers/1 network/7 volumes. Chạy từ repo root bằng `sh scripts/test-paper-p2.sh [NEW_RUN_DIRECTORY]`. Xem [báo cáo RS256 và HTTP perimeter P2](docs/backend/paper-p2-auth-and-http-perimeter.md). Giữ mặc định deployment là HS256/HTTP; tại thời điểm kết thúc P2, Stage 5 giữ `STAGE5_ENABLED=false` (mốc dừng sau 5.4); không xác nhận production hoặc zero-downtime.
+- **P3 — Vòng điều khiển Sensor trên simulator (25/10/2026): PASS** trên profile HTTPS/RS256 cô lập: hoàn thành vòng khép kín `PATCH desired-state` (`0 < Hz <= 100`, quyền `owner`/`operator`) → transaction intent → MQTT command → Gateway simulator đổi cadence scheduler/readback/durable dedup → MQTT result → transaction tiếp nhận → `reported.configuration` → REST reading.
+  - *Lượt nghiệm thu ban đầu (`ncs_79ba9068cca0`)*: Kiểm chứng 5 command đại diện (100 Hz, 100 Hz trên Sensor thứ hai cùng Gateway, 1.5 Hz decimal, 0.1 Hz có lỗi DB tạm thời phục hồi bằng resend, và 60 Hz có controlled reopen/duplicate); dọn sạch 15 containers / 1 network / 7 volumes; đo lường trễ thực tế `D_dispatch` (5 mẫu, mean 0,538s) và `D_e2e_succeeded` (5 mẫu, mean 0,862s).
+  - *Follow-up sửa hai lỗi HIGH sau review*: Đã sửa panic khi result observer nil và bỏ lỡ delivery trước SUBACK/install (có regression RED → GREEN). Lượt native E2E mới `ncs_64809f03cce5` đạt PASS (`PAPER_P3_ACCEPTED`, `full_p3_accepted: true`, cleanup exact 17 containers / 1 network / 7 volumes) với 6 commands (5 metrics-on + 1 metrics-off 50 Hz); Go race 8 packages PASS, Python 224 tests PASS. Lượt native bổ sung đầu `ncs_375e9aebcede` FAIL health_failed tại startup backend thay thế, cleanup verified (16 containers / 1 network / 7 volumes); helper sau đó đã thêm graceful-stop và protected startup diagnostics. Giữ nguyên lịch sử FAIL trong báo cáo.
+  - *Đường dẫn artifacts*: Lượt mới tại `/var/tmp/opencode/p3-review-fixes-EblFYP/native-02/artifacts/`; lượt ban đầu tại `/tmp/opencode/paper-p3-e2e-after-acl-20261025-07/artifacts/`.
+  - *Ranh giới vận hành*: Chạy từ repo root bằng `sh scripts/test-paper-p3.sh [NEW_RUN_DIRECTORY]`. Xem chi tiết tại [báo cáo P3](docs/backend/paper-p3-sensor-control-loop.md). Deployment mặc định tiếp tục `STAGE5_ENABLED=false`; không tự mở P6 hay Stage 6; remote CI và board HIL (AM5728) giữ NOT RUN.
+- **P4 — Shaper và ingress budget (25/10/2026): PASS, Local MVP** trên fixture riêng. Baseline shaper-off `ncs_4e31bc6aa1b1` và optimized `ncs_bd005abcca19` đều PASS với cleanup exact 18 containers / 1 network / 7 volumes; workload hữu hạn có 59 unique batches / 4.010 samples, B rate rejects/retry khi shaper bật, A tiếp tục commit và 4 pending rows được drain byte-hash exact sau reopen. P3 regression mới `ncs_705f0713b225` PASS, cleanup 17 / 1 / 7. Chạy từ repo root với **thư mục mới chưa tồn tại** và log ngoài thư mục:
+  ```sh
+  run_dir="/var/tmp/opencode/paper-p4/my-baseline-$(date +%Y%m%d-%H%M%S)"
+  log="/var/tmp/opencode/paper-p4/my-baseline-$(date +%Y%m%d-%H%M%S).log"
+  test ! -e "$run_dir" && sh scripts/test-paper-p4.sh baseline "$run_dir" >"$log" 2>&1
+  # Chế độ shaped: đổi baseline thành optimized
+  ```
+  Xem [báo cáo P4, so sánh, giới hạn và artifacts](docs/backend/paper-p4-shaper-and-ingress-budget.md). Kết quả không phải benchmark capacity/fairness/RSS/broker-wide; full/remote CI, board/HIL và live rollout NOT RUN.
+- **P5a + P5b — Microbatch persistence, RAM dedup và ledger Tier-2 (26/10/2026): PASS, Local MVP** trên fixture cô lập. Migration 24 giữ guard ID/hash/provenance/range; RAM cache confirmed-only, TTL 600s, tổng caps và cold restart quay DB. Bốn profile cache off/on × 100/1 sample/message đều schema 24; mỗi lượt có 24 unique Gateway messages/ACKs và 24 duplicate replays/ACKs. Off: 24 duplicate DB transactions/profile; on: 24 RAM hits/repository calls avoided, không thêm dữ liệu. Đọc [báo cáo P5b](docs/backend/paper-p5b-ram-dedup-and-ledger.md) để biết artifacts, số đo, FAIL lịch sử và giới hạn; backlog chung tại [limitations-and-backlog](docs/dynsec/limitations-and-backlog.md).
+  - Lệnh P5b bốn profile, cache functional smoke và P3 cache-control smoke (thư mục mới/log riêng) nằm trong mục “Runner navigation” của [báo cáo P5b](docs/backend/paper-p5b-ram-dedup-and-ledger.md). Lệnh bên dưới là profile/shutdown P5a; các cờ độc lập, deployment defaults vẫn off:
+    ```sh
+    set -e
+    base=/var/tmp/opencode/paper-p5a
+    mkdir -p "$base"
+    run_profile() {
+      mode=$1 dataset=$2 name=$3
+      stamp="$(date +%Y%m%d-%H%M%S)-$$"
+      run_dir="$base/$name-$stamp"; log="$base/$name-$stamp.log"
+      test ! -e "$run_dir" && sh scripts/test-paper-p5a.sh "$mode" "$dataset" "$run_dir" >"$log" 2>&1
+    }
+    run_profile off 100 off-100
+    run_profile on 100 on-100
+    run_profile off 1 off-1
+    run_profile on 1 on-1
+    # Chỉ shutdown smoke on/1:
+    stamp="$(date +%Y%m%d-%H%M%S)-$$"
+    run_dir="$base/shutdown-$stamp"; log="$base/shutdown-$stamp.log"
+    test ! -e "$run_dir" && sh scripts/test-paper-p5a.sh on 1 "$run_dir" --shutdown-smoke >"$log" 2>&1
+    ```
+   - `off` là rollback/ablation sang persistence từng message; protocol telemetry và ACK từng message không đổi. Xem báo cáo P5b để biết runner bốn profile, cache-off DB fallback và cache functional/P3 control smokes. `STAGE5_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false` là deployment defaults độc lập. **Ghi chú lịch sử tại checkpoint P5 (26/10/2026):** lúc đó P6 chưa chạy và công việc dừng ở P5; trạng thái hiện tại được cập nhật riêng ngay bên dưới, không sửa evidence/checkpoint P5.
+   - **P6 — Dispatch và tải hỗn hợp (26/10/2026): PASS trong phạm vi Local MVP trên simulator.** Bốn arm polling/wake-up theo source-qualified report (dataset 100 và 1 sample/message) có 6/6 commands accepted+succeeded, telemetry/database accounting và exact fixture cleanup; recovery `ncs_ce2eb3785586` được chấp nhận với broker giữ ổn định, chỉ restart backend. Xem [báo cáo P6](docs/backend/paper-p6-dispatch-and-mixed-load.md), [summary JSON](docs/backend/results/p6/summary.json), [summary CSV](docs/backend/results/p6/summary.csv) và [backlog/giới hạn chung](docs/dynsec/limitations-and-backlog.md). Runner native là [`scripts/tests/native_compose_smoke.py`](scripts/tests/native_compose_smoke.py); chế độ, run-directory mới và log riêng được mô tả trong report. Không chạy lại trên deployment.
+    - Wake-up chỉ là hint sau confirmed commit; periodic/startup scan vẫn là fallback. Deployment giữ `STAGE5_ENABLED=false`, `STAGE5_WAKEUP_ENABLED=false`, `MQTT_SHAPER_ENABLED=false`, `MQTT_MICROBATCH_ENABLED=false`, `MQTT_RAM_DEDUP_ENABLED=false`. Stage 5 gốc vẫn **chưa hoàn tất**: full/remote CI requirement lane, AM5728/HIL, cảm biến vật lý và live rollout NOT RUN; P6 Local MVP không phải xác nhận production.
+   - **P7 — WebSocket telemetry (27/10/2026): LOCAL MVP COMPLETE, SOURCE-QUALIFIED.** Có native sublane PASS cho perimeter, lifecycle, grouped/single commit fan-out, slow viewer, reconnect, cặp 0/2 viewer mô tả và P6+WS regression. Mỗi run giữ nguyên `full_p7_accepted=false`; aggregate không đổi cờ raw nào và không phải production acceptance. Xem [báo cáo P7](docs/backend/paper-p7-websocket-telemetry.md), [protocol v1](docs/protocols/websocket-v1.md), [opt-in runbook](config/nginx/P7-WS-OPT-IN.md), [summary JSON](docs/backend/results/p7/summary.json), [summary CSV](docs/backend/results/p7/summary.csv) và [backlog chung](docs/dynsec/limitations-and-backlog.md).
+   - **P8 — công cụ/checkpoint (29/10/2026): `LOCAL_TOOLING_COMPLETE_SOURCE_QUALIFIED`.** Đã ghi nhận handbook P8.14, safe results, bằng chứng pilot local đã chọn cho E1–E5, gate CI local source-mapped và bàn giao database restore giới hạn; đây không phải nghiệm thu paper chính thức, sẵn sàng production hay HIL. Sáu lượt E5 vẫn giữ `full_p8_accepted=false`; kích hoạt fanout và metric command-window còn inconclusive. A/B từ xa, CI từ xa, repeats/high-load/capacity/soak chính thức, TTL thực 600s, AM5728/HIL, cảm biến vật lý, live rollout và các legacy supervisor/reloader jobs được hoãn vẫn NOT RUN/DEFERRED. Xem [báo cáo nghiệm thu P8](docs/backend/paper-p8-experiments-and-acceptance.md), [handbook A/B/tải hiện hành](docs/backend/paper-p8-load-tools.md), [chỉ mục E2 equal_samples](docs/backend/results/p8/e2-equal-samples-20261031/index.md), [safe results](docs/backend/results/p8/overview.json), [summary recovery](docs/backend/results/p8/recovery-summary.json) và [backlog trung tâm](docs/dynsec/limitations-and-backlog.md). Deployment flags tiếp tục false. Dừng sau tooling P8; không Stage 6/P9.
 
 ---
 
@@ -65,20 +120,20 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 
 ### Các thành phần chính trong hệ thống:
 1. **Nginx (`config/nginx/nginx.conf.template`)**: HTTP reverse proxy duy nhất nhận traffic từ Cloudflare Tunnel / mạng ngoài, điều hướng các prefix:
-   - `/v1/*`: Định tuyến vào Go Backend (REST API).
-   - `/v1/ws`, `/v1/telemetry/ws`: Reverse proxy WebSocket cho Go Backend.
+    - `/v1/*`: Định tuyến vào Go Backend (REST API) theo template/profile được chọn.
+    - Exact `/v1/ws`: default template trả 404; P2 TLS template và opt-in P7 profile có route WebSocket qua perimeter auth. Xem [P7 opt-in runbook](config/nginx/P7-WS-OPT-IN.md). `/v1/telemetry/ws` không phải alias hiện hành.
    - `/auth/v1/*`: Định tuyến tới Supabase Auth (GoTrue qua Envoy gateway).
    - `/storage/v1/*`: Định tuyến tới Supabase Storage API (qua Envoy gateway).
 2. **Mosquitto MQTT Broker (`config/mosquitto/`)**:
    - Chạy MQTTS (port `8883` công khai qua TLS, `18830` cục bộ cho mTLS/TCP nội bộ).
    - Phân biệt hai cơ chế xác thực và vòng đời runtime:
      - **Mô hình Static Legacy (Task 2.5 baseline)**: Xác thực đọc từ file tĩnh `password_file` (`/mosquitto/auth/passwd`) trong named volume `mosquitto_auth`, atomic replace có lock/fsync, reload qua Unix domain socket sidecar (`mosquitto-reloader`), phân quyền qua file `config/mosquitto/acl` với pattern `%u` cách ly từng Gateway. File `config/mosquitto/passwd` hiện là template prototype tracked trong git và không tự động import vào volume mới.
-     - **Chu trình sống Dynamic Security (DynSec - Task 2.6 đã triển khai)**: Sử dụng plugin Mosquitto Dynamic Security (`mosquitto_dynamic_security.so`), điều khiển qua Go DynSec adapter. Cơ chế Ingress Gate fail-closed: khởi động ở trạng thái `CLOSED`, chỉ chuyển sang `OPEN` sau khi đối soát authority DB, epoch và recovery checkpoint; hỗ trợ bảo trì toàn cục (global maintenance: `CloseDrain`, cold restart, fresh verification); khi rotate credential sẽ ngắt session cũ và từ chối CONNECT cũ; khi revoke sẽ ngắt active session ngay lập tức và từ chối fresh CONNECT; ghi nhật ký audit bất biến trong CSDL (`mqtt_credential_events`). Mặc định môi trường triển khai tắt API này (`MQTT_CREDENTIAL_API_ENABLED=false`).
+      - **Dynamic Security hiện hành**: Sử dụng plugin Mosquitto Dynamic Security (`mosquitto_dynamic_security.so`), Go DynSec adapter và broker trực tiếp trong Compose. API/readiness fail-closed không đồng nghĩa global MQTT gate đóng khi backend lỗi/shutdown. Rotate/revoke và từ chối credential cũ/đã revoke được kiểm chứng trên native fixture; mặc định API tắt (`MQTT_CREDENTIAL_API_ENABLED=false`). Cơ chế gate `CLOSED`/verified `OPEN`/global maintenance còn trong component legacy, không phải lifecycle đang wire vào deployment. Hợp đồng hiện hành tại [current credential acceptance](docs/backend/stage-2-current-credential-acceptance.md).
    - Phân quyền theo topic với pattern `%u` cách ly tuyệt đối từng Gateway: telemetry, status, responses (Gateway publish), acks, commands (Gateway subscribe).
 3. **Go Backend Modular Monolith (`src/cmd/server`)**:
    - Xử lý xác thực JWT Supabase, phân quyền quan hệ User–Gateway (`user_gateways`).
    - Thu thập telemetry từ Mosquitto, deduplication bằng `processed_messages`, lưu trữ TimescaleDB.
-   - API truy vấn lịch sử (`time_bucket`), WebSocket streaming realtime cho client được cấp quyền.
+    - API truy vấn lịch sử (`time_bucket`); WebSocket telemetry streaming tại `/v1/ws` là opt-in Local MVP (`WEBSOCKET_ENABLED=false` mặc định), không phải durable replay hoặc production rollout.
    - Cấp Signed Upload/Read URL cho media (ảnh chụp từ Gateway), xác thực metadata và lưu trạng thái vào `media_objects`.
    - **Digital Twin Subsystem**: Quản lý thực thể Gateway/Sensor/Device chuẩn NGSI-LD, đồng bộ `reported_state` từ uplink, tiếp nhận `desired_state` từ người dùng, quản lý lệnh điều khiển qua Transactional Outbox và đối soát trạng thái (reconciliation).
 4. **PostgreSQL 16 + TimescaleDB**:
@@ -276,9 +331,9 @@ docker compose exec backend wget -qO- http://127.0.0.1:8080/readyz
 
 ### 3.3 Áp dụng migration
 
-Hệ thống quản lý schema CSDL thông qua chuỗi **22 migrations** (`000001` đến `000022`):
+Hệ thống quản lý schema CSDL thông qua chuỗi migrations hiện đến **24** (`000001` đến `000024`):
 - Các migration `000001` đến `000009` trong `/docker-entrypoint-initdb.d` chỉ tự chạy khi PostgreSQL khởi tạo data volume mới.
-- Từ version 10 trở đi (`000010` đến `000022`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
+- Từ version 10 trở đi (`000010` đến `000024`), service one-shot `application-migrations` sử dụng bảng `schema_migrations` và PostgreSQL advisory lock để tự động áp dụng các migration chưa chạy cho cả volume mới và volume hiện hữu đã baseline:
   - `000010`: Bổ sung bảng `platform_admins`, `gateway_mqtt_credentials`, ràng buộc định dạng định danh Gateway/Sensor, và phân quyền tối thiểu (least-privilege) cho role `iot_backend_app`.
   - `000011`: Bổ sung bảng nhật ký audit bất biến `mqtt_credential_events`, quản lý thế hệ `generation` và khóa `idempotency_key`.
   - `000012`: Bổ sung bảng khóa bảo trì toàn cục `mqtt_credential_maintenance`.
@@ -289,8 +344,10 @@ Hệ thống quản lý schema CSDL thông qua chuỗi **22 migrations** (`00000
   - `000020`: Bổ sung schema telemetry ingestion, hypertable raw samples, deduplication ledger và temporal observations cho Stage 3.
   - `000021`: Bổ sung quyền tối thiểu cho quản trị người dùng (`profiles.full_name`, `platform_admins`), tạo hàm bảo mật `list_admin_users_projection` đọc thông tin định danh an toàn từ `auth.users` cho backend.
   - `000022`: Cấp quyền `DELETE` trên bảng `public.user_gateways` cho role nhóm `iot_backend` (`000022_gateway_membership_revocation.up.sql`), phục vụ thu hồi membership trong API admin; không thay đổi cấu trúc bảng, ràng buộc hay dữ liệu người dùng.
+  - `000023`: Schema intent/receipt/outbox cho điều khiển Sensor Stage 5.
+  - `000024`: Timestamp gốc và unique timestamp/index cho telemetry ledger Tier-2; chỉ backfill từ sample 0 có provenance đầy đủ, legacy không đủ giữ NULL, guard ID cũ vẫn có hiệu lực. Đây là additive migration đã kiểm trên fixture schema 24, chưa áp dụng/xác nhận trên shared/live DB; trước nâng cấp thật cần preflight, backup và maintenance window phù hợp với table locks.
 
-Trên volume mới chưa có Auth, `application-migrations` dừng phần áp dụng thực tế ở schema 20; migrations `000021` và `000022` được hoãn. Service `supabase-compat-migration` chạy sau GoTrue, thiết lập compatibility bằng migration `000004`, rồi áp dụng `000021` và `000022` theo thứ tự. Không xem việc runner bỏ qua các migration hậu Auth là đã hoàn tất schema 22.
+Trên volume mới chưa có Auth, `application-migrations` dừng phần áp dụng thực tế ở schema 20; migrations `000021`–`000024` được hoãn. Service `supabase-compat-migration` chạy sau GoTrue, thiết lập compatibility bằng migration `000004`, rồi áp dụng `000021`–`000024` theo thứ tự. Không xem việc runner bỏ qua các migration hậu Auth là đã hoàn tất schema 24.
 
 Migration `000009` tạo bảng `schema_migrations` sau khi schema hiện hữu đã được đối chiếu. Trên database hiện hữu, chỉ áp dụng migration này sau khi `000006`–`000008` đã được xác minh; không chạy lại các migration hardening khi constraint đã tồn tại.
 
@@ -348,7 +405,7 @@ Xem thêm quy trình Task 2.1, backend role và bootstrap platform admin tại [
 
 ### 3.4 Kiểm thử tự động & CI (Continuous Integration)
 
-Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.2**, hiện bao gồm **10 jobs CI độc lập**:
+Repository tích hợp kiểm thử qua GitHub Actions (`.github/workflows/ci.yml`), dùng Go **1.27.3**, hiện bao gồm **10 jobs CI độc lập**:
 
 1. **`lint-and-test`**:
    - Kiểm tra định dạng code Go với `gofmt`.
@@ -463,21 +520,33 @@ Các route này đã được triển khai hoàn chỉnh theo Kế hoạch chi t
 | `DELETE` | `/v1/admin/gateways/{gateway_id}/users/{user_id}` | Bearer JWT + `platform_admins` | Thu hồi quyền thành viên (`operator`/`viewer`) trên Gateway; không có body/query. Thao tác có tính lũy đẳng (idempotent), không xóa tài khoản/profile/global role và không ảnh hưởng Gateway khác | Đã triển khai: HTTP 204 No Content (body rỗng) khi xóa thành công hoặc khi membership không tồn tại; HTTP 409 Conflict (`owner_transfer_required`) nếu target là owner (yêu cầu chuyển owner trước); HTTP 404 Not Found nếu Gateway không tồn tại; HTTP 400 nếu có body/query hoặc ID sai |
 
 #### 4. Nhóm Endpoint Stub có xác thực (Authenticated Stubs):
-Hiện tại chỉ còn duy nhất 1 route stub cho WebSocket truyền dữ liệu thời gian thực (thuộc Giai đoạn 7):
+Không còn route WebSocket business stub mặc định: exact `/v1/ws` trả 404 ở default Nginx; khi route tới Go authenticated compatibility handler và `WEBSOCKET_ENABLED=false`, handler trả 501. P7 có implementation opt-in Local MVP; xem protocol/runbook phía trên. Bảng này chỉ liệt kê disabled-handler compatibility response:
 
 | Phương thức | Đường dẫn | Xác thực & Quyền hạn | Mô tả chi tiết | Trạng thái hiện tại |
 |---|---|---|---|---|
-| `GET` | `/v1/ws` | Bearer JWT `authenticated` (header) | Nâng cấp kết nối WebSocket để streaming dữ liệu cảm biến thời gian thực | HTTP 401 nếu thiếu/sai JWT; HTTP 501 Not Implemented nếu JWT hợp lệ |
+| `GET` | `/v1/ws` | Bearer JWT or browser credential subprotocol | WebSocket telemetry; disabled authenticated Go handler returns 501; default Nginx exact route returns 404; opt-in profile behavior per protocol | HTTP 401 invalid/missing auth; 501 only if disabled Go handler is reached |
 
-#### 5. Nhóm Endpoint dự kiến theo thiết kế MVP (Planned Endpoints):
-Các endpoint dưới đây thuộc thiết kế kiến trúc MVP của đồ án nhưng **chưa được đăng ký trong router** Go backend. Mọi request gửi tới các đường dẫn này sẽ nhận phản hồi HTTP `404 Not Found`:
+#### 5. Endpoint điều khiển Sensor — vòng simulator P3 đã hoàn thành, mặc định tắt trên deployment:
+
+Các route đã đăng ký phục vụ nhận intent và tra cứu command; authenticated request
+khi Stage 5 tắt trả 503, thiếu/sai JWT trả 401. Vòng điều khiển khép kín (Gateway áp dụng cấu hình và backend xác nhận kết quả) đã được triển khai và kiểm chứng trên simulator qua P3, nhưng deployment chung vẫn giữ `STAGE5_ENABLED=false` do chưa rollout live.
+
+| Phương thức | Đường dẫn | Quyền thành viên Gateway | Trạng thái hiện tại |
+|---|---|---|---|
+| `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Owner/operator; Sensor đã provision | Nhận `frequency_hz` decimal + `expected_desired_version` string, bắt buộc Idempotency-Key; 202 nhận intent, 200 confirmed no-op; replay giữ status/body gốc |
+| `GET` | `/v1/digital-twins/{entity_id}/commands` | Owner/operator/viewer | Danh sách scope Sensor, keyset/Link, limit mặc định 20/tối đa 100 |
+| `GET` | `/v1/digital-twins/{entity_id}/commands/{command_id}` | Owner/operator/viewer | Chi tiết command đúng Sensor/Gateway; không trả outbox/raw diagnostics |
+
+Contract request/response, decimal rounding, replay/conflict, lỗi và polling xem tại [Stage 5 Sensor Control API](docs/protocols/stage5-sensor-control-api.md). `published` là PUBACK, không phải execution; chỉ result hợp lệ và transaction commit mới xác nhận configuration.
+
+Không có `POST .../commands`, `/v1/commands/{command_id}`, reboot hay capture-image.
+Chỉ hỗ trợ intent `update_configuration`/`sample_interval_us`. Global admin không
+tự bypass membership. Chi tiết xem [báo cáo P3](docs/backend/paper-p3-sensor-control-loop.md) và [bàn giao 5.4](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
+
+**Endpoint media dự kiến**, chưa được đăng ký trong router:
 
 | Phương thức | Đường dẫn | Xác thực dự kiến | Mô tả theo thiết kế MVP | Giai đoạn |
 |---|---|---|---|---|
-| `PATCH` | `/v1/digital-twins/{entity_id}/desired-state` | Bearer JWT (Supabase) | Đặt cấu hình mong muốn (tạo lệnh và outbox trong transaction) | Stage 5 |
-| `POST` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Phát lệnh điều khiển trực tiếp (vd: reboot, capture_image) | Stage 5 |
-| `GET` | `/v1/digital-twins/{entity_id}/commands` | Bearer JWT (Supabase) | Lấy danh sách chỉ lệnh đã phát cho thực thể | Stage 5 |
-| `GET` | `/v1/commands/{command_id}` | Bearer JWT (Supabase) | Kiểm tra trạng thái thực thi của command | Stage 5 |
 | `POST` | `/v1/media/upload-url` | Gateway HTTP Credential riêng | Cấp Signed Upload URL cho Gateway tải ảnh chụp lên private Storage | Stage 8 |
 
 *Lưu ý quan trọng về các tuyến đường không tồn tại*:
@@ -518,8 +587,8 @@ nằm tại `docs/protocols/mqtt-v1.md`.
   - `gateways/<gateway_id>/telemetry/#`: Gateway publish các batch mẫu đo lường.
   - `gateways/<gateway_id>/acks/#`: Gateway nhận application-level commit ACK từ Go Backend khi cần xác nhận đã lưu DB.
   - `gateways/<gateway_id>/status`: Gateway publish trạng thái kết nối / hoạt động (`online`, `offline`).
-  - `gateways/<gateway_id>/commands/#`: Gateway subscribe nhận lệnh điều khiển từ Go Backend (`update_configuration`, `reboot`, `capture_image`).
-  - `gateways/<gateway_id>/responses/#`: Gateway publish kết quả thực thi lệnh (`succeeded`, `failed`, kèm `reported_state`).
+   - `gateways/<gateway_id>/commands/#`: backend publish `update_configuration` cho Sensor; Gateway simulator apply/readback/receipt đã được kiểm chứng qua P3. Không có reboot/capture_image.
+   - `gateways/<gateway_id>/responses/#`: Gateway publish result; backend result consumer/transaction cập nhật `reported.configuration` đã được kiểm chứng qua P3. PUBACK không thay thế commit result.
 
 #### Định dạng gói tin telemetry (`telemetry_batch`):
 ```json
@@ -538,33 +607,36 @@ nằm tại `docs/protocols/mqtt-v1.md`.
 }
 ```
 
-#### Định dạng gói tin lệnh điều khiển từ Server (`command`):
+#### Gói tin command hiện hành (Gateway execution đã được kiểm chứng trên simulator qua P3):
 ```json
 {
   "protocol_version": 1,
   "message_type": "command",
   "command_id": "0195e18c-9fc1-7a42-9064-69ea49e63bf3",
-  "entity_id": "urn:ngsi-ld:Gateway:gateway_001",
+  "gateway_id": "gateway_001",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
   "action": "update_configuration",
   "parameters": {
-    "sampling_interval_seconds": 5
+    "sample_interval_us": 10000000
   },
-  "desired_version": 12,
+  "desired_version": "12",
   "issued_at": "2026-09-16T08:31:00Z",
   "expires_at": "2026-09-16T08:32:00Z"
 }
 ```
 
-#### Định dạng gói tin kết quả thực thi từ Gateway (`command_result`):
+#### Gói tin result (runtime P3; backend commit result/configuration):
 ```json
 {
   "protocol_version": 1,
   "message_type": "command_result",
   "command_id": "0195e18c-9fc1-7a42-9064-69ea49e63bf3",
   "gateway_id": "gateway_001",
+  "entity_id": "urn:ngsi-ld:Sensor:gateway_001:sensor_001",
+  "desired_version": "12",
   "status": "succeeded",
   "reported_state": {
-    "sampling_interval_seconds": 5
+    "sample_interval_us": 10000000
   },
   "completed_at": "2026-09-16T08:31:03Z"
 }
@@ -574,7 +646,7 @@ nằm tại `docs/protocols/mqtt-v1.md`.
 
 ## 5. Phân hệ Digital Twin & Quản lý điều khiển (Digital Twin Subsystem)
 
-Thay vì tích hợp Federated Learning (đã được loại bỏ để tập trung vào mục tiêu trọng tâm của đồ án), hệ thống thiết kế phân hệ **Digital Twin** theo kiến trúc Modular Monolith bên trong Go Backend. Các mục dưới mô tả hành vi mục tiêu; schema đã có nhưng business handlers/đường điều khiển chưa hoàn thành:
+Thay vì tích hợp Federated Learning (đã được loại bỏ để tập trung vào mục tiêu trọng tâm của đồ án), hệ thống thiết kế phân hệ **Digital Twin** theo kiến trúc Modular Monolith bên trong Go Backend. Tại mốc 5.4 đã có schema/admission/REST/publisher/expiry; tiếp đó kế hoạch Paper P3 đã hoàn tất vòng điều khiển khép kín trên simulator (Task 5.5–5.6). Tuy nhiên, Stage 5 gốc chưa hoàn tất toàn bộ do phần board AM5728/HIL, full CI requirement lane và live rollout chưa thực hiện. Môi trường triển khai chung tiếp tục giữ `STAGE5_ENABLED=false`.
 
 ### 5.1 Chuẩn định danh & Thực thể NGSI-LD
 - Mỗi thực thể vật lý (Gateway, Sensor, Device/Actuator) có định danh URN bền vững:
@@ -586,22 +658,27 @@ Thay vì tích hợp Federated Learning (đã được loại bỏ để tập t
 
 ### 5.2 Cơ chế phân tách Trạng thái (Reported vs Desired State)
 - **`reported_state`**: Đại diện cho trạng thái thực tế cuối cùng do Gateway xác nhận qua MQTT (telemetry, status, command result). Client tuyệt đối không được ghi trực tiếp vào `reported_state`.
+- **Hiện trạng sau P3:** telemetry tiếp tục ghi observation thực tế; nhánh `reported_state.configuration` đã được cập nhật khi nhận result thành công từ Gateway qua transaction xác nhận ở Task 5.6 (P3). PATCH desired không ghi trực tiếp vào reported; không coi dữ liệu seed trong test là config đã apply.
 - **`desired_state`**: Đại diện cho cấu hình đích do người dùng mong muốn và thiết lập qua REST API. Gateway không được ghi vào `desired_state`.
 - Quản lý phiên bản độc lập (`reported_version` và `desired_version`), áp dụng cơ chế **Optimistic Concurrency** để ngăn xung đột ghi đồng thời từ nhiều client.
 
 ### 5.3 Quy trình Điều khiển Downlink & Transactional Outbox
-1. Người dùng gửi yêu cầu đổi trạng thái (`PATCH /desired-state`) hoặc gửi lệnh (`POST /commands`).
+**Bước 1–4 đã có từ mốc 5.4; bước 5–7 đã được hiện thực và kiểm chứng E2E trên simulator qua P3.** Trên môi trường triển khai chung, luồng này tiếp tục bị vô hiệu hóa (`STAGE5_ENABLED=false`) chờ live rollout.
+
+1. Người dùng gửi `PATCH /v1/digital-twins/{entity_id}/desired-state`; không có API direct `POST /commands`.
 2. Go Backend kiểm tra quyền của người dùng trên Gateway liên kết (`user_gateways`).
 3. Mở **Database Transaction**:
    - Cập nhật `desired_state` và tăng `desired_version`.
    - Ghi bản ghi chỉ lệnh vào `twin_commands` với trạng thái `pending`.
-   - Ghi bản ghi thông điệp vào `twin_outbox`.
+    - Ghi bản ghi thông điệp vào `twin_outbox`.
+    - Ghi request receipt để replay đúng status/body, kể cả no-op đã được xác nhận; no-op không tạo command/outbox hoặc tăng version.
    - Commit transaction (đảm bảo không xảy ra tình trạng đã ghi DB nhưng mất tin MQTT hoặc ngược lại).
-4. **Outbox Worker** lấy tin từ `twin_outbox`, publish qua Mosquitto topic `gateways/<gateway_id>/commands/<command_id>`, cập nhật trạng thái `published`.
+4. **Outbox Worker** lấy stored bytes từ `twin_outbox`, publish qua Mosquitto topic `gateways/<gateway_id>/commands/<command_id>`; chỉ sau PUBACK mới conditional mark `published`, không coi đó là thực thi thành công. Expiry kết thúc command quá hạn và ngừng outbox, không rollback desired.
 5. Gateway nhận lệnh, kiểm tra idempotency (dựa trên `command_id`), thực thi cấu hình phần cứng.
 6. Gateway publish kết quả về topic `gateways/<gateway_id>/responses/<command_id>`.
-7. Go Backend đối soát (reconcile) kết quả: cập nhật `twin_commands` (`acknowledged -> succeeded / failed`) và cập nhật `reported_state` tương ứng trong cùng transaction.
-8. Bắn sự kiện realtime qua WebSocket cho client đang theo dõi.
+7. Backend correlate result rồi cập nhật command và merge `reported_state.configuration` trong cùng transaction; không ghi đè telemetry/desired (đã được hiện thực trong Task 5.6 / P3).
+
+Command status dùng REST polling; không có WebSocket command events trong Stage 5.
 
 ### 5.4 Lưu trữ Lịch sử Biến thiên Thời gian (TimescaleDB)
 - Bảng hypertable `twin_temporal_values` ghi lại mọi biến thiên thuộc tính theo thời gian:

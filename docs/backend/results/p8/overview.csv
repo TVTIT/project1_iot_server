@@ -1,0 +1,15 @@
+evidence_group,status,logical_artifact_id,count_or_metric,qualification
+E1 bounded pilot,PASS,P8.6-E1-final-pilot,sha256:d3c19bf2b3e2af898a169532ce9f6bd029b64f09f25d360ac1e6aba4614b8b0f; 20 unique; 2000 raw; 530 WS writes,64 sockets; cleanup 12/1/5; not capacity
+E2 paired telemetry pilot,PASS,P8.7-E2-final-pilot,sha256:8f7a1515655b0641395d9c3a46f9f0825c1d1e224cdb3e49476d20ad80e1769f; two bounded sample profiles,two earlier native FAILs retained; not official rate rungs
+E3 low-load and mixed polling+wakeup,PASS,P8.8-E3 plus mixed-load runs,low-load 4 commands; each mixed-load run 4 receipts/2 configs; cleanup 12/1/5; pending 0,low-load burst overlap N/A; both mixed-load arms PASS with runner-observed overlap; D_dispatch/D_e2e server-origin null/unavailable
+E4 extended diagnostic,PASS,P8.9-E4-extended-on,sha256:eb9e8b6da9659a85195924d439a1f9e8453b46d552d1c95a0c987132ba30b9d3; warm/WS/cold/conflict/durable reopen,cleanup 13/1/5; official 600s TTL not run
+E5 frozen runs,PASS,p8-e5-six-run-set,6,one colocated pilot; full_p8_accepted false
+E5 strict comparable pairs,COMPARABLE,p8-e5-six-run-set,5,one repeat; not official aggregation
+E5 dataset,RECORDED,p8-e5-six-run-set,20 unique messages; 2000 raw samples; 10 warm replay; 20 WS events total / 10 each across 2 viewers,finite pilot only
+E5 fanout scan,INCONCLUSIVE,p8-e5-fanout_scan-0cadf405faabd3c8,indexed 20; scan 40,readiness proof absent
+E5 command window,INCONCLUSIVE,p8-e5-six-run-set,counter_field_missing_events,count null; not zero latency
+Final local source gate,PASS,p812-final-source-20261029,35 required guards; 77.7% coverage,coverage not gate; 106 native opt-in skips remain skips
+P8.13 database restore,PASS,p8-recovery,8/8 phases; cleanup 14/1/5,database restore in same fixture cluster only
+Remote GitHub CI,NOT_RUN,not-applicable,,no push performed
+Official repeats/high-load/HIL,NOT_RUN,not-applicable,,remote A/B; >=3 repeats; capacity/soak; TTL 600s; AM5728/physical sensors
+Stage 5 rollout,NOT_RUN,not-applicable,,deployment flags remain false

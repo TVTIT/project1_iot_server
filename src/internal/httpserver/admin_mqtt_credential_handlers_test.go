@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -116,6 +117,35 @@ func credentialDeps(t *testing.T, spy *credentialSpy) (RouterDependencies, uuid.
 	d.CredentialStartupReadiness = credentialReady(true)
 	d.AdminMaxBodyBytes = 32
 	return d, id, token
+}
+
+func TestCredentialStartupReadinessEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		enabled, ready bool
+		want           int
+	}{
+		{"enabled ready", true, true, http.StatusOK},
+		{"enabled unavailable", true, false, http.StatusServiceUnavailable},
+		{"disabled independent", false, false, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, _, _ := credentialDeps(t, &credentialSpy{})
+			deps.CredentialAPIEnabled = tc.enabled
+			deps.CredentialStartupReadiness = credentialReady(tc.ready)
+			router, err := NewRouter(deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, want := range map[string]int{"/readyz": tc.want, "/healthz": http.StatusOK} {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+				if response.Code != want {
+					t.Fatalf("%s status %d, want %d", path, response.Code, want)
+				}
+			}
+		})
+	}
 }
 
 func TestCredentialRoutesAuthorization(t *testing.T) {

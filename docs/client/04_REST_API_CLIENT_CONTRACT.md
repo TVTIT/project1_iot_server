@@ -5,6 +5,7 @@
 **Tài liệu tham chiếu:**
 - `AGENTS.md` (Mục 5, 6, 6.5, 10, 16, 18)
 - `docs/protocols/stage4-read-and-entity-api.md` (Đặc tả chi tiết protocol, request/response, validation và errors Stage 4)
+- [`../protocols/stage5-sensor-control-api.md`](../protocols/stage5-sensor-control-api.md) (REST control sampling, command polling và lỗi Stage 5)
 - `docs/backend/stage-4-history-and-twin-api.md` (Báo cáo kiến trúc và bàn giao Stage 4)
 - `docs/client/01_OVERVIEW_AND_ARCHITECTURE.md` (Kiến trúc tổng quan)
 - `docs/client/02_AUTHENTICATION_AND_SESSION.md` (Xác thực và Phiên làm việc)
@@ -71,13 +72,19 @@ Căn cứ hiện thực mã nguồn định tuyến tại `src/internal/httpserv
 5. **Ranh giới chuyển đổi giao diện ETSI GS CIM 009 V1.9.1 (5 Endpoint Profile vs 4 Route Cũ bị Thu hồi):**
    - Sau chuyển đổi V1.9.1, Go Backend đã thu hồi hoàn toàn 4 route cũ: `GET /v1/telemetry/history` (404), `GET /v1/digital-twins/{entity_id}/state` (404), `GET /v1/digital-twins/{entity_id}/history` (404), và `PATCH /v1/digital-twins/{entity_id}` (405). Client gọi vào các path cũ này sẽ nhận mã lỗi tương ứng, không có chuyển hướng hay alias ngầm định.
    - Nhóm 5 endpoint Digital Twin hiện hành bao gồm: List (`GET /v1/digital-twins`), Create/Replay (`POST /v1/digital-twins`), Detail/State View (`GET /v1/digital-twins/{entity_id}`), Patch Attributes (`PATCH /v1/digital-twins/{entity_id}/attrs`), và Temporal History (`GET /v1/digital-twins/{entity_id}/temporal`).
-6. **Ranh giới tính năng Stage 4 và các tính năng giai đoạn sau (Stage 4 vs Future Stages):**
+6. **Ranh giới tính năng Stage 4 và Stage 5:**
    - Kênh truyền thời gian thực WebSocket (`GET /v1/ws`) hiện trả về `501 Not Implemented` (thuộc Giai đoạn 7).
-   - Thiết lập cấu hình điều khiển bền vững (`desired_state`) và hàng đợi lệnh điều khiển thiết bị downlink (`twin_commands`, outbox) chưa khả dụng (thuộc Giai đoạn 5 và 6).
+   - Điều khiển desired-state lấy mẫu Sensor đã có contract REST Stage 5; xem [Sensor Control API](../protocols/stage5-sensor-control-api.md). Chỉ `owner`/`operator` đổi sampling, `viewer` chỉ đọc; quyền metadata/provisioning không được mở rộng theo quyền này.
    - Tải lên/đọc tập tin media qua Supabase Storage chưa khả dụng (thuộc Giai đoạn 8).
    - Thao tác `PATCH /v1/digital-twins/{entity_id}/attrs` chỉ cập nhật metadata (`name`, `description`), tuyệt đối **KHÔNG** cập nhật trạng thái `desired_state` hay `reported_state`, và **KHÔNG** phát sinh lệnh điều khiển thiết bị.
    - Platform Admin không có tư cách thành viên trạm sẽ bị từ chối `404 Not Found` khi đọc dữ liệu nghiệp vụ (detail, state view, temporal history) của Gateway/Sensor. Admin chỉ được phép thực hiện các thao tác quản trị nền tảng hoặc mutation metadata khi có quyền.
-   - Vai trò `operator` và `viewer` là **hoàn toàn chỉ đọc** đối với toàn bộ các endpoint Stage 4 (mọi nỗ lực `POST` hoặc `PATCH` đều nhận `403 Forbidden`).
+   - Vai trò `operator` và `viewer` vẫn chỉ đọc trên mọi Stage 4 mutation. Riêng Stage 5 operator được phép PATCH desired sampling của Sensor đã provision; viewer không được ghi. Không coi đó là quyền sửa `/attrs`.
+
+Stage 5 commands được theo dõi bằng REST polling, không phải WebSocket command
+events. `202` xác nhận intent đã commit, không phải apply; `published` là PUBACK
+chứ không phải execution. Chỉ transaction nhận result hợp lệ xác nhận
+`reported.configuration`. Decimal/low-Hz representability, timeout và conflict
+được mô tả trong [contract Stage 5](../protocols/stage5-sensor-control-api.md).
 
 ---
 
@@ -787,10 +794,9 @@ Hệ thống tuân thủ nghiêm ngặt lộ trình phát triển phân tầng k
 
 | Endpoint / Nhóm tính năng | Method | Trạng thái hiện tại | Kế hoạch triển khai & Ghi chú |
 |---|:---:|:---:|---|
-| `/v1/ws` | `GET` | `501 Not Implemented` | Kênh truyền dữ liệu thời gian thực WebSocket (Giai đoạn 7). |
-| **Device Control & Commands** | `POST /v1/digital-twins/{entity_id}/commands` | **Chưa khả dụng** | Gửi lệnh điều khiển (`twin_commands`) và cơ chế Transactional Outbox (Giai đoạn 5). |
-| **Desired State Mutation** | `PATCH /v1/digital-twins/{entity_id}/desired-state` | **Chưa khả dụng** | Cập nhật cấu hình bền vững `desired_state` (Giai đoạn 5). |
-| **State Reconciliation** | Worker nền | **Chưa khả dụng** | Worker đối soát hội tụ trạng thái mong muốn và thực tế (Giai đoạn 6). |
+| `/v1/ws` | `GET` | Opt-in `WEBSOCKET_ENABLED=true` (mặc định tắt / stub `501`) | Kênh truyền dữ liệu viễn trắc thời gian thực WebSocket (Giai đoạn 7). Khi tắt trả về 501. Command status không dùng WebSocket mà tra cứu qua REST polling. |
+| **Sensor Desired State & Commands** | `PATCH /v1/digital-twins/{entity_id}/desired-state`<br>`GET /v1/digital-twins/{entity_id}/commands`<br>`GET /v1/digital-twins/{entity_id}/commands/{command_id}`<br>`POST /v1/digital-twins/{entity_id}/commands/{command_id}/cancel` | **Đã hoàn thành P3 & Stage 6 R0–R8** (`STAGE5_ENABLED=false`, `STAGE6_ENABLED=false` mặc định) | Điều khiển tần số lấy mẫu Sensor (`0 < Hz <= 100`) cho `owner`/`operator`. Trả về `202 Accepted` kèm `command_id` hoặc `200 OK` (no-op unchanged). Tra cứu trạng thái lệnh qua polling (`pending` → `published` → `acknowledged` → `succeeded`/`failed`/`timeout`/`cancelled`).<br>- `acknowledged`: Gateway đã lưu receipt bền vững trước khi apply, **chưa phải xác nhận áp dụng thành công**.<br>- Endpoint `POST .../cancel` (body rỗng): Hủy an toàn trước khi lệnh được cấp quyền dispatch. Trả về `200 OK` (kể cả gọi lặp idempotent); trả về `409 Conflict` (`command_not_cancellable`) nếu lệnh đã được reserve/dispatch hoặc đã terminal. Không có remote abort qua MQTT.<br>- Cấu hình xác nhận nằm tại `reported.configuration`, tách biệt với quan trắc viễn trắc. |
+| **State Reconciliation & Retry Resilience** | Worker nền | **Đã hoàn thành trong mã nguồn backend (Giai đoạn 6)** (`STAGE6_ENABLED=false`, `GATEWAY_STAGE6_ENABLED=false` mặc định) | Worker đối soát hội tụ trạng thái mong muốn và thực tế sau reconnect. Đọc cấu hình Gateway qua `configuration_query` / `configuration_snapshot`. Nếu sai lệch và thỏa mãn điều kiện phục hồi (chưa bị hủy, còn budget <= 1), tự động sinh successor command với `command_id` mới, `desired_version` tăng 1, cùng thông số lấy mẫu mong muốn. Lệnh cũ hết hạn giữ nguyên `timeout` (terminal). Nếu bị chặn (cancel block hoặc hết ngân sách), hiển thị `reconcile_blocked: true` và `current_reconciliation.decision` cho người dùng biết để gửi intent mới. |
 | **Media Upload & Read URLs** | `POST` / `GET` | **Chưa khả dụng** | Tạo signed upload URL và đọc ảnh từ private Supabase Storage qua Go REST API (Giai đoạn 8). |
 
 #### Payload phản hồi chuẩn khi gọi vào WebSocket stub `501`:

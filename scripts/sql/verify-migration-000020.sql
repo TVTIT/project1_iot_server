@@ -9,10 +9,12 @@ BEGIN
      OR (SELECT max(version) FROM public.schema_migrations) < 20 THEN
     RAISE EXCEPTION 'migration 20 tracking is missing or unexpected';
   END IF;
-  SELECT pg_get_constraintdef(oid) INTO pk_def FROM pg_constraint
-  WHERE conrelid='public.telemetry'::regclass AND contype='p';
-  IF pk_def <> 'PRIMARY KEY (measured_at, sample_id)' THEN
-    RAISE EXCEPTION 'telemetry primary key mismatch: %', pk_def;
+  IF NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version >= 26) THEN
+    SELECT pg_get_constraintdef(oid) INTO pk_def FROM pg_constraint
+    WHERE conrelid='public.telemetry'::regclass AND contype='p';
+    IF pk_def <> 'PRIMARY KEY (measured_at, sample_id)' THEN
+      RAISE EXCEPTION 'telemetry primary key mismatch: %', pk_def;
+    END IF;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='telemetry'
                  AND column_name='sample_id' AND data_type='bigint' AND is_nullable='NO'
@@ -28,14 +30,26 @@ BEGIN
      OR NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.processed_messages'::regclass AND conname='processed_new_provenance' AND NOT convalidated) THEN
     RAISE EXCEPTION 'new provenance constraints must exist and remain NOT VALID';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='telemetry_message_sample'
-                 AND indexdef LIKE '%UNIQUE INDEX telemetry_message_sample%WHERE (message_id IS NOT NULL)%')
-     OR NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='processed_messages' AND indexname='processed_stream_range') THEN
-    RAISE EXCEPTION 'new telemetry indexes are missing';
+  IF NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version >= 26) THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='telemetry_message_sample'
+                   AND indexdef LIKE '%UNIQUE INDEX telemetry_message_sample%WHERE (message_id IS NOT NULL)%')
+       OR NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='processed_messages' AND indexname='processed_stream_range') THEN
+      RAISE EXCEPTION 'new telemetry indexes are missing';
+    END IF;
+  ELSE
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='processed_messages' AND indexname='processed_stream_range') THEN
+      RAISE EXCEPTION 'processed_stream_range index is missing';
+    END IF;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='fk_telemetry_sensor')
-     OR NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='idx_telemetry_gateway_sensor_time') THEN
-    RAISE EXCEPTION 'historical telemetry FK/index was not preserved';
+  IF NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version >= 25) THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.telemetry'::regclass AND conname='fk_telemetry_sensor')
+       OR NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='idx_telemetry_gateway_sensor_time') THEN
+      RAISE EXCEPTION 'historical telemetry FK/index was not preserved';
+    END IF;
+  ELSE
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='telemetry' AND indexname='idx_telemetry_gateway_sensor_time') THEN
+      RAISE EXCEPTION 'historical telemetry index idx_telemetry_gateway_sensor_time was not preserved';
+    END IF;
   END IF;
   IF (SELECT count(*) FROM timescaledb_information.hypertables WHERE hypertable_name IN ('telemetry','twin_temporal_values')) <> 2
      OR EXISTS (SELECT 1 FROM timescaledb_information.jobs WHERE proc_name='policy_retention') THEN

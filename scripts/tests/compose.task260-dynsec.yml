@@ -11,7 +11,7 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs: [/tmp, /mosquitto/data, /mosquitto/log]
     restart: "no"
   setup:
     image: eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
@@ -23,6 +23,7 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    tmpfs: [/tmp, /mosquitto/data, /mosquitto/log]
     restart: "no"
 volumes:
   security:

@@ -1,8 +1,67 @@
 """Deterministic startup deadline and secret-safe diagnosis regressions."""
+import json
 import unittest
 from unittest.mock import patch, MagicMock
 
 import task2612_standalone as harness
+
+
+class BackendCleanupTests(unittest.TestCase):
+    def backend(self, owner='fixture_backend'):
+        return {'Id': 'a' * 64, 'Name': '/fixture_backend',
+                'Config': {'Labels': {'io.iot.standalone-backend': owner}},
+                'Mounts': [{'Type': 'volume', 'Name': 'b' * 64,
+                            'Destination': '/mosquitto/data'}]}
+
+    def test_unused_image_volume_paths_are_explicitly_masked(self):
+        options = harness.backend_volume_masks()
+        self.assertEqual(options.count('--tmpfs'), 2)
+        for path in ('/mosquitto/data:', '/mosquitto/log:'):
+            self.assertTrue(any(value.startswith(path) and 'size=1048576' in value
+                                for value in options))
+
+    def test_replacement_records_and_removes_only_exact_owned_container_and_volumes(self):
+        obj = self.backend()
+        def command(args, **kwargs):
+            if args[1:3] == ['container', 'inspect']:
+                return json.dumps([obj]).encode()
+            return b''
+        with patch.object(harness, 'run', side_effect=command) as run:
+            receipt = harness.capture_backend_receipt('fixture_backend')
+            harness.remove_owned_backend(receipt)
+        self.assertEqual(receipt['anonymous_volumes'], ['b' * 64])
+        self.assertIn(['docker', 'rm', '-f', '-v', 'a' * 64],
+                      [call.args[0] for call in run.call_args_list])
+
+    def test_foreign_owner_never_authorizes_removal(self):
+        obj = self.backend('foreign')
+        with patch.object(harness, 'run', return_value=json.dumps([obj]).encode()) as run:
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                harness.capture_backend_receipt('fixture_backend')
+        self.assertEqual(len(run.call_args_list), 1)
+
+    def test_replaced_container_identity_never_authorizes_removal(self):
+        obj = self.backend()
+        with patch.object(harness, 'run', return_value=json.dumps([obj]).encode()) as run:
+            receipt = harness.capture_backend_receipt('fixture_backend')
+            obj['Id'] = 'c' * 64
+            run.return_value = json.dumps([obj]).encode()
+            with self.assertRaisesRegex(RuntimeError, 'identity'):
+                harness.remove_owned_backend(receipt)
+        self.assertFalse(any(call.args[0][1] == 'rm' for call in run.call_args_list))
+
+    def test_remaining_volume_vetoes_cleanup_success(self):
+        obj = self.backend()
+        def command(args, **kwargs):
+            if args[1:3] == ['container', 'inspect']:
+                return json.dumps([obj]).encode()
+            if args[1:3] == ['volume', 'ls']:
+                return ('b' * 64 + '\n').encode()
+            return b''
+        with patch.object(harness, 'run', side_effect=command):
+            receipt = harness.capture_backend_receipt('fixture_backend')
+            with self.assertRaisesRegex(RuntimeError, 'volume cleanup'):
+                harness.remove_owned_backend(receipt)
 
 
 class ReadinessTests(unittest.TestCase):
@@ -48,6 +107,12 @@ class ReadinessTests(unittest.TestCase):
         with patch.object(harness.time, 'sleep'):
             self.assertEqual(harness.wait_ready(lambda timeout: next(results)), (True, 'http:200'))
 
+    def test_unready_startup_requires_503_not_proxy_failure_or_success(self):
+        results = iter([502, 200, 503])
+        with patch.object(harness.time, 'sleep'):
+            self.assertEqual(harness.wait_ready(lambda timeout: next(results), expected_status=503),
+                             (True, 'http:503'))
+
     def test_diagnosis_separates_proxy_direct_and_container_state(self):
         def docker(args, **kwargs):
             command = args[1]
@@ -83,7 +148,7 @@ class ReadinessTests(unittest.TestCase):
         self.assertIn(harness.IMAGE, calls[0][0])
         self.assertNotIn('-p', calls[0][0])
         self.assertNotIn('--env-file', calls[0][0])
-        self.assertEqual(calls[1][0], ['docker', 'rm', '-f', 'backend-readiness'])
+        self.assertEqual(calls[1][0], ['docker', 'rm', '-f', '-v', 'backend-readiness'])
 
 
 class StartupEnvironmentTests(unittest.TestCase):
@@ -118,6 +183,15 @@ class StartupEnvironmentTests(unittest.TestCase):
         self.assertEqual(mqtt_keys, [], f"Disabled environment must omit all MQTT_ variables, got {mqtt_keys}")
         self.assertEqual(env['DATABASE_URL'], payload['AppDSN'])
         self.assertEqual(env['SUPABASE_JWT_SECRET'], 'test_jwt_secret')
+
+    def test_current_environment_has_no_controller_dependency(self):
+        spike = MagicMock()
+        spike.passwords = {'admin': 'admin_pass', 'backend': 'backend_pass'}
+        env = harness.build_standalone_environment({'AppDSN': 'fixture'}, 'jwt', spike, current=True)
+        self.assertNotIn('MQTT_CONTROLLER_DIR', env)
+        self.assertEqual(env['MQTT_INTERNAL_MANAGEMENT_URL'], 'ssl://broker:8883')
+        self.assertEqual(env['MQTT_CREDENTIAL_RUNTIME_ENABLED'], 'false')
+        self.assertEqual(env['MQTT_CREDENTIAL_API_ENABLED'], 'true')
 
 
 if __name__ == '__main__':

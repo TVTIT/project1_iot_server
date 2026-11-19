@@ -1,6 +1,8 @@
 // Package mqttingress contains the transport-independent telemetry ingress
-// core: bounded admission, a single bounded queue, a fixed worker pool, and the
-// post-commit application ACK path.
+// core. One global pending-count budget bounds admission: baseline mode uses a
+// bounded channel, while microbatch mode uses per-Sensor queues sharing that
+// same total bound. Both modes use a fixed worker pool and post-commit
+// application ACK path.
 //
 // It owns no MQTT client, TLS, reconnect, broker configuration or Paho types. A
 // transport adapter feeds Admit and implements Publisher. Every admitted

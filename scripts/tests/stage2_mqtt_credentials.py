@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Owned HTTP credential acceptance; native regressions remain independent."""
+"""Current simplified backend acceptance, not legacy global gate protection.
+
+Legacy controller mechanics have their own component-only entrypoint:
+scripts/test-legacy-mqtt-controller.sh. They are not deployment acceptance.
+"""
 import os
 
 from stage2_mosquitto_runtime import ENV, ROOT, run
@@ -47,11 +51,7 @@ def start_proxy(directory, network, name, backend, publish=False, labels=()):
 
 def main():
     from task266_provision import main as fixture
-    fixture(standalone=True)
-    fixture(http=True)
-    # These are real service/native fault seams, not HTTP or SQL wire-loss tests.
-    for options in ({}, {'rotate': True}, {'revoke': True}, {'startup': True}, {'composition': True}):
-        fixture(**options)
+    require(fixture(current=True) is True, 'current simplified acceptance did not complete (no skips allowed)')
 
 
 if __name__ == '__main__':

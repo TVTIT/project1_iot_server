@@ -51,6 +51,25 @@ FROM public.user_gateways AS ug
 JOIN public.gateways AS g ON g.gateway_id = ug.gateway_id
 WHERE ug.user_id = $1 AND g.gateway_id = $2`
 
+const checkSensorSubscriptionTargetQuery = `SELECT ug.role
+FROM public.user_gateways AS ug
+JOIN public.gateways AS g ON g.gateway_id = ug.gateway_id
+JOIN public.sensors AS s ON s.gateway_id = g.gateway_id AND s.sensor_id = $3
+WHERE ug.user_id = $1 AND g.gateway_id = $2`
+
+const checkSubscriptionTargetsBatchQuery = `WITH requested AS (
+    SELECT user_id, gateway_id, sensor_id
+    FROM unnest($1::uuid[], $2::text[], $3::text[]) AS keys(user_id, gateway_id, sensor_id)
+)
+SELECT requested.user_id, requested.gateway_id, requested.sensor_id, ug.role
+FROM requested
+JOIN public.gateways AS g ON g.gateway_id = requested.gateway_id
+JOIN public.user_gateways AS ug ON ug.gateway_id = g.gateway_id AND ug.user_id = requested.user_id
+LEFT JOIN public.sensors AS s ON requested.sensor_id <> ''
+    AND s.gateway_id = g.gateway_id AND s.sensor_id = requested.sensor_id
+WHERE (requested.sensor_id = '' OR s.sensor_id IS NOT NULL)
+  AND ug.role IN ('owner', 'operator', 'viewer')`
+
 const checkPlatformAdminQuery = `SELECT EXISTS (
     SELECT 1
     FROM public.platform_admins
@@ -131,6 +150,114 @@ func (r *postgresRepository) GetGatewayRole(ctx context.Context, userID uuid.UUI
 		return "", fmt.Errorf("query gateway role: %w", err)
 	}
 	return role, nil
+}
+
+func (r *postgresRepository) AuthorizeSubscriptionTarget(ctx context.Context, userID uuid.UUID, gatewayID string, sensorID string) (Role, error) {
+	if userID == uuid.Nil {
+		return "", ErrInvalidUser
+	}
+	if err := ValidateGatewayID(gatewayID); err != nil {
+		return "", err
+	}
+	if sensorID != "" {
+		if err := ValidateSensorID(sensorID); err != nil {
+			return "", err
+		}
+		var role Role
+		if err := r.database.QueryRow(ctx, checkSensorSubscriptionTargetQuery, userID, gatewayID, sensorID).Scan(&role); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", ErrNotFound
+			}
+			return "", fmt.Errorf("authorize sensor subscription: %w", err)
+		}
+		switch role {
+		case RoleOwner, RoleOperator, RoleViewer:
+			return role, nil
+		default:
+			return "", ErrNotFound
+		}
+	}
+
+	var role Role
+	if err := r.database.QueryRow(ctx, gatewayRoleQuery, userID, gatewayID).Scan(&role); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("authorize gateway subscription: %w", err)
+	}
+	switch role {
+	case RoleOwner, RoleOperator, RoleViewer:
+		return role, nil
+	default:
+		return "", ErrNotFound
+	}
+}
+
+func (r *postgresRepository) AuthorizeSubscriptionTargets(ctx context.Context, keys []SubscriptionTargetKey) ([]SubscriptionTargetAuthorization, error) {
+	if len(keys) == 0 || len(keys) > MaxSubscriptionTargetBatchSize {
+		return nil, fmt.Errorf("invalid subscription target batch size")
+	}
+	unique := make([]SubscriptionTargetKey, 0, len(keys))
+	seen := make(map[SubscriptionTargetKey]struct{}, len(keys))
+	for _, key := range keys {
+		if key.UserID == uuid.Nil {
+			return nil, ErrInvalidUser
+		}
+		if err := ValidateGatewayID(key.GatewayID); err != nil {
+			return nil, err
+		}
+		if key.SensorID != "" {
+			if err := ValidateSensorID(key.SensorID); err != nil {
+				return nil, err
+			}
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+
+	userIDs := make([]uuid.UUID, len(unique))
+	gatewayIDs := make([]string, len(unique))
+	sensorIDs := make([]string, len(unique))
+	results := make(map[SubscriptionTargetKey]SubscriptionTargetAuthorization, len(unique))
+	for i, key := range unique {
+		userIDs[i], gatewayIDs[i], sensorIDs[i] = key.UserID, key.GatewayID, key.SensorID
+		results[key] = SubscriptionTargetAuthorization{Key: key}
+	}
+	rows, err := r.database.Query(ctx, checkSubscriptionTargetsBatchQuery, userIDs, gatewayIDs, sensorIDs)
+	if err != nil {
+		return nil, fmt.Errorf("authorize subscription target batch: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key SubscriptionTargetKey
+		var role Role
+		if err := rows.Scan(&key.UserID, &key.GatewayID, &key.SensorID, &role); err != nil {
+			return nil, fmt.Errorf("scan subscription target batch: %w", err)
+		}
+		if _, ok := results[key]; !ok {
+			return nil, fmt.Errorf("subscription target batch returned unexpected identity")
+		}
+		if role != RoleOwner && role != RoleOperator && role != RoleViewer {
+			return nil, fmt.Errorf("subscription target batch returned invalid role")
+		}
+		item := results[key]
+		if item.Authorized {
+			return nil, fmt.Errorf("subscription target batch returned duplicate identity")
+		}
+		item.Role, item.Authorized = role, true
+		results[key] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate subscription target batch: %w", err)
+	}
+	ordered := make([]SubscriptionTargetAuthorization, 0, len(unique))
+	for _, key := range unique {
+		ordered = append(ordered, results[key])
+	}
+	return ordered, nil
 }
 
 func (r *postgresRepository) ListAdminGateways(ctx context.Context, actor uuid.UUID, query AdminGatewayInventoryQuery) (AdminGatewayInventoryPage, error) {

@@ -106,6 +106,24 @@ func TestPostgresAuthorizationIntegration(t *testing.T) {
 	if err != nil || len(sensorsB) != 1 || sensorsB[0].Name != "other" {
 		t.Fatal("same sensor ID crossed gateways")
 	}
+	batchRepo := repo.(BatchSubscriptionTargetRepository)
+	batchKeys := []SubscriptionTargetKey{
+		{UserID: a, GatewayID: ga, SensorID: "a"},
+		{UserID: b, GatewayID: gb, SensorID: "a"},
+		{UserID: newcomer, GatewayID: ga, SensorID: "a"},
+		{UserID: a, GatewayID: gb, SensorID: "a"},
+		{UserID: a, GatewayID: ga, SensorID: "missing"},
+		{UserID: admin, GatewayID: ga, SensorID: "a"},
+	}
+	batch, err := batchRepo.AuthorizeSubscriptionTargets(ctx, batchKeys)
+	if err != nil || len(batch) != len(batchKeys) || !batch[0].Authorized || !batch[1].Authorized || batch[0].Key != batchKeys[0] || batch[1].Key != batchKeys[1] {
+		t.Fatal("batch authorization did not preserve same sensor IDs across full identities")
+	}
+	for _, denied := range batch[2:] {
+		if denied.Authorized {
+			t.Fatal("batch authorization allowed missing, misbound, or admin-only target")
+		}
+	}
 	exec("DELETE FROM user_gateways WHERE user_id=$1 AND gateway_id=$2", a, ga)
 	if _, err := repo.ListSensorsForUserAndGateway(ctx, a, ga); !errors.Is(err, ErrNotFound) {
 		t.Fatal("membership revocation not reflected")

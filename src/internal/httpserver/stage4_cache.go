@@ -28,8 +28,8 @@ func stage4CacheMiddleware() gin.HandlerFunc {
 // - /v1/digital-twins/:entity_id
 // - /v1/digital-twins/:entity_id/state
 // - /v1/digital-twins/:entity_id/history
-// It does NOT match future routes like /v1/digital-twins/:entity_id/desired-state,
-// /v1/digital-twins/:entity_id/commands, /v1/ws, or Stage 2 routes.
+// It does NOT match Stage 5 routes (handled by controlCacheMiddleware),
+// /v1/ws, or Stage 2 routes.
 func isStage4Route(path string) bool {
 	p := strings.TrimSuffix(path, "/")
 	if p == "/v1/telemetry/history" || p == "/v1/digital-twins" {

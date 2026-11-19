@@ -1,0 +1,198 @@
+package config
+
+import (
+	"testing"
+	"time"
+)
+
+func TestStage5EnvironmentBounds(t *testing.T) {
+	for key, value := range map[string]string{
+		"STAGE5_ENABLED": "maybe", "STAGE5_REQUEST_TIMEOUT": "0s",
+		"STAGE5_COMMAND_TTL": "25h", "STAGE5_MAX_PENDING_OUTBOX": "0", "STAGE5_MAX_RECEIPTS": "1000001",
+		"STAGE5_WAKEUP_ENABLED": "maybe", "STAGE5_PUBLISH_QUEUE_CAPACITY": "0",
+	} {
+		t.Run(key, func(t *testing.T) {
+			values := validConfigValues()
+			values[key] = value
+			if _, err := Load(mapLookup(values)); err == nil {
+				t.Fatalf("accepted %s=%s", key, value)
+			}
+		})
+	}
+}
+
+func TestStage5DispatchConfigDefaultsAndMappings(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stage5.Dispatch.WakeupEnabled || cfg.Stage5.Dispatch.QueueCapacity != 32 || cfg.Stage5.Dispatch.BatchSize != 32 || cfg.Stage5.Dispatch.Workers != 1 {
+		t.Fatalf("unexpected dispatch defaults: %+v", cfg.Stage5.Dispatch)
+	}
+	values["STAGE5_WAKEUP_ENABLED"] = "true"
+	values["STAGE5_PUBLISH_QUEUE_CAPACITY"] = "7"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.Stage5.Dispatch.WakeupEnabled || cfg.Stage5.Dispatch.QueueCapacity != 7 {
+		t.Fatalf("dispatch mapping: %+v err=%v", cfg.Stage5.Dispatch, err)
+	}
+	values["STAGE5_PUBLISH_QUEUE_CAPACITY"] = "4097"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("accepted queue capacity above 4096")
+	}
+}
+
+func TestStage5DefaultsAndIndependentFlag(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.Stage5.Enabled || cfg.Stage5.Control.DBTimeout != 5*time.Second || cfg.Stage5.Control.TTL != time.Minute {
+		t.Fatalf("defaults: %+v %v", cfg.Stage5, err)
+	}
+	values["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		values[k] = v
+	}
+	enabled, err := Load(mapLookup(values))
+	if err != nil || !enabled.Stage5.Enabled || enabled.Ingress.Enabled != cfg.Ingress.Enabled || enabled.Credential.Enabled != cfg.Credential.Enabled {
+		t.Fatal("Stage 5 changed unrelated feature flags", err)
+	}
+}
+
+func stage5TransportValues() map[string]string {
+	return map[string]string{
+		"MQTT_BROKER_URL": "ssl://localhost:8883", "STAGE5_MQTT_CLIENT_ID": "backend-control", "MQTT_USERNAME": "backend_service", "MQTT_PASSWORD": "data-independent-password-123456789",
+		"MQTT_TLS_CA_FILE": "/isolated/ca.crt", "MQTT_INTERNAL_MANAGEMENT_URL": "ssl://localhost:8884", "MQTT_DYNSEC_MANAGER_USERNAME": "fixture_manager", "MQTT_DYNSEC_MANAGER_PASSWORD": "manager-independent-password-123456789",
+	}
+}
+
+func TestStage5TransportConfiguration(t *testing.T) {
+	values := validConfigValues()
+	values["STAGE5_ENABLED"] = "true"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("enabled stage 5 accepted missing data/ACL prerequisites")
+	}
+	for k, v := range stage5TransportValues() {
+		values[k] = v
+	}
+	for key, value := range map[string]string{"STAGE5_PUBLISH_WORKERS": "17", "STAGE5_SCAN_BATCH": "1025", "STAGE5_RESULT_QUEUE": "0", "STAGE5_PAYLOAD_BYTES": "8193", "STAGE5_EXPIRE_INTERVAL": "0s", "STAGE5_SCAN_INTERVAL": "0s", "STAGE5_RETRY_BACKOFF": "0s", "STAGE5_ACL_TIMEOUT": "0s", "STAGE5_SUBSCRIBE_TIMEOUT": "0s", "STAGE5_PUBLISH_TIMEOUT": "0s", "STAGE5_RECONNECT_MAX_INTERVAL": "0s", "MQTT_DYNSEC_MANAGER_USERNAME": "backend_service", "MQTT_DYNSEC_MANAGER_PASSWORD": values["MQTT_PASSWORD"]} {
+		copy := map[string]string{}
+		for k, v := range values {
+			copy[k] = v
+		}
+		copy[key] = value
+		if _, err := Load(mapLookup(copy)); err == nil {
+			t.Errorf("invalid %s", key)
+		}
+	}
+	if cfg, err := Load(mapLookup(values)); err != nil || cfg.Credential.Enabled || cfg.Ingress.Enabled {
+		t.Fatalf("independent stage 5 config %v", err)
+	}
+}
+
+func TestStage5ResultWorkersAndPoolReservation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.Stage5.ResultWorkers != 2 {
+		t.Fatalf("result worker default: %d/%v", cfg.Stage5.ResultWorkers, err)
+	}
+	for _, value := range []string{"0", "17", "invalid"} {
+		values["STAGE5_RESULT_WORKERS"] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Fatalf("invalid workers %s", value)
+		}
+	}
+	values["STAGE5_RESULT_WORKERS"] = "2"
+	values["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		values[k] = v
+	}
+	values["DATABASE_MAX_CONNS"] = "5"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("result workers were omitted from DB pool reservation")
+	}
+	values["DATABASE_MAX_CONNS"] = "6"
+	if _, err := Load(mapLookup(values)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStage6ConfigurationAndValidation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stage5.Stage6Enabled {
+		t.Fatalf("expected STAGE6_ENABLED default false, got true")
+	}
+
+	// STAGE6_ENABLED=true without STAGE5_ENABLED=true must fail
+	values["STAGE6_ENABLED"] = "true"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected error when STAGE6_ENABLED=true but STAGE5_ENABLED=false")
+	}
+
+	// Enable STAGE5
+	values["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		values[k] = v
+	}
+	values["STAGE6_RETRY_MAX_BACKOFF"] = "16s"
+	values["STAGE6_RETRY_MAX_ATTEMPTS"] = "7"
+	cfg6, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("valid Stage 6 configuration failed: %v", err)
+	}
+	if !cfg6.Stage5.Stage6Enabled || cfg6.Stage5.Control.RetryPolicy.CapDelay != 16*time.Second || cfg6.Stage5.Control.RetryPolicy.MaxAttempts != 7 {
+		t.Fatalf("Stage 6 mapping mismatch: %+v", cfg6.Stage5.Control.RetryPolicy)
+	}
+	// The repository and the runtime must receive the same mode and the same
+	// single policy; a divergent policy would fence differently.
+	if !cfg6.Stage5.Control.Stage6Enabled || !cfg6.Stage5.Dispatch.Stage6Enabled {
+		t.Fatal("Stage 6 mode must be enabled for both the repository and the runtime")
+	}
+	if cfg6.Stage5.Control.RetryPolicy != cfg6.Stage5.Dispatch.RetryPolicy {
+		t.Fatalf("repository and runtime policy diverged: %+v vs %+v", cfg6.Stage5.Control.RetryPolicy, cfg6.Stage5.Dispatch.RetryPolicy)
+	}
+	if cfg6.Stage5.Dispatch.PublishTimeout != cfg6.Stage5.Control.RetryPolicy.PublishTimeout {
+		t.Fatal("runtime publish timeout must match the repository lease policy")
+	}
+
+	// STAGE5_RETRY_BACKOFF > STAGE6_RETRY_MAX_BACKOFF must fail (base > cap)
+	values["STAGE5_RETRY_BACKOFF"] = "20s"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected error when base backoff exceeds cap delay")
+	}
+
+	// Stage 5 only: STAGE5_RETRY_BACKOFF=30s must succeed when STAGE6_ENABLED=false
+	stage5Only := validConfigValues()
+	stage5Only["STAGE5_RETRY_BACKOFF"] = "30s"
+	cfg5, err := Load(mapLookup(stage5Only))
+	if err != nil || cfg5.Stage5.Dispatch.RetryBackoff != 30*time.Second {
+		t.Fatalf("Stage 5 valid backoff 30s failed: %v", err)
+	}
+
+	// Stage 6 enabled: sub-10ms STAGE5_RETRY_BACKOFF must fail
+	valuesSub10ms := validConfigValues()
+	valuesSub10ms["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		valuesSub10ms[k] = v
+	}
+	valuesSub10ms["STAGE6_ENABLED"] = "true"
+	valuesSub10ms["STAGE5_RETRY_BACKOFF"] = "5ms"
+	if _, err := Load(mapLookup(valuesSub10ms)); err == nil {
+		t.Fatal("expected error when STAGE5_RETRY_BACKOFF < 10ms with Stage 6 enabled")
+	}
+
+	// Stage 6 enabled: sub-10ms STAGE5_PUBLISH_TIMEOUT must fail
+	valuesSubPub := validConfigValues()
+	valuesSubPub["STAGE5_ENABLED"] = "true"
+	for k, v := range stage5TransportValues() {
+		valuesSubPub[k] = v
+	}
+	valuesSubPub["STAGE6_ENABLED"] = "true"
+	valuesSubPub["STAGE5_PUBLISH_TIMEOUT"] = "5ms"
+	if _, err := Load(mapLookup(valuesSubPub)); err == nil {
+		t.Fatal("expected error when STAGE5_PUBLISH_TIMEOUT < 10ms with Stage 6 enabled")
+	}
+}

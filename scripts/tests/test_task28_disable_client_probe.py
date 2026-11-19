@@ -18,7 +18,7 @@ import stage2_mosquitto_runtime as runtime
 class TestConsumerFixtureRepair(unittest.TestCase):
     def test_separated_prepare_and_secret_inputs(self):
         from task28_disable_client_probe import DynSecProbeFixture
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as directory:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
             fixture = DynSecProbeFixture(Path(directory), 'test_image', consumer_rehearsal=True)
             def offline(cmd, **kwargs):
                 if cmd[0] == 'openssl':
@@ -57,7 +57,7 @@ class TestConsumerFixtureRepair(unittest.TestCase):
 
     def test_consumer_capture_requires_exact_id_and_labels(self):
         from task28_disable_client_probe import DynSecProbeFixture
-        fixture = DynSecProbeFixture(Path('/tmp/opencode'), 'test_image', consumer_rehearsal=True)
+        fixture = DynSecProbeFixture(Path('/var/tmp/opencode'), 'test_image', consumer_rehearsal=True)
         cid = 'a' * 64
         for role in ('backend', 'nginx', 'auth', 'envoy'):
             name = f'{fixture.project}-{role}-1'
@@ -82,13 +82,13 @@ class TestConsumerFixtureRepair(unittest.TestCase):
 
     def test_mounts_without_receipts_are_rejected(self):
         from task28_disable_client_probe import DynSecProbeFixture
-        fixture = DynSecProbeFixture(Path('/tmp/opencode'), 'test_image', consumer_rehearsal=True)
+        fixture = DynSecProbeFixture(Path('/var/tmp/opencode'), 'test_image', consumer_rehearsal=True)
         with self.assertRaises(RuntimeError):
             fixture.consumer_mounts()
 
     def test_partial_volume_creation_is_tracked_and_unknown_vetoes_cleanup(self):
         from task28_disable_client_probe import DynSecProbeFixture
-        fixture = DynSecProbeFixture(Path('/tmp/opencode'), 'test_image', consumer_rehearsal=True)
+        fixture = DynSecProbeFixture(Path('/var/tmp/opencode'), 'test_image', consumer_rehearsal=True)
         name = f'{fixture.project}_security'
         with patch('task28_disable_client_probe.inspect_resource_presence') as presence, \
              patch('task28_disable_client_probe.inspect_owned_resource') as owned, \
@@ -110,7 +110,7 @@ class TestConsumerFixtureRepair(unittest.TestCase):
 
     def test_setup_captures_actual_id_before_start_with_no_secret_argv(self):
         from task28_disable_client_probe import DynSecProbeFixture
-        fixture = DynSecProbeFixture(Path('/tmp/opencode'), 'test_image', consumer_rehearsal=True)
+        fixture = DynSecProbeFixture(Path('/var/tmp/opencode'), 'test_image', consumer_rehearsal=True)
         cid = 'b' * 64
         with patch('task28_disable_client_probe.runtime.run') as run, \
              patch('task28_disable_client_probe.inspect_owned_resource') as owned, \
@@ -128,7 +128,7 @@ class TestConsumerFixtureRepair(unittest.TestCase):
     def test_backend_store_replacement_uses_separated_path(self):
         from task28_disable_client_probe import DynSecProbeFixture
         import base64
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as directory:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
             fixture = DynSecProbeFixture(Path(directory), 'test_image',
                                         initialize_backend=True, consumer_rehearsal=True)
             for name, username in (('admin', 'admin'), ('backend', 'backend_service')):
@@ -1381,14 +1381,14 @@ class TestC1CoverageRestoration(unittest.TestCase):
     def test_prepare_setup_allocation_raises_finally_invokes_capture_for_setup_and_volume(self):
         """4. prepare setup allocation raises after creation: actual prepare finally invokes capture
         for setup and volume (patch OpenSSL/runtime.run/file-copy to avoid secrets/native;
-        use TemporaryDirectory under /tmp/opencode and harmless fixture file contents).
+        use TemporaryDirectory under /var/tmp/opencode and harmless fixture file contents).
         At least one path records real qualified capture via mocked inspect JSON. Do not seed receipts beforehand.
         """
         from task28_disable_client_probe import DynSecProbeFixture
         import tempfile
         import json
 
-        base_tmp = Path('/tmp/opencode')
+        base_tmp = Path('/var/tmp/opencode')
         base_tmp.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory(dir=base_tmp) as tmpdir:
@@ -1700,7 +1700,7 @@ class TestC1dHostFixtureCleanup(unittest.TestCase):
     def setUp(self):
         import os
         self.os = os
-        self.test_base = Path('/tmp/opencode')
+        self.test_base = Path('/var/tmp/opencode')
         self.test_base.mkdir(parents=True, exist_ok=True)
 
     def test_create_verified_host_fixture_dir_rejects_symlink_base_and_ancestor(self):
@@ -1860,8 +1860,8 @@ class TestC1dHostFixtureCleanup(unittest.TestCase):
 
         base_valid = {
             'status': 'created',
-            'path': '/tmp/opencode/test/fixture_1234abcd',
-            'parent': '/tmp/opencode/test',
+            'path': '/var/tmp/opencode/test/fixture_1234abcd',
+            'parent': '/var/tmp/opencode/test',
             'name': 'fixture_1234abcd',
             'dev': 100,
             'ino': 200,
@@ -1889,13 +1889,13 @@ class TestC1dHostFixtureCleanup(unittest.TestCase):
 
         # Name not fixture_<8 hex>
         for bad_name in ['fixture_XYZ', 'fixture_1234abc', 'fixture_1234abcde', 'fixture_1234ABCD', 'not_fixture_1234abcd', '../fixture_1234abcd']:
-            r = dict(base_valid, name=bad_name, path=f'/tmp/opencode/test/{bad_name}')
+            r = dict(base_valid, name=bad_name, path=f'/var/tmp/opencode/test/{bad_name}')
             res = verified_remove_host_fixture_dir(r)
             self.assertEqual(res['status'], 'invalid_receipt')
             self.assertFalse(res['verified'])
 
         # Relative path / path traversal
-        for bad_path in ['relative/fixture_1234abcd', '/tmp/opencode/test/../other/fixture_1234abcd']:
+        for bad_path in ['relative/fixture_1234abcd', '/var/tmp/opencode/test/../other/fixture_1234abcd']:
             r = dict(base_valid, path=bad_path)
             res = verified_remove_host_fixture_dir(r)
             self.assertEqual(res['status'], 'invalid_receipt')
@@ -3349,7 +3349,7 @@ class TestC1PreflightCorrections(unittest.TestCase):
 class TestOptionalBackendInitialization(unittest.TestCase):
     def test_default_fixture_has_no_backend_secret(self):
         from task28_disable_client_probe import DynSecProbeFixture
-        fixture = DynSecProbeFixture(Path('/tmp/opencode'), 'test-image')
+        fixture = DynSecProbeFixture(Path('/var/tmp/opencode'), 'test-image')
         self.assertEqual(set(fixture.passwords), {'admin', 'target', 'observer'})
 
     def test_backend_native_initialization_is_private_and_before_launch(self):
@@ -3357,7 +3357,7 @@ class TestOptionalBackendInitialization(unittest.TestCase):
         import json
         import base64
         from task28_disable_client_probe import DynSecProbeFixture
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as directory:
+        with tempfile.TemporaryDirectory(dir='/var/tmp/opencode') as directory:
             fixture = DynSecProbeFixture(Path(directory), 'test-image', initialize_backend=True)
             self.assertNotEqual(fixture.passwords['admin'], fixture.passwords['backend_service'])
             calls = []

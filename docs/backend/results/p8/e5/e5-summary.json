@@ -1,0 +1,1018 @@
+{
+  "actual_binary_and_images_comparable": true,
+  "full_p8_accepted": false,
+  "independent_repeats": 1,
+  "official_repeats_gte_3": false,
+  "pairs": [
+    {
+      "activation_reason": null,
+      "activation_status": "ELIGIBLE",
+      "arm": "shaper_off",
+      "comparability": "COMPARABLE",
+      "comparison_arm": "shaper_off",
+      "denominator": "same single pilot; no repeat aggregation",
+      "improvement_percent": null,
+      "metric_status": "UNAVAILABLE",
+      "provenance": "no defined matching benefit metric in this report",
+      "reference_arm": "optimized",
+      "window": null
+    },
+    {
+      "ablation_begin_attempts": 20,
+      "ablation_confirmed_commits": 20,
+      "ablation_copy_calls": 20,
+      "activation_reason": null,
+      "activation_status": "ELIGIBLE",
+      "arm": "microbatch_off",
+      "comparability": "COMPARABLE",
+      "comparison_arm": "microbatch_off",
+      "denominator": "same single pilot; no repeat aggregation",
+      "gamma_begin_attempts": {
+        "available": true,
+        "c_opt": 16,
+        "c_ref": 20,
+        "gamma_red_percent": 20.0,
+        "metric": "initial_begin_attempts",
+        "normalized": false
+      },
+      "gamma_confirmed_commits": {
+        "available": true,
+        "c_opt": 16,
+        "c_ref": 20,
+        "gamma_red_percent": 20.0,
+        "metric": "initial_confirmed_commits",
+        "normalized": false
+      },
+      "gamma_copy_calls": {
+        "available": true,
+        "c_opt": 16,
+        "c_ref": 20,
+        "gamma_red_percent": 20.0,
+        "metric": "initial_repository_copy_calls",
+        "normalized": false
+      },
+      "interpretation_limit": "20% applies only to these initial operation counters, not all SQL/storage/RSS/latency/throughput",
+      "optimized_begin_attempts": 16,
+      "optimized_confirmed_commits": 16,
+      "optimized_copy_calls": 16,
+      "provenance": "phase_windows.initial admin_before/admin_after persistence deltas with matching process_instance; C_reference=microbatch_off; C_optimized=optimized",
+      "raw_samples_retained_ablation": 2000,
+      "raw_samples_retained_optimized": 2000,
+      "reference_arm": "optimized",
+      "window": "initial import phase"
+    },
+    {
+      "ablation_warm_attempts": 10,
+      "ablation_warm_confirmed_commits": 10,
+      "ablation_warm_db_calls_avoided": 0,
+      "ablation_warm_transactions": 10,
+      "activation_reason": null,
+      "activation_status": "ELIGIBLE",
+      "arm": "ram_dedup_off",
+      "comparability": "COMPARABLE",
+      "comparison_arm": "ram_dedup_off",
+      "denominator": "same single pilot; no repeat aggregation",
+      "gamma_warm_attempts": {
+        "available": true,
+        "c_opt": 0,
+        "c_ref": 10,
+        "gamma_red_percent": 100.0,
+        "metric": "warm_begin_attempts",
+        "normalized": false
+      },
+      "gamma_warm_commits": {
+        "available": true,
+        "c_opt": 0,
+        "c_ref": 10,
+        "gamma_red_percent": 100.0,
+        "metric": "warm_confirmed_commits",
+        "normalized": false
+      },
+      "gamma_warm_transactions": {
+        "available": true,
+        "c_opt": 0,
+        "c_ref": 10,
+        "gamma_red_percent": 100.0,
+        "metric": "warm_begin_attempts",
+        "normalized": false
+      },
+      "interpretation_limit": "100% only warm repository/transaction work reflected by this counter; not all SQL/storage/RSS/latency/throughput",
+      "optimized_warm_attempts": 0,
+      "optimized_warm_confirmed_commits": 0,
+      "optimized_warm_db_calls_avoided": 10,
+      "optimized_warm_transactions": 0,
+      "provenance": "phase_windows.warm_replay admin_before/admin_after persistence deltas (begin_attempts as attempts, confirmed_commits as commits) with matching process_instance; C_reference=ram_dedup_off; C_optimized=optimized; RAM lookup hits separately reported",
+      "raw_samples_retained_ablation": 0,
+      "raw_samples_retained_optimized": 0,
+      "reference_arm": "optimized",
+      "window": "warm replay phase"
+    },
+    {
+      "activation_reason": null,
+      "activation_status": "ELIGIBLE",
+      "arm": "polling",
+      "comparability": "COMPARABLE",
+      "comparison_arm": "polling",
+      "denominator": "same single pilot; no repeat aggregation",
+      "improvement_percent": null,
+      "metric_status": "UNAVAILABLE",
+      "provenance": "no defined matching benefit metric in this report",
+      "reference_arm": "optimized",
+      "window": null
+    },
+    {
+      "activation_reason": "fanout_viewer_readiness_unverified",
+      "activation_status": "INCONCLUSIVE",
+      "arm": "fanout_scan",
+      "comparability": "COMPARABLE",
+      "comparison_arm": "fanout_scan",
+      "denominator": "same single pilot; no repeat aggregation",
+      "improvement_percent": null,
+      "metric_status": "UNAVAILABLE",
+      "provenance": "no defined matching benefit metric in this report",
+      "raw_activation_evidence": {
+        "conservative_helper_result": {
+          "eligible": false,
+          "reason": "fanout_viewer_readiness_unverified",
+          "status": "INCONCLUSIVE"
+        },
+        "fanout_scan": {
+          "duplicates": 0,
+          "indexed_selections": 0,
+          "scan_evaluations": 40,
+          "subscriptions_ready_counter": 2,
+          "viewer_count": 2,
+          "viewer_events": 20,
+          "wrong_namespace": 0
+        },
+        "optimized": {
+          "duplicates": 0,
+          "indexed_selections": 20,
+          "scan_evaluations": 0,
+          "subscriptions_ready_counter": 2,
+          "viewer_count": 2,
+          "viewer_events": 20,
+          "wrong_namespace": 0
+        }
+      },
+      "reference_arm": "optimized",
+      "window": null
+    }
+  ],
+  "qualifications": [
+    "Native workloads ran; whole-run happy mocked integration was NOT RUN.",
+    "Command-window timeline is INCONCLUSIVE (counter_field_missing_events); command latency is INCONCLUSIVE and no zero latency or false zero sample counts are claimed.",
+    "Resource snapshots are sparse and colocated; not capacity evidence.",
+    "Fanout raw counters/viewer proof are reported alongside conservative helper result; adapter readiness_verified was absent, so activation stays INCONCLUSIVE.",
+    "This newly generated summary code was not the source executed by these frozen runs."
+  ],
+  "run_count": 6,
+  "runs": [
+    {
+      "arm": "optimized",
+      "cleanup_counts": {
+        "container": 12,
+        "network": 1,
+        "volume": 5
+      },
+      "cleanup_verified": true,
+      "command_timeline_reason": "counter_field_missing_events",
+      "command_timeline_status": "INCONCLUSIVE",
+      "committed": 20,
+      "configurations_verified": 2,
+      "control_runner_status": "COMPLETE",
+      "duplicate_committed": 0,
+      "exact_cleanup_verified": true,
+      "fanout_indexed_selections": 20,
+      "fanout_scan_evaluations": 0,
+      "flags": {
+        "MQTT_MICROBATCH_ENABLED": "true",
+        "MQTT_RAM_DEDUP_ENABLED": "true",
+        "MQTT_SHAPER_ENABLED": "true",
+        "STAGE5_ENABLED": "true",
+        "STAGE5_WAKEUP_ENABLED": "true",
+        "WEBSOCKET_ENABLED": "true",
+        "WS_FANOUT_MODE": "indexed"
+      },
+      "full_p8_accepted": false,
+      "gateway_binary_sha256": "993da9f59407d270ac8fccf298e0afa419cf7fb26fdb777f41c6e67f42635afe",
+      "image_ids": {
+        "application-migrations": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "auth-socket-init": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "backend": "sha256:924679a9aa50bc773ebfc2230d2ddc2534a15e83a758c448a5154fa5a0b410ec",
+        "gateway": "sha256:9c82293c3eafafc125abd67df61f04b2cfcfeb8484dd928d584021a6226f6fac",
+        "mosquitto": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "nginx": "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00",
+        "postgres": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-auth": "sha256:c0c25187a6b835e65a6f6e6c6b39d090e832d40e6de5186f2c038e0411944232",
+        "supabase-compat-migration": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-envoy": "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+        "supabase-role-provisioner": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-storage": "sha256:f1546fac6d1c7e345428ac904bfaa7be7cecd50a1f549fe1cf38c628a7b15c85"
+      },
+      "initial_persistence_delta": {
+        "configuration": 0,
+        "ledger": 20,
+        "raw": 2000,
+        "temporal": 20
+      },
+      "initial_phase_status": "COMPLETE",
+      "initial_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 0,
+          "delta": 2000,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+      "logical_artifact_id": "p8-e5-optimized-7039c0a9eb731fa0",
+      "microbatch_groups": 16,
+      "microbatch_members": 20,
+      "paperload_binary_sha256": "d29f58f30646c972b36dce3862b151f6e6ffcec634ff695c6ce75d7ae8a3b8c8",
+      "ram_db_calls_avoided": 10,
+      "ram_lookup_hits": 10,
+      "raw_report_sha256": "7039c0a9eb731fa0bd17735d1f9a851d271c2e249f9ec6f0aec80d1b46937188",
+      "receipts_verified": 4,
+      "samples_new": 2000,
+      "shaper_rate_limited": 24,
+      "source_dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+      "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+      "status": "PASS",
+      "timeline_dispatch_count": null,
+      "timeline_e2e_count": null,
+      "viewer_count": 2,
+      "viewer_duplicates": 0,
+      "viewer_unique_events": 20,
+      "viewer_wrong_namespace": 0,
+      "warm_persistence_delta": {
+        "configuration": 0,
+        "ledger": 0,
+        "raw": 0,
+        "temporal": 0
+      },
+      "warm_phase_status": "COMPLETE",
+      "warm_replay": 10,
+      "warm_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 2000,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+    },
+    {
+      "arm": "shaper_off",
+      "cleanup_counts": {
+        "container": 12,
+        "network": 1,
+        "volume": 5
+      },
+      "cleanup_verified": true,
+      "command_timeline_reason": "counter_field_missing_events",
+      "command_timeline_status": "INCONCLUSIVE",
+      "committed": 20,
+      "configurations_verified": 2,
+      "control_runner_status": "PARTIAL",
+      "duplicate_committed": 0,
+      "exact_cleanup_verified": true,
+      "fanout_indexed_selections": 20,
+      "fanout_scan_evaluations": 0,
+      "flags": {
+        "MQTT_MICROBATCH_ENABLED": "true",
+        "MQTT_RAM_DEDUP_ENABLED": "true",
+        "MQTT_SHAPER_ENABLED": "false",
+        "STAGE5_ENABLED": "true",
+        "STAGE5_WAKEUP_ENABLED": "true",
+        "WEBSOCKET_ENABLED": "true",
+        "WS_FANOUT_MODE": "indexed"
+      },
+      "full_p8_accepted": false,
+      "gateway_binary_sha256": "993da9f59407d270ac8fccf298e0afa419cf7fb26fdb777f41c6e67f42635afe",
+      "image_ids": {
+        "application-migrations": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "auth-socket-init": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "backend": "sha256:924679a9aa50bc773ebfc2230d2ddc2534a15e83a758c448a5154fa5a0b410ec",
+        "gateway": "sha256:9c82293c3eafafc125abd67df61f04b2cfcfeb8484dd928d584021a6226f6fac",
+        "mosquitto": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "nginx": "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00",
+        "postgres": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-auth": "sha256:c0c25187a6b835e65a6f6e6c6b39d090e832d40e6de5186f2c038e0411944232",
+        "supabase-compat-migration": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-envoy": "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+        "supabase-role-provisioner": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-storage": "sha256:f1546fac6d1c7e345428ac904bfaa7be7cecd50a1f549fe1cf38c628a7b15c85"
+      },
+      "initial_persistence_delta": {
+        "configuration": 0,
+        "ledger": 20,
+        "raw": 2000,
+        "temporal": 20
+      },
+      "initial_phase_status": "COMPLETE",
+      "initial_repository_counters": {
+        "begin_attempts": {
+          "after": 4,
+          "before": 0,
+          "delta": 4,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 4,
+          "before": 0,
+          "delta": 4,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 4,
+          "before": 0,
+          "delta": 4,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 0,
+          "delta": 2000,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+      "logical_artifact_id": "p8-e5-shaper_off-090fc844cf1bbd68",
+      "microbatch_groups": 4,
+      "microbatch_members": 20,
+      "paperload_binary_sha256": "d29f58f30646c972b36dce3862b151f6e6ffcec634ff695c6ce75d7ae8a3b8c8",
+      "ram_db_calls_avoided": 10,
+      "ram_lookup_hits": 10,
+      "raw_report_sha256": "090fc844cf1bbd688384d10f5902d8a865c186e8c39651068efeb7d593ecf2a0",
+      "receipts_verified": 4,
+      "samples_new": 2000,
+      "shaper_rate_limited": 0,
+      "source_dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+      "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+      "status": "PASS",
+      "timeline_dispatch_count": null,
+      "timeline_e2e_count": null,
+      "viewer_count": 2,
+      "viewer_duplicates": 0,
+      "viewer_unique_events": 20,
+      "viewer_wrong_namespace": 0,
+      "warm_persistence_delta": {
+        "configuration": 0,
+        "ledger": 0,
+        "raw": 0,
+        "temporal": 0
+      },
+      "warm_phase_status": "COMPLETE",
+      "warm_replay": 10,
+      "warm_repository_counters": {
+        "begin_attempts": {
+          "after": 4,
+          "before": 4,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 4,
+          "before": 4,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 4,
+          "before": 4,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 2000,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+    },
+    {
+      "arm": "microbatch_off",
+      "cleanup_counts": {
+        "container": 12,
+        "network": 1,
+        "volume": 5
+      },
+      "cleanup_verified": true,
+      "command_timeline_reason": "counter_field_missing_events",
+      "command_timeline_status": "INCONCLUSIVE",
+      "committed": 20,
+      "configurations_verified": 2,
+      "control_runner_status": "PARTIAL",
+      "duplicate_committed": 0,
+      "exact_cleanup_verified": true,
+      "fanout_indexed_selections": 20,
+      "fanout_scan_evaluations": 0,
+      "flags": {
+        "MQTT_MICROBATCH_ENABLED": "false",
+        "MQTT_RAM_DEDUP_ENABLED": "true",
+        "MQTT_SHAPER_ENABLED": "true",
+        "STAGE5_ENABLED": "true",
+        "STAGE5_WAKEUP_ENABLED": "true",
+        "WEBSOCKET_ENABLED": "true",
+        "WS_FANOUT_MODE": "indexed"
+      },
+      "full_p8_accepted": false,
+      "gateway_binary_sha256": "993da9f59407d270ac8fccf298e0afa419cf7fb26fdb777f41c6e67f42635afe",
+      "image_ids": {
+        "application-migrations": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "auth-socket-init": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "backend": "sha256:924679a9aa50bc773ebfc2230d2ddc2534a15e83a758c448a5154fa5a0b410ec",
+        "gateway": "sha256:9c82293c3eafafc125abd67df61f04b2cfcfeb8484dd928d584021a6226f6fac",
+        "mosquitto": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "nginx": "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00",
+        "postgres": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-auth": "sha256:c0c25187a6b835e65a6f6e6c6b39d090e832d40e6de5186f2c038e0411944232",
+        "supabase-compat-migration": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-envoy": "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+        "supabase-role-provisioner": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-storage": "sha256:f1546fac6d1c7e345428ac904bfaa7be7cecd50a1f549fe1cf38c628a7b15c85"
+      },
+      "initial_persistence_delta": {
+        "configuration": 0,
+        "ledger": 20,
+        "raw": 2000,
+        "temporal": 20
+      },
+      "initial_phase_status": "COMPLETE",
+      "initial_repository_counters": {
+        "begin_attempts": {
+          "after": 20,
+          "before": 0,
+          "delta": 20,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 20,
+          "before": 0,
+          "delta": 20,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 20,
+          "before": 0,
+          "delta": 20,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 0,
+          "delta": 2000,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+      "logical_artifact_id": "p8-e5-microbatch_off-3aafb955dd42a600",
+      "microbatch_groups": 0,
+      "microbatch_members": 0,
+      "paperload_binary_sha256": "d29f58f30646c972b36dce3862b151f6e6ffcec634ff695c6ce75d7ae8a3b8c8",
+      "ram_db_calls_avoided": 10,
+      "ram_lookup_hits": 10,
+      "raw_report_sha256": "3aafb955dd42a60037f3f39bbdb65c764c2218f49892a68a258e63c2ef31c3d9",
+      "receipts_verified": 4,
+      "samples_new": 2000,
+      "shaper_rate_limited": 24,
+      "source_dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+      "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+      "status": "PASS",
+      "timeline_dispatch_count": null,
+      "timeline_e2e_count": null,
+      "viewer_count": 2,
+      "viewer_duplicates": 0,
+      "viewer_unique_events": 20,
+      "viewer_wrong_namespace": 0,
+      "warm_persistence_delta": {
+        "configuration": 0,
+        "ledger": 0,
+        "raw": 0,
+        "temporal": 0
+      },
+      "warm_phase_status": "COMPLETE",
+      "warm_replay": 10,
+      "warm_repository_counters": {
+        "begin_attempts": {
+          "after": 20,
+          "before": 20,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 20,
+          "before": 20,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 20,
+          "before": 20,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 2000,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+    },
+    {
+      "arm": "ram_dedup_off",
+      "cleanup_counts": {
+        "container": 12,
+        "network": 1,
+        "volume": 5
+      },
+      "cleanup_verified": true,
+      "command_timeline_reason": "counter_field_missing_events",
+      "command_timeline_status": "INCONCLUSIVE",
+      "committed": 20,
+      "configurations_verified": 2,
+      "control_runner_status": "PARTIAL",
+      "duplicate_committed": 0,
+      "exact_cleanup_verified": true,
+      "fanout_indexed_selections": 20,
+      "fanout_scan_evaluations": 0,
+      "flags": {
+        "MQTT_MICROBATCH_ENABLED": "true",
+        "MQTT_RAM_DEDUP_ENABLED": "false",
+        "MQTT_SHAPER_ENABLED": "true",
+        "STAGE5_ENABLED": "true",
+        "STAGE5_WAKEUP_ENABLED": "true",
+        "WEBSOCKET_ENABLED": "true",
+        "WS_FANOUT_MODE": "indexed"
+      },
+      "full_p8_accepted": false,
+      "gateway_binary_sha256": "993da9f59407d270ac8fccf298e0afa419cf7fb26fdb777f41c6e67f42635afe",
+      "image_ids": {
+        "application-migrations": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "auth-socket-init": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "backend": "sha256:924679a9aa50bc773ebfc2230d2ddc2534a15e83a758c448a5154fa5a0b410ec",
+        "gateway": "sha256:9c82293c3eafafc125abd67df61f04b2cfcfeb8484dd928d584021a6226f6fac",
+        "mosquitto": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "nginx": "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00",
+        "postgres": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-auth": "sha256:c0c25187a6b835e65a6f6e6c6b39d090e832d40e6de5186f2c038e0411944232",
+        "supabase-compat-migration": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-envoy": "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+        "supabase-role-provisioner": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-storage": "sha256:f1546fac6d1c7e345428ac904bfaa7be7cecd50a1f549fe1cf38c628a7b15c85"
+      },
+      "initial_persistence_delta": {
+        "configuration": 0,
+        "ledger": 20,
+        "raw": 2000,
+        "temporal": 20
+      },
+      "initial_phase_status": "COMPLETE",
+      "initial_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 0,
+          "delta": 2000,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+      "logical_artifact_id": "p8-e5-ram_dedup_off-9252b4ecd604539a",
+      "microbatch_groups": 16,
+      "microbatch_members": 20,
+      "paperload_binary_sha256": "d29f58f30646c972b36dce3862b151f6e6ffcec634ff695c6ce75d7ae8a3b8c8",
+      "ram_db_calls_avoided": 0,
+      "ram_lookup_hits": 0,
+      "raw_report_sha256": "9252b4ecd604539a26e426fc0ac3272284af148a329024f04f20e4ff7f3880d4",
+      "receipts_verified": 4,
+      "samples_new": 2000,
+      "shaper_rate_limited": 24,
+      "source_dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+      "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+      "status": "PASS",
+      "timeline_dispatch_count": null,
+      "timeline_e2e_count": null,
+      "viewer_count": 2,
+      "viewer_duplicates": 0,
+      "viewer_unique_events": 20,
+      "viewer_wrong_namespace": 0,
+      "warm_persistence_delta": {
+        "configuration": 0,
+        "ledger": 0,
+        "raw": 0,
+        "temporal": 0
+      },
+      "warm_phase_status": "COMPLETE",
+      "warm_replay": 10,
+      "warm_repository_counters": {
+        "begin_attempts": {
+          "after": 26,
+          "before": 16,
+          "delta": 10,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 26,
+          "before": 16,
+          "delta": 10,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 2000,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+    },
+    {
+      "arm": "polling",
+      "cleanup_counts": {
+        "container": 12,
+        "network": 1,
+        "volume": 5
+      },
+      "cleanup_verified": true,
+      "command_timeline_reason": "counter_field_missing_events",
+      "command_timeline_status": "INCONCLUSIVE",
+      "committed": 20,
+      "configurations_verified": 2,
+      "control_runner_status": "COMPLETE",
+      "duplicate_committed": 0,
+      "exact_cleanup_verified": true,
+      "fanout_indexed_selections": 20,
+      "fanout_scan_evaluations": 0,
+      "flags": {
+        "MQTT_MICROBATCH_ENABLED": "true",
+        "MQTT_RAM_DEDUP_ENABLED": "true",
+        "MQTT_SHAPER_ENABLED": "true",
+        "STAGE5_ENABLED": "true",
+        "STAGE5_WAKEUP_ENABLED": "false",
+        "WEBSOCKET_ENABLED": "true",
+        "WS_FANOUT_MODE": "indexed"
+      },
+      "full_p8_accepted": false,
+      "gateway_binary_sha256": "993da9f59407d270ac8fccf298e0afa419cf7fb26fdb777f41c6e67f42635afe",
+      "image_ids": {
+        "application-migrations": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "auth-socket-init": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "backend": "sha256:924679a9aa50bc773ebfc2230d2ddc2534a15e83a758c448a5154fa5a0b410ec",
+        "gateway": "sha256:9c82293c3eafafc125abd67df61f04b2cfcfeb8484dd928d584021a6226f6fac",
+        "mosquitto": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "nginx": "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00",
+        "postgres": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-auth": "sha256:c0c25187a6b835e65a6f6e6c6b39d090e832d40e6de5186f2c038e0411944232",
+        "supabase-compat-migration": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-envoy": "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+        "supabase-role-provisioner": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-storage": "sha256:f1546fac6d1c7e345428ac904bfaa7be7cecd50a1f549fe1cf38c628a7b15c85"
+      },
+      "initial_persistence_delta": {
+        "configuration": 0,
+        "ledger": 20,
+        "raw": 2000,
+        "temporal": 20
+      },
+      "initial_phase_status": "COMPLETE",
+      "initial_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 0,
+          "delta": 2000,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+      "logical_artifact_id": "p8-e5-polling-0c6d6097e17acd84",
+      "microbatch_groups": 16,
+      "microbatch_members": 20,
+      "paperload_binary_sha256": "d29f58f30646c972b36dce3862b151f6e6ffcec634ff695c6ce75d7ae8a3b8c8",
+      "ram_db_calls_avoided": 10,
+      "ram_lookup_hits": 10,
+      "raw_report_sha256": "0c6d6097e17acd8477af68e07bb3a1100bf9b55aa327923f20ba2103ccda3739",
+      "receipts_verified": 4,
+      "samples_new": 2000,
+      "shaper_rate_limited": 24,
+      "source_dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+      "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+      "status": "PASS",
+      "timeline_dispatch_count": null,
+      "timeline_e2e_count": null,
+      "viewer_count": 2,
+      "viewer_duplicates": 0,
+      "viewer_unique_events": 20,
+      "viewer_wrong_namespace": 0,
+      "warm_persistence_delta": {
+        "configuration": 0,
+        "ledger": 0,
+        "raw": 0,
+        "temporal": 0
+      },
+      "warm_phase_status": "COMPLETE",
+      "warm_replay": 10,
+      "warm_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 2000,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+    },
+    {
+      "arm": "fanout_scan",
+      "cleanup_counts": {
+        "container": 12,
+        "network": 1,
+        "volume": 5
+      },
+      "cleanup_verified": true,
+      "command_timeline_reason": "counter_field_missing_events",
+      "command_timeline_status": "INCONCLUSIVE",
+      "committed": 20,
+      "configurations_verified": 2,
+      "control_runner_status": "PARTIAL",
+      "duplicate_committed": 0,
+      "exact_cleanup_verified": true,
+      "fanout_indexed_selections": 0,
+      "fanout_scan_evaluations": 40,
+      "flags": {
+        "MQTT_MICROBATCH_ENABLED": "true",
+        "MQTT_RAM_DEDUP_ENABLED": "true",
+        "MQTT_SHAPER_ENABLED": "true",
+        "STAGE5_ENABLED": "true",
+        "STAGE5_WAKEUP_ENABLED": "true",
+        "WEBSOCKET_ENABLED": "true",
+        "WS_FANOUT_MODE": "scan"
+      },
+      "full_p8_accepted": false,
+      "gateway_binary_sha256": "993da9f59407d270ac8fccf298e0afa419cf7fb26fdb777f41c6e67f42635afe",
+      "image_ids": {
+        "application-migrations": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "auth-socket-init": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "backend": "sha256:924679a9aa50bc773ebfc2230d2ddc2534a15e83a758c448a5154fa5a0b410ec",
+        "gateway": "sha256:9c82293c3eafafc125abd67df61f04b2cfcfeb8484dd928d584021a6226f6fac",
+        "mosquitto": "sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9",
+        "nginx": "sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00",
+        "postgres": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-auth": "sha256:c0c25187a6b835e65a6f6e6c6b39d090e832d40e6de5186f2c038e0411944232",
+        "supabase-compat-migration": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-envoy": "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+        "supabase-role-provisioner": "sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a",
+        "supabase-storage": "sha256:f1546fac6d1c7e345428ac904bfaa7be7cecd50a1f549fe1cf38c628a7b15c85"
+      },
+      "initial_persistence_delta": {
+        "configuration": 0,
+        "ledger": 20,
+        "raw": 2000,
+        "temporal": 20
+      },
+      "initial_phase_status": "COMPLETE",
+      "initial_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 0,
+          "delta": 16,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 0,
+          "delta": 2000,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+      "logical_artifact_id": "p8-e5-fanout_scan-0cadf405faabd3c8",
+      "microbatch_groups": 16,
+      "microbatch_members": 20,
+      "paperload_binary_sha256": "d29f58f30646c972b36dce3862b151f6e6ffcec634ff695c6ce75d7ae8a3b8c8",
+      "ram_db_calls_avoided": 10,
+      "ram_lookup_hits": 10,
+      "raw_report_sha256": "0cadf405faabd3c83630f5354d4ee075fc03336db0f53dd64df6540a5d4c88de",
+      "receipts_verified": 4,
+      "samples_new": 2000,
+      "shaper_rate_limited": 24,
+      "source_dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+      "source_revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+      "status": "PASS",
+      "timeline_dispatch_count": null,
+      "timeline_e2e_count": null,
+      "viewer_count": 2,
+      "viewer_duplicates": 0,
+      "viewer_unique_events": 20,
+      "viewer_wrong_namespace": 0,
+      "warm_persistence_delta": {
+        "configuration": 0,
+        "ledger": 0,
+        "raw": 0,
+        "temporal": 0
+      },
+      "warm_phase_status": "COMPLETE",
+      "warm_replay": 10,
+      "warm_repository_counters": {
+        "begin_attempts": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "confirmed_commits": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_calls": {
+          "after": 16,
+          "before": 16,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        },
+        "copy_returned_rows": {
+          "after": 2000,
+          "before": 2000,
+          "delta": 0,
+          "reason": null,
+          "status": "AVAILABLE"
+        }
+      },
+      "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+    }
+  ],
+  "schema": "p8-e5-safe-summary-v1",
+  "source_recorded_by_runs": {
+    "context_sha256": null,
+    "context_sha256_provenance": "unavailable_not_in_raw_schema",
+    "context_sha256_status": "UNAVAILABLE",
+    "dirty_sha256": "b4bd87aec7600da3357b2f72ad0e5d05611449fb8f703f3fde5a4ea5f14fa223",
+    "journal_sha256": "b10e8d998e056342549392f4b733baf2dd50caba38b7e02620c512264223dbbe",
+    "revision": "52fd9456a9dbaa3316196eb92de40d14ba4ef32e",
+    "seed": 805,
+    "workload_sha256": "6a4da3560f24686cf66dc709d74a59cbb6458ef2222fcb8a2eb4584ff28aeaab"
+  },
+  "status": "PILOT_RUNS_COMPLETE_QUALIFIED"
+}

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -409,7 +410,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual({a['topic'] for a in roles['bootstrap_manager']},
                          {'$CONTROL/dynamic-security/v1', '$CONTROL/dynamic-security/v1/response'})
         self.assertEqual({a['topic'] for a in roles['bootstrap_backend']},
-                         {'gateways/+/telemetry/#', 'gateways/+/acks/#'})
+                         {'gateways/+/telemetry/#', 'gateways/+/acks/#',
+                          'gateways/+/commands/#', 'gateways/+/responses/#'})
+        self.assertEqual({(a['acltype'], a['topic'], a['allow'], a['priority'])
+                          for a in roles['bootstrap_backend']},
+                         {(k, f'gateways/+/{suffix}/#', True, 0)
+                          for suffix in ('telemetry', 'responses')
+                          for k in ('publishClientReceive', 'subscribeLiteral', 'unsubscribeLiteral')} |
+                         {('publishClientSend', f'gateways/+/{suffix}/#', True, 0)
+                          for suffix in ('acks', 'commands')})
         self.assertNotIn('admin', json.dumps(store))
         self.assertEqual(store['clients'][0]['password'], clients[0]['password'])
 
@@ -492,18 +501,59 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(self.m.BootstrapError):
             self.m.guard_directory(self.root / '..' / 'store.json', os.getuid(), os.getgid())
 
-    def test_bootstrap_orchestration_and_wrong_version(self):
+    def test_bootstrap_orchestration(self):
         cfg = dict(self.config, mapping='rootless', broker_uid=os.getuid(), broker_gid=os.getgid(),
                    uid_map=[[1883, os.getuid(), 1]], gid_map=[[1883, os.getgid(), 1]])
-        # Trusted installed binary path; version/build mocked in this unit lane.
-        with mock.patch.object(self.m.subprocess, 'run', return_value=mock.Mock(stdout=b'wrong')):
-            with self.assertRaises(self.m.BootstrapError):
+        with mock.patch.object(self.m, 'verify_native_tool', return_value='/trusted/tool') as verify:
+            with mock.patch.object(self.m, 'build_store', return_value=b'{}') as build:
                 self.m.bootstrap(cfg, '/usr/bin/true')
-        with mock.patch.object(self.m.subprocess, 'run', return_value=mock.Mock(
-                stdout=b'mosquitto_ctrl version 2.0.18 running on libmosquitto 2.0.18.')):
-            with mock.patch.object(self.m, 'build_store', return_value=b'{}'):
-                self.m.bootstrap(cfg, '/usr/bin/true')
+        verify.assert_called_once_with('/usr/bin/true')
+        build.assert_called_once_with(cfg, '/trusted/tool')
         self.assertEqual(self.store.read_bytes(), b'{}')
+
+    def test_verify_native_tool_security_and_version(self):
+        regular = mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        directory = mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        tool = '/trusted/tool'
+        with (mock.patch.object(Path, 'stat', return_value=regular),
+              mock.patch.object(Path, 'lstat', return_value=directory),
+              mock.patch.object(Path, 'is_symlink', return_value=False),
+              mock.patch.object(self.m.subprocess, 'run') as run):
+            run.return_value.stdout = self.m.EXPECTED_VERSION_BANNER
+            self.assertEqual(self.m.verify_native_tool(tool), tool)
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], [tool, '--help'])
+            run.reset_mock()
+            run.return_value.stdout = b'wrong'
+            with self.assertRaisesRegex(self.m.BootstrapError, '2.0.18 required'):
+                self.m.verify_native_tool(tool)
+            run.assert_called_once()
+            run.reset_mock()
+            for mode, uid in ((stat.S_IFREG | 0o775, 0), (stat.S_IFREG | 0o755, 1000),
+                              (stat.S_IFDIR | 0o755, 0)):
+                with self.subTest(mode=mode, uid=uid), mock.patch.object(
+                        Path, 'stat', return_value=mock.Mock(st_mode=mode, st_uid=uid)):
+                    with self.assertRaisesRegex(self.m.BootstrapError, 'trusted root-owned'):
+                        self.m.verify_native_tool(tool)
+            with mock.patch.object(Path, 'is_symlink', return_value=True):
+                with self.assertRaisesRegex(self.m.BootstrapError, 'trusted root-owned'):
+                    self.m.verify_native_tool(tool)
+            with mock.patch.object(Path, 'lstat', return_value=mock.Mock(st_mode=0o777, st_uid=0)):
+                with self.assertRaisesRegex(self.m.BootstrapError, 'unsafe native executable ancestor'):
+                    self.m.verify_native_tool(tool)
+            with mock.patch.object(Path, 'lstat', return_value=mock.Mock(st_mode=0o755, st_uid=1000)):
+                with self.assertRaisesRegex(self.m.BootstrapError, 'unsafe native executable ancestor'):
+                    self.m.verify_native_tool(tool)
+            with self.assertRaisesRegex(self.m.BootstrapError, 'trusted root-owned'):
+                self.m.verify_native_tool('relative/tool')
+            run.assert_not_called()
+
+    def test_bootstrap_orchestration_does_not_depend_on_host_tool_metadata(self):
+        original = Path.is_symlink
+        def host_symlink(path):
+            return True if str(path) == '/usr/bin/true' else original(path)
+        with mock.patch.object(Path, 'is_symlink', host_symlink):
+            self.test_bootstrap_orchestration()
 
     def test_container_mode_config_validation(self):
         # Valid config

@@ -284,6 +284,105 @@ func TestACKProcessorDeletesOnlyExactPending(t *testing.T) {
 	}
 }
 
+func TestACKIgnoreBudgetPreservesExactRowThenDeletes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	o := openTestOutbox(t, testOutboxConfig(path))
+	item := enqueueTestBatch(t, o, outboxBootID, uuid.New(), outboxBaseTime)
+	p, err := NewACKProcessor(o, 4, WithACKIgnoreValidBudget(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	topic, payload := validACK(t, item.MessageID, outboxBaseTime)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: topic, payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	kept, found, err := o.Lookup(context.Background(), item.MessageID)
+	if err != nil || !found || string(kept.Payload) != string(item.Payload) || kept.FirstSequence != item.FirstSequence || kept.Status != outboxStatusPending {
+		t.Fatalf("ignored row changed: found=%v err=%v item=%+v", found, err, kept)
+	}
+	if stats := p.Stats(); stats.IgnoredValidACKs != 1 || stats.Acknowledged != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if len(p.Notify()) != 0 {
+		t.Fatal("ignored ACK notified scheduler")
+	}
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: topic, payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := o.Lookup(context.Background(), item.MessageID); err != nil || found {
+		t.Fatalf("row after exhausted budget found=%v err=%v", found, err)
+	}
+	if stats := p.Stats(); stats.IgnoredValidACKs != 1 || stats.Acknowledged != 1 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestACKIgnoreDoesNotConsumeOnInvalidOrNonPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	o := openTestOutbox(t, testOutboxConfig(path))
+	item := enqueueTestBatch(t, o, outboxBootID, uuid.New(), outboxBaseTime)
+	q := enqueueTestBatch(t, o, outboxBootID, uuid.New(), outboxBaseTime.Add(time.Second))
+	if ok, err := o.Quarantine(context.Background(), q.MessageID, "test"); err != nil || !ok {
+		t.Fatalf("quarantine=%v/%v", ok, err)
+	}
+	p, err := NewACKProcessor(o, 4, WithACKIgnoreValidBudget(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedTopic, retainedPayload := validACK(t, item.MessageID, outboxBaseTime)
+	p.Admit(retainedTopic, retainedPayload, true)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: ackTestTopic(item.MessageID), payload: []byte(`{"protocol_version":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	qt, qp := validACK(t, q.MessageID, outboxBaseTime)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: qt, payload: qp}); err != nil {
+		t.Fatal(err)
+	}
+	unknownTopic, unknownPayload := validACK(t, uuid.New(), outboxBaseTime)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: unknownTopic, payload: unknownPayload}); err != nil {
+		t.Fatal(err)
+	}
+	validTopic, validPayload := validACK(t, item.MessageID, outboxBaseTime)
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: validTopic, payload: validPayload}); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Stats(); got.IgnoredValidACKs != 1 || got.Acknowledged != 0 {
+		t.Fatalf("stats=%+v", got)
+	}
+	if got := p.Stats().DroppedRetained; got != 1 {
+		t.Fatalf("retained drops=%d", got)
+	}
+}
+
+func TestACKProcessorReopenAcceptsPreviouslyIgnoredACK(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	cfg := testOutboxConfig(path)
+	o := openTestOutbox(t, cfg)
+	item := enqueueTestBatch(t, o, outboxBootID, uuid.New(), outboxBaseTime)
+	topic, payload := validACK(t, item.MessageID, outboxBaseTime)
+	p, err := NewACKProcessor(o, 4, WithACKIgnoreValidBudget(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.handleAdmission(context.Background(), ackAdmission{topic: topic, payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	o2 := openTestOutbox(t, cfg)
+	p2 := newACKTestProcessor(t, o2, 4)
+	if err := p2.handleAdmission(context.Background(), ackAdmission{topic: topic, payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := o2.Lookup(context.Background(), item.MessageID); err != nil || found {
+		t.Fatalf("reopened row found=%v err=%v", found, err)
+	}
+	if got := p2.Stats().Acknowledged; got != 1 {
+		t.Fatalf("acknowledged=%d", got)
+	}
+}
+
 func TestACKProcessorAcceptsEarlyLateAndPriorBoot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.db")
 	o := openTestOutbox(t, testOutboxConfig(path))

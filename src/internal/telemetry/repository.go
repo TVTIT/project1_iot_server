@@ -19,6 +19,14 @@ type Repository interface {
 	Persist(context.Context, *Message) (PersistResult, error)
 }
 
+// BatchRepository persists validated messages as one bounded group. Each input
+// receives its own result, in input order, so callers can associate confirmed
+// outcomes with the original delivery. Implementations must not report a
+// committed outcome unless the transaction commit is confirmed.
+type BatchRepository interface {
+	PersistBatch(context.Context, []*Message) []BatchPersistResult
+}
+
 // TxBeginner is the small pgx pool boundary used by a repository. pgxpool.Pool
 // implements it directly, while tests can provide a fake transaction source.
 type TxBeginner interface {
@@ -40,5 +48,17 @@ type MessageIdentity struct {
 type PersistResult struct {
 	Identity     MessageIdentity
 	Outcome      CommitOutcome
+	SamplesSaved int
+}
+
+// BatchPersistResult describes the persistence outcome for one input delivery.
+// InputIndex refers to the original slice passed to PersistBatch. Err is
+// non-nil when this input has no confirmed successful outcome; a zero Outcome
+// is deliberately unconfirmed.
+type BatchPersistResult struct {
+	InputIndex   int
+	Identity     MessageIdentity
+	Outcome      CommitOutcome
+	Err          error
 	SamplesSaved int
 }

@@ -846,27 +846,27 @@ func TestStage4Router_FutureRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("future desired-state returns 404 and does not match detail", func(t *testing.T) {
+	t.Run("disabled desired-state fails closed and does not match detail", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPatch, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01/desired-state", strings.NewReader(`{}`))
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 
 		router.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("expected 404 Not Found, got %d", rec.Code)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
 		}
 	})
 
-	t.Run("future commands returns 404", func(t *testing.T) {
+	t.Run("commands does not permit client POST", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/digital-twins/urn:ngsi-ld:Gateway:gw-01/commands", strings.NewReader(`{}`))
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 
 		router.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("expected 404 Not Found, got %d", rec.Code)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
 		}
 	})
 

@@ -1,0 +1,14 @@
+# P0 only; applied after the generated native-smoke isolation override.
+services:
+  backend:
+    cpus: 2
+    mem_limit: 4294967296
+  supabase-envoy:
+    depends_on: !override
+      supabase-auth:
+        condition: service_healthy
+      supabase-storage:
+        condition: service_healthy
+volumes:
+  storage_data:
+    labels: {io.iot.native-smoke.run: "${NCS_RUN:?required}", io.iot.native-smoke.role: storage_data}

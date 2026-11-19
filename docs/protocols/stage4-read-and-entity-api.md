@@ -25,6 +25,10 @@
 
 **Phạm vi:** Đặc tả contract kỹ thuật cho 5 endpoints Digital Twin chuẩn hóa theo ETSI GS CIM 009 V1.9.1 project profile, cùng bảng ánh xạ chuyển đổi từ 7 endpoint cũ.
 
+Stage 5 bổ sung ba route điều khiển dưới đường dẫn Sensor mà không thay đổi năm
+route Stage 4 canonical. Xem [Stage 5 Sensor Control API](stage5-sensor-control-api.md)
+để biết phân quyền, PATCH desired-state, polling command và semantics result hiện hành.
+
 Các đường dẫn source trong dấu backtick tính từ gốc `main_src/`. Liên kết Markdown
 tính từ vị trí tài liệu này.
 
@@ -331,7 +335,7 @@ Nguồn: migration 1; provenance/PK mới ở migration 20.
   WHERE message_id IS NOT NULL`.
 - Index range `idx_telemetry_gateway_sensor_time (gateway_id, sensor_id, measured_at DESC)`
   (migration 1).
-- FK `fk_telemetry_sensor (gateway_id, sensor_id) → sensors ON DELETE RESTRICT` (migration 8).
+- FK `fk_telemetry_sensor (gateway_id, sensor_id) → sensors ON DELETE RESTRICT` (migration 8, được gỡ bỏ tại migration 25 để triệt tiêu per-row trigger overhead khi COPY và chuyển thành trigger đảo chiều `trg_sensors_restrict_telemetry` trên bảng `sensors`).
 - Hypertable `measured_at`, chunk 1 ngày; compression 7 ngày segment `gateway_id, sensor_id`,
   order `measured_at DESC, sequence_num DESC`. Retention TẮT.
 

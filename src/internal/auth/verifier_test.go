@@ -22,7 +22,8 @@ const (
 func TestHS256VerifierAcceptsValidHumanToken(t *testing.T) {
 	userID := uuid.New()
 	verifier := newTestVerifier(t, 30*time.Second)
-	token := signToken(t, jwt.SigningMethodHS256, []byte(testSecret), validClaims(userID))
+	claims := validClaims(userID)
+	token := signToken(t, jwt.SigningMethodHS256, []byte(testSecret), claims)
 
 	principal, err := verifier.Verify(context.Background(), token)
 	if err != nil {
@@ -33,6 +34,10 @@ func TestHS256VerifierAcceptsValidHumanToken(t *testing.T) {
 	}
 	if principal.Role != "authenticated" {
 		t.Errorf("Role = %q, want authenticated", principal.Role)
+	}
+	wantExpiry := claims.ExpiresAt.Time
+	if !principal.ExpiresAt.Equal(wantExpiry) {
+		t.Errorf("ExpiresAt = %s, want verified exp %s", principal.ExpiresAt, wantExpiry)
 	}
 }
 
