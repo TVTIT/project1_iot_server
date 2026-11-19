@@ -95,8 +95,13 @@ def verify_hardening_parent_scope(fixture):
 
 def native(fixture, binary):
     docker_cp(fixture, binary, '/tmp/control.test')
+    docker_cp(fixture, ROOT / 'scripts/sql/stage6-command-retention.sql',
+              '/tmp/stage6-command-retention.sql')
+    docker_cp(fixture, ROOT / 'scripts/sql/stage6-command-retention-candidates.sql',
+              '/tmp/stage6-command-retention-candidates.sql')
     output = docker_exec(fixture, ['sh', '-c',
         'export CONTROL_TEST_ISOLATED=1 '
+        'RETENTION_PSQL_PATH=/tmp/stage6-command-retention.sql PGPASSWORD="$POSTGRES_PASSWORD" '
         'CONTROL_TEST_SETUP_URL="postgres://fixture_admin:${POSTGRES_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable" '
         'CONTROL_TEST_BACKEND_URL="postgres://iot_backend_app:${BACKEND_DB_PASSWORD}@127.0.0.1:5432/fixture_service?sslmode=disable"; '
         'exec /tmp/control.test -test.v -test.timeout 120s -test.coverprofile=/tmp/control.cover -test.run "^TestNativeControl"'], timeout=150)

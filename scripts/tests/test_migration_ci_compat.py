@@ -1,7 +1,9 @@
 """Focused fixture security and compatibility contracts (no Docker)."""
 import importlib.util
+import os
 from pathlib import Path
 import re
+import tempfile
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -79,6 +81,45 @@ class CompatFixture(unittest.TestCase):
             with self.assertRaises(self.m.Failure):
                 self.f.cleanup()
 
+    def test_cleanup_removes_staged_directory_without_container(self):
+        with tempfile.TemporaryDirectory() as parent:
+            staged = Path(parent) / 'init'
+            staged.mkdir()
+            self.f.id = None
+            self.f.init_dir = staged
+            self.f.init_root = staged.parent
+            info = staged.stat()
+            self.f.init_identity = (info.st_dev, info.st_ino, info.st_uid)
+            with patch.object(self.m.shutil, 'rmtree') as remove:
+                self.f.cleanup()
+            remove.assert_called_once_with(staged)
+
+    def test_cleanup_removal_error_vetoes_success(self):
+        with tempfile.TemporaryDirectory() as parent:
+            staged = Path(parent) / 'init'
+            staged.mkdir()
+            self.f.id = None
+            self.f.init_dir = staged
+            self.f.init_root = staged.parent
+            info = staged.stat()
+            self.f.init_identity = (info.st_dev, info.st_ino, info.st_uid)
+            with patch.object(self.m.shutil, 'rmtree', side_effect=OSError('denied')):
+                with self.assertRaises(self.m.Failure):
+                    self.f.cleanup()
+
+    def test_cleanup_refuses_staged_directory_with_changed_identity(self):
+        with tempfile.TemporaryDirectory() as parent:
+            staged = Path(parent) / 'init'
+            staged.mkdir()
+            self.f.id = None
+            self.f.init_dir = staged
+            self.f.init_root = staged.parent
+            self.f.init_identity = (0, 0, os.getuid())
+            with patch.object(self.m.shutil, 'rmtree') as remove:
+                with self.assertRaises(self.m.Failure):
+                    self.f.cleanup()
+            remove.assert_not_called()
+
     def test_role_login_failure_is_fatal(self):
         with patch.object(self.f, 'sql', side_effect=self.m.Failure('login')):
             with self.assertRaises(self.m.Failure):
@@ -96,6 +137,8 @@ class CompatFixture(unittest.TestCase):
         seen_migration24 = False
         def sql_stub(query, **kwargs):
             nonlocal seen_migration24
+            if 'SELECT jsonb_build_object(' in query:
+                return 'fixture oracle'
             if query == migration24 and not seen_migration24:
                 seen_migration24 = True
                 raise self.m.Failure('ERROR: Migration 24 conflicting telemetry provenance')
@@ -138,12 +181,11 @@ class CompatFixture(unittest.TestCase):
         self.assertEqual(inputs.count(migration23), 2)
         self.assertIn((ROOT / 'scripts/sql/verify-migration-000023.sql').read_text(), inputs)
         self.assertIn("DELETE FROM public.user_gateways WHERE false;", inputs)
-        terminal = max(int(path.name[:6]) for path in (ROOT / 'migrations').glob('*.up.sql'))
         for version in (21, 22, 23):
             verifier = next((ROOT / 'scripts/sql').glob(f'verify-migration-{version:06d}.sql')).read_text()
             calls = [call for call in sql.call_args_list if call.args[0] == verifier]
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0].kwargs.get('expected_schema_terminal'), terminal)
+            self.assertEqual(calls[0].kwargs.get('expected_schema_terminal'), version)
 
     def test_sql_passes_explicit_terminal_to_psql(self):
         with patch.object(self.f, 'command', return_value='verified') as command:
@@ -180,11 +222,49 @@ class CompatFixture(unittest.TestCase):
         source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
         compose = (ROOT / 'docker-compose.yml').read_text()
         self.assertIn("migration27 = (ROOT / 'migrations/000027_stage6_control_resilience.up.sql').read_text()", source)
-        self.assertIn("self.sql(migration27)", source)
+        self.assertIn("self.sql(migration27)\n        self.expect(\"SELECT count(*) FROM schema_migrations WHERE version=27 AND name='stage6_control_resilience';\", '1')", source)
+        self.assertIn("Migration 27 FIRST data-bearing application preserved Stage 5 oracle byte-for-byte.", source)
+        self.assertIn("Migration 27 separate idempotent reapply preserved the same oracle.", source)
+        self.assertIn("int(match.group(1)) <= 20", source)
+        self.assertIn("WHERE version=27;", source)
+        self.assertIn("twin_command_requests WHERE status_code=202", source)
+        self.assertIn("'state_completed', (SELECT jsonb_build_object", source)
         self.assertIn("stage6_control_resilience", source)
         self.assertIn("000027_stage6_control_resilience.up.sql", compose)
         self.assertLess(compose.index('000026_drop_telemetry_redundant_indexes.up.sql'),
                         compose.index('000027_stage6_control_resilience.up.sql'))
+
+    def test_native_fixture_requires_stage6_retention_entrypoint(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        self.assertIn('fixture.verify_retention()', source)
+        entrypoint = (ROOT / 'scripts/sql/stage6-command-retention.sql').read_text()
+        candidates = (ROOT / 'scripts/sql/stage6-command-retention-candidates.sql').read_text()
+        self.assertIn("'-f', '/tmp/stage6-command-retention.sql'", source)
+        self.assertIn(r'\ir stage6-command-retention-candidates.sql', entrypoint)
+        self.assertIn("interval '720 hours'", candidates)
+        self.assertIn('pg_temp.stage6_retention_json', candidates)
+        self.assertIn('json_each', candidates)
+        self.assertIn("nested_entry.key = 'sample_interval_us'", candidates)
+        self.assertIn("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;", entrypoint)
+        self.assertIn("ROLLBACK;", entrypoint)
+        self.assertIn("to_regprocedure('pg_temp.stage6_retention_json(bytea)') IS NULL", entrypoint)
+        self.assertNotIn("REPEATABLE READ READ ONLY", entrypoint)
+        self.assertIn("((c.parameters->>'sample_interval_us')::numeric - 0.5)", candidates)
+        self.assertIn("1000000 < ((c.parameters->>'sample_interval_us')::numeric + 0.5)", candidates)
+        self.assertIn("raw_frequency.requested_hz > 0", candidates)
+        self.assertIn("c.retry_stop_reason = 'acknowledged'", candidates)
+        self.assertIn("c.retry_stop_reason = 'retry_exhausted'", candidates)
+        self.assertIn("NOT r.reconcile_blocked", candidates)
+        self.assertIn("current_root.reconcile_blocked", candidates)
+        self.assertIn("COALESCE(r.result_received_at, r.completed_at)", candidates)
+
+    def test_fixture_scratch_root_is_existing_user_owned_ci_or_persistent_path(self):
+        source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
+        self.assertIn("Path('/var/tmp/opencode'), Path('/tmp/opencode')", source)
+        self.assertIn('metadata.st_uid != os.getuid()', source)
+        self.assertIn('candidate.is_symlink()', source)
+        self.assertIn("dir=self.init_root", source)
+        self.assertNotIn("dir='/var/tmp/opencode'", source)
 
 
     def test_stage3_writer_fixtures_apply_post_auth_schema24_before_writer(self):
