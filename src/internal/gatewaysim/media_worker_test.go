@@ -223,6 +223,103 @@ func TestMediaWorkerAmbiguousPUTReopensAsReconcileWithoutRepeatingBytes(t *testi
 	}
 }
 
+func TestMediaWorkerLostPUTResponseAfterStorageWriteReconcilesWithoutReplay(t *testing.T) {
+	const mediaID = "11111111-1111-4111-8111-111111111111"
+	data := []byte("fixture media")
+	var stored []byte
+	puts := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		puts++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read PUT body: %v", err)
+			return
+		}
+		stored = append([]byte(nil), body...)
+
+		// Simulate Storage committing the object before its response is lost.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack response after object write: %v", err)
+			return
+		}
+		if err := conn.Close(); err != nil {
+			t.Errorf("close hijacked connection: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	cfg := mediaSpoolConfig(t)
+	cfg.IntentTTL = time.Hour
+	spool, err := OpenMediaSpool(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
+	source := filepath.Join(t.TempDir(), "source.mp4")
+	if err := os.WriteFile(source, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := spool.IngestFinalized(context.Background(), "lost_put_response_1", source, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &mediaRecorder{}
+	worker, err := NewMediaWorker(MediaWorkerOptions{
+		GatewayID: "gateway_001", UploadOrigin: server.URL, Spool: spool,
+		Publisher: publisher, Capacity: 2, RetryMin: time.Millisecond, RetryMax: time.Second,
+		PutTimeout: time.Second, httpClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.RecordAttempt(context.Background(), record.UploadID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	grant := mediaprotocol.UploadGrant{
+		Version: 1, GatewayID: "gateway_001", UploadID: record.UploadID,
+		Status: mediaprotocol.GrantNeedUpload, MediaID: mediaID,
+		UploadURL: server.URL + "/storage/v1/object/upload/sign/media-video/" + mediaID + ".mp4?token=t",
+		ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}
+	payload, err := mediaprotocol.Encode(mediaprotocol.UploadGrantTopic("gateway_001"), grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.handle(context.Background(), mediaDelivery{topic: mediaprotocol.UploadGrantTopic("gateway_001"), payload: payload})
+
+	state, err := spool.Get(context.Background(), record.UploadID)
+	if err != nil || state.Phase != "awaiting_result" || state.MediaID != mediaID {
+		t.Fatalf("ambiguous PUT state=%+v err=%v", state, err)
+	}
+	messages := publisher.snapshot()
+	if puts != 1 || !bytes.Equal(stored, data) || len(messages) != 1 {
+		t.Fatalf("stored=%q PUTs=%d published=%#v", stored, puts, messages)
+	}
+	if _, ok := messages[0].(mediaprotocol.UploadComplete); !ok {
+		t.Fatalf("expected completion reconciliation, got %#v", messages[0])
+	}
+
+	ready, err := mediaprotocol.Encode(mediaprotocol.UploadResultTopic("gateway_001"), mediaprotocol.UploadResult{
+		Version: 1, GatewayID: "gateway_001", UploadID: record.UploadID,
+		MediaID: mediaID, Status: mediaprotocol.ResultReady,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.handle(context.Background(), mediaDelivery{topic: mediaprotocol.UploadResultTopic("gateway_001"), payload: ready})
+	if _, err := os.Stat(record.Path); !os.IsNotExist(err) {
+		t.Fatalf("spool file should be removed only after matching ready; stat err=%v", err)
+	}
+	if puts != 1 {
+		t.Fatalf("ambiguous PUT was replayed: puts=%d", puts)
+	}
+}
+
 func TestMediaWorkerSuccessfulPUTReopensBeforeCompletionWithoutRepeatingBytes(t *testing.T) {
 	const mediaID = "11111111-1111-4111-8111-111111111111"
 	data := []byte("fixture media")

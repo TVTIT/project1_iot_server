@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1427,9 +1428,162 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
     return process
 
 
+def run_cleanup_worker_e2e(fixture, prefix, registry, material, report):
+    """Exercise the production cleanup worker against a real Storage object."""
+    storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
+    upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload", 443)
+    ready_rows = smoke.db_psql(
+        registry, material["postgres_id"],
+        """SELECT json_build_array(media_id::text,storage_path,verified_sha256,
+           validation_status)::text FROM public.media_objects
+           WHERE managed AND gateway_id='""" + material["gateway_id"] + """'
+             AND validation_status='ready' ORDER BY media_id;""",
+    ).splitlines()
+    try:
+        ready_records = [json.loads(row) for row in ready_rows if row]
+    except json.JSONDecodeError:
+        raise ProofFailure("cleanup_ready_control_row_invalid") from None
+    require(len(ready_records) == 1 and ready_records[0][3] == "ready",
+            "cleanup_ready_control_missing")
+    ready_media_id, ready_path, ready_sha, _ = ready_records[0]
+    require(re.fullmatch(r"[0-9a-f-]{36}\.mp4", ready_path) is not None
+            and re.fullmatch(r"[0-9a-f]{64}", ready_sha) is not None,
+            "cleanup_ready_control_metadata_invalid")
+
+    cleanup_media_id = str(uuid.uuid4())
+    cleanup_path = cleanup_media_id + ".mp4"
+    cleanup_upload_id = "cleanup_probe_" + secrets.token_hex(8)
+    payload = VIDEO_BYTES
+    payload_sha = hashlib.sha256(payload).hexdigest()
+    endpoint = smoke.HTTPSEndpoint(
+        f"https://127.0.0.1:{upload_port}", fixture.private / "p2-ca.crt",
+    )
+    grant = make_grant(fixture, storage_port, upload_port, cleanup_path)
+    target, _, _ = grant_target(grant, upload_port, cleanup_path)
+    put_status, _, _ = https_request(endpoint, "PUT", target, payload, {
+        "Content-Type": "video/mp4",
+    })
+    require(put_status in (200, 201), "cleanup_probe_signed_put_failed")
+    initial_status, _, initial_size, initial_sha = storage_readback(
+        storage_port, fixture.values["SERVICE_ROLE_KEY"], cleanup_path,
+    )
+    require(initial_status == 200 and initial_size == len(payload)
+            and initial_sha == payload_sha, "cleanup_probe_object_readback_failed")
+
+    # Seed only the terminal row and due timestamps. The production worker must
+    # perform both Storage deletes, the follow-up wait, and DB confirmation.
+    smoke.db_psql(
+        registry, material["postgres_id"],
+        f"""
+        INSERT INTO public.media_objects
+          (media_id,gateway_id,storage_path,media_type,expected_size,validation_status,
+           created_at,managed,upload_id,captured_at,intent_expires_at,declared_sha256,
+           latest_upload_grant_expires_at,terminal_reason,cleanup_scheduled_at,next_cleanup_at)
+        VALUES ('{cleanup_media_id}','{material["gateway_id"]}','{cleanup_path}',
+           'video/mp4',{len(payload)},'expired',now()-interval '30 seconds',true,
+           '{cleanup_upload_id}',now()-interval '20 seconds',now()-interval '5 seconds',
+           '{payload_sha}',now()-interval '4 seconds','intent_expired',
+           now()-interval '3 seconds',now()-interval '2 seconds');
+        """,
+    )
+
+    def cleanup_snapshot():
+        raw = smoke.db_psql(
+            registry, material["postgres_id"],
+            f"""SELECT json_build_array(validation_status,terminal_reason,
+                cleanup_attempts,cleanup_first_deleted_at IS NOT NULL,
+                cleanup_confirmed_at IS NOT NULL,COALESCE(last_cleanup_error,''))
+                FROM public.media_objects WHERE media_id='{cleanup_media_id}';""",
+        ).strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise ProofFailure("cleanup_probe_db_snapshot_invalid") from None
+
+    def unsettled_for_gateway():
+        raw = smoke.db_psql(
+            registry, material["postgres_id"],
+            f"""SELECT count(*) FROM public.media_objects WHERE managed
+                AND gateway_id='{material["gateway_id"]}'
+                AND (validation_status IN ('pending','verifying') OR
+                  (validation_status IN ('rejected','expired')
+                   AND cleanup_confirmed_at IS NULL));""",
+        ).strip()
+        require(raw.isdigit(), "cleanup_probe_quota_count_invalid")
+        return int(raw)
+
+    deadline = time.monotonic() + 35
+    first_absence = None
+    while time.monotonic() < deadline:
+        snapshot = cleanup_snapshot()
+        if snapshot[3] and not snapshot[4]:
+            missing = storage_readback(
+                storage_port, fixture.values["SERVICE_ROLE_KEY"], cleanup_path,
+            )
+            if missing[0] in (400, 404):
+                first_absence = snapshot
+                break
+        time.sleep(0.1)
+    require(first_absence is not None,
+            "cleanup_probe_first_delete_or_followup_not_observed")
+    require(first_absence[0] == "expired" and first_absence[1] == "intent_expired"
+            and first_absence[2] == 1 and first_absence[5] == "FOLLOWUP_WINDOW",
+            "cleanup_probe_first_delete_state_invalid")
+    quota_before_confirm = unsettled_for_gateway()
+    require(quota_before_confirm == 1,
+            "cleanup_probe_quota_released_before_confirmation")
+    ready_before, _, ready_before_size, ready_before_sha = storage_readback(
+        storage_port, fixture.values["SERVICE_ROLE_KEY"], ready_path,
+    )
+    require(ready_before == 200 and ready_before_size > 0 and ready_before_sha == ready_sha,
+            "cleanup_probe_ready_object_changed_before_confirmation")
+
+    while time.monotonic() < deadline:
+        snapshot = cleanup_snapshot()
+        if snapshot[4]:
+            break
+        time.sleep(0.1)
+    else:
+        raise ProofFailure("cleanup_probe_confirmation_timeout")
+    require(snapshot[0] == "expired" and snapshot[1] == "intent_expired"
+            and snapshot[2] >= 2 and snapshot[3] and snapshot[4] and snapshot[5] == "",
+            "cleanup_probe_confirmed_state_invalid")
+    final_missing = storage_readback(
+        storage_port, fixture.values["SERVICE_ROLE_KEY"], cleanup_path,
+    )
+    require(final_missing[0] in (400, 404), "cleanup_probe_object_still_present")
+    quota_after_confirm = unsettled_for_gateway()
+    require(quota_after_confirm == 0,
+            "cleanup_probe_quota_not_released_after_confirmation")
+    ready_after, _, ready_after_size, ready_after_sha = storage_readback(
+        storage_port, fixture.values["SERVICE_ROLE_KEY"], ready_path,
+    )
+    require(ready_after == 200 and ready_after_size == ready_before_size
+            and ready_after_sha == ready_sha,
+            "cleanup_probe_ready_object_deleted_or_changed")
+    ready_status = smoke.db_psql(
+        registry, material["postgres_id"],
+        f"SELECT validation_status FROM public.media_objects WHERE media_id='{ready_media_id}';",
+    ).strip()
+    require(ready_status == "ready", "cleanup_probe_ready_row_changed")
+    report["checks"]["native_cleanup_worker_storage_postgres"] = {
+        "status": "PASS",
+        "seeded_terminal_state": "expired",
+        "real_storage_put_and_initial_readback": "PASS",
+        "first_delete_absence_observed": True,
+        "first_delete_attempts": first_absence[2],
+        "quota_unsettled_before_confirmation": quota_before_confirm,
+        "followup_delete_attempts": snapshot[2],
+        "cleanup_confirmed": True,
+        "object_absent_after_followup": True,
+        "quota_unsettled_after_confirmation": quota_after_confirm,
+        "ready_control_row_and_object_preserved": True,
+    }
+
+
 def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 stage8_local_e2e=False, stage8_local_e2e_cap=False,
-                stage8_local_restart=False):
+                stage8_local_restart=False, stage8_local_cleanup=False):
     scratch_root = Path("/var/tmp/opencode")
     scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="stage8-media-http-", dir=scratch_root))
@@ -1450,13 +1604,20 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             "MEDIA_UPLOAD_GRANT_TTL_SECONDS": "30",
         })
         prepare_mode = (prepare_stage8_e2e or stage8_local_e2e or stage8_local_e2e_cap
-                        or stage8_local_restart)
+                        or stage8_local_restart or stage8_local_cleanup)
         if prepare_mode:
             fixture.values.update(
                 MEDIA_UPLOAD_ENABLED="true",
                 MEDIA_UPLOAD_MQTT_CLIENT_ID="backend_media_" + secrets.token_hex(5),
                 STORAGE_INTERNAL_URL="http://supabase-storage:5000",
                 MEDIA_UPLOAD_PUBLIC_ORIGIN="",
+            )
+        if stage8_local_cleanup:
+            fixture.values.update(
+                MEDIA_UPLOAD_CLEANUP_SCAN_INTERVAL="250ms",
+                MEDIA_UPLOAD_CLEANUP_RETRY_MIN_DELAY="1s",
+                MEDIA_UPLOAD_CLEANUP_RETRY_MAX_DELAY="1s",
+                MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS="3",
             )
         fixture.env_file.write_text(
             "".join(f"{name}={value}\n" for name, value in sorted(fixture.values.items())),
@@ -1568,7 +1729,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                     pass
                 time.sleep(1)
             require(ready, "stage8_backend_readiness_timeout")
-            if stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart:
+            if (stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart
+                    or stage8_local_cleanup):
                 report["phase"] = "backend_media_readiness_precondition"
                 backend_media_precondition(fixture, prefix, report)
             storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
@@ -1584,6 +1746,7 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             report["checks"]["media_backend_and_private_bucket"] = {"status": "PASS"}
             sensor_id = ("sensor_stage8_" + secrets.token_hex(4)
                          if stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart
+                         or stage8_local_cleanup
                          else None)
             material = provision_gateway_credential(
                 fixture, prefix, registry, report, sensor_id=sensor_id,
@@ -1591,7 +1754,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             report["checks"]["credential_in_memory_only"] = {
                 "status": "PASS", "password_persisted": False,
             }
-            if stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart:
+            if (stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart
+                    or stage8_local_cleanup):
                 secrets_to_scan = [
                     value for key, value in fixture.values.items()
                     if isinstance(value, str) and value and any(
@@ -1607,6 +1771,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                     exact_cap=stage8_local_e2e_cap,
                     restart_recovery=stage8_local_restart,
                 )
+                if stage8_local_cleanup:
+                    run_cleanup_worker_e2e(fixture, prefix, registry, material, report)
                 material["password"] = ""
                 material["owner_password"] = ""
                 material["owner_token"] = ""
@@ -1744,10 +1910,11 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
 def main():
     args = sys.argv[1:]
     if args not in ([], ["--stage8-local-base"], ["--prepare-stage8-e2e"], ["--stage8-local-e2e"],
-                    ["--stage8-local-e2e-cap"], ["--stage8-local-restart"]):
+                    ["--stage8-local-e2e-cap"], ["--stage8-local-restart"],
+                    ["--stage8-local-cleanup"]):
         print("usage: stage8_media_storage_http_fixture.py "
               "[--stage8-local-base|--prepare-stage8-e2e|--stage8-local-e2e|"
-              "--stage8-local-e2e-cap|--stage8-local-restart]",
+              "--stage8-local-e2e-cap|--stage8-local-restart|--stage8-local-cleanup]",
               file=sys.stderr)
         return 2
     return run_fixture(
@@ -1756,6 +1923,7 @@ def main():
         stage8_local_e2e=args == ["--stage8-local-e2e"],
         stage8_local_e2e_cap=args == ["--stage8-local-e2e-cap"],
         stage8_local_restart=args == ["--stage8-local-restart"],
+        stage8_local_cleanup=args == ["--stage8-local-cleanup"],
     )
 
 

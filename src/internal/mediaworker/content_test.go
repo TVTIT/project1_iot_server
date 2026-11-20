@@ -84,6 +84,59 @@ func TestVerifyContentDetectsByteCapPlusOneDuringStreaming(t *testing.T) {
 	}
 }
 
+type maxReadSizeReader struct {
+	r       io.Reader
+	maxRead int
+}
+
+func (r *maxReadSizeReader) Read(p []byte) (int, error) {
+	if len(p) > r.maxRead {
+		r.maxRead = len(p)
+	}
+	return r.r.Read(p)
+}
+
+func TestVerifyContentReadsExactCapMP4WithoutWholeFileBuffer(t *testing.T) {
+	freeSize := MaxVerifiedBytes - int64(len(validH264MP4))
+	if freeSize < 8 {
+		t.Fatal("embedded MP4 unexpectedly exceeds exact-cap fixture size")
+	}
+	freeHeader := make([]byte, 8)
+	binary.BigEndian.PutUint32(freeHeader[:4], uint32(freeSize))
+	copy(freeHeader[4:], "free")
+	payloadSize := freeSize - int64(len(freeHeader))
+
+	hash := sha256.New()
+	if _, err := hash.Write(validH264MP4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hash.Write(freeHeader); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(hash, zeroReader{}, payloadSize); err != nil {
+		t.Fatal(err)
+	}
+
+	source := io.MultiReader(
+		bytes.NewReader(validH264MP4),
+		bytes.NewReader(freeHeader),
+		io.LimitReader(zeroReader{}, payloadSize),
+	)
+	tracked := &maxReadSizeReader{r: source}
+	evidence, err := VerifyContent(tracked, ContentMetadata{
+		DeclaredLength: MaxVerifiedBytes,
+		DeclaredSHA256: hex.EncodeToString(hash.Sum(nil)),
+		ServerMIME:     "video/mp4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.ActualSize != MaxVerifiedBytes || tracked.maxRead > maxMOOVBytes {
+		t.Fatalf("verified size=%d, largest reader buffer=%d; want exact cap with buffer <= %d",
+			evidence.ActualSize, tracked.maxRead, maxMOOVBytes)
+	}
+}
+
 func TestVerifyContentRejectsMetadataAboveByteCapBeforeReading(t *testing.T) {
 	reader := &countingReader{}
 	meta := ContentMetadata{
