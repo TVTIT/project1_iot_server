@@ -57,13 +57,13 @@ class Stage6SchemaTest(unittest.TestCase):
         self.assertIn("CREATE INDEX idx_twin_states_reconcile_due", sql)
         self.assertIn("CREATE INDEX idx_twin_commands_root", sql)
 
-    def test_schema_terminal_guards_match_migration_27(self):
+    def test_schema_terminal_guards_match_migration_28(self):
         compat_source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()
-        self.assertIn("TERMINAL_SCHEMA_VERSION = 27", compat_source)
+        self.assertIn("TERMINAL_SCHEMA_VERSION = 28", compat_source)
 
         runner_source = (ROOT / 'scripts/test-stage2-migrations.sh').read_text()
-        self.assertIn("expected_schema_terminal=27", runner_source)
-        self.assertIn("versions 20–27 fresh/upgrade schema verification passed", runner_source)
+        self.assertIn("expected_schema_terminal=28", runner_source)
+        self.assertIn("versions 20–28 fresh/upgrade schema verification passed", runner_source)
 
 
 if __name__ == '__main__':

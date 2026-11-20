@@ -22,9 +22,20 @@ SELECT current_database() = :'target_database'
    AND to_regclass('public.schema_migrations') IS NOT NULL
    AND to_regclass('public.twin_commands') IS NOT NULL
    AND to_regclass('public.twin_command_requests') IS NOT NULL
-   AND (SELECT count(*) = 1 FROM public.schema_migrations
-        WHERE version = 27 AND name = 'stage6_control_resilience')
-   AND (SELECT max(version) = 27 FROM public.schema_migrations)
+    AND (SELECT count(*) = 1 FROM public.schema_migrations
+         WHERE version = 27 AND name = 'stage6_control_resilience')
+    -- v28 is additive media metadata only. Preserve the exact v27 Stage 6
+    -- name guard while allowing only that known compatible successor; future
+    -- or misnamed terminal versions remain refused.
+    AND (SELECT max(version) IN (27, 28) FROM public.schema_migrations)
+    AND (
+        ((SELECT max(version) FROM public.schema_migrations) = 27
+         AND NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version = 28))
+        OR
+        ((SELECT max(version) FROM public.schema_migrations) = 28
+         AND (SELECT count(*) = 1 FROM public.schema_migrations
+              WHERE version = 28 AND name = 'stage8_media_metadata'))
+    )
    AND (SELECT count(*) = 4
         FROM pg_constraint
         WHERE contype = 'f' AND confrelid = 'public.twin_commands'::regclass)

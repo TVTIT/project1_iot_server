@@ -16,7 +16,7 @@ class HarnessSecurity(unittest.TestCase):
         terminal = max(int(path.name[:6]) for path in (ROOT / 'migrations').glob('*.up.sql'))
         source = (ROOT / 'scripts/test-stage2-migrations.sh').read_text()
         pins = [int(value) for value in re.findall(r'-v expected_schema_terminal=(\d+)', source)]
-        self.assertEqual(pins, [terminal] * 3)
+        self.assertEqual(pins, [terminal] * 4)
 
     def test_migration23_verifier_defaults_to_history_but_checks_requested_terminal(self):
         source = (ROOT / 'scripts/sql/verify-migration-000023.sql').read_text()
@@ -160,6 +160,18 @@ class CompatFixture(unittest.TestCase):
                 raise self.m.Failure('ERROR: update or delete on table "twin_commands" violates foreign key constraint "fk_twin_commands_root"')
             if "SET ROLE anon;" in query or "SET ROLE authenticated;" in query:
                 raise self.m.Failure('ERROR: permission denied for table twin_commands')
+            if any(media_id in query for media_id in (
+                '99999999-9999-9999-9999-999999999993',
+                '99999999-9999-9999-9999-999999999994',
+                '99999999-9999-9999-9999-999999999983',
+                '99999999-9999-9999-9999-999999999996',
+                '99999999-9999-9999-9999-999999999980',
+                '99999999-9999-9999-9999-999999999981',
+                '99999999-9999-9999-9999-999999999982',
+            )):
+                raise self.m.Failure('ERROR: check constraint "chk_media_objects_managed_metadata"')
+            if '99999999-9999-9999-9999-999999999998' in query:
+                raise self.m.Failure('ERROR: duplicate key value violates unique constraint "uq_media_objects_gateway_upload"')
             return ''
         with patch.object(self.f, 'sql', side_effect=sql_stub) as sql, \
              patch.object(self.f, 'expect') as expect, patch.object(self.f, 'login') as login:
@@ -257,6 +269,11 @@ class CompatFixture(unittest.TestCase):
         self.assertIn("NOT r.reconcile_blocked", candidates)
         self.assertIn("current_root.reconcile_blocked", candidates)
         self.assertIn("COALESCE(r.result_received_at, r.completed_at)", candidates)
+        # Keep the historical v27 contract exact while allowing the additive
+        # media-only v28 schema, and reject unknown future terminal versions.
+        self.assertIn("version = 27 AND name = 'stage6_control_resilience'", entrypoint)
+        self.assertIn("version = 28 AND name = 'stage8_media_metadata'", entrypoint)
+        self.assertIn("max(version) IN (27, 28)", entrypoint)
 
     def test_fixture_scratch_root_is_existing_user_owned_ci_or_persistent_path(self):
         source = (ROOT / 'scripts/tests/migration_ci_compat.py').read_text()

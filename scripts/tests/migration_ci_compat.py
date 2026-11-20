@@ -21,7 +21,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = 'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a'
 LABEL = 'stage2.migration-compat'
-TERMINAL_SCHEMA_VERSION = 27
+TERMINAL_SCHEMA_VERSION = 28
 
 
 class Failure(Exception):
@@ -584,6 +584,129 @@ class Fixture:
         self.expect("SELECT retry_stop_reason FROM twin_commands WHERE command_id = '00000000-0000-0000-0000-000000000004';", 'result_received')
         print('Migration 27 native control resilience schema, legacy preservation, constraints and triggers passed.', flush=True)
 
+        # Migration 28 starts from the exact terminal-27 state and preserves an
+        # existing media row byte-for-byte, including legacy unverified status.
+        self.sql("""INSERT INTO media_objects
+            (media_id, gateway_id, storage_path, media_type, expected_size, actual_size, checksum, validation_status, created_at)
+            VALUES ('88888888-8888-8888-8888-888888888888', 'migration-fixture',
+                    'legacy/photo.jpg', 'image/jpeg', 1234, 1200, 'legacy-checksum',
+                    'pending', '2025-01-02T03:04:05Z');""")
+        media_snapshot = self.sql("""SELECT jsonb_build_object(
+            'media_id', media_id, 'gateway_id', gateway_id, 'storage_path', storage_path,
+            'media_type', media_type, 'expected_size', expected_size, 'actual_size', actual_size,
+            'checksum', checksum, 'validation_status', validation_status, 'created_at', created_at)::text
+            FROM media_objects WHERE media_id='88888888-8888-8888-8888-888888888888';""")
+        migration28 = (ROOT / 'migrations/000028_stage8_media_metadata.up.sql').read_text()
+        self.sql(migration28)
+        self.sql((ROOT / 'scripts/sql/verify-migration-000028.sql').read_text(),
+                 expected_schema_terminal=28)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=28 AND name='stage8_media_metadata';", '1')
+        self.expect("SELECT concat_ws('|', managed::text, coalesce(upload_id::text, ''), coalesce(verified_sha256, ''), validation_status) FROM media_objects WHERE media_id='88888888-8888-8888-8888-888888888888';",
+                    'false|||pending')
+        if self.sql("""SELECT jsonb_build_object(
+            'media_id', media_id, 'gateway_id', gateway_id, 'storage_path', storage_path,
+            'media_type', media_type, 'expected_size', expected_size, 'actual_size', actual_size,
+            'checksum', checksum, 'validation_status', validation_status, 'created_at', created_at)::text
+            FROM media_objects WHERE media_id='88888888-8888-8888-8888-888888888888';""") != media_snapshot:
+            raise Failure('Migration 28 changed existing media metadata.')
+        self.sql(migration28)
+        self.sql((ROOT / 'scripts/sql/verify-migration-000028.sql').read_text(),
+                 expected_schema_terminal=28)
+        self.expect("SELECT count(*) FROM schema_migrations WHERE version=28 AND name='stage8_media_metadata';", '1')
+        print('Migration 28 from exact v27 preserved legacy media metadata and passed separate idempotent reapply.', flush=True)
+
+        media_hash = 'a' * 64
+        print('Migration 28 managed-row positive insert: clip-A_01 (non-UUID protocol ID).', flush=True)
+        self.sql("""INSERT INTO media_objects
+            (media_id, gateway_id, storage_path, media_type, expected_size, actual_size,
+             validation_status, managed, upload_id, captured_at, intent_expires_at,
+             declared_sha256, verified_sha256, actual_media_type)
+            VALUES ('99999999-9999-9999-9999-999999999991', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999991.mp4', 'video/mp4', 100, 100, 'ready', true,
+                    'clip-A_01', now(), now() + interval '1 hour',
+                    '""" + media_hash + """', '""" + media_hash + """', 'video/mp4');""")
+        self.expect("SELECT count(*) FROM media_objects WHERE managed AND validation_status='ready' AND verified_sha256=declared_sha256;", '1')
+        self.expect("SELECT upload_id || '|' || storage_path || '|' || media_type FROM media_objects WHERE media_id='99999999-9999-9999-9999-999999999991';",
+                    'clip-A_01|99999999-9999-9999-9999-999999999991.mp4|video/mp4')
+        for probe_name, query, constraint in (
+            ('missing-required', """INSERT INTO media_objects
+                (media_id, storage_path, media_type, managed, validation_status)
+                VALUES ('99999999-9999-9999-9999-999999999993',
+                        '99999999-9999-9999-9999-999999999993.mp4', 'video/mp4', true, 'pending');""",
+             'chk_media_objects_managed_metadata'),
+            ('bad-hash', """INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, actual_size,
+                 validation_status, managed, upload_id, captured_at, intent_expires_at,
+                 declared_sha256, verified_sha256, actual_media_type)
+                VALUES ('99999999-9999-9999-9999-999999999994', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999994.mp4', 'video/mp4', 100, 100, 'ready', true,
+                    'clip-B_01', now(), now() + interval '1 hour',
+                    '""" + media_hash + """', '""" + ('b' * 64) + """', 'video/mp4');""",
+              'chk_media_objects_managed_metadata'),
+            ('bad-actual-mime', """INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, actual_size,
+                 validation_status, managed, upload_id, captured_at, intent_expires_at,
+                 declared_sha256, verified_sha256, actual_media_type)
+                VALUES ('99999999-9999-9999-9999-999999999983', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999983.mp4', 'video/mp4', 100, 100, 'ready', true,
+                    'clip-mime', now(), now() + interval '1 hour',
+                    '""" + media_hash + """', '""" + media_hash + """', 'application/octet-stream');""",
+             'chk_media_objects_managed_metadata'),
+            ('over-cap', """INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, validation_status,
+                 managed, upload_id, captured_at, intent_expires_at, declared_sha256)
+                VALUES ('99999999-9999-9999-9999-999999999996', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999996.mp4', 'video/mp4', 80000001, 'pending', true,
+                    'clip-C_01', now(), now() + interval '1 hour',
+                    '""" + media_hash + """');""",
+             'chk_media_objects_managed_metadata'),
+            ('wrong-mime', """INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, validation_status,
+                 managed, upload_id, captured_at, intent_expires_at, declared_sha256)
+                VALUES ('99999999-9999-9999-9999-999999999980', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999980.mp4', 'image/jpeg', 100, 'pending', true,
+                    'clip-image', now(), now() + interval '1 hour', '""" + media_hash + """');""",
+             'chk_media_objects_managed_metadata'),
+            ('client-path', """INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, validation_status,
+                 managed, upload_id, captured_at, intent_expires_at, declared_sha256)
+                VALUES ('99999999-9999-9999-9999-999999999981', 'migration-fixture',
+                    'client-controlled.mp4', 'video/mp4', 100, 'pending', true,
+                    'clip-path', now(), now() + interval '1 hour', '""" + media_hash + """');""",
+             'chk_media_objects_managed_metadata'),
+            ('unsafe-cleanup-time', """INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, validation_status,
+                 managed, upload_id, captured_at, created_at, intent_expires_at,
+                 declared_sha256, latest_upload_grant_expires_at, terminal_reason, cleanup_scheduled_at)
+                VALUES ('99999999-9999-9999-9999-999999999982', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999982.mp4', 'video/mp4', 100, 'rejected', true,
+                    'clip-cleanup', now(), '2025-01-01T00:00:00Z', '2025-01-01T01:00:00Z',
+                    '""" + media_hash + """', '2025-01-01T02:00:00Z', 'upload_rejected',
+                    '2025-01-01T01:30:00Z');""",
+             'chk_media_objects_managed_metadata'),
+        ):
+            print('Migration 28 rejecting managed probe: ' + probe_name, flush=True)
+            try:
+                self.sql(query)
+                raise Failure('Invalid managed media row was accepted.')
+            except Failure as error:
+                if constraint not in str(error):
+                    print('Migration 28 managed probe failed under unexpected constraint: ' + str(error), flush=True)
+                    raise
+        try:
+            self.sql("""INSERT INTO media_objects
+                (media_id, gateway_id, storage_path, media_type, expected_size, validation_status,
+                 managed, upload_id, captured_at, intent_expires_at, declared_sha256)
+                VALUES ('99999999-9999-9999-9999-999999999998', 'migration-fixture',
+                    '99999999-9999-9999-9999-999999999998.mp4', 'video/mp4', 100, 'pending', true,
+                    'clip-A_01', now(), now() + interval '1 hour',
+                    '""" + media_hash + """');""")
+            raise Failure('Duplicate Gateway upload_id was accepted.')
+        except Failure as error:
+            if 'uq_media_objects_gateway_upload' not in str(error):
+                raise
+        print('Migration 28 managed-ready evidence, protocol upload-ID uniqueness, path control, cleanup floor and cap constraints passed.', flush=True)
+
     def verify_retention(self):
         entrypoint = ROOT / 'scripts/sql/stage6-command-retention.sql'
         if not entrypoint.is_file():
@@ -591,6 +714,16 @@ class Fixture:
         dry_run = self.retention_sql()
         if 'DRY-RUN:' not in dry_run:
             raise Failure('Default retention mode did not execute a dry-run.')
+        self.sql("INSERT INTO schema_migrations(version, name) VALUES (29, 'future_fixture_migration');")
+        try:
+            self.retention_sql()
+            raise Failure('Stage 6 retention accepted an unknown future schema terminal.')
+        except Failure as error:
+            if 'division by zero' not in str(error):
+                raise
+        finally:
+            self.sql("DELETE FROM schema_migrations WHERE version=29 AND name='future_fixture_migration';")
+        print('Stage 6 retention accepted current v28 and refused unknown terminal v29.', flush=True)
         for label, kwargs in (
             ('invalid mode', {'mode': 'delete'}),
             ('mismatched target', {'mode': 'dry-run', 'target': 'wrong_target'}),

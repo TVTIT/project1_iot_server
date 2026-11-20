@@ -238,10 +238,11 @@ services:
       - ./migrations/000025_drop_telemetry_sensor_fk.up.sql:/migrations/000025_drop_telemetry_sensor_fk.up.sql:ro
       - ./migrations/000026_drop_telemetry_redundant_indexes.up.sql:/migrations/000026_drop_telemetry_redundant_indexes.up.sql:ro
       - ./migrations/000027_stage6_control_resilience.up.sql:/migrations/000027_stage6_control_resilience.up.sql:ro
+      - ./migrations/000028_stage8_media_metadata.up.sql:/migrations/000028_stage8_media_metadata.up.sql:ro
     command:
       - /bin/sh
       - -ec
-      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000026_drop_telemetry_redundant_indexes.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000027_stage6_control_resilience.up.sql
+      - psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000026_drop_telemetry_redundant_indexes.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000027_stage6_control_resilience.up.sql && psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-iot_platform}" -f /migrations/000028_stage8_media_metadata.up.sql
     networks:
       - iot_net
 
@@ -340,6 +341,27 @@ services:
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-backend_monolith}
       MQTT_USERNAME: ${MQTT_USERNAME:-backend_service}
       MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD is required}
+      # Media MQTT ACL/profile is opt-in; Storage is not configured by this flag.
+      MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}
+      MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY: ${MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY:-1}
+      MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS: ${MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS:-8}
+      MEDIA_UPLOAD_TEMPORARY_BYTES: ${MEDIA_UPLOAD_TEMPORARY_BYTES:-640000000}
+      MEDIA_UPLOAD_STORED_BYTES: ${MEDIA_UPLOAD_STORED_BYTES:-1600000000}
+      MEDIA_UPLOAD_INTENT_TTL: ${MEDIA_UPLOAD_INTENT_TTL:-15m}
+      MEDIA_UPLOAD_DB_TIMEOUT: ${MEDIA_UPLOAD_DB_TIMEOUT:-5s}
+      MEDIA_UPLOAD_STORAGE_TIMEOUT: ${MEDIA_UPLOAD_STORAGE_TIMEOUT:-30s}
+      MEDIA_UPLOAD_VERIFY_WORKERS: ${MEDIA_UPLOAD_VERIFY_WORKERS:-1}
+      MEDIA_UPLOAD_VERIFY_BATCH_SIZE: ${MEDIA_UPLOAD_VERIFY_BATCH_SIZE:-4}
+      MEDIA_UPLOAD_VERIFY_SCAN_INTERVAL: ${MEDIA_UPLOAD_VERIFY_SCAN_INTERVAL:-5s}
+      MEDIA_UPLOAD_VERIFY_RETRY_MIN_DELAY: ${MEDIA_UPLOAD_VERIFY_RETRY_MIN_DELAY:-5s}
+      MEDIA_UPLOAD_VERIFY_RETRY_MAX_DELAY: ${MEDIA_UPLOAD_VERIFY_RETRY_MAX_DELAY:-1m}
+      MEDIA_UPLOAD_VERIFY_MAX_ATTEMPTS: ${MEDIA_UPLOAD_VERIFY_MAX_ATTEMPTS:-5}
+      MEDIA_UPLOAD_CLEANUP_WORKERS: ${MEDIA_UPLOAD_CLEANUP_WORKERS:-1}
+      MEDIA_UPLOAD_CLEANUP_BATCH_SIZE: ${MEDIA_UPLOAD_CLEANUP_BATCH_SIZE:-4}
+      MEDIA_UPLOAD_CLEANUP_SCAN_INTERVAL: ${MEDIA_UPLOAD_CLEANUP_SCAN_INTERVAL:-10s}
+      MEDIA_UPLOAD_CLEANUP_RETRY_MIN_DELAY: ${MEDIA_UPLOAD_CLEANUP_RETRY_MIN_DELAY:-10s}
+      MEDIA_UPLOAD_CLEANUP_RETRY_MAX_DELAY: ${MEDIA_UPLOAD_CLEANUP_RETRY_MAX_DELAY:-5m}
+      MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS: ${MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS:-5}
       # MQTT telemetry ingress is opt-in and independent of the credential flags.
       MQTT_INGRESS_ENABLED: ${MQTT_INGRESS_ENABLED:-false}
       MQTT_QUEUE_CAPACITY: ${MQTT_QUEUE_CAPACITY:-256}
