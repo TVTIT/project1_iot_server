@@ -62,15 +62,28 @@ services:
   #     - production
   #     - tcp_tunnel
 
-  rathole:
-    image: rapiz1/rathole:v0.5.0
-    container_name: iot_rathole
+  # rathole:
+  #   image: rapiz1/rathole:v0.5.0
+  #   container_name: iot_rathole
+  #   volumes:
+  #     - ./client_rathole.toml:/app/config.toml
+  #   command: "/app/config.toml"
+  #   networks:
+  #     - iot_net
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - mosquitto
+
+  frpc:
+    image: ghcr.io/fatedier/frpc:v0.71.0
+    restart: unless-stopped
+    command: ["-c", "/etc/frp/frpc.toml"]
     volumes:
-      - ./client_rathole.toml:/app/config.toml
-    command: "/app/config.toml"
+      - ./frpc_config/frpc.toml:/etc/frp/frpc.toml:ro
+      - ./frpc_config/token:/etc/frp/token:ro
+      - ./frpc_config/ca.crt:/etc/frp/tls/ca.crt:ro
     networks:
       - iot_net
-    restart: unless-stopped
     depends_on:
       - mosquitto
 

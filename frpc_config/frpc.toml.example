@@ -1,0 +1,16 @@
+serverAddr = "frp.example.com"
+serverPort = 7000
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/etc/frp/tls/ca.crt"
+
+[[proxies]]
+name = "mqtts"
+type = "tcp"
+localIP = "mosquitto"
+localPort = 8883
+remotePort = 8883

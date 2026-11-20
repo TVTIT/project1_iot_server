@@ -82,3 +82,7 @@ build/
 /config/mosquitto/controller-runtime/
 
 AGENTS.md
+
+# Config for frpc
+frpc_config/frpc.toml
+frpc_config/token
