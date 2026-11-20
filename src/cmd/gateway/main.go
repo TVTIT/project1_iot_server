@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -77,11 +78,30 @@ type simTransport interface {
 	Stop(ctx context.Context) error
 }
 
+type simMediaWorker interface {
+	gatewaysim.MediaAdmitter
+	SetPublisher(publisher gatewaysim.MediaPublisher)
+	Start(ctx context.Context)
+	Stop(ctx context.Context) error
+}
+
 // buildTransport creates the MQTT transport. It is a package-level seam so the
 // full run lifecycle can be exercised by a test through a small fake transport
 // without a broker. It is never nil in production.
-var buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter) (simTransport, error) {
-	return gatewaysim.NewTransport(gatewaysim.TransportOptionsFromConfig(cfg), admit)
+var buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+	return gatewaysim.NewTransport(transportOptions(cfg, media), admit)
+}
+
+var buildMediaWorker = func(opts gatewaysim.MediaWorkerOptions) (simMediaWorker, error) {
+	return gatewaysim.NewMediaWorker(opts)
+}
+
+func transportOptions(cfg gatewaysim.Config, media gatewaysim.MediaAdmitter) gatewaysim.TransportOptions {
+	opts := gatewaysim.TransportOptionsFromConfig(cfg)
+	if cfg.MediaUpload.Enabled {
+		opts.MediaEnabled, opts.MediaInbox = true, media
+	}
+	return opts
 }
 
 func main() {
@@ -221,9 +241,11 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	}
 
 	var (
-		processor *gatewaysim.ACKProcessor
-		transport simTransport
-		control   *gatewaysim.ControlRuntime
+		processor   *gatewaysim.ACKProcessor
+		transport   simTransport
+		control     *gatewaysim.ControlRuntime
+		mediaSpool  *gatewaysim.MediaSpool
+		mediaWorker simMediaWorker
 	)
 	// closeAll tears down every resource opened so far within one bounded
 	// budget. It is safe once, on any startup failure after the outbox opened.
@@ -233,13 +255,46 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		if control != nil {
 			_ = control.Close(tctx)
 		}
+		mediaJoined := true
+		if mediaWorker != nil {
+			if err := mediaWorker.Stop(tctx); err != nil {
+				mediaJoined = false
+			}
+		}
 		if processor != nil {
 			_ = processor.Stop(tctx)
 		}
 		if transport != nil {
 			_ = transport.Stop(tctx)
 		}
+		if mediaSpool != nil && mediaJoined {
+			_ = mediaSpool.Close()
+		}
 		_ = outbox.Close()
+	}
+
+	if cfg.MediaUpload.Enabled {
+		if err := prepareMediaSpoolDir(cfg.MediaUpload.SpoolDir); err != nil {
+			writeln(stderr, "error: media spool directory is unavailable or not private")
+			_ = outbox.Close()
+			return 1
+		}
+		mediaSpool, err = gatewaysim.OpenMediaSpool(gatewaysim.MediaSpoolConfig{
+			DBPath: filepath.Join(cfg.MediaUpload.SpoolDir, "media.sqlite"), Dir: cfg.MediaUpload.SpoolDir,
+			GatewayID: cfg.GatewayID, MaxFiles: cfg.MediaUpload.MaxFiles, MaxBytes: cfg.MediaUpload.MaxBytes,
+			MaxAttempts: cfg.MediaUpload.MaxAttempts, OpTimeout: cfg.SQLiteTimeout, IntentTTL: cfg.MediaUpload.TTL,
+		})
+		if err != nil {
+			writeln(stderr, "error: could not open media spool")
+			_ = outbox.Close()
+			return 1
+		}
+		if _, err := mediaSpool.IngestFinalized(ctx, cfg.MediaUpload.UploadID, cfg.MediaUpload.InputFile, time.Now().UTC()); err != nil {
+			writeln(stderr, "error: could not ingest configured finalized media fixture")
+			_ = mediaSpool.Close()
+			_ = outbox.Close()
+			return 1
+		}
 	}
 
 	createdProcessor, err := gatewaysim.NewACKProcessor(outbox, admissionCapacity(cfg.MaxInflight), gatewaysim.WithACKLatencyRecorder(tracker), gatewaysim.WithACKIgnoreValidBudget(ignoreACKBudget))
@@ -256,13 +311,37 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		commands = gatewaysim.NewCommandInbox(cfg.GatewayID, processor)
 		admit = commands
 	}
-	createdTransport, err := buildTransport(cfg, admit)
+	if cfg.MediaUpload.Enabled {
+		createdMediaWorker, err := buildMediaWorker(gatewaysim.MediaWorkerOptions{
+			GatewayID: cfg.GatewayID, UploadOrigin: cfg.MediaUpload.UploadOrigin, CAFile: cfg.MediaUpload.CAFile,
+			Spool: mediaSpool, Capacity: 16, RetryMin: cfg.MediaUpload.RetryMin,
+			RetryMax: cfg.MediaUpload.RetryMax, PutTimeout: cfg.MediaUpload.PutTimeout,
+		})
+		if err != nil {
+			writeln(stderr, "error: could not create media upload worker")
+			closeAll()
+			return 1
+		}
+		mediaWorker = createdMediaWorker
+	}
+	createdTransport, err := buildTransport(cfg, admit, mediaWorker)
 	if err != nil {
 		writef(stderr, "error: could not create the MQTT transport: %s\n", transportErrorMessage(err))
 		closeAll()
 		return 1
 	}
 	transport = createdTransport
+	if mediaWorker != nil {
+		publisher, ok := transport.(interface {
+			PublishMedia(context.Context, any) error
+		})
+		if !ok {
+			writeln(stderr, "error: MQTT transport does not support media publishing")
+			closeAll()
+			return 1
+		}
+		mediaWorker.SetPublisher(publisher)
+	}
 
 	scheduler, err := gatewaysim.NewScheduler(gatewaysim.SchedulerOptions{
 		Outbox:           outbox,
@@ -318,6 +397,9 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 		closeAll()
 		return 1
 	}
+	if mediaWorker != nil {
+		mediaWorker.Start(ctx)
+	}
 
 	writef(stdout, "gateway simulator running gateway=%s sensor=%s boot_id=%s\n", cfg.GatewayID, cfg.SensorID, scheduler.BootID())
 
@@ -353,6 +435,13 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 			writeln(stderr, "warning: control workers did not join within shutdown budget")
 		}
 	}
+	mediaJoined := true
+	if mediaWorker != nil {
+		if err := mediaWorker.Stop(shutCtx); err != nil {
+			mediaJoined = false
+			writeln(stderr, "warning: media upload worker did not join within shutdown budget")
+		}
+	}
 	scheduler.Stop()
 
 	var schedErr error
@@ -372,6 +461,15 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	}
 	if err := transport.Stop(shutCtx); err != nil {
 		writeln(stderr, "warning: the MQTT transport did not stop within the shutdown budget")
+	}
+	if mediaSpool != nil {
+		if mediaJoined {
+			if err := mediaSpool.Close(); err != nil {
+				writeln(stderr, "warning: media spool did not close cleanly")
+			}
+		} else {
+			writeln(stderr, "warning: media spool handle and ownership retained because media upload worker did not join")
+		}
 	}
 
 	// Read the final durable counts and payload-free counters before closing the
@@ -403,6 +501,9 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	}
 
 	switch {
+	case !mediaJoined:
+		writeln(stderr, "error: media upload worker did not join within shutdown budget; recovery is supervised")
+		return 1
 	case stats.Completed:
 		return 0
 	case errors.Is(schedErr, gatewaysim.ErrSchedulerCompletion):
@@ -423,6 +524,20 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 	default:
 		return 0
 	}
+}
+
+func prepareMediaSpoolDir(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			return err
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
+		return errors.New("media spool directory must be a private non-symlink directory")
+	}
+	return nil
 }
 
 func parsePending(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer) int {

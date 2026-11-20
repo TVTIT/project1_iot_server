@@ -294,7 +294,7 @@ func TestTransportStartupDeliveryAtLimits(t *testing.T) {
 	topic := string(make([]byte, startupTopicBytes))
 	payload := make([]byte, startupPayloadBytes)
 	for i := 0; i < startupDeliveryCapacity; i++ {
-		tr.onMessage(lt, topic, payload, false)
+		tr.onMessage(lt, topic, payload, false, false)
 	}
 	if !tr.installCurrent(lt) || tr.Fatal() != nil {
 		t.Fatal("startup delivery limits refused inclusive boundary")
@@ -361,8 +361,8 @@ func TestTransportLiveCallbackCannotOvertakeStartupDrain(t *testing.T) {
 	}
 	t.Cleanup(func() { release(); tr.closeLifetime(lt, 0) })
 	topic := "gateways/gateway_001/commands/ordered"
-	tr.onMessage(lt, topic, []byte("first"), false)
-	tr.onMessage(lt, topic, []byte("second"), false)
+	tr.onMessage(lt, topic, []byte("first"), false, false)
+	tr.onMessage(lt, topic, []byte("second"), false, false)
 	installed := make(chan bool, 1)
 	go func() { installed <- tr.installCurrent(lt) }()
 	select {
@@ -373,7 +373,7 @@ func TestTransportLiveCallbackCannotOvertakeStartupDrain(t *testing.T) {
 	liveStarted, liveDone := make(chan struct{}), make(chan struct{})
 	go func() {
 		close(liveStarted)
-		tr.onMessage(lt, topic, []byte("third"), false)
+		tr.onMessage(lt, topic, []byte("third"), false, false)
 		close(liveDone)
 	}()
 	<-liveStarted
@@ -399,5 +399,104 @@ func TestTransportLiveCallbackCannotOvertakeStartupDrain(t *testing.T) {
 		if string(got[i].payload) != want {
 			t.Fatalf("delivery %d = %q, want %q", i, got[i].payload, want)
 		}
+	}
+}
+
+func TestTransportMediaNamedGatewayDeliversACKAndControl(t *testing.T) {
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{} }
+	admit := &recordAdmitter{}
+	media := &recordMediaAdmitter{}
+	tr := newTestTransport(t, admit, h, func(o *TransportOptions) {
+		o.GatewayID = "media"
+		o.Username = "media"
+		o.ControlEnabled = true
+		o.MediaEnabled = false
+		o.MediaInbox = media
+	})
+	ctx := context.Background()
+	lt, err := tr.connectOnce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tr.closeLifetime(lt, 0) })
+
+	ackTopicPre := "gateways/media/acks/sensor_01/msg_pre"
+	cmdTopicPre := "gateways/media/commands/sensor_01/1"
+	realMediaTopic := "gateways/media/media/down/upload_grant"
+
+	// 1. Before install: stage valid ACK and command deliveries for Gateway "media".
+	tr.onMessage(lt, ackTopicPre, []byte("ack_pre_payload"), false, false)
+	tr.onMessage(lt, cmdTopicPre, []byte("cmd_pre_payload"), false, false)
+
+	// A real media namespace delivery arriving on the non-media callback must NOT be staged or admitted.
+	tr.onMessage(lt, realMediaTopic, []byte(`{"version":1}`), false, false)
+
+	// Install the lifetime: staged deliveries must be drained in unchanged startup ordering.
+	if !tr.installCurrent(lt) || tr.Fatal() != nil {
+		t.Fatal("installCurrent failed")
+	}
+
+	// 2. After install (current): live deliveries for Gateway "media" must be admitted directly.
+	ackTopicLive := "gateways/media/acks/sensor_01/msg_live"
+	cmdTopicLive := "gateways/media/commands/sensor_01/2"
+	tr.onMessage(lt, ackTopicLive, []byte("ack_live_payload"), false, false)
+	tr.onMessage(lt, cmdTopicLive, []byte("cmd_live_payload"), false, false)
+
+	// Live real media namespace delivery on the wrong callback must still not reach the ordinary admitter.
+	tr.onMessage(lt, realMediaTopic, []byte(`{"version":2}`), false, false)
+
+	calls := admit.calls()
+	expected := []struct {
+		topic   string
+		payload string
+	}{
+		{ackTopicPre, "ack_pre_payload"},
+		{cmdTopicPre, "cmd_pre_payload"},
+		{ackTopicLive, "ack_live_payload"},
+		{cmdTopicLive, "cmd_live_payload"},
+	}
+
+	if len(calls) != len(expected) {
+		t.Fatalf("admitted calls = %d, want %d: got %+v", len(calls), len(expected), calls)
+	}
+	for i, exp := range expected {
+		if calls[i].topic != exp.topic || string(calls[i].payload) != exp.payload {
+			t.Errorf("call %d: got topic=%q payload=%q, want topic=%q payload=%q",
+				i, calls[i].topic, string(calls[i].payload), exp.topic, exp.payload)
+		}
+	}
+
+	if len(media.got) != 0 {
+		t.Fatalf("media inbox received unexpected messages: %+v", media.got)
+	}
+
+	// 3. When MediaEnabled=true for Gateway "media", legitimate media traffic on mediaCallback
+	// must go ONLY to its media inbox, not to the ordinary admitter.
+	trMedia := newTestTransport(t, admit, h, func(o *TransportOptions) {
+		o.GatewayID = "media"
+		o.Username = "media"
+		o.ControlEnabled = true
+		o.MediaEnabled = true
+		o.MediaInbox = media
+	})
+	ltMedia, err := trMedia.connectOnce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { trMedia.closeLifetime(ltMedia, 0) })
+	if !trMedia.installCurrent(ltMedia) || trMedia.Fatal() != nil {
+		t.Fatal("installCurrent trMedia failed")
+	}
+
+	admitCountBefore := len(admit.calls())
+	mediaPayload := []byte(`{"version":1}`)
+	trMedia.onMessage(ltMedia, realMediaTopic, mediaPayload, false, true)
+
+	if len(media.got) != 1 || string(media.got[0].payload) != `{"version":1}` {
+		t.Fatalf("media inbox did not receive legitimate media message: %+v", media.got)
+	}
+	if len(admit.calls()) != admitCountBefore {
+		t.Fatalf("ordinary admitter received media traffic: %d vs %d", len(admit.calls()), admitCountBefore)
 	}
 }

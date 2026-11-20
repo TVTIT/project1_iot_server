@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -192,12 +193,14 @@ func (f *fakeTransport) Publish(ctx context.Context, topic string, payload []byt
 	return nil
 }
 
+func (f *fakeTransport) PublishMedia(context.Context, any) error { return nil }
+
 // installFakeTransport replaces the transport seam for one test. The fake learns
 // the admitter and gateway id from the composition.
 func installFakeTransport(t *testing.T, fake *fakeTransport) {
 	t.Helper()
 	original := buildTransport
-	buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter) (simTransport, error) {
+	buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, _ gatewaysim.MediaAdmitter) (simTransport, error) {
 		fake.admit = admit
 		fake.gatewayID = cfg.GatewayID
 		return fake, nil
@@ -308,12 +311,14 @@ func TestAdminQuarantineKeepsQuotaAndValidates(t *testing.T) {
 
 func TestRunFiniteAckSuccess(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.db")
+	spool := filepath.Join(t.TempDir(), "media-spool")
 	fake := newFakeTransport(true)
 	installFakeTransport(t, fake)
 
 	var out, errBuf bytes.Buffer
+	env := runEnv(path, map[string]string{"GATEWAY_MEDIA_SPOOL_DIR": spool})
 	code := run(context.Background(), []string{"run", "--batches", "1", "--completion-timeout", "2s"},
-		lookupFrom(runEnv(path, nil)), &out, &errBuf)
+		lookupFrom(env), &out, &errBuf)
 	if code != 0 {
 		t.Fatalf("run exit = %d, stderr = %s", code, errBuf.String())
 	}
@@ -323,6 +328,265 @@ func TestRunFiniteAckSuccess(t *testing.T) {
 	if got := adminCounts(t, path); got.PendingRows != 0 {
 		t.Fatalf("pending after success = %+v", got)
 	}
+	if _, err := os.Stat(spool); !os.IsNotExist(err) {
+		t.Fatalf("media-off run created spool path: stat err=%v", err)
+	}
+}
+
+func TestGatewayTransportOptionsKeepMediaSubscriptionOptIn(t *testing.T) {
+	disabled := transportOptions(gatewaysim.Config{}, nil)
+	if disabled.MediaEnabled || disabled.MediaInbox != nil {
+		t.Fatalf("media-off transport options enabled media: %+v", disabled)
+	}
+}
+
+func TestPrepareMediaSpoolDirCreatesPrivateButDoesNotRepairExisting(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "new-spool")
+	if err := prepareMediaSpoolDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Fatalf("created spool mode=%v", info.Mode().Perm())
+	}
+	loose := filepath.Join(t.TempDir(), "loose")
+	if err := os.Mkdir(loose, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareMediaSpoolDir(loose); err == nil {
+		t.Fatal("accepted existing non-private spool directory")
+	}
+	info, err = os.Stat(loose)
+	if err != nil || info.Mode().Perm() != 0750 {
+		t.Fatalf("existing directory permissions changed: mode=%v err=%v", info.Mode().Perm(), err)
+	}
+}
+
+func TestRunMediaCompositionUsesPrivateSeparateSpoolAndWorkerInbox(t *testing.T) {
+	root := t.TempDir()
+	outboxPath := filepath.Join(root, "telemetry.db")
+	spoolDir := filepath.Join(root, "media-spool")
+	input := filepath.Join(root, "finalized.mp4")
+	data := []byte("finalized fixture bytes")
+	if err := os.WriteFile(input, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeTransport(true)
+	original := buildTransport
+	var gotMedia gatewaysim.MediaAdmitter
+	buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+		if !cfg.MediaUpload.Enabled {
+			t.Fatal("media config disabled in media-on composition")
+		}
+		opts := transportOptions(cfg, media)
+		if !opts.MediaEnabled || opts.MediaInbox != media {
+			t.Fatalf("media transport subscription was not configured: %+v", opts)
+		}
+		gotMedia = media
+		fake.admit, fake.gatewayID = admit, cfg.GatewayID
+		return fake, nil
+	}
+	t.Cleanup(func() { buildTransport = original })
+
+	env := runEnv(outboxPath, map[string]string{
+		"MEDIA_UPLOAD_ENABLED":        "true",
+		"GATEWAY_MEDIA_INPUT_FILE":    input,
+		"GATEWAY_MEDIA_SPOOL_DIR":     spoolDir,
+		"GATEWAY_MEDIA_UPLOAD_ID":     "fixture_upload_001",
+		"GATEWAY_MEDIA_UPLOAD_ORIGIN": "https://storage.example",
+	})
+	var out, errBuf bytes.Buffer
+	if code := run(context.Background(), []string{"run", "--batches", "1", "--completion-timeout", "2s"}, lookupFrom(env), &out, &errBuf); code != 0 {
+		t.Fatalf("run exit=%d stderr=%q", code, errBuf.String())
+	}
+	if gotMedia == nil {
+		t.Fatal("media inbox was not passed to transport")
+	}
+	for _, path := range []string{outboxPath, filepath.Join(spoolDir, "media.sqlite")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected separate database %q: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(spoolDir, "fixture_upload_001.mp4")); err != nil {
+		t.Fatalf("spooled fixture missing before correlated ready: %v", err)
+	}
+	got, err := os.ReadFile(input)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("configured source changed: err=%v data=%q", err, got)
+	}
+}
+
+type lifecycleMediaWorkerStub struct {
+	gatewaysim.MediaAdmitter
+	spool     *gatewaysim.MediaSpool
+	blockStop bool
+	joined    bool
+	stopped   bool
+}
+
+func (s *lifecycleMediaWorkerStub) Admit(topic string, payload []byte, retained bool) {}
+func (s *lifecycleMediaWorkerStub) SetPublisher(publisher gatewaysim.MediaPublisher)  {}
+func (s *lifecycleMediaWorkerStub) Start(ctx context.Context)                         {}
+func (s *lifecycleMediaWorkerStub) Stop(ctx context.Context) error {
+	s.stopped = true
+	if s.blockStop {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s.joined = true
+	return nil
+}
+
+func TestRunMediaWorkerShutdownLifecycleAndSpoolOwnership(t *testing.T) {
+	setupFixture := func(t *testing.T) (string, string, string, map[string]string) {
+		root := t.TempDir()
+		outboxPath := filepath.Join(root, "telemetry.db")
+		spoolDir := filepath.Join(root, "media-spool")
+		input := filepath.Join(root, "finalized.mp4")
+		if err := os.WriteFile(input, []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		env := runEnv(outboxPath, map[string]string{
+			"MEDIA_UPLOAD_ENABLED":        "true",
+			"GATEWAY_MEDIA_INPUT_FILE":    input,
+			"GATEWAY_MEDIA_SPOOL_DIR":     spoolDir,
+			"GATEWAY_MEDIA_UPLOAD_ID":     "fixture_upload_001",
+			"GATEWAY_MEDIA_UPLOAD_ORIGIN": "https://storage.example",
+			"GATEWAY_SHUTDOWN_TIMEOUT":    "50ms",
+		})
+		return outboxPath, spoolDir, input, env
+	}
+
+	t.Run("unconfirmed worker stop retains spool lock and reports nonzero exit", func(t *testing.T) {
+		_, spoolDir, _, env := setupFixture(t)
+		fake := newFakeTransport(true)
+		origTransport := buildTransport
+		origWorker := buildMediaWorker
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+			fake.admit, fake.gatewayID = admit, cfg.GatewayID
+			return fake, nil
+		}
+		stub := &lifecycleMediaWorkerStub{blockStop: true}
+		buildMediaWorker = func(opts gatewaysim.MediaWorkerOptions) (simMediaWorker, error) {
+			stub.spool = opts.Spool
+			return stub, nil
+		}
+		t.Cleanup(func() {
+			buildTransport = origTransport
+			buildMediaWorker = origWorker
+			if stub.spool != nil {
+				_ = stub.spool.Close()
+			}
+		})
+
+		var out, errBuf bytes.Buffer
+		code := run(context.Background(), []string{"run", "--batches", "1", "--completion-timeout", "2s"}, lookupFrom(env), &out, &errBuf)
+		if code == 0 {
+			t.Fatalf("expected nonzero exit code when media worker stop times out, got 0; stdout=%q stderr=%q", out.String(), errBuf.String())
+		}
+		if !stub.stopped {
+			t.Fatal("media worker stop was not invoked")
+		}
+		if stub.joined {
+			t.Fatal("media worker should not have joined when blocked")
+		}
+
+		// Pre-fix bug: mediaSpool.Close() was called, releasing the lock.
+		// Fixed behavior: spool ownership and lock are retained because worker did not join.
+		_, reopenErr := gatewaysim.OpenMediaSpool(gatewaysim.MediaSpoolConfig{
+			DBPath: filepath.Join(spoolDir, "media.sqlite"), Dir: spoolDir,
+			GatewayID: "gateway_001", MaxFiles: 10, MaxBytes: 1000000, MaxAttempts: 5, OpTimeout: time.Second,
+		})
+		if !errors.Is(reopenErr, gatewaysim.ErrMediaSpoolBusy) {
+			t.Fatalf("expected spool lock to remain held (ErrMediaSpoolBusy), got %v", reopenErr)
+		}
+	})
+
+	t.Run("successful worker join closes spool and releases ownership", func(t *testing.T) {
+		_, spoolDir, _, env := setupFixture(t)
+		fake := newFakeTransport(true)
+		origTransport := buildTransport
+		origWorker := buildMediaWorker
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+			fake.admit, fake.gatewayID = admit, cfg.GatewayID
+			return fake, nil
+		}
+		stub := &lifecycleMediaWorkerStub{blockStop: false}
+		buildMediaWorker = func(opts gatewaysim.MediaWorkerOptions) (simMediaWorker, error) {
+			stub.spool = opts.Spool
+			return stub, nil
+		}
+		t.Cleanup(func() {
+			buildTransport = origTransport
+			buildMediaWorker = origWorker
+		})
+
+		var out, errBuf bytes.Buffer
+		code := run(context.Background(), []string{"run", "--batches", "1", "--completion-timeout", "2s"}, lookupFrom(env), &out, &errBuf)
+		if code != 0 {
+			t.Fatalf("expected exit code 0 on clean shutdown, got %d; stderr=%q", code, errBuf.String())
+		}
+		if !stub.joined {
+			t.Fatal("media worker did not join")
+		}
+
+		// Reopen must succeed because spool was cleanly closed after join
+		reopened, reopenErr := gatewaysim.OpenMediaSpool(gatewaysim.MediaSpoolConfig{
+			DBPath: filepath.Join(spoolDir, "media.sqlite"), Dir: spoolDir,
+			GatewayID: "gateway_001", MaxFiles: 10, MaxBytes: 1000000, MaxAttempts: 5, OpTimeout: time.Second,
+		})
+		if reopenErr != nil {
+			t.Fatalf("reopen failed after clean shutdown: %v", reopenErr)
+		}
+		_ = reopened.Close()
+	})
+
+	t.Run("no media enabled preserves normal shutdown", func(t *testing.T) {
+		root := t.TempDir()
+		outboxPath := filepath.Join(root, "telemetry.db")
+		env := runEnv(outboxPath, nil)
+		fake := newFakeTransport(true)
+		origTransport := buildTransport
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+			fake.admit, fake.gatewayID = admit, cfg.GatewayID
+			return fake, nil
+		}
+		t.Cleanup(func() { buildTransport = origTransport })
+
+		var out, errBuf bytes.Buffer
+		code := run(context.Background(), []string{"run", "--batches", "1", "--completion-timeout", "2s"}, lookupFrom(env), &out, &errBuf)
+		if code != 0 {
+			t.Fatalf("expected exit code 0, got %d; stderr=%q", code, errBuf.String())
+		}
+	})
+
+	t.Run("partial startup failure before media worker starts releases spool", func(t *testing.T) {
+		_, spoolDir, _, env := setupFixture(t)
+		origTransport := buildTransport
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+			return nil, errors.New("simulated transport failure")
+		}
+		t.Cleanup(func() { buildTransport = origTransport })
+
+		var out, errBuf bytes.Buffer
+		code := run(context.Background(), []string{"run", "--batches", "1"}, lookupFrom(env), &out, &errBuf)
+		if code != 1 {
+			t.Fatalf("expected exit code 1 on startup failure, got %d", code)
+		}
+
+		// Spool was opened before transport creation, so closeAll must have cleaned it up
+		reopened, reopenErr := gatewaysim.OpenMediaSpool(gatewaysim.MediaSpoolConfig{
+			DBPath: filepath.Join(spoolDir, "media.sqlite"), Dir: spoolDir,
+			GatewayID: "gateway_001", MaxFiles: 10, MaxBytes: 1000000, MaxAttempts: 5, OpTimeout: time.Second,
+		})
+		if reopenErr != nil {
+			t.Fatalf("spool lock leaked on partial startup failure: %v", reopenErr)
+		}
+		_ = reopened.Close()
+	})
 }
 
 func TestRunFinitePendingFailurePreserves(t *testing.T) {

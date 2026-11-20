@@ -2,6 +2,8 @@ package gatewaysim
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +28,14 @@ func mapLookup(values map[string]string) LookupFunc {
 		value, ok := values[key]
 		return value, ok
 	}
+}
+
+func cloneGatewayEnv(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func TestLoadDefaults(t *testing.T) {
@@ -62,6 +72,93 @@ func TestLoadDefaults(t *testing.T) {
 		cfg.PublishTimeout != 5*time.Second || cfg.SQLiteTimeout != 5*time.Second ||
 		cfg.ShutdownTimeout != 10*time.Second {
 		t.Fatalf("operation timeouts = %s/%s/%s/%s/%s", cfg.ConnectTimeout, cfg.SubscribeTimeout, cfg.PublishTimeout, cfg.SQLiteTimeout, cfg.ShutdownTimeout)
+	}
+	if cfg.MediaUpload.Enabled || cfg.MediaUpload.MaxFiles != 2 || cfg.MediaUpload.MaxBytes != 160_000_000 ||
+		cfg.MediaUpload.MaxAttempts < 1 || cfg.MediaUpload.PutTimeout <= 0 {
+		t.Fatalf("unexpected disabled media defaults: %+v", cfg.MediaUpload)
+	}
+}
+
+func TestMediaUploadConfigIsOptInAndIndependentOfCredentials(t *testing.T) {
+	values := validGatewayEnv()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MediaUpload.Enabled {
+		t.Fatalf("media default config=%+v err=%v", cfg.MediaUpload, err)
+	}
+	values["MEDIA_UPLOAD_ENABLED"] = "true"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("enabled media accepted missing finalized input and spool paths")
+	}
+
+	dir := t.TempDir()
+	input := filepath.Join(dir, "finalized.mp4")
+	if err := os.WriteFile(input, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spool := filepath.Join(dir, "spool")
+	if err := os.Mkdir(spool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	values["GATEWAY_MEDIA_INPUT_FILE"] = input
+	values["GATEWAY_MEDIA_SPOOL_DIR"] = spool
+	values["GATEWAY_MEDIA_UPLOAD_ORIGIN"] = "https://storage.example"
+	values["GATEWAY_MEDIA_UPLOAD_ID"] = "fixture_001"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MediaUpload.Enabled || cfg.MediaUpload.InputFile != values["GATEWAY_MEDIA_INPUT_FILE"] ||
+		cfg.MediaUpload.SpoolDir != values["GATEWAY_MEDIA_SPOOL_DIR"] {
+		t.Fatalf("enabled media config=%+v err=%v", cfg.MediaUpload, err)
+	}
+}
+
+func TestMediaUploadRequiresTrustedHTTPSOriginAndUsablePaths(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "finalized.mp4")
+	if err := os.WriteFile(input, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spoolDir := filepath.Join(dir, "spool")
+	if err := os.Mkdir(spoolDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	base := validGatewayEnv()
+	base["MEDIA_UPLOAD_ENABLED"] = "true"
+	base["GATEWAY_MEDIA_INPUT_FILE"] = input
+	base["GATEWAY_MEDIA_SPOOL_DIR"] = spoolDir
+	base["GATEWAY_MEDIA_UPLOAD_ID"] = "fixture_001"
+	for _, origin := range []string{"http://storage.example", "https://user@storage.example", "https://storage.example/path", "https://storage.example?token=x", "https://storage.example#fragment", "https://storage.example?", "https://storage.example#"} {
+		values := cloneGatewayEnv(base)
+		values["GATEWAY_MEDIA_UPLOAD_ORIGIN"] = origin
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("accepted untrusted media origin %q", origin)
+		}
+	}
+	values := cloneGatewayEnv(base)
+	values["GATEWAY_MEDIA_UPLOAD_ORIGIN"] = "https://storage.example"
+	caPath := filepath.Join(dir, "storage-ca.pem")
+	if err := os.WriteFile(caPath, []byte("test CA fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	values["GATEWAY_MEDIA_CA_FILE"] = caPath
+	cfg, err := Load(mapLookup(values))
+	if err != nil || !cfg.MediaUpload.Enabled || cfg.MediaUpload.UploadOrigin != "https://storage.example" || cfg.MediaUpload.CAFile != caPath {
+		t.Fatalf("valid media config=%+v err=%v", cfg.MediaUpload, err)
+	}
+}
+
+func TestMediaUploadLimitsRejectInvalidAndInconsistentValues(t *testing.T) {
+	for key, value := range map[string]string{
+		"GATEWAY_MEDIA_MAX_FILES":       "0",
+		"GATEWAY_MEDIA_MAX_BYTES":       "159999999",
+		"GATEWAY_MEDIA_MAX_ATTEMPTS":    "0",
+		"GATEWAY_MEDIA_RETRY_MIN_DELAY": "2m",
+		"GATEWAY_MEDIA_UPLOAD_TTL":      "0s",
+		"GATEWAY_MEDIA_PUT_TIMEOUT":     "soon",
+	} {
+		values := validGatewayEnv()
+		values[key] = value
+		if _, err := Load(mapLookup(values)); err == nil {
+			t.Errorf("accepted %s=%q", key, value)
+		}
 	}
 }
 

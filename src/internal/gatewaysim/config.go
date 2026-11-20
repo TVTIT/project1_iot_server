@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"iot-platform/internal/gateway"
+	"iot-platform/internal/mediaprotocol"
 )
 
 // LookupFunc returns an environment value and whether it is set.
@@ -55,6 +56,8 @@ const (
 	defaultPublishTimeout   = 5 * time.Second
 	defaultSQLiteTimeout    = 5 * time.Second
 	defaultShutdownTimeout  = 10 * time.Second
+	defaultMediaMaxFiles    = 2
+	defaultMediaMaxBytes    = int64(160_000_000)
 	minTimeout              = time.Millisecond
 	maxTimeout              = 10 * time.Minute
 
@@ -68,6 +71,7 @@ const (
 type Config struct {
 	ControlEnabled bool
 	Stage6Enabled  bool
+	MediaUpload    MediaUploadConfig
 	GatewayID      string
 	SensorID       string
 
@@ -135,6 +139,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if c.Stage6Enabled && !c.ControlEnabled {
 		return c, fmt.Errorf("GATEWAY_STAGE6_ENABLED requires GATEWAY_CONTROL_ENABLED")
+	}
+	if c.MediaUpload, err = loadMediaUploadConfig(lookup); err != nil {
+		return c, err
 	}
 
 	gatewayID, ok := nonEmpty(lookup, "GATEWAY_ID")
@@ -262,6 +269,118 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 
 	return c, nil
+}
+
+// MediaUploadConfig is a validated future-slice input/spool budget. It does
+// not open files, create a spool, or configure an HTTP client.
+type MediaUploadConfig struct {
+	Enabled      bool
+	InputFile    string
+	SpoolDir     string
+	UploadOrigin string
+	CAFile       string
+	UploadID     string
+	MaxFiles     int
+	MaxBytes     int64
+	MaxAttempts  int
+	RetryMin     time.Duration
+	RetryMax     time.Duration
+	TTL          time.Duration
+	PutTimeout   time.Duration
+}
+
+func loadMediaUploadConfig(lookup LookupFunc) (MediaUploadConfig, error) {
+	c := MediaUploadConfig{MaxFiles: defaultMediaMaxFiles, MaxBytes: defaultMediaMaxBytes,
+		MaxAttempts: 5, RetryMin: 5 * time.Second, RetryMax: time.Minute,
+		TTL: 24 * time.Hour, PutTimeout: time.Minute}
+	var err error
+	if raw, ok := lookup("MEDIA_UPLOAD_ENABLED"); ok {
+		c.Enabled, err = strconv.ParseBool(raw)
+		if err != nil {
+			return MediaUploadConfig{}, fmt.Errorf("MEDIA_UPLOAD_ENABLED must be a boolean")
+		}
+	}
+	if c.MaxFiles, err = integer(lookup, "GATEWAY_MEDIA_MAX_FILES", c.MaxFiles, 1, 100); err != nil {
+		return MediaUploadConfig{}, err
+	}
+	if c.MaxBytes, err = integer64(lookup, "GATEWAY_MEDIA_MAX_BYTES", c.MaxBytes, mediaprotocol.MaxUploadBytes, 8<<30); err != nil {
+		return MediaUploadConfig{}, err
+	}
+	if c.MaxAttempts, err = integer(lookup, "GATEWAY_MEDIA_MAX_ATTEMPTS", c.MaxAttempts, 1, 20); err != nil {
+		return MediaUploadConfig{}, err
+	}
+	for _, item := range []struct {
+		key string
+		dst *time.Duration
+		def time.Duration
+		max time.Duration
+	}{
+		{"GATEWAY_MEDIA_RETRY_MIN_DELAY", &c.RetryMin, c.RetryMin, time.Hour},
+		{"GATEWAY_MEDIA_RETRY_MAX_DELAY", &c.RetryMax, c.RetryMax, 24 * time.Hour},
+		{"GATEWAY_MEDIA_UPLOAD_TTL", &c.TTL, c.TTL, 7 * 24 * time.Hour},
+		{"GATEWAY_MEDIA_PUT_TIMEOUT", &c.PutTimeout, c.PutTimeout, 10 * time.Minute},
+	} {
+		if *item.dst, err = boundedDuration(lookup, item.key, item.def, minTimeout, item.max); err != nil {
+			return MediaUploadConfig{}, err
+		}
+	}
+	if c.RetryMin > c.RetryMax {
+		return MediaUploadConfig{}, fmt.Errorf("GATEWAY_MEDIA_RETRY_MIN_DELAY must not exceed GATEWAY_MEDIA_RETRY_MAX_DELAY")
+	}
+	if c.MaxBytes < int64(c.MaxFiles)*mediaprotocol.MaxUploadBytes {
+		return MediaUploadConfig{}, fmt.Errorf("GATEWAY_MEDIA_MAX_BYTES must cover GATEWAY_MEDIA_MAX_FILES times the fixed upload cap")
+	}
+	if c.Enabled {
+		for _, item := range []struct{ key, dst string }{
+			{"GATEWAY_MEDIA_INPUT_FILE", "input"},
+			{"GATEWAY_MEDIA_SPOOL_DIR", "spool"},
+			{"GATEWAY_MEDIA_UPLOAD_ORIGIN", "origin"},
+			{"GATEWAY_MEDIA_UPLOAD_ID", "id"},
+		} {
+			value, ok := nonEmpty(lookup, item.key)
+			if !ok {
+				return MediaUploadConfig{}, fmt.Errorf("%s is required when media upload is enabled", item.key)
+			}
+			switch item.dst {
+			case "input":
+				if err := validateCleanAbsolutePath(item.key, value); err != nil {
+					return MediaUploadConfig{}, err
+				}
+				c.InputFile = value
+			case "spool":
+				if err := validateCleanAbsolutePath(item.key, value); err != nil {
+					return MediaUploadConfig{}, err
+				}
+				c.SpoolDir = value
+			case "origin":
+				if err := validateMediaUploadOrigin(value); err != nil {
+					return MediaUploadConfig{}, err
+				}
+				c.UploadOrigin = value
+			case "id":
+				if !mediaUploadIDPattern.MatchString(value) {
+					return MediaUploadConfig{}, fmt.Errorf("GATEWAY_MEDIA_UPLOAD_ID is invalid")
+				}
+				c.UploadID = value
+			}
+		}
+		if value, ok := nonEmpty(lookup, "GATEWAY_MEDIA_CA_FILE"); ok {
+			if err := validateCleanAbsolutePath("GATEWAY_MEDIA_CA_FILE", value); err != nil {
+				return MediaUploadConfig{}, err
+			}
+			c.CAFile = value
+		}
+	}
+	return c, nil
+}
+
+func validateMediaUploadOrigin(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !strings.HasPrefix(raw, "https://") || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+		u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || strings.ContainsAny(raw, "?#") {
+		return fmt.Errorf("GATEWAY_MEDIA_UPLOAD_ORIGIN must be an HTTPS origin with no userinfo, path, query or fragment")
+	}
+	return nil
 }
 
 // loadPassword reads the MQTT password preserving its raw bytes while rejecting

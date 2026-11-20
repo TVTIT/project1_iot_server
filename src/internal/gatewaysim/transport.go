@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,8 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/eclipse/paho.mqtt.golang/packets"
+
+	"iot-platform/internal/mediaprotocol"
 )
 
 // The transport is the Gateway-side mirror of internal/mqttingress: it keeps
@@ -56,7 +59,8 @@ const (
 
 	// ackSubscribeQoS is the QoS requested for the single own-ACK subscription.
 	// The granted SUBACK code must be a valid QoS no higher than this.
-	ackSubscribeQoS byte = 1
+	ackSubscribeQoS   byte = 1
+	mediaSubscribeQoS byte = 1
 	// telemetryPublishQoS is the QoS used for every telemetry publish. Telemetry
 	// is always published QoS 1 and non-retained.
 	telemetryPublishQoS byte = 1
@@ -90,6 +94,12 @@ type ACKAdmitter interface {
 	Admit(topic string, payload []byte, retained bool)
 }
 
+// MediaAdmitter receives raw downlink envelopes into an injected bounded queue.
+// It must return quickly and must not parse JSON or perform I/O.
+type MediaAdmitter interface {
+	Admit(topic string, payload []byte, retained bool)
+}
+
 // TransportOptions configures the Paho telemetry transport and its supervisor.
 // GatewayID derives the single own ACK filter; the CA is loaded and validated
 // at construction so startup fails clearly. The unexported fields are test
@@ -97,6 +107,10 @@ type ACKAdmitter interface {
 type TransportOptions struct {
 	// ControlEnabled requires both own ACK and command subscriptions before ready.
 	ControlEnabled bool
+	// MediaEnabled opts into the own media downlink subscription.
+	MediaEnabled bool
+	// MediaInbox is required when MediaEnabled and must be bounded/non-blocking.
+	MediaInbox MediaAdmitter
 	// GatewayID is the configured Gateway identity. It must equal Username and
 	// is used to derive the exact own ACK subscription filter.
 	GatewayID string
@@ -194,6 +208,7 @@ type startupDelivery struct {
 	topic    string
 	payload  []byte
 	retained bool
+	media    bool
 }
 
 func newLifetime(epoch uint64) *lifetime {
@@ -279,6 +294,7 @@ func (lt *lifetime) closeSocket() {
 type Transport struct {
 	opts   TransportOptions
 	admit  ACKAdmitter
+	media  MediaAdmitter
 	url    *url.URL
 	tls    *tls.Config
 	log    *slog.Logger
@@ -327,6 +343,9 @@ type Transport struct {
 func NewTransport(opts TransportOptions, admit ACKAdmitter) (*Transport, error) {
 	if admit == nil {
 		return nil, errors.New("gatewaysim: transport requires an ACK admitter")
+	}
+	if opts.MediaEnabled && opts.MediaInbox == nil {
+		return nil, errors.New("gatewaysim: media inbox is required when media is enabled")
 	}
 	if opts.GatewayID == "" {
 		return nil, errors.New("gatewaysim: transport gateway id is required")
@@ -381,6 +400,7 @@ func NewTransport(opts TransportOptions, admit ACKAdmitter) (*Transport, error) 
 	t := &Transport{
 		opts:          opts,
 		admit:         admit,
+		media:         opts.MediaInbox,
 		url:           u,
 		log:           log,
 		filter:        "gateways/" + opts.GatewayID + "/acks/#",
@@ -677,6 +697,38 @@ func (t *Transport) Publish(ctx context.Context, topic string, payload []byte) e
 	}
 }
 
+// PublishMedia admits only the Gateway's two validated media uplink message
+// types. Publish uses the same counted, bounded invocation path as telemetry.
+func (t *Transport) PublishMedia(ctx context.Context, message any) error {
+	var topic string
+	switch m := message.(type) {
+	case mediaprotocol.UploadRequest:
+		if m.GatewayID != "" && m.GatewayID != t.opts.GatewayID {
+			return ErrPublishUnconfirmed
+		}
+		m.GatewayID = t.opts.GatewayID
+		topic = mediaprotocol.UploadRequestTopic(t.opts.GatewayID)
+		message = m
+	case mediaprotocol.UploadComplete:
+		if m.GatewayID != "" && m.GatewayID != t.opts.GatewayID {
+			return ErrPublishUnconfirmed
+		}
+		m.GatewayID = t.opts.GatewayID
+		topic = mediaprotocol.UploadCompleteTopic(t.opts.GatewayID)
+		message = m
+	default:
+		return ErrPublishUnconfirmed
+	}
+	if !t.opts.MediaEnabled {
+		return ErrPublishUnconfirmed
+	}
+	payload, err := mediaprotocol.Encode(topic, message)
+	if err != nil {
+		return ErrPublishUnconfirmed
+	}
+	return t.Publish(ctx, topic, payload)
+}
+
 // failCurrent marks a lifetime failed, prevents further invocations by closing
 // its socket, clears it as the current lifetime and wakes the supervisor to
 // replace it.
@@ -809,13 +861,24 @@ func (t *Transport) connectOnce(ctx context.Context) (*lifetime, error) {
 	if t.opts.ControlEnabled {
 		filters = append(filters, "gateways/"+t.opts.GatewayID+"/commands/#")
 	}
+	if t.opts.MediaEnabled {
+		filters = append(filters, "gateways/"+t.opts.GatewayID+"/media/down/#")
+	}
 	for _, filter := range filters {
-		subToken := client.Subscribe(filter, ackSubscribeQoS, func(topic string, payload []byte, retained bool) {
-			t.onMessage(lt, topic, payload, retained)
+		requestedQoS := ackSubscribeQoS
+		mediaCallback := filter == "gateways/"+t.opts.GatewayID+"/media/down/#"
+		if mediaCallback {
+			requestedQoS = mediaSubscribeQoS
+		}
+		subToken := client.Subscribe(filter, requestedQoS, func(topic string, payload []byte, retained bool) {
+			t.onMessage(lt, topic, payload, retained, mediaCallback)
 		})
 		err := waitSubscribeToken(subCtx, subToken, filter)
-		if err == nil && t.opts.ControlEnabled && subToken.Result()[filter] != 1 {
-			err = errors.New("gatewaysim: control requires QoS 1 subscriptions")
+		controlQoS1Required := t.opts.ControlEnabled &&
+			(filter == t.filter || filter == "gateways/"+t.opts.GatewayID+"/commands/#")
+		mediaQoS1Required := t.opts.MediaEnabled && filter == "gateways/"+t.opts.GatewayID+"/media/down/#"
+		if err == nil && (controlQoS1Required || mediaQoS1Required) && subToken.Result()[filter] != 1 {
+			err = errors.New("gatewaysim: required subscription QoS 1 was not granted")
 		}
 		if err != nil {
 			t.counters.subscribeFailed.Add(1)
@@ -890,10 +953,24 @@ func awaitToken(ctx context.Context, token waitToken) error {
 // install/drain and live delivery, so a live callback cannot overtake the buffer.
 // Admit is contractually only a bounded check/copy/enqueue; no JSON, SQLite,
 // network calls or per-message goroutines may run while holding this lock.
-func (t *Transport) onMessage(lt *lifetime, topic string, payload []byte, retained bool) {
+func (t *Transport) onMessage(lt *lifetime, topic string, payload []byte, retained, mediaCallback bool) {
 	t.mu.Lock()
 	if t.closed || lt.failed.Load() || (lt.installed && t.current != lt) {
 		t.counters.staleDropped.Add(1)
+		t.mu.Unlock()
+		return
+	}
+	media := t.opts.MediaEnabled && mediaCallback
+	// A broker/client callback for another subscription must never route a
+	// media-shaped topic into the ACK/command consumer.
+	if !media && isMediaNamespaceTopic(topic) {
+		t.mu.Unlock()
+		return
+	}
+	// Validate media callback metadata before generic startup overflow handling:
+	// malformed, retained or oversized media must not poison a healthy lifetime.
+	if media && (retained || len(topic) > startupTopicBytes || len(payload) == 0 ||
+		len(payload) > mediaprotocol.MaxEnvelopeBytes || !validMediaDownTopic(topic, t.opts.GatewayID)) {
 		t.mu.Unlock()
 		return
 	}
@@ -908,12 +985,36 @@ func (t *Transport) onMessage(lt *lifetime, topic string, payload []byte, retain
 			lt.signalWake()
 			return
 		}
-		lt.staged = append(lt.staged, startupDelivery{topic: topic, payload: append([]byte(nil), payload...), retained: retained})
+		lt.staged = append(lt.staged, startupDelivery{topic: topic, payload: append([]byte(nil), payload...), retained: retained, media: media})
 		t.mu.Unlock()
 		return
 	}
-	t.admit.Admit(topic, payload, retained)
+	if media {
+		t.media.Admit(topic, append([]byte(nil), payload...), retained)
+	} else {
+		t.admit.Admit(topic, payload, retained)
+	}
 	t.mu.Unlock()
+}
+
+func validMediaDownTopic(topic, gatewayID string) bool {
+	return topic == mediaprotocol.UploadGrantTopic(gatewayID) || topic == mediaprotocol.UploadResultTopic(gatewayID)
+}
+
+// isMediaNamespaceTopic reports whether topic addresses the media namespace
+// (the exact segment following gateways/{gateway_id}/), distinguishing it from
+// legitimate ACK/command topics whose Gateway ID or content is "media".
+func isMediaNamespaceTopic(topic string) bool {
+	if !strings.HasPrefix(topic, "gateways/") {
+		return false
+	}
+	rest := topic[len("gateways/"):]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return false
+	}
+	after := rest[slash+1:]
+	return after == "media" || strings.HasPrefix(after, "media/")
 }
 
 // onLost is the Paho connection-lost callback. It immediately makes readiness
@@ -1073,7 +1174,11 @@ func (t *Transport) installCurrent(lt *lifetime) bool {
 		if lt.failed.Load() {
 			break
 		}
-		t.admit.Admit(delivery.topic, delivery.payload, delivery.retained)
+		if delivery.media {
+			t.media.Admit(delivery.topic, delivery.payload, delivery.retained)
+		} else {
+			t.admit.Admit(delivery.topic, delivery.payload, delivery.retained)
+		}
 	}
 	lt.staged = nil
 	if lt.failed.Load() {

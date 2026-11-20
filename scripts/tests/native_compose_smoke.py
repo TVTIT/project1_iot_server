@@ -45,7 +45,7 @@ SERVICES = ("postgres", "supabase-role-provisioner", "application-migrations",
 # of accepting any suffix keeps a missing, extra, renamed, or wrong-version
 # history failing closed; a newly supported migration must update this pin
 # explicitly rather than being silently accepted.
-EXPECTED_SCHEMA_TERMINAL = "27:stage6_control_resilience"
+EXPECTED_SCHEMA_TERMINAL = "28:stage8_media_metadata"
 
 
 def expected_schema_history(directory=None):
@@ -148,6 +148,17 @@ DEFAULTS = dict(
     # Stage 6 durable control retry policy and resilience
     STAGE6_ENABLED="false", STAGE6_RETRY_MAX_BACKOFF="8s",
     STAGE6_RETRY_MAX_ATTEMPTS="5",
+    MEDIA_UPLOAD_ENABLED="false",
+    MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY="1", MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS="8",
+    MEDIA_UPLOAD_TEMPORARY_BYTES="640000000", MEDIA_UPLOAD_STORED_BYTES="1600000000",
+    MEDIA_UPLOAD_INTENT_TTL="15m", MEDIA_UPLOAD_DB_TIMEOUT="5s",
+    MEDIA_UPLOAD_STORAGE_TIMEOUT="30s", MEDIA_UPLOAD_VERIFY_WORKERS="1",
+    MEDIA_UPLOAD_VERIFY_BATCH_SIZE="4", MEDIA_UPLOAD_VERIFY_SCAN_INTERVAL="5s",
+    MEDIA_UPLOAD_VERIFY_RETRY_MIN_DELAY="5s", MEDIA_UPLOAD_VERIFY_RETRY_MAX_DELAY="1m",
+    MEDIA_UPLOAD_VERIFY_MAX_ATTEMPTS="5", MEDIA_UPLOAD_CLEANUP_WORKERS="1",
+    MEDIA_UPLOAD_CLEANUP_BATCH_SIZE="4", MEDIA_UPLOAD_CLEANUP_SCAN_INTERVAL="10s",
+    MEDIA_UPLOAD_CLEANUP_RETRY_MIN_DELAY="10s", MEDIA_UPLOAD_CLEANUP_RETRY_MAX_DELAY="5m",
+    MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS="5",
     TWIN_RELATIONSHIP_DEFAULT_LIMIT="50", TWIN_RELATIONSHIP_MAX_LIMIT="200",
     SUPABASE_JWT_CLOCK_SKEW="30s", CLOUDFLARE_TUNNEL_TOKEN="fixture-unused-not-a-token",
     SUPABASE_JWT_MODE="hs256", SUPABASE_JWKS_URL="", SUPABASE_JWKS_CACHE_TTL="60s",
@@ -464,7 +475,7 @@ def bootstrap_lifecycle():
     return module
 
 
-def allocate_bootstrap_store(fixture, registry, lifecycle):
+def allocate_bootstrap_store(fixture, registry, lifecycle, *, media_upload_enabled=False):
     image = lifecycle.verify_pinned_image()
     name = fixture.values["MQTT_DYNSEC_BOOTSTRAP_VOLUME"]
     labels = {"test.task": "native-compose-allocation", "test.run": fixture.project,
@@ -475,7 +486,8 @@ def allocate_bootstrap_store(fixture, registry, lifecycle):
     private_write(config, json.dumps({"volume_name": name,
         "manager": fixture.values["MQTT_DYNSEC_MANAGER_USERNAME"], "backend": fixture.values["MQTT_USERNAME"],
         "manager_password": fixture.values["MQTT_DYNSEC_MANAGER_PASSWORD"], "backend_password": fixture.values["MQTT_PASSWORD"],
-        "labels": {"test.task": labels["test.task"], "test.run": labels["test.run"]}}))
+        "labels": {"test.task": labels["test.task"], "test.run": labels["test.run"]},
+        **({"media_upload_enabled": True} if media_upload_enabled else {})}))
     registry.allocating(item)
     output = lifecycle.execute_bootstrap(config, timeout=45, secrets_to_scan=(
         fixture.values["MQTT_PASSWORD"], fixture.values["MQTT_DYNSEC_MANAGER_PASSWORD"]))
@@ -490,7 +502,7 @@ def allocate_bootstrap_store(fixture, registry, lifecycle):
     return item
 
 
-def allocation_readback(fixture, registry, volume):
+def allocation_readback(fixture, registry, volume, *, media_upload_enabled=False):
     """One read-only UID-1883 helper: TLS access and store metadata, not broker."""
     labels = {"test.task": "native-compose-allocation", "test.run": fixture.project,
               "allocation.nonce": secrets.token_hex(16)}
@@ -533,6 +545,17 @@ def allocation_readback(fixture, registry, volume):
     if (set(c["username"] for c in store["clients"]) != {fixture.values["MQTT_USERNAME"], fixture.values["MQTT_DYNSEC_MANAGER_USERNAME"]}
             or len(store["clients"]) != 2 or any(v is not False for v in store["defaultACLAccess"].values())):
         raise ValueError("store_metadata_rejected")
+    # The opt-in media bootstrap must grant only the expected additional backend
+    # role entries. Keep the default allocation fixture unchanged.
+    if media_upload_enabled:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import mqtt_backend_acl
+        backend_role = next((r for r in store.get("roles", [])
+                             if r.get("rolename") == "bootstrap_backend"), None)
+        if (backend_role is None or
+                mqtt_backend_acl.role_acls({"role": backend_role}) !=
+                mqtt_backend_acl.expected_backend_media_acls()):
+            raise ValueError("media_backend_role_readback_rejected")
     private_write(fixture.private / "store-readback.json", json.dumps(store))
     return True
 
@@ -1398,6 +1421,7 @@ def validate_effective_model(fixture, model):
             str(ROOT / "migrations/000025_drop_telemetry_sensor_fk.up.sql"): "/migrations/000025_drop_telemetry_sensor_fk.up.sql",
             str(ROOT / "migrations/000026_drop_telemetry_redundant_indexes.up.sql"): "/migrations/000026_drop_telemetry_redundant_indexes.up.sql",
             str(ROOT / "migrations/000027_stage6_control_resilience.up.sql"): "/migrations/000027_stage6_control_resilience.up.sql",
+            str(ROOT / "migrations/000028_stage8_media_metadata.up.sql"): "/migrations/000028_stage8_media_metadata.up.sql",
         },
         "supabase-envoy": {str(ROOT / "config/envoy" / name): target for name, target in (
             ("envoy.yaml", "/etc/envoy/envoy.yaml"), ("cds.yaml", "/etc/envoy/cds.yaml"),
@@ -1540,7 +1564,7 @@ def validate_effective_model(fixture, model):
         raise ValueError("effective_rootfs_rejected")
     commands = {"application-migrations": ["/bin/sh", "/run-migrations.sh"],
                 "supabase-role-provisioner": ["/bin/sh", "/migrations/000000_configure_supabase_roles.sh"],
-                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000026_drop_telemetry_redundant_indexes.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000027_stage6_control_resilience.up.sql']}
+                "supabase-compat-migration": ["/bin/sh", "-ec", 'psql -h postgres -U "postgres" -d "smoke" -f /migrations/000004_supabase_compat.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000021_admin_user_management.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000022_gateway_membership_revocation.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000023_sensor_control_intent.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000024_telemetry_ledger_timestamp.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000025_drop_telemetry_sensor_fk.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000026_drop_telemetry_redundant_indexes.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000027_stage6_control_resilience.up.sql && psql -h postgres -U "postgres" -d "smoke" -f /migrations/000028_stage8_media_metadata.up.sql']}
     if any(services[name].get("command") != command for name, command in commands.items()):
         raise ValueError("effective_migrations_rejected")
     volumes = model.get("volumes", {})

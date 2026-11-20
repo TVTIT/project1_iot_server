@@ -1162,6 +1162,14 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(fixture.env_file.stat().st_mode & 0o777, 0o600)
             self.assertFalse(list(fixture.artifacts.iterdir()))
 
+    def test_media_upload_feature_is_explicitly_off_in_synthetic_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.prepare(directory)
+            self.assertEqual(fixture.values["MEDIA_UPLOAD_ENABLED"], "false")
+            self.assertIn("MEDIA_UPLOAD_ENABLED=false\n", fixture.env_file.read_text())
+            self.assertEqual(fixture.values["MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS"], "8")
+            self.assertEqual(fixture.values["MEDIA_UPLOAD_TEMPORARY_BYTES"], "640000000")
+
     def test_unique_projects_and_fresh_volume(self):
         with tempfile.TemporaryDirectory() as directory:
             a = smoke.prepare(Path(directory) / "a")
@@ -2712,13 +2720,13 @@ class PaperP0Tests(unittest.TestCase):
 class SchemaHistoryTests(unittest.TestCase):
     """Focused regression: the smoke must accept only the exact supported schema.
 
-    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 27);
+    The pinned terminal is ``EXPECTED_SCHEMA_TERMINAL`` (current migration 28);
     stale, missing, renamed, extra, or failed histories must all fail closed.
     """
 
     def test_current_schema_history_matches_pinned_terminal(self):
         expected = smoke.expected_schema_history()
-        self.assertIn("27:stage6_control_resilience", expected)
+        self.assertIn("28:stage8_media_metadata", expected)
         self.assertTrue(expected.endswith(smoke.EXPECTED_SCHEMA_TERMINAL))
         self.assertTrue(smoke.schema_history_verified(0, expected, expected))
 
@@ -2729,7 +2737,7 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertTrue(history26.endswith("26:drop_telemetry_redundant_indexes"))
         self.assertTrue(smoke.schema_history_verified(
             0, history26, history26, terminal="26:drop_telemetry_redundant_indexes"))
-        # The default verifier remains pinned to current terminal 27.
+        # The default verifier remains pinned to current terminal 28.
         self.assertFalse(smoke.schema_history_verified(0, history26, history26))
 
     def test_historical_schema25_context_remains_explicitly_supported(self):
@@ -2739,7 +2747,7 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertTrue(history25.endswith("25:drop_telemetry_sensor_fk"))
         self.assertTrue(smoke.schema_history_verified(
             0, history25, history25, terminal="25:drop_telemetry_sensor_fk"))
-        # The default verifier remains pinned to current terminal 27.
+        # The default verifier remains pinned to current terminal 28.
         self.assertFalse(smoke.schema_history_verified(0, history25, history25))
 
     def test_historical_schema23_context_remains_explicitly_supported(self):
@@ -2749,7 +2757,7 @@ class SchemaHistoryTests(unittest.TestCase):
         self.assertTrue(history23.endswith("23:sensor_control_intent"))
         self.assertTrue(smoke.schema_history_verified(
             0, history23, history23, terminal="23:sensor_control_intent"))
-        # The default verifier remains pinned to current terminal 27.
+        # The default verifier remains pinned to current terminal 28.
         self.assertFalse(smoke.schema_history_verified(0, history23, history23))
 
     def test_historical_schema24_context_remains_explicitly_supported(self):
@@ -2763,17 +2771,17 @@ class SchemaHistoryTests(unittest.TestCase):
 
     def test_stale_schema21_history_rejected(self):
         expected = smoke.expected_schema_history()
-        stale = expected.removesuffix(",27:stage6_control_resilience")
+        stale = expected.removesuffix(",28:stage8_media_metadata")
         self.assertFalse(smoke.schema_history_verified(0, stale, expected))
 
     def test_missing_terminal_migration_rejected(self):
         expected = smoke.expected_schema_history()
-        missing = ",".join(p for p in expected.split(",") if p != "27:stage6_control_resilience")
+        missing = ",".join(p for p in expected.split(",") if p != "28:stage8_media_metadata")
         self.assertFalse(smoke.schema_history_verified(0, missing, expected))
 
     def test_wrong_terminal_name_rejected(self):
         expected = smoke.expected_schema_history()
-        wrong = expected.replace("27:stage6_control_resilience", "27:unexpected_name")
+        wrong = expected.replace("28:stage8_media_metadata", "28:unexpected_name")
         self.assertFalse(smoke.schema_history_verified(0, wrong, expected))
 
     def test_extra_migration_row_rejected(self):
@@ -2789,7 +2797,7 @@ class SchemaHistoryTests(unittest.TestCase):
         # longer ends at the pinned terminal is rejected, so adding a supported
         # migration forces an explicit terminal update instead of passing.
         expected = smoke.expected_schema_history()
-        future = expected.replace("27:stage6_control_resilience", "28:future_migration")
+        future = expected.replace("28:stage8_media_metadata", "29:future_migration")
         self.assertFalse(smoke.schema_history_verified(0, future, future))
 
 

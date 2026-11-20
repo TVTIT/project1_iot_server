@@ -27,6 +27,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/eclipse/paho.mqtt.golang/packets"
 
+	"iot-platform/internal/mediaprotocol"
 	"iot-platform/internal/telemetry"
 )
 
@@ -724,7 +725,7 @@ func TestTransportStaleCallbacksCannotInvalidateReplacement(t *testing.T) {
 	tr.installCurrent(replacement)
 
 	tr.onLost(old)
-	tr.onMessage(old, "gateways/"+transportTestGatewayID+"/acks/x", []byte("stale"), false)
+	tr.onMessage(old, "gateways/"+transportTestGatewayID+"/acks/x", []byte("stale"), false, false)
 
 	if !tr.Ready() {
 		t.Fatal("stale loss invalidated the replacement lifetime")
@@ -746,6 +747,172 @@ func TestTransportWaitReadyTimesOutWithoutConnection(t *testing.T) {
 	defer cancel()
 	if err := tr.WaitReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WaitReady = %v, want DeadlineExceeded", err)
+	}
+}
+
+func TestMediaSubscriptionRequiresQoS1AndMediaPublishRequiresReady(t *testing.T) {
+	for name, result := range map[string]map[string]byte{
+		"missing":    {},
+		"denied":     {"gateways/" + transportTestGatewayID + "/media/down/#": 0x80},
+		"downgraded": {"gateways/" + transportTestGatewayID + "/media/down/#": 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness()
+			h.clientFn = func(*mqtt.ClientOptions) *fakeClient {
+				return &fakeClient{subscribeFn: func(_ *fakeClient, topic string, qos byte) subscribeToken {
+					if topic == "gateways/"+transportTestGatewayID+"/media/down/#" {
+						return completedSubscribe(result, nil)
+					}
+					return completedSubscribe(map[string]byte{topic: qos}, nil)
+				}}
+			}
+			tr := newTestTransport(t, &recordAdmitter{}, h, func(o *TransportOptions) {
+				o.MediaEnabled = true
+				o.MediaInbox = &recordMediaAdmitter{}
+			})
+			if _, err := tr.connectOnce(context.Background()); err == nil {
+				t.Fatal("media invalid SUBACK accepted")
+			}
+		})
+	}
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{} }
+	tr := newTestTransport(t, &recordAdmitter{}, h, func(o *TransportOptions) {
+		o.MediaEnabled = true
+		o.MediaInbox = &recordMediaAdmitter{}
+	})
+	request := mediaprotocol.UploadRequest{Version: 1, GatewayID: transportTestGatewayID, UploadID: "clip_1", CapturedAt: "2026-11-20T10:00:00Z", ContentType: "video/mp4", SizeBytes: 1, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if err := tr.PublishMedia(context.Background(), request); !errors.Is(err, ErrPublishUnconfirmed) {
+		t.Fatalf("PublishMedia before readiness = %v, want unconfirmed", err)
+	}
+}
+
+func TestControlProfileRequiresQoS1ACKEvenWithMediaOff(t *testing.T) {
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient {
+		return &fakeClient{subscribeFn: func(_ *fakeClient, topic string, qos byte) subscribeToken {
+			if topic == "gateways/"+transportTestGatewayID+"/acks/#" {
+				return completedSubscribe(map[string]byte{topic: 0}, nil)
+			}
+			return completedSubscribe(map[string]byte{topic: qos}, nil)
+		}}
+	}
+	tr := newTestTransport(t, &recordAdmitter{}, h, func(o *TransportOptions) { o.ControlEnabled = true })
+	if _, err := tr.connectOnce(context.Background()); err == nil {
+		t.Fatal("control profile accepted downgraded ACK SUBACK")
+	}
+}
+
+type recordMediaAdmitter struct{ got []admitCall }
+
+func (a *recordMediaAdmitter) Admit(topic string, payload []byte, retained bool) {
+	a.got = append(a.got, admitCall{topic: topic, payload: append([]byte(nil), payload...), retained: retained})
+}
+
+func TestMediaDownlinkRoutesToSeparateInboxAndCopiesPayload(t *testing.T) {
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{} }
+	acks := &recordAdmitter{}
+	media := &recordMediaAdmitter{}
+	tr := newTestTransport(t, acks, h, func(o *TransportOptions) {
+		o.MediaEnabled = true
+		o.MediaInbox = media
+	})
+	lt := primeConnectedLifetime(t, tr)
+	topic := mediaprotocol.UploadGrantTopic(transportTestGatewayID)
+	buf := []byte(`{"version":1}`)
+	tr.onMessage(lt, topic, buf, false, true)
+	buf[0] = 'x'
+	if len(media.got) != 1 || media.got[0].payload[0] != '{' || len(acks.calls()) != 0 {
+		t.Fatalf("media was not isolated/copied: media=%+v ack=%+v", media.got, acks.calls())
+	}
+	tr.onMessage(lt, topic, []byte("retained"), true, true)
+	if len(media.got) != 1 {
+		t.Fatal("retained media delivery reached inbox")
+	}
+}
+
+func TestInvalidMediaCallbacksDoNotOverflowOrReachOtherConsumers(t *testing.T) {
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{} }
+	acks := &recordAdmitter{}
+	media := &recordMediaAdmitter{}
+	tr := newTestTransport(t, acks, h, func(o *TransportOptions) {
+		o.MediaEnabled = true
+		o.MediaInbox = media
+	})
+	lt, err := tr.connectOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		topic    string
+		payload  []byte
+		retained bool
+	}{
+		{mediaprotocol.UploadGrantTopic(transportTestGatewayID), make([]byte, startupPayloadBytes+1), false},
+		{mediaprotocol.UploadGrantTopic(transportTestGatewayID), nil, false},
+		{mediaprotocol.UploadGrantTopic(transportTestGatewayID), []byte("x"), true},
+		{mediaprotocol.UploadGrantTopic("other_gateway"), []byte("x"), false},
+		{mediaprotocol.UploadRequestTopic(transportTestGatewayID), []byte("x"), false},
+	} {
+		tr.onMessage(lt, tc.topic, tc.payload, tc.retained, true)
+	}
+	// A downlink delivered through a non-media subscription callback is not
+	// classified as media based only on its topic prefix.
+	tr.onMessage(lt, mediaprotocol.UploadGrantTopic(transportTestGatewayID), []byte("x"), false, false)
+	if lt.failed.Load() || len(lt.staged) != 0 || len(acks.calls()) != 0 || len(media.got) != 0 {
+		t.Fatalf("invalid media affected lifetime/consumers: failed=%v staged=%d ack=%d media=%d", lt.failed.Load(), len(lt.staged), len(acks.calls()), len(media.got))
+	}
+	tr.onMessage(lt, mediaprotocol.UploadGrantTopic(transportTestGatewayID), []byte(`{"version":1}`), false, true)
+	if len(lt.staged) != 1 || lt.staged[0].media != true {
+		t.Fatalf("valid pre-install media delivery was not staged: %+v", lt.staged)
+	}
+	if !tr.installCurrent(lt) || len(media.got) != 1 || len(acks.calls()) != 0 {
+		t.Fatalf("staged media was not routed separately: media=%d ack=%d", len(media.got), len(acks.calls()))
+	}
+}
+
+func TestIsMediaNamespaceTopic(t *testing.T) {
+	for _, tc := range []struct {
+		topic string
+		want  bool
+	}{
+		{"gateways/media/acks/sensor1/msg1", false},
+		{"gateways/media/commands/sensor1/1", false},
+		{"gateways/media/media/down/upload_grant", true},
+		{"gateways/media/media", true},
+		{"gateways/media", false},
+		{"gateways/gw_001/acks/media/msg1", false},
+		{"gateways/gw_001/commands/sensor/media/1", false},
+		{"gateways/gw_001/media/down/upload_result", true},
+		{"other/media/test", false},
+		{"gateways", false},
+		{"", false},
+	} {
+		if got := isMediaNamespaceTopic(tc.topic); got != tc.want {
+			t.Errorf("isMediaNamespaceTopic(%q) = %v, want %v", tc.topic, got, tc.want)
+		}
+	}
+}
+
+func TestMediaPublishUsesOwnTopicQoS1AndNoRetain(t *testing.T) {
+	h := newHarness()
+	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{} }
+	tr := newTestTransport(t, &recordAdmitter{}, h, func(o *TransportOptions) {
+		o.MediaEnabled = true
+		o.MediaInbox = &recordMediaAdmitter{}
+	})
+	primeConnectedLifetime(t, tr)
+	request := mediaprotocol.UploadRequest{Version: 1, UploadID: "clip_1", CapturedAt: "2026-11-20T10:00:00Z", ContentType: "video/mp4", SizeBytes: 1, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if err := tr.PublishMedia(context.Background(), request); err != nil {
+		t.Fatalf("PublishMedia: %v", err)
+	}
+	client := h.client(0)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.lastPubTopic != mediaprotocol.UploadRequestTopic(transportTestGatewayID) || client.lastPubQoS != 1 || client.lastPubRetained {
+		t.Fatalf("media publish = %q qos=%d retain=%v", client.lastPubTopic, client.lastPubQoS, client.lastPubRetained)
 	}
 }
 
