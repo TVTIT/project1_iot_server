@@ -77,7 +77,9 @@ func TestRequestSignsOnlyCommittedPathAfterConfirm(t *testing.T) {
 	signer := &signerStub{grant: SignedGrant{URL: testSignedURL, ExpiresAt: expires}}
 	pub := &publisherStub{}
 	h := newTestHandler(repo, signer, pub)
-	h.Handle(context.Background(), delivery(`{"version":1,"upload_id":"u1","captured_at":"2026-11-20T10:00:00Z","content_type":"video/mp4","size_bytes":20,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+	if err := h.Handle(context.Background(), delivery(`{"version":1,"upload_id":"u1","captured_at":"2026-11-20T10:00:00Z","content_type":"video/mp4","size_bytes":20,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)); err != nil {
+		t.Fatalf("handle request: %v", err)
+	}
 	if signer.path != "committed.mp4" || len(pub.grants) != 1 || pub.grants[0].Status != mediaprotocol.GrantNeedUpload || pub.grants[0].UploadURL != testSignedURL {
 		t.Fatalf("sign path=%q grants=%+v", signer.path, pub.grants)
 	}
@@ -96,7 +98,14 @@ func TestRequestNoGrantOnDependencyOrRevocationAndDuplicateFence(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			signer, pub := &signerStub{}, &publisherStub{}
-			newTestHandler(tt.repo, signer, pub).Handle(context.Background(), delivery(requestPayload))
+			err := newTestHandler(tt.repo, signer, pub).Handle(context.Background(), delivery(requestPayload))
+			if tt.name == "revoked" {
+				if !errors.Is(err, media.ErrForbidden) {
+					t.Fatalf("handle revoked err=%v, want ErrForbidden", err)
+				}
+			} else if err != nil {
+				t.Fatalf("handle err=%v, want nil", err)
+			}
 			if len(pub.grants) != boolInt(tt.want != "") || (tt.want != "" && pub.grants[0].Status != tt.want) || signer.path != "" {
 				t.Fatalf("grants=%+v path=%q", pub.grants, signer.path)
 			}
@@ -110,7 +119,9 @@ func TestRequestNoGrantOnDependencyOrRevocationAndDuplicateFence(t *testing.T) {
 func TestCompleteReplayPublishesDurableReady(t *testing.T) {
 	repo := &repositoryStub{record: media.Record{MediaID: testMediaID, ValidationStatus: "ready"}}
 	pub := &publisherStub{}
-	newTestHandler(repo, &signerStub{}, pub).Handle(context.Background(), completion("u1"))
+	if err := newTestHandler(repo, &signerStub{}, pub).Handle(context.Background(), completion("u1")); err != nil {
+		t.Fatalf("handle completion: %v", err)
+	}
 	if len(pub.results) != 1 || pub.results[0].Status != mediaprotocol.ResultReady || pub.results[0].MediaID != testMediaID.String() {
 		t.Fatalf("results=%+v", pub.results)
 	}
@@ -129,7 +140,9 @@ func TestRejectedAndExpiredRequestReplayPublishesResult(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			repo := &repositoryStub{record: media.Record{MediaID: testMediaID, ValidationStatus: state}}
 			pub := &publisherStub{}
-			newTestHandler(repo, &signerStub{}, pub).Handle(context.Background(), delivery(requestPayload))
+			if err := newTestHandler(repo, &signerStub{}, pub).Handle(context.Background(), delivery(requestPayload)); err != nil {
+				t.Fatalf("handle replay: %v", err)
+			}
 			if len(pub.results) != 1 || len(pub.grants) != 0 {
 				t.Fatalf("results=%+v grants=%+v", pub.results, pub.grants)
 			}
@@ -140,7 +153,9 @@ func TestRejectedAndExpiredRequestReplayPublishesResult(t *testing.T) {
 func TestReadyRequestReplayAndFailedConfirmNeverPublishURL(t *testing.T) {
 	readyRepo := &repositoryStub{record: media.Record{MediaID: testMediaID, ValidationStatus: "ready"}}
 	readyPub := &publisherStub{}
-	newTestHandler(readyRepo, &signerStub{}, readyPub).Handle(context.Background(), delivery(requestPayload))
+	if err := newTestHandler(readyRepo, &signerStub{}, readyPub).Handle(context.Background(), delivery(requestPayload)); err != nil {
+		t.Fatalf("handle ready replay: %v", err)
+	}
 	if len(readyPub.results) != 1 || readyPub.results[0].Status != mediaprotocol.ResultReady {
 		t.Fatalf("ready replay results=%+v", readyPub.results)
 	}
@@ -152,7 +167,9 @@ func TestReadyRequestReplayAndFailedConfirmNeverPublishURL(t *testing.T) {
 		reserveStat: media.GrantNeedUpload, confirmOK: false,
 	}
 	pub := &publisherStub{}
-	newTestHandler(repo, &signerStub{grant: SignedGrant{URL: testSignedURL, ExpiresAt: expires}}, pub).Handle(context.Background(), delivery(requestPayload))
+	if err := newTestHandler(repo, &signerStub{grant: SignedGrant{URL: testSignedURL, ExpiresAt: expires}}, pub).Handle(context.Background(), delivery(requestPayload)); err != nil {
+		t.Fatalf("handle unconfirmed grant: %v", err)
+	}
 	if len(pub.grants) != 0 {
 		t.Fatalf("published unconfirmed grant: %+v", pub.grants)
 	}

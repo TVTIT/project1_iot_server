@@ -147,7 +147,7 @@ type leaseTrackingStorageFake struct {
 	currentTime time.Time
 }
 
-func (s *leaseTrackingStorageFake) Delete(ctx context.Context, _ string) error {
+func (s *leaseTrackingStorageFake) Delete(_ context.Context, _ string) error {
 	s.mu.Lock()
 	s.currentTime = s.currentTime.Add(s.deleteDelay)
 	s.mu.Unlock()
@@ -165,11 +165,11 @@ type leaseTrackingRepoFake struct {
 	expiredCalls int
 }
 
-func (r *leaseTrackingRepoFake) ExpireDue(ctx context.Context, _ int) (int, error) {
+func (r *leaseTrackingRepoFake) ExpireDue(_ context.Context, _ int) (int, error) {
 	return 0, nil
 }
 
-func (r *leaseTrackingRepoFake) ClaimDueCleanup(ctx context.Context, limit int, lease time.Duration) ([]media.CleanupClaim, error) {
+func (r *leaseTrackingRepoFake) ClaimDueCleanup(_ context.Context, limit int, lease time.Duration) ([]media.CleanupClaim, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if limit > r.maxBatchSize {
@@ -194,11 +194,11 @@ func (r *leaseTrackingRepoFake) ClaimDueCleanup(ctx context.Context, limit int, 
 	return claimed, nil
 }
 
-func (r *leaseTrackingRepoFake) ScheduleCleanupRetry(ctx context.Context, c media.CleanupClaim, _ time.Duration, _ string) error {
+func (r *leaseTrackingRepoFake) ScheduleCleanupRetry(_ context.Context, _ media.CleanupClaim, _ time.Duration, _ string) error {
 	return nil
 }
 
-func (r *leaseTrackingRepoFake) ConfirmCleanup(ctx context.Context, c media.CleanupClaim) error {
+func (r *leaseTrackingRepoFake) ConfirmCleanup(_ context.Context, c media.CleanupClaim) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	claimedAt := r.claimTimes[c.Path]

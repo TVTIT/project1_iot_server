@@ -35,8 +35,8 @@ type ContentEvidence struct {
 	MediaType  string
 }
 
-// ContentError.Code is safe to persist or return. Retryable is true only for
-// an I/O failure reading the Storage response, never for malformed bytes.
+// ContentError represents an error verifying media content where Code is safe to persist or return.
+// Retryable is true only for an I/O failure reading the Storage response, never for malformed bytes.
 type ContentError struct {
 	Code      string
 	Retryable bool
@@ -44,6 +44,7 @@ type ContentError struct {
 
 func (e *ContentError) Error() string { return e.Code }
 
+// VerifyContent inspects the stream to verify MP4 structure, box constraints, size, and hash against metadata.
 func VerifyContent(src io.Reader, metadata ContentMetadata) (ContentEvidence, error) {
 	if src == nil {
 		return ContentEvidence{}, &ContentError{Code: "STORAGE_UNAVAILABLE", Retryable: true}
@@ -65,6 +66,7 @@ func VerifyContent(src io.Reader, metadata ContentMetadata) (ContentEvidence, er
 	var haveFTYP, haveMOOV, haveMDAT, haveAVC bool
 	var mdatRanges []byteRange
 	var avcSampleRanges []byteRange
+scanLoop:
 	for {
 		start := stream.n
 		var header [8]byte
@@ -78,14 +80,15 @@ func VerifyContent(src io.Reader, metadata ContentMetadata) (ContentEvidence, er
 		boxSize := uint64(binary.BigEndian.Uint32(header[:4]))
 		boxType := string(header[4:])
 		headerSize := uint64(8)
-		if boxSize == 1 {
+		switch boxSize {
+		case 1:
 			var extended [8]byte
 			if _, err = io.ReadFull(stream, extended[:]); err != nil {
 				return ContentEvidence{}, classifyStreamError(stream, err)
 			}
 			boxSize = binary.BigEndian.Uint64(extended[:])
 			headerSize = 16
-		} else if boxSize == 0 {
+		case 0:
 			// Size zero extends to EOF. Only the final mdat is useful here.
 			if boxType != "mdat" {
 				return ContentEvidence{}, invalidMP4()
@@ -99,11 +102,11 @@ func VerifyContent(src io.Reader, metadata ContentMetadata) (ContentEvidence, er
 		if boxSize == math.MaxUint64 {
 			payloadSize = uint64(MaxVerifiedBytes) + 1
 		}
-		if boxType == "moof" {
+		switch boxType {
+		case "moof":
 			// Fragmented MP4 is not supported in this finalized profile.
 			return ContentEvidence{}, invalidMP4()
-		}
-		if boxType == "ftyp" {
+		case "ftyp":
 			if haveFTYP || payloadSize > maxFTYPBytes {
 				return ContentEvidence{}, invalidMP4()
 			}
@@ -115,7 +118,7 @@ func VerifyContent(src io.Reader, metadata ContentMetadata) (ContentEvidence, er
 				return ContentEvidence{}, invalidMP4()
 			}
 			haveFTYP = true
-		} else if boxType == "moov" {
+		case "moov":
 			if haveMOOV || payloadSize > maxMOOVBytes {
 				return ContentEvidence{}, invalidMP4()
 			}
@@ -129,52 +132,50 @@ func VerifyContent(src io.Reader, metadata ContentMetadata) (ContentEvidence, er
 				avcSampleRanges = append(avcSampleRanges, samples...)
 			}
 			haveMOOV = true
-		} else {
-			if boxType == "mdat" {
-				if len(mdatRanges) >= maxMdatBoxes {
-					return ContentEvidence{}, invalidMP4()
+		case "mdat":
+			if len(mdatRanges) >= maxMdatBoxes {
+				return ContentEvidence{}, invalidMP4()
+			}
+			payloadStart := stream.n
+			if boxSize == math.MaxUint64 {
+				// Drain to EOF with the global cap; no file-sized allocation.
+				drained, err := io.Copy(io.Discard, stream)
+				if err != nil {
+					return ContentEvidence{}, classifyStreamError(stream, err)
 				}
-				payloadStart := stream.n
-				if boxSize == math.MaxUint64 {
-					// Drain to EOF with the global cap; no file-sized allocation.
-					drained, err := io.Copy(io.Discard, stream)
-					if err != nil {
-						return ContentEvidence{}, classifyStreamError(stream, err)
-					}
-					payloadEnd := payloadStart + drained
-					if payloadEnd <= payloadStart {
-						return ContentEvidence{}, invalidMP4()
-					}
-					haveMDAT = true
-					mdatRanges = append(mdatRanges, byteRange{start: payloadStart, end: payloadEnd})
-					break
-				}
-				if payloadSize == 0 || payloadSize > math.MaxInt64 {
-					return ContentEvidence{}, invalidMP4()
-				}
-				payloadEnd := payloadStart + int64(payloadSize)
+				payloadEnd := payloadStart + drained
 				if payloadEnd <= payloadStart {
 					return ContentEvidence{}, invalidMP4()
 				}
 				haveMDAT = true
 				mdatRanges = append(mdatRanges, byteRange{start: payloadStart, end: payloadEnd})
-				if _, err = io.CopyN(io.Discard, stream, int64(payloadSize)); err != nil {
+				break scanLoop
+			}
+			if payloadSize == 0 || payloadSize > math.MaxInt64 {
+				return ContentEvidence{}, invalidMP4()
+			}
+			payloadEnd := payloadStart + int64(payloadSize)
+			if payloadEnd <= payloadStart {
+				return ContentEvidence{}, invalidMP4()
+			}
+			haveMDAT = true
+			mdatRanges = append(mdatRanges, byteRange{start: payloadStart, end: payloadEnd})
+			if _, err = io.CopyN(io.Discard, stream, int64(payloadSize)); err != nil {
+				return ContentEvidence{}, classifyStreamError(stream, err)
+			}
+		default:
+			if boxSize == math.MaxUint64 {
+				_, err = io.Copy(io.Discard, stream)
+				if err != nil {
 					return ContentEvidence{}, classifyStreamError(stream, err)
 				}
-			} else {
-				if boxSize == math.MaxUint64 {
-					_, err = io.Copy(io.Discard, stream)
-					if err != nil {
-						return ContentEvidence{}, classifyStreamError(stream, err)
-					}
-					break
-				}
-				if payloadSize > math.MaxInt64 {
-					return ContentEvidence{}, invalidMP4()
-				}
-				if _, err = io.CopyN(io.Discard, stream, int64(payloadSize)); err != nil {
-					return ContentEvidence{}, classifyStreamError(stream, err)
-				}
+				break scanLoop
+			}
+			if payloadSize > math.MaxInt64 {
+				return ContentEvidence{}, invalidMP4()
+			}
+			if _, err = io.CopyN(io.Discard, stream, int64(payloadSize)); err != nil {
+				return ContentEvidence{}, classifyStreamError(stream, err)
 			}
 		}
 		if stream.n <= start {
@@ -291,13 +292,14 @@ func boxes(data []byte) ([]bmffBox, bool) {
 		}
 		size := uint64(binary.BigEndian.Uint32(data[:4]))
 		header := uint64(8)
-		if size == 1 {
+		switch size {
+		case 1:
 			if len(data) < 16 {
 				return nil, false
 			}
 			size = binary.BigEndian.Uint64(data[8:16])
 			header = 16
-		} else if size == 0 {
+		case 0:
 			return nil, false
 		}
 		if size < header || size > uint64(len(data)) {

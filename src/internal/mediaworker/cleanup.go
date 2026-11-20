@@ -8,6 +8,7 @@ import (
 	"iot-platform/internal/media"
 )
 
+// CleanupRepository abstracts database interactions required for claiming and tracking object cleanups.
 type CleanupRepository interface {
 	ExpireDue(context.Context, int) (int, error)
 	ClaimDueCleanup(context.Context, int, time.Duration) ([]media.CleanupClaim, error)
@@ -15,10 +16,12 @@ type CleanupRepository interface {
 	ConfirmCleanup(context.Context, media.CleanupClaim) error
 }
 
+// ObjectDeleter abstracts storage deletion for rejected and expired media objects.
 type ObjectDeleter interface {
 	Delete(context.Context, string) error
 }
 
+// CleanupOptions provides worker pool and retry parameters for background cleanup processing.
 type CleanupOptions struct {
 	Workers                                                         int
 	BatchSize                                                       int
@@ -27,6 +30,7 @@ type CleanupOptions struct {
 	Lease                                                           time.Duration
 }
 
+// CleanupWorker coordinates scheduled deletion of expired and rejected media objects from storage.
 type CleanupWorker struct {
 	repo    CleanupRepository
 	storage ObjectDeleter
@@ -36,10 +40,12 @@ type CleanupWorker struct {
 	done    chan struct{}
 }
 
+// NewCleanupWorker constructs a background cleanup worker bound to repository and storage deleters.
 func NewCleanupWorker(repo CleanupRepository, storage ObjectDeleter, opts CleanupOptions) *CleanupWorker {
 	return &CleanupWorker{repo: repo, storage: storage, opts: opts}
 }
 
+// Options returns a copy of the cleanup worker's configured options.
 func (w *CleanupWorker) Options() CleanupOptions {
 	if w == nil {
 		return CleanupOptions{}
@@ -47,6 +53,7 @@ func (w *CleanupWorker) Options() CleanupOptions {
 	return w.opts
 }
 
+// Start begins the cleanup worker's background scanning loop.
 func (w *CleanupWorker) Start(ctx context.Context) error {
 	if w == nil || ctx == nil || w.repo == nil || w.storage == nil || w.opts.BatchSize < 1 ||
 		w.opts.BatchSize > 64 || w.opts.ScanInterval <= 0 || w.opts.StorageTimeout <= 0 ||
@@ -106,10 +113,7 @@ func (w *CleanupWorker) scan(ctx context.Context) {
 	var claimedCount int
 	var mu sync.Mutex
 
-	for {
-		if ctx.Err() != nil {
-			break
-		}
+	for ctx.Err() == nil {
 		mu.Lock()
 		if claimedCount >= w.opts.BatchSize {
 			mu.Unlock()
@@ -185,6 +189,7 @@ func (w *CleanupWorker) retryDelay(attempt int) time.Duration {
 	return delay
 }
 
+// Close signals the cleanup worker to stop and waits for in-flight cleanup jobs to finish or context cancellation.
 func (w *CleanupWorker) Close(ctx context.Context) error {
 	if w == nil {
 		return nil

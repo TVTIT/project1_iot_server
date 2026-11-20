@@ -15,10 +15,13 @@ import (
 	"iot-platform/internal/mqttmedia"
 )
 
+// ErrInvalidDelivery indicates an unparseable, malformed, or out-of-order delivery.
 var ErrInvalidDelivery = errors.New("invalid media delivery")
 
+// Delivery aliases the transport-level MQTT inbound delivery type.
 type Delivery = mqttmedia.Delivery
 
+// Repository defines the repository methods required by the media worker handler.
 type Repository interface {
 	Admit(context.Context, media.Admission) (media.Record, error)
 	ReserveGrant(context.Context, media.GrantRequest) (media.GrantReservation, media.GrantStatus, error)
@@ -26,27 +29,35 @@ type Repository interface {
 	Complete(context.Context, string, string) (media.Record, error)
 }
 
+// SignedGrant carries the ephemeral signed URL and its expiry from the signer.
 type SignedGrant struct {
 	URL       string
 	ExpiresAt time.Time
 }
 
-func (SignedGrant) String() string   { return "mediaworker.SignedGrant{redacted}" }
+func (SignedGrant) String() string { return "mediaworker.SignedGrant{redacted}" }
+
+// GoString returns a redacted string representation of SignedGrant to prevent token leakage.
 func (SignedGrant) GoString() string { return "mediaworker.SignedGrant{redacted}" }
 
+// Signer abstracts generation of ephemeral upload URLs for storage paths.
 type Signer interface {
 	SignUpload(context.Context, string) (SignedGrant, error)
 }
+
+// Publisher abstracts publishing media messages back to MQTT.
 type Publisher interface {
 	Publish(context.Context, any) error
 }
 
+// Options configures handler concurrency, timeouts, and grant horizons.
 type Options struct {
 	Workers                                 int
 	SigningTimeout, GrantTTL, InFlightGrace time.Duration
 	PublishTimeout                          time.Duration
 }
 
+// Handler processes media upload requests and completion messages received over MQTT.
 type Handler struct {
 	repo      Repository
 	signer    Signer
@@ -57,10 +68,12 @@ type Handler struct {
 	done      chan struct{}
 }
 
+// New constructs a new media worker Handler with the provided dependencies and options.
 func New(repo Repository, signer Signer, publisher Publisher, opts Options) *Handler {
 	return &Handler{repo: repo, signer: signer, publisher: publisher, opts: opts}
 }
 
+// Start spawns worker goroutines to consume deliveries from the provided input channel.
 func (h *Handler) Start(ctx context.Context, input <-chan Delivery) error {
 	if h == nil || ctx == nil || h.repo == nil || h.signer == nil || h.publisher == nil || input == nil ||
 		h.opts.Workers < 1 || h.opts.Workers > 4 ||
@@ -99,6 +112,7 @@ func (h *Handler) Start(ctx context.Context, input <-chan Delivery) error {
 	return nil
 }
 
+// Stop cancels worker execution without waiting for completion.
 func (h *Handler) Stop() {
 	if h == nil {
 		return
@@ -111,6 +125,7 @@ func (h *Handler) Stop() {
 	}
 }
 
+// Close stops the handler and waits for all active worker goroutines to exit or context expiration.
 func (h *Handler) Close(ctx context.Context) error {
 	if h == nil {
 		return nil

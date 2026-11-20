@@ -11,6 +11,7 @@ import (
 	"iot-platform/internal/mediastorage"
 )
 
+// VerificationRepository defines the repository methods required for media object verification.
 type VerificationRepository interface {
 	ClaimDueVerification(context.Context, int, time.Duration) ([]media.Record, error)
 	FinishVerification(context.Context, media.VerificationGeneration, *media.VerifiedEvidence, string) (media.Record, error)
@@ -18,20 +19,24 @@ type VerificationRepository interface {
 	RecordMissingResult(context.Context, media.VerificationGeneration) (media.Record, bool, error)
 }
 
+// ObjectOpener abstracts opening an authenticated storage object stream for verification.
 type ObjectOpener interface {
 	Open(context.Context, string) (*mediastorage.Object, error)
 }
 
+// VerificationPublisher abstracts publishing verification outcome results.
 type VerificationPublisher interface {
 	PublishResult(context.Context, mediaprotocol.UploadResult) error
 }
 
+// VerifierOptions configures the verifier worker pool, scan intervals, and lease parameters.
 type VerifierOptions struct {
 	Workers, BatchSize, MaxAttempts int
 	ScanInterval, StorageTimeout    time.Duration
 	RetryMin, RetryMax, Lease       time.Duration
 }
 
+// Verifier coordinates background leasing and verification of uploaded media objects.
 type Verifier struct {
 	repo      VerificationRepository
 	storage   ObjectOpener
@@ -43,10 +48,12 @@ type Verifier struct {
 	done   chan struct{}
 }
 
+// NewVerifier constructs a new media Verifier with the specified repository, storage opener, and publisher.
 func NewVerifier(repo VerificationRepository, storage ObjectOpener, publisher VerificationPublisher, opts VerifierOptions) *Verifier {
 	return &Verifier{repo: repo, storage: storage, publisher: publisher, opts: opts}
 }
 
+// Start launches the background polling loop and worker pool for verifying pending media objects.
 func (v *Verifier) Start(ctx context.Context) error {
 	if v == nil || ctx == nil || v.repo == nil || v.storage == nil || v.publisher == nil ||
 		v.opts.Workers < 1 || v.opts.Workers > 8 || v.opts.BatchSize < 1 ||
@@ -165,6 +172,7 @@ func (v *Verifier) retry(ctx context.Context, claim media.VerificationGeneration
 	}
 }
 
+// Stop cancels the verifier's execution loop without waiting for completion.
 func (v *Verifier) Stop() {
 	if v == nil {
 		return
@@ -177,6 +185,7 @@ func (v *Verifier) Stop() {
 	}
 }
 
+// Close stops the verifier and waits for in-flight verification jobs to finish or context cancellation.
 func (v *Verifier) Close(ctx context.Context) error {
 	if v == nil {
 		return nil
