@@ -3077,7 +3077,7 @@ class ModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = smoke.prepare(Path(directory) / "fixture")
             text = fixture.override.read_text()
-            for name in ("rathole", "supabase-storage", "cloudflared"):
+            for name in ("rathole", "frpc", "supabase-storage", "cloudflared"):
                 self.assertIn("  " + name + ": !reset null", text)
             self.assertIn("\nvolumes: !override\n", text)
             self.assertIn("\nnetworks: !override\n", text)

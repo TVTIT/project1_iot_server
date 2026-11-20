@@ -1214,7 +1214,7 @@ def prepare(base, paper_p0=False, paper_p1=None, metrics_enabled=True, paper_p2_
     extras = template[template.index("  nginx:"):resource_offset]
     blocks = re.split(r"(?m)^  ([a-z][a-z-]+):\n", extras)
     extra_by_service = dict(zip(blocks[1::2], blocks[2::2]))
-    stanzas = ["services:\n  rathole: !reset null\n  cloudflared: !reset null\n"]
+    stanzas = ["services:\n  rathole: !reset null\n  frpc: !reset null\n  cloudflared: !reset null\n"]
     if not paper_profile:
         stanzas.append("  supabase-storage: !reset null\n")
     services = SERVICES[:-2] + ('supabase-storage',) + SERVICES[-2:] if paper_profile else SERVICES
