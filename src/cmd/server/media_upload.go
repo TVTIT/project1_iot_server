@@ -81,6 +81,15 @@ func composeMediaRuntime(cfg config.Config, pool *pgxpool.Pool) (mediaRuntime, e
 		defer func() { stopClose(); client.Close() }()
 		return client.VerifyBackendACL(ctx, data.Username, data.ClientID, true)
 	}
+	verifyWorkers := cfg.MediaUpload.VerifyWorkers
+	verifyBatch := cfg.MediaUpload.VerifyBatchSize
+	if verifyBatch > verifyWorkers {
+		verifyBatch = verifyWorkers
+	}
+	lease := cfg.MediaUpload.StorageTimeout + time.Duration(verifyWorkers+2)*cfg.MediaUpload.DBTimeout
+	if lease <= cfg.MediaUpload.StorageTimeout || lease > 10*time.Minute {
+		return mediaRuntime{}, fmt.Errorf("media verification lease exceeds its bounded maximum")
+	}
 	transport, err := mqttmedia.NewTransport(data)
 	if err != nil {
 		return mediaRuntime{}, err
@@ -90,16 +99,6 @@ func composeMediaRuntime(cfg config.Config, pool *pgxpool.Pool) (mediaRuntime, e
 		SigningTimeout: cfg.MediaRuntime.SigningTimeout, GrantTTL: cfg.MediaRuntime.GrantTTL,
 		InFlightGrace: cfg.MediaRuntime.InFlightGrace, PublishTimeout: data.PublishTimeout,
 	})
-	verifyWorkers := cfg.MediaUpload.VerifyWorkers
-	verifyBatch := cfg.MediaUpload.VerifyBatchSize
-	if verifyBatch > verifyWorkers {
-		verifyBatch = verifyWorkers
-	}
-	lease := cfg.MediaUpload.StorageTimeout + time.Duration(verifyWorkers+2)*cfg.MediaUpload.DBTimeout
-	if lease <= cfg.MediaUpload.StorageTimeout || lease > 10*time.Minute {
-		transport.Close(context.Background())
-		return mediaRuntime{}, fmt.Errorf("media verification lease exceeds its bounded maximum")
-	}
 	verifier := mediaworker.NewVerifier(repo, storage, handler, mediaworker.VerifierOptions{
 		Workers: verifyWorkers, BatchSize: verifyBatch, MaxAttempts: cfg.MediaUpload.VerifyMaxAttempts,
 		ScanInterval: cfg.MediaUpload.VerifyScanInterval, StorageTimeout: cfg.MediaUpload.StorageTimeout,
@@ -183,10 +182,8 @@ func (r mediaRuntime) stop() {
 	if r.verifier != nil {
 		r.verifier.Stop()
 	}
-	if r.cleanup != nil {
-		// Close performs cancellation and join; deferred until close to preserve
-		// the existing non-blocking stop phase.
-	}
+	// Close performs cancellation and join for cleanup; deferred until close to
+	// preserve the existing non-blocking stop phase.
 }
 
 func (r mediaRuntime) close(ctx context.Context) error {

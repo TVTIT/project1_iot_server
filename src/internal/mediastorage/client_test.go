@@ -52,7 +52,9 @@ func TestSignUploadBuildsPublicURLAndExpiry(t *testing.T) {
 		if r.Header.Get("x-upsert") != "false" || r.Header.Get("Content-Type") != "video/mp4" {
 			t.Errorf("unexpected signing headers: %#v", r.Header)
 		}
-		fmt.Fprintf(w, `{"url":%q,"token":%q}`, signedPath, token)
+		if _, err := fmt.Fprintf(w, `{"url":%q,"token":%q}`, signedPath, token); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -84,7 +86,7 @@ func TestSignUploadRejectsInvalidResponseAndExpiry(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				body := tt.response
 				if tt.name == "expired token" {
 					expired := jwtWithExp(time.Now().Add(-time.Minute).Unix())
@@ -100,7 +102,9 @@ func TestSignUploadRejectsInvalidResponseAndExpiry(t *testing.T) {
 					farFuture := jwtWithExp(time.Now().Add(48 * time.Hour).Unix())
 					body = fmt.Sprintf(`{"url":"/object/upload/sign/media-video/2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4?token=%s","token":%q}`, farFuture, farFuture)
 				}
-				fmt.Fprint(w, body)
+				if _, err := fmt.Fprint(w, body); err != nil {
+					t.Errorf("write response: %v", err)
+				}
 			}))
 			defer server.Close()
 			_, err := client.SignUpload(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
@@ -113,9 +117,11 @@ func TestSignUploadRejectsInvalidResponseAndExpiry(t *testing.T) {
 
 func TestSignUploadRedactsResponseAndRequestFailure(t *testing.T) {
 	secret := "do-not-leak-token"
-	client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprint(w, secret)
+		if _, err := fmt.Fprint(w, secret); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 	_, err := client.SignUpload(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
@@ -134,14 +140,20 @@ func TestOpenStreamsAuthenticatedObjectAndDistinguishesNotFound(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "video/mp4")
 		w.Header().Set("Content-Length", "4")
-		io.WriteString(w, "data")
+		if _, err := io.WriteString(w, "data"); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 	obj, err := client.Open(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer obj.Body.Close()
+	defer func() {
+		if err := obj.Body.Close(); err != nil {
+			t.Errorf("close object body: %v", err)
+		}
+	}()
 	if obj.ContentType != "video/mp4" || obj.ContentLength != 4 {
 		t.Fatalf("unexpected metadata: %#v", obj)
 	}
@@ -150,9 +162,11 @@ func TestOpenStreamsAuthenticatedObjectAndDistinguishesNotFound(t *testing.T) {
 		t.Fatalf("unexpected body %q", body)
 	}
 
-	missing, missingServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	missing, missingServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprint(w, `{"statusCode":"404","error":"not_found","message":"Object not found","code":"NoSuchKey"}`)
+		if _, err := fmt.Fprint(w, `{"statusCode":"404","error":"not_found","message":"Object not found","code":"NoSuchKey"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer missingServer.Close()
 	_, err = missing.Open(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
@@ -183,7 +197,9 @@ func TestDeleteOnlyTreatsObjectNoSuchKeyAsIdempotent(t *testing.T) {
 					t.Errorf("unexpected delete request")
 				}
 				w.WriteHeader(tc.status)
-				fmt.Fprint(w, tc.body)
+				if _, err := fmt.Fprint(w, tc.body); err != nil {
+					t.Errorf("write response: %v", err)
+				}
 			}))
 			defer server.Close()
 			err := client.Delete(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
@@ -201,9 +217,11 @@ func TestStorageMissingRequiresMachineCodedNoSuchKey(t *testing.T) {
 		`not json`,
 		`{"statusCode":"404","code":"NoSuchKey"}`,
 	} {
-		client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, body)
+			if _, err := fmt.Fprint(w, body); err != nil {
+				t.Errorf("write response: %v", err)
+			}
 		}))
 		_, err := client.Open(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
 		server.Close()
@@ -214,9 +232,11 @@ func TestStorageMissingRequiresMachineCodedNoSuchKey(t *testing.T) {
 }
 
 func TestStorageReadMapsNativeNoSuchKeyBadRequest(t *testing.T) {
-	client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"statusCode":"404","error":"not_found","message":"Object not found","code":"NoSuchKey"}`)
+		if _, err := fmt.Fprint(w, `{"statusCode":"404","error":"not_found","message":"Object not found","code":"NoSuchKey"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 	_, err := client.Open(context.Background(), "2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4")
@@ -227,9 +247,11 @@ func TestStorageReadMapsNativeNoSuchKeyBadRequest(t *testing.T) {
 
 func TestSensitiveValuesAreFmtAndJSONSafe(t *testing.T) {
 	token := jwtWithExp(time.Now().Add(time.Minute).Unix())
-	client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"url":"/object/upload/sign/media-video/2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4?token=%s","token":%q}`,
-			token, token)
+	client, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := fmt.Fprintf(w, `{"url":"/object/upload/sign/media-video/2fbc3f6f-6fb8-4b6e-8f2e-0c0e5e560bbb.mp4?token=%s","token":%q}`,
+			token, token); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 	cfg := Config{InternalBaseURL: server.URL + "/storage/v1", PublicOrigin: "https://media.example.test", ServiceToken: "private-storage-token"}
@@ -278,7 +300,7 @@ func TestRejectsInvalidOwnedPathAndDoesNotFollowRedirects(t *testing.T) {
 }
 
 func TestStorageRequestTimeout(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}))
 	defer server.Close()
@@ -324,7 +346,11 @@ func TestOpenStreamHonorsCallerCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel()
-	defer object.Body.Close()
+	defer func() {
+		if err := object.Body.Close(); err != nil {
+			t.Errorf("close object body: %v", err)
+		}
+	}()
 	if _, err := io.ReadAll(object.Body); err == nil {
 		t.Fatal("expected canceled stream read")
 	}
@@ -361,18 +387,18 @@ func TestStorageClientTransportProxyExplicitlyDisabled(t *testing.T) {
 func TestStorageClientIgnoresEnvironmentProxySubprocess(t *testing.T) {
 	if os.Getenv("TEST_STORAGE_PROXY_SUBPROCESS") == "1" {
 		var proxyRequests int32
-		dummyProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dummyProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			atomic.AddInt32(&proxyRequests, 1)
 			w.WriteHeader(http.StatusBadGateway)
 		}))
 		defer dummyProxy.Close()
 
-		os.Setenv("HTTP_PROXY", dummyProxy.URL)
-		os.Setenv("http_proxy", dummyProxy.URL)
-		os.Setenv("ALL_PROXY", dummyProxy.URL)
-		os.Setenv("all_proxy", dummyProxy.URL)
-		os.Setenv("NO_PROXY", "")
-		os.Setenv("no_proxy", "")
+		t.Setenv("HTTP_PROXY", dummyProxy.URL)
+		t.Setenv("http_proxy", dummyProxy.URL)
+		t.Setenv("ALL_PROXY", dummyProxy.URL)
+		t.Setenv("all_proxy", dummyProxy.URL)
+		t.Setenv("NO_PROXY", "")
+		t.Setenv("no_proxy", "")
 
 		client, err := New(Config{
 			InternalBaseURL: "http://supabase-storage.internal:5000/storage/v1",

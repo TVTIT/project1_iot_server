@@ -12,6 +12,7 @@ import (
 	"iot-platform/internal/mqttingress"
 )
 
+// MediaRuntimeConfig defines the runtime options for media MQTT transport, Storage client, and worker pools.
 type MediaRuntimeConfig struct {
 	Data                                                         mqttingress.TransportOptions
 	Management                                                   mqttcredential.DynSecConfig
@@ -20,7 +21,9 @@ type MediaRuntimeConfig struct {
 	Workers                                                      int
 }
 
-func (MediaRuntimeConfig) String() string     { return "MediaRuntimeConfig{redacted}" }
+func (MediaRuntimeConfig) String() string { return "MediaRuntimeConfig{redacted}" }
+
+// GoString returns a redacted string representation of MediaRuntimeConfig to prevent credential leakage.
 func (c MediaRuntimeConfig) GoString() string { return c.String() }
 
 func loadMediaRuntime(lookup LookupFunc, enabled bool) (MediaRuntimeConfig, error) {

@@ -14,14 +14,17 @@ import (
 	"iot-platform/internal/mqttingress"
 )
 
+// Topic filter and capacity limits for media uplink MQTT transport.
 const (
 	UploadFilter  = "gateways/+/media/up/#"
 	queueCapacity = 128
 	maxTopicBytes = 256
 )
 
+// ErrInvalidMessage indicates a rejected, malformed, or out-of-order MQTT media message.
 var ErrInvalidMessage = errors.New("mqtt media: invalid message")
 
+// Delivery encapsulates an admitted media MQTT message along with arrival metadata.
 type Delivery struct {
 	Topic      string
 	Payload    []byte
@@ -76,6 +79,7 @@ func (t *Transport) Admit(topic string, payload []byte, at time.Time, retained b
 	}
 }
 
+// Messages exposes the receive-only channel of admitted inbound deliveries.
 func (t *Transport) Messages() <-chan Delivery { return t.queue }
 
 // Publish accepts only typed media downlink messages.
@@ -90,11 +94,13 @@ func (t *Transport) Publish(ctx context.Context, message any) error {
 	}
 }
 
+// StopIntake disables new message admissions and terminates the reconnect supervisor.
 func (t *Transport) StopIntake() {
 	t.stopped.Store(true)
 	t.StopReconnect()
 }
 
+// PublishGrant encodes and publishes an upload grant message to the gateway's downlink topic.
 func (t *Transport) PublishGrant(ctx context.Context, grant mediaprotocol.UploadGrant) error {
 	topic := mediaprotocol.UploadGrantTopic(grant.GatewayID)
 	payload, err := mediaprotocol.Encode(topic, grant)
@@ -113,6 +119,7 @@ func (t *Transport) PublishGrant(ctx context.Context, grant mediaprotocol.Upload
 	return t.wire.Publish(ctx, mqttingress.Delivery{Topic: topic, Payload: payload, QoS: mediaprotocol.WireQoS, Retained: false})
 }
 
+// PublishResult encodes and publishes a verification result message to the gateway's downlink topic.
 func (t *Transport) PublishResult(ctx context.Context, result mediaprotocol.UploadResult) error {
 	topic := mediaprotocol.UploadResultTopic(result.GatewayID)
 	payload, err := mediaprotocol.Encode(topic, result)

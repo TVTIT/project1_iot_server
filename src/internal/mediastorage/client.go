@@ -27,11 +27,13 @@ const (
 	maxGrantHorizon    = 24 * time.Hour
 )
 
+// ErrNotFound indicates that the requested object does not exist in storage.
 var (
 	ErrNotFound  = errors.New("storage object not found")
 	objectPathRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$`)
 )
 
+// Config provides connection settings, origins, and timeout configuration for the Storage client.
 type Config struct {
 	// InternalBaseURL is the trusted Storage API base, normally ending in
 	// /storage/v1. It is never used to construct a client-facing URL.
@@ -42,9 +44,12 @@ type Config struct {
 	Timeout      time.Duration
 }
 
-func (Config) String() string   { return "mediastorage.Config{redacted}" }
+func (Config) String() string { return "mediastorage.Config{redacted}" }
+
+// GoString returns a redacted string representation of Config.
 func (Config) GoString() string { return "mediastorage.Config{redacted}" }
 
+// Client manages interactions with Supabase Storage for object signing, streaming, and deletion.
 type Client struct {
 	internal *url.URL
 	public   *url.URL
@@ -52,9 +57,12 @@ type Client struct {
 	http     *http.Client
 }
 
-func (*Client) String() string   { return "mediastorage.Client{redacted}" }
+func (*Client) String() string { return "mediastorage.Client{redacted}" }
+
+// GoString returns a redacted string representation of Client.
 func (*Client) GoString() string { return "mediastorage.Client{redacted}" }
 
+// UploadGrant holds the signed upload URL and expiry for a granted media upload.
 type UploadGrant struct {
 	url       string
 	ExpiresAt time.Time
@@ -64,15 +72,19 @@ type UploadGrant struct {
 // exported field, so fmt and JSON struct formatting do not reveal its token.
 func (g UploadGrant) SignedURL() string { return g.url }
 
-func (UploadGrant) String() string   { return "mediastorage.UploadGrant{redacted}" }
+func (UploadGrant) String() string { return "mediastorage.UploadGrant{redacted}" }
+
+// GoString returns a redacted string representation of UploadGrant.
 func (UploadGrant) GoString() string { return "mediastorage.UploadGrant{redacted}" }
 
+// Object represents an authenticated media object opened from storage for verification reading.
 type Object struct {
 	Body          io.ReadCloser
 	ContentType   string
 	ContentLength int64
 }
 
+// New constructs and validates a new Supabase Storage client with hardened transports.
 func New(cfg Config) (*Client, error) {
 	internal, err := url.Parse(cfg.InternalBaseURL)
 	if err != nil || (internal.Scheme != "http" && internal.Scheme != "https") ||
@@ -131,6 +143,7 @@ func newPrivateStorageTransport() *http.Transport {
 	}
 }
 
+// SignUpload requests an ephemeral upload URL from the storage service for the given object path.
 func (c *Client) SignUpload(ctx context.Context, objectPath string) (UploadGrant, error) {
 	if !validObjectPath(objectPath) {
 		return UploadGrant{}, errors.New("invalid Storage object path")
@@ -146,7 +159,9 @@ func (c *Client) SignUpload(ctx context.Context, objectPath string) (UploadGrant
 	if err != nil {
 		return UploadGrant{}, errors.New("storage signing request failed")
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusNotFound {
 			_, _ = readControlBody(resp.Body)
@@ -176,6 +191,7 @@ func (c *Client) SignUpload(ctx context.Context, objectPath string) (UploadGrant
 	return UploadGrant{url: publicURL, ExpiresAt: expiresAt}, nil
 }
 
+// Open streams an authenticated object from storage, transferring Body ownership to the caller on success.
 func (c *Client) Open(ctx context.Context, objectPath string) (*Object, error) {
 	if !validObjectPath(objectPath) {
 		return nil, errors.New("invalid Storage object path")
@@ -190,14 +206,14 @@ func (c *Client) Open(ctx context.Context, objectPath string) (*Object, error) {
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
 		body, readErr := readControlBody(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr == nil && isObjectNotFound(resp.StatusCode, body) {
 			return nil, ErrNotFound
 		}
 		return nil, errors.New("storage read returned an unclassified HTTP 404")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("storage read returned HTTP %d", resp.StatusCode)
 	}
 	length := int64(-1)
@@ -221,7 +237,9 @@ func (c *Client) Delete(ctx context.Context, objectPath string) error {
 	if err != nil {
 		return errors.New("storage delete request failed")
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}

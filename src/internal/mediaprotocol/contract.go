@@ -16,6 +16,7 @@ import (
 	"iot-platform/internal/gateway"
 )
 
+// Protocol limits and MQTT QoS/retain constraints for the media wire protocol.
 const (
 	MaxEnvelopeBytes = 4096
 	MaxUploadBytes   = 80000000
@@ -23,6 +24,7 @@ const (
 	WireRetain       = false
 )
 
+// Grant status values transmitted in downlink upload_grant messages.
 const (
 	GrantNeedUpload           = "need_upload"
 	GrantRetryAfterCompletion = "retry_after_completion"
@@ -34,6 +36,7 @@ const (
 	GrantConflict             = "conflict"
 )
 
+// Result status values transmitted in downlink upload_result messages.
 const (
 	ResultPending   = "pending"
 	ResultVerifying = "verifying"
@@ -43,6 +46,7 @@ const (
 	ResultConflict  = "conflict"
 )
 
+// UploadRequest represents an uplink intent request message from a gateway.
 type UploadRequest struct {
 	Version     int    `json:"version"`
 	GatewayID   string `json:"gateway_id"`
@@ -53,6 +57,7 @@ type UploadRequest struct {
 	SHA256      string `json:"sha256"`
 }
 
+// UploadComplete represents an uplink completion notification message from a gateway.
 type UploadComplete struct {
 	Version   int    `json:"version"`
 	GatewayID string `json:"gateway_id"`
@@ -73,9 +78,12 @@ type UploadGrant struct {
 	Retryable bool   `json:"retryable,omitempty"`
 }
 
-func (UploadGrant) String() string   { return "mediaprotocol.UploadGrant{redacted}" }
+func (UploadGrant) String() string { return "mediaprotocol.UploadGrant{redacted}" }
+
+// GoString returns a redacted string representation of UploadGrant to protect signed URLs.
 func (UploadGrant) GoString() string { return "mediaprotocol.UploadGrant{redacted}" }
 
+// UploadResult represents a downlink terminal or interim verification status message.
 type UploadResult struct {
 	Version   int    `json:"version"`
 	GatewayID string `json:"gateway_id"`
@@ -93,10 +101,17 @@ var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-
 
 func validCanonicalUUID(id string) bool { return canonicalUUIDPattern.MatchString(id) }
 
-func UploadRequestTopic(id string) string  { return "gateways/" + id + "/media/up/upload_request" }
+// UploadRequestTopic returns the MQTT topic for uplink upload requests from a gateway.
+func UploadRequestTopic(id string) string { return "gateways/" + id + "/media/up/upload_request" }
+
+// UploadCompleteTopic returns the MQTT topic for uplink upload completions from a gateway.
 func UploadCompleteTopic(id string) string { return "gateways/" + id + "/media/up/upload_complete" }
-func UploadGrantTopic(id string) string    { return "gateways/" + id + "/media/down/upload_grant" }
-func UploadResultTopic(id string) string   { return "gateways/" + id + "/media/down/upload_result" }
+
+// UploadGrantTopic returns the MQTT topic for downlink upload grants to a gateway.
+func UploadGrantTopic(id string) string { return "gateways/" + id + "/media/down/upload_grant" }
+
+// UploadResultTopic returns the MQTT topic for downlink upload results to a gateway.
+func UploadResultTopic(id string) string { return "gateways/" + id + "/media/down/upload_result" }
 
 // Decode validates topic, direction, envelope and message-specific fields.
 func Decode(topic string, payload []byte) (any, error) {

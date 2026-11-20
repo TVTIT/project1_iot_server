@@ -48,12 +48,18 @@ func TestNativeStage8SignedUpload(t *testing.T) {
 		t.Fatal("native signed grant private result creation failed")
 	}
 	if _, err := file.Write(result); err != nil {
-		file.Close()
-		os.Remove(resultPath)
+		if cErr := file.Close(); cErr != nil {
+			t.Errorf("file close failed: %v", cErr)
+		}
+		if rErr := os.Remove(resultPath); rErr != nil && !os.IsNotExist(rErr) {
+			t.Errorf("cleanup remove failed: %v", rErr)
+		}
 		t.Fatal("native signed grant private result write failed")
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(resultPath)
+		if rErr := os.Remove(resultPath); rErr != nil && !os.IsNotExist(rErr) {
+			t.Errorf("cleanup remove failed: %v", rErr)
+		}
 		t.Fatal("native signed grant private result close failed")
 	}
 }

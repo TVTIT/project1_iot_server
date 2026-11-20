@@ -18,8 +18,10 @@ import (
 	"iot-platform/internal/mediaprotocol"
 )
 
+// MaxUploadBytes defines the maximum allowed size in bytes for a media upload.
 const MaxUploadBytes int64 = mediaprotocol.MaxUploadBytes
 
+// Common sentinel errors returned by media repository operations.
 var (
 	ErrInvalidRequest  = errors.New("invalid media admission request")
 	ErrForbidden       = errors.New("media admission forbidden")
@@ -34,6 +36,7 @@ var (
 var uploadIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// Admission contains the parameters required to request intent admission for an upload.
 type Admission struct {
 	GatewayID      string
 	UploadID       string
@@ -42,6 +45,7 @@ type Admission struct {
 	DeclaredSHA256 string
 }
 
+// Record represents the committed database state for an admitted media object.
 type Record struct {
 	MediaID                uuid.UUID
 	GatewayID              string
@@ -60,8 +64,10 @@ type Record struct {
 	LastVerificationError  string
 }
 
+// GrantStatus represents the state of a media upload grant lifecycle.
 type GrantStatus string
 
+// Grant status values representing the lifecycle and outcome of an upload request.
 const (
 	GrantNeedUpload           GrantStatus = "need_upload"
 	GrantRetryAfterCompletion GrantStatus = "retry_after_completion"
@@ -81,6 +87,7 @@ type GrantRequest struct {
 	SigningTimeout, GrantTTL, InFlightGrace time.Duration
 }
 
+// GrantReservation represents an in-flight upload grant lease held by a gateway.
 type GrantReservation struct {
 	GatewayID, UploadID string
 	MediaID             uuid.UUID
@@ -89,6 +96,7 @@ type GrantReservation struct {
 	IntentExpiresAt     time.Time
 }
 
+// VerificationGeneration identifies a specific verification lease epoch for an upload.
 type VerificationGeneration struct {
 	GatewayID, UploadID string
 	MediaID             uuid.UUID
@@ -275,14 +283,17 @@ func (r *Repository) FinishVerification(ctx context.Context, claim VerificationG
 	return out, nil
 }
 
+// VerifiedEvidence contains inspected content properties from storage verification.
 type VerifiedEvidence struct {
 	ActualSize int64
 	SHA256     string
 	MediaType  string
 }
 
+// GeneratedStoragePath returns the canonical object storage filename for this record.
 func (r Record) GeneratedStoragePath() string { return r.MediaID.String() + ".mp4" }
 
+// Repository manages PostgreSQL persistence for media intents, grants, verification, and cleanup.
 type Repository struct {
 	pool    *pgxpool.Pool
 	timeout time.Duration
@@ -322,6 +333,7 @@ RETURNING m.media_id`, limit)
 	return int(tag.RowsAffected()), nil
 }
 
+// ClaimDueCleanup acquires a batch of expired or rejected media records due for object deletion.
 func (r *Repository) ClaimDueCleanup(ctx context.Context, limit int, lease time.Duration) ([]CleanupClaim, error) {
 	if limit < 1 || limit > 64 || lease <= 0 || lease > 10*time.Minute {
 		return nil, ErrInvalidRequest
@@ -357,6 +369,7 @@ RETURNING m.media_id,m.storage_path,m.cleanup_attempts,(m.cleanup_first_deleted_
 	return out, nil
 }
 
+// ScheduleCleanupRetry schedules a retry for a failed object cleanup attempt.
 func (r *Repository) ScheduleCleanupRetry(ctx context.Context, c CleanupClaim, delay time.Duration, reason string) error {
 	if c.MediaID == uuid.Nil || c.Attempt < 1 || delay <= 0 || delay > 24*time.Hour ||
 		(reason != "STORAGE_UNAVAILABLE" && reason != "CLEANUP_EXHAUSTED" && reason != "FOLLOWUP_WINDOW") {
@@ -379,6 +392,7 @@ func (r *Repository) ScheduleCleanupRetry(ctx context.Context, c CleanupClaim, d
 	return nil
 }
 
+// ConfirmCleanup marks an object cleanup claim as permanently confirmed after verified absence.
 func (r *Repository) ConfirmCleanup(ctx context.Context, c CleanupClaim) error {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
@@ -396,6 +410,7 @@ func (r *Repository) ConfirmCleanup(ctx context.Context, c CleanupClaim) error {
 	return nil
 }
 
+// NewRepository creates and validates a new media repository with database connection pool and limits.
 func NewRepository(pool *pgxpool.Pool, limits config.MediaUploadConfig, timeout time.Duration) (*Repository, error) {
 	if pool == nil || timeout <= 0 || limits.MaxPendingPerGateway < 1 ||
 		limits.MaxUnsettledIntents < 1 || limits.MaxPendingPerGateway > limits.MaxUnsettledIntents ||
@@ -418,6 +433,7 @@ func validateAdmission(req Admission) (Admission, error) {
 
 func safeDependencyError(error) error { return ErrDependency }
 
+// Admit executes atomic admission of an upload intent within configured gateway and global quotas.
 func (r *Repository) Admit(ctx context.Context, req Admission) (Record, error) {
 	req, err := validateAdmission(req)
 	if err != nil {
