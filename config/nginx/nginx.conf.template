@@ -26,6 +26,13 @@ server {
     }
 
     # 2. Supabase Storage Routing (/storage/v1/*)
+    # The private video bucket is reachable only through the opt-in exact signed
+    # PUT route. Do not let the general Storage proxy expose it in the base profile.
+    location ~ ^/storage/v1/object/upload/sign/media-video/[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}\.mp4$ {
+        access_log off;
+        error_log /dev/null emerg;
+        return 404;
+    }
     location /storage/v1/ {
         proxy_pass $supabase_upstream;
         proxy_http_version 1.1;

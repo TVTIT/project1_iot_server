@@ -67,7 +67,7 @@ func composeStage5Transport(cfg config.Config, pool *pgxpool.Pool) (stage5Runtim
 		// synchronous Paho write cannot outlive this connection's ACL budget.
 		stopClose := context.AfterFunc(ctx, client.Close)
 		defer func() { stopClose(); client.Close() }()
-		return client.VerifyBackendACL(ctx, data.Username, data.ClientID)
+		return client.VerifyBackendACL(ctx, data.Username, data.ClientID, cfg.MediaUploadEnabled)
 	}
 	transport, err := mqttcontrol.NewTransport(data, cfg.Stage5.Dispatch)
 	if err != nil {

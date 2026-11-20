@@ -3,6 +3,21 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Media mode is an explicit local opt-in. It deliberately does not read .env;
+# provide a fixture-only key and the direct Storage service URL in the process
+# environment, then run this from a container on the Compose network.
+if [ "${1:-}" = "--media" ]; then
+    if [ "$#" -ne 1 ]; then
+        echo "ERROR: --media does not accept additional arguments." >&2
+        exit 2
+    fi
+    exec python3 "${PROJECT_ROOT}/scripts/init-media-bucket.py"
+fi
+if [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--media]" >&2
+    exit 2
+fi
+
 # Load configuration from .env if present
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     set -a

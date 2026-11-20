@@ -6,9 +6,9 @@ import (
 )
 
 // VerifyBackendACL reads native policy; it never mutates broker configuration.
-func (c *DynSecClient) VerifyBackendACL(ctx context.Context, username, clientID string) error {
+func (c *DynSecClient) VerifyBackendACL(ctx context.Context, username, clientID string, mediaEnabled ...bool) error {
 	bad := dynSecError("backend_acl_mismatch")
-	if ctx == nil || username == "" || username == c.cfg.ManagerUsername || clientID == "" {
+	if ctx == nil || username == "" || username == c.cfg.ManagerUsername || clientID == "" || len(mediaEnabled) > 1 {
 		return bad
 	}
 	// This bypasses mutation target guards only for these three fixed read APIs.
@@ -52,6 +52,12 @@ func (c *DynSecClient) VerifyBackendACL(ctx context.Context, username, clientID 
 	}
 	for _, suffix := range []string{"acks", "commands"} {
 		expected["publishClientSend|gateways/+/"+suffix+"/#"] = true
+	}
+	if len(mediaEnabled) == 1 && mediaEnabled[0] {
+		expected["publishClientSend|gateways/+/media/down/#"] = true
+		for _, kind := range []string{"publishClientReceive", "subscribeLiteral", "unsubscribeLiteral"} {
+			expected[kind+"|gateways/+/media/up/#"] = true
+		}
 	}
 	for _, acl := range role.Role.ACLs {
 		key := acl.Kind + "|" + acl.Topic

@@ -13,6 +13,7 @@ import (
 // CredentialConfig is opt-in. No secrets are interpolated into child argv.
 type CredentialConfig struct {
 	Enabled                                           bool
+	MediaUploadEnabled                                bool
 	ManagerUsername, ManagerPassword, BackendPassword string
 	ManagementURL, CAFile, SnapshotPath, ControlDir   string
 	WriterUID                                         uint32

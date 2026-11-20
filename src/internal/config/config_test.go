@@ -43,6 +43,97 @@ func TestWebSocketFlagOptIn(t *testing.T) {
 	}
 }
 
+func TestMediaUploadFlagOptIn(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MediaUploadEnabled {
+		t.Fatalf("default media flag=%v err=%v", cfg.MediaUploadEnabled, err)
+	}
+	values["MEDIA_UPLOAD_ENABLED"] = "true"
+	addMediaRuntimeSettings(values)
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MediaUploadEnabled || !cfg.Credential.MediaUploadEnabled {
+		t.Fatalf("enabled media flag=%v credential=%v err=%v", cfg.MediaUploadEnabled, cfg.Credential.MediaUploadEnabled, err)
+	}
+	values["MEDIA_UPLOAD_ENABLED"] = "yes"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("invalid media flag accepted")
+	}
+}
+
+func TestMediaUploadLimitsDefaultsAndValidation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.MediaUpload
+	if cfg.MediaUploadEnabled || m.MaxUploadBytes != 80_000_000 || m.MaxPendingPerGateway != 1 ||
+		m.MaxUnsettledIntents != 8 || m.TemporaryBytes != 640_000_000 || m.StoredBytes < m.MaxUploadBytes ||
+		m.IntentTTL <= 0 || m.DBTimeout <= 0 || m.StorageTimeout <= 0 ||
+		m.VerifyWorkers < 1 || m.VerifyBatchSize < 1 || m.VerifyMaxAttempts < 1 ||
+		m.CleanupWorkers < 1 || m.CleanupBatchSize < 1 || m.CleanupMaxAttempts < 1 {
+		t.Fatalf("unexpected media defaults: enabled=%v config=%+v", cfg.MediaUploadEnabled, m)
+	}
+
+	values["MEDIA_UPLOAD_ENABLED"] = "true"
+	addMediaRuntimeSettings(values)
+	values["MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY"] = "2"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MediaUploadEnabled || cfg.MediaUpload.MaxPendingPerGateway != 2 {
+		t.Fatalf("media opt-in config=%+v enabled=%v err=%v", cfg.MediaUpload, cfg.MediaUploadEnabled, err)
+	}
+
+	for key, value := range map[string]string{
+		"MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY": "9",
+		"MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS":   "0",
+		"MEDIA_UPLOAD_TEMPORARY_BYTES":         "639999999",
+		"MEDIA_UPLOAD_STORED_BYTES":            "79999999",
+		"MEDIA_UPLOAD_INTENT_TTL":              "0s",
+		"MEDIA_UPLOAD_DB_TIMEOUT":              "soon",
+		"MEDIA_UPLOAD_VERIFY_WORKERS":          "0",
+		"MEDIA_UPLOAD_VERIFY_BATCH_SIZE":       "1001",
+		"MEDIA_UPLOAD_VERIFY_RETRY_MIN_DELAY":  "2m",
+		"MEDIA_UPLOAD_CLEANUP_RETRY_MIN_DELAY": "6m",
+	} {
+		bad := validConfigValues()
+		bad[key] = value
+		if _, err := Load(mapLookup(bad)); err == nil {
+			t.Errorf("accepted %s=%q", key, value)
+		}
+	}
+}
+
+func TestMediaUploadCleanupMaxAttemptsValidation(t *testing.T) {
+	// Attempt limit 1 must be rejected because cleanup requires >= 2 attempts (initial delete + followup confirmation)
+	values := validConfigValues()
+	values["MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS"] = "1"
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS=1 must be rejected")
+	}
+
+	// Attempt limit 2 must be accepted
+	values["MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS"] = "2"
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MediaUpload.CleanupMaxAttempts != 2 {
+		t.Fatalf("MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS=2 failed: cfg=%+v err=%v", cfg.MediaUpload, err)
+	}
+}
+
+func addMediaRuntimeSettings(values map[string]string) {
+	values["MQTT_BROKER_URL"] = "ssl://mosquitto:8883"
+	values["MEDIA_UPLOAD_MQTT_CLIENT_ID"] = "backend_media"
+	values["MQTT_USERNAME"] = "backend_service"
+	values["MQTT_PASSWORD"] = "data-password"
+	values["MQTT_TLS_CA_FILE"] = "/certs/ca.pem"
+	values["MQTT_DYNSEC_MANAGER_USERNAME"] = "backend_manager"
+	values["MQTT_DYNSEC_MANAGER_PASSWORD"] = "manager-password"
+	values["MQTT_INTERNAL_MANAGEMENT_URL"] = "ssl://mosquitto:8883"
+	values["STORAGE_INTERNAL_URL"] = "http://supabase-storage:5000"
+	values["MEDIA_UPLOAD_PUBLIC_ORIGIN"] = "https://upload.example.test"
+	values["SERVICE_ROLE_KEY"] = "fixture-service-token"
+}
+
 func TestWebSocketLimitsDefaultsAndValidation(t *testing.T) {
 	cfg, err := Load(mapLookup(validConfigValues()))
 	if err != nil {

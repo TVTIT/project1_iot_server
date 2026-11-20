@@ -17,6 +17,9 @@ type LookupFunc func(string) (string, bool)
 
 // Config contains process-level settings required by the backend.
 type Config struct {
+	MediaUploadEnabled         bool
+	MediaUpload                MediaUploadConfig
+	MediaRuntime               MediaRuntimeConfig
 	MetricsEnabled             bool
 	WebSocketEnabled           bool
 	WebSocket                  WebSocketConfig
@@ -94,6 +97,15 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.WebSocketEnabled, err = boolValue(lookup, "WEBSOCKET_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.MediaUploadEnabled, err = boolValue(lookup, "MEDIA_UPLOAD_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.MediaUpload, err = loadMediaUpload(lookup); err != nil {
+		return Config{}, err
+	}
+	if cfg.MediaRuntime, err = loadMediaRuntime(lookup, cfg.MediaUploadEnabled); err != nil {
 		return Config{}, err
 	}
 	if cfg.WebSocket, err = loadWebSocket(lookup); err != nil {
@@ -192,6 +204,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	if cfg.Credential, err = loadCredential(lookup, cfg); err != nil {
 		return Config{}, err
 	}
+	cfg.Credential.MediaUploadEnabled = cfg.MediaUploadEnabled
 	if cfg.Ingress, err = loadIngress(lookup, cfg.DatabaseMaxConns, cfg.Credential.Enabled, cfg.ShutdownTimeout); err != nil {
 		return Config{}, err
 	}
@@ -206,6 +219,24 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if cfg.Stage5, err = loadStage5(lookup); err != nil {
 		return Config{}, err
+	}
+	if cfg.MediaUploadEnabled {
+		workers := cfg.MediaRuntime.Workers
+		if cfg.Ingress.Enabled {
+			workers += cfg.Ingress.WorkerCount
+			if cfg.MediaRuntime.Data.ClientID == cfg.Ingress.ClientID {
+				return Config{}, fmt.Errorf("media and telemetry MQTT client IDs must differ")
+			}
+		}
+		if cfg.Stage5.Enabled {
+			workers += cfg.Stage5.Dispatch.Workers + cfg.Stage5.ResultWorkers + 1
+			if cfg.MediaRuntime.Data.ClientID == cfg.Stage5.Data.ClientID {
+				return Config{}, fmt.Errorf("media and Stage 5 MQTT client IDs must differ")
+			}
+		}
+		if err = checkIngressPoolReservation(workers, cfg.DatabaseMaxConns, cfg.Credential.Enabled); err != nil {
+			return Config{}, fmt.Errorf("media MQTT worker pool reservation: %w", err)
+		}
 	}
 	if cfg.Stage5.Enabled {
 		workers := cfg.Stage5.Dispatch.Workers + cfg.Stage5.ResultWorkers + 1
@@ -244,6 +275,18 @@ func integer(lookup LookupFunc, key string, fallback, minimum, maximum int) (int
 		return fallback, nil
 	}
 	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, minimum, maximum)
+	}
+	return value, nil
+}
+
+func integer64(lookup LookupFunc, key string, fallback, minimum, maximum int64) (int64, error) {
+	raw, ok := nonEmpty(lookup, key)
+	if !ok {
+		return fallback, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value < minimum || value > maximum {
 		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, minimum, maximum)
 	}

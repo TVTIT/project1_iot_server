@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -618,7 +619,8 @@ func (t *Transport) supervise(ctx context.Context) {
 		lt, err := t.connectOnce(ctx)
 		if err != nil {
 			t.counters.connectFailures.Add(1)
-			t.log.Debug("mqtt ingress transport connect failed", "event", "connect_failed")
+			t.log.Warn("mqtt ingress transport connect failed", "event", "connect_failed",
+				"reason_code", connectFailureReasonCode(err))
 			if !t.waitBackoff(ctx, attempt) {
 				return
 			}
@@ -638,7 +640,8 @@ func (t *Transport) supervise(ctx context.Context) {
 			continue
 		}
 		t.counters.connected.Add(1)
-		t.log.Debug("mqtt ingress transport connected", "event", "connected", "epoch", lt.epoch)
+		t.log.Info("mqtt ingress transport subscribed", "event", "subscribed",
+			"epoch", lt.epoch, "client_id", t.opts.ClientID, "filter", t.opts.Filter)
 		attempt = 0
 
 		select {
@@ -674,6 +677,28 @@ func (t *Transport) supervise(ctx context.Context) {
 		}
 		attempt++
 	}
+}
+
+// connectFailureReasonCode keeps retry diagnostics useful without logging
+// broker addresses, credentials, or arbitrary driver error strings.
+func connectFailureReasonCode(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	message := err.Error()
+	if !strings.HasPrefix(message, "dynsec_") {
+		return "mqtt_connection_unavailable"
+	}
+	code := strings.TrimPrefix(message, "dynsec_")
+	if code == "" || len(code) > 64 {
+		return "dynsec_unavailable"
+	}
+	for _, r := range code {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return "dynsec_unavailable"
+		}
+	}
+	return "dynsec_" + code
 }
 
 // connectOnce opens one fresh client lifetime: TLS dial, CONNECT, exact-filter

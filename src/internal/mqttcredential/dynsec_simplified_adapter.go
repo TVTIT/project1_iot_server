@@ -115,6 +115,7 @@ type SimplifiedDynSecConfig struct {
 	Timeout            time.Duration
 	VerifyRevoked      func(ctx context.Context, target string) error
 	Qualification      NativeDisableQualification
+	MediaUploadEnabled bool
 }
 
 // SimplifiedExecutionEvidence captures real native observations for an execution.
@@ -622,7 +623,7 @@ func (e *SimplifiedDynSecExecutor) ensureRole(ctx context.Context, c SimplifiedD
 		return ErrInvalidInput
 	}
 
-	wanted := adapterGatewayACLs(u)
+	wanted := adapterGatewayACLsForProfile(u, e.cfg.MediaUploadEnabled)
 	b, err := c.adapterRequest(ctx, "getRole", map[string]any{"rolename": role})
 	if errors.Is(err, errDynSecRoleAbsent) {
 		if !create {
@@ -658,4 +659,17 @@ func (e *SimplifiedDynSecExecutor) ensureRole(ctx context.Context, c SimplifiedD
 		}
 	}
 	return nil
+}
+
+func adapterGatewayACLsForProfile(u string, mediaEnabled bool) []adapterACL {
+	acls := adapterGatewayACLs(u)
+	if mediaEnabled {
+		acls = append(acls,
+			adapterACL{Type: "publishClientSend", Topic: "gateways/" + u + "/media/up/#", Priority: 0, Allow: true},
+			adapterACL{Type: "publishClientReceive", Topic: "gateways/" + u + "/media/down/#", Priority: 0, Allow: true},
+			adapterACL{Type: "subscribeLiteral", Topic: "gateways/" + u + "/media/down/#", Priority: 0, Allow: true},
+			adapterACL{Type: "unsubscribeLiteral", Topic: "gateways/" + u + "/media/down/#", Priority: 0, Allow: true},
+		)
+	}
+	return acls
 }

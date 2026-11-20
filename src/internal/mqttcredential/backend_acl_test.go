@@ -84,3 +84,59 @@ func TestBackendACLReadOnlyExact(t *testing.T) {
 		})
 	}
 }
+
+func TestBackendACLMediaProfileExact(t *testing.T) {
+	for _, mediaEnabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "enabled"}[mediaEnabled], func(t *testing.T) {
+			f := &dynsecFake{}
+			c, err := newDynSecClient(context.Background(), dynsecTestConfig(), f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			f.publish = func(b []byte) {
+				var req struct {
+					Commands []map[string]any `json:"commands"`
+				}
+				_ = json.Unmarshal(b, &req)
+				command := req.Commands[0]["command"].(string)
+				var data any
+				switch command {
+				case "getClient":
+					data = map[string]any{"client": map[string]any{"username": "backend", "roles": []any{map[string]any{"rolename": "bootstrap_backend"}}, "groups": []any{}, "disabled": false}}
+				case "getRole":
+					acls := []map[string]any{}
+					for _, suffix := range []string{"telemetry", "responses"} {
+						for _, kind := range []string{"publishClientReceive", "subscribeLiteral", "unsubscribeLiteral"} {
+							acls = append(acls, map[string]any{"acltype": kind, "topic": "gateways/+/" + suffix + "/#", "allow": true, "priority": 0})
+						}
+					}
+					for _, suffix := range []string{"acks", "commands"} {
+						acls = append(acls, map[string]any{"acltype": "publishClientSend", "topic": "gateways/+/" + suffix + "/#", "allow": true, "priority": 0})
+					}
+					if mediaEnabled {
+						for _, rule := range []struct{ kind, topic string }{
+							{"publishClientSend", "gateways/+/media/down/#"},
+							{"publishClientReceive", "gateways/+/media/up/#"},
+							{"subscribeLiteral", "gateways/+/media/up/#"},
+							{"unsubscribeLiteral", "gateways/+/media/up/#"},
+						} {
+							acls = append(acls, map[string]any{"acltype": rule.kind, "topic": rule.topic, "allow": true, "priority": 0})
+						}
+					}
+					data = map[string]any{"role": map[string]any{"rolename": "bootstrap_backend", "acls": acls}}
+				case "getDefaultACLAccess":
+					acls := []any{}
+					for _, kind := range []string{"publishClientSend", "publishClientReceive", "subscribe", "unsubscribe"} {
+						acls = append(acls, map[string]any{"acltype": kind, "allow": false})
+					}
+					data = map[string]any{"acls": acls}
+				}
+				f.receive(dynSecResponseTopic, dynsecReply(b, "", "", map[string]any{"data": data}), false)
+			}
+			if err := c.VerifyBackendACL(context.Background(), "backend", "data-client", mediaEnabled); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

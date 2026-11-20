@@ -77,6 +77,7 @@ func run() error {
 		serverReady  bool
 		ingress      ingressRuntime
 		control      stage5Runtime
+		mediaUpload  mediaRuntime
 		authSocket   *auth.UnixAuthServer
 		closeAuth    = func() {}
 		wsHandler    *telemetryws.Handler
@@ -92,6 +93,7 @@ func run() error {
 			// publish post-commit ACKs during the drain.
 			ingress.stopIntake()
 			control.stop()
+			mediaUpload.stop()
 
 			httpErrors := make(chan error, 1)
 			if serverReady {
@@ -114,6 +116,9 @@ func run() error {
 			}
 			if err := control.close(ctx); err != nil {
 				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("stage 5 shutdown: %w", err))
+			}
+			if err := mediaUpload.close(ctx); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("media upload shutdown: %w", err))
 			}
 			if serverReady {
 				if err := <-httpErrors; err != nil {
@@ -153,6 +158,9 @@ func run() error {
 	}
 	if control, err = composeStage5Transport(cfg, pool); err != nil {
 		return err
+	}
+	if mediaUpload, err = composeMediaRuntime(cfg, pool); err != nil {
+		return fmt.Errorf("compose media upload runtime: %w", err)
 	}
 
 	if _, err := cfg.MQTTCredentialRuntime.Start(rootCtx); err != nil {
@@ -286,6 +294,9 @@ func run() error {
 	}
 	if err := control.start(); err != nil {
 		return fmt.Errorf("start stage 5 transport: %w", err)
+	}
+	if err := mediaUpload.start(rootCtx); err != nil {
+		return fmt.Errorf("start media upload transport: %w", err)
 	}
 	if err := wsRuntime.start(rootCtx); err != nil {
 		return fmt.Errorf("start websocket membership rechecker: %w", err)

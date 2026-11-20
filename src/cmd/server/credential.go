@@ -244,10 +244,11 @@ func composeCredentialsWithSeam(ctx context.Context, pool *pgxpool.Pool, c confi
 	}
 
 	snapshotReader, err := mqttcredential.NewDynSecSnapshotReader(mqttcredential.DynSecSnapshotConfig{
-		Path:           c.SnapshotPath,
-		WriterUID:      c.WriterUID,
-		MaxBytes:       int64(c.MaxSnapshotBytes),
-		ValidateTarget: validateTarget,
+		Path:               c.SnapshotPath,
+		WriterUID:          c.WriterUID,
+		MaxBytes:           int64(c.MaxSnapshotBytes),
+		ValidateTarget:     validateTarget,
+		MediaUploadEnabled: c.MediaUploadEnabled,
 	})
 	if err != nil {
 		return out, fmt.Errorf("create credential snapshot reader: %w", err)
@@ -371,6 +372,7 @@ func composeCredentialsWithSeam(ctx context.Context, pool *pgxpool.Pool, c confi
 		Timeout:            c.OperationTimeout,
 		VerifyRevoked:      snapshotReader.VerifyRevoked,
 		Qualification:      c.Qualification,
+		MediaUploadEnabled: c.MediaUploadEnabled,
 	}
 
 	newExec := seam.newExecutor

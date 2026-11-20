@@ -167,7 +167,7 @@ def parse_config(stream, container_mode=False):
 
     if container_mode:
         required = {'manager', 'backend', 'manager_password', 'backend_password'}
-        optional = {'volume_name', 'labels'}
+        optional = {'volume_name', 'labels', 'media_upload_enabled'}
         if not required <= cfg.keys() or cfg.keys() - required - optional:
             raise BootstrapError('configuration fields missing or unknown')
         if 'volume_name' in cfg:
@@ -190,7 +190,7 @@ def parse_config(stream, container_mode=False):
     else:
         required = {'store', 'manager', 'backend', 'manager_password', 'backend_password',
                     'mapping', 'broker_uid', 'broker_gid'}
-        if not required <= cfg.keys() or cfg.keys() - required - {'uid_map', 'gid_map'}:
+        if not required <= cfg.keys() or cfg.keys() - required - {'uid_map', 'gid_map', 'media_upload_enabled'}:
             raise BootstrapError('configuration fields missing or unknown')
         if not isinstance(cfg['store'], str) or not Path(cfg['store']).is_absolute() or '\x00' in cfg['store']:
             raise BootstrapError('absolute store path required')
@@ -204,6 +204,9 @@ def parse_config(stream, container_mode=False):
             raise BootstrapError('explicit ownership mapping required')
         if any(type(cfg[k]) is not int for k in ('broker_uid', 'broker_gid')) or ids != (cfg['broker_uid'], cfg['broker_gid']):
             raise BootstrapError('ownership does not match broker 1883 mapping')
+
+    if 'media_upload_enabled' in cfg and type(cfg['media_upload_enabled']) is not bool:
+        raise BootstrapError('media_upload_enabled must be a boolean')
 
     for key in ('manager', 'backend'):
         if not isinstance(cfg[key], str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}', cfg[key]):
@@ -261,7 +264,7 @@ def acl(kind, topic):
     return {'acltype': kind, 'topic': topic, 'allow': True, 'priority': 0}
 
 
-def compose_store(manager, backend):
+def compose_store(manager, backend, media_upload_enabled=False):
     """Preserve native credentials; replace broad init ACLs with exact roles."""
     clients = []
     for source, role in ((manager, 'bootstrap_manager'), (backend, 'bootstrap_backend')):
@@ -282,6 +285,13 @@ def compose_store(manager, backend):
     telemetry.append(acl('publishClientSend', 'gateways/+/commands/#'))
     telemetry.extend(acl(k, 'gateways/+/responses/#') for k in
                      ('publishClientReceive', 'subscribeLiteral', 'unsubscribeLiteral'))
+    if media_upload_enabled:
+        telemetry.extend((
+            acl('publishClientReceive', 'gateways/+/media/up/#'),
+            acl('subscribeLiteral', 'gateways/+/media/up/#'),
+            acl('unsubscribeLiteral', 'gateways/+/media/up/#'),
+            acl('publishClientSend', 'gateways/+/media/down/#'),
+        ))
     return {'clients': clients, 'roles': [
         {'rolename': 'bootstrap_manager', 'acls': management},
         {'rolename': 'bootstrap_backend', 'acls': telemetry}],
@@ -310,7 +320,9 @@ def build_store(cfg, tool, initializer=native_init):
             except (KeyError, ValueError, TypeError):
                 raise BootstrapError('unexpected native hash schema') from None
             sources.append(source)
-        return json.dumps(compose_store(*sources), separators=(',', ':')).encode()
+        return json.dumps(compose_store(
+            *sources, media_upload_enabled=cfg.get('media_upload_enabled', False)
+        ), separators=(',', ':')).encode()
 
 
 def publish(directory_fd, name, data, uid, gid):
@@ -821,7 +833,9 @@ def bootstrap_container(cfg, image_ref=PINNED_IMAGE, runner=subprocess.run):
                     raise BootstrapError('unexpected native hash schema') from None
                 sources.append(source)
 
-            composed_dict = compose_store(*sources)
+            composed_dict = compose_store(
+                *sources, media_upload_enabled=cfg.get('media_upload_enabled', False)
+            )
             composed_bytes = json.dumps(composed_dict, separators=(',', ':')).encode()
         finally:
             os.umask(old_umask)

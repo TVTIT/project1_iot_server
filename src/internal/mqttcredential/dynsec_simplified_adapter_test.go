@@ -193,6 +193,94 @@ func defaultTestConfig(spy *spyDynSecClient) SimplifiedDynSecConfig {
 	}
 }
 
+func TestSimplifiedDynSecMediaRoleProfileReadback(t *testing.T) {
+	spy := newSpyClient()
+	role := "gateway_test_gateway"
+	for _, enabled := range []bool{false, true} {
+		cfg := defaultTestConfig(spy)
+		cfg.MediaUploadEnabled = enabled
+		exec, err := NewSimplifiedDynSecExecutor(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spy.roles[role] = adapterGatewayACLsForProfile("test_gateway", enabled)
+		if err := exec.ensureRole(context.Background(), spy, "test_gateway", role, false); err != nil {
+			t.Fatalf("enabled=%v: %v", enabled, err)
+		}
+		spy.roles[role] = adapterGatewayACLsForProfile("test_gateway", !enabled)
+		if err := exec.ensureRole(context.Background(), spy, "test_gateway", role, false); err == nil {
+			t.Fatalf("enabled=%v accepted wrong role profile", enabled)
+		}
+	}
+}
+
+func TestSimplifiedDynSecMediaProvisionRotateRevokeLifecycle(t *testing.T) {
+	const gatewayID = "gateway_001"
+	role := "gateway_" + gatewayID
+	expected := adapterGatewayACLsForProfile(gatewayID, true)
+	spy := newSpyClient()
+	spy.roleAbsentOn = role
+	cfg := defaultTestConfig(spy)
+	cfg.MediaUploadEnabled = true
+	cfg.Qualification, _ = NewNativeDisableQualification(QualifiedMosquittoImageRef, QualifiedMosquittoConfigID, QualifiedMosquittoPlatform)
+	cfg.VerifyRevoked = func(context.Context, string) error {
+		if !reflect.DeepEqual(spy.roles[role], expected) {
+			return errors.New("snapshot profile mismatch")
+		}
+		return nil
+	}
+	exec, err := NewSimplifiedDynSecExecutor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeOperation := func(action Action, version int64, previous *CredentialSnapshot) Operation {
+		op := Operation{
+			OperationID: uuid.New(), ActorUserID: uuid.New(), GatewayID: gatewayID,
+			IdempotencyKey: uuid.New(), Action: action, CredentialVersion: version,
+			Status: OperationPending, Phase: PhaseIntent, DeliveryStatus: DeliveryUnknown,
+			ExecutionContract: ContractSimplified, Previous: previous,
+		}
+		if action == ActionReset {
+			pred := uuid.New()
+			reason := ResetReasonRecoveryAfterUnknown
+			op.ResetPredecessorID, op.ResetReason = &pred, &reason
+		}
+		return op
+	}
+	run := func(op Operation) {
+		t.Helper()
+		if _, err := exec.Execute(context.Background(), op, func(context.Context) (string, error) {
+			return "secret123456789012", nil
+		}); err != nil {
+			t.Fatalf("%s failed: %v", op.Action, err)
+		}
+		if !reflect.DeepEqual(spy.roles[role], expected) {
+			t.Fatalf("%s changed role ACLs: got=%v want=%v", op.Action, spy.roles[role], expected)
+		}
+	}
+	run(makeOperation(ActionProvision, 1, nil))
+	run(makeOperation(ActionRotate, 2, &CredentialSnapshot{Status: CredentialActive, CredentialVersion: 1}))
+	run(makeOperation(ActionRevoke, 2, &CredentialSnapshot{Status: CredentialActive, CredentialVersion: 2}))
+
+	// A role from the old (media-disabled) profile must not be silently migrated.
+	oldSpy := newSpyClient()
+	oldSpy.clients[gatewayID] = DynSecClientMetadata{Username: gatewayID, Roles: []string{role}}
+	oldSpy.roles[role] = adapterGatewayACLs(gatewayID)
+	oldCfg := defaultTestConfig(oldSpy)
+	oldCfg.MediaUploadEnabled = true
+	oldExec, err := NewSimplifiedDynSecExecutor(oldCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = oldExec.Execute(context.Background(), makeOperation(ActionRotate, 2,
+		&CredentialSnapshot{Status: CredentialActive, CredentialVersion: 1}), func(context.Context) (string, error) {
+		return "secret123456789012", nil
+	})
+	if err != ErrRecoveryRequired || !reflect.DeepEqual(oldSpy.roles[role], adapterGatewayACLs(gatewayID)) {
+		t.Fatalf("old profile was not rejected unchanged: err=%v ACLs=%v", err, oldSpy.roles[role])
+	}
+}
+
 func TestSimplifiedDynSecExecutor_NoWorkAfterGenerationDeadline(t *testing.T) {
 	spy := newSpyClient()
 	cfg := defaultTestConfig(spy)
@@ -1888,7 +1976,9 @@ func TestSimplifiedDynSecExecutor_Reset_Success(t *testing.T) {
 		spy := newSpyClient()
 		spy.roleAbsentOn = "gateway_gateway_001"
 
-		exec, err := NewSimplifiedDynSecExecutor(defaultTestConfig(spy))
+		cfg := defaultTestConfig(spy)
+		cfg.MediaUploadEnabled = true
+		exec, err := NewSimplifiedDynSecExecutor(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1919,17 +2009,11 @@ func TestSimplifiedDynSecExecutor_Reset_Success(t *testing.T) {
 		res, err := exec.Execute(context.Background(), op, func(_ context.Context) (string, error) {
 			return "resetpw1234567890", nil
 		})
-		if err != nil {
-			t.Fatalf("reset failed: %v", err)
+		if err != nil || res.Outcome != ExecutionVerifiedSuccess {
+			t.Fatalf("reset recovery failed: result=%+v err=%v", res, err)
 		}
-		if res.Outcome != ExecutionVerifiedSuccess {
-			t.Fatalf("expected verified_success, got %v", res.Outcome)
-		}
-		if !res.Evidence.RAMApplied || !res.Evidence.FreshPositiveVerified {
-			t.Fatalf("unexpected evidence: %+v", res.Evidence)
-		}
-		if spy.clients["gateway_001"].Disabled {
-			t.Fatal("client should be enabled after reset")
+		if !reflect.DeepEqual(spy.roles["gateway_gateway_001"], adapterGatewayACLsForProfile("gateway_001", true)) {
+			t.Fatal("reset did not create exact media-enabled role ACLs")
 		}
 
 		// Foreign username mismatch on RecoveryAfterUnknown

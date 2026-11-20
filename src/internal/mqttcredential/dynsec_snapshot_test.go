@@ -139,6 +139,53 @@ func TestDynSecVerifyRevoked_Success(t *testing.T) {
 	}
 }
 
+func TestDynSecVerifyRevokedMediaProfile(t *testing.T) {
+	enabledACLs := adapterGatewayACLsForProfile("A", true)
+	store := []byte(testBuildDynSecStore("A", true, "gateway_A", enabledACLs, nil))
+	if err := parseAndVerifyRevokedSnapshot(store, "A", true); err != nil {
+		t.Fatalf("enabled profile rejected: %v", err)
+	}
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
+	path := filepath.Join(dir, "native.json")
+	if err := os.WriteFile(path, store, 0600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewDynSecSnapshotReader(DynSecSnapshotConfig{
+		Path: path, WriterUID: uint32(os.Getuid()), MaxBytes: 65536,
+		ValidateTarget: func(s string) bool { return s == "A" }, MediaUploadEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.VerifyRevoked(context.Background(), "A"); err != nil {
+		t.Fatalf("configured snapshot verifier rejected enabled profile: %v", err)
+	}
+	for name, acls := range map[string][]adapterACL{
+		"missing": adapterGatewayACLs("A"),
+		"wrong_direction": func() []adapterACL {
+			acl := append([]adapterACL(nil), enabledACLs...)
+			acl[len(acl)-4].Type = "publishClientReceive"
+			return acl
+		}(),
+		"duplicate": func() []adapterACL {
+			acl := append([]adapterACL(nil), enabledACLs...)
+			acl = append(acl, acl[len(acl)-4])
+			return acl
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := []byte(testBuildDynSecStore("A", true, "gateway_A", acls, nil))
+			if err := parseAndVerifyRevokedSnapshot(bad, "A", true); err == nil {
+				t.Fatal("accepted invalid enabled profile")
+			}
+		})
+	}
+	if err := parseAndVerifyRevokedSnapshot(store, "A", false); err == nil {
+		t.Fatal("disabled profile accepted media ACLs")
+	}
+}
+
 func TestDynSecVerifyRevoked_Mismatch(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.Chmod(dir, 0700)

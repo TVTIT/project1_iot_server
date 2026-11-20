@@ -18,10 +18,11 @@ var errDynSecSnapshotAbsent = errors.New("dynsec snapshot target absent")
 // DynSecSnapshotConfig is trusted local configuration, never a request path.
 // WriterUID must be the actual broker native writer UID (not reader's UID).
 type DynSecSnapshotConfig struct {
-	Path           string
-	WriterUID      uint32
-	MaxBytes       int64
-	ValidateTarget func(string) bool
+	Path               string
+	WriterUID          uint32
+	MaxBytes           int64
+	ValidateTarget     func(string) bool
+	MediaUploadEnabled bool
 }
 
 // DynSecSnapshotReader reads filesystem snapshots of dynamic security state.
@@ -131,11 +132,11 @@ func (r *DynSecSnapshotReader) VerifyRevoked(ctx context.Context, target string)
 		return dynSecError("snapshot_uncertain")
 	}
 	return r.readSnapshot(ctx, func(b []byte) error {
-		return parseAndVerifyRevokedSnapshot(b, target)
+		return parseAndVerifyRevokedSnapshot(b, target, r.cfg.MediaUploadEnabled)
 	})
 }
 
-func parseAndVerifyRevokedSnapshot(b []byte, target string) error {
+func parseAndVerifyRevokedSnapshot(b []byte, target string, mediaEnabled ...bool) error {
 	if strictDynSecJSON(b) != nil {
 		return dynSecError("snapshot_invalid")
 	}
@@ -211,7 +212,11 @@ func parseAndVerifyRevokedSnapshot(b []byte, target string) error {
 		return dynSecError("snapshot_invalid")
 	}
 
-	wanted := adapterGatewayACLs(target)
+	media := len(mediaEnabled) == 1 && mediaEnabled[0]
+	if len(mediaEnabled) > 1 {
+		return dynSecError("snapshot_invalid")
+	}
+	wanted := adapterGatewayACLsForProfile(target, media)
 	if len(aclItems) != len(wanted) {
 		return dynSecError("snapshot_invalid")
 	}

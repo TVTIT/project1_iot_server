@@ -1,0 +1,52 @@
+# Local Stage 8 opt-in only. TLS materials and route key are fixture/operator inputs.
+server {
+    listen 443 ssl;
+    server_name ${API_DOMAIN};
+    ssl_certificate /etc/nginx/stage8-tls/server.crt;
+    ssl_certificate_key /etc/nginx/stage8-tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_header_timeout 10s;
+    client_body_timeout 120s;
+    send_timeout 120s;
+    keepalive_timeout 30s;
+    proxy_connect_timeout 5s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+    # Signed query strings are bearer credentials. Suppress URI-bearing access
+    # and error logs throughout this isolated profile.
+    access_log off;
+    error_log /dev/null emerg;
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    set $supabase_upstream http://kong:8000;
+
+    location ~ "^/storage/v1/object/upload/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$" {
+        if ($request_method != PUT) { return 405; }
+        client_max_body_size 80m;
+        proxy_http_version 1.1;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_pass $supabase_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Authorization "";
+        proxy_set_header apikey "";
+        proxy_set_header x-upsert "";
+        proxy_set_header X-User-ID "";
+        proxy_set_header X-Authenticated-User "";
+        proxy_set_header X-Role "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header X-Forwarded-Roles "";
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Stage8-Media-Route "${MEDIA_UPLOAD_ROUTE_KEY}";
+    }
+
+    # No other public Storage API is exposed by this media-only HTTPS profile.
+    location /storage/v1/ { return 404; }
+    location = /healthz {
+        default_type text/plain;
+        return 200 'OK';
+    }
+    location / { return 404; }
+}

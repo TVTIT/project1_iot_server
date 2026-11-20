@@ -30,7 +30,7 @@ resources:
                       type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                     log_format:
                       text_format_source:
-                        inline_string: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% - - [%START_TIME(%d/%b/%Y:%H:%M:%S %z)%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" %RESPONSE_CODE% %BYTES_SENT% \"%REQ(REFERER)%\" \"%REQ(USER-AGENT)%\"\n"
+                        inline_string: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% - - [%START_TIME(%d/%b/%Y:%H:%M:%S %z)%] \"%REQ(:METHOD)% %PROTOCOL%\" %RESPONSE_CODE% %BYTES_SENT% route=%ROUTE_NAME%\n"
 
               route_config:
                 name: supabase_route
@@ -56,6 +56,93 @@ resources:
                           value: "%DOWNSTREAM_LOCAL_PORT%"
                         append_action: ADD_IF_ABSENT
                     routes:
+                      - name: stage8-media-signed-put
+                        match:
+                          safe_regex:
+                            google_re2: {}
+                            regex: '^/storage/v1/object/upload/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$'
+                          headers:
+                            - name: ':method'
+                              string_match:
+                                exact: PUT
+                            - name: x-stage8-media-route
+                              string_match:
+                                safe_regex:
+                                  google_re2: {}
+                                  regex: '^.+$'
+                            - name: x-stage8-media-route
+                              string_match:
+                                exact: '${MEDIA_UPLOAD_ROUTE_KEY}'
+                        route:
+                          cluster: storage
+                          regex_rewrite:
+                            pattern:
+                              google_re2: {}
+                              regex: '^/storage/v1/(.*)$'
+                            substitution: '/\1'
+                          timeout: 120s
+                          idle_timeout: 120s
+                        request_headers_to_remove:
+                          - authorization
+                          - apikey
+                          - x-upsert
+                          - x-stage8-media-route
+                          - x-user-id
+                          - x-authenticated-user
+                          - x-role
+                          - x-forwarded-user
+                          - x-forwarded-roles
+                          - forwarded
+                        typed_per_filter_config:
+                          envoy.filters.http.basic_auth:
+                            '@type': type.googleapis.com/envoy.config.route.v3.FilterConfig
+                            disabled: true
+                          envoy.filters.http.rbac:
+                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                            rbac:
+                              rules:
+                                action: ALLOW
+                                policies:
+                                  stage8_media_route:
+                                    permissions:
+                                      - any: true
+                                    principals:
+                                      - and_ids:
+                                          ids:
+                                            - header:
+                                                name: x-stage8-media-route
+                                                string_match:
+                                                  safe_regex:
+                                                    google_re2: {}
+                                                    regex: '^.+$'
+                                            - header:
+                                                name: x-stage8-media-route
+                                                string_match:
+                                                  exact: '${MEDIA_UPLOAD_ROUTE_KEY}'
+
+                      - name: stage8-media-blocked
+                        match:
+                          safe_regex:
+                            google_re2: {}
+                            regex: '^/storage/v1/(?:bucket|object(?:/(?:upload/sign|sign|authenticated|public|info|list))?)/media-video(?:/.*)?$'
+                        direct_response:
+                          status: 404
+                        typed_per_filter_config:
+                          envoy.filters.http.basic_auth:
+                            '@type': type.googleapis.com/envoy.config.route.v3.FilterConfig
+                            disabled: true
+                          envoy.filters.http.rbac:
+                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                            rbac:
+                              rules:
+                                action: ALLOW
+                                policies:
+                                  allow_all:
+                                    permissions:
+                                      - any: true
+                                    principals:
+                                      - any: true
+
                       - match:
                           prefix: /auth/v1/verify
                         route:
