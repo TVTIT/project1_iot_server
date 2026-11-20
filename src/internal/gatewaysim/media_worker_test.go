@@ -42,7 +42,7 @@ func (r *mediaRecorder) snapshot() []any {
 
 func TestMediaWorkerDoesNotTrustGrantTargetOrDeleteBeforeReady(t *testing.T) {
 	requests := make(chan struct{}, 1)
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests <- struct{}{}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -52,7 +52,11 @@ func TestMediaWorkerDoesNotTrustGrantTargetOrDeleteBeforeReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	worker, err := NewMediaWorker(MediaWorkerOptions{
 		GatewayID: "gateway_001", Spool: spool, Publisher: mediaPublisherFunc(func(context.Context, any) error { return nil }),
 		UploadOrigin: server.URL, httpClient: server.Client(), Capacity: 1,
@@ -61,7 +65,11 @@ func TestMediaWorkerDoesNotTrustGrantTargetOrDeleteBeforeReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker.Start(context.Background())
-	defer worker.Stop(context.Background())
+	defer func() {
+		if err := worker.Stop(context.Background()); err != nil {
+			t.Errorf("stop worker: %v", err)
+		}
+	}()
 	payload, _ := mediaprotocol.Encode(mediaprotocol.UploadGrantTopic("gateway_001"), mediaprotocol.UploadGrant{
 		Version: 1, UploadID: "clip_1", Status: mediaprotocol.GrantNeedUpload, MediaID: "11111111-1111-4111-8111-111111111111",
 		UploadURL: server.URL + "/storage/v1/object/upload/sign/media-video/11111111-1111-4111-8111-111111111111.mp4?token=x", ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
@@ -85,7 +93,11 @@ func TestMediaWorkerReadiesOnlyCorrelatedResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "clip.mp4")
 	if err := os.WriteFile(source, []byte("mp4 fixture"), 0600); err != nil {
 		t.Fatal(err)
@@ -111,7 +123,11 @@ func TestMediaWorkerRejectsUnusableExplicitCA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	caFile := filepath.Join(t.TempDir(), "ca.pem")
 	if err := os.WriteFile(caFile, []byte("not a CA"), 0600); err != nil {
 		t.Fatal(err)
@@ -187,7 +203,11 @@ func TestMediaWorkerAmbiguousPUTReopensAsReconcileWithoutRepeatingBytes(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	worker.opts.Spool = spool
 	if _, err := spool.db.Exec("UPDATE media_spool SET next_attempt=0 WHERE upload_id=?", record.UploadID); err != nil {
 		t.Fatal(err)
@@ -277,7 +297,11 @@ func TestMediaWorkerSuccessfulPUTReopensBeforeCompletionWithoutRepeatingBytes(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	restartedPublisher := &mediaRecorder{}
 	restarted, err := NewMediaWorker(MediaWorkerOptions{
 		GatewayID: "gateway_001", UploadOrigin: server.URL, Spool: spool,
@@ -308,7 +332,11 @@ func TestMediaWorkerGrantReadyAndWrongCorrelationCannotDeleteSpool(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "source.mp4")
 	if err := os.WriteFile(source, []byte("clip"), 0600); err != nil {
 		t.Fatal(err)
@@ -366,7 +394,11 @@ func TestMediaWorkerRejectsDuplicateTokenAndRedirectDoesNotForward(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "source.mp4")
 	if err := os.WriteFile(source, []byte("clip"), 0600); err != nil {
 		t.Fatal(err)
@@ -413,7 +445,11 @@ func TestMediaWorkerAttemptLimitIsDurableAndKeepsFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "source.mp4")
 	if err := os.WriteFile(source, []byte("clip"), 0600); err != nil {
 		t.Fatal(err)
@@ -492,7 +528,11 @@ func TestMediaWorkerRetryAfterCompletionReconcilesAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	worker.opts.Spool = spool
 	if _, err := spool.db.Exec("UPDATE media_spool SET next_attempt=0 WHERE upload_id=?", record.UploadID); err != nil {
 		t.Fatal(err)
@@ -566,7 +606,11 @@ func TestMediaWorkerLostGrantAndMissingObjectRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	worker.opts.Spool = spool
 
 	reopened, err := spool.Get(context.Background(), record.UploadID)
@@ -683,7 +727,11 @@ func TestMediaWorkerRejectsIDLessRetryAfterCompletionWithoutTransitionOrComplete
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "source.mp4")
 	if err := os.WriteFile(source, []byte("clip"), 0600); err != nil {
 		t.Fatal(err)

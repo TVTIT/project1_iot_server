@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +22,7 @@ import (
 
 const mediaSpoolMaxUploadBytes = mediaprotocol.MaxUploadBytes
 
+// Common errors returned by MediaSpool operations.
 var (
 	ErrMediaSpoolFull     = errors.New("gatewaysim: media spool capacity reached")
 	ErrMediaSpoolConflict = errors.New("gatewaysim: media upload identity conflict")
@@ -67,6 +69,7 @@ type MediaUpload struct {
 	Outcome       string
 }
 
+// MediaSpool manages durable on-disk spooled media clips and tracks their admission and delivery lifecycle.
 type MediaSpool struct {
 	db          *sql.DB
 	dir         string
@@ -166,7 +169,7 @@ func (s *MediaSpool) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var id, name string
 		if err := rows.Scan(&id, &name); err != nil {
@@ -190,6 +193,7 @@ func ensureMediaColumn(ctx context.Context, db *sql.DB, name, definition string)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = rows.Close() }()
 	found := false
 	for rows.Next() {
 		var cid int
@@ -197,13 +201,11 @@ func ensureMediaColumn(ctx context.Context, db *sql.DB, name, definition string)
 		var notNull, primary int
 		var defaultValue any
 		if err := rows.Scan(&cid, &column, &kind, &notNull, &defaultValue, &primary); err != nil {
-			rows.Close()
 			return err
 		}
 		found = found || column == name
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
 		return err
 	}
 	if err := rows.Close(); err != nil {
@@ -236,7 +238,9 @@ func (s *MediaSpool) IngestFinalized(ctx context.Context, uploadID, source strin
 	if err != nil {
 		return MediaUpload{}, err
 	}
-	defer in.Close()
+	defer func() {
+		_ = in.Close()
+	}()
 	info, err := in.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > mediaSpoolMaxUploadBytes {
 		return MediaUpload{}, ErrMediaSpoolRecord
@@ -270,7 +274,11 @@ func (s *MediaSpool) IngestFinalized(ctx context.Context, uploadID, source strin
 		return MediaUpload{}, err
 	}
 	tempName := tmp.Name()
-	defer os.Remove(tempName)
+	defer func() {
+		if err := os.Remove(tempName); err != nil && !os.IsNotExist(err) {
+			slog.Warn("gatewaysim: cleanup temp spool file failed")
+		}
+	}()
 	hash := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(tmp, hash), io.LimitReader(mediaContextReader{ctx: ctx, r: in}, mediaSpoolMaxUploadBytes+1))
 	if copyErr != nil || n != info.Size() || n < 1 || n > mediaSpoolMaxUploadBytes {
@@ -295,7 +303,11 @@ func (s *MediaSpool) IngestFinalized(ctx context.Context, uploadID, source strin
 	if err != nil {
 		return MediaUpload{}, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			slog.Warn("gatewaysim: media spool transaction rollback failed")
+		}
+	}()
 	var count, used int64
 	if err := tx.QueryRowContext(ctx, "SELECT count(*), COALESCE(sum(size_bytes),0) FROM media_spool WHERE phase!='ready'").Scan(&count, &used); err != nil {
 		return MediaUpload{}, err
@@ -373,6 +385,7 @@ func sourceReceipt(path string, info os.FileInfo) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Get retrieves a persisted media upload record by its upload ID.
 func (s *MediaSpool) Get(ctx context.Context, uploadID string) (MediaUpload, error) {
 	if !mediaUploadIDPattern.MatchString(uploadID) {
 		return MediaUpload{}, ErrMediaSpoolRecord
@@ -405,6 +418,7 @@ func scanMediaUpload(row *sql.Row, dir string) (MediaUpload, error) {
 	return r, nil
 }
 
+// List returns active, non-terminal media uploads whose next attempt is due.
 func (s *MediaSpool) List(ctx context.Context, due time.Time) ([]MediaUpload, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
@@ -412,7 +426,7 @@ func (s *MediaSpool) List(ctx context.Context, due time.Time) ([]MediaUpload, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]MediaUpload, 0, s.maxFiles)
 	for rows.Next() {
 		var r MediaUpload
@@ -476,6 +490,7 @@ func (s *MediaSpool) MarkGranted(ctx context.Context, uploadID, mediaID string, 
 	return requireMediaRow(res, err)
 }
 
+// MarkPutMayHaveStarted transitions an upload in granted phase to indicate a PUT may have begun.
 func (s *MediaSpool) MarkPutMayHaveStarted(ctx context.Context, uploadID string, grantExpiry time.Time) error {
 	if grantExpiry.IsZero() {
 		return ErrMediaSpoolRecord
@@ -488,6 +503,7 @@ func (s *MediaSpool) MarkPutMayHaveStarted(ctx context.Context, uploadID string,
 	return requireMediaRow(res, err)
 }
 
+// MarkAwaitingResult transitions an upload to the awaiting_result phase with a given next attempt time.
 func (s *MediaSpool) MarkAwaitingResult(ctx context.Context, uploadID string, due time.Time) error {
 	if due.IsZero() {
 		return ErrMediaSpoolRecord
@@ -500,6 +516,7 @@ func (s *MediaSpool) MarkAwaitingResult(ctx context.Context, uploadID string, du
 	return requireMediaRow(res, err)
 }
 
+// RecordAttempt increments the attempt counter for an upload awaiting grant and schedules the next attempt.
 func (s *MediaSpool) RecordAttempt(ctx context.Context, uploadID string, due time.Time) error {
 	if !mediaUploadIDPattern.MatchString(uploadID) || due.IsZero() {
 		return ErrMediaSpoolRecord
@@ -522,6 +539,7 @@ func (s *MediaSpool) RecordAttempt(ctx context.Context, uploadID string, due tim
 	return nil
 }
 
+// SchedulePoll updates the next attempt schedule for an upload in awaiting_result phase.
 func (s *MediaSpool) SchedulePoll(ctx context.Context, uploadID string, due time.Time) error {
 	if due.IsZero() {
 		return ErrMediaSpoolRecord
@@ -534,10 +552,12 @@ func (s *MediaSpool) SchedulePoll(ctx context.Context, uploadID string, due time
 	return requireMediaRow(res, err)
 }
 
+// Fail records an upload as expired with the provided failure reason.
 func (s *MediaSpool) Fail(ctx context.Context, uploadID, reason string, now time.Time) error {
 	return s.recordResult(ctx, uploadID, "", "expired", reason, now)
 }
 
+// RecordTerminal persists a terminal outcome (rejected, expired, or conflict) for an upload.
 func (s *MediaSpool) RecordTerminal(ctx context.Context, uploadID, mediaID, status, code string, now time.Time) error {
 	if status != "rejected" && status != "expired" && status != "conflict" {
 		return ErrMediaSpoolRecord
@@ -548,6 +568,7 @@ func (s *MediaSpool) RecordTerminal(ctx context.Context, uploadID, mediaID, stat
 	return s.recordResult(ctx, uploadID, mediaID, status, code, now)
 }
 
+// MoveToReconcile schedules an upload for completion reconciliation, optionally binding a media ID.
 func (s *MediaSpool) MoveToReconcile(ctx context.Context, uploadID string, due time.Time, mediaID ...string) error {
 	if due.IsZero() {
 		return ErrMediaSpoolRecord
@@ -587,7 +608,11 @@ func (s *MediaSpool) recordResult(ctx context.Context, uploadID, mediaID, status
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			slog.Warn("gatewaysim: media spool transaction rollback failed")
+		}
+	}()
 	var name, bound, phase, priorOutcome, priorReason string
 	err = tx.QueryRowContext(ctx, "SELECT spool_name,media_id,phase,outcome,reason FROM media_spool WHERE upload_id=?", uploadID).Scan(&name, &bound, &phase, &priorOutcome, &priorReason)
 	if err != nil {
@@ -658,6 +683,7 @@ func (s *MediaSpool) ApplyMQTTResult(ctx context.Context, payload []byte, now ti
 	return s.ApplyMQTTResultTopic(ctx, mediaprotocol.UploadResultTopic(s.gatewayID), payload, now)
 }
 
+// ApplyMQTTResultTopic validates and applies a decoded MQTT result message matching the spool's gateway.
 func (s *MediaSpool) ApplyMQTTResultTopic(ctx context.Context, topic string, payload []byte, now time.Time, retryAt ...time.Time) error {
 	if topic != mediaprotocol.UploadResultTopic(s.gatewayID) {
 		return ErrMediaSpoolRecord
@@ -721,15 +747,20 @@ func requireMediaRow(res sql.Result, err error) error {
 	return nil
 }
 
-func syncDirectory(path string) error {
+func syncDirectory(path string) (retErr error) {
 	d, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() {
+		if cErr := d.Close(); retErr == nil {
+			retErr = cErr
+		}
+	}()
 	return d.Sync()
 }
 
+// Close closes the underlying SQLite database and releases the exclusive process lock.
 func (s *MediaSpool) Close() error {
 	var err error
 	if s.db != nil {

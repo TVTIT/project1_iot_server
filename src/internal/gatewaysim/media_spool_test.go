@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +46,11 @@ func TestMediaSpoolIngestPersistsStableRecordAndSourceReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	second, err := s.IngestFinalized(context.Background(), "upload_1", source, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -59,9 +64,20 @@ func TestMediaSpoolIngestPersistsStableRecordAndSourceReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(opened.Name())
-	opened.Close()
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if string(got) != string(data) {
 		t.Fatalf("spooled bytes = %q", got)
+	}
+	entries, err := os.ReadDir(cfg.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".media-") && strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("lingering temp spool file: %s", entry.Name())
+		}
 	}
 }
 
@@ -71,7 +87,11 @@ func TestMediaSpoolRejectsUnsafeInputAndIncompleteFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "clip")
 	if err := os.WriteFile(source, []byte("x"), 0600); err != nil {
 		t.Fatal(err)
@@ -115,7 +135,11 @@ func TestMediaSpoolQuotaTransitionsAndReadyCorrelation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	source := filepath.Join(t.TempDir(), "clip")
 	_ = os.WriteFile(source, []byte("small video"), 0600)
 	r, err := s.IngestFinalized(context.Background(), "upload_3", source, time.Now())
@@ -211,7 +235,11 @@ func TestMediaSpoolResumesAttemptAndReadyCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	got, err := s.Get(context.Background(), r.UploadID)
 	if err != nil || got.Phase != "awaiting_result" || got.MediaID != "55555555-5555-4555-8555-555555555555" || got.Attempts != 1 || got.Path != r.Path {
 		t.Fatalf("resumed record=%+v err=%v", got, err)
@@ -230,7 +258,11 @@ func TestMediaSpoolResumesAttemptAndReadyCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	if _, err := os.Lstat(got.Path); !os.IsNotExist(err) {
 		t.Fatalf("ready cleanup did not resume: %v", err)
 	}
@@ -246,7 +278,11 @@ func TestMediaSpoolGrantRequiresFreshRequestAndReadyReplayChecksStoredName(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	record, err := spool.IngestFinalized(context.Background(), "fresh_1", source, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -300,7 +336,11 @@ func TestMediaSpoolObjectMissingReopensRequestOnlyForMatchingPendingResult(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer spool.Close()
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
 	record, err := spool.IngestFinalized(context.Background(), "missing_1", source, time.Now())
 	if err != nil {
 		t.Fatal(err)

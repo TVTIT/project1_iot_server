@@ -427,9 +427,9 @@ type lifecycleMediaWorkerStub struct {
 	stopped   bool
 }
 
-func (s *lifecycleMediaWorkerStub) Admit(topic string, payload []byte, retained bool) {}
-func (s *lifecycleMediaWorkerStub) SetPublisher(publisher gatewaysim.MediaPublisher)  {}
-func (s *lifecycleMediaWorkerStub) Start(ctx context.Context)                         {}
+func (s *lifecycleMediaWorkerStub) Admit(_ string, _ []byte, _ bool)         {}
+func (s *lifecycleMediaWorkerStub) SetPublisher(_ gatewaysim.MediaPublisher) {}
+func (s *lifecycleMediaWorkerStub) Start(_ context.Context)                  {}
 func (s *lifecycleMediaWorkerStub) Stop(ctx context.Context) error {
 	s.stopped = true
 	if s.blockStop {
@@ -465,7 +465,7 @@ func TestRunMediaWorkerShutdownLifecycleAndSpoolOwnership(t *testing.T) {
 		fake := newFakeTransport(true)
 		origTransport := buildTransport
 		origWorker := buildMediaWorker
-		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, _ gatewaysim.MediaAdmitter) (simTransport, error) {
 			fake.admit, fake.gatewayID = admit, cfg.GatewayID
 			return fake, nil
 		}
@@ -510,7 +510,7 @@ func TestRunMediaWorkerShutdownLifecycleAndSpoolOwnership(t *testing.T) {
 		fake := newFakeTransport(true)
 		origTransport := buildTransport
 		origWorker := buildMediaWorker
-		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, _ gatewaysim.MediaAdmitter) (simTransport, error) {
 			fake.admit, fake.gatewayID = admit, cfg.GatewayID
 			return fake, nil
 		}
@@ -550,7 +550,7 @@ func TestRunMediaWorkerShutdownLifecycleAndSpoolOwnership(t *testing.T) {
 		env := runEnv(outboxPath, nil)
 		fake := newFakeTransport(true)
 		origTransport := buildTransport
-		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, _ gatewaysim.MediaAdmitter) (simTransport, error) {
 			fake.admit, fake.gatewayID = admit, cfg.GatewayID
 			return fake, nil
 		}
@@ -566,7 +566,7 @@ func TestRunMediaWorkerShutdownLifecycleAndSpoolOwnership(t *testing.T) {
 	t.Run("partial startup failure before media worker starts releases spool", func(t *testing.T) {
 		_, spoolDir, _, env := setupFixture(t)
 		origTransport := buildTransport
-		buildTransport = func(cfg gatewaysim.Config, admit gatewaysim.ACKAdmitter, media gatewaysim.MediaAdmitter) (simTransport, error) {
+		buildTransport = func(_ gatewaysim.Config, _ gatewaysim.ACKAdmitter, _ gatewaysim.MediaAdmitter) (simTransport, error) {
 			return nil, errors.New("simulated transport failure")
 		}
 		t.Cleanup(func() { buildTransport = origTransport })

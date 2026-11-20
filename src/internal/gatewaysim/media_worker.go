@@ -15,10 +15,12 @@ import (
 	"iot-platform/internal/mediaprotocol"
 )
 
+// MediaPublisher abstracts the MQTT outbound publication seam for media worker notifications.
 type MediaPublisher interface {
 	PublishMedia(context.Context, any) error
 }
 
+// MediaWorkerOptions configures the simulator's background media worker and storage client.
 type MediaWorkerOptions struct {
 	GatewayID, UploadOrigin, CAFile string
 	Spool                           *MediaSpool
@@ -50,6 +52,7 @@ type MediaWorker struct {
 	cancel      context.CancelFunc
 }
 
+// NewMediaWorker constructs a validated media worker with bounded capacity and TLS configuration.
 func NewMediaWorker(opts MediaWorkerOptions) (*MediaWorker, error) {
 	u, err := url.Parse(opts.UploadOrigin)
 	if validateMediaUploadOrigin(opts.UploadOrigin) != nil || err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" ||
@@ -86,10 +89,12 @@ func NewMediaWorker(opts MediaWorkerOptions) (*MediaWorker, error) {
 	return &MediaWorker{opts: opts, inbox: make(chan mediaDelivery, opts.Capacity), stop: make(chan struct{}), done: make(chan struct{})}, nil
 }
 
+// Admit queues an inbound media MQTT message if capacity allows, discarding overflow.
 func (w *MediaWorker) Admit(topic string, payload []byte, retained bool) {
 	_ = w.TryAdmit(topic, payload, retained)
 }
 
+// TryAdmit attempts to enqueue an inbound media MQTT message into the bounded inbox.
 func (w *MediaWorker) TryAdmit(topic string, payload []byte, retained bool) bool {
 	if len(payload) > mediaprotocol.MaxEnvelopeBytes {
 		return false
@@ -105,6 +110,7 @@ func (w *MediaWorker) TryAdmit(topic string, payload []byte, retained bool) bool
 	}
 }
 
+// Start begins the media worker's background event loop and ticker.
 func (w *MediaWorker) Start(ctx context.Context) {
 	w.startOnce.Do(func() {
 		workerCtx, cancel := context.WithCancel(ctx)
@@ -134,6 +140,7 @@ func (w *MediaWorker) Start(ctx context.Context) {
 	})
 }
 
+// Stop gracefully terminates the media worker loop and waits for its goroutine to finish.
 func (w *MediaWorker) Stop(ctx context.Context) error {
 	w.once.Do(func() { close(w.stop) })
 	w.lifecycleMu.Lock()
@@ -273,7 +280,9 @@ func (w *MediaWorker) put(ctx context.Context, id, mediaID, rawURL string, expir
 		_ = w.opts.Spool.MarkAwaitingResult(ctx, id, time.Now().Add(w.retryDelay(r.Attempts)))
 		return
 	}
-	defer f.Close()
+	defer func() {
+		_ = f.Close()
+	}()
 	u, _ := url.Parse(rawURL)
 	base, _ := url.Parse(w.opts.UploadOrigin)
 	if !validMediaTarget(u, base, mediaID) {
