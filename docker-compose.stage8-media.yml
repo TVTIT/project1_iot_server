@@ -7,12 +7,29 @@ services:
       MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:?fixture/operator route key required}
     volumes: !override
       - ./config/nginx/stage8-media.conf.template:/etc/nginx/templates/default.conf.template:ro
+  # Fixture-only TLS edge models Cloudflare termination, then proxies over HTTP
+  # to the production listener. Never included by the root Compose profile.
+  stage8-media-upload-test-edge:
+    image: nginx:1.25-alpine
+    restart: "no"
+    ports:
+      - target: 443
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - ./config/nginx/stage8-media-test-edge.conf.template:/etc/nginx/templates/default.conf.template:ro
       - type: bind
-        source: ${MEDIA_TLS_DIR:?fixture/operator TLS directory required}
+        source: ${MEDIA_TEST_TLS_DIR:?fixture TLS directory required}
         target: /etc/nginx/stage8-tls
         read_only: true
         bind:
           create_host_path: false
+    networks:
+      - iot_net
+    depends_on:
+      stage8-media-upload:
+        condition: service_started
   supabase-envoy:
     environment:
       MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:?fixture/operator route key required}

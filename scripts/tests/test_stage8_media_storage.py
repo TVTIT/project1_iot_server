@@ -202,7 +202,9 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         listener = compose.split("  stage8-media-upload:\n", 1)[1].split("\n  #", 1)[0]
         self.assertIn('profiles: ["stage8-media"]', listener)
         self.assertIn("host_ip: 127.0.0.1", listener)
-        self.assertIn("create_host_path: false", listener)
+        self.assertIn('target: 80', listener)
+        self.assertIn('published: "${MEDIA_HTTP_PORT:-0}"', listener)
+        self.assertNotIn("MEDIA_TLS_DIR", listener)
         self.assertIn("MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}", compose)
         self.assertIn("MEDIA_UPLOAD_PUBLIC_ORIGIN: ${MEDIA_UPLOAD_PUBLIC_ORIGIN:-}", compose)
         self.assertIn("MEDIA_UPLOAD_MQTT_CLIENT_ID: ${MEDIA_UPLOAD_MQTT_CLIENT_ID:-backend_media}", compose)
@@ -210,9 +212,11 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         example = (ROOT / ".env.example").read_text().splitlines()
         for name in ("MEDIA_UPLOAD_MQTT_CLIENT_ID", "MEDIA_UPLOAD_PUBLIC_ORIGIN",
                      "STORAGE_INTERNAL_URL", "MEDIA_UPLOAD_GRANT_TTL_SECONDS",
-                     "MEDIA_UPLOAD_ROUTE_KEY", "MEDIA_TLS_DIR", "MEDIA_HTTPS_PORT",
+                     "MEDIA_UPLOAD_ROUTE_KEY", "MEDIA_HTTP_PORT",
                      "STORAGE_FILE_SIZE_LIMIT", "STORAGE_LOG_LEVEL"):
             self.assertTrue(any(line.startswith(name + "=") for line in example), name)
+        self.assertFalse(any(line.startswith(("MEDIA_TLS_DIR=", "MEDIA_HTTPS_PORT="))
+                             for line in example))
 
     def test_signed_put_route_is_exact_opt_in_and_fail_closed(self):
         override = (ROOT / "docker-compose.stage8-media.yml").read_text()
@@ -221,6 +225,9 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         envoy = (ROOT / "config" / "envoy" / "lds.template.yaml").read_text()
         self.assertIn("stage8-media-upload:", override)
         self.assertIn("stage8-media.conf.template", (ROOT / "docker-compose.yml").read_text())
+        self.assertIn("listen 80;", nginx)
+        self.assertNotIn("listen 443 ssl;", nginx)
+        self.assertNotIn("ssl_certificate", nginx)
         self.assertIn('location ~ "^/storage/v1/object/upload/sign/media-video/', nginx)
         self.assertIn("client_max_body_size 80m", nginx)
         self.assertIn("proxy_request_buffering off", nginx)
@@ -239,7 +246,12 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         self.assertLess(envoy.index("name: stage8-media-blocked"),
                         envoy.index("prefix: /storage/v1/"))
         self.assertIn("MEDIA_UPLOAD_ROUTE_KEY", override)
-        self.assertIn("MEDIA_TLS_DIR", override)
+        self.assertNotIn("MEDIA_TLS_DIR", override)
+        self.assertIn("target: 443", override)
+        self.assertIn("stage8-media-upload-test-edge:", override)
+        test_edge = (ROOT / "config" / "nginx" / "stage8-media-test-edge.conf.template").read_text()
+        self.assertIn("listen 443 ssl;", test_edge)
+        self.assertIn("proxy_pass http://stage8-media-upload:80;", test_edge)
         fixture = (ROOT / "scripts" / "tests" / "stage8_media_storage_http_fixture.py").read_text()
         self.assertIn("TestNativeStage8SignedUpload", fixture)
         self.assertIn("NoSuchKey", fixture)

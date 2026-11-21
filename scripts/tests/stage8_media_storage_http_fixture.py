@@ -370,7 +370,7 @@ def prove_fixture(fixture, prefix, report):
     key = fixture.values["MEDIA_UPLOAD_ROUTE_KEY"]
     storage_token = fixture.values["SERVICE_ROLE_KEY"]
     storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
-    upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload", 443)
+    upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
     endpoint = smoke.HTTPSEndpoint(
         f"https://127.0.0.1:{upload_port}", fixture.private / "p2-ca.crt",
     )
@@ -1431,7 +1431,7 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
 def run_cleanup_worker_e2e(fixture, prefix, registry, material, report):
     """Exercise the production cleanup worker against a real Storage object."""
     storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
-    upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload", 443)
+    upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
     ready_rows = smoke.db_psql(
         registry, material["postgres_id"],
         """SELECT json_build_array(media_id::text,storage_path,verified_sha256,
@@ -1599,8 +1599,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
         fixture = smoke.prepare(work / "fixture", paper_p2=True)
         fixture.values.update({
             "MEDIA_UPLOAD_ROUTE_KEY": secrets.token_hex(32),
-            "MEDIA_TLS_DIR": str(fixture.private / "p2-tls"),
-            "MEDIA_HTTPS_PORT": "0",
+            "MEDIA_TEST_TLS_DIR": str(fixture.private / "p2-tls"),
+            "MEDIA_HTTP_PORT": "0",
             "MEDIA_UPLOAD_GRANT_TTL_SECONDS": "30",
         })
         prepare_mode = (prepare_stage8_e2e or stage8_local_e2e or stage8_local_e2e_cap
@@ -1689,7 +1689,7 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             media_init.ensure_image_bucket(storage_api)
             report["checks"]["base_bucket_bootstrap"] = {"status": "PASS"}
             upload_port_probe = subprocess.run(
-                prefix + ["port", "stage8-media-upload", "443"],
+                prefix + ["port", "stage8-media-upload", "80"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=smoke.process_env(fixture), timeout=10, check=False,
             )
             require(upload_port_probe.returncode != 0, "dedicated_listener_unexpectedly_present_in_base")
@@ -1701,10 +1701,11 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             dependencies = [s for s in smoke.fixture_services(fixture)
                             if s not in ("backend", "nginx")]
             started = run(prefix + ["up", "--detach", "--no-build", "--pull", "never",
-                                    *dependencies, "stage8-media-upload"],
+                                    *dependencies, "stage8-media-upload",
+                                    "stage8-media-upload-test-edge"],
                           fixture, timeout=300, check=False)
             require(started.returncode == 0, "stage8_prerequisite_compose_start_failed")
-            upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload", 443)
+            upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
             fixture.values["MEDIA_UPLOAD_PUBLIC_ORIGIN"] = f"https://127.0.0.1:{upload_port}"
             fixture.env_file.write_text(
                 "".join(f"{name}={value}\n" for name, value in sorted(fixture.values.items())),
@@ -1778,7 +1779,9 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 material["owner_token"] = ""
             else:
                 material["password"] = ""
-                endpoint = smoke.HTTPSEndpoint(f"https://127.0.0.1:{upload_port}", fixture.private / "p2-ca.crt")
+                endpoint = smoke.HTTPSEndpoint(
+                    f"https://127.0.0.1:{upload_port}", fixture.private / "p2-ca.crt",
+                )
                 health = https_request(endpoint, "GET", "/healthz")
                 require(health[0] == 200 and health[2] == b"OK", "media_listener_health_failed")
                 require(https_request(endpoint, "GET", "/v1/health")[0] == 404,
@@ -1790,7 +1793,9 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 }
             report["status"] = "PASS"
         else:
-            services = list(smoke.fixture_services(fixture)) + ["stage8-media-upload"]
+            services = list(smoke.fixture_services(fixture)) + [
+                "stage8-media-upload", "stage8-media-upload-test-edge",
+            ]
             started = run(prefix + ["up", "--detach", "--no-build", "--pull", "never", *services],
                           fixture, timeout=300, check=False)
             if started.returncode:
@@ -1799,7 +1804,7 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             ready = False
             for _ in range(60):
                 try:
-                    port = mapped_loopback_port(prefix, fixture, "stage8-media-upload", 443)
+                    port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
                     endpoint = smoke.HTTPSEndpoint(f"https://127.0.0.1:{port}", fixture.private / "p2-ca.crt")
                     if https_request(endpoint, "GET", "/healthz", timeout=1)[0] == 200:
                         ready = True

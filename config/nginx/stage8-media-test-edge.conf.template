@@ -1,0 +1,22 @@
+# Fixture-only HTTPS edge that models public TLS termination. The real
+# stage8-media-upload service remains HTTP-only on the Docker network.
+server {
+    listen 443 ssl;
+    server_name localhost;
+    ssl_certificate /etc/nginx/stage8-tls/server.crt;
+    ssl_certificate_key /etc/nginx/stage8-tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 80m;
+    access_log off;
+    error_log /dev/null emerg;
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_pass http://stage8-media-upload:80;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}

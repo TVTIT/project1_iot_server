@@ -1,10 +1,8 @@
-# Local Stage 8 opt-in only. TLS materials and route key are fixture/operator inputs.
+# Local Stage 8 opt-in only. Cloudflare terminates public TLS; this listener is
+# HTTP-only on the trusted Docker network.
 server {
-    listen 443 ssl;
+    listen 80;
     server_name ${API_DOMAIN};
-    ssl_certificate /etc/nginx/stage8-tls/server.crt;
-    ssl_certificate_key /etc/nginx/stage8-tls/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
     client_header_timeout 10s;
     client_body_timeout 120s;
     send_timeout 120s;
@@ -29,7 +27,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header Authorization "";
         proxy_set_header apikey "";
         proxy_set_header x-upsert "";
@@ -42,7 +40,7 @@ server {
         proxy_set_header X-Stage8-Media-Route "${MEDIA_UPLOAD_ROUTE_KEY}";
     }
 
-    # No other public Storage API is exposed by this media-only HTTPS profile.
+    # No other public Storage API is exposed by this media-only profile.
     location /storage/v1/ { return 404; }
     location = /healthz {
         default_type text/plain;

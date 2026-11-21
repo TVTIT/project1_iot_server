@@ -513,14 +513,14 @@ services:
     networks:
       - iot_net
 
-  # Opt-in HTTPS ingress for signed video PUT only; cloudflared can use iot_net.
+  # Opt-in HTTP origin for Cloudflare's HTTPS-terminated signed video PUT tunnel.
   stage8-media-upload:
     image: nginx:1.25-alpine
     profiles: ["stage8-media"]
     restart: "no"
     ports:
-      - target: 443
-        published: "${MEDIA_HTTPS_PORT:-0}"
+      - target: 80
+        published: "${MEDIA_HTTP_PORT:-0}"
         host_ip: 127.0.0.1
         protocol: tcp
     environment:
@@ -528,12 +528,6 @@ services:
       MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:-}
     volumes:
       - ./config/nginx/stage8-media.conf.template:/etc/nginx/templates/default.conf.template:ro
-      - type: bind
-        source: ${MEDIA_TLS_DIR:-./.stage8-media-tls}
-        target: /etc/nginx/stage8-tls
-        read_only: true
-        bind:
-          create_host_path: false
     networks:
       - iot_net
     depends_on:
