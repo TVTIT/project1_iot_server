@@ -25,6 +25,35 @@ serializes request URLs with the `token` query parameter redacted, and the
 overlay sets `LOG_LEVEL=fatal` to suppress routine request logs. Fixture
 artifacts must contain only sanitized status/timing metadata.
 
+## Chạy bằng Compose gốc trên máy demo
+
+`docker-compose.yml` có profile `stage8-media`; không cần truyền overlay local
+`docker-compose.stage8-media.yml` khi vận hành demo. Profile chỉ kích hoạt
+listener riêng; cờ backend và giới hạn Storage vẫn là cấu hình độc lập. Mặc định
+backend tắt media, Storage giữ 50 MiB và listener không được khởi động.
+
+Trước khi bật, xác nhận ACL DynSec media và migration 28. Theo `.env.example`, đặt
+`MEDIA_UPLOAD_ENABLED=true`, `MEDIA_UPLOAD_PUBLIC_ORIGIN` bằng HTTPS origin
+demo, `MEDIA_TLS_DIR` chứa `server.crt`/`server.key` và
+`MEDIA_UPLOAD_ROUTE_KEY` là chuỗi hex ngẫu nhiên không rỗng. Đặt
+`STORAGE_FILE_SIZE_LIMIT=80000000` và `STORAGE_LOG_LEVEL=fatal`. Backend và Storage
+dùng chung `MEDIA_UPLOAD_GRANT_TTL_SECONDS` (mặc định `60`); thay đổi giá trị
+này không thay đổi timeout HTTP. Giữ credentials và project name hiện có.
+
+```sh
+docker compose -p "$PROJECT" --env-file .env -f docker-compose.yml \
+  --profile stage8-media config --quiet
+docker compose -p "$PROJECT" --env-file .env -f docker-compose.yml \
+  --profile stage8-media up -d --build nginx stage8-media-upload
+```
+
+Không chạy lệnh trên bằng project name khác nếu container mang tên cố định
+đang thuộc project cũ. Hai file Compose ghép vào cùng một project không tự tạo
+container trùng tên. Sau khi áp dụng, kiểm backend/Storage healthy, listener
+HTTPS và bucket private `media-video` bằng `scripts/init-media-bucket.py` qua
+Storage nội bộ. Bước này không tự bật FRP hay Cloudflare. Overlay cũ được giữ
+cho fixture cục bộ và các lệnh hồi quy hiện có.
+
 Owned native HTTP/Storage fixture: **PASS**, exact cleanup verified. It bootstraps
 and reads back the private bucket; obtains the signed URL through the Go client;
 uploads over CA-verified HTTPS; confirms direct Storage read/hash and overwrite

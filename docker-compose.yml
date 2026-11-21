@@ -182,6 +182,7 @@ services:
     environment:
       ANON_KEY: ${ANON_KEY}
       SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:-}
       SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-admin}
@@ -282,7 +283,9 @@ services:
       STORAGE_BACKEND: file
       FILE_STORAGE_BACKEND_PATH: /var/lib/storage
       GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-iot-storage}
-      FILE_SIZE_LIMIT: 52428800
+      FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}
+      UPLOAD_SIGNED_URL_EXPIRATION_TIME: ${MEDIA_UPLOAD_GRANT_TTL_SECONDS:-60}
+      LOG_LEVEL: ${STORAGE_LOG_LEVEL:-info}
       STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost}
       TENANT_ID: default
       REGION: local
@@ -354,8 +357,16 @@ services:
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-backend_monolith}
       MQTT_USERNAME: ${MQTT_USERNAME:-backend_service}
       MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD is required}
-      # Media MQTT ACL/profile is opt-in; Storage is not configured by this flag.
+      # Stage 8 runtime is opt-in; start the dedicated listener separately.
       MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}
+      MEDIA_UPLOAD_MQTT_CLIENT_ID: ${MEDIA_UPLOAD_MQTT_CLIENT_ID:-backend_media}
+      MEDIA_UPLOAD_SIGN_TIMEOUT: ${MEDIA_UPLOAD_SIGN_TIMEOUT:-5s}
+      MEDIA_UPLOAD_GRANT_TTL_SECONDS: ${MEDIA_UPLOAD_GRANT_TTL_SECONDS:-60}
+      MEDIA_UPLOAD_INFLIGHT_GRACE: ${MEDIA_UPLOAD_INFLIGHT_GRACE:-2m}
+      MEDIA_UPLOAD_REQUEST_WORKERS: ${MEDIA_UPLOAD_REQUEST_WORKERS:-2}
+      MEDIA_UPLOAD_PUBLIC_ORIGIN: ${MEDIA_UPLOAD_PUBLIC_ORIGIN:-}
+      STORAGE_INTERNAL_URL: ${STORAGE_INTERNAL_URL:-http://supabase-storage:5000}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY:-}
       MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY: ${MEDIA_UPLOAD_MAX_PENDING_PER_GATEWAY:-1}
       MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS: ${MEDIA_UPLOAD_MAX_UNSETTLED_INTENTS:-8}
       MEDIA_UPLOAD_TEMPORARY_BYTES: ${MEDIA_UPLOAD_TEMPORARY_BYTES:-640000000}
@@ -501,6 +512,35 @@ services:
       start_period: 10s
     networks:
       - iot_net
+
+  # Opt-in HTTPS ingress for signed video PUT only; cloudflared can use iot_net.
+  stage8-media-upload:
+    image: nginx:1.25-alpine
+    profiles: ["stage8-media"]
+    restart: "no"
+    ports:
+      - target: 443
+        published: "${MEDIA_HTTPS_PORT:-0}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    environment:
+      API_DOMAIN: ${API_DOMAIN:-localhost}
+      MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:-}
+    volumes:
+      - ./config/nginx/stage8-media.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - type: bind
+        source: ${MEDIA_TLS_DIR:-./.stage8-media-tls}
+        target: /etc/nginx/stage8-tls
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - iot_net
+    depends_on:
+      supabase-envoy:
+        condition: service_started
+    labels:
+      io.iot.stage: stage8-media-upload
 
   # 8. Cloudflare Tunnel
   cloudflared:

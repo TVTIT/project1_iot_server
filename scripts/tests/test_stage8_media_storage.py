@@ -190,11 +190,29 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         compose = (ROOT / "docker-compose.yml").read_text()
         storage_client = (ROOT / "src" / "internal" / "mediastorage" / "client.go").read_text()
         self.assertIn("FILE_SIZE_LIMIT: 80000000", override)
-        self.assertIn("UPLOAD_SIGNED_URL_EXPIRATION_TIME: ${MEDIA_UPLOAD_GRANT_TTL_SECONDS:-60}", override)
-        self.assertIn("FILE_SIZE_LIMIT: 52428800", compose)
+        self.assertIn("profiles: !reset []", override)
+        self.assertIn("FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}", compose)
         self.assertIn('init-media-bucket.py', (ROOT / "scripts" / "init-buckets.sh").read_text())
         self.assertIn('VideoBucketID      = "media-video"', storage_client)
         self.assertIn('http://supabase-storage:5000', (ROOT / "scripts" / "init-media-bucket.py").read_text())
+
+    def test_root_compose_can_configure_media_without_the_fixture_overlay(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        self.assertIn("  stage8-media-upload:\n", compose)
+        listener = compose.split("  stage8-media-upload:\n", 1)[1].split("\n  #", 1)[0]
+        self.assertIn('profiles: ["stage8-media"]', listener)
+        self.assertIn("host_ip: 127.0.0.1", listener)
+        self.assertIn("create_host_path: false", listener)
+        self.assertIn("MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}", compose)
+        self.assertIn("MEDIA_UPLOAD_PUBLIC_ORIGIN: ${MEDIA_UPLOAD_PUBLIC_ORIGIN:-}", compose)
+        self.assertIn("MEDIA_UPLOAD_MQTT_CLIENT_ID: ${MEDIA_UPLOAD_MQTT_CLIENT_ID:-backend_media}", compose)
+        self.assertIn("UPLOAD_SIGNED_URL_EXPIRATION_TIME: ${MEDIA_UPLOAD_GRANT_TTL_SECONDS:-60}", compose)
+        example = (ROOT / ".env.example").read_text().splitlines()
+        for name in ("MEDIA_UPLOAD_MQTT_CLIENT_ID", "MEDIA_UPLOAD_PUBLIC_ORIGIN",
+                     "STORAGE_INTERNAL_URL", "MEDIA_UPLOAD_GRANT_TTL_SECONDS",
+                     "MEDIA_UPLOAD_ROUTE_KEY", "MEDIA_TLS_DIR", "MEDIA_HTTPS_PORT",
+                     "STORAGE_FILE_SIZE_LIMIT", "STORAGE_LOG_LEVEL"):
+            self.assertTrue(any(line.startswith(name + "=") for line in example), name)
 
     def test_signed_put_route_is_exact_opt_in_and_fail_closed(self):
         override = (ROOT / "docker-compose.stage8-media.yml").read_text()
@@ -202,7 +220,7 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         base_nginx = (ROOT / "config" / "nginx" / "nginx.conf.template").read_text()
         envoy = (ROOT / "config" / "envoy" / "lds.template.yaml").read_text()
         self.assertIn("stage8-media-upload:", override)
-        self.assertIn("stage8-media.conf.template", override)
+        self.assertIn("stage8-media.conf.template", (ROOT / "docker-compose.yml").read_text())
         self.assertIn('location ~ "^/storage/v1/object/upload/sign/media-video/', nginx)
         self.assertIn("client_max_body_size 80m", nginx)
         self.assertIn("proxy_request_buffering off", nginx)
@@ -215,7 +233,7 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         self.assertIn("- x-upsert", envoy)
         self.assertNotIn("X-ENVOY-ORIGINAL-PATH?:PATH", envoy)
         self.assertIn("stage8-media-blocked", envoy)
-        self.assertIn("UPLOAD_SIGNED_URL_EXPIRATION_TIME", override)
+        self.assertIn("UPLOAD_SIGNED_URL_EXPIRATION_TIME", (ROOT / "docker-compose.yml").read_text())
         self.assertLess(envoy.index("name: stage8-media-signed-put"),
                         envoy.index("name: stage8-media-blocked"))
         self.assertLess(envoy.index("name: stage8-media-blocked"),
