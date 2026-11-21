@@ -1,9 +1,11 @@
 package gatewaysim
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -109,6 +111,9 @@ type TransportOptions struct {
 	ControlEnabled bool
 	// MediaEnabled opts into the own media downlink subscription.
 	MediaEnabled bool
+	// AllowTestMediaPayloads enables one narrowly validated malformed upload
+	// request used by the simulator's declared-size test case only.
+	AllowTestMediaPayloads bool
 	// MediaInbox is required when MediaEnabled and must be bounded/non-blocking.
 	MediaInbox MediaAdmitter
 	// GatewayID is the configured Gateway identity. It must equal Username and
@@ -156,20 +161,21 @@ type TransportOptions struct {
 // to NewTransport.
 func TransportOptionsFromConfig(cfg Config) TransportOptions {
 	return TransportOptions{
-		ControlEnabled:       cfg.ControlEnabled,
-		GatewayID:            cfg.GatewayID,
-		BrokerURL:            cfg.BrokerURL,
-		ClientID:             cfg.ClientID,
-		Username:             cfg.Username,
-		Password:             cfg.Password,
-		CAFile:               cfg.CAFile,
-		ServerName:           cfg.MQTTServerName,
-		ConnectTimeout:       cfg.ConnectTimeout,
-		SubscribeTimeout:     cfg.SubscribeTimeout,
-		PublishTimeout:       cfg.PublishTimeout,
-		ReconnectMaxInterval: cfg.RetryMaxDelay,
-		CloseWaitTimeout:     cfg.ShutdownTimeout,
-		MaxInflight:          cfg.MaxInflight,
+		ControlEnabled:         cfg.ControlEnabled,
+		AllowTestMediaPayloads: cfg.MediaUpload.TestCase == MediaTestDeclaredOverCap,
+		GatewayID:              cfg.GatewayID,
+		BrokerURL:              cfg.BrokerURL,
+		ClientID:               cfg.ClientID,
+		Username:               cfg.Username,
+		Password:               cfg.Password,
+		CAFile:                 cfg.CAFile,
+		ServerName:             cfg.MQTTServerName,
+		ConnectTimeout:         cfg.ConnectTimeout,
+		SubscribeTimeout:       cfg.SubscribeTimeout,
+		PublishTimeout:         cfg.PublishTimeout,
+		ReconnectMaxInterval:   cfg.RetryMaxDelay,
+		CloseWaitTimeout:       cfg.ShutdownTimeout,
+		MaxInflight:            cfg.MaxInflight,
 	}
 }
 
@@ -727,6 +733,28 @@ func (t *Transport) PublishMedia(ctx context.Context, message any) error {
 		return ErrPublishUnconfirmed
 	}
 	return t.Publish(ctx, topic, payload)
+}
+
+// PublishMediaTestPayload publishes only the exact test payload whose sole
+// protocol violation is an upload size one byte above the server cap.
+func (t *Transport) PublishMediaTestPayload(ctx context.Context, payload []byte) error {
+	if !t.opts.AllowTestMediaPayloads || !t.opts.MediaEnabled ||
+		len(payload) == 0 || len(payload) > mediaprotocol.MaxEnvelopeBytes {
+		return ErrPublishUnconfirmed
+	}
+	var request mediaprotocol.UploadRequest
+	if json.Unmarshal(payload, &request) != nil || request.SizeBytes != mediaprotocol.MaxUploadBytes+1 {
+		return ErrPublishUnconfirmed
+	}
+	request.SizeBytes--
+	expected, err := declaredOverCapTestPayload(request)
+	if err != nil || !bytes.Equal(payload, expected) {
+		return ErrPublishUnconfirmed
+	}
+	if _, err := mediaprotocol.Decode(mediaprotocol.UploadRequestTopic(t.opts.GatewayID), payload); err == nil {
+		return ErrPublishUnconfirmed
+	}
+	return t.Publish(ctx, mediaprotocol.UploadRequestTopic(t.opts.GatewayID), payload)
 }
 
 // failCurrent marks a lifetime failed, prevents further invocations by closing

@@ -419,6 +419,52 @@ func TestRunMediaCompositionUsesPrivateSeparateSpoolAndWorkerInbox(t *testing.T)
 	}
 }
 
+func TestRunRejectsUnknownMediaTestCaseBeforeStartingRuntime(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	code := run(context.Background(), []string{"run", "--test-media-case", "unbounded"},
+		lookupFrom(runEnv(filepath.Join(t.TempDir(), "outbox.db"), nil)), &out, &errBuf)
+	if code != 2 || !strings.Contains(errBuf.String(), "--test-media-case") {
+		t.Fatalf("code=%d stderr=%q", code, errBuf.String())
+	}
+}
+
+func TestRunMediaTestCaseRequiresOptInAndExactCapFixture(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "clip.mp4")
+	if err := os.WriteFile(input, []byte("not an exact-cap fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spool := filepath.Join(root, "spool")
+	if err := os.Mkdir(spool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	mediaEnv := map[string]string{
+		"MEDIA_UPLOAD_ENABLED":        "true",
+		"GATEWAY_MEDIA_INPUT_FILE":    input,
+		"GATEWAY_MEDIA_SPOOL_DIR":     spool,
+		"GATEWAY_MEDIA_UPLOAD_ORIGIN": "https://storage.example",
+		"GATEWAY_MEDIA_UPLOAD_ID":     "test_probe_001",
+	}
+	for _, tt := range []struct {
+		name      string
+		overrides map[string]string
+		want      string
+	}{
+		{name: "requires media opt-in", want: "--test-media-case requires MEDIA_UPLOAD_ENABLED=true"},
+		{name: "requires exact cap fixture", overrides: mediaEnv, want: "exactly 80000000 bytes"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := runEnv(filepath.Join(root, tt.name+".db"), tt.overrides)
+			var out, errBuf bytes.Buffer
+			code := run(context.Background(), []string{"run", "--test-media-case", gatewaysim.MediaTestStorageCapPlusOne},
+				lookupFrom(env), &out, &errBuf)
+			if code != 2 || !strings.Contains(errBuf.String(), tt.want) {
+				t.Fatalf("code=%d stderr=%q, want %q", code, errBuf.String(), tt.want)
+			}
+		})
+	}
+}
+
 type lifecycleMediaWorkerStub struct {
 	gatewaysim.MediaAdmitter
 	spool     *gatewaysim.MediaSpool

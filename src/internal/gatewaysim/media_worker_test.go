@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -114,6 +115,103 @@ func TestMediaWorkerReadiesOnlyCorrelatedResult(t *testing.T) {
 	}
 	if _, err := os.Stat(record.Path); err != nil {
 		t.Fatalf("file was removed before correlated ready: %v", err)
+	}
+}
+
+func TestMediaTestPUTBodyPreservesDeclarationAndAddsOneByteOnlyForStorageProbe(t *testing.T) {
+	tests := []struct {
+		name       string
+		testCase   string
+		declared   int64
+		wantLength int64
+		wantBody   []byte
+		wantErr    bool
+	}{
+		{
+			name: "ordinary upload is unchanged", declared: 4, wantLength: 4, wantBody: []byte("clip"),
+		},
+		{
+			name: "storage probe appends one byte to exact cap", testCase: MediaTestStorageCapPlusOne,
+			declared: mediaprotocol.MaxUploadBytes, wantLength: mediaprotocol.MaxUploadBytes + 1,
+		},
+		{
+			name: "storage probe refuses non-cap declaration", testCase: MediaTestStorageCapPlusOne,
+			declared: 4, wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := io.Reader(strings.NewReader("clip"))
+			if tt.testCase == MediaTestStorageCapPlusOne {
+				source = io.LimitReader(repeatedByteReader('c'), mediaprotocol.MaxUploadBytes)
+			}
+			body, length, err := mediaPUTBodyForTest(source, tt.declared, tt.testCase)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			var tail lastByteWriter
+			count, readErr := io.Copy(&tail, body)
+			if readErr != nil || length != tt.wantLength || count != tt.wantLength {
+				t.Fatalf("length=%d copied=%d tail=%d err=%v", length, count, tail.value, readErr)
+			}
+			if tt.testCase == MediaTestStorageCapPlusOne && tail.value != 0 {
+				t.Fatalf("extra byte = %d, want 0", tail.value)
+			}
+			if tt.testCase == "" && !bytes.Equal(tail.data, tt.wantBody) {
+				t.Fatalf("ordinary body changed: %q", tail.data)
+			}
+		})
+	}
+}
+
+type repeatedByteReader byte
+
+func (r repeatedByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(r)
+	}
+	return len(p), nil
+}
+
+type lastByteWriter struct {
+	value byte
+	data  []byte
+}
+
+func (w *lastByteWriter) Write(p []byte) (int, error) {
+	if len(p) != 0 {
+		w.value = p[len(p)-1]
+		if len(w.data)+len(p) <= 16 {
+			w.data = append(w.data, p...)
+		}
+	}
+	return len(p), nil
+}
+
+func TestDeclaredOverCapTestPayloadBypassesOnlyProtocolSizeValidation(t *testing.T) {
+	request := mediaprotocol.UploadRequest{
+		Version: 1, UploadID: "probe_001", CapturedAt: "2026-11-21T10:00:00Z",
+		ContentType: "video/mp4", SizeBytes: mediaprotocol.MaxUploadBytes,
+		SHA256:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		GatewayID: "gateway_001",
+	}
+	payload, err := declaredOverCapTestPayload(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mediaprotocol.Decode(mediaprotocol.UploadRequestTopic("gateway_001"), payload); err == nil {
+		t.Fatal("over-cap test payload unexpectedly passed normal protocol validation")
+	}
+	var got mediaprotocol.UploadRequest
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SizeBytes != mediaprotocol.MaxUploadBytes+1 || got.UploadID != request.UploadID ||
+		got.SHA256 != request.SHA256 || got.GatewayID != request.GatewayID {
+		t.Fatalf("unexpected probe request: %+v", got)
 	}
 }
 

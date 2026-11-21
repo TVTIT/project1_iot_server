@@ -66,6 +66,7 @@ run flags:
   --measure-capacity N    explicit measurement capacity (defaults to --batches)
   --ignore-first-valid-acks N  test fault: ignore up to 10 valid pending-row ACKs
   --stop-after-ignored-ack     cooperatively stop after the first ignored ACK (requires finite --batches and N > 0)
+  --test-media-case CASE        test-only: declared-over-cap or storage-cap-plus-one
 `
 
 // simTransport is the transport surface the run lifecycle composes. It is the
@@ -118,7 +119,7 @@ func run(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, stdou
 		ctx = context.Background()
 	}
 	if len(args) == 0 {
-		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0, 0, false)
+		return runSimulator(ctx, lookup, stdout, stderr, 0, defaultCompletionTimeout, 0, 0, false, "")
 	}
 	switch args[0] {
 	case "run":
@@ -148,6 +149,7 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 	measureCap := fs.Int("measure-capacity", 0, "explicit measurement capacity (defaults to --batches)")
 	ignoreACKs := fs.Int("ignore-first-valid-acks", 0, "test-only: ignore at most 10 valid ACKs for pending rows")
 	stopAfterIgnore := fs.Bool("stop-after-ignored-ack", false, "test-only: stop after the first ignored valid ACK")
+	testMediaCase := fs.String("test-media-case", "", "test-only: declared-over-cap or storage-cap-plus-one")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -178,6 +180,12 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 		writef(stderr, "--completion-timeout must be between %s and %s\n", minCompletionTimeout, maxCompletionTimeout)
 		return 2
 	}
+	if *testMediaCase != "" && *testMediaCase != gatewaysim.MediaTestDeclaredOverCap &&
+		*testMediaCase != gatewaysim.MediaTestStorageCapPlusOne {
+		writef(stderr, "--test-media-case must be %q or %q\n",
+			gatewaysim.MediaTestDeclaredOverCap, gatewaysim.MediaTestStorageCapPlusOne)
+		return 2
+	}
 
 	capacity := 0
 	if *measure || *measureLatency {
@@ -203,18 +211,30 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 		return 2
 	}
 
-	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity, *ignoreACKs, *stopAfterIgnore)
+	return runSimulator(ctx, lookup, stdout, stderr, *batches, *completion, capacity, *ignoreACKs, *stopAfterIgnore, *testMediaCase)
 }
 
 // runSimulator composes the outbox, ACK processor, transport and scheduler and
 // runs until the context ends, a finite target completes, or a classified fatal
 // stop occurs. Every resource opened here is closed on every exit path, and
 // SQLite is closed only after the scheduler and ACK worker have stopped.
-func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity, ignoreACKBudget int, stopAfterIgnore bool) int {
+func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, stderr io.Writer, batches int, completionBudget time.Duration, measureCapacity, ignoreACKBudget int, stopAfterIgnore bool, testMediaCase string) int {
 	cfg, err := gatewaysim.Load(lookup)
 	if err != nil {
 		writef(stderr, "configuration error: %s\n", err)
 		return 2
+	}
+	if testMediaCase != "" {
+		if !cfg.MediaUpload.Enabled {
+			writeln(stderr, "--test-media-case requires MEDIA_UPLOAD_ENABLED=true")
+			return 2
+		}
+		info, statErr := os.Stat(cfg.MediaUpload.InputFile)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() != 80_000_000 {
+			writeln(stderr, "--test-media-case requires a readable finalized media file of exactly 80000000 bytes")
+			return 2
+		}
+		cfg.MediaUpload.TestCase = testMediaCase
 	}
 
 	var tracker *gatewaysim.LatencyTracker
@@ -316,6 +336,7 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 			GatewayID: cfg.GatewayID, UploadOrigin: cfg.MediaUpload.UploadOrigin, CAFile: cfg.MediaUpload.CAFile,
 			Spool: mediaSpool, Capacity: 16, RetryMin: cfg.MediaUpload.RetryMin,
 			RetryMax: cfg.MediaUpload.RetryMax, PutTimeout: cfg.MediaUpload.PutTimeout,
+			TestCase: cfg.MediaUpload.TestCase, TestUploadID: cfg.MediaUpload.UploadID,
 		})
 		if err != nil {
 			writeln(stderr, "error: could not create media upload worker")

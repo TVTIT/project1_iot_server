@@ -916,6 +916,28 @@ func TestMediaPublishUsesOwnTopicQoS1AndNoRetain(t *testing.T) {
 	}
 }
 
+func TestMediaTestPublishRequiresExplicitTestMode(t *testing.T) {
+	request := mediaprotocol.UploadRequest{
+		Version: 1, UploadID: "probe_001", CapturedAt: "2026-11-21T10:00:00Z",
+		ContentType: "video/mp4", SizeBytes: mediaprotocol.MaxUploadBytes,
+		SHA256:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		GatewayID: "gateway_001",
+	}
+	payload, err := declaredOverCapTestPayload(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []TransportOptions{
+		{GatewayID: "gateway_001", MediaEnabled: true},
+		{GatewayID: "gateway_001", AllowTestMediaPayloads: true},
+	} {
+		transport := &Transport{opts: opts}
+		if err := transport.PublishMediaTestPayload(context.Background(), payload); !errors.Is(err, ErrPublishUnconfirmed) {
+			t.Fatalf("opts=%+v err=%v, want test mode and media enabled", opts, err)
+		}
+	}
+}
+
 func TestTransportPublishGatedUntilReady(t *testing.T) {
 	h := newHarness()
 	h.clientFn = func(*mqtt.ClientOptions) *fakeClient { return &fakeClient{} }

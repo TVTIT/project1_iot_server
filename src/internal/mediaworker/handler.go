@@ -3,7 +3,9 @@ package mediaworker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -160,6 +162,21 @@ func (h *Handler) Handle(ctx context.Context, d Delivery) error {
 	}
 	message, err := mediaprotocol.Decode(d.Topic, d.Payload)
 	if err != nil {
+		var rejected mediaprotocol.UploadRequest
+		if strings.HasSuffix(d.Topic, "/media/up/upload_request") &&
+			json.Unmarshal(d.Payload, &rejected) == nil &&
+			rejected.SizeBytes == mediaprotocol.MaxUploadBytes+1 {
+			declaredBytes := rejected.SizeBytes
+			rejected.SizeBytes = mediaprotocol.MaxUploadBytes
+			_, exactCapErr := mediaprotocol.Encode(d.Topic, rejected)
+			if exactCapErr == nil {
+				slog.Warn("media upload request rejected",
+					"reason", "declared_size_over_cap",
+					"gateway_id", rejected.GatewayID,
+					"upload_id", rejected.UploadID,
+					"declared_bytes", declaredBytes)
+			}
+		}
 		return ErrInvalidDelivery
 	}
 	switch m := message.(type) {

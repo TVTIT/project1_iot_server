@@ -1,10 +1,15 @@
 package gatewaysim
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,9 +20,22 @@ import (
 	"iot-platform/internal/mediaprotocol"
 )
 
+const (
+	// MediaTestDeclaredOverCap names the test-only malformed request case.
+	MediaTestDeclaredOverCap = "declared-over-cap"
+	// MediaTestStorageCapPlusOne names the test-only oversized PUT case.
+	MediaTestStorageCapPlusOne = "storage-cap-plus-one"
+)
+
 // MediaPublisher abstracts the MQTT outbound publication seam for media worker notifications.
 type MediaPublisher interface {
 	PublishMedia(context.Context, any) error
+}
+
+// MediaTestPublisher exposes a raw publish path only for the explicit
+// declared-over-cap simulator test case.
+type MediaTestPublisher interface {
+	PublishMediaTestPayload(context.Context, []byte) error
 }
 
 // MediaWorkerOptions configures the simulator's background media worker and storage client.
@@ -28,6 +46,8 @@ type MediaWorkerOptions struct {
 	Capacity                        int
 	RetryMin, RetryMax              time.Duration
 	PutTimeout                      time.Duration
+	TestCase                        string
+	TestUploadID                    string
 	httpClient                      *http.Client
 }
 
@@ -40,16 +60,17 @@ type mediaDelivery struct {
 // MediaWorker owns one bounded inbox and one serial consumer, isolated from
 // telemetry and control callbacks.
 type MediaWorker struct {
-	opts        MediaWorkerOptions
-	inbox       chan mediaDelivery
-	stop        chan struct{}
-	done        chan struct{}
-	once        sync.Once
-	startOnce   sync.Once
-	doneOnce    sync.Once
-	lifecycleMu sync.Mutex
-	started     bool
-	cancel      context.CancelFunc
+	opts          MediaWorkerOptions
+	inbox         chan mediaDelivery
+	stop          chan struct{}
+	done          chan struct{}
+	once          sync.Once
+	startOnce     sync.Once
+	doneOnce      sync.Once
+	lifecycleMu   sync.Mutex
+	started       bool
+	cancel        context.CancelFunc
+	testProbeSent bool
 }
 
 // NewMediaWorker constructs a validated media worker with bounded capacity and TLS configuration.
@@ -58,6 +79,12 @@ func NewMediaWorker(opts MediaWorkerOptions) (*MediaWorker, error) {
 	if validateMediaUploadOrigin(opts.UploadOrigin) != nil || err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" ||
 		opts.GatewayID == "" || opts.Spool == nil || opts.Capacity <= 0 {
 		return nil, errors.New("gatewaysim: invalid media worker configuration")
+	}
+	if opts.TestCase != "" && opts.TestCase != MediaTestDeclaredOverCap && opts.TestCase != MediaTestStorageCapPlusOne {
+		return nil, errors.New("gatewaysim: invalid media test case")
+	}
+	if opts.TestCase != "" && !mediaUploadIDPattern.MatchString(opts.TestUploadID) {
+		return nil, errors.New("gatewaysim: media test upload ID is required")
 	}
 	if opts.RetryMin <= 0 {
 		opts.RetryMin = 5 * time.Second
@@ -244,6 +271,10 @@ func (w *MediaWorker) processDue(ctx context.Context) {
 		}
 		switch r.Phase {
 		case "awaiting_grant":
+			if w.opts.TestCase == MediaTestDeclaredOverCap && r.UploadID == w.opts.TestUploadID {
+				w.publishDeclaredOverCapProbe(ctx, r)
+				continue
+			}
 			due := now.Add(w.retryDelay(r.Attempts))
 			if err := w.opts.Spool.RecordAttempt(ctx, r.UploadID, due); err != nil {
 				if errors.Is(err, ErrMediaSpoolAttempts) {
@@ -265,6 +296,33 @@ func (w *MediaWorker) processDue(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (w *MediaWorker) publishDeclaredOverCapProbe(ctx context.Context, r MediaUpload) {
+	if w.testProbeSent {
+		return
+	}
+	w.testProbeSent = true
+	publisher, ok := w.opts.Publisher.(MediaTestPublisher)
+	if !ok {
+		slog.Warn("gatewaysim media test probe unavailable", "case", MediaTestDeclaredOverCap)
+		return
+	}
+	request := mediaprotocol.UploadRequest{
+		Version: 1, GatewayID: w.opts.GatewayID, UploadID: r.UploadID,
+		CapturedAt: r.CapturedAt.Format(time.RFC3339Nano), ContentType: "video/mp4",
+		SizeBytes: r.SizeBytes, SHA256: r.SHA256,
+	}
+	payload, err := declaredOverCapTestPayload(request)
+	if err == nil {
+		err = publisher.PublishMediaTestPayload(ctx, payload)
+	}
+	if err != nil {
+		slog.Warn("gatewaysim media test probe publish failed", "case", MediaTestDeclaredOverCap)
+		return
+	}
+	slog.Info("gatewaysim media test probe published", "case", MediaTestDeclaredOverCap,
+		"declared_bytes", r.SizeBytes+1, "broker_ack_only", true)
 }
 
 func (w *MediaWorker) put(ctx context.Context, id, mediaID, rawURL string, expiry time.Time) {
@@ -295,16 +353,32 @@ func (w *MediaWorker) put(ctx context.Context, id, mediaID, rawURL string, expir
 	}
 	putCtx, cancel := context.WithDeadline(ctx, putDeadline)
 	defer cancel()
-	req, err := http.NewRequestWithContext(putCtx, http.MethodPut, rawURL, f)
+	testCase := ""
+	if id == w.opts.TestUploadID {
+		testCase = w.opts.TestCase
+	}
+	body, contentLength, err := mediaPUTBodyForTest(f, r.SizeBytes, testCase)
 	if err != nil {
 		_ = w.opts.Spool.MarkAwaitingResult(ctx, id, time.Now().Add(w.retryDelay(r.Attempts)))
 		return
 	}
-	req.ContentLength, req.Header = r.SizeBytes, make(http.Header)
+	req, err := http.NewRequestWithContext(putCtx, http.MethodPut, rawURL, body)
+	if err != nil {
+		_ = w.opts.Spool.MarkAwaitingResult(ctx, id, time.Now().Add(w.retryDelay(r.Attempts)))
+		return
+	}
+	req.ContentLength, req.Header = contentLength, make(http.Header)
 	req.Header.Set("Content-Type", "video/mp4")
 	resp, err := w.opts.httpClient.Do(req)
 	if err == nil {
+		if testCase == MediaTestStorageCapPlusOne {
+			slog.Info("gatewaysim media test PUT completed", "case", MediaTestStorageCapPlusOne,
+				"declared_bytes", r.SizeBytes, "content_length_bytes", contentLength, "http_status", resp.StatusCode)
+		}
 		_ = resp.Body.Close()
+	} else if testCase == MediaTestStorageCapPlusOne {
+		slog.Warn("gatewaysim media test PUT failed", "case", MediaTestStorageCapPlusOne,
+			"declared_bytes", r.SizeBytes, "content_length_bytes", contentLength, "error_class", fmt.Sprintf("%T", err))
 	}
 	// A non-2xx, redirect, timeout or lost response is ambiguous. Never repeat
 	// bytes; reconcile by upload_complete with the durable ID.
@@ -312,6 +386,35 @@ func (w *MediaWorker) put(ctx context.Context, id, mediaID, rawURL string, expir
 	if err := w.opts.Spool.MarkAwaitingResult(ctx, id, due); err == nil {
 		_ = w.opts.Publisher.PublishMedia(ctx, mediaprotocol.UploadComplete{Version: 1, GatewayID: w.opts.GatewayID, UploadID: id})
 	}
+}
+
+func mediaPUTBodyForTest(body io.Reader, declaredBytes int64, testCase string) (io.Reader, int64, error) {
+	if body == nil || declaredBytes < 1 {
+		return nil, 0, errors.New("invalid media PUT body")
+	}
+	switch testCase {
+	case "":
+		return body, declaredBytes, nil
+	case MediaTestStorageCapPlusOne:
+		if declaredBytes != mediaprotocol.MaxUploadBytes {
+			return nil, 0, errors.New("storage cap probe requires exact-cap declaration")
+		}
+		return io.MultiReader(body, bytes.NewReader([]byte{0})), declaredBytes + 1, nil
+	default:
+		return nil, 0, errors.New("unsupported media test case")
+	}
+}
+
+func declaredOverCapTestPayload(request mediaprotocol.UploadRequest) ([]byte, error) {
+	if request.SizeBytes != mediaprotocol.MaxUploadBytes || request.UploadID == "" ||
+		request.GatewayID == "" || request.ContentType != "video/mp4" {
+		return nil, errors.New("declared-size probe requires a valid exact-cap request")
+	}
+	if _, err := mediaprotocol.Encode(mediaprotocol.UploadRequestTopic(request.GatewayID), request); err != nil {
+		return nil, errors.New("declared-size probe requires a valid exact-cap request")
+	}
+	request.SizeBytes++
+	return json.Marshal(request)
 }
 
 func (w *MediaWorker) retryDelay(attempt int) time.Duration {

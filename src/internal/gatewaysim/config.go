@@ -275,6 +275,7 @@ func Load(lookup LookupFunc) (Config, error) {
 // not open files, create a spool, or configure an HTTP client.
 type MediaUploadConfig struct {
 	Enabled      bool
+	TestCase     string
 	InputFile    string
 	SpoolDir     string
 	UploadOrigin string

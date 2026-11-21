@@ -1,8 +1,11 @@
 package mediaworker
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,34 @@ import (
 	"iot-platform/internal/media"
 	"iot-platform/internal/mediaprotocol"
 )
+
+func TestHandlerLogsAndRejectsDeclaredOverCapBeforeAdmission(t *testing.T) {
+	repo, signer, pub := &repositoryStub{}, &signerStub{}, &publisherStub{}
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+
+	payload := strings.Replace(requestPayload, `"size_bytes":20`, `"size_bytes":80000001`, 1)
+	payload = strings.Replace(payload, `"upload_id":"u1"`, `"gateway_id":"gw1","upload_id":"u1"`, 1)
+	err := newTestHandler(repo, signer, pub).Handle(context.Background(), delivery(payload))
+	if !errors.Is(err, ErrInvalidDelivery) {
+		t.Fatalf("Handle err=%v, want invalid delivery", err)
+	}
+	if repo.admitCalls != 0 || signer.path != "" || len(pub.grants) != 0 {
+		t.Fatalf("over-cap request reached admission/signing: admits=%d signer_path=%q grants=%d",
+			repo.admitCalls, signer.path, len(pub.grants))
+	}
+	log := logs.String()
+	for _, want := range []string{`"reason":"declared_size_over_cap"`, `"gateway_id":"gw1"`, `"upload_id":"u1"`, `"declared_bytes":80000001`} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("rejection log missing %s: %s", want, log)
+		}
+	}
+	if strings.Contains(log, "token") {
+		t.Fatalf("rejection log contains token-like data: %s", log)
+	}
+}
 
 type repositoryStub struct {
 	record        media.Record
