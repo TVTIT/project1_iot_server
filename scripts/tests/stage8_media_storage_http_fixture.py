@@ -4,6 +4,8 @@
 import datetime as dt
 import hashlib
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
 import struct
@@ -18,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import uuid
 import urllib.error
 import urllib.parse
@@ -32,6 +35,106 @@ VIDEO_ID = "media-video"
 VIDEO_BYTES = b"\x00\x00\x00\x18ftypmp42stage8-local-native-proof"
 MAX_OBJECT_BYTES = 80_000_000
 ACTIVE_GATEWAY_PROCESS = None
+
+
+class FirstStorageReadDelayProxy:
+    """Fixture-only Storage forwarder that delays one authenticated object read response."""
+
+    def __init__(self, storage_port, bind_address, delay_seconds=5):
+        self.storage_port = storage_port
+        self.bind_address = bind_address
+        self.delay_seconds = delay_seconds
+        self.first_get_delayed = threading.Event()
+        self.lock = threading.Lock()
+        self.get_count = 0
+
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format, *_args):
+                return
+
+            def do_GET(self):
+                self.forward()
+
+            def do_POST(self):
+                self.forward()
+
+            def do_PUT(self):
+                self.forward()
+
+            def do_DELETE(self):
+                self.forward()
+
+            def do_OPTIONS(self):
+                self.forward()
+
+            def forward(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                headers = {
+                    key: value for key, value in self.headers.items()
+                    if key.lower() not in ("host", "connection", "transfer-encoding")
+                }
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{owner.storage_port}{self.path}",
+                    data=body if body else None, headers=headers, method=self.command,
+                )
+                try:
+                    with urllib.request.build_opener(
+                        urllib.request.ProxyHandler({}),
+                    ).open(request, timeout=20) as response:
+                        status = response.status
+                        response_headers = dict(response.headers.items())
+                        payload = response.read(MAX_OBJECT_BYTES + 1)
+                except urllib.error.HTTPError as error:
+                    status = error.code
+                    response_headers = dict(error.headers.items())
+                    payload = error.read(MAX_OBJECT_BYTES + 1)
+                    error.close()
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    self.send_error(502)
+                    return
+
+                delay_this_response = False
+                if self.command == "GET" and self.path.startswith(
+                    "/object/authenticated/media-video/",
+                ):
+                    with owner.lock:
+                        owner.get_count += 1
+                        if owner.get_count == 1:
+                            delay_this_response = True
+                            owner.first_get_delayed.set()
+                if delay_this_response:
+                    time.sleep(owner.delay_seconds)
+
+                self.send_response(status)
+                for key, value in response_headers.items():
+                    if key.lower() not in (
+                        "connection", "transfer-encoding", "content-length",
+                        "keep-alive", "content-encoding",
+                    ):
+                        self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                try:
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+        self.server = ThreadingHTTPServer((self.bind_address, 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 class ProofFailure(Exception):
@@ -128,6 +231,22 @@ def mapped_loopback_port(prefix, fixture, service, target):
             "fixture_port_mapping_invalid")
     require(host == "127.0.0.1", "fixture_port_not_loopback")
     return int(port)
+
+
+def docker_host_gateway(fixture):
+    result = subprocess.run(
+        ["docker", "network", "inspect", "bridge", "--format",
+         "{{(index .IPAM.Config 0).Gateway}}"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=smoke.process_env(fixture), timeout=15, check=False,
+    )
+    try:
+        address = ipaddress.ip_address(result.stdout.decode().strip())
+    except ValueError:
+        raise ProofFailure("docker_host_gateway_unavailable") from None
+    require(result.returncode == 0 and address.is_private,
+            "docker_host_gateway_unavailable")
+    return str(address)
 
 
 def make_grant(fixture, internal_port, public_port, object_path):
@@ -774,6 +893,23 @@ def managed_media_rows(registry, postgres_id):
     return int(count), parsed
 
 
+def media_verification_state(registry, postgres_id, upload_id):
+    require(re.fullmatch(r"upload_[A-Za-z0-9_-]{1,64}", upload_id) is not None,
+            "fixture_upload_id_invalid_for_verification_readback")
+    rows = smoke.db_psql(
+        registry, postgres_id,
+        f"""SELECT json_build_array(validation_status,last_verification_error,
+           (next_verification_at IS NOT NULL)::text)::text
+           FROM public.media_objects WHERE managed IS TRUE AND upload_id='{upload_id}';""",
+    ).splitlines()
+    try:
+        parsed = [json.loads(row) for row in rows if row]
+    except json.JSONDecodeError:
+        raise ProofFailure("media_verification_state_decode_failed") from None
+    require(len(parsed) <= 1, "media_verification_state_duplicate_upload")
+    return parsed[0] if parsed else None
+
+
 def media_ready_trigger(registry, postgres_id, upload_id, *, install):
     require(re.fullmatch(r"upload_[A-Za-z0-9_-]{1,64}", upload_id) is not None,
             "fixture_upload_id_invalid_for_trigger")
@@ -1128,7 +1264,8 @@ def remove_fixture_work(path):
 
 
 def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_to_scan,
-                          exact_cap=False, restart_recovery=False):
+                          exact_cap=False, restart_recovery=False, test_case="",
+                          verifier_timeout=False, storage_proxy=None):
     """Run one actual Gateway media upload and verify DB, Storage, and spool."""
     gateway_id, upload_id, sensor_id = (
         material["gateway_id"], "upload_" + secrets.token_hex(8), material["sensor_id"],
@@ -1194,8 +1331,11 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
     process = None
     started_at = time.monotonic()
     with os.fdopen(fd, "wb") as log_stream:
+        command = [str(binary), "run"]
+        if test_case:
+            command.extend(["--test-media-case", test_case])
         process = subprocess.Popen(
-            [str(binary), "run"], cwd=ROOT / "src", env=env,
+            command, cwd=ROOT / "src", env=env,
             stdout=log_stream, stderr=subprocess.STDOUT, close_fds=True,
         )
     global ACTIVE_GATEWAY_PROCESS
@@ -1211,6 +1351,8 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
         }
     deadline = time.monotonic() + (600 if exact_cap else 120)
     running_seen = False
+    object_missing_observed = False
+    verifier_timeout_observed = False
     media_row = None
     spool_state = None
     if restart_recovery:
@@ -1288,9 +1430,17 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
         if process.poll() is not None:
             raise ProofFailure(f"gateway_simulator_exited_{process.returncode}")
         try:
-            running_seen = running_seen or b"gateway simulator running" in bounded_log_tail(gateway_log)
+            runtime_tail = bounded_log_tail(gateway_log)
+            running_seen = running_seen or b"gateway simulator running" in runtime_tail
         except OSError:
-            pass
+            runtime_tail = b""
+        if test_case == "drop-first-grant" and b"code=OBJECT_MISSING" in runtime_tail:
+            object_missing_observed = True
+            put_count_at_missing = envoy_media_put_count(prefix, fixture)
+            require(put_count_at_missing == 0, "lost_grant_put_started_before_object_missing")
+            report["checks"]["lost_grant_object_missing_before_put"] = {
+                "status": "PASS", "upload_id": upload_id, "envoy_put_count": 0,
+            }
         if running_seen:
             managed_count, rows = managed_media_rows(registry, material["postgres_id"])
             spool_state = gateway_spool_row(spool_db, upload_id)
@@ -1321,8 +1471,78 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
                     and not (spool_dir / (upload_id + ".mp4")).exists()):
                 media_row = rows[0]
                 break
+            if verifier_timeout and managed_count == 1 and len(rows) == 1:
+                verification = media_verification_state(
+                    registry, material["postgres_id"], upload_id,
+                )
+                if (verification == ["verifying", "STORAGE_UNAVAILABLE", "true"]
+                        and storage_proxy is not None
+                        and storage_proxy.first_get_delayed.is_set()):
+                    object_count = smoke.db_psql(
+                        registry, material["postgres_id"],
+                        """SELECT count(*) FROM storage.objects
+                           WHERE bucket_id='media-video' AND name='""" + rows[0][0] + """.mp4';""",
+                    ).strip()
+                    puts = envoy_media_put_count(prefix, fixture)
+                    file_present = (spool_dir / (upload_id + ".mp4")).is_file()
+                    require(object_count == "1" and puts == 1 and file_present
+                            and spool_state is not None and spool_state[1] is not None
+                            and spool_state[1][1] == "awaiting_result",
+                            "verifier_timeout_intermediate_state_mismatch")
+                    verifier_timeout_observed = True
+                    report["checks"]["verifier_timeout_intermediate_state"] = {
+                        "status": "PASS", "upload_id": upload_id,
+                        "validation_status": verification[0],
+                        "last_verification_error": verification[1],
+                        "next_verification_at_present": verification[2] == "true",
+                        "storage_object_count": 1, "envoy_put_count": puts,
+                        "sqlite_phase": spool_state[1][1], "spool_file_present": file_present,
+                        "first_storage_read_delayed": True,
+                    }
         time.sleep(0.5)
+    if media_row is None and (test_case == "drop-first-grant" or verifier_timeout):
+        result_counts = {}
+        grant_drop_seen = False
+        for line in bounded_log_tail(gateway_log).decode(errors="replace").splitlines():
+            if "gatewaysim media test grant dropped" in line:
+                grant_drop_seen = True
+            elif "gatewaysim media test result observed" in line:
+                match = re.search(r"status=([A-Za-z_]+).*code=([A-Za-z0-9_]*)", line)
+                if match:
+                    key = match.group(1) + ":" + (match.group(2) or "none")
+                    result_counts[key] = result_counts.get(key, 0) + 1
+        count, rows = managed_media_rows(registry, material["postgres_id"])
+        report["checks"]["recovery_failure_diagnostic"] = {
+            "managed_rows": count,
+            "validation_status": rows[0][7] if rows else None,
+            "verification_state": media_verification_state(
+                registry, material["postgres_id"], upload_id,
+            ) if rows else None,
+            "spool_phase": spool_state[1][1] if spool_state and spool_state[1] else None,
+            "spool_outcome": spool_state[1][6] if spool_state and spool_state[1] else None,
+            "envoy_put_count": envoy_media_put_count(prefix, fixture),
+            "grant_drop_seen": grant_drop_seen, "result_counts": result_counts,
+        }
     require(media_row is not None, "gateway_media_ready_timeout")
+    if test_case == "drop-first-grant":
+        runtime_log = bounded_log_tail(gateway_log)
+        require(b"case=drop-first-grant" in runtime_log,
+                "lost_grant_drop_event_missing")
+        require(object_missing_observed, "lost_grant_object_missing_event_missing")
+    if verifier_timeout:
+        if not verifier_timeout_observed:
+            latest_verification = media_verification_state(
+                registry, material["postgres_id"], upload_id,
+            )
+            report["checks"]["verifier_timeout_failure_diagnostic"] = {
+                "verification_state": latest_verification,
+                "proxy_get_count": storage_proxy.get_count if storage_proxy else None,
+                "first_get_delayed": bool(
+                    storage_proxy and storage_proxy.first_get_delayed.is_set()
+                ),
+                "envoy_put_count": envoy_media_put_count(prefix, fixture),
+            }
+        require(verifier_timeout_observed, "verifier_timeout_intermediate_state_not_observed")
 
     (media_id, db_gateway, db_upload, db_path, media_type, size_expected,
      size_actual, validation, managed, declared_sha, verified_sha, actual_type) = media_row
@@ -1394,6 +1614,15 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
         "spool_copy_gone": True, "source_untouched": True,
         "gateway_to_ready_seconds": elapsed, "exact_cap_mode": exact_cap, "logs": log_check,
     }
+    if test_case == "drop-first-grant":
+        require(log_check.get("status") == "PASS", "lost_grant_log_safety_check_failed")
+        report["checks"]["lost_grant_recovery"] = {
+            "status": "PASS", "upload_id": upload_id, "media_id": media_id,
+            "object_missing_observed": object_missing_observed,
+            "put_count_at_object_missing": 0, "final_put_count": 1,
+            "final_validation_status": validation, "final_spool_phase": spool_row[1],
+            "storage_path": db_path, "sha256": expected_sha,
+        }
     process.send_signal(signal.SIGTERM)
     try:
         exit_code = process.wait(timeout=20)
@@ -1414,6 +1643,25 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
             and source_path.is_file(),
             "gateway_spool_post_stop_state_mismatch")
     report["checks"]["post_stop_spool_and_source"] = {"status": "PASS"}
+    if test_case == "drop-first-grant" or verifier_timeout:
+        single_put = wait_for_media_put_quiescence(
+            lambda: envoy_media_put_count(prefix, fixture),
+            expected=1, quiet_seconds=4, timeout=35,
+        )
+        report["checks"]["recovery_single_put_quiescence"] = {
+            "status": "PASS", **single_put,
+        }
+        if verifier_timeout:
+            require(storage_proxy is not None and storage_proxy.get_count >= 2,
+                    "verifier_timeout_retry_did_not_read_existing_object")
+            report["checks"]["verifier_timeout_recovered_existing_object"] = {
+                "status": "PASS", "upload_id": upload_id, "media_id": media_id,
+                "final_validation_status": validation, "sqlite_phase": spool_row[1],
+                "spool_file_removed": not (spool_dir / (upload_id + ".mp4")).exists(),
+                "storage_read_attempts_through_proxy": storage_proxy.get_count,
+                "single_successful_put": True, "sha256": expected_sha,
+                "verified_sha256": verified_sha,
+            }
     if restart_recovery:
         post_restart_observation = wait_for_media_put_quiescence(
             lambda: envoy_media_put_count(prefix, fixture),
@@ -1583,7 +1831,8 @@ def run_cleanup_worker_e2e(fixture, prefix, registry, material, report):
 
 def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 stage8_local_e2e=False, stage8_local_e2e_cap=False,
-                stage8_local_restart=False, stage8_local_cleanup=False):
+                stage8_local_restart=False, stage8_local_cleanup=False,
+                stage8_local_lost_grant=False, stage8_local_verifier_timeout=False):
     scratch_root = Path("/var/tmp/opencode")
     scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="stage8-media-http-", dir=scratch_root))
@@ -1591,6 +1840,7 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
     fixture = None
     prefix = None
     registry = None
+    storage_proxy = None
     report = {"schema_version": 1, "status": "FAIL", "checks": {}}
     primary = None
     cleanup_verified = False
@@ -1601,10 +1851,11 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             "MEDIA_UPLOAD_ROUTE_KEY": secrets.token_hex(32),
             "MEDIA_TEST_TLS_DIR": str(fixture.private / "p2-tls"),
             "MEDIA_HTTP_PORT": "0",
-            "MEDIA_UPLOAD_GRANT_TTL_SECONDS": "30",
+            "MEDIA_UPLOAD_GRANT_TTL_SECONDS": "3" if stage8_local_lost_grant else "30",
         })
         prepare_mode = (prepare_stage8_e2e or stage8_local_e2e or stage8_local_e2e_cap
-                        or stage8_local_restart or stage8_local_cleanup)
+                        or stage8_local_restart or stage8_local_cleanup
+                        or stage8_local_lost_grant or stage8_local_verifier_timeout)
         if prepare_mode:
             fixture.values.update(
                 MEDIA_UPLOAD_ENABLED="true",
@@ -1619,6 +1870,18 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 MEDIA_UPLOAD_CLEANUP_RETRY_MAX_DELAY="1s",
                 MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS="3",
             )
+        if stage8_local_verifier_timeout:
+            fixture.values.update(
+                MEDIA_UPLOAD_STORAGE_TIMEOUT="1s",
+                MEDIA_UPLOAD_VERIFY_SCAN_INTERVAL="250ms",
+                MEDIA_UPLOAD_VERIFY_RETRY_MIN_DELAY="2s",
+                MEDIA_UPLOAD_VERIFY_RETRY_MAX_DELAY="2s",
+            )
+        if stage8_local_lost_grant:
+            fixture.values.update(
+                MEDIA_UPLOAD_INFLIGHT_GRACE="1s",
+                MEDIA_UPLOAD_VERIFY_SCAN_INTERVAL="250ms",
+            )
         fixture.env_file.write_text(
             "".join(f"{name}={value}\n" for name, value in sorted(fixture.values.items())),
             encoding="utf-8",
@@ -1632,6 +1895,12 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
         published: "0"
         host_ip: 127.0.0.1
         protocol: tcp
+""")
+        if stage8_local_verifier_timeout:
+            with storage_overlay.open("a", encoding="utf-8") as overlay:
+                overlay.write("""  backend:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 """)
         broker_overlay = fixture.private / "compose.broker-loopback.yml"
         smoke.private_write(broker_overlay, """services:
@@ -1706,7 +1975,16 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                           fixture, timeout=300, check=False)
             require(started.returncode == 0, "stage8_prerequisite_compose_start_failed")
             upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
+            storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
             fixture.values["MEDIA_UPLOAD_PUBLIC_ORIGIN"] = f"https://127.0.0.1:{upload_port}"
+            if stage8_local_verifier_timeout:
+                storage_proxy = FirstStorageReadDelayProxy(
+                    storage_port, docker_host_gateway(fixture),
+                )
+                storage_proxy.start()
+                fixture.values["STORAGE_INTERNAL_URL"] = (
+                    f"http://host.docker.internal:{storage_proxy.port}"
+                )
             fixture.env_file.write_text(
                 "".join(f"{name}={value}\n" for name, value in sorted(fixture.values.items())),
                 encoding="utf-8",
@@ -1731,10 +2009,10 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 time.sleep(1)
             require(ready, "stage8_backend_readiness_timeout")
             if (stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart
-                    or stage8_local_cleanup):
+                    or stage8_local_cleanup or stage8_local_lost_grant
+                    or stage8_local_verifier_timeout):
                 report["phase"] = "backend_media_readiness_precondition"
                 backend_media_precondition(fixture, prefix, report)
-            storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
             env = smoke.process_env(fixture)
             env.update(STORAGE_INTERNAL_URL=f"http://127.0.0.1:{storage_port}",
                        SERVICE_ROLE_KEY=fixture.values["SERVICE_ROLE_KEY"])
@@ -1747,7 +2025,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             report["checks"]["media_backend_and_private_bucket"] = {"status": "PASS"}
             sensor_id = ("sensor_stage8_" + secrets.token_hex(4)
                          if stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart
-                         or stage8_local_cleanup
+                         or stage8_local_cleanup or stage8_local_lost_grant
+                         or stage8_local_verifier_timeout
                          else None)
             material = provision_gateway_credential(
                 fixture, prefix, registry, report, sensor_id=sensor_id,
@@ -1756,7 +2035,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 "status": "PASS", "password_persisted": False,
             }
             if (stage8_local_e2e or stage8_local_e2e_cap or stage8_local_restart
-                    or stage8_local_cleanup):
+                    or stage8_local_cleanup or stage8_local_lost_grant
+                    or stage8_local_verifier_timeout):
                 secrets_to_scan = [
                     value for key, value in fixture.values.items()
                     if isinstance(value, str) and value and any(
@@ -1771,6 +2051,9 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                     fixture, prefix, registry, material, report, secrets_to_scan,
                     exact_cap=stage8_local_e2e_cap,
                     restart_recovery=stage8_local_restart,
+                    test_case=("drop-first-grant" if stage8_local_lost_grant else ""),
+                    verifier_timeout=stage8_local_verifier_timeout,
+                    storage_proxy=storage_proxy,
                 )
                 if stage8_local_cleanup:
                     run_cleanup_worker_e2e(fixture, prefix, registry, material, report)
@@ -1846,6 +2129,11 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 except (OSError, subprocess.TimeoutExpired):
                     cleanup_verified = False
             ACTIVE_GATEWAY_PROCESS = None
+        if storage_proxy is not None:
+            try:
+                storage_proxy.close()
+            except OSError:
+                cleanup_verified = False
         if prefix is not None:
             if registry is not None and prepare_mode:
                 try:
@@ -1916,10 +2204,12 @@ def main():
     args = sys.argv[1:]
     if args not in ([], ["--stage8-local-base"], ["--prepare-stage8-e2e"], ["--stage8-local-e2e"],
                     ["--stage8-local-e2e-cap"], ["--stage8-local-restart"],
-                    ["--stage8-local-cleanup"]):
+                    ["--stage8-local-cleanup"], ["--stage8-local-lost-grant"],
+                    ["--stage8-local-verifier-timeout"]):
         print("usage: stage8_media_storage_http_fixture.py "
               "[--stage8-local-base|--prepare-stage8-e2e|--stage8-local-e2e|"
-              "--stage8-local-e2e-cap|--stage8-local-restart|--stage8-local-cleanup]",
+              "--stage8-local-e2e-cap|--stage8-local-restart|--stage8-local-cleanup|"
+              "--stage8-local-lost-grant|--stage8-local-verifier-timeout]",
               file=sys.stderr)
         return 2
     return run_fixture(
@@ -1929,6 +2219,8 @@ def main():
         stage8_local_e2e_cap=args == ["--stage8-local-e2e-cap"],
         stage8_local_restart=args == ["--stage8-local-restart"],
         stage8_local_cleanup=args == ["--stage8-local-cleanup"],
+        stage8_local_lost_grant=args == ["--stage8-local-lost-grant"],
+        stage8_local_verifier_timeout=args == ["--stage8-local-verifier-timeout"],
     )
 
 

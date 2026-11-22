@@ -447,16 +447,22 @@ func TestRunMediaTestCaseRequiresOptInAndExactCapFixture(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name      string
+		testCase  string
 		overrides map[string]string
 		want      string
 	}{
-		{name: "requires media opt-in", want: "--test-media-case requires MEDIA_UPLOAD_ENABLED=true"},
-		{name: "requires exact cap fixture", overrides: mediaEnv, want: "exactly 80000000 bytes"},
+		{name: "requires media opt-in", testCase: gatewaysim.MediaTestStorageCapPlusOne,
+			want: "--test-media-case requires MEDIA_UPLOAD_ENABLED=true"},
+		{name: "requires exact cap fixture", testCase: gatewaysim.MediaTestStorageCapPlusOne,
+			overrides: mediaEnv, want: "exactly 80000000 bytes"},
+		{name: "lost grant mode is recognized before media opt-in",
+			testCase: gatewaysim.MediaTestDropFirstGrant,
+			want:     "--test-media-case requires MEDIA_UPLOAD_ENABLED=true"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			env := runEnv(filepath.Join(root, tt.name+".db"), tt.overrides)
 			var out, errBuf bytes.Buffer
-			code := run(context.Background(), []string{"run", "--test-media-case", gatewaysim.MediaTestStorageCapPlusOne},
+			code := run(context.Background(), []string{"run", "--test-media-case", tt.testCase},
 				lookupFrom(env), &out, &errBuf)
 			if code != 2 || !strings.Contains(errBuf.String(), tt.want) {
 				t.Fatalf("code=%d stderr=%q, want %q", code, errBuf.String(), tt.want)

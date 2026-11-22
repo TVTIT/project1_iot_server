@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,6 +86,76 @@ func TestMediaWorkerDoesNotTrustGrantTargetOrDeleteBeforeReady(t *testing.T) {
 	case <-requests:
 		t.Fatal("invalid grant target reached HTTP server")
 	default:
+	}
+}
+
+func TestMediaWorkerTestModeDropsOnlyFirstGrantForSelectedUpload(t *testing.T) {
+	var putCount atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method=%s, want PUT", r.Method)
+		}
+		putCount.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := mediaSpoolConfig(t)
+	spool, err := OpenMediaSpool(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Errorf("close media spool: %v", err)
+		}
+	}()
+	source := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(source, []byte("fixture clip"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := spool.IngestFinalized(context.Background(), "drop_grant_001", source, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.RecordAttempt(context.Background(), record.UploadID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	publisher := &mediaRecorder{}
+	worker, err := NewMediaWorker(MediaWorkerOptions{
+		GatewayID: "gateway_001", UploadOrigin: server.URL, Spool: spool,
+		Publisher: publisher, Capacity: 1, RetryMin: time.Millisecond, RetryMax: time.Second,
+		PutTimeout: time.Second,
+		TestCase:   MediaTestDropFirstGrant, TestUploadID: record.UploadID, httpClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := mediaprotocol.UploadGrant{
+		Version: 1, GatewayID: "gateway_001", UploadID: record.UploadID,
+		Status: mediaprotocol.GrantNeedUpload, MediaID: "11111111-1111-4111-8111-111111111111",
+		UploadURL: server.URL + "/storage/v1/object/upload/sign/media-video/11111111-1111-4111-8111-111111111111.mp4?token=fixture",
+		ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
+	}
+	payload, err := mediaprotocol.Encode(mediaprotocol.UploadGrantTopic("gateway_001"), grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	worker.handle(context.Background(), mediaDelivery{topic: mediaprotocol.UploadGrantTopic("gateway_001"), payload: payload})
+	first, err := spool.Get(context.Background(), record.UploadID)
+	if err != nil || first.Phase != "awaiting_grant" || putCount.Load() != 0 {
+		t.Fatalf("first grant was not dropped safely: phase=%q PUTs=%d err=%v", first.Phase, putCount.Load(), err)
+	}
+
+	worker.handle(context.Background(), mediaDelivery{topic: mediaprotocol.UploadGrantTopic("gateway_001"), payload: payload})
+	deadline := time.Now().Add(time.Second)
+	for putCount.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	second, err := spool.Get(context.Background(), record.UploadID)
+	if err != nil || putCount.Load() != 1 || second.Phase != "awaiting_result" {
+		t.Fatalf("second grant did not resume upload once: phase=%q PUTs=%d err=%v", second.Phase, putCount.Load(), err)
 	}
 }
 

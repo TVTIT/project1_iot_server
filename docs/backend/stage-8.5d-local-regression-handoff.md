@@ -151,3 +151,18 @@ token; không có feature, endpoint hoặc rollout thay đổi.
   - **Mục 8.8A (FRP/VPS) và kiểm thử qua Cloudflare/8.8A: NOT RUN** (chưa triển khai hạ tầng VPS ngoài).
   - **Remote CI / Full CI GitHub Actions: NOT RUN** (chỉ thực hiện nghiệm thu cục bộ theo kế hoạch một người làm).
   - **Live Rollout / Production Deployment: NOT RUN** (giữ nguyên cờ mặc định `MEDIA_UPLOAD_ENABLED=false`).
+
+## Follow-up 22/11/2026 — Hai nhánh phục hồi 8.5 còn thiếu
+
+**Revision & Scope:** HEAD `fbd077b325f6508c4e46167a041394232193a1bc` cùng dirty worktree; từng runner build từ source local lúc chạy, không tuyên bố đây là revision sạch hoặc mọi lượt dùng byte-identical diff. Tất cả dùng fixture Docker cô lập và clip H.264 1.546 byte. Không đọc `.env` triển khai. Các run độc lập, cleanup chính xác; kết quả chỉ chứng minh local fixture.
+
+| Lượt | Trạng thái trung gian đã quan sát | Kết quả cuối |
+|---|---|---|
+| `--stage8-local-lost-grant` | Gateway `gw_stage8_ad1b32a25755` bỏ grant đầu cho `upload_680a65c722e22b52`; nhận `OBJECT_MISSING` khi Envoy PUT count còn 0. | Cùng upload ID/media ID `1937ad54-1b5b-437e-9b33-fa483b3621f5` được cấp lại; đúng 1 PUT, row và SQLite `ready`, object private/path đúng, spool file gỡ. SHA-256 `133b3ccc3377dfcb2f7d6b17bb3a7a4e3a3cb38e80aec6b094b2e1a734da04cc`; cleanup PASS. |
+| `--stage8-local-verifier-timeout` | Gateway `gw_stage8_9bba375d81c8`; với Storage timeout 1s, proxy trì hoãn response GET đầu 5s: DB `verifying` / `STORAGE_UNAVAILABLE`, `next_verification_at` có giá trị; object đã tồn tại, Envoy PUT count 1, SQLite `awaiting_result` và spool file còn. | Proxy ghi nhận 2 lượt GET; lần sau xác minh object hiện hữu thành công. DB/SQLite `ready`, spool file gỡ, vẫn đúng 1 PUT; cùng SHA-256 trên; cleanup PASS. |
+| `--stage8-local-e2e` | Luồng chuẩn clip nhỏ. | PASS, một row/object, hash khớp, cleanup PASS. |
+| `--stage8-local-restart` | Backend commit `ready` khi Gateway dừng; spool/source/upload ID giữ nguyên. | Gateway khởi động lại, đúng một PUT trước và sau restart, spool chỉ gỡ sau `ready`; cleanup PASS. |
+
+Các báo cáo runtime kiểm tra không có signed URL/query token hoặc Authorization header trong log. Fixture chỉ giảm `MEDIA_UPLOAD_INFLIGHT_GRACE`/scan interval cho lượt mất grant và chỉ bật Storage proxy cùng timeout/retry profile ở lượt verifier-timeout; mặc định runner không tiêm lỗi. Các lượt thử trước profile/route cuối vẫn là **FAIL**: hai lost-grant run hết cửa sổ quan sát do grace mặc định 2 phút; hai timeout run chưa khớp path GET thực tế nên số GET bị chặn là 0. Cleanup các lượt này PASS; không lượt nào được tính lại thành PASS.
+
+**Verification:** `go test -race ./internal/gatewaysim ./cmd/gateway -count=1`, `go vet ./internal/gatewaysim ./cmd/gateway`, `go build ./internal/gatewaysim ./cmd/gateway`, `golangci-lint` (0 issues), ARMv7 cross-build, Python bundle/driver 22 tests, `py_compile` và `git diff --check`: PASS. Remote CI, Cloudflare, backend-process restart thuộc 8.2 và live rollout vẫn NOT RUN.

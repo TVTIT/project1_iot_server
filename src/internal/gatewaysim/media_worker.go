@@ -25,6 +25,8 @@ const (
 	MediaTestDeclaredOverCap = "declared-over-cap"
 	// MediaTestStorageCapPlusOne names the test-only oversized PUT case.
 	MediaTestStorageCapPlusOne = "storage-cap-plus-one"
+	// MediaTestDropFirstGrant names the fixture-only lost-grant recovery case.
+	MediaTestDropFirstGrant = "drop-first-grant"
 )
 
 // MediaPublisher abstracts the MQTT outbound publication seam for media worker notifications.
@@ -60,17 +62,18 @@ type mediaDelivery struct {
 // MediaWorker owns one bounded inbox and one serial consumer, isolated from
 // telemetry and control callbacks.
 type MediaWorker struct {
-	opts          MediaWorkerOptions
-	inbox         chan mediaDelivery
-	stop          chan struct{}
-	done          chan struct{}
-	once          sync.Once
-	startOnce     sync.Once
-	doneOnce      sync.Once
-	lifecycleMu   sync.Mutex
-	started       bool
-	cancel        context.CancelFunc
-	testProbeSent bool
+	opts             MediaWorkerOptions
+	inbox            chan mediaDelivery
+	stop             chan struct{}
+	done             chan struct{}
+	once             sync.Once
+	startOnce        sync.Once
+	doneOnce         sync.Once
+	lifecycleMu      sync.Mutex
+	started          bool
+	cancel           context.CancelFunc
+	testProbeSent    bool
+	testGrantDropped bool
 }
 
 // NewMediaWorker constructs a validated media worker with bounded capacity and TLS configuration.
@@ -80,7 +83,8 @@ func NewMediaWorker(opts MediaWorkerOptions) (*MediaWorker, error) {
 		opts.GatewayID == "" || opts.Spool == nil || opts.Capacity <= 0 {
 		return nil, errors.New("gatewaysim: invalid media worker configuration")
 	}
-	if opts.TestCase != "" && opts.TestCase != MediaTestDeclaredOverCap && opts.TestCase != MediaTestStorageCapPlusOne {
+	if opts.TestCase != "" && opts.TestCase != MediaTestDeclaredOverCap &&
+		opts.TestCase != MediaTestStorageCapPlusOne && opts.TestCase != MediaTestDropFirstGrant {
 		return nil, errors.New("gatewaysim: invalid media test case")
 	}
 	if opts.TestCase != "" && !mediaUploadIDPattern.MatchString(opts.TestUploadID) {
@@ -222,6 +226,13 @@ func (w *MediaWorker) handle(ctx context.Context, d mediaDelivery) {
 			if err != nil || timeErr != nil || !validMediaTarget(u, base, m.MediaID) || expiry.Before(time.Now()) || expiry.After(r.Deadline) || (r.MediaID != "" && r.MediaID != m.MediaID) {
 				return
 			}
+			if w.opts.TestCase == MediaTestDropFirstGrant && m.UploadID == w.opts.TestUploadID &&
+				!w.testGrantDropped {
+				w.testGrantDropped = true
+				slog.Info("gatewaysim media test grant dropped", "case", MediaTestDropFirstGrant,
+					"upload_id", m.UploadID)
+				return
+			}
 			if w.opts.Spool.MarkGranted(ctx, m.UploadID, m.MediaID, expiry) != nil {
 				return
 			}
@@ -243,6 +254,11 @@ func (w *MediaWorker) handle(ctx context.Context, d mediaDelivery) {
 	case mediaprotocol.UploadResult:
 		if m.GatewayID != w.opts.GatewayID {
 			return
+		}
+		if w.opts.TestCase == MediaTestDropFirstGrant && m.UploadID == w.opts.TestUploadID &&
+			m.Code == "OBJECT_MISSING" {
+			slog.Info("gatewaysim media test result observed", "case", MediaTestDropFirstGrant,
+				"upload_id", m.UploadID, "status", m.Status, "code", m.Code)
 		}
 		r, err := w.opts.Spool.Get(ctx, m.UploadID)
 		if err == nil && (m.MediaID == "" || r.MediaID == "" || r.MediaID == m.MediaID) {
@@ -393,7 +409,7 @@ func mediaPUTBodyForTest(body io.Reader, declaredBytes int64, testCase string) (
 		return nil, 0, errors.New("invalid media PUT body")
 	}
 	switch testCase {
-	case "":
+	case "", MediaTestDropFirstGrant:
 		return body, declaredBytes, nil
 	case MediaTestStorageCapPlusOne:
 		if declaredBytes != mediaprotocol.MaxUploadBytes {

@@ -181,9 +181,11 @@ func parseRun(ctx context.Context, args []string, lookup gatewaysim.LookupFunc, 
 		return 2
 	}
 	if *testMediaCase != "" && *testMediaCase != gatewaysim.MediaTestDeclaredOverCap &&
-		*testMediaCase != gatewaysim.MediaTestStorageCapPlusOne {
-		writef(stderr, "--test-media-case must be %q or %q\n",
-			gatewaysim.MediaTestDeclaredOverCap, gatewaysim.MediaTestStorageCapPlusOne)
+		*testMediaCase != gatewaysim.MediaTestStorageCapPlusOne &&
+		*testMediaCase != gatewaysim.MediaTestDropFirstGrant {
+		writef(stderr, "--test-media-case must be %q, %q, or %q\n",
+			gatewaysim.MediaTestDeclaredOverCap, gatewaysim.MediaTestStorageCapPlusOne,
+			gatewaysim.MediaTestDropFirstGrant)
 		return 2
 	}
 
@@ -230,8 +232,15 @@ func runSimulator(ctx context.Context, lookup gatewaysim.LookupFunc, stdout, std
 			return 2
 		}
 		info, statErr := os.Stat(cfg.MediaUpload.InputFile)
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() != 80_000_000 {
-			writeln(stderr, "--test-media-case requires a readable finalized media file of exactly 80000000 bytes")
+		needsExactCap := testMediaCase == gatewaysim.MediaTestDeclaredOverCap ||
+			testMediaCase == gatewaysim.MediaTestStorageCapPlusOne
+		if statErr != nil || !info.Mode().IsRegular() ||
+			(needsExactCap && info.Size() != 80_000_000) {
+			if needsExactCap {
+				writeln(stderr, "--test-media-case requires a readable finalized media file of exactly 80000000 bytes")
+			} else {
+				writeln(stderr, "--test-media-case requires a readable finalized media file")
+			}
 			return 2
 		}
 		cfg.MediaUpload.TestCase = testMediaCase
