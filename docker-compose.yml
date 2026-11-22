@@ -8,6 +8,8 @@ services:
       - "80:80"
     environment:
       - API_DOMAIN=${API_DOMAIN:-localhost}
+      - MEDIA_UPLOAD_ENABLED=${MEDIA_UPLOAD_ENABLED:-false}
+      - MEDIA_UPLOAD_ROUTE_KEY=${MEDIA_UPLOAD_ROUTE_KEY:-}
     volumes:
       - ./config/nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
     depends_on:
@@ -357,7 +359,7 @@ services:
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-backend_monolith}
       MQTT_USERNAME: ${MQTT_USERNAME:-backend_service}
       MQTT_PASSWORD: ${MQTT_PASSWORD:?MQTT_PASSWORD is required}
-      # Stage 8 runtime is opt-in; start the dedicated listener separately.
+      # Stage 8 runtime follows MEDIA_UPLOAD_ENABLED; the dedicated listener is rollback-only.
       MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}
       MEDIA_UPLOAD_MQTT_CLIENT_ID: ${MEDIA_UPLOAD_MQTT_CLIENT_ID:-backend_media}
       MEDIA_UPLOAD_SIGN_TIMEOUT: ${MEDIA_UPLOAD_SIGN_TIMEOUT:-5s}

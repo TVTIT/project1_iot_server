@@ -2,13 +2,32 @@
 # the stage8-media profile in docker-compose.yml directly.
 services:
   stage8-media-upload:
-    profiles: !reset []
     environment:
       MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:?fixture/operator route key required}
     volumes: !override
       - ./config/nginx/stage8-media.conf.template:/etc/nginx/templates/default.conf.template:ro
+  nginx:
+    ports: !override
+      - target: 80
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    environment:
+      MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}
+      MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:-}
+    volumes: !override
+      - ./config/nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    networks: !override
+      iot_net:
+        aliases:
+          - stage8-shared-nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+      supabase-envoy:
+        condition: service_started
   # Fixture-only TLS edge models Cloudflare termination, then proxies over HTTP
-  # to the production listener. Never included by the root Compose profile.
+  # to the shared API Nginx origin. Never included by the root Compose profile.
   stage8-media-upload-test-edge:
     image: nginx:1.25-alpine
     restart: "no"
@@ -28,7 +47,7 @@ services:
     networks:
       - iot_net
     depends_on:
-      stage8-media-upload:
+      nginx:
         condition: service_started
   supabase-envoy:
     environment:

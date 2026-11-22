@@ -166,3 +166,78 @@ token; không có feature, endpoint hoặc rollout thay đổi.
 Các báo cáo runtime kiểm tra không có signed URL/query token hoặc Authorization header trong log. Fixture chỉ giảm `MEDIA_UPLOAD_INFLIGHT_GRACE`/scan interval cho lượt mất grant và chỉ bật Storage proxy cùng timeout/retry profile ở lượt verifier-timeout; mặc định runner không tiêm lỗi. Các lượt thử trước profile/route cuối vẫn là **FAIL**: hai lost-grant run hết cửa sổ quan sát do grace mặc định 2 phút; hai timeout run chưa khớp path GET thực tế nên số GET bị chặn là 0. Cleanup các lượt này PASS; không lượt nào được tính lại thành PASS.
 
 **Verification:** `go test -race ./internal/gatewaysim ./cmd/gateway -count=1`, `go vet ./internal/gatewaysim ./cmd/gateway`, `go build ./internal/gatewaysim ./cmd/gateway`, `golangci-lint` (0 issues), ARMv7 cross-build, Python bundle/driver 22 tests, `py_compile` và `git diff --check`: PASS. Remote CI, Cloudflare, backend-process restart thuộc 8.2 và live rollout vẫn NOT RUN.
+
+## Follow-up 23/11/2026 — Signed PUT qua Nginx chung (local only)
+
+> Ghi nhận trạng thái triển khai trung gian hai-cờ; đã được hợp nhất thành một
+> cờ trong mục follow-up cuối tài liệu.
+
+**Phạm vi:** thêm route signed `PUT` chính xác cho `media-video/<uuid>.mp4` vào
+`config/nginx/nginx.conf.template`, mặc định đóng bằng
+`MEDIA_UPLOAD_EDGE_ENABLED=false`. Khi bật, Nginx yêu cầu route key không rỗng,
+chỉ ghi đè header `X-Stage8-Media-Route` ở location upload rồi chuyển nguyên
+request tới Envoy. Storage ảnh và các route API/Auth hiện hữu giữ nguyên; tunnel
+`media-upload`, listener `stage8-media-upload` và origin hiện tại chưa bị gỡ hay
+đổi. Cổng 80 không đổi.
+
+### RED → GREEN và kiểm chứng local
+
+- RED: hai kiểm tra cấu hình mới thất bại trước implementation: fixture TLS còn
+  proxy tới `stage8-media-upload`, và Compose/Nginx chung chưa có công tắc edge.
+- GREEN: fixture TLS hiện trỏ tới `nginx.conf.template` qua một alias nội bộ;
+  cùng HTTPS edge được dùng để kiểm tra readiness/API, Storage ảnh và upload.
+  Base fixture xác nhận route signed trả 404 khi media edge tắt; upload hợp lệ
+  khi bật đi qua Nginx → Envoy → Storage.
+- `python3 -m unittest scripts.tests.test_stage8_media_storage`: **16 tests PASS**.
+- `python3 scripts/tests/stage8_media_storage_http_fixture.py --stage8-local-base`:
+  PASS, gồm media-off, Storage ảnh và cleanup chính xác.
+- Fixture mặc định: PASS — signed PUT nhỏ, readback/hash, no-overwrite, sai path/
+  method, token hết hạn, route quản trị/đọc bị chặn, cap +1 bị Storage từ chối,
+  không thấy token trong log/artifact; cleanup chính xác.
+- `--stage8-local-e2e`: PASS, 1.546 byte, DB/SQLite `ready`, 1 object, hash
+  khớp; `--stage8-local-e2e-cap`: PASS đúng **80.000.000 byte**, hash khớp.
+- `--stage8-local-restart`: PASS, Gateway dùng lại cùng spool/source/upload ID,
+  đúng một PUT; `--stage8-local-lost-grant`: PASS, object vắng trước PUT đầu và
+  chỉ một PUT sau recovery.
+- `--stage8-local-verifier-timeout`: PASS sau khi chờ hữu hạn để Envoy access
+  log ghi nhận PUT; quan sát DB `verifying` / `STORAGE_UNAVAILABLE`, SQLite
+  `awaiting_result`, object đã tồn tại, sau đó `ready` mà không PUT lần hai.
+- `--stage8-local-cleanup`: PASS, cleanup worker xóa object terminal, giữ row/
+  object `ready`, giải phóng quota sau xác nhận.
+- `py_compile` cho fixture/unit files và `git diff --check`: PASS. Các native
+  fixture xác nhận `docker compose config` và khởi động Nginx thành công.
+
+### Lịch sử lỗi trong lượt này và giới hạn
+
+- Lượt `--stage8-local-e2e` đầu: readiness timeout vì fixture khởi động backend
+  trước khi cấp origin tạm hợp lệ; đã sửa fixture setup và chạy lại PASS. Lượt
+  `--stage8-local-verifier-timeout` đầu: Envoy log count còn 0 tại thời điểm
+  assertion; thêm chờ hữu hạn cho visibility của log và lượt chạy lại PASS.
+  Các FAIL ban đầu được giữ nguyên, không tính lại thành PASS.
+- **Không gọi Cloudflare/tunnel hay mạng ngoài; user tự làm smoke/cutover.**
+  Remote CI, live deployment, đổi đồng bộ hai origin, dừng tunnel cũ và gỡ
+  listener cũ đều NOT RUN. Mặc định `MEDIA_UPLOAD_EDGE_ENABLED=false` được giữ;
+  chưa có commit cho thay đổi này.
+
+## Follow-up 23/11/2026 — Dùng một cờ bật media
+
+Phần cấu hình hai cờ ở follow-up trước đã được thay thế: `MEDIA_UPLOAD_ENABLED`
+điều khiển cả backend media lẫn signed PUT route trên Nginx chung. Xóa
+`MEDIA_UPLOAD_EDGE_ENABLED` khỏi Compose, `.env.example`, Nginx template và
+fixture. Không cần `stage8-media` trong `COMPOSE_PROFILES` để dùng route chung;
+profile/listener `stage8-media-upload` vẫn được giữ riêng như đường rollback.
+
+**Bằng chứng cục bộ:** test contract mới có RED trước khi đổi wiring vì Nginx
+chưa nhận `MEDIA_UPLOAD_ENABLED`; sau thay đổi, `python3 -m unittest
+scripts.tests.test_stage8_media_storage` PASS (16 tests). Fixture
+`--stage8-local-base` PASS với media false/404; fixture mặc định PASS với signed
+PUT qua Nginx chung; `--stage8-local-e2e` PASS với media true, 1.546-byte clip,
+hash khớp, một object `ready`, và cleanup chính xác. Các fixture Compose chỉ
+start service Nginx chung và test TLS edge, không start listener thuộc profile
+`stage8-media`.
+
+Lượt mặc định đầu sau khi gộp cờ FAIL khi backend media được bật nhưng fixture
+chưa có HTTPS origin hợp lệ; fixture được sửa để cấp origin tạm và bootstrap
+media DynSec theo đúng cờ, sau đó chạy lại PASS. Không gọi Cloudflare/tunnel hay
+mạng ngoài; không sửa `.env` triển khai, đổi origin, dừng tunnel hoặc gỡ
+listener. Không commit.

@@ -155,13 +155,12 @@ def safe_compose_diagnostic(output, fixture):
     return candidates[-1][:500] if candidates else "compose_up_nonzero"
 
 
-def compose_prefix(fixture, storage_overlay, media_overlay=True):
+def compose_prefix(fixture, storage_overlay):
     files = [
         "-f", str(smoke.ROOT_COMPOSE), "-f", str(fixture.override),
         "-f", str(smoke.PAPER_P0_TEMPLATE), "-f", str(fixture.private / "compose.p2.yml"),
     ]
-    if media_overlay:
-        files.extend(["-f", str(ROOT / "docker-compose.stage8-media.yml")])
+    files.extend(["-f", str(ROOT / "docker-compose.stage8-media.yml")])
     files.extend(["-f", str(storage_overlay)])
     return [
         "docker", "compose", "--project-directory", str(ROOT), "--project-name",
@@ -439,17 +438,18 @@ def prove_legacy_storage(fixture, prefix, report, *, api_endpoint, dedicated_end
                       f"/storage/v1/object/authenticated/media-video/{object_probe}")[0] == 404,
         "nginx_media_video_read_not_rejected",
     )
-    require(
-        https_request(api_endpoint, "POST",
-                      f"/storage/v1/object/upload/sign/media-video/{object_probe}")[0] == 404,
-        "nginx_media_video_sign_not_rejected",
-    )
-    require(
-        https_request(api_endpoint, "PUT",
-                      f"/storage/v1/object/upload/sign/media-video/{object_probe}",
-                      body=VIDEO_BYTES)[0] == 404,
-        "nginx_media_video_put_not_rejected",
-    )
+    signing_status = https_request(
+        api_endpoint, "POST",
+        f"/storage/v1/object/upload/sign/media-video/{object_probe}",
+    )[0]
+    require(signing_status in (404, 405), "shared_media_route_sign_method_not_rejected")
+    unauthenticated_put_status = https_request(
+        api_endpoint, "PUT",
+        f"/storage/v1/object/upload/sign/media-video/{object_probe}",
+        body=VIDEO_BYTES,
+    )[0]
+    require(unauthenticated_put_status in (400, 403, 404),
+            "shared_media_route_unauthenticated_put_not_rejected")
     require(
         https_request(api_endpoint, "POST", "/storage/v1/bucket/media-video")[0] == 404,
         "nginx_media_video_bucket_admin_not_rejected",
@@ -535,24 +535,15 @@ def prove_fixture(fixture, prefix, report):
             "storage_bucket_policy_mismatch")
     report["checks"]["bucket_bootstrap_readback"] = {"status": "PASS", "http_status": status}
 
-    # The dedicated origin has just its probe and upload route. The profile
-    # adds a separate service rather than replacing or redirecting base Nginx.
     report["phase"] = "media_health"
     health = https_request(endpoint, "GET", "/healthz")
     require(health[0] == 200 and health[2] == b"OK", "media_listener_health_failed")
-    report["phase"] = "media_business_deny"
-    require(https_request(endpoint, "GET", "/v1/health")[0] == 404,
-            "media_listener_exposed_business_route")
-    report["checks"]["dedicated_listener_isolation"] = {"status": "PASS"}
 
-    # Legacy storage API regression check: properly authenticated image write/read
-    # through the normal Nginx -> Envoy -> Storage route must succeed, and the dedicated
-    # media listener must not leak legacy storage routes.
-    api_port = mapped_loopback_port(prefix, fixture, "nginx", 443)
-    api_endpoint = smoke.HTTPSEndpoint(
-        f"https://127.0.0.1:{api_port}", fixture.private / "p2-ca.crt",
-    )
-    prove_legacy_storage(fixture, prefix, report, api_endpoint=api_endpoint, dedicated_endpoint=endpoint)
+    # REST/Auth and image storage share this TLS origin with the signed upload.
+    api_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
+    api_endpoint = endpoint
+    require(api_port == upload_port, "shared_tls_origin_port_mismatch")
+    prove_legacy_storage(fixture, prefix, report, api_endpoint=api_endpoint)
 
     # Construct a canonical UUID rather than relying on a fixture-specific shape.
     object_path = "8e55f26c-2a01-4f77-a1cb-" + secrets.token_hex(6) + ".mp4"
@@ -612,17 +603,18 @@ def prove_fixture(fixture, prefix, report):
                       f"/storage/v1/object/authenticated/media-video/{object_path}")[0] == 404,
         "nginx_media_video_read_not_rejected",
     )
-    require(
-        https_request(api_endpoint, "POST",
-                      f"/storage/v1/object/upload/sign/media-video/{object_path}")[0] == 404,
-        "nginx_media_video_sign_not_rejected",
-    )
-    require(
-        https_request(api_endpoint, "PUT",
-                      f"/storage/v1/object/upload/sign/media-video/{object_path}",
-                      body=VIDEO_BYTES)[0] == 404,
-        "nginx_media_video_put_not_rejected",
-    )
+    signing_status = https_request(
+        api_endpoint, "POST",
+        f"/storage/v1/object/upload/sign/media-video/{object_path}",
+    )[0]
+    require(signing_status == 405, "shared_media_route_sign_method_not_rejected")
+    unauthenticated_put_status = https_request(
+        api_endpoint, "PUT",
+        f"/storage/v1/object/upload/sign/media-video/{object_path}",
+        body=VIDEO_BYTES,
+    )[0]
+    require(unauthenticated_put_status in (400, 403, 404),
+            "shared_media_route_unauthenticated_put_not_rejected")
     require(
         https_request(api_endpoint, "POST", "/storage/v1/bucket/media-video")[0] == 404,
         "nginx_media_video_bucket_admin_not_rejected",
@@ -729,8 +721,8 @@ def prove_fixture(fixture, prefix, report):
     # Inspect only in-memory logs and artifacts for the actual grant tokens and
     # fixture marker. Raw log text and signed URLs are never persisted or printed.
     report["phase"] = "log_scan"
-    logs = run(prefix + ["logs", "--no-color", "stage8-media-upload",
-                         "supabase-envoy", "supabase-storage"],
+    logs = run(prefix + ["logs", "--no-color", "nginx",
+                         "stage8-media-upload-test-edge", "supabase-envoy", "supabase-storage"],
                fixture, timeout=30)
     log_bytes = logs.stdout + logs.stderr
     require(all(value.encode() not in log_bytes for value in (token, cap_token, expired_token, key)),
@@ -746,7 +738,7 @@ def prove_fixture(fixture, prefix, report):
 
 def provision_gateway_credential(fixture, prefix, registry, report, *, sensor_id=None):
     """Create one fixture Gateway and credential through the ordinary P2 APIs."""
-    api_port = mapped_loopback_port(prefix, fixture, "nginx", 443)
+    api_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
     endpoint = smoke.HTTPSEndpoint(
         f"https://127.0.0.1:{api_port}", fixture.private / "p2-ca.crt",
     )
@@ -1065,7 +1057,7 @@ def verify_media_logs(prefix, fixture, gateway_log, secrets_to_scan):
     gateway_bytes = bounded_log_tail(gateway_log)
     compose_logs = run(
         prefix + ["logs", "--no-color", "--tail", "2000", "backend", "mosquitto",
-                  "stage8-media-upload", "supabase-envoy", "supabase-storage"],
+                  "nginx", "stage8-media-upload-test-edge", "supabase-envoy", "supabase-storage"],
         fixture, timeout=30,
     ).stdout
     combined = gateway_bytes + compose_logs
@@ -1483,12 +1475,20 @@ def run_gateway_media_e2e(fixture, prefix, registry, material, report, secrets_t
                         """SELECT count(*) FROM storage.objects
                            WHERE bucket_id='media-video' AND name='""" + rows[0][0] + """.mp4';""",
                     ).strip()
-                    puts = envoy_media_put_count(prefix, fixture)
+                    put_observation = wait_for_media_put_count(
+                        lambda: envoy_media_put_count(prefix, fixture),
+                        expected=1, timeout=5,
+                    )
+                    puts = put_observation["count"]
                     file_present = (spool_dir / (upload_id + ".mp4")).is_file()
+                    spool_phase = (
+                        spool_state[1][1] if spool_state is not None and spool_state[1] is not None
+                        else "missing"
+                    )
                     require(object_count == "1" and puts == 1 and file_present
-                            and spool_state is not None and spool_state[1] is not None
-                            and spool_state[1][1] == "awaiting_result",
-                            "verifier_timeout_intermediate_state_mismatch")
+                            and spool_phase == "awaiting_result",
+                            f"verifier_timeout_intermediate_state_mismatch_object_{object_count}_"
+                            f"puts_{puts}_file_{str(file_present).lower()}_phase_{spool_phase}")
                     verifier_timeout_observed = True
                     report["checks"]["verifier_timeout_intermediate_state"] = {
                         "status": "PASS", "upload_id": upload_id,
@@ -1851,6 +1851,8 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             "MEDIA_UPLOAD_ROUTE_KEY": secrets.token_hex(32),
             "MEDIA_TEST_TLS_DIR": str(fixture.private / "p2-tls"),
             "MEDIA_HTTP_PORT": "0",
+            "MEDIA_UPLOAD_ENABLED": "false" if stage8_local_base else "true",
+            "MEDIA_UPLOAD_PUBLIC_ORIGIN": "" if stage8_local_base else "https://127.0.0.1",
             "MEDIA_UPLOAD_GRANT_TTL_SECONDS": "3" if stage8_local_lost_grant else "30",
         })
         prepare_mode = (prepare_stage8_e2e or stage8_local_e2e or stage8_local_e2e_cap
@@ -1861,7 +1863,7 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                 MEDIA_UPLOAD_ENABLED="true",
                 MEDIA_UPLOAD_MQTT_CLIENT_ID="backend_media_" + secrets.token_hex(5),
                 STORAGE_INTERNAL_URL="http://supabase-storage:5000",
-                MEDIA_UPLOAD_PUBLIC_ORIGIN="",
+                MEDIA_UPLOAD_PUBLIC_ORIGIN="https://127.0.0.1",
             )
         if stage8_local_cleanup:
             fixture.values.update(
@@ -1911,30 +1913,31 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
         host_ip: 127.0.0.1
         protocol: tcp
 """)
-        prefix = compose_prefix(fixture, storage_overlay, media_overlay=not stage8_local_base) + ["-f", str(broker_overlay)]
+        prefix = compose_prefix(fixture, storage_overlay) + ["-f", str(broker_overlay)]
         registry = smoke.ResourceRegistry(fixture)
         run(prefix + ["config", "--quiet"], fixture, timeout=60)
         report["checks"]["compose_model"] = {"status": "PASS"}
         lifecycle = smoke.bootstrap_lifecycle()
         smoke.generate_fixture_tls(fixture)
+        media_upload_enabled = fixture.values["MEDIA_UPLOAD_ENABLED"] == "true"
         volume = smoke.allocate_bootstrap_store(
-            fixture, registry, lifecycle, media_upload_enabled=prepare_mode,
+            fixture, registry, lifecycle, media_upload_enabled=media_upload_enabled,
         )
         smoke.allocation_readback(
-            fixture, registry, volume, media_upload_enabled=prepare_mode,
+            fixture, registry, volume, media_upload_enabled=media_upload_enabled,
         )
         report["checks"]["owned_dynsec_bootstrap"] = {"status": "PASS"}
         built = run(prefix + ["build", "backend"], fixture, timeout=300, check=False)
         require(built.returncode == 0, "isolated_backend_build_failed")
         if stage8_local_base:
-            services = list(smoke.fixture_services(fixture))
+            services = list(smoke.fixture_services(fixture)) + ["stage8-media-upload-test-edge"]
             started = run(prefix + ["up", "--detach", "--no-build", "--pull", "never", *services],
                           fixture, timeout=300, check=False)
             if started.returncode:
                 raise ProofFailure("isolated_compose_start_failed_exit_" + str(started.returncode) + ":" +
                                    safe_compose_diagnostic(started.stdout + started.stderr, fixture))
             storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
-            api_port = mapped_loopback_port(prefix, fixture, "nginx", 443)
+            api_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
             api_endpoint = smoke.HTTPSEndpoint(f"https://127.0.0.1:{api_port}", fixture.private / "p2-ca.crt")
             ready = False
             for _ in range(60):
@@ -1964,16 +1967,28 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
             require(upload_port_probe.returncode != 0, "dedicated_listener_unexpectedly_present_in_base")
             report["checks"]["dedicated_listener_absent_in_base"] = {"status": "PASS"}
             prove_legacy_storage(fixture, prefix, report, api_endpoint=api_endpoint, dedicated_endpoint=None)
+            media_off = https_request(
+                api_endpoint, "PUT",
+                "/storage/v1/object/upload/sign/media-video/" + str(uuid.uuid4()) + ".mp4?token=fixture",
+                VIDEO_BYTES,
+            )
+            require(media_off[0] == 404, "shared_media_route_enabled_by_default")
+            report["checks"]["shared_media_route_default_off"] = {
+                "status": "PASS", "http_status": media_off[0],
+            }
             report["checks"]["base_composition_verified"] = {"status": "PASS"}
             report["status"] = "PASS"
         elif prepare_mode:
             dependencies = [s for s in smoke.fixture_services(fixture)
                             if s not in ("backend", "nginx")]
             started = run(prefix + ["up", "--detach", "--no-build", "--pull", "never",
-                                    *dependencies, "stage8-media-upload",
-                                    "stage8-media-upload-test-edge"],
+                                    *dependencies, "nginx", "stage8-media-upload-test-edge"],
                           fixture, timeout=300, check=False)
-            require(started.returncode == 0, "stage8_prerequisite_compose_start_failed")
+            require(
+                started.returncode == 0,
+                "shared_nginx_prerequisite_compose_start_failed_" +
+                safe_compose_diagnostic(started.stdout + started.stderr, fixture),
+            )
             upload_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
             storage_port = mapped_loopback_port(prefix, fixture, "supabase-storage", 5000)
             fixture.values["MEDIA_UPLOAD_PUBLIC_ORIGIN"] = f"https://127.0.0.1:{upload_port}"
@@ -1994,7 +2009,7 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                                     "backend", "nginx"],
                           fixture, timeout=300, check=False)
             require(started.returncode == 0, "stage8_backend_compose_start_failed")
-            api_port = mapped_loopback_port(prefix, fixture, "nginx", 443)
+            api_port = mapped_loopback_port(prefix, fixture, "stage8-media-upload-test-edge", 443)
             api_endpoint = smoke.HTTPSEndpoint(
                 f"https://127.0.0.1:{api_port}", fixture.private / "p2-ca.crt",
             )
@@ -2066,19 +2081,17 @@ def run_fixture(stage8_local_base=False, prepare_stage8_e2e=False,
                     f"https://127.0.0.1:{upload_port}", fixture.private / "p2-ca.crt",
                 )
                 health = https_request(endpoint, "GET", "/healthz")
-                require(health[0] == 200 and health[2] == b"OK", "media_listener_health_failed")
-                require(https_request(endpoint, "GET", "/v1/health")[0] == 404,
-                        "media_listener_exposed_business_route")
-                report["checks"]["dedicated_listener_isolation"] = {"status": "PASS"}
-                prove_legacy_storage(fixture, prefix, report, api_endpoint=api_endpoint, dedicated_endpoint=endpoint)
+                require(health[0] == 200 and health[2] == b"OK", "shared_nginx_health_failed")
+                require(https_request(endpoint, "GET", "/readyz")[0] == 200,
+                        "shared_nginx_api_not_ready")
+                prove_legacy_storage(fixture, prefix, report, api_endpoint=endpoint)
                 report["checks"]["media_upload_enabled_backend_verified"] = {
                     "status": "PASS", "runtime_flag": "MEDIA_UPLOAD_ENABLED=true",
+                    "origin": "shared_nginx_test_tls_edge",
                 }
             report["status"] = "PASS"
         else:
-            services = list(smoke.fixture_services(fixture)) + [
-                "stage8-media-upload", "stage8-media-upload-test-edge",
-            ]
+            services = list(smoke.fixture_services(fixture)) + ["stage8-media-upload-test-edge"]
             started = run(prefix + ["up", "--detach", "--no-build", "--pull", "never", *services],
                           fixture, timeout=300, check=False)
             if started.returncode:

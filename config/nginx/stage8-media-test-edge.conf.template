@@ -1,5 +1,5 @@
-# Fixture-only HTTPS edge that models public TLS termination. The real
-# stage8-media-upload service remains HTTP-only on the Docker network.
+# Fixture-only HTTPS edge that models public TLS termination and reaches the
+# shared API Nginx origin over HTTP.
 server {
     listen 443 ssl;
     server_name localhost;
@@ -9,12 +9,14 @@ server {
     client_max_body_size 80m;
     access_log off;
     error_log /dev/null emerg;
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    set $api_upstream http://stage8-shared-nginx:80;
 
     location / {
         proxy_http_version 1.1;
         proxy_request_buffering off;
         proxy_buffering off;
-        proxy_pass http://stage8-media-upload:80;
+        proxy_pass $api_upstream;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;

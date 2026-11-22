@@ -1,5 +1,12 @@
 # Stage 8.3c — Local signed Storage PUT route
 
+> **Cấu hình hiện hành (23/11/2026):** signed upload đã được gộp vào Nginx
+> chung ở `config/nginx/nginx.conf.template`. Chỉ cần đặt
+> `MEDIA_UPLOAD_ENABLED=true` để bật backend media và route upload trên Nginx;
+> không cần thêm `stage8-media` vào `COMPOSE_PROFILES`. Listener/profile riêng
+> bên dưới là đường cũ được giữ để rollback trong giai đoạn chuyển đổi, không
+> phải điều kiện để dùng route chung. Chưa kiểm thử Cloudflare/tunnel ngoài.
+
 This is a local, opt-in route slice; it does not publish a hostname or enable
 Cloudflare or FRP. The base Nginx template rejects the canonical `media-video`
 signed-upload path. The root Compose `stage8-media` profile adds a dedicated
@@ -32,40 +39,24 @@ serializes request URLs with the `token` query parameter redacted, and the
 overlay sets `LOG_LEVEL=fatal` to suppress routine request logs. Fixture
 artifacts must contain only sanitized status/timing metadata.
 
-## Chạy bằng Compose gốc trên máy demo
+## Bật route trên Nginx chung
 
-`docker-compose.yml` có profile `stage8-media`; không cần truyền overlay
-`docker-compose.stage8-media.yml` khi vận hành demo. Profile chỉ kích hoạt
-listener HTTP riêng; cờ backend và giới hạn Storage vẫn là cấu hình độc lập.
-Mặc định backend tắt media, Storage giữ 50 MiB và listener không được khởi động.
+Trước khi bật, xác nhận ACL DynSec media và migration 28. Trong `.env`, đặt
+`MEDIA_UPLOAD_ENABLED=true`, `MEDIA_UPLOAD_PUBLIC_ORIGIN` bằng HTTPS origin mà
+backend và Gateway cùng dùng, và `MEDIA_UPLOAD_ROUTE_KEY` là chuỗi hex ngẫu nhiên
+không rỗng, khớp với Envoy. Cùng một cờ Compose bật backend processing và route
+Nginx; **không** thêm `stage8-media` vào `COMPOSE_PROFILES` cho luồng này.
 
-Trước khi bật, xác nhận ACL DynSec media và migration 28. Theo `.env.example`, đặt
-`MEDIA_UPLOAD_ENABLED=true`, `MEDIA_UPLOAD_PUBLIC_ORIGIN` bằng HTTPS origin
-công khai của tunnel, `MEDIA_UPLOAD_ROUTE_KEY` là chuỗi hex ngẫu nhiên không rỗng.
-Không cần `MEDIA_TLS_DIR` hoặc chứng chỉ TLS cho listener này. Tuỳ chọn đặt
-`MEDIA_HTTP_PORT` để publish cổng HTTP loopback trên host phục vụ kiểm tra cục bộ;
-mặc định Docker tự chọn cổng. Cấu hình Cloudflare Tunnel service URL là
-`http://stage8-media-upload:80`. Đặt
-`STORAGE_FILE_SIZE_LIMIT=80000000` và `STORAGE_LOG_LEVEL=fatal`. Backend và Storage
-dùng chung `MEDIA_UPLOAD_GRANT_TTL_SECONDS` (mặc định `60`); thay đổi giá trị
-này không thay đổi timeout HTTP. Nếu `.env` cũ có `MEDIA_TLS_DIR` hoặc
-`MEDIA_HTTPS_PORT`, có thể xoá vì Compose mới không còn đọc hai biến đó. Giữ
-credentials và project name hiện có.
+Đặt `STORAGE_FILE_SIZE_LIMIT=80000000` và `STORAGE_LOG_LEVEL=fatal`; bootstrap
+bucket private `media-video` bằng `scripts/init-media-bucket.py` qua Storage nội
+bộ. Backend và Storage dùng chung `MEDIA_UPLOAD_GRANT_TTL_SECONDS` (mặc định
+`60`); thay đổi giá trị này không đổi timeout HTTP. Cổng Nginx 80 giữ nguyên.
 
-```sh
-docker compose -p "$PROJECT" --env-file .env -f docker-compose.yml \
-  --profile stage8-media config --quiet
-docker compose -p "$PROJECT" --env-file .env -f docker-compose.yml \
-  --profile stage8-media up -d --build nginx stage8-media-upload
-```
-
-Không chạy lệnh trên bằng project name khác nếu container mang tên cố định
-đang thuộc project cũ. Hai file Compose ghép vào cùng một project không tự tạo
-container trùng tên. Sau khi áp dụng, kiểm backend/Storage healthy, listener
-HTTP nội bộ và bucket private `media-video` bằng `scripts/init-media-bucket.py`
-qua Storage nội bộ. Bước này không tự bật FRP hay Cloudflare. Overlay được giữ
-cho fixture: ngoài storage settings, nó thêm một TLS test edge loopback để giả
-lập kết thúc HTTPS bên ngoài rồi proxy HTTP tới listener thật.
+Profile `stage8-media` hiện chỉ dành cho listener HTTP cũ
+`stage8-media-upload:80` trong thời gian giữ đường rollback. Nếu tunnel
+`media-upload` còn trỏ tới listener đó, không bỏ profile đang chạy cho tới khi
+hoàn tất cutover và xác minh origin mới. Fixture TLS loopback proxy tới Nginx
+chung; nó không bật listener cũ hoặc gọi Cloudflare.
 
 Owned native HTTP/Storage fixture: **PASS**, exact cleanup verified. It bootstraps
 and reads back the private bucket; obtains the signed URL through the Go client;
