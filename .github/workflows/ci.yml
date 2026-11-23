@@ -825,6 +825,56 @@ jobs:
           path: ${{ runner.temp }}/stage5-control-${{ github.run_id }}-${{ github.run_attempt }}/stage6-summary.json
           if-no-files-found: error
 
+  stage8-media-playback-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: src/go.sum
+      - name: Check prerequisites
+        run: |
+          mkdir -p /tmp/opencode /var/tmp/opencode
+          python3 --version
+          python3 -c 'import cryptography'
+          openssl version
+          which setfacl getfacl
+          docker version
+          docker compose version
+          go version
+      - name: Test Stage 8 playback guard and CI wiring
+        run: |
+          python3 -m unittest scripts/tests/test_stage8_playback_guard.py scripts/tests/test_ci_feature_jobs.py
+      - name: Pull runtime images
+        run: |
+          docker pull --platform linux/amd64 timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
+          docker pull --platform linux/amd64 eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9
+          docker pull --platform linux/amd64 nginx:1.25-alpine
+          docker pull --platform linux/amd64 supabase/gotrue:v2.196.0
+          docker pull --platform linux/amd64 envoyproxy/envoy:v1.39.1
+          docker pull --platform linux/amd64 supabase/storage-api:v1.74.0
+      - name: Prepare private run directory
+        run: |
+           private_dir="${RUNNER_TEMP:-/tmp}/stage8-playback-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+           test ! -e "$private_dir"
+           printf 'STAGE8_PLAYBACK_RUN_DIR=%s\n' "$private_dir" >> "$GITHUB_ENV"
+      - name: Run Stage 8 playback require-run
+        id: playback
+        run: |
+          timeout --signal=TERM --kill-after=90s 1800s \
+          sh scripts/test-stage8-playback-gate.sh "$STAGE8_PLAYBACK_RUN_DIR"
+      - name: Upload safe Stage 8 playback report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage8-playback-safe-report
+          path: ${{ runner.temp }}/stage8-playback-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
+          if-no-files-found: error
+
   native-compose-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30

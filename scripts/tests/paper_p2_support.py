@@ -201,6 +201,8 @@ def prepare_perimeter(smoke, fixture):
         protocol: tcp
     volumes: !override
       - {smoke.ROOT / 'config/nginx/paper-p2.conf.template'}:/etc/nginx/templates/default.conf.template:ro
+      - {smoke.ROOT / 'config/nginx/stage8-media-playback.conf.template'}:/etc/nginx/templates/stage8-media-playback.conf.template:ro
+      - {smoke.ROOT / 'config/nginx/18-validate-playback-key.envsh'}:/docker-entrypoint.d/18-validate-playback-key.envsh:ro
       - {tls}:/etc/nginx/p2-tls:ro
       - auth_socket:/run/iot-auth:ro
 {e1_nginx_main}{e1_nginx_ulimits}

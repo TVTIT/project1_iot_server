@@ -79,7 +79,8 @@ class TestCIFeatureJobs(unittest.TestCase):
                 ('mosquitto-credential-integration', 'test-stage2-mqtt-credentials.sh'),
                 ('auth-integration', 'test-stage2-admin.sh'),
                 ('native-compose-smoke', 'test_native_compose_smoke.py'),
-                ('stage5-control-integration', 'test_paper_p3_support.py')):
+                ('stage5-control-integration', 'test_paper_p3_support.py'),
+                ('stage8-media-playback-integration', 'test_stage8_playback_guard.py')):
             with self.subTest(job=name):
                 job = self._extract_job_section(name)
                 setup = re.search(r'mkdir -p /tmp/opencode /var/tmp/opencode', job)
@@ -269,10 +270,10 @@ class TestCIFeatureJobs(unittest.TestCase):
         assert_credential_job_contract(cred_job)
         assert_runtime_job_contract(runtime_job)
 
-        # Verify all 17 job IDs remain defined
+        # Verify all 18 job IDs remain defined
         jobs_content = self.raw_content.split('\njobs:\n', 1)[1]
         all_jobs = re.findall(r'^  ([a-z0-9-]+):[ \t]*$', jobs_content, re.MULTILINE)
-        self.assertEqual(len(all_jobs), 17, f"expected 17 jobs, found {len(all_jobs)}: {all_jobs}")
+        self.assertEqual(len(all_jobs), 18, f"expected 18 jobs, found {len(all_jobs)}: {all_jobs}")
         expected_jobs = {
             'lint-and-test', 'cross-compile', 'migration-check',
             'docker-build', 'authorization-integration',
@@ -283,6 +284,7 @@ class TestCIFeatureJobs(unittest.TestCase):
             'dynsec-bootstrap-tests', 'stage3-uplink-integration',
             'stage4-api-integration', 'native-compose-smoke',
             'stage5-control-integration',
+            'stage8-media-playback-integration',
         }
         self.assertEqual(set(all_jobs), expected_jobs)
 
@@ -642,6 +644,41 @@ class TestCIFeatureJobs(unittest.TestCase):
         self.assertNotIn(".env", job)
         self.assertNotIn("ca.key", job)
         self.assertNotIn("dynamic-security.json", job)
+
+    def test_stage8_media_playback_integration_job_contract(self):
+        job = self._extract_job_section('stage8-media-playback-integration')
+        self.assertTrue(job, "stage8-media-playback-integration must exist")
+        self.assertIn('timeout-minutes: 40', job)
+        self.assertIn('working-directory: .', job)
+        self.assertIn("go-version: '1.27.3'", job)
+        self.assertIn('cache-dependency-path: src/go.sum', job)
+        self.assertIn('test_stage8_playback_guard.py', job)
+        self.assertIn('test_ci_feature_jobs.py', job)
+        self.assertLess(job.index('test_stage8_playback_guard.py'), job.index('test-stage8-playback-gate.sh'))
+        self.assertIn('sh scripts/test-stage8-playback-gate.sh "$STAGE8_PLAYBACK_RUN_DIR"', job)
+        self.assertIn('timeout --signal=TERM --kill-after=90s 1800s', job)
+        self.assertNotIn('--stage8-local-playback', job)
+        self.assertIn('stage8-playback-safe-report', job)
+        self.assertIn('path: ${{ runner.temp }}/stage8-playback-${{ github.run_id }}-${{ github.run_attempt }}/summary.json', job)
+        self.assertIn('if-no-files-found: error', job)
+        self.assertNotIn('playwright', job.lower())
+        self.assertNotIn('chromium', job.lower())
+        self.assertNotIn('vps', job.lower())
+        self.assertNotIn('cloudflare', job.lower())
+        self.assertNotIn('.env', job)
+        self.assertNotIn('prune', job)
+
+    def test_stage8_media_playback_integration_pinned_images(self):
+        job = self._extract_job_section('stage8-media-playback-integration')
+        for image in (
+            'timescale/timescaledb@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a',
+            'eclipse-mosquitto@sha256:d12c8f80dfc65b768bb9acecc7ef182b976f71fb681640b66358e5e0cf94e9e9',
+            'nginx:1.25-alpine',
+            'supabase/gotrue:v2.196.0',
+            'envoyproxy/envoy:v1.39.1',
+            'supabase/storage-api:v1.74.0',
+        ):
+            self.assertIn(f'docker pull --platform linux/amd64 {image}', job)
 
     def test_job_contracts_allow_missing_or_changed_display_names(self):
         """Optional job labels must not determine job identity or routing."""

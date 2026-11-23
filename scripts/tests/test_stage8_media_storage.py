@@ -207,16 +207,30 @@ class MediaStorageBootstrapTests(unittest.TestCase):
         self.assertNotIn("MEDIA_TLS_DIR", listener)
         self.assertIn("MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}", compose)
         self.assertIn("MEDIA_UPLOAD_PUBLIC_ORIGIN: ${MEDIA_UPLOAD_PUBLIC_ORIGIN:-}", compose)
+        self.assertIn("MEDIA_PLAYBACK_ENABLED: ${MEDIA_PLAYBACK_ENABLED:-false}", compose)
+        self.assertIn("MEDIA_PLAYBACK_PUBLIC_ORIGIN: ${MEDIA_PLAYBACK_PUBLIC_ORIGIN:-}", compose)
         self.assertIn("MEDIA_UPLOAD_MQTT_CLIENT_ID: ${MEDIA_UPLOAD_MQTT_CLIENT_ID:-backend_media}", compose)
         self.assertIn("UPLOAD_SIGNED_URL_EXPIRATION_TIME: ${MEDIA_UPLOAD_GRANT_TTL_SECONDS:-60}", compose)
         example = (ROOT / ".env.example").read_text().splitlines()
         for name in ("MEDIA_UPLOAD_MQTT_CLIENT_ID", "MEDIA_UPLOAD_PUBLIC_ORIGIN",
                      "STORAGE_INTERNAL_URL", "MEDIA_UPLOAD_GRANT_TTL_SECONDS",
                      "MEDIA_UPLOAD_ROUTE_KEY", "MEDIA_HTTP_PORT",
-                     "STORAGE_FILE_SIZE_LIMIT", "STORAGE_LOG_LEVEL"):
+                     "STORAGE_FILE_SIZE_LIMIT", "STORAGE_LOG_LEVEL",
+                     "MEDIA_PLAYBACK_ENABLED", "MEDIA_PLAYBACK_PUBLIC_ORIGIN",
+                     "MEDIA_PLAYBACK_ROUTE_KEY"):
             self.assertTrue(any(line.startswith(name + "=") for line in example), name)
         self.assertFalse(any(line.startswith(("MEDIA_TLS_DIR=", "MEDIA_HTTPS_PORT="))
                              for line in example))
+
+    def test_playback_bootstrap_service_is_in_maintenance_profile_and_depends_on_storage_healthy(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        self.assertIn("  stage8-media-playback-bootstrap:\n", compose)
+        section = compose.split("  stage8-media-playback-bootstrap:\n", 1)[1].split("\n  #", 1)[0]
+        # Regression: must not use the shared stage8-media profile used for upload rollback
+        self.assertNotIn('profiles: ["stage8-media"]', section)
+        self.assertIn('profiles: ["stage8-media-playback-bootstrap"]', section)
+        # Must wait for supabase-storage to be healthy (not just started) to avoid schema races
+        self.assertIn("condition: service_healthy", section.split("supabase-storage:", 1)[1].split("\n    environment:", 1)[0])
 
     def test_signed_put_route_is_exact_opt_in_and_fail_closed(self):
         override = (ROOT / "docker-compose.stage8-media.yml").read_text()
@@ -329,6 +343,286 @@ class MediaStorageBootstrapTests(unittest.TestCase):
                              "Upload sign media-video without header must be blocked")
         self.assertIsNotNone(compiled.match("/storage/v1/object/list/media-video"),
                              "Object list media-video must be blocked")
+
+
+class Stage8PlaybackSupportTests(unittest.TestCase):
+    def test_fixture_cli_help_includes_playback_api_flag(self):
+        fixture_text = (ROOT / "scripts" / "tests" / "stage8_media_storage_http_fixture.py").read_text()
+        self.assertIn("--stage8-local-playback-api", fixture_text)
+        self.assertIn("--stage8-local-playback", fixture_text)
+        self.assertIn("--stage8-local-playback-browser", fixture_text)
+
+    def test_browser_runner_script_and_demo_mount_exist(self):
+        runner_path = ROOT / "scripts" / "tests" / "stage8_browser_playback_runner.js"
+        self.assertTrue(runner_path.exists(), "stage8_browser_playback_runner.js must exist")
+        override = (ROOT / "docker-compose.stage8-media.yml").read_text()
+        self.assertIn("./docs/examples/media-playback/index.html:/var/www/demo/index.html:ro", override)
+        self.assertIn("./docs/examples/media-playback/player.js:/var/www/demo/player.js:ro", override)
+        edge_template = (ROOT / "config" / "nginx" / "stage8-media-test-edge.conf.template").read_text()
+        self.assertIn("location = /demo/index.html", edge_template)
+        self.assertIn("location = /demo/player.js", edge_template)
+
+    def test_fixture_playback_tls_edge_configured_correctly(self):
+        override = (ROOT / "docker-compose.stage8-media.yml").read_text()
+        self.assertIn("stage8-media-playback-test-edge:", override)
+        edge_template_path = ROOT / "config" / "nginx" / "stage8-media-playback-test-edge.conf.template"
+        self.assertTrue(edge_template_path.exists(), "stage8-media-playback-test-edge.conf.template must exist")
+        edge_template = edge_template_path.read_text()
+        self.assertIn("listen 443 ssl;", edge_template)
+        self.assertIn("set $playback_upstream http://stage8-shared-nginx:8081;", edge_template)
+        self.assertIn("proxy_pass $playback_upstream;", edge_template)
+
+    def test_verify_signed_url_in_memory(self):
+        import base64
+        import datetime
+        import sys
+        import time
+        sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+        from stage8_playback_support import verify_signed_url_in_memory, PlaybackProofFailure
+
+        now = int(time.time())
+        exp = now + 120
+        payload = base64.urlsafe_b64encode(f'{{"exp":{exp}}}'.encode()).decode().rstrip("=")
+        fake_token = f"header.{payload}.sig"
+        media_id = "00000000-0000-0000-0000-000000000001"
+        url = f"https://playback.local.invalid/storage/v1/object/sign/media-video/{media_id}.mp4?token={fake_token}"
+        expires_at = datetime.datetime.fromtimestamp(exp, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+        tok = verify_signed_url_in_memory(url, expires_at, "playback.local.invalid", media_id)
+        self.assertEqual(tok, fake_token)
+
+        # Invalid scheme
+        with self.assertRaises(PlaybackProofFailure):
+            verify_signed_url_in_memory(url.replace("https://", "http://"), expires_at, "playback.local.invalid", media_id)
+
+        # Origin mismatch
+        with self.assertRaises(PlaybackProofFailure):
+            verify_signed_url_in_memory(url, expires_at, "other.origin.invalid", media_id)
+
+        # Fragment present
+        with self.assertRaises(PlaybackProofFailure):
+            verify_signed_url_in_memory(url + "#frag", expires_at, "playback.local.invalid", media_id)
+
+        # Extra query parameter
+        with self.assertRaises(PlaybackProofFailure):
+            verify_signed_url_in_memory(url + "&extra=1", expires_at, "playback.local.invalid", media_id)
+
+    def test_get_header_case_insensitive(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+        from stage8_playback_support import get_header
+        headers = {"cache-control": "no-store", "Content-Type": "application/json"}
+        self.assertEqual(get_header(headers, "Cache-Control"), "no-store")
+        self.assertEqual(get_header(headers, "content-type"), "application/json")
+        self.assertIsNone(get_header(headers, "Authorization"))
+
+
+class Stage8PlaybackDataPlaneContractTests(unittest.TestCase):
+    def test_env_example_and_compose_defaults(self):
+        example = (ROOT / ".env.example").read_text().splitlines()
+        self.assertTrue(any(line.startswith("MEDIA_PLAYBACK_ROUTE_KEY=") for line in example),
+                        "MEDIA_PLAYBACK_ROUTE_KEY must be in .env.example")
+        self.assertTrue(any(line.startswith("MEDIA_PLAYBACK_ENABLED=false") for line in example),
+                        "MEDIA_PLAYBACK_ENABLED=false must be in .env.example")
+        smoke_text = (ROOT / "scripts" / "tests" / "native_compose_smoke.py").read_text()
+        self.assertIn('MEDIA_PLAYBACK_ROUTE_KEY=""', smoke_text)
+
+    def test_playback_listener_topology_and_port(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        nginx_service = compose.split("  nginx:\n", 1)[1].split("\n  # 2.", 1)[0]
+        # Only port 80:80 published on host, no host ports added for 8081
+        self.assertIn('ports:\n      - "80:80"\n', nginx_service)
+        self.assertNotIn("8081:8081", compose)
+        self.assertNotIn('published: "8081"', compose)
+        self.assertNotIn("published: 8081", compose)
+        # Environment variables passed to Nginx and Envoy
+        self.assertIn("- MEDIA_PLAYBACK_ENABLED=${MEDIA_PLAYBACK_ENABLED:-false}", nginx_service)
+        self.assertIn("- MEDIA_PLAYBACK_ROUTE_KEY=${MEDIA_PLAYBACK_ROUTE_KEY:-}", nginx_service)
+        envoy_service = compose.split("  supabase-envoy:\n", 1)[1].split("\n  # 5.", 1)[0]
+        self.assertIn("MEDIA_PLAYBACK_ROUTE_KEY: ${MEDIA_PLAYBACK_ROUTE_KEY:-}", envoy_service)
+        # Volume mount for shared playback config template and entrypoint validation hook
+        self.assertIn("stage8-media-playback.conf.template", nginx_service)
+        self.assertIn("18-validate-playback-key.envsh", nginx_service)
+
+    def test_nginx_entrypoint_envsh_hook(self):
+        hook_path = ROOT / "config" / "nginx" / "18-validate-playback-key.envsh"
+        self.assertTrue(hook_path.exists(), "18-validate-playback-key.envsh must exist")
+        self.assertTrue(os.access(hook_path, os.X_OK), "18-validate-playback-key.envsh must be executable")
+        content = hook_path.read_text()
+        self.assertNotIn("echo", content, "Hook must not log or print anything")
+        self.assertNotIn("printf", content, "Hook must not log or print anything")
+
+        # Test hook evaluation with various keys via sh
+        import subprocess
+        def eval_hook(key_val, enabled_val="true"):
+            env = dict(os.environ, MEDIA_PLAYBACK_ROUTE_KEY=key_val, MEDIA_PLAYBACK_ENABLED=enabled_val)
+            cmd = [
+                "/bin/sh", "-ec",
+                f'. "{hook_path}"; echo "KEY=$MEDIA_PLAYBACK_ROUTE_KEY;ENABLED=$MEDIA_PLAYBACK_ENABLED"'
+            ]
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
+            return res.stdout.strip()
+
+        # Valid 64-hex key preserved
+        valid_key = "a" * 64
+        self.assertEqual(eval_hook(valid_key), f"KEY={valid_key};ENABLED=true")
+
+        # Short/long/invalid chars/quotes/newlines/pipes disabled cleanly
+        for bad_key in ["a" * 63, "a" * 65, "A" * 64, "bad'quote", 'bad"quote', "bad|pipe", "bad\nnewline", "bad\\backslash"]:
+            self.assertEqual(eval_hook(bad_key), "KEY=;ENABLED=false")
+
+    def test_playback_config_shared_template(self):
+        tpl_path = ROOT / "config" / "nginx" / "stage8-media-playback.conf.template"
+        self.assertTrue(tpl_path.exists(), "stage8-media-playback.conf.template must exist")
+        tpl = tpl_path.read_text()
+        # Internal fixed port 8081
+        self.assertIn("listen 8081;", tpl)
+        # Bounded active connections keyed to listener/server
+        self.assertIn("limit_conn_zone $server_name zone=stage8_playback_conn:10m;", tpl)
+        self.assertIn("limit_conn stage8_playback_conn 64;", tpl)
+        # Never log signed query in success, deny or upstream failure
+        self.assertIn("access_log off;", tpl)
+        self.assertIn("error_log /dev/null emerg;", tpl)
+        # Only canonical lowercase UUID path
+        self.assertIn('location ~ "^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4$"', tpl)
+        # Fail closed on feature flag and 64 lowercase hex key
+        self.assertIn('set $media_playback_enabled "${MEDIA_PLAYBACK_ENABLED}";', tpl)
+        self.assertIn('set $media_playback_route_key "${MEDIA_PLAYBACK_ROUTE_KEY}";', tpl)
+        self.assertIn("if ($media_playback_enabled != true) { return 404; }", tpl)
+        self.assertIn('if ($media_playback_route_key !~ "^[0-9a-f]{64}$") { return 404; }', tpl)
+        # Pass exact GET only to start; leave HEAD closed
+        self.assertIn("if ($request_method != GET) { return 405; }", tpl)
+        # Require raw request_uri to match canonical path and 3-part base64url JWT query token
+        self.assertIn('if ($request_uri !~ "^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4\\?token=[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$")', tpl)
+        # Whitelist forwarded headers via proxy_pass_request_headers off
+        self.assertIn("proxy_pass_request_headers off;", tpl)
+        self.assertIn("proxy_pass_request_body off;", tpl)
+        self.assertIn("client_max_body_size 1k;", tpl)
+        # Explicit proxy_cache off, gzip off, hide upstream Cache-Control
+        self.assertIn("proxy_cache off;", tpl)
+        self.assertIn("gzip off;", tpl)
+        self.assertIn("proxy_hide_header Cache-Control;", tpl)
+        # Cache control always private, no-store at server level including denied paths
+        self.assertIn('add_header Cache-Control "private, no-store" always;', tpl)
+        # Forward only controlled Host/guard and Range/If-Range
+        self.assertIn("proxy_set_header Host $host;", tpl)
+        self.assertIn("proxy_set_header Range $http_range;", tpl)
+        self.assertIn("proxy_set_header If-Range $http_if_range;", tpl)
+        self.assertIn("proxy_set_header X-Stage8-Media-Playback-Route $media_playback_route_key;", tpl)
+        # Suppress external auth
+        self.assertIn('proxy_set_header Authorization "";', tpl)
+        self.assertIn('proxy_set_header apikey "";', tpl)
+        self.assertIn('proxy_set_header Content-Length "";', tpl)
+        self.assertIn('proxy_set_header Content-Type "";', tpl)
+        # No shared cache / whole-file buffering
+        self.assertIn("proxy_buffering off;", tpl)
+        self.assertIn("proxy_request_buffering off;", tpl)
+        # Default deny all other paths
+        self.assertIn("location / {", tpl)
+        self.assertIn("return 404;", tpl)
+
+    def test_common_origin_strips_guard_and_suppresses_logs_on_denials(self):
+        base_nginx = (ROOT / "config" / "nginx" / "nginx.conf.template").read_text()
+        p2_nginx = (ROOT / "config" / "nginx" / "paper-p2.conf.template").read_text()
+        p7_nginx = (ROOT / "config" / "nginx" / "paper-p7-ws.conf.template").read_text()
+        for name, text in [("base_nginx", base_nginx), ("p2_nginx", p2_nginx), ("p7_nginx", p7_nginx)]:
+            # Strip incoming playback guard header on common origin
+            self.assertIn('proxy_set_header X-Stage8-Media-Playback-Route "";', text,
+                          f"{name} must strip incoming X-Stage8-Media-Playback-Route")
+            # Suppress request/error logging on signed media read denials
+            self.assertIn("location ~* ^/storage/v1/object/sign/media-video", text,
+                          f"{name} must have a denial location for signed media-video")
+            storage_deny_block = text.split("location ~* ^/storage/v1/object/sign/media-video", 1)[1].split("}", 1)[0]
+            self.assertIn("access_log off;", storage_deny_block,
+                          f"{name} must turn access_log off on signed media read denials")
+            self.assertIn("error_log /dev/null emerg;", storage_deny_block,
+                          f"{name} must suppress error_log on signed media read denials")
+            self.assertIn("return 404;", storage_deny_block,
+                          f"{name} must return 404 on signed media read denials")
+
+    def test_envoy_playback_route_and_security(self):
+        envoy = (ROOT / "config" / "envoy" / "lds.template.yaml").read_text()
+        entrypoint = (ROOT / "config" / "envoy" / "docker-entrypoint.sh").read_text()
+        # Entrypoint sanitizes MEDIA_PLAYBACK_ROUTE_KEY before sed substitution
+        self.assertIn("SAFE_MEDIA_PLAYBACK_ROUTE_KEY", entrypoint)
+        self.assertIn(r"s|\${MEDIA_PLAYBACK_ROUTE_KEY}|${SAFE_MEDIA_PLAYBACK_ROUTE_KEY}|g", entrypoint)
+        # Route exists and placed before stage8-media-blocked
+        self.assertIn("name: stage8-media-signed-get", envoy)
+        self.assertIn("name: stage8-media-blocked", envoy)
+        self.assertLess(envoy.index("name: stage8-media-signed-get"),
+                        envoy.index("name: stage8-media-blocked"),
+                        "stage8-media-signed-get must be ahead of stage8-media-blocked")
+        # Route regex and method
+        get_block = envoy.split("name: stage8-media-signed-get", 1)[1].split("name: stage8-media-blocked", 1)[0]
+        self.assertIn("regex: '^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4$'", get_block)
+        self.assertIn("exact: GET", get_block)
+        self.assertNotIn("exact: HEAD", get_block)
+        # Route requires guard header
+        self.assertIn("name: x-stage8-media-playback-route", get_block)
+        self.assertIn("regex: '^.+$'", get_block)
+        self.assertIn("exact: '${MEDIA_PLAYBACK_ROUTE_KEY}'", get_block)
+        # Guard stripped before upstream, plus cookie and both media guards stripped
+        headers_removed = get_block.split("request_headers_to_remove:", 1)[1].split("typed_per_filter_config:", 1)[0]
+        self.assertIn("- cookie", headers_removed)
+        self.assertIn("- x-stage8-media-route", headers_removed)
+        self.assertIn("- x-stage8-media-playback-route", headers_removed)
+        # Access log format must remain metadata-only (no :path or query)
+        self.assertNotIn("%REQ(:PATH)%", envoy)
+        self.assertNotIn("%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%", envoy)
+
+    def test_regex_matching_rules(self):
+        import re
+        # Raw request_uri regex: canonical lowercase UUID path + 3-part base64url JWT query token
+        uri_re = re.compile(r"^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4\?token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+        valid_uri = "/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"
+        self.assertTrue(uri_re.match(valid_uri))
+
+        # Rejected: Non-JWT query (single part or two parts)
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token=notajwt"))
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token=part1.part2"))
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token=part1.part2.part3.part4"))
+
+        # Rejected: Normalized raw path aliases
+        self.assertFalse(uri_re.match("//storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token=a.b.c"))
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/./01234567-89ab-cdef-0123-456789abcdef.mp4?token=a.b.c"))
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/../media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token=a.b.c"))
+
+        # Rejected: Uppercase UUID
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89AB-CDEF-0123-456789ABCDEF.mp4?token=a.b.c"))
+
+        # Rejected: Duplicate token query
+        self.assertFalse(uri_re.match(valid_uri + "&token=a.b.c"))
+
+        # Rejected: Foreign query parameter
+        self.assertFalse(uri_re.match(valid_uri + "&extra=1"))
+        self.assertFalse(uri_re.match(valid_uri.replace("?token=", "?other=1&token=")))
+
+        # Rejected: Alternate raw encoding
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token%3Da.b.c"))
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?%74oken=a.b.c"))
+
+        # Rejected: Empty token
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4?token="))
+        self.assertFalse(uri_re.match("/storage/v1/object/sign/media-video/01234567-89ab-cdef-0123-456789abcdef.mp4"))
+
+        # Route key regex: 64 lowercase hex
+        key_re = re.compile(r"^[0-9a-f]{64}$")
+        self.assertTrue(key_re.match("a" * 64))
+        self.assertTrue(key_re.match("0123456789abcdef" * 4))
+        self.assertFalse(key_re.match("A" * 64))
+        self.assertFalse(key_re.match("a" * 63))
+        self.assertFalse(key_re.match("a" * 65))
+        self.assertFalse(key_re.match("g" * 64))
+        self.assertTrue(key_re.match("a" * 64))
+        self.assertTrue(key_re.match("0123456789abcdef" * 4))
+        # Uppercase rejected
+        self.assertFalse(key_re.match("A" * 64))
+        # Shorter or longer rejected
+        self.assertFalse(key_re.match("a" * 63))
+        self.assertFalse(key_re.match("a" * 65))
+        # Non-hex rejected
+        self.assertFalse(key_re.match("g" * 64))
 
 
 if __name__ == "__main__":

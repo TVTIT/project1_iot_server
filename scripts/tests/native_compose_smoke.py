@@ -165,6 +165,11 @@ DEFAULTS = dict(
     MEDIA_UPLOAD_CLEANUP_BATCH_SIZE="4", MEDIA_UPLOAD_CLEANUP_SCAN_INTERVAL="10s",
     MEDIA_UPLOAD_CLEANUP_RETRY_MIN_DELAY="10s", MEDIA_UPLOAD_CLEANUP_RETRY_MAX_DELAY="5m",
     MEDIA_UPLOAD_CLEANUP_MAX_ATTEMPTS="5",
+    MEDIA_PLAYBACK_ENABLED="false",
+    MEDIA_PLAYBACK_PUBLIC_ORIGIN="",
+    MEDIA_PLAYBACK_STORAGE_TOKEN="",
+    MEDIA_PLAYBACK_SIGN_TIMEOUT="5s",
+    MEDIA_PLAYBACK_ROUTE_KEY="",
     TWIN_RELATIONSHIP_DEFAULT_LIMIT="50", TWIN_RELATIONSHIP_MAX_LIMIT="200",
     SUPABASE_JWT_CLOCK_SKEW="30s", CLOUDFLARE_TUNNEL_TOKEN="fixture-unused-not-a-token",
     SUPABASE_JWT_MODE="hs256", SUPABASE_JWKS_URL="", SUPABASE_JWKS_CACHE_TTL="60s",
@@ -1414,7 +1419,11 @@ def validate_effective_model(fixture, model):
     for role in ("supabase-role-provisioner", "application-migrations", "supabase-compat-migration"):
         expected_images[role] = expected_images["postgres"]
     binds = {
-        "nginx": {str(ROOT / "config/nginx/nginx.conf.template"): "/etc/nginx/templates/default.conf.template"},
+        "nginx": {
+            str(ROOT / "config/nginx/nginx.conf.template"): "/etc/nginx/templates/default.conf.template",
+            str(ROOT / "config/nginx/stage8-media-playback.conf.template"): "/etc/nginx/templates/stage8-media-playback.conf.template",
+            str(ROOT / "config/nginx/18-validate-playback-key.envsh"): "/docker-entrypoint.d/18-validate-playback-key.envsh",
+        },
         "postgres": {str(ROOT / "migrations"): "/docker-entrypoint-initdb.d"},
         "application-migrations": {str(ROOT / "migrations"): "/migrations", str(ROOT / "scripts/run-migrations.sh"): "/run-migrations.sh"},
         "supabase-role-provisioner": {str(ROOT / "migrations/000000_configure_supabase_roles.sh"): "/migrations/000000_configure_supabase_roles.sh"},
@@ -1455,8 +1464,12 @@ def validate_effective_model(fixture, model):
         dependencies['supabase-envoy']['supabase-storage'] = 'service_healthy'
     if fixture.paper_p2:
         binds['auth-socket-init'] = {}
-        binds['nginx'] = {str(ROOT / 'config/nginx/paper-p2.conf.template'): '/etc/nginx/templates/default.conf.template',
-                          str(fixture.private / 'p2-tls'): '/etc/nginx/p2-tls'}
+        binds['nginx'] = {
+            str(ROOT / 'config/nginx/paper-p2.conf.template'): '/etc/nginx/templates/default.conf.template',
+            str(ROOT / 'config/nginx/stage8-media-playback.conf.template'): '/etc/nginx/templates/stage8-media-playback.conf.template',
+            str(ROOT / 'config/nginx/18-validate-playback-key.envsh'): '/docker-entrypoint.d/18-validate-playback-key.envsh',
+            str(fixture.private / 'p2-tls'): '/etc/nginx/p2-tls',
+        }
         volume_mounts['auth-socket-init'] = {('auth_socket', '/run/iot-auth', False)}
         volume_mounts['backend'].add(('auth_socket', '/run/iot-auth', False))
         volume_mounts['nginx'] = {('auth_socket', '/run/iot-auth', True)}
