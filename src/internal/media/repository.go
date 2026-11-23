@@ -5,6 +5,8 @@ package media
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"regexp"
 	"time"
 
@@ -23,14 +25,16 @@ const MaxUploadBytes int64 = mediaprotocol.MaxUploadBytes
 
 // Common sentinel errors returned by media repository operations.
 var (
-	ErrInvalidRequest  = errors.New("invalid media admission request")
-	ErrForbidden       = errors.New("media admission forbidden")
-	ErrNotFound        = errors.New("media intent not found")
-	ErrConflict        = errors.New("media upload metadata conflict")
-	ErrQuota           = errors.New("media quota exceeded")
-	ErrDependency      = errors.New("media repository dependency unavailable")
-	ErrStaleOperation  = errors.New("stale media operation")
-	ErrGrantUnresolved = errors.New("media grant may still be usable")
+	ErrInvalidRequest           = errors.New("invalid media admission request")
+	ErrForbidden                = errors.New("media admission forbidden")
+	ErrNotFound                 = errors.New("media intent not found")
+	ErrConflict                 = errors.New("media upload metadata conflict")
+	ErrQuota                    = errors.New("media quota exceeded")
+	ErrDependency               = errors.New("media repository dependency unavailable")
+	ErrStaleOperation           = errors.New("stale media operation")
+	ErrGrantUnresolved          = errors.New("media grant may still be usable")
+	ErrPlaybackNotFound         = errors.New("media playback not found or unauthorized")
+	ErrPlaybackInconsistentPath = errors.New("inconsistent media storage path")
 )
 
 var uploadIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
@@ -408,6 +412,70 @@ func (r *Repository) ConfirmCleanup(ctx context.Context, c CleanupClaim) error {
 		return ErrStaleOperation
 	}
 	return nil
+}
+
+const playbackPathQuery = `SELECT m.storage_path
+FROM public.media_objects m
+JOIN public.user_gateways ug ON ug.gateway_id = m.gateway_id AND ug.user_id = $3
+WHERE m.gateway_id = $1
+  AND m.media_id = $2
+  AND m.managed = true
+  AND m.validation_status = 'ready'
+  AND ug.role IN ('owner', 'operator', 'viewer')`
+
+// playbackDB represents the database query interface required for playback metadata lookup.
+type playbackDB interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// PlaybackReader manages authorized playback path lookups from PostgreSQL.
+type PlaybackReader struct {
+	db      playbackDB
+	timeout time.Duration
+}
+
+func isNilDB(db playbackDB) bool {
+	if db == nil {
+		return true
+	}
+	v := reflect.ValueOf(db)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
+// NewPlaybackReader constructs a PlaybackReader with a validated database connection and timeout.
+func NewPlaybackReader(db playbackDB, timeout time.Duration) (*PlaybackReader, error) {
+	if isNilDB(db) || timeout <= 0 {
+		return nil, ErrInvalidRequest
+	}
+	return &PlaybackReader{db: db, timeout: timeout}, nil
+}
+
+// LookupPlaybackPath retrieves and verifies the canonical storage path for an authorized playback request.
+func (r *PlaybackReader) LookupPlaybackPath(ctx context.Context, gatewayID string, mediaID, userID uuid.UUID) (string, error) {
+	if gateway.ValidateGatewayID(gatewayID) != nil || mediaID == uuid.Nil || userID == uuid.Nil {
+		return "", ErrInvalidRequest
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var storagePath string
+	err := r.db.QueryRow(ctx, playbackPathQuery, gatewayID, mediaID, userID).Scan(&storagePath)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrPlaybackNotFound
+		}
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("%w: %w", ErrDependency, ctx.Err())
+		}
+		return "", safeDependencyError(err)
+	}
+
+	expectedPath := mediaID.String() + ".mp4"
+	if storagePath != expectedPath {
+		return "", ErrPlaybackInconsistentPath
+	}
+	return storagePath, nil
 }
 
 // NewRepository creates and validates a new media repository with database connection pool and limits.

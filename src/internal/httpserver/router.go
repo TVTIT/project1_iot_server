@@ -76,6 +76,10 @@ type RouterDependencies struct {
 	GatewayUserAssigner        usermanagement.GatewayUserAssigner
 	GatewayUserRemover         usermanagement.GatewayUserRemover
 	GatewayOwnerTransferer     usermanagement.GatewayOwnerTransferer
+	MediaPlaybackEnabled       bool
+	PlaybackReader             PlaybackPathReader
+	PlaybackSigner             PlaybackSigner
+	MediaListReader            GatewayMediaListReader
 }
 
 // NewRouter creates the backend HTTP routes and fails closed when an
@@ -98,6 +102,9 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 	}
 	if deps.WebSocketEnabled && deps.WebSocketHandler == nil {
 		return nil, fmt.Errorf("enabled websocket requires owned handler")
+	}
+	if deps.MediaPlaybackEnabled && (auth.IsNilDependency(deps.PlaybackReader) || auth.IsNilDependency(deps.PlaybackSigner) || auth.IsNilDependency(deps.MediaListReader)) {
+		return nil, fmt.Errorf("enabled media playback requires reader, signer, and list reader")
 	}
 	if auth.IsNilDependency(deps.PlatformAdminChecker) {
 		return nil, fmt.Errorf("platform admin checker is required")
@@ -216,6 +223,7 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		stage4CacheMiddleware(),
 		controlCacheMiddleware(),
 		adminUserManagementCacheMiddleware(),
+		playbackCacheMiddleware(),
 		corsMiddleware(deps.CORSAllowedOrigins),
 		httpapi.RecoveryMiddleware(slog.Default()),
 	)
@@ -300,6 +308,10 @@ func NewRouter(deps RouterDependencies) (http.Handler, error) {
 		// The cancellation surface is opt-in. With Stage 6 disabled the route
 		// does not exist and the request is a plain not-found.
 		authenticated.POST("/digital-twins/:entity_id/commands/:command_id/cancel", controlHandler(deps, "cancel"))
+	}
+	if deps.MediaPlaybackEnabled {
+		authenticated.POST("/gateways/:gateway_id/media/:media_id/playback-url", playbackURLHandler(deps.PlaybackReader, deps.PlaybackSigner))
+		authenticated.GET("/gateways/:gateway_id/media", listGatewayMediaHandler(deps.MediaListReader))
 	}
 
 	return router, nil

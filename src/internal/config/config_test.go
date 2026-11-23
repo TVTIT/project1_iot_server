@@ -61,6 +61,302 @@ func TestMediaUploadFlagOptIn(t *testing.T) {
 	}
 }
 
+func TestMediaPlaybackConfigValidation(t *testing.T) {
+	values := validConfigValues()
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MediaPlaybackEnabled {
+		t.Fatalf("default media playback flag=%v err=%v", cfg.MediaPlaybackEnabled, err)
+	}
+
+	// Playback enabled with uploads disabled (no MQTT or upload origin needed)
+	values["MEDIA_PLAYBACK_ENABLED"] = "true"
+	values["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MediaPlaybackEnabled || cfg.MediaUploadEnabled {
+		t.Fatalf("enabled playback flag=%v uploads=%v err=%v", cfg.MediaPlaybackEnabled, cfg.MediaUploadEnabled, err)
+	}
+	if cfg.MediaPlayback.PublicOrigin != "https://playback.example.test" {
+		t.Fatalf("unexpected playback origin: %s", cfg.MediaPlayback.PublicOrigin)
+	}
+	if cfg.MediaPlayback.StorageServiceToken != "playback-storage-token" {
+		t.Fatalf("unexpected storage service token: %s", cfg.MediaPlayback.StorageServiceToken)
+	}
+	if cfg.MediaPlayback.String() != "MediaPlaybackConfig{redacted}" || cfg.MediaPlayback.GoString() != "MediaPlaybackConfig{redacted}" {
+		t.Fatalf("playback config must be redacted")
+	}
+
+	// Invalid playback flag
+	badValues := validConfigValues()
+	badValues["MEDIA_PLAYBACK_ENABLED"] = "not-a-bool"
+	if _, err := Load(mapLookup(badValues)); err == nil {
+		t.Fatal("invalid playback flag accepted")
+	}
+
+	// Missing public origin
+	badOrigin := validConfigValues()
+	badOrigin["MEDIA_PLAYBACK_ENABLED"] = "true"
+	badOrigin["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "key"
+	if _, err := Load(mapLookup(badOrigin)); err == nil {
+		t.Fatal("missing playback public origin accepted")
+	}
+
+	// Non-HTTPS origin
+	badOrigin["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "http://insecure.test"
+	if _, err := Load(mapLookup(badOrigin)); err == nil {
+		t.Fatal("HTTP playback public origin accepted")
+	}
+
+	// Origin with path or fragment
+	badOrigin["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.test/path"
+	if _, err := Load(mapLookup(badOrigin)); err == nil {
+		t.Fatal("playback origin with path accepted")
+	}
+	badOrigin["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.test#frag"
+	if _, err := Load(mapLookup(badOrigin)); err == nil {
+		t.Fatal("playback origin with fragment accepted")
+	}
+
+	// Missing playback storage token
+	badKey := validConfigValues()
+	badKey["MEDIA_PLAYBACK_ENABLED"] = "true"
+	badKey["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	badKey["MEDIA_PLAYBACK_STORAGE_TOKEN"] = ""
+	if _, err := Load(mapLookup(badKey)); err == nil {
+		t.Fatal("missing playback storage token accepted")
+	}
+}
+
+func TestMediaPlaybackEnabledFlagExactCanonical(t *testing.T) {
+	// Missing flag defaults to false
+	values := validConfigValues()
+	delete(values, "MEDIA_PLAYBACK_ENABLED")
+	cfg, err := Load(mapLookup(values))
+	if err != nil || cfg.MediaPlaybackEnabled {
+		t.Fatalf("expected missing MEDIA_PLAYBACK_ENABLED to default to false, got %v, err=%v", cfg.MediaPlaybackEnabled, err)
+	}
+
+	// Exact "false" is valid and false
+	values["MEDIA_PLAYBACK_ENABLED"] = "false"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || cfg.MediaPlaybackEnabled {
+		t.Fatalf("expected MEDIA_PLAYBACK_ENABLED=false to be false, got %v, err=%v", cfg.MediaPlaybackEnabled, err)
+	}
+
+	// Exact "true" is valid and true
+	values["MEDIA_PLAYBACK_ENABLED"] = "true"
+	values["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	cfg, err = Load(mapLookup(values))
+	if err != nil || !cfg.MediaPlaybackEnabled {
+		t.Fatalf("expected MEDIA_PLAYBACK_ENABLED=true to be true, got %v, err=%v", cfg.MediaPlaybackEnabled, err)
+	}
+
+	// Noncanonical values must be rejected: TRUE, True, 1, 0, " true", "true ", "yes", "no", FALSE, False
+	invalidFlags := []string{"TRUE", "True", "1", "0", " true", "true ", "yes", "no", "FALSE", "False"}
+	for _, invalid := range invalidFlags {
+		t.Run("reject_"+invalid, func(t *testing.T) {
+			bad := validConfigValues()
+			bad["MEDIA_PLAYBACK_ENABLED"] = invalid
+			bad["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+			bad["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+			if _, err := Load(mapLookup(bad)); err == nil {
+				t.Fatalf("expected noncanonical MEDIA_PLAYBACK_ENABLED=%q to be rejected", invalid)
+			}
+		})
+	}
+}
+
+func TestMediaPlaybackHTTPSOriginPorts(t *testing.T) {
+	validOrigins := []string{
+		"https://playback.example.test",
+		"https://playback.example.test:443",
+		"https://playback.example.test:8443",
+		"https://playback.example.test:1",
+		"https://playback.example.test:65535",
+	}
+	for _, origin := range validOrigins {
+		t.Run("accept_"+origin, func(t *testing.T) {
+			values := validConfigValues()
+			values["MEDIA_PLAYBACK_ENABLED"] = "true"
+			values["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = origin
+			values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+			cfg, err := Load(mapLookup(values))
+			if err != nil || cfg.MediaPlayback.PublicOrigin != origin {
+				t.Fatalf("expected valid playback origin %q to be accepted, err=%v", origin, err)
+			}
+		})
+	}
+
+	invalidOrigins := []string{
+		"https://playback.example.test:0",
+		"https://playback.example.test:65536",
+		"https://playback.example.test:",
+		"https://playback.example.test:-1",
+		"https://playback.example.test:abc",
+		"https://playback.example.test:080",
+		"http://playback.example.test:8443",
+		"https://playback.example.test:8443/path",
+		"https://playback.example.test:8443#frag",
+		"https://user:pass@playback.example.test:8443",
+	}
+	for _, origin := range invalidOrigins {
+		t.Run("reject_"+origin, func(t *testing.T) {
+			bad := validConfigValues()
+			bad["MEDIA_PLAYBACK_ENABLED"] = "true"
+			bad["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = origin
+			bad["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+			if _, err := Load(mapLookup(bad)); err == nil {
+				t.Fatalf("expected invalid playback origin %q to be rejected", origin)
+			}
+		})
+	}
+}
+
+func TestMediaPlaybackTimeoutBudgetValidation(t *testing.T) {
+	// 1. Current valid defaults with HS256: 30s HTTP_WRITE > 0s authIO + 2s auth + 5s sign = 7s
+	values := validConfigValues()
+	values["MEDIA_PLAYBACK_ENABLED"] = "true"
+	values["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	if _, err := Load(mapLookup(values)); err != nil {
+		t.Fatalf("valid defaults should pass budget validation, got %v", err)
+	}
+
+	// 2. Exact-boundary budget: HTTP_WRITE_TIMEOUT == authIO + auth + sign (7s) leaves no margin
+	boundaryValues := validConfigValues()
+	boundaryValues["MEDIA_PLAYBACK_ENABLED"] = "true"
+	boundaryValues["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	boundaryValues["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	boundaryValues["AUTHORIZATION_TIMEOUT"] = "2s"
+	boundaryValues["MEDIA_PLAYBACK_SIGN_TIMEOUT"] = "5s"
+	boundaryValues["HTTP_WRITE_TIMEOUT"] = "7s"
+	if _, err := Load(mapLookup(boundaryValues)); err == nil {
+		t.Fatal("exact-boundary budget (7s <= 2s + 5s) must be rejected")
+	}
+
+	// 3. Excessive budget: HTTP_WRITE_TIMEOUT < authIO + auth + sign (6s < 7s)
+	excessiveValues := validConfigValues()
+	excessiveValues["MEDIA_PLAYBACK_ENABLED"] = "true"
+	excessiveValues["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	excessiveValues["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	excessiveValues["AUTHORIZATION_TIMEOUT"] = "2s"
+	excessiveValues["MEDIA_PLAYBACK_SIGN_TIMEOUT"] = "5s"
+	excessiveValues["HTTP_WRITE_TIMEOUT"] = "6s"
+	if _, err := Load(mapLookup(excessiveValues)); err == nil {
+		t.Fatal("excessive budget (6s < 2s + 5s) must be rejected")
+	}
+
+	// 4. Exact-boundary with RS256: authIO is SUPABASE_JWKS_HTTP_TIMEOUT (2s)
+	rs256Boundary := validConfigValues()
+	rs256Boundary["SUPABASE_JWT_MODE"] = "rs256"
+	rs256Boundary["SUPABASE_JWKS_URL"] = "http://envoy:8000/auth/v1/.well-known/jwks.json"
+	rs256Boundary["SUPABASE_JWKS_HTTP_TIMEOUT"] = "2s"
+	rs256Boundary["MEDIA_PLAYBACK_ENABLED"] = "true"
+	rs256Boundary["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	rs256Boundary["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	rs256Boundary["AUTHORIZATION_TIMEOUT"] = "2s"
+	rs256Boundary["MEDIA_PLAYBACK_SIGN_TIMEOUT"] = "5s"
+	// Total ops = 2s (JWKS) + 2s (auth) + 5s (sign) = 9s
+	rs256Boundary["HTTP_WRITE_TIMEOUT"] = "9s"
+	if _, err := Load(mapLookup(rs256Boundary)); err == nil {
+		t.Fatal("exact-boundary RS256 budget (9s <= 2s + 2s + 5s) must be rejected")
+	}
+
+	// 5. Margin > 0 passes: 9s + 1ms passes
+	rs256Valid := validConfigValues()
+	rs256Valid["SUPABASE_JWT_MODE"] = "rs256"
+	rs256Valid["SUPABASE_JWKS_URL"] = "http://envoy:8000/auth/v1/.well-known/jwks.json"
+	rs256Valid["SUPABASE_JWKS_HTTP_TIMEOUT"] = "2s"
+	rs256Valid["MEDIA_PLAYBACK_ENABLED"] = "true"
+	rs256Valid["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	rs256Valid["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "playback-storage-token"
+	rs256Valid["AUTHORIZATION_TIMEOUT"] = "2s"
+	rs256Valid["MEDIA_PLAYBACK_SIGN_TIMEOUT"] = "5s"
+	rs256Valid["HTTP_WRITE_TIMEOUT"] = "10s"
+	if _, err := Load(mapLookup(rs256Valid)); err != nil {
+		t.Fatalf("valid RS256 budget (10s > 9s) should pass, got %v", err)
+	}
+
+	// 6. Playback-off is unaffected by low HTTP_WRITE_TIMEOUT
+	offValues := validConfigValues()
+	offValues["MEDIA_PLAYBACK_ENABLED"] = "false"
+	offValues["AUTHORIZATION_TIMEOUT"] = "2s"
+	offValues["MEDIA_PLAYBACK_SIGN_TIMEOUT"] = "5s"
+	offValues["HTTP_WRITE_TIMEOUT"] = "6s"
+	if _, err := Load(mapLookup(offValues)); err != nil {
+		t.Fatalf("playback-off must not be affected by playback budget checks, got %v", err)
+	}
+}
+
+func TestMediaPlaybackIndependentCredentialNoServiceRoleFallback(t *testing.T) {
+	// 1. Playback enabled with only SERVICE_ROLE_KEY must fail
+	onlyServiceRole := validConfigValues()
+	onlyServiceRole["MEDIA_PLAYBACK_ENABLED"] = "true"
+	onlyServiceRole["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	onlyServiceRole["SERVICE_ROLE_KEY"] = "my-service-role-key"
+	delete(onlyServiceRole, "MEDIA_PLAYBACK_STORAGE_TOKEN")
+	if _, err := Load(mapLookup(onlyServiceRole)); err == nil {
+		t.Fatal("playback enabled with only SERVICE_ROLE_KEY must be rejected (no fallback allowed)")
+	}
+
+	// 2. Playback enabled with MEDIA_PLAYBACK_STORAGE_TOKEN succeeds independently
+	independentToken := validConfigValues()
+	independentToken["MEDIA_PLAYBACK_ENABLED"] = "true"
+	independentToken["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+	independentToken["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "my-playback-token"
+	delete(independentToken, "SERVICE_ROLE_KEY")
+	cfg, err := Load(mapLookup(independentToken))
+	if err != nil {
+		t.Fatalf("expected MEDIA_PLAYBACK_STORAGE_TOKEN to work independently, got err: %v", err)
+	}
+	if cfg.MediaPlayback.StorageServiceToken != "my-playback-token" {
+		t.Fatalf("expected StorageServiceToken %q, got %q", "my-playback-token", cfg.MediaPlayback.StorageServiceToken)
+	}
+}
+
+func TestMediaPlaybackStorageTokenRoleValidation(t *testing.T) {
+	// A JWT with role "service_role" must be rejected
+	serviceRoleJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.sig"
+	anonJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiJ9.sig"
+	authJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYXV0aGVudGljYXRlZCJ9.sig"
+	playbackSignerJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic3RvcmFnZV9wbGF5YmFja19zaWduZXIifQ.sig"
+
+	values := validConfigValues()
+	values["MEDIA_PLAYBACK_ENABLED"] = "true"
+	values["MEDIA_PLAYBACK_PUBLIC_ORIGIN"] = "https://playback.example.test"
+
+	// 1. service_role JWT must fail
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = serviceRoleJWT
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected Load to reject MEDIA_PLAYBACK_STORAGE_TOKEN with service_role")
+	}
+
+	// 2. anon JWT must fail
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = anonJWT
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected Load to reject MEDIA_PLAYBACK_STORAGE_TOKEN with anon role")
+	}
+
+	// 3. authenticated JWT must fail
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = authJWT
+	if _, err := Load(mapLookup(values)); err == nil {
+		t.Fatal("expected Load to reject MEDIA_PLAYBACK_STORAGE_TOKEN with authenticated role")
+	}
+
+	// 4. storage_playback_signer JWT must succeed
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = playbackSignerJWT
+	if _, err := Load(mapLookup(values)); err != nil {
+		t.Fatalf("expected Load to accept MEDIA_PLAYBACK_STORAGE_TOKEN with storage_playback_signer role, got: %v", err)
+	}
+
+	// 5. non-JWT token (opaque string) passes config validation (Storage validates signature/format)
+	values["MEDIA_PLAYBACK_STORAGE_TOKEN"] = "opaque-token-string"
+	if _, err := Load(mapLookup(values)); err != nil {
+		t.Fatalf("expected Load to accept opaque token string, got: %v", err)
+	}
+}
+
 func TestMediaUploadLimitsDefaultsAndValidation(t *testing.T) {
 	values := validConfigValues()
 	cfg, err := Load(mapLookup(values))

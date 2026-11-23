@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
@@ -20,6 +21,8 @@ type Config struct {
 	MediaUploadEnabled         bool
 	MediaUpload                MediaUploadConfig
 	MediaRuntime               MediaRuntimeConfig
+	MediaPlaybackEnabled       bool
+	MediaPlayback              MediaPlaybackConfig
 	MetricsEnabled             bool
 	WebSocketEnabled           bool
 	WebSocket                  WebSocketConfig
@@ -106,6 +109,12 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.MediaRuntime, err = loadMediaRuntime(lookup, cfg.MediaUploadEnabled); err != nil {
+		return Config{}, err
+	}
+	if cfg.MediaPlaybackEnabled, err = strictPlaybackBoolValue(lookup, "MEDIA_PLAYBACK_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.MediaPlayback, err = loadMediaPlayback(lookup, cfg.MediaPlaybackEnabled); err != nil {
 		return Config{}, err
 	}
 	if cfg.WebSocket, err = loadWebSocket(lookup); err != nil {
@@ -251,6 +260,21 @@ func Load(lookup LookupFunc) (Config, error) {
 		}
 		if cfg.ShutdownTimeout < cfg.Stage5.Control.DBTimeout+cfg.Stage5.Dispatch.PublishTimeout {
 			return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must cover stage 5 DB and publish budgets")
+		}
+	}
+	if cfg.MediaPlaybackEnabled {
+		var authIO time.Duration
+		if cfg.SupabaseJWTMode == "rs256" {
+			authIO = cfg.JWKSHTTPTimeout
+		}
+		if authIO > math.MaxInt64-cfg.AuthorizationTimeout ||
+			(authIO+cfg.AuthorizationTimeout) > math.MaxInt64-cfg.MediaPlayback.SigningTimeout {
+			return Config{}, fmt.Errorf("media playback timeout budget overflows time.Duration")
+		}
+		totalOps := authIO + cfg.AuthorizationTimeout + cfg.MediaPlayback.SigningTimeout
+		if cfg.HTTPWriteTimeout <= totalOps {
+			return Config{}, fmt.Errorf("HTTP_WRITE_TIMEOUT (%v) must exceed sum of auth I/O (%v), authorization (%v) and playback signing (%v) timeouts (total %v)",
+				cfg.HTTPWriteTimeout, authIO, cfg.AuthorizationTimeout, cfg.MediaPlayback.SigningTimeout, totalOps)
 		}
 	}
 	return cfg, nil

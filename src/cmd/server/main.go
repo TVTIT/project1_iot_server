@@ -266,6 +266,9 @@ func run() error {
 		}
 		routerDeps.WebSocketHandler = wsHandler
 	}
+	if err := populateMediaPlaybackDependencies(&routerDeps, cfg, pool); err != nil {
+		return err
+	}
 	router, err := httpserver.NewRouter(routerDeps)
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)
