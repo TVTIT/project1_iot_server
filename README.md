@@ -20,7 +20,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
       - *Kiểm chứng CI từ xa*: GitHub Actions Run [44501549344](https://github.com/TVTIT/project1_iot_server/actions/runs/44501549344) trên commit HEAD `a648ec1c8e22b99d3a185aa480a8b17534f7df8f` đã hoàn thành thành công toàn bộ các jobs `migration-check`, `dynsec-bootstrap-tests`, `stage5-control-integration` và `native-compose-smoke`.
       - *Giới hạn còn mở*: Script retention còn finding review chưa đóng (MEDIUM guard `json_each` thứ tự đánh giá, LOW timestamp snapshot); target demo/preflight/restore và rollout shared/live NOT RUN; board AM5728 / real sensor / HIL DEFERRED / NOT RUN. Mặc định triển khai tiếp tục tắt: `STAGE6_ENABLED=false`, `GATEWAY_STAGE6_ENABLED=false`.
       - *Tài liệu chi tiết*: Xem [báo cáo kỹ thuật Stage 6](docs/backend/stage-6-control-resilience.md), [hợp đồng Sensor Control API](docs/protocols/stage5-sensor-control-api.md) và [sổ tay vận hành](docs/dynsec/deployment-and-operations.md).
-  - **Stage 8, Phần 1 — media Gateway:** đã triển khai 8.1–8.4 và kiểm thử 8.5 ở phạm vi local. Upload đúng 80.000.000 byte đạt; hai lượt xác minh lại restart đều chỉ có một PUT. Xem [bàn giao hồi quy 8.5d](docs/backend/stage-8.5d-local-regression-handoff.md). Không triển khai 8.8A; kiểm thử từ mạng ngoài và remote CI **NOT RUN**. Chưa mở Phần 2; `MEDIA_UPLOAD_ENABLED` mặc định tắt.
+  - **Stage 8 — video Gateway:** upload đúng 80.000.000 byte và khôi phục sau restart backend đạt trên fixture. Phần 2 đã kiểm cấp URL theo membership, HTTP Range và phát/tua HTTPS local; cấu hình mẫu `frpc` giữ playback tắt mặc định. Xem [hồi quy upload](docs/backend/stage-8.5d-local-regression-handoff.md) và [bàn giao Phần 2](docs/backend/stage-8-part2-local-handoff.md). Cả hai cờ upload/playback mặc định tắt; nghiệm thu playback từ mạng ngoài và remote CI **NOT RUN**.
   - **Quản trị Người dùng & Quyền Thành viên Gateway (Admin User & Gateway Membership - Tasks U0–U8 & Follow-up D1–D5)**: Đã triển khai Migration 21 (`000021_admin_user_management.up.sql`), Migration 22 (`000022_gateway_membership_revocation.up.sql`) và 6 endpoint quản trị tập trung (`POST /v1/admin/users`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/users/{user_id}`, `PUT /v1/admin/gateways/{gateway_id}/owner`, `DELETE /v1/admin/gateways/{gateway_id}/users/{user_id}`), adapter Supabase Auth Admin (với `email_confirm: true`), cơ chế khóa Gateway cha tuần tự, cấm tự hạ quyền admin (`409 Conflict`), chuyển giao owner nguyên tử (owner cũ trở thành viewer), và thu hồi quyền thành viên viewer/operator (hoặc no-op khi không có membership: `204 No Content` body rỗng; cấm xóa owner khi chưa chuyển giao: `409 Conflict` `owner_transfer_required`; Gateway thiếu: `404 Not Found`; tuyệt đối không xóa tài khoản, profile hay global role, không đổi Gateway khác). Chi tiết xem [báo cáo quản trị người dùng & membership](docs/backend/admin-users-and-gateway-membership.md) và [kế hoạch bổ sung DELETE membership](../docs/backend_plan/gateway_membership_delete_detailed_plan.md).
     - **Checkpoint lịch sử 24/10/2026**: `a5f9f812f3212413f772ef60e1299f58cca43837` đã commit Task 5.3/5.4 và sửa shutdown liên quan; mô tả worktree diff trên `bcce3fe` là lịch sử trước commit. Source terminal migration **23** ở checkpoint đó, không xác nhận shared/live DB đã migrate. Các native/affected checks khi ấy PASS theo [bảng evidence](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md); ghi nhận “chưa chạy Stage 5 Gateway/result E2E” chỉ mô tả trạng thái lịch sử 24/10, đã được P3 simulator kiểm chứng sau đó. Không gán các kết quả lịch sử cho revision mới. Xem [baseline/testbed P0](docs/backend/paper-p0-baseline-and-testbed.md) cho evidence riêng P0.
   - **Kiểm chứng CI từ xa (Remote CI Verification)**: GitHub Actions Run [39272190456](https://github.com/TVTIT/project1_iot_server/actions/runs/39272190456) tại commit `35b6136f22c5a1c819afefc12003dba3ba613062` đã hoàn thành thành công toàn bộ **16/16 jobs**, bao gồm `lint-and-test` (job 118127109089), `stage4-api-integration` (job 118127109577), `stage3-uplink-integration` (job 118127109787) và `native-compose-smoke` (job 118129034156).
@@ -544,11 +544,14 @@ Không có `POST .../commands`, `/v1/commands/{command_id}`, reboot hay capture-
 Chỉ hỗ trợ intent `update_configuration`/`sample_interval_us`. Global admin không
 tự bypass membership. Chi tiết xem [báo cáo P3](docs/backend/paper-p3-sensor-control-loop.md) và [bàn giao 5.4](docs/backend/stage-5-task-5.4-publisher-acl-and-expiry.md).
 
-**Endpoint media dự kiến**, chưa được đăng ký trong router:
+**Stage 8 — video đã ghi:**
 
-| Phương thức | Đường dẫn | Xác thực dự kiến | Mô tả theo thiết kế MVP | Giai đoạn |
-|---|---|---|---|---|
-| `POST` | `/v1/media/upload-url` | Gateway HTTP Credential riêng | Cấp Signed Upload URL cho Gateway tải ảnh chụp lên private Storage | Stage 8 |
+| Phương thức | Đường dẫn | Quyền | Trạng thái |
+|---|---|---|---|
+| `POST` | `/v1/gateways/{gateway_id}/media/{media_id}/playback-url` | User JWT + owner/operator/viewer của Gateway | Cấp URL phát clip `ready`, opt-in, [hợp đồng API](docs/protocols/stage8-media-playback-api.md) |
+
+Gateway nhận quyền upload video qua MQTT, rồi signed PUT vào private Storage;
+không có `POST /v1/media/upload-url`.
 
 *Lưu ý quan trọng về các tuyến đường không tồn tại*:
 - Router Go backend hiện **KHÔNG CÓ** endpoint xem chi tiết Gateway đơn lẻ (`GET /v1/gateways/{gateway_id}`) hay Sensor đơn lẻ (`GET /v1/gateways/{gateway_id}/sensors/{sensor_id}`). Việc đọc danh sách Sensor được thực hiện thông qua route cha `GET /v1/gateways/{gateway_id}/sensors` hoặc endpoint Digital Twin detail `GET /v1/digital-twins/{entity_id}`.
@@ -561,7 +564,7 @@ Các tính năng sau đây đã được quyết định loại bỏ hoặc hoã
 - **Đăng ký công khai người dùng**: Tự đăng ký (`/auth/v1/signup`) bị vô hiệu hóa; chỉ platform admin được tạo tài khoản người dùng.
 - **Gateway tự đăng ký hoặc tự nhận quyền**: Không hỗ trợ Gateway self-claiming hoặc automated enrollment; Gateway và credential chỉ do platform admin cấp phát tập trung.
 - **Context Broker NGSI-LD bên thứ ba**: Không triển khai Scorpio hay Orion-LD; CSDL PostgreSQL/TimescaleDB là nguồn chân lý duy nhất (source of truth) và Go backend tự xuất định dạng NGSI-LD tại biên API.
-- **Live-video streaming & Media Server**: Không hỗ trợ truyền video trực tiếp (RTSP/WebRTC/HLS) hay media server chuyên dụng; phân hệ media chỉ hỗ trợ lưu trữ ảnh tĩnh qua Supabase Storage.
+- **Live-video streaming & Media Server**: Không hỗ trợ video trực tiếp (RTSP/WebRTC/HLS) hay media server chuyên dụng. Stage 8 phát/tua clip MP4 đã ghi từ private Storage.
 - **Tải lên video lớn, Resumable/TUS upload & Chuyển mã (Transcoding)**: Nằm ngoài phạm vi của MVP.
 - **Phân hệ cảnh báo hoàn chỉnh (Full Alert Engine)**: Tạm hoãn; tập trung vào thu thập, lưu trữ và Digital Twin.
 - **Lệnh điều khiển tự trị hoặc sinh bởi LLM**: Toàn bộ chỉ lệnh điều khiển phải xuất phát từ người dùng được ủy quyền qua REST API.

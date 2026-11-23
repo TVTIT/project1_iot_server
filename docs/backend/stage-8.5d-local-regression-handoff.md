@@ -241,3 +241,31 @@ chưa có HTTPS origin hợp lệ; fixture được sửa để cấp origin t�
 media DynSec theo đúng cờ, sau đó chạy lại PASS. Không gọi Cloudflare/tunnel hay
 mạng ngoài; không sửa `.env` triển khai, đổi origin, dừng tunnel hoặc gỡ
 listener. Không commit.
+
+## 8.2R — Phục hồi khi restart tiến trình Go backend
+
+**Phạm vi:** fixture Compose cô lập, Gateway simulator Linux, private Storage
+và HTTPS local. Code chạy tại baseline `6994d3eba0f0f34f69922ed7b9c1e0dfda9bdf40`
+cùng diff fixture SHA-256 `8300907bcf1163b22a045d0c7b8a529fdd18be60a3eafa53d8815e121c02a2bb`;
+không phải commit sạch hay bằng chứng remote.
+
+`sh scripts/test-stage8-media-storage-http.sh --stage8-local-backend-restart`
+**PASS**, cleanup chính xác. Với một verifier, Storage timeout 45 giây, DB
+timeout 5 giây và scan 250 ms, fixture giữ phản hồi GET đầu khi clip đang
+`verifying`, lease 60 giây còn hiệu lực và spool ở `awaiting_result`. Gateway
+được xác nhận dừng (`SIGSTOP`, trạng thái Linux `T`). Backend dừng thật rồi chạy
+lại cùng container, PID/`StartedAt` mới, `/readyz` và media SUBACK mới. Không
+sửa hàng DB hoặc chỉnh lease để thúc đẩy recovery.
+
+Backend mới đọc đúng object lần thứ hai và chốt `ready` ở generation/attempt
+2, từ 1, khi Gateway vẫn dừng; lần đọc DB thấy `ready` khoảng 0,48 giây sau hết
+lease. Sau `SIGCONT`, cùng `upload_id`/`media_id` về `ready` trong SQLite, file
+spool được gỡ và file nguồn còn. Chỉ có một row managed, một object private,
+một PUT; đối soát 1.546 byte, `video/mp4` và SHA-256 khớp. Báo cáo JSON đã lọc
+và fingerprint được giữ riêng dưới
+`/var/tmp/opencode/stage8-2r-c-durable-20261123-031706/`.
+
+Hồi quy media-off: fixture `--stage8-local-base` **PASS** với signed PUT
+`404`, ảnh đọc/ghi được và cleanup chính xác; `TestMediaRuntimeOffIsInert`
+**PASS**. 38 unit tests Python liên quan, `py_compile` và `git diff --check`
+đạt. Không kiểm Cloudflare, VPS, phần cứng hoặc rollout.
