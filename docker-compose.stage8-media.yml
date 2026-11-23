@@ -15,8 +15,12 @@ services:
     environment:
       MEDIA_UPLOAD_ENABLED: ${MEDIA_UPLOAD_ENABLED:-false}
       MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:-}
+      MEDIA_PLAYBACK_ENABLED: ${MEDIA_PLAYBACK_ENABLED:-false}
+      MEDIA_PLAYBACK_ROUTE_KEY: ${MEDIA_PLAYBACK_ROUTE_KEY:-}
     volumes: !override
       - ./config/nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./config/nginx/stage8-media-playback.conf.template:/etc/nginx/templates/stage8-media-playback.conf.template:ro
+      - ./config/nginx/18-validate-playback-key.envsh:/docker-entrypoint.d/18-validate-playback-key.envsh:ro
     networks: !override
       iot_net:
         aliases:
@@ -44,6 +48,31 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - ./docs/examples/media-playback/index.html:/var/www/demo/index.html:ro
+      - ./docs/examples/media-playback/player.js:/var/www/demo/player.js:ro
+    networks:
+      - iot_net
+    depends_on:
+      nginx:
+        condition: service_started
+  # Fixture-only TLS edge models public TLS termination for playback, then proxies over HTTP
+  # to the internal Nginx playback listener (port 8081). Never included by the root Compose profile.
+  stage8-media-playback-test-edge:
+    image: nginx:1.25-alpine
+    restart: "no"
+    ports:
+      - target: 443
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - ./config/nginx/stage8-media-playback-test-edge.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - type: bind
+        source: ${MEDIA_TEST_TLS_DIR:?fixture TLS directory required}
+        target: /etc/nginx/stage8-tls
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - iot_net
     depends_on:
@@ -52,6 +81,8 @@ services:
   supabase-envoy:
     environment:
       MEDIA_UPLOAD_ROUTE_KEY: ${MEDIA_UPLOAD_ROUTE_KEY:?fixture/operator route key required}
+      MEDIA_PLAYBACK_ROUTE_KEY: ${MEDIA_PLAYBACK_ROUTE_KEY:-}
+      MEDIA_PLAYBACK_ENABLED: ${MEDIA_PLAYBACK_ENABLED:-false}
   supabase-storage:
     environment:
       FILE_SIZE_LIMIT: 80000000

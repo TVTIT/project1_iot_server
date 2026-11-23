@@ -85,8 +85,10 @@ resources:
                         request_headers_to_remove:
                           - authorization
                           - apikey
+                          - cookie
                           - x-upsert
                           - x-stage8-media-route
+                          - x-stage8-media-playback-route
                           - x-user-id
                           - x-authenticated-user
                           - x-role
@@ -119,6 +121,72 @@ resources:
                                                 name: x-stage8-media-route
                                                 string_match:
                                                   exact: '${MEDIA_UPLOAD_ROUTE_KEY}'
+
+                      - name: stage8-media-signed-get
+                        match:
+                          safe_regex:
+                            google_re2: {}
+                            regex: '^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$'
+                          headers:
+                            - name: ':method'
+                              string_match:
+                                exact: GET
+                            - name: x-stage8-media-playback-route
+                              string_match:
+                                safe_regex:
+                                  google_re2: {}
+                                  regex: '^.+$'
+                            - name: x-stage8-media-playback-route
+                              string_match:
+                                exact: '${MEDIA_PLAYBACK_ROUTE_KEY}'
+                        route:
+                          cluster: storage
+                          regex_rewrite:
+                            pattern:
+                              google_re2: {}
+                              regex: '^/storage/v1/(.*)$'
+                            substitution: '/\1'
+                          timeout: 120s
+                          idle_timeout: 120s
+                        request_headers_to_remove:
+                          - authorization
+                          - apikey
+                          - cookie
+                          - x-upsert
+                          - x-stage8-media-route
+                          - x-stage8-media-playback-route
+                          - x-user-id
+                          - x-authenticated-user
+                          - x-role
+                          - x-forwarded-user
+                          - x-forwarded-roles
+                          - forwarded
+                        typed_per_filter_config:
+                          envoy.filters.http.basic_auth:
+                            '@type': type.googleapis.com/envoy.config.route.v3.FilterConfig
+                            disabled: true
+                          envoy.filters.http.rbac:
+                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                            rbac:
+                              rules:
+                                action: ALLOW
+                                policies:
+                                  stage8_media_playback_route:
+                                    permissions:
+                                      - any: true
+                                    principals:
+                                      - and_ids:
+                                          ids:
+                                            - header:
+                                                name: x-stage8-media-playback-route
+                                                string_match:
+                                                  safe_regex:
+                                                    google_re2: {}
+                                                    regex: '^.+$'
+                                            - header:
+                                                name: x-stage8-media-playback-route
+                                                string_match:
+                                                  exact: '${MEDIA_PLAYBACK_ROUTE_KEY}'
 
                       - name: stage8-media-blocked
                         match:

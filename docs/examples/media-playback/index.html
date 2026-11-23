@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Media Playback Example (Stage 8.6)</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 680px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.5;
+      color: #222;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    p.desc { font-size: 0.9rem; color: #555; margin-top: 0; }
+    .form-group { margin-bottom: 0.85rem; }
+    label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.25rem; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 0.5rem;
+      font-family: monospace;
+      font-size: 0.9rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    .btn-group { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    button {
+      padding: 0.5rem 1rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      border-radius: 4px;
+      border: 1px solid #aaa;
+      background: #f7f7f7;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status-box {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 4px;
+      background: #f0f4f8;
+      font-size: 0.85rem;
+      font-family: monospace;
+      min-height: 1.25rem;
+      word-break: break-all;
+    }
+    video {
+      width: 100%;
+      max-height: 380px;
+      margin-top: 1rem;
+      background: #000;
+      border-radius: 4px;
+    }
+    .protocol-notes {
+      margin-top: 1.5rem;
+      padding-top: 1rem;
+      border-top: 1px solid #e0e0e0;
+      font-size: 0.8rem;
+      color: #666;
+    }
+    .protocol-notes ul { padding-left: 1.2rem; margin: 0.5rem 0; }
+  </style>
+</head>
+<body>
+  <h1>Media Playback Example (Stage 8.6)</h1>
+  <p class="desc">Minimal player exercising signed URL issuance, authenticated fetch, and near-expiry refresh.</p>
+
+  <form id="playback-form" autocomplete="off">
+    <div class="form-group">
+      <label for="api-origin">API Origin (HTTPS)</label>
+      <input type="text" id="api-origin" placeholder="https://api.example.com" required>
+    </div>
+    <div class="form-group">
+      <label for="gateway-id">Gateway ID</label>
+      <input type="text" id="gateway-id" placeholder="gw_xxxxxxxxxxxx" required>
+    </div>
+    <div class="form-group">
+      <label for="media-id">Media ID (UUID)</label>
+      <input type="text" id="media-id" placeholder="00000000-0000-0000-0000-000000000000" required>
+    </div>
+    <div class="form-group">
+      <label for="user-jwt">User JWT (In-memory only)</label>
+      <input type="password" id="user-jwt" placeholder="eyJhbGciOi..." required autocomplete="off">
+    </div>
+    <div class="btn-group">
+      <button type="submit" id="btn-fetch-play">Fetch &amp; Play</button>
+      <button type="button" id="btn-seek-test" disabled>Seek +5s (Test)</button>
+      <button type="button" id="btn-stop" disabled>Stop</button>
+    </div>
+  </form>
+
+  <div id="status-box">Ready.</div>
+
+  <video id="video-player" controls playsinline></video>
+
+  <div class="protocol-notes">
+    <strong>Security &amp; Protocol Contract:</strong>
+    <ul>
+      <li>Tokens and signed URLs are kept strictly in page memory (no localStorage, sessionStorage, or cookies).</li>
+      <li>Signed URLs expire in ~120s; the client refreshes signed URLs on error recovery or near expiration on seek while preserving playback position.</li>
+      <li>Issuance route uses <code>Cache-Control: no-store</code> to prevent intermediate or browser caching of signed tokens.</li>
+      <li>Membership revocation immediately yields 404 for subsequent issuance requests.</li>
+      <li>Playback data plane listener, HTTP Range requests, and end-to-end browser media streaming are evaluated in Task 8.7.</li>
+    </ul>
+  </div>
+
+  <script src="player.js"></script>
+</body>
+</html>

@@ -1,3 +1,9 @@
+# FRPC Client Configuration Example (FRP v0.71.0)
+#
+# Operator Note:
+# When configuring production credentials, update BOTH identity fields below:
+# 1. 'serverAddr' with the real VPS/FRPS server address/domain
+# 2. 'transport.tls.serverName' with the expected server certificate SAN
 serverAddr = "frp.example.com"
 serverPort = 7000
 
@@ -5,12 +11,31 @@ auth.method = "token"
 auth.tokenSource.type = "file"
 auth.tokenSource.file.path = "/etc/frp/token"
 
+# Enforce TLS encryption and custom CA certificate validation
 transport.tls.enable = true
 transport.tls.trustedCaFile = "/etc/frp/tls/ca.crt"
+transport.tls.serverName = "frp.example.com"
 
+# MQTTS proxy configuration (telemetry and control plane)
 [[proxies]]
 name = "mqtts"
 type = "tcp"
 localIP = "mosquitto"
 localPort = 8883
 remotePort = 8883
+
+# Opt-in Stage 8 media playback TCP proxy.
+# Inactive by default to prevent accidental registration or public exposure on copy.
+#
+# Activation instructions for operator (Stage 8.8B / 8.9):
+# 1. On VPS: Ensure frps.toml 'allowPorts' includes the media remotePort (e.g. 8081).
+# 2. On VPS: Route Nginx Proxy Manager (NPM) to frps:8081 over an internal Docker bridge.
+#    NEVER publish this media port directly to the host / public Internet.
+# 3. On this client: Uncomment the block below and restart the frpc container.
+#
+# [[proxies]]
+# name = "media-playback"
+# type = "tcp"
+# localIP = "nginx"
+# localPort = 8081
+# remotePort = 8081

@@ -71,26 +71,43 @@ server {
     location /auth/v1/ {
         proxy_pass $supabase_upstream;
         proxy_http_version 1.1;
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
+    }
+    location ~ ^/storage/v1/object/upload/sign/media-video/ {
+        access_log off;
+        error_log /dev/null emerg;
+        return 404;
+    }
+    location ~* ^/storage/v1/object/sign/media-video(/.*)?$ {
+        access_log off;
+        error_log /dev/null emerg;
+        return 404;
     }
     location /storage/v1/ {
         client_max_body_size 50m;
         proxy_pass $supabase_upstream;
         proxy_http_version 1.1;
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location = /healthz {
         return 200 'OK';
     }
     location = /readyz {
         proxy_pass http://backend_api;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location = /v1/health {
         proxy_pass http://backend_api;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
 
     # OPTIONS goes to the existing Go CORS validator, not an unconditional 204.
     # A named location is inaccessible by a client URI.
     location @business_preflight {
         proxy_pass http://backend_api;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location = /v1/ws {
         error_page 418 = @business_preflight;
@@ -112,12 +129,16 @@ server {
         proxy_set_header X-Forwarded-Roles "";
         proxy_set_header Forwarded "";
         proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location /v1/ {
         error_page 418 = @business_preflight;
         if ($request_method = OPTIONS) { return 418; }
         auth_request /_p2_auth;
         proxy_pass http://backend_api;
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location / {
         return 404;

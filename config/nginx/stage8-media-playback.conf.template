@@ -1,0 +1,90 @@
+# Stage 8 media playback shared configuration include for base and Paper P2 profiles.
+# Internal playback listener bound to fixed port 8081 on the trusted Docker network only.
+# No host ports are added for 8081 (port 80:80 unchanged).
+
+# Modest demo concurrency limit for the internal playback listener.
+# Keyed to $server_name (listener-wide) because upstream reverse proxies (FRP/NPM)
+# funnel multiple end-users through a single gateway IP. Modest demo cap: 64 streams.
+limit_conn_zone $server_name zone=stage8_playback_conn:10m;
+
+server {
+    listen 8081;
+    server_name ${API_DOMAIN};
+
+    # Signed query strings are bearer credentials. Suppress URI-bearing access
+    # and error logs throughout this internal playback listener.
+    access_log off;
+    error_log /dev/null emerg;
+
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    send_timeout 60s;
+    keepalive_timeout 30s;
+    keepalive_requests 1000;
+
+    proxy_connect_timeout 5s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+
+    # Always enforce private, no-store at the server level, including denied paths.
+    add_header Cache-Control "private, no-store" always;
+
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    set $supabase_upstream http://kong:8000;
+
+    # Whitelist only canonical lowercase UUID path for signed video playback.
+    location ~ "^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$" {
+        limit_conn stage8_playback_conn 64;
+
+        set $media_playback_enabled "${MEDIA_PLAYBACK_ENABLED}";
+        set $media_playback_route_key "${MEDIA_PLAYBACK_ROUTE_KEY}";
+
+        # Feature and key fail closed: require enabled=true and valid 64 lowercase hex key
+        if ($media_playback_enabled != true) { return 404; }
+        if ($media_playback_route_key !~ "^[0-9a-f]{64}$") { return 404; }
+
+        # Pass exact GET only to start; leave HEAD closed until qualified on real pinned Storage
+        if ($request_method != GET) { return 405; }
+
+        # Require raw request_uri to match exact canonical path and 3-part base64url JWT query token.
+        # Rejects non-JWT values, normalized raw path aliases, duplicate/foreign query parameters.
+        if ($request_uri !~ "^/storage/v1/object/sign/media-video/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4\?token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$") {
+            return 400;
+        }
+
+        # Whitelist forwarded client headers via proxy_pass_request_headers off
+        proxy_pass_request_headers off;
+        proxy_pass_request_body off;
+
+        client_max_body_size 1k;
+        proxy_http_version 1.1;
+
+        # Disable caching, whole-file buffering, and gzip compression
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        gzip off;
+
+        # Hide upstream Cache-Control so only our server-level private, no-store header is emitted
+        proxy_hide_header Cache-Control;
+
+        # Forward only controlled Host/guard and Range/If-Range
+        proxy_set_header Host $host;
+        proxy_set_header Range $http_range;
+        proxy_set_header If-Range $http_if_range;
+        proxy_set_header X-Stage8-Media-Playback-Route $media_playback_route_key;
+
+        # Explicitly suppress external auth and body headers
+        proxy_set_header Authorization "";
+        proxy_set_header apikey "";
+        proxy_set_header Content-Length "";
+        proxy_set_header Content-Type "";
+
+        proxy_pass $supabase_upstream;
+    }
+
+    # Reject all other paths on the playback listener
+    location / {
+        return 404;
+    }
+}

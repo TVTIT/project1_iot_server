@@ -23,6 +23,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization $http_authorization;
         proxy_pass_header Authorization;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
 
     # 2. Supabase Storage Routing (/storage/v1/*)
@@ -60,8 +61,14 @@ server {
         proxy_set_header X-Forwarded-Roles "";
         proxy_set_header Forwarded "";
         proxy_set_header X-Stage8-Media-Route $media_upload_route_key;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location ~ ^/storage/v1/object/upload/sign/media-video/ {
+        access_log off;
+        error_log /dev/null emerg;
+        return 404;
+    }
+    location ~* ^/storage/v1/object/sign/media-video(/.*)?$ {
         access_log off;
         error_log /dev/null emerg;
         return 404;
@@ -76,6 +83,7 @@ server {
         proxy_set_header Authorization $http_authorization;
         proxy_pass_header Authorization;
         proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
 
     # WS is unavailable in the base profile: never proxy an enabled handler
@@ -93,6 +101,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization $http_authorization;
         proxy_pass_header Authorization;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
 
     # 5. Health check
@@ -108,5 +117,6 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
 }

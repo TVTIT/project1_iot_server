@@ -23,6 +23,12 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization $http_authorization;
         proxy_pass_header Authorization;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
+    }
+    location ~* ^/storage/v1/object/sign/media-video(/.*)?$ {
+        access_log off;
+        error_log /dev/null emerg;
+        return 404;
     }
     location /storage/v1/ {
         proxy_pass $supabase_upstream;
@@ -33,6 +39,8 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization $http_authorization;
         proxy_pass_header Authorization;
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
 
     location = /_p7_ws_auth {
@@ -68,6 +76,8 @@ server {
         proxy_set_header X-Forwarded-User "";
         proxy_set_header X-Forwarded-Roles "";
         proxy_set_header Forwarded "";
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
         proxy_buffering off;
         proxy_read_timeout 75s;
         proxy_send_timeout 75s;
@@ -81,6 +91,8 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization $http_authorization;
         proxy_pass_header Authorization;
+        proxy_set_header X-Stage8-Media-Route "";
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location = /healthz {
         return 200 'OK';
@@ -88,6 +100,7 @@ server {
     }
     location = /readyz {
         proxy_pass http://backend_api;
+        proxy_set_header X-Stage8-Media-Playback-Route "";
     }
     location / {
         return 404;

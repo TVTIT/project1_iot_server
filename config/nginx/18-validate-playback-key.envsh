@@ -1,0 +1,32 @@
+#!/bin/sh
+# Validates MEDIA_PLAYBACK_ENABLED and MEDIA_PLAYBACK_ROUTE_KEY before 20-envsubst-on-templates.sh runs.
+# Rejects wrong syntax (non-[0-9a-f], wrong length, quotes, pipes, newlines)
+# and normalizes invalid or noncanonical flag values to false, clearing the key when disabled.
+
+case "${MEDIA_PLAYBACK_ENABLED:-}" in
+    true)
+        export MEDIA_PLAYBACK_ENABLED="true"
+        ;;
+    *)
+        export MEDIA_PLAYBACK_ENABLED="false"
+        ;;
+esac
+
+case "${MEDIA_PLAYBACK_ROUTE_KEY:-}" in
+    "")
+        ;;
+    *[!0-9a-f]*)
+        export MEDIA_PLAYBACK_ROUTE_KEY=""
+        export MEDIA_PLAYBACK_ENABLED="false"
+        ;;
+    ????????????????????????????????????????????????????????????????)
+        ;;
+    *)
+        export MEDIA_PLAYBACK_ROUTE_KEY=""
+        export MEDIA_PLAYBACK_ENABLED="false"
+        ;;
+esac
+
+if [ "${MEDIA_PLAYBACK_ENABLED}" != "true" ]; then
+    export MEDIA_PLAYBACK_ROUTE_KEY=""
+fi
