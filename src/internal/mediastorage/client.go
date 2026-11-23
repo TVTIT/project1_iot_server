@@ -29,8 +29,19 @@ const (
 
 // ErrNotFound indicates that the requested object does not exist in storage.
 var (
-	ErrNotFound  = errors.New("storage object not found")
-	objectPathRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$`)
+	ErrNotFound              = errors.New("storage object not found")
+	ErrInvalidPath           = errors.New("invalid Storage object path")
+	ErrSignerUnavailable     = errors.New("storage signer unavailable")
+	ErrInvalidSignerContract = errors.New("invalid storage signer contract")
+	objectPathRE             = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp4$`)
+)
+
+const (
+	// DefaultReadGrantTTL is the fixed validity window requested from Storage for playback.
+	DefaultReadGrantTTL = 120 * time.Second
+	// ReadGrantClockTolerance is the maximum acceptable skew between the backend
+	// clock and the Storage token's exp claim.
+	ReadGrantClockTolerance = 15 * time.Second
 )
 
 // Config provides connection settings, origins, and timeout configuration for the Storage client.
@@ -40,8 +51,10 @@ type Config struct {
 	InternalBaseURL string
 	// PublicOrigin is the configured HTTPS origin used by Gateway PUT requests.
 	PublicOrigin string
-	ServiceToken string `json:"-"`
-	Timeout      time.Duration
+	// PlaybackOrigin is the configured HTTPS origin used by Playback GET requests.
+	PlaybackOrigin string
+	ServiceToken   string `json:"-"`
+	Timeout        time.Duration
 }
 
 func (Config) String() string { return "mediastorage.Config{redacted}" }
@@ -53,6 +66,7 @@ func (Config) GoString() string { return "mediastorage.Config{redacted}" }
 type Client struct {
 	internal *url.URL
 	public   *url.URL
+	playback *url.URL
 	token    string
 	http     *http.Client
 }
@@ -77,6 +91,21 @@ func (UploadGrant) String() string { return "mediastorage.UploadGrant{redacted}"
 // GoString returns a redacted string representation of UploadGrant.
 func (UploadGrant) GoString() string { return "mediastorage.UploadGrant{redacted}" }
 
+// ReadGrant holds the signed playback URL and expiry for a granted media stream.
+type ReadGrant struct {
+	url       string
+	ExpiresAt time.Time
+}
+
+// SignedURL returns the ephemeral playback URL. It is deliberately not an
+// exported field, so fmt and JSON struct formatting do not reveal its token.
+func (g ReadGrant) SignedURL() string { return g.url }
+
+func (ReadGrant) String() string { return "mediastorage.ReadGrant{redacted}" }
+
+// GoString returns a redacted string representation of ReadGrant.
+func (ReadGrant) GoString() string { return "mediastorage.ReadGrant{redacted}" }
+
 // Object represents an authenticated media object opened from storage for verification reading.
 type Object struct {
 	Body          io.ReadCloser
@@ -84,19 +113,52 @@ type Object struct {
 	ContentLength int64
 }
 
-// New constructs and validates a new Supabase Storage client with hardened transports.
-func New(cfg Config) (*Client, error) {
+func parseHTTPSOrigin(rawOrigin, kind string) (*url.URL, error) {
+	if strings.ContainsAny(rawOrigin, "#?") || strings.TrimSpace(rawOrigin) != rawOrigin {
+		return nil, fmt.Errorf("invalid %s Storage origin", kind)
+	}
+	parsed, err := url.Parse(rawOrigin)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Hostname() == "" ||
+		parsed.User != nil || parsed.Path != "" || parsed.RawPath != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, fmt.Errorf("invalid %s Storage origin", kind)
+	}
+	return parsed, nil
+}
+
+// ValidatePlaybackOrigin validates an HTTPS origin for media playback, ensuring strict scheme and port rules.
+func ValidatePlaybackOrigin(rawOrigin string) (*url.URL, error) {
+	if strings.ContainsAny(rawOrigin, "#?") || strings.TrimSpace(rawOrigin) != rawOrigin {
+		return nil, errors.New("invalid playback HTTPS origin")
+	}
+	parsed, err := url.Parse(rawOrigin)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Hostname() == "" ||
+		parsed.User != nil || parsed.Path != "" || parsed.RawPath != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, errors.New("invalid playback HTTPS origin")
+	}
+
+	// Validate explicitly specified port: must be numeric 1-65535, nonempty, no leading zeros
+	if parsed.Host != parsed.Hostname() {
+		portStr := parsed.Port()
+		if portStr == "" {
+			return nil, errors.New("invalid playback HTTPS origin port: empty port")
+		}
+		portNum, err := strconv.Atoi(portStr)
+		if err != nil || portNum < 1 || portNum > 65535 || strconv.Itoa(portNum) != portStr {
+			return nil, errors.New("invalid playback HTTPS origin port: must be 1-65535")
+		}
+	}
+
+	return parsed, nil
+}
+
+func initBaseClient(cfg Config) (*Client, error) {
 	internal, err := url.Parse(cfg.InternalBaseURL)
 	if err != nil || (internal.Scheme != "http" && internal.Scheme != "https") ||
 		internal.Host == "" || internal.User != nil || internal.RawQuery != "" ||
 		internal.Fragment != "" {
 		return nil, errors.New("invalid internal Storage API base URL")
-	}
-	public, err := url.Parse(cfg.PublicOrigin)
-	if err != nil || public.Scheme != "https" || public.Host == "" ||
-		public.User != nil || public.Path != "" || public.RawPath != "" ||
-		public.RawQuery != "" || public.Fragment != "" {
-		return nil, errors.New("invalid public Storage origin")
 	}
 	if strings.TrimSpace(cfg.ServiceToken) == "" {
 		return nil, errors.New("storage service token is required")
@@ -110,7 +172,6 @@ func New(cfg Config) (*Client, error) {
 	}
 	return &Client{
 		internal: internal,
-		public:   public,
 		token:    cfg.ServiceToken,
 		http: &http.Client{
 			Timeout:   timeout,
@@ -120,6 +181,186 @@ func New(cfg Config) (*Client, error) {
 			},
 		},
 	}, nil
+}
+
+// New constructs and validates a new Supabase Storage client with hardened transports.
+func New(cfg Config) (*Client, error) {
+	public, err := parseHTTPSOrigin(cfg.PublicOrigin, "public")
+	if err != nil {
+		return nil, err
+	}
+	var playback *url.URL
+	if cfg.PlaybackOrigin != "" {
+		p, err := parseHTTPSOrigin(cfg.PlaybackOrigin, "playback")
+		if err != nil {
+			return nil, err
+		}
+		playback = p
+	}
+	client, err := initBaseClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client.public = public
+	client.playback = playback
+	return client, nil
+}
+
+// NewPlayback constructs and validates a read-only Supabase Storage client for playback URL signing.
+// It requires a pure HTTPS playback origin and does not permit upload signing calls.
+// NewPlayback constructs and validates a read-only Supabase Storage client for playback URL signing.
+// It requires a pure HTTPS playback origin and returns a PlaybackClient restricted solely to SignRead.
+func NewPlayback(cfg Config) (*PlaybackClient, error) {
+	if cfg.PlaybackOrigin == "" {
+		return nil, errors.New("invalid playback Storage origin")
+	}
+	playback, err := ValidatePlaybackOrigin(cfg.PlaybackOrigin)
+	if err != nil {
+		return nil, err
+	}
+	client, err := initBaseClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client.playback = playback
+	return &PlaybackClient{client: client}, nil
+}
+
+// PlaybackClient is a specialized Supabase Storage client whose only capability is SignRead.
+type PlaybackClient struct {
+	client *Client
+}
+
+// SignRead requests an ephemeral signed read URL from the storage service for playback of the given object path.
+func (p *PlaybackClient) SignRead(ctx context.Context, objectPath string) (ReadGrant, error) {
+	if p == nil || p.client == nil {
+		return ReadGrant{}, errors.New("nil playback client")
+	}
+	return p.client.SignRead(ctx, objectPath)
+}
+
+// SignRead requests an ephemeral signed read URL from the storage service for playback of the given object path.
+func (c *Client) SignRead(ctx context.Context, objectPath string) (ReadGrant, error) {
+	if !validObjectPath(objectPath) {
+		return ReadGrant{}, ErrInvalidPath
+	}
+	if c.playback == nil {
+		return ReadGrant{}, fmt.Errorf("%w: playback signing is not configured on this client", ErrInvalidSignerContract)
+	}
+
+	path := "/object/sign/" + VideoBucketID + "/" + objectPath
+	bodyReader := strings.NewReader(`{"expiresIn":120}`)
+	req, err := c.request(ctx, http.MethodPost, path, bodyReader)
+	if err != nil {
+		return ReadGrant{}, fmt.Errorf("%w: invalid storage signing request", ErrInvalidSignerContract)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ReadGrant{}, fmt.Errorf("%w: storage signing request timed out or canceled: %w", ErrSignerUnavailable, ctx.Err())
+		}
+		return ReadGrant{}, fmt.Errorf("%w: storage signing request failed", ErrSignerUnavailable)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if (resp.StatusCode >= 500 && resp.StatusCode <= 599) || resp.StatusCode == http.StatusTooManyRequests {
+		_, _ = readControlBody(resp.Body)
+		return ReadGrant{}, fmt.Errorf("%w: storage service temporarily unavailable", ErrSignerUnavailable)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = readControlBody(resp.Body)
+		return ReadGrant{}, fmt.Errorf("%w: storage signing request rejected", ErrInvalidSignerContract)
+	}
+
+	body, err := readControlBody(resp.Body)
+	if err != nil {
+		if ctx.Err() != nil || isTimeoutError(err) {
+			return ReadGrant{}, fmt.Errorf("%w: storage response read timed out or canceled", ErrSignerUnavailable)
+		}
+		return ReadGrant{}, fmt.Errorf("%w: bounded response read failed", ErrInvalidSignerContract)
+	}
+
+	var result struct {
+		SignedURL string `json:"signedURL"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || result.SignedURL == "" {
+		return ReadGrant{}, fmt.Errorf("%w: invalid storage signing response", ErrInvalidSignerContract)
+	}
+
+	publicURL, token, err := c.parsePlaybackSignedURL(result.SignedURL, objectPath)
+	if err != nil {
+		return ReadGrant{}, err
+	}
+
+	expiresAt, err := parsePlaybackTokenClaims(token, VideoBucketID, objectPath)
+	if err != nil {
+		return ReadGrant{}, err
+	}
+
+	now := time.Now().UTC()
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return ReadGrant{}, fmt.Errorf("%w: storage token is expired", ErrInvalidSignerContract)
+	}
+	if remaining < DefaultReadGrantTTL-ReadGrantClockTolerance {
+		return ReadGrant{}, fmt.Errorf("%w: storage token expiry is materially too short", ErrInvalidSignerContract)
+	}
+	if remaining > DefaultReadGrantTTL+ReadGrantClockTolerance {
+		return ReadGrant{}, fmt.Errorf("%w: storage token expiry is materially too long", ErrInvalidSignerContract)
+	}
+
+	return ReadGrant{
+		url:       publicURL,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (c *Client) parsePlaybackSignedURL(rawSignedURL, objectPath string) (publicURL, token string, err error) {
+	expectedPrefix := "/object/sign/" + VideoBucketID + "/" + objectPath + "?token="
+	if !strings.HasPrefix(rawSignedURL, expectedPrefix) {
+		return "", "", fmt.Errorf("%w: invalid signed URL prefix or path", ErrInvalidSignerContract)
+	}
+
+	token = strings.TrimPrefix(rawSignedURL, expectedPrefix)
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || !isBase64URL(parts[0]) || !isBase64URL(parts[1]) || !isBase64URL(parts[2]) {
+		return "", "", fmt.Errorf("%w: invalid token query format in signed URL", ErrInvalidSignerContract)
+	}
+
+	publicURL = c.playback.String() + "/storage/v1" + rawSignedURL
+	return publicURL, token, nil
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+func isBase64URL(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func newPrivateStorageTransport() *http.Transport {
@@ -145,6 +386,9 @@ func newPrivateStorageTransport() *http.Transport {
 
 // SignUpload requests an ephemeral upload URL from the storage service for the given object path.
 func (c *Client) SignUpload(ctx context.Context, objectPath string) (UploadGrant, error) {
+	if c.public == nil {
+		return UploadGrant{}, errors.New("upload signing is not configured on this client")
+	}
 	if !validObjectPath(objectPath) {
 		return UploadGrant{}, errors.New("invalid Storage object path")
 	}
@@ -312,7 +556,59 @@ func tokenExpiry(token string) (time.Time, error) {
 	if err != nil || seconds <= 0 {
 		return time.Time{}, errors.New("invalid expiry")
 	}
-	return time.Unix(seconds, 0), nil
+	return time.Unix(seconds, 0).UTC(), nil
+}
+
+func parsePlaybackTokenClaims(token, expectedBucket, expectedObjectPath string) (time.Time, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+		return time.Time{}, fmt.Errorf("%w: invalid token format", ErrInvalidSignerContract)
+	}
+	header, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid token header", ErrInvalidSignerContract)
+	}
+	var headerFields map[string]json.RawMessage
+	if json.Unmarshal(header, &headerFields) != nil || len(headerFields) == 0 {
+		return time.Time{}, fmt.Errorf("%w: invalid token header JSON", ErrInvalidSignerContract)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid token payload", ErrInvalidSignerContract)
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(signature) == 0 {
+		return time.Time{}, fmt.Errorf("%w: invalid token signature", ErrInvalidSignerContract)
+	}
+	var claims map[string]json.RawMessage
+	if json.Unmarshal(payload, &claims) != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid token claims JSON", ErrInvalidSignerContract)
+	}
+
+	// 1. Verify exact object identity claim: url must match expectedBucket + "/" + expectedObjectPath
+	rawURL, ok := claims["url"]
+	if !ok {
+		return time.Time{}, fmt.Errorf("%w: missing url claim in signed token", ErrInvalidSignerContract)
+	}
+	var urlClaim string
+	if err := json.Unmarshal(rawURL, &urlClaim); err != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid url claim type", ErrInvalidSignerContract)
+	}
+	expectedURL := expectedBucket + "/" + expectedObjectPath
+	if urlClaim != expectedURL {
+		return time.Time{}, fmt.Errorf("%w: signed token url claim %q does not match expected %q", ErrInvalidSignerContract, urlClaim, expectedURL)
+	}
+
+	// 2. Verify expiry claim
+	rawExp, ok := claims["exp"]
+	if !ok {
+		return time.Time{}, fmt.Errorf("%w: missing expiry claim", ErrInvalidSignerContract)
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSpace(string(rawExp)), 10, 64)
+	if err != nil || seconds <= 0 {
+		return time.Time{}, fmt.Errorf("%w: invalid expiry claim", ErrInvalidSignerContract)
+	}
+	return time.Unix(seconds, 0).UTC(), nil
 }
 
 func isObjectNotFound(status int, body []byte) bool {
@@ -334,7 +630,10 @@ func isObjectNotFound(status int, body []byte) bool {
 
 func readControlBody(r io.Reader) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(r, maxControlBody+1))
-	if err != nil || len(body) > maxControlBody {
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxControlBody {
 		return nil, errors.New("bounded response read failed")
 	}
 	return body, nil
