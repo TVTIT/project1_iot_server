@@ -63,12 +63,21 @@ def main():
         "iat": now,
         "exp": exp
     }
+
+    playback_payload = {
+        "role": "storage_playback_signer",
+        "iss": "supabase",
+        "iat": now,
+        "exp": exp
+    }
     
     anon_token = create_jwt(anon_payload, secret)
     service_token = create_jwt(service_payload, secret)
+    playback_token = create_jwt(playback_payload, secret)
     
     print(f"ANON_KEY={anon_token}")
     print(f"SERVICE_ROLE_KEY={service_token}")
+    print(f"MEDIA_PLAYBACK_STORAGE_TOKEN={playback_token}")
 
 if __name__ == "__main__":
     main()

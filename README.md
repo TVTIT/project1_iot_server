@@ -201,7 +201,7 @@ Hệ thống IoT Gateway–Server phục vụ thu thập dữ liệu cảm biế
 │       └── docker-entrypoint.sh     # Script thế biến môi trường khởi chạy Envoy
 ├── scripts/
 │   ├── gen-certs.sh                 # Tạo Root CA và Server Certificate cho Mosquitto TLS
-│   ├── gen-keys.py                  # Sinh ANON_KEY và SERVICE_ROLE_KEY từ JWT_SECRET
+│   ├── gen-keys.py                  # Sinh ANON_KEY, SERVICE_ROLE_KEY và token playback từ JWT_SECRET
 │   ├── init-buckets.sh              # Khởi tạo private storage bucket (media-images)
 │   ├── backup-db.sh                 # Sao lưu dữ liệu PostgreSQL + TimescaleDB ra file nén .sql.gz
 │   └── sql/                         # Preflight, verification và rollback schema hardening
